@@ -333,6 +333,46 @@ pub mod flash_book {
             FlashBookError::OutOfRange
         );
 
+        // Stress-lattice margin gate. If the trader has an existing position
+        // on this market, reject if it would push them past maintenance.
+        // Empty position (first ever order) is trivially healthy.
+        let position = &ctx.accounts.position;
+        if position.size_lots > 0 {
+            require!(
+                position.trader == ctx.accounts.trader.key(),
+                FlashBookError::WrongTrader
+            );
+            require!(
+                position.market == market.key(),
+                FlashBookError::WrongMarket
+            );
+            let pos_snap = RiskPosSnap {
+                market: position.market,
+                side: if position.side == 0 { Side::Long } else { Side::Short },
+                size_lots: position.size_lots,
+                entry_price: Ticks(position.entry_price_ticks),
+                cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+            };
+            let market_snap = RiskMarketSnap {
+                market: market.key(),
+                mark_price: Ticks(market.mark_price_ticks),
+                cum_funding_index: market.cum_funding_index,
+                maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+                tick_size: market.params.tick_size,
+            };
+            let scenarios = default_scenarios_fn(&[market.key()]);
+            let assessment = assess_margin_fn(
+                &[pos_snap],
+                &[market_snap],
+                &scenarios,
+                ctx.accounts.trader_state.collateral_quote_lots,
+            )?;
+            require!(
+                assessment.is_healthy,
+                FlashBookError::TraderLiquidatable
+            );
+        }
+
         // Per-trader rate limit (reset on batch boundary).
         let trader_state = &mut ctx.accounts.trader_state;
         if trader_state.last_batch_seen != market.current_batch {
@@ -642,6 +682,77 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Apply a fill in which the FLP pool is the *maker*. Mutates the
+    /// `FlpExposureAccount.per_market` entry for this market while
+    /// applying the opposite-side update to the taker's `PositionAccount`.
+    ///
+    /// Trust model: same as `apply_fill` — sequencer-authenticated; the
+    /// fill data is taken at face value (production verifies via per-batch
+    /// fill buffer or Merkle proof).
+    pub fn apply_flp_fill(
+        ctx: Context<ApplyFlpFill>,
+        size_lots: u64,
+        price_ticks: u64,
+        taker_side: u8,
+    ) -> Result<()> {
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(taker_side <= 1, FlashBookError::OutOfRange);
+
+        let market = &mut ctx.accounts.market;
+        let market_key = market.key();
+        let funding_index = market.cum_funding_index;
+        let current_batch = market.current_batch;
+        let taker_side_enum = if taker_side == 0 { Side::Long } else { Side::Short };
+        let flp_side_enum = taker_side_enum.opposite();
+        let taker_trader_pk = ctx.accounts.taker_trader_state.trader;
+
+        let taker_pos = &mut ctx.accounts.taker_position;
+        if taker_pos.market == Pubkey::default() {
+            taker_pos.market = market_key;
+            taker_pos.trader = taker_trader_pk;
+            taker_pos.bump = ctx.bumps.taker_position;
+            taker_pos.cum_funding_index_at_entry = funding_index;
+            taker_pos.last_settlement_batch = current_batch;
+        }
+
+        let taker_was_open = taker_pos.size_lots > 0;
+        let taker_pre_side = taker_pos.side;
+        let taker_pre_size = taker_pos.size_lots;
+
+        apply_fill_to_position(taker_pos, taker_side_enum, size_lots, price_ticks, funding_index)?;
+
+        update_oi(market, taker_pre_side, taker_pre_size, taker_pos.side, taker_pos.size_lots)?;
+
+        // Update FLP per-market entry on the OPPOSITE side.
+        let flp = &mut ctx.accounts.flp_exposure;
+        let flp_pre = flp_market_pre_state(flp, market_key);
+        apply_fill_to_flp_market(flp, market_key, flp_side_enum, size_lots, price_ticks)?;
+        let flp_post = flp_market_pre_state(flp, market_key);
+        update_oi(market, flp_pre.0, flp_pre.1, flp_post.0, flp_post.1)?;
+
+        // Update open_positions on TraderState.
+        let taker_is_open = taker_pos.size_lots > 0;
+        let taker_state = &mut ctx.accounts.taker_trader_state;
+        if !taker_was_open && taker_is_open {
+            taker_state.open_positions = taker_state.open_positions.saturating_add(1);
+        } else if taker_was_open && !taker_is_open {
+            taker_state.open_positions = taker_state.open_positions.saturating_sub(1);
+        }
+
+        emit!(FlpFillAppliedEvent {
+            market: market_key,
+            taker: taker_trader_pk,
+            taker_side,
+            size_lots,
+            price_ticks,
+            batch_num: current_batch,
+            flp_size_after: flp_post.1,
+            flp_side_after: flp_post.0,
+        });
+        Ok(())
+    }
+
     /// Liquidate a specific position. Anyone may call this for any position;
     /// the matcher determines if the trader is actually unhealthy. If they
     /// are not, the instruction errors with `NotLiquidatable` — preserving
@@ -868,6 +979,7 @@ pub struct UpdateOracle<'info> {
 
 #[derive(Accounts)]
 pub struct PlaceOrder<'info> {
+    #[account(mut)]
     pub trader: Signer<'info>,
     #[account(
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
@@ -887,6 +999,18 @@ pub struct PlaceOrder<'info> {
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
+    /// Position PDA — initialized lazily on first order for this (market, trader).
+    /// `init_if_needed` makes the trader pay rent on first creation; subsequent
+    /// orders find it already initialized. Used by the stress-lattice gate.
+    #[account(
+        init_if_needed,
+        payer = trader,
+        space = state::PositionAccount::space(),
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader.key().as_ref()],
+        bump,
+    )]
+    pub position: Account<'info, state::PositionAccount>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -1033,6 +1157,44 @@ pub struct ApplyFill<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ApplyFlpFill<'info> {
+    #[account(mut)]
+    pub sequencer: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, taker_trader_state.trader.as_ref()],
+        bump = taker_trader_state.bump,
+    )]
+    pub taker_trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = sequencer,
+        space = state::PositionAccount::space(),
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.trader.as_ref()],
+        bump,
+    )]
+    pub taker_position: Account<'info, state::PositionAccount>,
+
+    #[account(
+        mut,
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
+    )]
+    pub flp_exposure: Account<'info, FlpExposureAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct LiquidatePosition<'info> {
     /// Anyone may call. Future iteration may gate by sequencer or
     /// liquidator-bond, but in v1 anyone can permissionlessly trigger
@@ -1097,6 +1259,18 @@ pub struct CollateralWithdrawnEvent {
     pub trader: Pubkey,
     pub amount: u64,
     pub new_balance: u64,
+}
+
+#[event]
+pub struct FlpFillAppliedEvent {
+    pub market: Pubkey,
+    pub taker: Pubkey,
+    pub taker_side: u8,
+    pub size_lots: u64,
+    pub price_ticks: u64,
+    pub batch_num: u64,
+    pub flp_size_after: u64,
+    pub flp_side_after: u8,
 }
 
 #[event]
@@ -1196,6 +1370,120 @@ fn realized_vol_bps_from_window(prices: &[u64; MARK_HISTORY_LEN], count: u8) -> 
     let stdev = (variance.max(0) as u128).isqrt() as u64;
     // Cap at 10_000 bps (= 100%) — a plausible upper bound on per-batch return stdev.
     stdev.min(10_000) as u32
+}
+
+/// Read FLP per-market entry side+size for a market. Returns (side, size).
+/// Side 255 = empty slot.
+fn flp_market_pre_state(flp: &FlpExposureAccount, market: Pubkey) -> (u8, u64) {
+    for entry in flp.per_market.iter() {
+        if entry.side != 255 && entry.market == market {
+            return (entry.side, entry.size_lots);
+        }
+    }
+    (255, 0)
+}
+
+/// Apply a fill against the FLP's per-market entry. Mirrors
+/// `apply_fill_to_position` semantics on a `FlpMarketExposure` slot.
+fn apply_fill_to_flp_market(
+    flp: &mut FlpExposureAccount,
+    market: Pubkey,
+    fill_side: Side,
+    fill_size_lots: u64,
+    fill_price_ticks: u64,
+) -> Result<()> {
+    // Find existing entry or first empty slot.
+    let mut entry_idx: Option<usize> = None;
+    let mut empty_idx: Option<usize> = None;
+    for (i, entry) in flp.per_market.iter().enumerate() {
+        if entry.side != 255 && entry.market == market {
+            entry_idx = Some(i);
+            break;
+        }
+        if entry.side == 255 && empty_idx.is_none() {
+            empty_idx = Some(i);
+        }
+    }
+
+    let idx = match entry_idx {
+        Some(i) => i,
+        None => {
+            let i = empty_idx.ok_or_else(|| error!(FlashBookError::BufferFull))?;
+            flp.per_market[i] = state::FlpMarketExposure {
+                market,
+                side: fill_side as u8,
+                size_lots: fill_size_lots,
+                entry_price_ticks: fill_price_ticks,
+            };
+            flp.markets_count = flp.markets_count.saturating_add(1);
+            return Ok(());
+        }
+    };
+
+    let cur = &mut flp.per_market[idx];
+    let cur_side_enum = if cur.side == 0 { Side::Long } else { Side::Short };
+
+    if cur_side_enum == fill_side {
+        let new_size = cur
+            .size_lots
+            .checked_add(fill_size_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let weighted = (cur.entry_price_ticks as u128)
+            .checked_mul(cur.size_lots as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+            .checked_add(
+                (fill_price_ticks as u128)
+                    .checked_mul(fill_size_lots as u128)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?,
+            )
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+            .checked_div(new_size as u128)
+            .ok_or_else(|| error!(FlashBookError::DivisionByZero))?;
+        cur.entry_price_ticks = weighted as u64;
+        cur.size_lots = new_size;
+        return Ok(());
+    }
+
+    // Opposite side: realize PnL on closed portion (FLP carries this in
+    // `flp.realized_pnl`, not per-market).
+    let close_size = fill_size_lots.min(cur.size_lots);
+    let sign: i128 = if cur_side_enum == Side::Long { 1 } else { -1 };
+    let pnl_per_lot: i128 = (fill_price_ticks as i128) - (cur.entry_price_ticks as i128);
+    let pnl: i128 = sign
+        .checked_mul(close_size as i128)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+        .checked_mul(pnl_per_lot)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    let pnl_clamped = if pnl > i64::MAX as i128 {
+        i64::MAX
+    } else if pnl < i64::MIN as i128 {
+        i64::MIN
+    } else {
+        pnl as i64
+    };
+    flp.realized_pnl = flp.realized_pnl.saturating_add(pnl_clamped);
+
+    if fill_size_lots <= cur.size_lots {
+        cur.size_lots = cur
+            .size_lots
+            .checked_sub(fill_size_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        if cur.size_lots == 0 {
+            // Mark slot empty.
+            cur.side = 255;
+            cur.entry_price_ticks = 0;
+            flp.markets_count = flp.markets_count.saturating_sub(1);
+        }
+    } else {
+        // Flip side.
+        let remaining = fill_size_lots
+            .checked_sub(cur.size_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        cur.side = fill_side as u8;
+        cur.size_lots = remaining;
+        cur.entry_price_ticks = fill_price_ticks;
+    }
+    Ok(())
 }
 
 /// Update OI counters for a single trader's position transition.

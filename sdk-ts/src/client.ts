@@ -182,6 +182,7 @@ export class FlashBookClient {
   }): Promise<TransactionInstruction> {
     const buffer = this.orderBuffer(args.market);
     const state = this.traderState(args.trader);
+    const position = this.position(args.market, args.trader);
     return this.methods
       .placeLimitOrder(
         args.side === 'long' ? 0 : 1,
@@ -194,6 +195,8 @@ export class FlashBookClient {
         market: args.market,
         orderBuffer: buffer.address,
         traderState: state.address,
+        position: position.address,
+        systemProgram: SystemProgram.programId,
       })
       .instruction();
   }
@@ -279,6 +282,34 @@ export class FlashBookClient {
         orderBuffer: buffer.address,
         traderState: traderState.address,
         position: position.address,
+      })
+      .instruction();
+  }
+
+  applyFlpFillIx(args: {
+    sequencer: PublicKey;
+    market: PublicKey;
+    takerTrader: PublicKey;
+    sizeLots: bigint | number;
+    priceTicks: bigint | number;
+    takerSide: 'long' | 'short';
+  }): Promise<TransactionInstruction> {
+    const takerState = this.traderState(args.takerTrader);
+    const takerPos = this.position(args.market, args.takerTrader);
+    const flp = this.flpExposure();
+    return this.methods
+      .applyFlpFill(
+        args.sizeLots,
+        args.priceTicks,
+        args.takerSide === 'long' ? 0 : 1,
+      )
+      .accountsPartial({
+        sequencer: args.sequencer,
+        market: args.market,
+        takerTraderState: takerState.address,
+        takerPosition: takerPos.address,
+        flpExposure: flp.address,
+        systemProgram: SystemProgram.programId,
       })
       .instruction();
   }

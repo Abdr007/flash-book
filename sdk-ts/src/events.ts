@@ -51,10 +51,22 @@ export interface LiquidationInjectedEvent {
   worstScenarioIdx: number;
 }
 
+export interface FlpFillAppliedEvent {
+  market: PublicKey;
+  taker: PublicKey;
+  takerSide: number;
+  sizeLots: BN;
+  priceTicks: BN;
+  batchNum: BN;
+  flpSizeAfter: BN;
+  flpSideAfter: number;
+}
+
 export type FlashBookEvent =
   | { name: 'MarketInitializedEvent'; data: MarketInitializedEvent }
   | { name: 'BatchClearedEvent'; data: BatchClearedEvent }
   | { name: 'CollateralDepositedEvent'; data: CollateralDepositedEvent }
   | { name: 'CollateralWithdrawnEvent'; data: CollateralWithdrawnEvent }
   | { name: 'FillAppliedEvent'; data: FillAppliedEvent }
-  | { name: 'LiquidationInjectedEvent'; data: LiquidationInjectedEvent };
+  | { name: 'LiquidationInjectedEvent'; data: LiquidationInjectedEvent }
+  | { name: 'FlpFillAppliedEvent'; data: FlpFillAppliedEvent };

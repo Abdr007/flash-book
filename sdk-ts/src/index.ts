@@ -36,6 +36,7 @@ export type {
   CollateralDepositedEvent,
   CollateralWithdrawnEvent,
   FillAppliedEvent,
+  FlpFillAppliedEvent,
   LiquidationInjectedEvent,
   FlashBookEvent,
 } from './events.ts';

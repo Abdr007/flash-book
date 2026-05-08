@@ -4,6 +4,42 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-05-08
+
+### Added — Phase 1 continued (FLP fill bookkeeping + stress-lattice gate)
+
+**`apply_flp_fill` instruction.**
+- The on-chain settlement path for fills where the FLP pool is the maker.
+- Mutates `FlpExposureAccount.per_market` for this market via the new
+  `apply_fill_to_flp_market()` helper, mirroring `apply_fill_to_position`
+  semantics on a `FlpMarketExposure` slot (open / add / reduce / flip
+  with realized PnL accumulated globally on `flp.realized_pnl`).
+- Updates the taker's `PositionAccount` on the opposite side via the
+  existing `apply_fill_to_position()` helper.
+- Updates market OI counters for both sides via `update_oi`.
+- Updates `TraderState.open_positions` on transitions.
+- New `FlpFillAppliedEvent` carries the FLP's post-fill side+size for
+  off-chain monitors.
+
+**Stress-lattice margin gate on order intake.**
+- `place_limit_order` now requires the caller's `PositionAccount` PDA
+  (init-if-needed). If the trader has an existing non-empty position on
+  this market, the matcher's `assess_margin` runs against the default
+  stress lattice. If the position is unhealthy, the order is rejected
+  with `TraderLiquidatable` (1400) — preventing unhealthy traders from
+  digging deeper.
+- Empty positions (first-ever order on a market) skip the gate
+  trivially.
+- Cost: one rent-exempt account creation on first order per
+  (trader, market) pair; subsequent orders pay zero rent (Anchor's
+  `init_if_needed` is a no-op when already initialized).
+
+**SDK extended.**
+- `applyFlpFillIx` builder.
+- `FlpFillAppliedEvent` type definition.
+- `placeLimitOrderIx` updated to pass the position PDA.
+- IDL regenerated (2,848 lines, was 2,595).
+
 ## [0.8.0] — 2026-05-08
 
 ### Added — Phase 1 continued (liquidation entry point + SDK tests)

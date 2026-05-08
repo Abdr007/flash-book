@@ -204,6 +204,167 @@
       ]
     },
     {
+      "name": "apply_flp_fill",
+      "docs": [
+        "Apply a fill in which the FLP pool is the *maker*. Mutates the",
+        "`FlpExposureAccount.per_market` entry for this market while",
+        "applying the opposite-side update to the taker's `PositionAccount`.",
+        "",
+        "Trust model: same as `apply_fill` — sequencer-authenticated; the",
+        "fill data is taken at face value (production verifies via per-batch",
+        "fill buffer or Merkle proof)."
+      ],
+      "discriminator": [
+        101,
+        217,
+        245,
+        185,
+        121,
+        114,
+        96,
+        4
+      ],
+      "accounts": [
+        {
+          "name": "sequencer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "taker_trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "taker_trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "taker_position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "taker_trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "price_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "taker_side",
+          "type": "u8"
+        }
+      ]
+    },
+    {
       "name": "deposit_collateral",
       "docs": [
         "Deposit collateral into the trader's state. SPL token transfer is",
@@ -759,6 +920,7 @@
       "accounts": [
         {
           "name": "trader",
+          "writable": true,
           "signer": true
         },
         {
@@ -846,6 +1008,44 @@
               }
             ]
           }
+        },
+        {
+          "name": "position",
+          "docs": [
+            "Position PDA — initialized lazily on first order for this (market, trader).",
+            "`init_if_needed` makes the trader pay rent on first creation; subsequent",
+            "orders find it already initialized. Used by the stress-lattice gate."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": [
@@ -1534,6 +1734,19 @@
       ]
     },
     {
+      "name": "FlpFillAppliedEvent",
+      "discriminator": [
+        47,
+        91,
+        252,
+        185,
+        104,
+        137,
+        141,
+        118
+      ]
+    },
+    {
       "name": "LiquidationInjectedEvent",
       "discriminator": [
         164,
@@ -1978,6 +2191,46 @@
                 16
               ]
             }
+          }
+        ]
+      }
+    },
+    {
+      "name": "FlpFillAppliedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker_side",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "batch_num",
+            "type": "u64"
+          },
+          {
+            "name": "flp_size_after",
+            "type": "u64"
+          },
+          {
+            "name": "flp_side_after",
+            "type": "u8"
           }
         ]
       }

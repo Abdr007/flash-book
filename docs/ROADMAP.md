@@ -62,6 +62,11 @@ Target: deployable to MagicBlock ER devnet.
 - [x] TypeScript SDK package (`@flash-book/sdk`) with 11 typed instruction
       builders, 7 PDA derivers, error-code enum, default params helpers
 - [x] SDK test suite (28 tests covering PDAs, errors, params)
+- [x] `apply_flp_fill` instruction — on-chain settlement for FLP-side fills
+      with `FlpExposureAccount.per_market` mutation
+- [x] Stress-lattice margin gate on order intake
+      (rejects new orders that would push trader into liquidation)
+- [x] FLP per-market position lifecycle (open / add / reduce / flip / close)
 - [ ] In-loop liquidation injection during run_batch (logic complete, wiring
       to per-trader iteration via remaining_accounts pending)
 - [ ] Stress-lattice margin enforcement on order intake
