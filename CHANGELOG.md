@@ -4,6 +4,42 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] — 2026-05-08
+
+### Added — apply_flp_fill fee wiring + cross-language parity test
+
+#### apply_flp_fill fee/rebate wiring (parity with apply_fill)
+
+Same correctness gap that apply_fill had — fees were computed in the
+matcher but never collected. Now fixed for the FLP-side path too:
+- Computes notional, taker_fee, maker_rebate same as apply_fill.
+- Deducts taker_fee from taker collateral.
+- Credits maker_rebate to **flp.total_capital_quote_lots** (FLP is the
+  maker; rebate accrues to pool capital).
+- Contributes net fee to insurance fund.
+- Updates market.total_fees_collected.
+
+`InsuranceFundAccount` now required (mut) in `ApplyFlpFill` context.
+
+#### Cross-language parity test — Rust ↔ TS implementations agree
+
+Shared fixture `tests/parity/scenarios.json` with 8 canonical scenarios.
+Both Rust (`programs/flash-book/tests/parity_test.rs`) and TS
+(`sdk-ts/tests/parity.test.ts`) read the same file and assert identical
+outputs. **If the two implementations ever drift apart, both tests
+fail loudly.**
+
+Scenarios: non-crossing, single crossing, tie-break, liquidation
+priority, FIFO within priority class, self-trade prevention,
+volume maximization, empty input.
+
+The "self-trade prevention" scenario revealed a documented semantic:
+`clearing_volume` is the Walrasian-max (theoretical) while
+`fills.length × size` is the actual after STP. Both implementations
+agree; documented in the fixture's `_doc` annotation.
+
+### Total test count: 271. Total fuzz assertions: ~72,000.
+
 ## [0.29.0] — 2026-05-08
 
 ### Added — Phase 1 final-final-final polish (deep audit pass)
