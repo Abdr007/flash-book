@@ -4,6 +4,61 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] — 2026-05-08
+
+### Added — Phase 1 polish (composable previewTrade SDK helper)
+
+**`sdk-ts/src/preview-trade.ts`** — the canonical pre-trade UX
+composer. One call fetches all relevant on-chain state, simulates
+clearing with the trader's prospective order, projects the post-fill
+position, runs risk preview against it.
+
+```ts
+const result = await previewTrade(client, {
+  trader: alice.publicKey,
+  market: solUsdcMarket,
+  side: 'long',
+  sizeLots: 10,
+  limitTicks: 99_950,
+  orderType: 'taker',
+});
+
+// result:
+// {
+//   intakeAllowed: true,
+//   expectedFill: { sizeLots: 10, priceTicks: 99_950 },
+//   priceImprovementBps: 0,
+//   postTradeRisk: {
+//     equity: 50_000,
+//     required: 12_500,
+//     isHealthy: true,
+//     healthRatio: 4.0,
+//     worstScenario: 'all_down_10pct',
+//     ...
+//   },
+//   initialMarginRequired: 25_000,
+// }
+```
+
+What it does:
+1. Fetches market + order buffer + trader state + current position
+   (4 RPC calls in parallel via `Promise.all`).
+2. Checks intake gates: market status, trader exists, rate limit.
+3. Builds the simulator input from the current buffer + the
+   prospective order.
+4. Runs `simulateBatchClearing` for the predicted fill.
+5. Projects the post-fill position state (open / add / reduce / flip
+   semantics matching `apply_fill_to_position`).
+6. Runs `previewPortfolioRisk` against the projected portfolio.
+7. Computes `priceImprovementBps` (always ≥ 0; FBA fills at-or-better
+   than limit by construction).
+
+This is the canonical UI feature for any frontend. TradingView-style
+"limit order will fill at ~X with N% slippage; resulting position
+would be Y% to liquidation" — all in one async call.
+
+### Total test count: 238 (152 TS sim+SDK + 31 Rust unit + 30 Rust property × 2K + 25 E2E integration).
+
 ## [0.25.0] — 2026-05-08
 
 ### Added — Phase 1 closure (100% instruction E2E coverage)

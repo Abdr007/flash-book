@@ -75,6 +75,12 @@ export {
 } from './order-simulator.ts';
 
 export {
+  previewTrade,
+  type PreviewTradeRequest,
+  type PreviewTradeResult,
+} from './preview-trade.ts';
+
+export {
   FlashBookErrorCode,
   errorFamily,
   errorName,
