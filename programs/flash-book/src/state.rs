@@ -70,6 +70,12 @@ pub struct MarketParams {
     /// 0 = unlimited. Prevents the POPCAT-style coordinated long buildup
     /// where a single attacker accumulates outsized concentrated risk.
     pub max_position_lots_per_trader: u64,
+
+    /// Multi-oracle quorum maximum dispersion as bps of the median.
+    /// E.g. 50 = if max-source - min-source > 0.5% of median, the update
+    /// is rejected because oracles disagree. 0 = no dispersion check.
+    /// Used by `update_oracle_quorum`.
+    pub oracle_quorum_max_dispersion_bps: u32,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).

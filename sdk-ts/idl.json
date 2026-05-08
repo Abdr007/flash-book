@@ -2147,6 +2147,101 @@
       ]
     },
     {
+      "name": "update_oracle_quorum",
+      "docs": [
+        "Update oracle price using a multi-oracle quorum (median of 3).",
+        "",
+        "Defense in depth against the JELLY/POPCAT class of attacks where an",
+        "attacker manipulates a single upstream price source. With three",
+        "independent sources (e.g. Pyth + Switchboard + internal TWAP), an",
+        "attacker would have to corrupt the majority simultaneously to move",
+        "the median.",
+        "",
+        "Each input has its own staleness + confidence checked individually.",
+        "Additionally: the dispersion `(max − min) / median` must be ≤",
+        "`oracle_quorum_max_dispersion_bps`. If it exceeds, the update is",
+        "rejected — sources clearly disagree, so no single one is safe to use.",
+        "",
+        "The accepted price is the median; the accepted confidence is the",
+        "max of the three (most pessimistic); the accepted publish time is",
+        "the min of the three (oldest, so the staleness gate is conservative)."
+      ],
+      "discriminator": [
+        174,
+        73,
+        220,
+        162,
+        66,
+        63,
+        216,
+        248
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "prices_ticks",
+          "type": {
+            "array": [
+              "u64",
+              3
+            ]
+          }
+        },
+        {
+          "name": "confidences",
+          "type": {
+            "array": [
+              "u64",
+              3
+            ]
+          }
+        },
+        {
+          "name": "published_at_unix_seconds",
+          "type": {
+            "array": [
+              "u64",
+              3
+            ]
+          }
+        }
+      ]
+    },
+    {
       "name": "withdraw_collateral",
       "docs": [
         "Withdraw collateral. Blocked if it would push the trader below",
@@ -2736,6 +2831,11 @@
       "code": 7802,
       "name": "OraclePausedConfidence",
       "msg": "Oracle in fail-safe mode; new positions paused"
+    },
+    {
+      "code": 7803,
+      "name": "OracleQuorumDispersionTooWide",
+      "msg": "Oracle quorum dispersion exceeds configured maximum — sources disagree"
     }
   ],
   "types": [
@@ -3459,6 +3559,16 @@
               "where a single attacker accumulates outsized concentrated risk."
             ],
             "type": "u64"
+          },
+          {
+            "name": "oracle_quorum_max_dispersion_bps",
+            "docs": [
+              "Multi-oracle quorum maximum dispersion as bps of the median.",
+              "E.g. 50 = if max-source - min-source > 0.5% of median, the update",
+              "is rejected because oracles disagree. 0 = no dispersion check.",
+              "Used by `update_oracle_quorum`."
+            ],
+            "type": "u32"
           }
         ]
       }

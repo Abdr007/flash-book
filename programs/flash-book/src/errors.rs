@@ -114,6 +114,8 @@ pub enum FlashBookError {
     OracleConfidenceTooWide = 1801,
     #[msg("Oracle in fail-safe mode; new positions paused")]
     OraclePausedConfidence = 1802,
+    #[msg("Oracle quorum dispersion exceeds configured maximum — sources disagree")]
+    OracleQuorumDispersionTooWide = 1803,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

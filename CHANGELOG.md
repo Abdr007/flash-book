@@ -4,6 +4,77 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] — 2026-05-08
+
+### Added — multi-oracle quorum (median-of-3 + dispersion gate)
+
+Defense in depth against the JELLY/POPCAT class of attacks where an
+attacker manipulates a single upstream price source. With three
+independent sources (e.g. Pyth + Switchboard + internal TWAP), an
+attacker would have to corrupt the majority simultaneously to move
+the median.
+
+#### `update_oracle_quorum` instruction
+
+Takes three independent oracle observations (price, confidence,
+publish_time):
+
+```rust
+update_oracle_quorum(
+    prices_ticks: [u64; 3],
+    confidences: [u64; 3],
+    published_at_unix_seconds: [u64; 3],
+)
+```
+
+Per-call validation:
+1. Each source individually passes the existing staleness +
+   confidence gates (params unchanged from `update_oracle`).
+2. **Dispersion check**: `(max − min) / median × 10_000 ≤
+   oracle_quorum_max_dispersion_bps`. If sources disagree by more
+   than the configured threshold, the update is rejected — they're
+   clearly seeing different markets, no single source is safe to use.
+
+Conservative aggregation written to chain:
+- `oracle_price_ticks` = median (most robust to one corrupt source).
+- `oracle_confidence` = max of the three (most pessimistic).
+- `oracle_published_at_unix_seconds` = min of the three (oldest, so
+  staleness gates remain conservative for downstream readers).
+
+#### Configuration
+
+- New `MarketParams.oracle_quorum_max_dispersion_bps`
+  (default 50 = 0.5%; 0 = disable check).
+- Default in `defaultMajorMarketParams()` set to 50.
+
+#### New error
+
+- `OracleQuorumDispersionTooWide (1803)` — sources disagree.
+
+#### SDK
+
+- New `updateOracleQuorumIx({ authority, market, pricesTicks,
+  confidences, publishedAtUnixSeconds })` builder.
+- Coverage tripwire updated to **22** expected instruction builders.
+- `MarketParamsRaw` extended with `oracleQuorumMaxDispersionBps`.
+
+#### 2 new E2E integration tests
+
+- `update_oracle_quorum_writes_median_with_three_close_sources` —
+  three sources within tolerance, median accepted.
+- `update_oracle_quorum_rejects_dispersed_sources` — sources
+  disagreeing by ~10% with 50bps cap → rejected.
+
+### Phase 2 / future work
+
+The current quorum takes raw price values from the authority. A future
+instruction will read directly via CPI from on-chain Pyth +
+Switchboard + chainlink-on-solana accounts, removing the trust-the-caller
+assumption. The quorum logic itself is identical.
+
+### Total Anchor instruction surface: **22**.
+### Total test count: 273 (172 TS sim+SDK+parity + 31 Rust unit + 36 Rust property × 2K + 33 E2E + 1 Rust parity).
+
 ## [0.30.0] — 2026-05-08
 
 ### Added — apply_flp_fill fee wiring + cross-language parity test

@@ -253,8 +253,26 @@ describe('Instruction builders', () => {
       market,
       priceTicks: new BN(105_000),
       confidence: new BN(50),
+      publishedAtUnixSeconds: new BN(1_700_000_000),
     });
     expect(ix.keys.length).toBe(2);
+  });
+
+  test('updateOracleQuorumIx', async () => {
+    const client = makeClient();
+    const market = client.market(SOL, USDC).address;
+    const ix = await client.updateOracleQuorumIx({
+      authority: Keypair.generate().publicKey,
+      market,
+      pricesTicks: [new BN(99_950), new BN(100_000), new BN(100_050)],
+      confidences: [new BN(0), new BN(0), new BN(0)],
+      publishedAtUnixSeconds: [
+        new BN(1_700_000_000),
+        new BN(1_700_000_000),
+        new BN(1_700_000_000),
+      ],
+    });
+    expect(ix.keys.length).toBe(2); // authority, market
   });
 
   test('setMarketStatusIx', async () => {
@@ -293,7 +311,7 @@ describe('Instruction builders', () => {
 
   // ─── Coverage check ────────────────────────────────────────────────
 
-  test('all 21 instruction builders covered', () => {
+  test('all 22 instruction builders covered', () => {
     // This test serves as a tripwire: if a new instruction is added to
     // the program, this list will fall out of sync with the test count
     // above.
@@ -316,11 +334,12 @@ describe('Instruction builders', () => {
       'liquidatePositionIx',
       'liquidatePortfolioIx',
       'updateOracleIx',
+      'updateOracleQuorumIx',
       'setMarketStatusIx',
       'updateMarketParamsIx',
       'transferMarketAuthorityIx',
     ];
-    expect(expected.length).toBe(21);
+    expect(expected.length).toBe(22);
     const client = makeClient();
     for (const name of expected) {
       expect(typeof (client as unknown as Record<string, unknown>)[name]).toBe('function');

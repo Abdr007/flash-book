@@ -48,6 +48,8 @@ export interface MarketParamsRaw {
   oracleConfidenceMaxBps: number;
   /** Per-trader max position size on this market (lots); 0 = unlimited. */
   maxPositionLotsPerTrader: BN;
+  /** Multi-oracle quorum max dispersion (bps of median); 0 = no check. */
+  oracleQuorumMaxDispersionBps: number;
 }
 
 /** Sensible default parameter set for SOL/BTC/ETH-style major markets. */
@@ -96,6 +98,9 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
     // Concentration cap: 10x the FLP per-batch growth as a sane default
     // (production should set per market based on historical OI distribution).
     maxPositionLotsPerTrader: new BN(0), // 0 = unlimited; opt-in by markets
+    // Quorum dispersion: 50 bps = 0.5%. If 3 oracles disagree by more
+    // than this, reject the update (sources are seeing different markets).
+    oracleQuorumMaxDispersionBps: 50,
   };
 }
 

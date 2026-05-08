@@ -121,6 +121,7 @@ fn default_params() -> MarketParams {
         oracle_staleness_max_seconds: 0,
         oracle_confidence_max_bps: 0,
         max_position_lots_per_trader: 0,
+        oracle_quorum_max_dispersion_bps: 0,
     }
 }
 
@@ -2662,4 +2663,131 @@ async fn cancel_order_rejects_other_traders_order() {
     // Alice's order is still there.
     let buf_unchanged: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
     assert_eq!(buf_unchanged.head, 1);
+}
+
+#[tokio::test]
+async fn update_oracle_quorum_writes_median_with_three_close_sources() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Three sources within tolerance: 99_950, 100_000, 100_050.
+    // Median = 100_000; max-min = 100; dispersion = 100/100_000*10000 = 10 bps.
+    let ix = build_ix(
+        flash_book::instruction::UpdateOracleQuorum {
+            prices_ticks: [99_950, 100_000, 100_050],
+            confidences: [0, 0, 0],
+            published_at_unix_seconds: [now, now, now],
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.oracle_price_ticks, 100_000); // median
+}
+
+#[tokio::test]
+async fn update_oracle_quorum_rejects_dispersed_sources() {
+    // Set tight dispersion gate (50 bps) and feed 3 prices that disagree
+    // by ~10% — should reject.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (insurance_fund, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+
+    let base_mint = Keypair::new().pubkey();
+    let quote_mint = Keypair::new().pubkey();
+    let (market_pda, _) = pda(&[
+        MarketAccount::SEED,
+        base_mint.as_ref(),
+        quote_mint.as_ref(),
+    ]);
+    let (order_buf, _) = pda(&[OrderBufferAccount::SEED, market_pda.as_ref()]);
+    let (cb, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    let mut params = default_params();
+    params.oracle_quorum_max_dispersion_bps = 50; // 0.5%
+    let init_ix = build_ix(
+        flash_book::instruction::InitializeMarket {
+            params,
+            initial_oracle_ticks: 100_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(cb, false),
+            AccountMeta::new_readonly(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // 95k / 100k / 105k → max-min = 10k = 10% of median. Way over 50bps.
+    let ix = build_ix(
+        flash_book::instruction::UpdateOracleQuorum {
+            prices_ticks: [95_000, 100_000, 105_000],
+            confidences: [0, 0, 0],
+            published_at_unix_seconds: [now, now, now],
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "dispersed-oracle update should fail");
 }

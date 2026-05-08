@@ -498,6 +498,90 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Update oracle price using a multi-oracle quorum (median of 3).
+    ///
+    /// Defense in depth against the JELLY/POPCAT class of attacks where an
+    /// attacker manipulates a single upstream price source. With three
+    /// independent sources (e.g. Pyth + Switchboard + internal TWAP), an
+    /// attacker would have to corrupt the majority simultaneously to move
+    /// the median.
+    ///
+    /// Each input has its own staleness + confidence checked individually.
+    /// Additionally: the dispersion `(max − min) / median` must be ≤
+    /// `oracle_quorum_max_dispersion_bps`. If it exceeds, the update is
+    /// rejected — sources clearly disagree, so no single one is safe to use.
+    ///
+    /// The accepted price is the median; the accepted confidence is the
+    /// max of the three (most pessimistic); the accepted publish time is
+    /// the min of the three (oldest, so the staleness gate is conservative).
+    pub fn update_oracle_quorum(
+        ctx: Context<UpdateOracle>,
+        prices_ticks: [u64; 3],
+        confidences: [u64; 3],
+        published_at_unix_seconds: [u64; 3],
+    ) -> Result<()> {
+        for &p in &prices_ticks {
+            require!(p > 0, FlashBookError::ZeroPrice);
+        }
+        let market = &mut ctx.accounts.market;
+        require_keys_eq!(
+            market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized,
+        );
+
+        // Per-source staleness check.
+        let now = Clock::get()?.unix_timestamp.max(0) as u64;
+        let max_age = market.params.oracle_staleness_max_seconds as u64;
+        if max_age > 0 {
+            for &t in &published_at_unix_seconds {
+                let age = now.saturating_sub(t);
+                require!(age <= max_age, FlashBookError::OracleTooStale);
+            }
+        }
+
+        // Per-source confidence check.
+        let max_conf = market.params.oracle_confidence_max_bps;
+        if max_conf > 0 {
+            for i in 0..3 {
+                let conf_bps = ((confidences[i] as u128) * (constants::BPS_DENOM as u128))
+                    .checked_div(prices_ticks[i] as u128)
+                    .ok_or_else(|| error!(FlashBookError::DivisionByZero))?;
+                require!(
+                    conf_bps <= max_conf as u128,
+                    FlashBookError::OracleConfidenceTooWide,
+                );
+            }
+        }
+
+        // Median + dispersion check.
+        let mut sorted = prices_ticks;
+        sorted.sort();
+        let min_p = sorted[0];
+        let median = sorted[1];
+        let max_p = sorted[2];
+
+        let max_disp = market.params.oracle_quorum_max_dispersion_bps;
+        if max_disp > 0 {
+            let dispersion_bps = ((max_p - min_p) as u128) * (constants::BPS_DENOM as u128)
+                / (median as u128);
+            require!(
+                dispersion_bps <= max_disp as u128,
+                FlashBookError::OracleQuorumDispersionTooWide,
+            );
+        }
+
+        // Write conservative aggregates: median price, max confidence,
+        // oldest publish_time.
+        let combined_conf = confidences.iter().copied().max().unwrap_or(0);
+        let combined_published_at = published_at_unix_seconds.iter().copied().min().unwrap_or(0);
+
+        market.oracle_price_ticks = median;
+        market.oracle_confidence = combined_conf;
+        market.oracle_published_at_unix_seconds = combined_published_at;
+        Ok(())
+    }
+
     /// Update market status (authority-only).
     ///
     /// Status transitions:

@@ -368,6 +368,36 @@ export class FlashBookClient {
   }
 
   /**
+   * Multi-oracle quorum update. Pass three independent oracle observations
+   * (price, confidence, publish_time). The matcher computes the median
+   * price, validates dispersion, and writes conservative aggregates.
+   *
+   * In production, the caller is responsible for fetching each underlying
+   * oracle account (e.g. Pyth, Switchboard, internal TWAP) and feeding
+   * the values here. A future Phase 2 instruction will read directly via
+   * CPI to remove the trust-the-caller assumption.
+   */
+  updateOracleQuorumIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    pricesTicks: [bigint | number, bigint | number, bigint | number];
+    confidences: [bigint | number, bigint | number, bigint | number];
+    publishedAtUnixSeconds: [bigint | number, bigint | number, bigint | number];
+  }): Promise<TransactionInstruction> {
+    return this.methods
+      .updateOracleQuorum(
+        args.pricesTicks,
+        args.confidences,
+        args.publishedAtUnixSeconds,
+      )
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+      })
+      .instruction();
+  }
+
+  /**
    * Cross-market portfolio liquidation. Walks the trader's positions
    * across multiple markets via remaining_accounts.
    *
