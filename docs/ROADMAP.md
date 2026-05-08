@@ -74,6 +74,8 @@ Target: deployable to MagicBlock ER devnet.
 - [x] FLP capital lifecycle: initialize_flp_exposure, deposit_flp_capital,
       withdraw_flp_capital (with open-positions gate)
 - [x] Standalone lifecycle demo via SDK (sdk-ts/examples/full-lifecycle.ts)
+- [x] **E2E integration tests via solana-program-test (5 passing)**
+- [x] SDK builder coverage tests (20 cases — every Ix builder verified)
 - [ ] In-loop liquidation injection during run_batch (logic complete, wiring
       to per-trader iteration via remaining_accounts pending)
 - [ ] Stress-lattice margin enforcement on order intake

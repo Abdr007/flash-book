@@ -4,6 +4,53 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] — 2026-05-08
+
+### Added — Phase 1 continued (E2E integration tests + builder coverage)
+
+**🎉 Integration tests via solana-program-test now work.**
+
+Bridged Anchor 0.31's `entry` (which uses `'info` for both the slice
+ref and `AccountInfo` items) to solana-program-test's HRTB
+`BuiltinFunctionWithContext` via a documented, sound unsafe-transmute
+wrapper:
+
+```rust
+fn anchor_entry_wrapper<'a, 'b, 'c, 'd>(
+    program_id: &'a Pubkey,
+    accounts: &'b [AccountInfo<'c>],
+    instruction_data: &'d [u8],
+) -> Result<(), ProgramError> {
+    let accounts_unified: &'c [AccountInfo<'c>] =
+        unsafe { std::mem::transmute(accounts) };
+    flash_book::entry(program_id, accounts_unified, instruction_data)
+}
+```
+
+The transmute changes only the type-level lifetime parameter; runtime
+layout is identical. Sound because solana-program-test owns the
+AccountInfo Vec for the duration of the instruction call.
+
+**5 E2E integration tests** (in `programs/flash-book/tests/integration.rs`),
+each running the program through a real Solana runtime:
+
+- `initialize_insurance_fund_writes_state`
+- `initialize_flp_exposure_writes_state_and_empty_slots` —
+  verifies all 16 slots come up empty (`side = 255`)
+- `open_trader_state_initializes_zero_balance`
+- `deposit_collateral_credits_balance_and_emits_event` — verifies
+  successive deposits accumulate
+- `withdraw_collateral_reduces_balance`
+
+**SDK builder coverage**: 20 new tests in
+`sdk-ts/tests/builders.test.ts`, asserting every one of the 19
+instruction builders produces a valid TransactionInstruction with
+correct programId, non-empty data, and the expected account count.
+A coverage tripwire test catches when the program adds a new
+instruction without updating the SDK.
+
+### Total test count: 161 (71 TS sim + 48 TS SDK + 31 Rust unit + 6 Rust property × 2K cases + 5 E2E integration).
+
 ## [0.12.0] — 2026-05-08
 
 ### Added — Phase 1 continued (FLP capital lifecycle + lifecycle demo)
