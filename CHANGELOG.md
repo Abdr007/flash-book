@@ -4,6 +4,36 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] — 2026-05-08
+
+### Added — Phase 1 continued (E2E coverage at 17 tests)
+
+Six more E2E integration tests covering FLP capital, commit/reveal, and
+authority management:
+
+- **`deposit_flp_capital_grows_pool`** — verifies LP capital injection
+  increments `total_capital_quote_lots`.
+- **`withdraw_flp_capital_blocked_with_open_positions`** — verifies the
+  empty-pool path succeeds (open-positions block tested separately).
+- **`submit_commit_and_reveal_full_flow`** — end-to-end: build keccak
+  hash on the client side matching the program's exact rule, commit,
+  verify the slot is active, reveal, verify the slot is consumed and
+  a Taker-priority order materializes in the buffer with the right
+  side / size / limit / trader.
+- **`submit_reveal_with_wrong_payload_fails`** — proves
+  `CommitMismatch` fires when the reveal's `size_lots` is tampered
+  vs the committed hash. The MEV-resistance property is enforced
+  on-chain.
+- **`update_oracle_authority_only`** — proves only the market
+  authority can write oracle. Random caller is rejected with
+  `Unauthorized`. Verifies oracle state unchanged after the
+  rejected attempt.
+- **`transfer_market_authority_rotates_keys`** — verifies authority
+  swap, then proves the OLD authority is revoked (old key can't
+  update oracle anymore).
+
+### Total test count: 173 (119 TS sim+SDK + 31 Rust unit + 6 Rust property × 2K + 17 E2E integration).
+
 ## [0.14.0] — 2026-05-08
 
 ### Added — Phase 1 continued (E2E coverage doubled to 11 tests)

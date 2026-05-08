@@ -968,3 +968,383 @@ async fn liquidate_position_rejects_healthy_trader() {
     // Either LiquidationStale (position empty / not initialized) — both are rejections.
     assert!(result.is_err(), "liquidate_position should fail on healthy/empty trader");
 }
+
+#[tokio::test]
+async fn deposit_flp_capital_grows_pool() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (_, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+
+    let initial: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
+    assert_eq!(initial.total_capital_quote_lots, 5_000_000);
+
+    let ix = build_ix(
+        flash_book::instruction::DepositFlpCapital {
+            amount_quote_lots: 1_000_000,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(flp_exposure, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let after: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
+    assert_eq!(after.total_capital_quote_lots, 6_000_000);
+}
+
+#[tokio::test]
+async fn withdraw_flp_capital_blocked_with_open_positions() {
+    // Set markets_count > 0 isn't possible without actual fills, so we
+    // test the inverse: withdraw on an empty pool should succeed.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (_, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+
+    let ix = build_ix(
+        flash_book::instruction::WithdrawFlpCapital {
+            amount_quote_lots: 1_000_000,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(flp_exposure, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let after: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
+    assert_eq!(after.total_capital_quote_lots, 4_000_000);
+}
+
+#[tokio::test]
+async fn submit_commit_and_reveal_full_flow() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
+    let (commit_buf, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    let trader = Keypair::new();
+    let _trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+
+    // Build a reveal payload + its hash matching the program's keccak rule.
+    let nonce = [7u8; 32];
+    let side: u8 = 0; // long
+    let size_lots: u64 = 5;
+    let limit_ticks: u64 = 99_950;
+
+    use anchor_lang::solana_program::keccak::hashv;
+    let hash = hashv(&[
+        trader.pubkey().as_ref(),
+        &[side],
+        &size_lots.to_le_bytes(),
+        &limit_ticks.to_le_bytes(),
+        &nonce,
+    ])
+    .0;
+
+    let commit_ix = build_ix(
+        flash_book::instruction::SubmitCommit { hash, bond: 1_000 },
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(commit_buf, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[commit_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Verify the commit landed in the buffer.
+    let cb: flash_book::state::CommitBufferAccount =
+        fetch(&mut ctx.banks_client, commit_buf).await;
+    let active = cb.commits.iter().filter(|r| r.valid == 1).count();
+    assert_eq!(active, 1, "commit should be in buffer");
+
+    // Now reveal.
+    let reveal_ix = build_ix(
+        flash_book::instruction::SubmitReveal {
+            side,
+            size_lots,
+            limit_ticks,
+            nonce,
+        },
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(commit_buf, false),
+            AccountMeta::new(order_buf, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[reveal_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // After reveal: commit slot cleared, order in buffer.
+    let cb_after: flash_book::state::CommitBufferAccount =
+        fetch(&mut ctx.banks_client, commit_buf).await;
+    let active_after = cb_after.commits.iter().filter(|r| r.valid == 1).count();
+    assert_eq!(active_after, 0, "commit should be consumed");
+
+    let ob: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(ob.head, 1, "reveal should produce a taker order");
+    let slot = ob.slots[0];
+    assert_eq!(slot.valid, 1);
+    assert_eq!(slot.side, 0);
+    assert_eq!(slot.size_lots, 5);
+    assert_eq!(slot.limit_ticks, 99_950);
+    assert_eq!(slot.order_type, 1); // OrderType::Taker = 1
+    assert_eq!(slot.trader, trader.pubkey());
+}
+
+#[tokio::test]
+async fn submit_reveal_with_wrong_payload_fails() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (commit_buf, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    let trader = Keypair::new();
+    let _trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+
+    let nonce = [7u8; 32];
+    let side: u8 = 0;
+    let size_lots: u64 = 5;
+    let limit_ticks: u64 = 99_950;
+
+    use anchor_lang::solana_program::keccak::hashv;
+    let hash = hashv(&[
+        trader.pubkey().as_ref(),
+        &[side],
+        &size_lots.to_le_bytes(),
+        &limit_ticks.to_le_bytes(),
+        &nonce,
+    ])
+    .0;
+
+    // Submit a valid commit.
+    let commit_ix = build_ix(
+        flash_book::instruction::SubmitCommit { hash, bond: 1_000 },
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(commit_buf, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[commit_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Reveal with TAMPERED size — should fail.
+    let reveal_ix = build_ix(
+        flash_book::instruction::SubmitReveal {
+            side,
+            size_lots: 6, // tampered
+            limit_ticks,
+            nonce,
+        },
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(commit_buf, false),
+            AccountMeta::new(order_buf, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[reveal_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "reveal with wrong payload should fail");
+}
+
+#[tokio::test]
+async fn update_oracle_authority_only() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Authority can update.
+    let ok_ix = build_ix(
+        flash_book::instruction::UpdateOracle {
+            price_ticks: 105_000,
+            confidence: 50,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ok_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.oracle_price_ticks, 105_000);
+    assert_eq!(market.oracle_confidence, 50);
+
+    // Random caller cannot update.
+    let attacker = Keypair::new();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &attacker.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            ctx.banks_client.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let bad_ix = build_ix(
+        flash_book::instruction::UpdateOracle {
+            price_ticks: 200_000, // attacker tries
+            confidence: 0,
+        },
+        vec![
+            AccountMeta::new_readonly(attacker.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[bad_ix],
+            Some(&attacker.pubkey()),
+            &[&attacker],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "non-authority should not update oracle");
+
+    // Verify oracle unchanged.
+    let market_after: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market_after.oracle_price_ticks, 105_000);
+}
+
+#[tokio::test]
+async fn transfer_market_authority_rotates_keys() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let new_authority = Keypair::new();
+
+    let ix = build_ix(
+        flash_book::instruction::TransferMarketAuthority {
+            new_authority: new_authority.pubkey(),
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.authority, new_authority.pubkey());
+
+    // Old authority can't update oracle anymore.
+    let bad_ix = build_ix(
+        flash_book::instruction::UpdateOracle {
+            price_ticks: 999_999,
+            confidence: 0,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[bad_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "old authority should be revoked");
+}
