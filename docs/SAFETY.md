@@ -1,0 +1,122 @@
+# Safety
+
+This document is the threat model and invariant specification. It is the
+authoritative reference for what can and cannot go wrong.
+
+## Solvency invariants (always)
+
+These hold at every batch boundary:
+
+| # | Invariant | Where checked |
+|---|---|---|
+| S1 | All collateral, capital, fund balances are finite | `engine.checkInvariants()` |
+| S2 | Insurance fund balance ≥ 0 | `engine.checkInvariants()` |
+| S3 | No trader has negative collateral without an open position | `engine.checkInvariants()` |
+| S4 | Σ trader collateral + FLP capital + insurance fund + protocol reserve = Σ initial endowments + Σ realized proceeds − Σ realized payouts | property test |
+| S5 | OI_long = OI_short (recomputed from authoritative position state) | `recomputeOpenInterest()` |
+| S6 | No position has size ≤ 0 (positions of zero size are removed) | `applyFillToTrader` |
+| S7 | No position has entry price ≤ 0 | order intake guard |
+| S8 | Cumulative funding index is finite and monotonic in the absence of negative premiums | `advanceFundingIndex` |
+
+## Per-trade guards
+
+Every order is checked at intake:
+
+- Size > 0 and finite
+- Limit price > 0 and finite
+- For takers: trader has sufficient collateral for initial margin on the
+  combined post-trade portfolio
+- For new positions: insurance fund is above pause threshold
+
+## FLP pool safety
+
+The FLP pool's exposure is bounded:
+
+- **Per-batch growth cap:** the pool cannot grow its position by more than
+  `flp_max_growth_per_batch_pct · pool_capital` in any single batch.
+  Default 0.5%. Mathematical floor on the loss rate per unit time.
+- **Adaptive spread:** when VPIN spikes (toxic flow), the FLP spread widens
+  automatically; when pool utilization is high, spread widens more; when
+  realized vol spikes, spread widens more. The pool is never forced to
+  quote tighter than `s₀` (default 5 bps).
+- **Capacity gate:** if pool capital is exhausted, no virtual quotes are
+  emitted (orderbook reverts to MM-only liquidity).
+
+## Liquidation safety
+
+- **Single-batch resolution:** all liquidations triggered in a batch clear
+  at the same uniform price. Cascades that walk the book in sequence are
+  **mathematically impossible** because there's no sequence — all liquidation
+  orders enter the same Walrasian clear.
+- **Deterministic clearing price:** liquidation price = batch clearing price,
+  computed from joint demand-supply curves. No keeper race, no per-liquidator
+  MEV.
+- **Bankruptcy waterfall:** insurance → ADL. ADL fairness ranked by
+  profit/leverage so the most-leveraged-and-profitable positions absorb
+  shortfall first.
+
+## MEV / front-running
+
+| Threat | Mitigation |
+|---|---|
+| Sequencer reorders txs to extract value | FBA: clearing price is invariant to within-batch ordering. |
+| Sequencer observes taker intent before submission | Commit-reveal: hash hides side/size/limit until N+1 batch. |
+| Liquidation race by competing keepers | In-loop liquidations: keepers obsoleted; protocol auto-injects. |
+| Mark price manipulation via wash trades | Mark = TWAP of clearing prices, oracle-banded. Manipulator pays for every bp moved. |
+| Funding-tick sniping (flip flat just before/after tick) | Continuous per-block funding accrual eliminates the discontinuity. |
+| Pyth oracle manipulation upstream | Mark-oracle band (±1%) caps divergence; circuit-breaker on Pyth confidence interval. |
+| ADL gaming (stay just-not-most-profitable) | ADL ranking is deterministic from public state; gaming requires consistently underperforming. |
+| Self-trading to manipulate VPIN | Matcher rejects same-trader-on-both-sides pairings. |
+
+## ER fault recovery
+
+| Fault | Behaviour | Trader outcome |
+|---|---|---|
+| Sequencer halts mid-session | Periodic L1 commits (every K batches) preserve last known state. | Force-include reveal on L1 + wait for next session, OR settle at last-committed mark. |
+| Sequencer censors a specific reveal | Trader posts reveal directly to L1; matcher honors on next sync with original commit timestamp. | Same fill order, with delay. |
+| Network partition | ER pauses; commits resume on reconnect. | Positions held; no liquidation while paused. |
+| ER outage > timeout (1 h) | Auto-settle on L1 at **last-committed mark**, not current oracle. | Fair valuation; no flash-crash liquidation cascade. |
+| L1 reorg of an ER commit | ER state replays from previous commit; affected fills re-clear. | Identical outcome (FBA is deterministic). |
+
+## What this design does *not* protect against
+
+Honest about open problems and what's outside the protocol's scope:
+
+1. **Pyth oracle bug or compromise.** If Pyth itself reports a fundamentally
+   wrong price (e.g. publishers compromised), the mark-oracle band still
+   constrains mark within ±1% of the wrong price. Mitigation: governance
+   circuit-breaker can pause new positions if Pyth confidence interval
+   exceeds threshold; multi-oracle quorum (Pyth + Switchboard + on-chain
+   median) is a roadmap item.
+
+2. **Sequencer collusion with maker.** A sequencer that drops *only* its
+   colluder's reveals from the next batch can give the colluder a one-batch
+   information advantage on that side. Mitigation: sequencer accountability
+   bond + censorship-detection from gap-between-commit-and-reveal
+   statistics. Requires MagicBlock-side support.
+
+3. **Fundamental black-swan beyond stress lattice.** Our worst-case
+   scenario is ±30% (`black_swan_*`). A single-batch ±50% move could
+   bankrupt traders faster than the engine can resolve. Insurance fund
+   sized to 1% of OI buffers ~50σ of normal-market events; against
+   genuine fat-tail shocks, ADL is the backstop, and beyond ADL, socialized
+   loss to LPs is the residual exposure.
+
+4. **Smart-contract-level bugs in the deployed program.** This repository
+   is a TypeScript reference simulator. The production Rust program will
+   require independent audit before mainnet deployment. The reference
+   matcher is a behavioural specification for the audited program.
+
+## Audit checklist (for the eventual Rust program)
+
+- [ ] No floating-point arithmetic in matcher path; all integer lot/tick
+- [ ] Re-entrancy guards on every state-mutating instruction
+- [ ] Account ownership checks on every PDA
+- [ ] Signed-vs-unsigned arithmetic correctness in funding integration
+- [ ] Overflow protection on cumulative funding index over multi-year horizons
+- [ ] Per-trader rate limits on commit/reveal/limit submissions
+- [ ] Bond mechanics for orphaned commits (slashing, recoverability)
+- [ ] Fraud-proof challenge window for ER state commits
+- [ ] Force-include path tested under sequencer-down scenarios
+- [ ] Insurance fund cap to prevent over-collection (excess returns to LPs)
+- [ ] ADL randomization within tied profit-ratio brackets to prevent gaming
