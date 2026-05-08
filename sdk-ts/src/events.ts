@@ -51,6 +51,16 @@ export interface LiquidationInjectedEvent {
   worstScenarioIdx: number;
 }
 
+export interface FlpExposureInitializedEvent {
+  authority: PublicKey;
+  initialCapital: BN;
+}
+
+export interface FlpCapitalUpdatedEvent {
+  newTotal: BN;
+  delta: BN;
+}
+
 export interface FlpFillAppliedEvent {
   market: PublicKey;
   taker: PublicKey;
@@ -96,4 +106,6 @@ export type FlashBookEvent =
   | { name: 'FlpFillAppliedEvent'; data: FlpFillAppliedEvent }
   | { name: 'MarketStatusChangedEvent'; data: MarketStatusChangedEvent }
   | { name: 'MarketParamsUpdatedEvent'; data: MarketParamsUpdatedEvent }
-  | { name: 'MarketAuthorityTransferredEvent'; data: MarketAuthorityTransferredEvent };
+  | { name: 'MarketAuthorityTransferredEvent'; data: MarketAuthorityTransferredEvent }
+  | { name: 'FlpExposureInitializedEvent'; data: FlpExposureInitializedEvent }
+  | { name: 'FlpCapitalUpdatedEvent'; data: FlpCapitalUpdatedEvent };

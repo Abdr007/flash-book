@@ -83,6 +83,49 @@ export class FlashBookClient {
 
   // ─── Instruction builders ────────────────────────────────────────
 
+  initializeFlpExposureIx(
+    authority: PublicKey,
+    initialCapitalQuoteLots: bigint | number,
+  ): Promise<TransactionInstruction> {
+    const flp = this.flpExposure();
+    return this.methods
+      .initializeFlpExposure(initialCapitalQuoteLots)
+      .accountsPartial({
+        authority,
+        flpExposure: flp.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  depositFlpCapitalIx(
+    authority: PublicKey,
+    amountQuoteLots: bigint | number,
+  ): Promise<TransactionInstruction> {
+    const flp = this.flpExposure();
+    return this.methods
+      .depositFlpCapital(amountQuoteLots)
+      .accountsPartial({
+        authority,
+        flpExposure: flp.address,
+      })
+      .instruction();
+  }
+
+  withdrawFlpCapitalIx(
+    authority: PublicKey,
+    amountQuoteLots: bigint | number,
+  ): Promise<TransactionInstruction> {
+    const flp = this.flpExposure();
+    return this.methods
+      .withdrawFlpCapital(amountQuoteLots)
+      .accountsPartial({
+        authority,
+        flpExposure: flp.address,
+      })
+      .instruction();
+  }
+
   initializeInsuranceFundIx(
     authority: PublicKey,
     params: InsuranceFundInitParams,

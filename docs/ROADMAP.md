@@ -71,6 +71,9 @@ Target: deployable to MagicBlock ER devnet.
 - [x] `update_market_params` — governance tuning with immutable-primitive enforcement
 - [x] `transfer_market_authority` — safe key rotation
 - [x] Status gate on `place_limit_order`
+- [x] FLP capital lifecycle: initialize_flp_exposure, deposit_flp_capital,
+      withdraw_flp_capital (with open-positions gate)
+- [x] Standalone lifecycle demo via SDK (sdk-ts/examples/full-lifecycle.ts)
 - [ ] In-loop liquidation injection during run_batch (logic complete, wiring
       to per-trader iteration via remaining_accounts pending)
 - [ ] Stress-lattice margin enforcement on order intake

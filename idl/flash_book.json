@@ -425,6 +425,120 @@
       ]
     },
     {
+      "name": "deposit_flp_capital",
+      "docs": [
+        "LP deposits capital into the FLP pool. SPL transfer integration",
+        "is a follow-up; v1 increments the accounting balance."
+      ],
+      "discriminator": [
+        70,
+        218,
+        71,
+        194,
+        174,
+        10,
+        76,
+        200
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "flp_exposure",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "initialize_flp_exposure",
+      "docs": [
+        "Initialize the FLP exposure account (one per protocol). Must run",
+        "before `initialize_market`. Tracks the FLP pool's total capital",
+        "and per-market net positions."
+      ],
+      "discriminator": [
+        121,
+        107,
+        105,
+        186,
+        89,
+        116,
+        139,
+        93
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "flp_exposure",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "initial_capital_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "initialize_insurance_fund",
       "docs": [
         "Initialize an insurance fund (one per protocol)."
@@ -1775,6 +1889,61 @@
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "withdraw_flp_capital",
+      "docs": [
+        "LP withdraws capital from the FLP pool. Blocked if it would push",
+        "utilization past 100% (current gross exposure must remain ≤ new",
+        "capital)."
+      ],
+      "discriminator": [
+        207,
+        159,
+        140,
+        251,
+        10,
+        225,
+        149,
+        95
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "flp_exposure",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
     }
   ],
   "accounts": [
@@ -1921,6 +2090,32 @@
         101,
         33,
         208
+      ]
+    },
+    {
+      "name": "FlpCapitalUpdatedEvent",
+      "discriminator": [
+        156,
+        137,
+        139,
+        119,
+        17,
+        204,
+        2,
+        104
+      ]
+    },
+    {
+      "name": "FlpExposureInitializedEvent",
+      "discriminator": [
+        131,
+        165,
+        178,
+        53,
+        112,
+        238,
+        88,
+        149
       ]
     },
     {
@@ -2381,6 +2576,22 @@
       }
     },
     {
+      "name": "FlpCapitalUpdatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "new_total",
+            "type": "u64"
+          },
+          {
+            "name": "delta",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
       "name": "FlpExposureAccount",
       "docs": [
         "FLP pool exposure across markets. Single account; per-market sub-positions."
@@ -2420,6 +2631,22 @@
                 16
               ]
             }
+          }
+        ]
+      }
+    },
+    {
+      "name": "FlpExposureInitializedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "initial_capital",
+            "type": "u64"
           }
         ]
       }

@@ -110,6 +110,91 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Initialize the FLP exposure account (one per protocol). Must run
+    /// before `initialize_market`. Tracks the FLP pool's total capital
+    /// and per-market net positions.
+    pub fn initialize_flp_exposure(
+        ctx: Context<InitializeFlpExposure>,
+        initial_capital_quote_lots: u64,
+    ) -> Result<()> {
+        let flp = &mut ctx.accounts.flp_exposure;
+        flp.authority = ctx.accounts.authority.key();
+        flp.bump = ctx.bumps.flp_exposure;
+        flp.total_capital_quote_lots = initial_capital_quote_lots;
+        flp.realized_pnl = 0;
+        flp.markets_count = 0;
+        flp.per_market = [state::FlpMarketExposure::default(); 16];
+        // Mark every slot empty (side = 255 means "no entry").
+        for slot in flp.per_market.iter_mut() {
+            slot.side = 255;
+        }
+        emit!(FlpExposureInitializedEvent {
+            authority: flp.authority,
+            initial_capital: initial_capital_quote_lots,
+        });
+        Ok(())
+    }
+
+    /// LP deposits capital into the FLP pool. SPL transfer integration
+    /// is a follow-up; v1 increments the accounting balance.
+    pub fn deposit_flp_capital(
+        ctx: Context<UpdateFlpCapital>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        let flp = &mut ctx.accounts.flp_exposure;
+        require_keys_eq!(
+            flp.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+        flp.total_capital_quote_lots = flp
+            .total_capital_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        emit!(FlpCapitalUpdatedEvent {
+            new_total: flp.total_capital_quote_lots,
+            delta: amount_quote_lots as i64,
+        });
+        Ok(())
+    }
+
+    /// LP withdraws capital from the FLP pool. Blocked if it would push
+    /// utilization past 100% (current gross exposure must remain ≤ new
+    /// capital).
+    pub fn withdraw_flp_capital(
+        ctx: Context<UpdateFlpCapital>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        let flp = &mut ctx.accounts.flp_exposure;
+        require_keys_eq!(
+            flp.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+        let new_total = flp
+            .total_capital_quote_lots
+            .checked_sub(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        // Capital must always strictly exceed gross exposure so the pool
+        // can absorb a max-shock loss without going insolvent.
+        // Gross exposure is the sum of |size × entry_price × tick_size|.
+        // For v1 we approximate against zero (open positions block
+        // withdrawals); a Phase 2 instruction takes remaining_accounts to
+        // verify against actual market mark prices.
+        require!(
+            flp.markets_count == 0,
+            FlashBookError::InsufficientCollateral
+        );
+        flp.total_capital_quote_lots = new_total;
+        emit!(FlpCapitalUpdatedEvent {
+            new_total,
+            delta: -(amount_quote_lots as i64),
+        });
+        Ok(())
+    }
+
     /// Initialize an insurance fund (one per protocol).
     pub fn initialize_insurance_fund(
         ctx: Context<InitializeInsuranceFund>,
@@ -1061,6 +1146,32 @@ pub struct InitializeMarket<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializeFlpExposure<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        init,
+        payer = authority,
+        space = FlpExposureAccount::space(),
+        seeds = [FlpExposureAccount::SEED],
+        bump,
+    )]
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateFlpCapital<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
+    )]
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+}
+
+#[derive(Accounts)]
 pub struct InitializeInsuranceFund<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -1394,6 +1505,18 @@ pub struct CollateralWithdrawnEvent {
     pub trader: Pubkey,
     pub amount: u64,
     pub new_balance: u64,
+}
+
+#[event]
+pub struct FlpExposureInitializedEvent {
+    pub authority: Pubkey,
+    pub initial_capital: u64,
+}
+
+#[event]
+pub struct FlpCapitalUpdatedEvent {
+    pub new_total: u64,
+    pub delta: i64,
 }
 
 #[event]

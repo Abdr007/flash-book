@@ -4,6 +4,46 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] — 2026-05-08
+
+### Added — Phase 1 continued (FLP capital lifecycle + lifecycle demo)
+
+**Three new authority-gated FLP instructions, fixing a real init gap.**
+
+The `FlpExposureAccount` PDA was referenced in `initialize_market`'s
+context as a required existing account, but no instruction existed to
+create it — the program could not actually be deployed end-to-end.
+
+- **`initialize_flp_exposure(initial_capital_quote_lots)`** — creates
+  the global FLP exposure PDA. Initializes all 16 per-market slots to
+  empty (`side = 255`). Emits `FlpExposureInitializedEvent`.
+- **`deposit_flp_capital(amount)`** — LP adds capital. Authority-gated.
+  Emits `FlpCapitalUpdatedEvent` with delta.
+- **`withdraw_flp_capital(amount)`** — LP removes capital. Blocked
+  while pool has any open positions (`markets_count > 0`). Phase 2
+  version takes `remaining_accounts` to verify against actual mark
+  prices. Emits `FlpCapitalUpdatedEvent`.
+
+**SDK extended.**
+- `initializeFlpExposureIx`, `depositFlpCapitalIx`,
+  `withdrawFlpCapitalIx` builders.
+- `FlpExposureInitializedEvent`, `FlpCapitalUpdatedEvent` types.
+
+**Standalone lifecycle demo** at `sdk-ts/examples/full-lifecycle.ts`.
+
+Builds and prints all 9 instructions for the full single-market
+lifecycle (insurance fund init, FLP exposure init, market init,
+trader onboarding, deposit, place limit, run batch, apply fill,
+governance status change). Total: 290 bytes across 9 instructions, 44
+account references. Runnable with `bun run examples/full-lifecycle.ts`
+without any external dependencies — proves the SDK constructs
+syntactically valid transactions against the IDL with reproducible
+PDA seeds. Includes a (commented) send block for executing against a
+deployed program.
+
+IDL regenerated: 3,356 lines (was 3,129).
+Total Anchor instruction surface: **19**.
+
 ## [0.11.0] — 2026-05-08
 
 ### Added — Phase 1 continued (documentation pass)

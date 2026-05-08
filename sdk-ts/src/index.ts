@@ -41,6 +41,8 @@ export type {
   MarketStatusChangedEvent,
   MarketParamsUpdatedEvent,
   MarketAuthorityTransferredEvent,
+  FlpExposureInitializedEvent,
+  FlpCapitalUpdatedEvent,
   FlashBookEvent,
 } from './events.ts';
 export { MarketStatus } from './events.ts';
