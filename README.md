@@ -155,6 +155,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the long-form design.
 - [`docs/SAFETY.md`](docs/SAFETY.md) — 14 solvency invariants, threat model, audit checklist
 - [`docs/COMPARISON.md`](docs/COMPARISON.md) — vs every modern perp DEX
 - [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — runbook from `cargo test` to devnet
+- [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md) — single-source-of-truth status
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — staged path to mainnet
 
 ## Layout
