@@ -4,6 +4,56 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] — 2026-05-08
+
+### Added — Phase 1 polish (matcher::risk property tests + integer-math findings)
+
+`programs/flash-book/tests/proptest_risk.rs` — 7 property tests for
+the stress-lattice maintenance margin engine, each running 2,000
+random cases (= 14,000 fuzz assertions on top of the 12K from the
+FBA matcher):
+
+1. **`required_margin_non_negative`** — for any portfolio shape.
+2. **`monotonic_in_collateral`** — more collateral never makes you
+   less healthy. Asserts `equity_diff == delta` (exact linearity)
+   AND `a.healthy ⇒ b.healthy` (healthy is preserved by extra
+   collateral).
+3. **`hedge_at_fair_value_reduces_required_margin`** — at mark = entry,
+   long+short same market always reduces required margin.
+4. **`is_healthy_consistent_with_equity_required`** — `is_healthy ↔
+   equity ≥ required` (definitional invariant).
+5. **`empty_portfolio_zero_required`** — zero positions ⇒ required = 0
+   ⇒ healthy ⇒ equity = collateral.
+6. **`worst_scenario_idx_within_bounds`** — index always valid.
+7. **`approximately_linear_scaling_in_position_size`** — doubling all
+   sizes ≈ doubles required margin (with tolerance for integer
+   truncation in per-scenario arithmetic).
+
+### Real findings from the property tests
+
+The proptest run found two **mathematical edge cases** worth documenting:
+
+1. **Hedge does NOT always reduce required margin** — only at fair
+   value (mark ≈ entry). When a long is deep in the money, adding
+   a hedge "trades" the favorable directional component for double
+   maintenance margin overhead. This is correct behavior; the
+   property test now constrains mark = entry to capture the clean
+   case.
+
+2. **Linear scaling has integer-truncation drift** — doubling size
+   doesn't always exactly double required margin because the
+   maintenance margin term truncates differently across scenarios
+   at size N vs 2N. Drift is bounded by ~26 (1 unit per scenario
+   per term × 13 scenarios × 2 terms). Property test asserts
+   approximate linearity with a generous tolerance.
+
+These are not bugs — they're correct behaviors of integer arithmetic
+on a stress lattice. But they're surprising, and the property tests
+now document them for any future engineer reading the code.
+
+### Total fuzz assertions: 26,000 (12K FBA + 14K risk).
+### Total test count: 216 (152 TS sim+SDK + 31 Rust unit + 13 Rust property × 2K cases + 20 E2E integration).
+
 ## [0.21.0] — 2026-05-08
 
 ### Security audit pass — zero panic paths in production code
