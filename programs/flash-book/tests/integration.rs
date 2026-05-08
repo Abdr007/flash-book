@@ -217,6 +217,38 @@ async fn create_token_account(
     acct.pubkey()
 }
 
+/// Derive the canonical Associated Token Account address for (owner, mint).
+fn ata_for(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    spl_associated_token_account::get_associated_token_address(owner, mint)
+}
+
+/// Create the canonical ATA for (owner, mint) via the Associated Token
+/// Account program. Idempotent: succeeds even if the ATA already exists.
+async fn create_ata(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    owner: Pubkey,
+    mint: Pubkey,
+) -> Pubkey {
+    let ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+        &payer.pubkey(),
+        &owner,
+        &mint,
+        &spl_token::id(),
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    ata_for(&owner, &mint)
+}
+
 /// Mint `amount` tokens to `dest` (assumes payer is mint authority).
 async fn mint_tokens(
     ctx: &mut solana_program_test::ProgramTestContext,
@@ -493,8 +525,8 @@ async fn setup_trader(
         .unwrap();
 
     if deposit_amount > 0 {
-        let trader_ata =
-            create_token_account(ctx, payer, protocol.quote_mint, trader.pubkey()).await;
+        // Real ATA path: derive the canonical ATA, create it, mint USDC.
+        let trader_ata = create_ata(ctx, payer, trader.pubkey(), protocol.quote_mint).await;
         mint_tokens(ctx, payer, protocol.quote_mint, trader_ata, deposit_amount).await;
 
         let deposit_ix = build_ix(
@@ -505,6 +537,7 @@ async fn setup_trader(
                 AccountMeta::new_readonly(trader.pubkey(), true),
                 AccountMeta::new(trader_state, false),
                 AccountMeta::new_readonly(protocol.insurance_fund, false),
+                AccountMeta::new_readonly(protocol.quote_mint, false),
                 AccountMeta::new(trader_ata, false),
                 AccountMeta::new(protocol.quote_vault, false),
                 AccountMeta::new_readonly(spl_token::id(), false),
@@ -662,10 +695,10 @@ async fn deposit_collateral_credits_balance_and_emits_event() {
         <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&vault_after_first.data).unwrap();
     assert_eq!(vault_first.amount, 50_000);
 
-    // Second deposit: fresh trader-owned token account, mint, deposit.
-    let trader_ata2 =
-        create_token_account(&mut ctx, &payer, protocol.quote_mint, trader.pubkey()).await;
-    mint_tokens(&mut ctx, &payer, protocol.quote_mint, trader_ata2, 25_000).await;
+    // Second deposit reuses the canonical ATA (idempotent — already created by
+    // the first deposit via setup_trader). Mint additional tokens and deposit.
+    let trader_ata = ata_for(&trader.pubkey(), &protocol.quote_mint);
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, trader_ata, 25_000).await;
 
     let deposit_ix2 = build_ix(
         flash_book::instruction::DepositCollateral {
@@ -675,7 +708,8 @@ async fn deposit_collateral_credits_balance_and_emits_event() {
             AccountMeta::new_readonly(trader.pubkey(), true),
             AccountMeta::new(trader_state, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
-            AccountMeta::new(trader_ata2, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(trader_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
@@ -715,11 +749,9 @@ async fn withdraw_collateral_reduces_balance() {
     let protocol = setup_protocol(&mut ctx, &payer).await;
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 100_000, &protocol).await;
 
-    // Re-derive the trader's ATA used by setup_trader. setup_trader creates a
-    // throwaway keypair-owned token account; for withdraw we need a destination
-    // ATA — create a fresh one owned by the trader.
-    let trader_dest_ata =
-        create_token_account(&mut ctx, &payer, protocol.quote_mint, trader.pubkey()).await;
+    // Reuse the canonical ATA created by setup_trader for the withdraw
+    // destination. After the deposit it should be empty (all tokens in vault).
+    let trader_ata = ata_for(&trader.pubkey(), &protocol.quote_mint);
 
     let withdraw_ix = build_ix(
         flash_book::instruction::WithdrawCollateral {
@@ -729,7 +761,8 @@ async fn withdraw_collateral_reduces_balance() {
             AccountMeta::new_readonly(trader.pubkey(), true),
             AccountMeta::new(trader_state, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
-            AccountMeta::new(trader_dest_ata, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(trader_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
@@ -759,10 +792,10 @@ async fn withdraw_collateral_reduces_balance() {
         <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&vault_after.data).unwrap();
     assert_eq!(vault_state.amount, 70_000);
 
-    // Trader's destination ATA should hold the withdrawn 30_000.
+    // Trader's ATA should hold the withdrawn 30_000.
     let dest_after = ctx
         .banks_client
-        .get_account(trader_dest_ata)
+        .get_account(trader_ata)
         .await
         .unwrap()
         .unwrap();
@@ -1147,8 +1180,8 @@ async fn deposit_flp_capital_grows_pool() {
         fetch(&mut ctx.banks_client, protocol.flp_exposure).await;
     assert_eq!(initial.total_capital_quote_lots, 5_000_000);
 
-    // LP needs a USDC ATA with enough tokens to deposit.
-    let lp_ata = create_token_account(&mut ctx, &payer, protocol.quote_mint, payer.pubkey()).await;
+    // LP uses their canonical ATA for the quote mint.
+    let lp_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
     mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp_ata, 1_000_000).await;
 
     let ix = build_ix(
@@ -1159,6 +1192,7 @@ async fn deposit_flp_capital_grows_pool() {
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(protocol.flp_exposure, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
             AccountMeta::new_readonly(spl_token::id(), false),
@@ -1204,7 +1238,7 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
 
     // Pre-fund the vault so withdraw has tokens to take. The simplest path is
     // to deposit first via the SPL deposit_flp_capital instruction itself.
-    let lp_ata = create_token_account(&mut ctx, &payer, protocol.quote_mint, payer.pubkey()).await;
+    let lp_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
     mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp_ata, 1_000_000).await;
     let dep_ix = build_ix(
         flash_book::instruction::DepositFlpCapital {
@@ -1214,6 +1248,7 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(protocol.flp_exposure, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
             AccountMeta::new_readonly(spl_token::id(), false),
@@ -1238,6 +1273,7 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(protocol.flp_exposure, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
             AccountMeta::new_readonly(spl_token::id(), false),

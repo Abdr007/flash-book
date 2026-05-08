@@ -86,11 +86,11 @@ describe('Instruction builders', () => {
     const ix = await client.depositCollateralIx({
       trader: Keypair.generate().publicKey,
       amount: new BN(1_000),
-      traderQuoteAta: Keypair.generate().publicKey,
+      quoteMint: Keypair.generate().publicKey,
       quoteVault: Keypair.generate().publicKey,
     });
-    // trader, trader_state, insurance_fund, trader_quote_ata, quote_vault, token_program
-    expect(ix.keys.length).toBe(6);
+    // trader, trader_state, insurance_fund, quote_mint, trader_quote_ata, quote_vault, token_program
+    expect(ix.keys.length).toBe(7);
   });
 
   test('withdrawCollateralIx', async () => {
@@ -98,10 +98,10 @@ describe('Instruction builders', () => {
     const ix = await client.withdrawCollateralIx({
       trader: Keypair.generate().publicKey,
       amount: new BN(500),
-      traderQuoteAta: Keypair.generate().publicKey,
+      quoteMint: Keypair.generate().publicKey,
       quoteVault: Keypair.generate().publicKey,
     });
-    expect(ix.keys.length).toBe(6);
+    expect(ix.keys.length).toBe(7);
   });
 
   test('depositFlpCapitalIx', async () => {
@@ -109,11 +109,11 @@ describe('Instruction builders', () => {
     const ix = await client.depositFlpCapitalIx({
       authority: Keypair.generate().publicKey,
       amountQuoteLots: new BN(1_000_000),
-      authorityQuoteAta: Keypair.generate().publicKey,
+      quoteMint: Keypair.generate().publicKey,
       quoteVault: Keypair.generate().publicKey,
     });
-    // authority, flp, insurance_fund, authority_quote_ata, quote_vault, token_program
-    expect(ix.keys.length).toBe(6);
+    // authority, flp, insurance_fund, quote_mint, authority_quote_ata, quote_vault, token_program
+    expect(ix.keys.length).toBe(7);
   });
 
   test('withdrawFlpCapitalIx', async () => {
@@ -121,10 +121,10 @@ describe('Instruction builders', () => {
     const ix = await client.withdrawFlpCapitalIx({
       authority: Keypair.generate().publicKey,
       amountQuoteLots: new BN(500_000),
-      authorityQuoteAta: Keypair.generate().publicKey,
+      quoteMint: Keypair.generate().publicKey,
       quoteVault: Keypair.generate().publicKey,
     });
-    expect(ix.keys.length).toBe(6);
+    expect(ix.keys.length).toBe(7);
   });
 
   // ─── Order intake (3) ──────────────────────────────────────────────

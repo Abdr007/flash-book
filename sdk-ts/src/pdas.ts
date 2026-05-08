@@ -16,6 +16,30 @@ export const FLASH_BOOK_PROGRAM_ID = new PublicKey(
   'FBookV1111111111111111111111111111111111111',
 );
 
+export const TOKEN_PROGRAM_ID = new PublicKey(
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+);
+
+export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+);
+
+/// Derive the canonical Associated Token Account address for (owner, mint).
+/// Equivalent to `getAssociatedTokenAddressSync` from `@solana/spl-token`,
+/// inlined to avoid pulling that package as a runtime dependency.
+export function associatedTokenAddress(
+  owner: PublicKey,
+  mint: PublicKey,
+  tokenProgramId: PublicKey = TOKEN_PROGRAM_ID,
+  associatedTokenProgramId: PublicKey = ASSOCIATED_TOKEN_PROGRAM_ID,
+): PublicKey {
+  const [address] = PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), tokenProgramId.toBuffer(), mint.toBuffer()],
+    associatedTokenProgramId,
+  );
+  return address;
+}
+
 const MARKET_SEED = Buffer.from('market');
 const ORDER_BUFFER_SEED = Buffer.from('order_buffer');
 const COMMIT_BUFFER_SEED = Buffer.from('commit_buffer');

@@ -12,6 +12,7 @@
 #![allow(unexpected_cfgs)]
 
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::{self, AssociatedToken};
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 pub mod constants;
@@ -1745,11 +1746,15 @@ pub struct UpdateFlpCapital<'info> {
     )]
     pub insurance_fund: Account<'info, InsuranceFundAccount>,
 
-    /// LP's USDC ATA — source on deposit, destination on withdraw.
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// LP's USDC ATA — source on deposit, destination on withdraw. Must be
+    /// the canonical associated token account for (authority, quote_mint).
     #[account(
         mut,
-        token::mint = insurance_fund.quote_mint,
-        token::authority = authority,
+        associated_token::mint = quote_mint,
+        associated_token::authority = authority,
     )]
     pub authority_quote_ata: Account<'info, TokenAccount>,
 
@@ -1957,11 +1962,17 @@ pub struct DepositCollateral<'info> {
     )]
     pub insurance_fund: Account<'info, InsuranceFundAccount>,
 
-    /// Trader's USDC ATA — authority must be `trader`, mint must match.
+    /// Quote mint (typically USDC). Required so `associated_token` can derive
+    /// the canonical ATA address for validation.
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// Trader's USDC ATA — must be the canonical associated token account
+    /// for (trader, quote_mint). Anchor validates the address derivation.
     #[account(
         mut,
-        token::mint = insurance_fund.quote_mint,
-        token::authority = trader,
+        associated_token::mint = quote_mint,
+        associated_token::authority = trader,
     )]
     pub trader_quote_ata: Account<'info, TokenAccount>,
 
@@ -1995,10 +2006,13 @@ pub struct WithdrawCollateral<'info> {
     )]
     pub insurance_fund: Account<'info, InsuranceFundAccount>,
 
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
     #[account(
         mut,
-        token::mint = insurance_fund.quote_mint,
-        token::authority = trader,
+        associated_token::mint = quote_mint,
+        associated_token::authority = trader,
     )]
     pub trader_quote_ata: Account<'info, TokenAccount>,
 

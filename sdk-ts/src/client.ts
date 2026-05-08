@@ -22,6 +22,7 @@ import {
 } from '@solana/web3.js';
 import idlJson from '../idl.json' assert { type: 'json' };
 import {
+  associatedTokenAddress,
   commitBufferPda,
   flpExposurePda,
   insuranceFundPda,
@@ -30,16 +31,12 @@ import {
   positionPda,
   traderStatePda,
   FLASH_BOOK_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
 } from './pdas.ts';
 import type { InsuranceFundInitParams, MarketParamsRaw } from './params.ts';
 
 export const IDL = idlJson as unknown as Idl;
-
-/// SPL Token program ID. Hardcoded to avoid a runtime dependency on
-/// `@solana/spl-token` for a single constant.
-export const TOKEN_PROGRAM_ID = new PublicKey(
-  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-);
+export { TOKEN_PROGRAM_ID, associatedTokenAddress };
 
 interface MethodsBuilder {
   accountsPartial: (accounts: Record<string, PublicKey>) => MethodsBuilder;
@@ -113,18 +110,22 @@ export class FlashBookClient {
   depositFlpCapitalIx(args: {
     authority: PublicKey;
     amountQuoteLots: bigint | number;
-    authorityQuoteAta: PublicKey;
+    quoteMint: PublicKey;
     quoteVault: PublicKey;
+    /** Optional override; defaults to the canonical ATA for (authority, quoteMint). */
+    authorityQuoteAta?: PublicKey;
   }): Promise<TransactionInstruction> {
     const flp = this.flpExposure();
     const fund = this.insuranceFund();
+    const ata = args.authorityQuoteAta ?? associatedTokenAddress(args.authority, args.quoteMint);
     return this.methods
       .depositFlpCapital(args.amountQuoteLots)
       .accountsPartial({
         authority: args.authority,
         flpExposure: flp.address,
         insuranceFund: fund.address,
-        authorityQuoteAta: args.authorityQuoteAta,
+        quoteMint: args.quoteMint,
+        authorityQuoteAta: ata,
         quoteVault: args.quoteVault,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
@@ -134,18 +135,21 @@ export class FlashBookClient {
   withdrawFlpCapitalIx(args: {
     authority: PublicKey;
     amountQuoteLots: bigint | number;
-    authorityQuoteAta: PublicKey;
+    quoteMint: PublicKey;
     quoteVault: PublicKey;
+    authorityQuoteAta?: PublicKey;
   }): Promise<TransactionInstruction> {
     const flp = this.flpExposure();
     const fund = this.insuranceFund();
+    const ata = args.authorityQuoteAta ?? associatedTokenAddress(args.authority, args.quoteMint);
     return this.methods
       .withdrawFlpCapital(args.amountQuoteLots)
       .accountsPartial({
         authority: args.authority,
         flpExposure: flp.address,
         insuranceFund: fund.address,
-        authorityQuoteAta: args.authorityQuoteAta,
+        quoteMint: args.quoteMint,
+        authorityQuoteAta: ata,
         quoteVault: args.quoteVault,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
@@ -228,18 +232,22 @@ export class FlashBookClient {
   depositCollateralIx(args: {
     trader: PublicKey;
     amount: bigint | number;
-    traderQuoteAta: PublicKey;
+    quoteMint: PublicKey;
     quoteVault: PublicKey;
+    /** Optional override; defaults to the canonical ATA for (trader, quoteMint). */
+    traderQuoteAta?: PublicKey;
   }): Promise<TransactionInstruction> {
     const state = this.traderState(args.trader);
     const fund = this.insuranceFund();
+    const ata = args.traderQuoteAta ?? associatedTokenAddress(args.trader, args.quoteMint);
     return this.methods
       .depositCollateral(args.amount)
       .accountsPartial({
         trader: args.trader,
         traderState: state.address,
         insuranceFund: fund.address,
-        traderQuoteAta: args.traderQuoteAta,
+        quoteMint: args.quoteMint,
+        traderQuoteAta: ata,
         quoteVault: args.quoteVault,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
@@ -249,18 +257,21 @@ export class FlashBookClient {
   withdrawCollateralIx(args: {
     trader: PublicKey;
     amount: bigint | number;
-    traderQuoteAta: PublicKey;
+    quoteMint: PublicKey;
     quoteVault: PublicKey;
+    traderQuoteAta?: PublicKey;
   }): Promise<TransactionInstruction> {
     const state = this.traderState(args.trader);
     const fund = this.insuranceFund();
+    const ata = args.traderQuoteAta ?? associatedTokenAddress(args.trader, args.quoteMint);
     return this.methods
       .withdrawCollateral(args.amount)
       .accountsPartial({
         trader: args.trader,
         traderState: state.address,
         insuranceFund: fund.address,
-        traderQuoteAta: args.traderQuoteAta,
+        quoteMint: args.quoteMint,
+        traderQuoteAta: ata,
         quoteVault: args.quoteVault,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
