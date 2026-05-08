@@ -4,6 +4,42 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-05-08
+
+### Added — Phase 1 continued (governance + circuit breaker)
+
+Three new authority-gated instructions completing the operational surface:
+
+- **`set_market_status(new_status)`** — circuit breaker. Status enum:
+  Inactive(0) / Active(1) / PostOnly(2) / Paused(3) / Closed(4).
+  Closed is terminal; cannot be reopened. Emits `MarketStatusChangedEvent`.
+- **`update_market_params(new_params)`** — governance parameter tuning.
+  Enforces immutability of measurement primitives (`tick_size`,
+  `base_lot_size`, `quote_lot_size`, `min_base_lots` — changing these
+  would silently invalidate every existing order and position). All
+  other fields (fees, margins, FLP coefficients, funding rates, oracle
+  band, VPIN, batch interval) can be retuned. Sanity bounds enforced
+  on the mutable fields. Emits `MarketParamsUpdatedEvent`.
+- **`transfer_market_authority(new_authority)`** — for safe key
+  rotation. Emits `MarketAuthorityTransferredEvent`.
+
+Wire-up:
+- `place_limit_order` now gates by status: blocked unless market is
+  Active or PostOnly. (Liquidation, fills, and run_batch remain
+  available in any status so positions can be closed during pause.)
+
+SDK extended:
+- `setMarketStatusIx`, `updateMarketParamsIx`,
+  `transferMarketAuthorityIx`, `updateOracleIx` builders.
+- `MarketStatus` enum re-exported.
+- Three new event type definitions.
+
+IDL regenerated: 3,129 lines (was 2,848).
+
+The Anchor program now exposes 16 instructions covering the full
+production lifecycle: setup, lifecycle, order intake, batch execution,
+settlement, liquidation, and governance.
+
 ## [0.9.0] — 2026-05-08
 
 ### Added — Phase 1 continued (FLP fill bookkeeping + stress-lattice gate)

@@ -1237,6 +1237,68 @@
       ]
     },
     {
+      "name": "set_market_status",
+      "docs": [
+        "Update market status (authority-only).",
+        "",
+        "Status transitions:",
+        "Active → PostOnly: existing positions trade; new takers blocked",
+        "Active → Paused:   no order intake; existing positions held",
+        "Any → Closed:      terminal sunset; only liquidation + close"
+      ],
+      "discriminator": [
+        101,
+        175,
+        83,
+        107,
+        200,
+        141,
+        155,
+        182
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "new_status",
+          "type": "u8"
+        }
+      ]
+    },
+    {
       "name": "submit_commit",
       "docs": [
         "Submit a commit hash for a future taker reveal."
@@ -1460,6 +1522,134 @@
               "u8",
               32
             ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "transfer_market_authority",
+      "docs": [
+        "Update a trader's authority (e.g. for wallet rotation). Either the",
+        "current authority OR the trader signs."
+      ],
+      "discriminator": [
+        178,
+        89,
+        112,
+        182,
+        253,
+        69,
+        166,
+        127
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "new_authority",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "update_market_params",
+      "docs": [
+        "Update mutable market parameters (authority-only).",
+        "",
+        "Immutable fields (set at initialization, NEVER mutable post-init):",
+        "- tick_size, base_lot_size, quote_lot_size, min_base_lots",
+        "These define the market's measurement primitives. Changing them",
+        "would silently invalidate every existing order and position.",
+        "",
+        "Mutable: everything else — fees, margins, FLP coefficients, funding",
+        "rates, oracle band, VPIN, batch interval. Changes are applied to the",
+        "next batch."
+      ],
+      "discriminator": [
+        70,
+        117,
+        202,
+        191,
+        205,
+        174,
+        92,
+        82
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "new_params",
+          "type": {
+            "defined": {
+              "name": "MarketParams"
+            }
           }
         }
       ]
@@ -1760,6 +1950,19 @@
       ]
     },
     {
+      "name": "MarketAuthorityTransferredEvent",
+      "discriminator": [
+        19,
+        141,
+        235,
+        21,
+        103,
+        67,
+        82,
+        66
+      ]
+    },
+    {
       "name": "MarketInitializedEvent",
       "discriminator": [
         70,
@@ -1770,6 +1973,32 @@
         143,
         45,
         25
+      ]
+    },
+    {
+      "name": "MarketParamsUpdatedEvent",
+      "discriminator": [
+        159,
+        73,
+        27,
+        179,
+        194,
+        219,
+        7,
+        230
+      ]
+    },
+    {
+      "name": "MarketStatusChangedEvent",
+      "discriminator": [
+        189,
+        57,
+        199,
+        130,
+        179,
+        34,
+        39,
+        53
       ]
     }
   ],
@@ -2464,6 +2693,26 @@
       }
     },
     {
+      "name": "MarketAuthorityTransferredEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "new_authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
       "name": "MarketInitializedEvent",
       "type": {
         "kind": "struct",
@@ -2603,6 +2852,38 @@
           {
             "name": "batch_interval_ms",
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketParamsUpdatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketStatusChangedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_status",
+            "type": "u8"
+          },
+          {
+            "name": "new_status",
+            "type": "u8"
           }
         ]
       }

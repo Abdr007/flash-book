@@ -38,5 +38,9 @@ export type {
   FillAppliedEvent,
   FlpFillAppliedEvent,
   LiquidationInjectedEvent,
+  MarketStatusChangedEvent,
+  MarketParamsUpdatedEvent,
+  MarketAuthorityTransferredEvent,
   FlashBookEvent,
 } from './events.ts';
+export { MarketStatus } from './events.ts';

@@ -266,6 +266,63 @@ export class FlashBookClient {
       .instruction();
   }
 
+  setMarketStatusIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    newStatus: number;
+  }): Promise<TransactionInstruction> {
+    return this.methods
+      .setMarketStatus(args.newStatus)
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+      })
+      .instruction();
+  }
+
+  updateMarketParamsIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    newParams: MarketParamsRaw;
+  }): Promise<TransactionInstruction> {
+    return this.methods
+      .updateMarketParams(args.newParams)
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+      })
+      .instruction();
+  }
+
+  transferMarketAuthorityIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    newAuthority: PublicKey;
+  }): Promise<TransactionInstruction> {
+    return this.methods
+      .transferMarketAuthority(args.newAuthority)
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+      })
+      .instruction();
+  }
+
+  updateOracleIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    priceTicks: bigint | number;
+    confidence: bigint | number;
+  }): Promise<TransactionInstruction> {
+    return this.methods
+      .updateOracle(args.priceTicks, args.confidence)
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+      })
+      .instruction();
+  }
+
   liquidatePositionIx(args: {
     caller: PublicKey;
     market: PublicKey;

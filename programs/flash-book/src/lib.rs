@@ -304,6 +304,121 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Update market status (authority-only).
+    ///
+    /// Status transitions:
+    ///   Active → PostOnly: existing positions trade; new takers blocked
+    ///   Active → Paused:   no order intake; existing positions held
+    ///   Any → Closed:      terminal sunset; only liquidation + close
+    pub fn set_market_status(
+        ctx: Context<UpdateMarketAuthority>,
+        new_status: u8,
+    ) -> Result<()> {
+        require!(new_status <= 4, FlashBookError::OutOfRange);
+        let market = &mut ctx.accounts.market;
+        require_keys_eq!(
+            market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+        // Closed is terminal — cannot reopen.
+        require!(
+            market.status != MarketStatus::Closed as u8,
+            FlashBookError::OutOfRange
+        );
+        let prev = market.status;
+        market.status = new_status;
+        emit!(MarketStatusChangedEvent {
+            market: market.key(),
+            previous_status: prev,
+            new_status,
+        });
+        Ok(())
+    }
+
+    /// Update mutable market parameters (authority-only).
+    ///
+    /// Immutable fields (set at initialization, NEVER mutable post-init):
+    ///   - tick_size, base_lot_size, quote_lot_size, min_base_lots
+    ///   These define the market's measurement primitives. Changing them
+    ///   would silently invalidate every existing order and position.
+    ///
+    /// Mutable: everything else — fees, margins, FLP coefficients, funding
+    /// rates, oracle band, VPIN, batch interval. Changes are applied to the
+    /// next batch.
+    pub fn update_market_params(
+        ctx: Context<UpdateMarketAuthority>,
+        new_params: MarketParams,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        require_keys_eq!(
+            market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+
+        // Enforce immutability of measurement primitives.
+        require!(
+            new_params.tick_size == market.params.tick_size,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.base_lot_size == market.params.base_lot_size,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.quote_lot_size == market.params.quote_lot_size,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.min_base_lots == market.params.min_base_lots,
+            FlashBookError::OutOfRange
+        );
+
+        // Sanity bounds on the mutable fields.
+        require!(new_params.max_leverage >= 1, FlashBookError::OutOfRange);
+        require!(
+            new_params.maintenance_margin_ratio_bps <= new_params.initial_margin_ratio_bps,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.flp_max_growth_per_batch_bps <= constants::BPS_DENOM,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.oracle_band_bps <= constants::BPS_DENOM,
+            FlashBookError::OutOfRange
+        );
+
+        market.params = new_params;
+        emit!(MarketParamsUpdatedEvent {
+            market: market.key(),
+        });
+        Ok(())
+    }
+
+    /// Update a trader's authority (e.g. for wallet rotation). Either the
+    /// current authority OR the trader signs.
+    pub fn transfer_market_authority(
+        ctx: Context<UpdateMarketAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        require_keys_eq!(
+            market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+        let prev = market.authority;
+        market.authority = new_authority;
+        emit!(MarketAuthorityTransferredEvent {
+            market: market.key(),
+            previous_authority: prev,
+            new_authority,
+        });
+        Ok(())
+    }
+
     // ─── Order intake ───────────────────────────────────────────────
 
     /// Submit a resting limit order. Routed to the order buffer for the
@@ -320,6 +435,15 @@ pub mod flash_book {
         require!(side <= 1, FlashBookError::OutOfRange);
 
         let market = &ctx.accounts.market;
+        // Status gate: limit orders are blocked when the market is Paused
+        // or Closed. PostOnly status allows new limits (they rest until
+        // crossing) but the taker-flow path (commit/reveal) is gated
+        // separately.
+        require!(
+            market.status == MarketStatus::Active as u8
+                || market.status == MarketStatus::PostOnly as u8,
+            FlashBookError::OutOfRange
+        );
         require!(
             size_lots >= market.params.min_base_lots,
             FlashBookError::SizeBelowMinLot
@@ -978,6 +1102,17 @@ pub struct UpdateOracle<'info> {
 }
 
 #[derive(Accounts)]
+pub struct UpdateMarketAuthority<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+}
+
+#[derive(Accounts)]
 pub struct PlaceOrder<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
@@ -1259,6 +1394,25 @@ pub struct CollateralWithdrawnEvent {
     pub trader: Pubkey,
     pub amount: u64,
     pub new_balance: u64,
+}
+
+#[event]
+pub struct MarketStatusChangedEvent {
+    pub market: Pubkey,
+    pub previous_status: u8,
+    pub new_status: u8,
+}
+
+#[event]
+pub struct MarketParamsUpdatedEvent {
+    pub market: Pubkey,
+}
+
+#[event]
+pub struct MarketAuthorityTransferredEvent {
+    pub market: Pubkey,
+    pub previous_authority: Pubkey,
+    pub new_authority: Pubkey,
 }
 
 #[event]

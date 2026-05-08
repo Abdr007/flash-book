@@ -67,6 +67,10 @@ Target: deployable to MagicBlock ER devnet.
 - [x] Stress-lattice margin gate on order intake
       (rejects new orders that would push trader into liquidation)
 - [x] FLP per-market position lifecycle (open / add / reduce / flip / close)
+- [x] `set_market_status` — circuit breaker (Active/PostOnly/Paused/Closed)
+- [x] `update_market_params` — governance tuning with immutable-primitive enforcement
+- [x] `transfer_market_authority` — safe key rotation
+- [x] Status gate on `place_limit_order`
 - [ ] In-loop liquidation injection during run_batch (logic complete, wiring
       to per-trader iteration via remaining_accounts pending)
 - [ ] Stress-lattice margin enforcement on order intake
