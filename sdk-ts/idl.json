@@ -1,0 +1,2389 @@
+{
+  "address": "FBookV1111111111111111111111111111111111111",
+  "metadata": {
+    "name": "flash_book",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Flash Book — pool-backed CLOB matched by FBA on MagicBlock ER."
+  },
+  "instructions": [
+    {
+      "name": "apply_fill",
+      "docs": [
+        "Apply a single fill against the taker's and maker's Position PDAs.",
+        "Called by the sequencer after `run_batch` for each emitted Fill,",
+        "or by an off-chain bookkeeper that batches multiple fills per tx.",
+        "",
+        "Trust model: `sequencer` is the same authority as `run_batch`; the",
+        "fill data is taken at face value (production version verifies via",
+        "per-batch fill buffer or Merkle proof)."
+      ],
+      "discriminator": [
+        201,
+        39,
+        90,
+        111,
+        97,
+        71,
+        105,
+        6
+      ],
+      "accounts": [
+        {
+          "name": "sequencer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "taker_trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "taker_trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "maker_trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "maker_trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "taker_position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "taker_trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "maker_position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "maker_trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "price_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "taker_side",
+          "type": "u8"
+        }
+      ]
+    },
+    {
+      "name": "deposit_collateral",
+      "docs": [
+        "Deposit collateral into the trader's state. SPL token transfer is",
+        "done in a follow-up (this instruction credits the trader's accounting",
+        "balance; production wiring also moves USDC into the protocol vault",
+        "via SPL CPI)."
+      ],
+      "discriminator": [
+        156,
+        131,
+        142,
+        116,
+        146,
+        247,
+        162,
+        120
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "initialize_insurance_fund",
+      "docs": [
+        "Initialize an insurance fund (one per protocol)."
+      ],
+      "discriminator": [
+        2,
+        239,
+        39,
+        87,
+        50,
+        28,
+        108,
+        12
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "insurance_fund",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "fee_contribution_bps",
+          "type": "u32"
+        },
+        {
+          "name": "toxicity_tax_contribution_bps",
+          "type": "u32"
+        },
+        {
+          "name": "liq_penalty_contribution_bps",
+          "type": "u32"
+        },
+        {
+          "name": "pause_threshold_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "initialize_market",
+      "docs": [
+        "Initialize a new market and all associated PDAs."
+      ],
+      "discriminator": [
+        35,
+        35,
+        189,
+        193,
+        155,
+        48,
+        170,
+        203
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "base_mint"
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "base_vault"
+        },
+        {
+          "name": "quote_vault"
+        },
+        {
+          "name": "oracle_account"
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "base_mint"
+              },
+              {
+                "kind": "account",
+                "path": "quote_mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "commit_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "MarketParams"
+            }
+          }
+        },
+        {
+          "name": "initial_oracle_ticks",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "open_trader_state",
+      "docs": [
+        "Initialize per-trader state."
+      ],
+      "discriminator": [
+        155,
+        147,
+        104,
+        198,
+        190,
+        54,
+        127,
+        101
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "place_limit_order",
+      "docs": [
+        "Submit a resting limit order. Routed to the order buffer for the",
+        "next batch."
+      ],
+      "discriminator": [
+        108,
+        176,
+        33,
+        186,
+        146,
+        229,
+        1,
+        197
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "post_only",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "run_batch",
+      "docs": [
+        "Run one batch: advance funding, generate FLP quotes, clear FBA,",
+        "update mark, sweep expired commits. Position updates are emitted as",
+        "an event for the off-chain bookkeeper or for `apply_fill` to consume."
+      ],
+      "discriminator": [
+        252,
+        221,
+        85,
+        107,
+        31,
+        61,
+        26,
+        213
+      ],
+      "accounts": [
+        {
+          "name": "sequencer",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "commit_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "now_ms",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "submit_commit",
+      "docs": [
+        "Submit a commit hash for a future taker reveal."
+      ],
+      "discriminator": [
+        213,
+        213,
+        149,
+        72,
+        230,
+        14,
+        23,
+        16
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "commit_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "bond",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "submit_reveal",
+      "docs": [
+        "Reveal a previously committed taker order. The matcher checks the",
+        "hash and synthesizes a taker order in the next batch."
+      ],
+      "discriminator": [
+        255,
+        153,
+        68,
+        56,
+        227,
+        55,
+        19,
+        157
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "commit_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "nonce",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "update_oracle",
+      "docs": [
+        "Update oracle price (authority-only). In production this is replaced",
+        "by a Pyth read in `run_batch`."
+      ],
+      "discriminator": [
+        112,
+        41,
+        209,
+        18,
+        248,
+        226,
+        252,
+        188
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "price_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "confidence",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "withdraw_collateral",
+      "docs": [
+        "Withdraw collateral. Blocked if it would push the trader below",
+        "initial-margin requirement on any open position. (For v1 we approximate",
+        "by checking against `open_positions == 0`; production wiring iterates",
+        "open Position PDAs via remaining_accounts.)"
+      ],
+      "discriminator": [
+        115,
+        135,
+        168,
+        106,
+        139,
+        214,
+        138,
+        150
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "CommitBufferAccount",
+      "discriminator": [
+        35,
+        117,
+        115,
+        207,
+        75,
+        203,
+        49,
+        127
+      ]
+    },
+    {
+      "name": "FlpExposureAccount",
+      "discriminator": [
+        156,
+        44,
+        150,
+        232,
+        149,
+        158,
+        70,
+        56
+      ]
+    },
+    {
+      "name": "InsuranceFundAccount",
+      "discriminator": [
+        207,
+        17,
+        68,
+        223,
+        65,
+        72,
+        98,
+        52
+      ]
+    },
+    {
+      "name": "MarketAccount",
+      "discriminator": [
+        201,
+        78,
+        187,
+        225,
+        240,
+        198,
+        201,
+        251
+      ]
+    },
+    {
+      "name": "OrderBufferAccount",
+      "discriminator": [
+        57,
+        46,
+        2,
+        49,
+        10,
+        168,
+        125,
+        100
+      ]
+    },
+    {
+      "name": "PositionAccount",
+      "discriminator": [
+        60,
+        125,
+        250,
+        193,
+        181,
+        109,
+        238,
+        86
+      ]
+    },
+    {
+      "name": "TraderStateAccount",
+      "discriminator": [
+        80,
+        247,
+        115,
+        47,
+        164,
+        154,
+        243,
+        127
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "BatchClearedEvent",
+      "discriminator": [
+        194,
+        149,
+        85,
+        248,
+        69,
+        49,
+        117,
+        214
+      ]
+    },
+    {
+      "name": "CollateralDepositedEvent",
+      "discriminator": [
+        76,
+        214,
+        14,
+        34,
+        152,
+        143,
+        196,
+        5
+      ]
+    },
+    {
+      "name": "CollateralWithdrawnEvent",
+      "discriminator": [
+        213,
+        133,
+        147,
+        44,
+        32,
+        59,
+        29,
+        112
+      ]
+    },
+    {
+      "name": "FillAppliedEvent",
+      "discriminator": [
+        138,
+        68,
+        3,
+        173,
+        240,
+        101,
+        33,
+        208
+      ]
+    },
+    {
+      "name": "MarketInitializedEvent",
+      "discriminator": [
+        70,
+        173,
+        96,
+        202,
+        100,
+        143,
+        45,
+        25
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 7000,
+      "name": "ArithmeticOverflow",
+      "msg": "Arithmetic overflow"
+    },
+    {
+      "code": 7001,
+      "name": "ArithmeticUnderflow",
+      "msg": "Arithmetic underflow"
+    },
+    {
+      "code": 7002,
+      "name": "DivisionByZero",
+      "msg": "Division by zero"
+    },
+    {
+      "code": 7003,
+      "name": "OutOfRange",
+      "msg": "Value out of range"
+    },
+    {
+      "code": 7004,
+      "name": "NonFinite",
+      "msg": "Non-finite value"
+    },
+    {
+      "code": 7100,
+      "name": "Unauthorized",
+      "msg": "Caller is not the market authority"
+    },
+    {
+      "code": 7101,
+      "name": "AlreadyInitialized",
+      "msg": "Account already initialized"
+    },
+    {
+      "code": 7102,
+      "name": "NotInitialized",
+      "msg": "Account not initialized"
+    },
+    {
+      "code": 7103,
+      "name": "WrongMarket",
+      "msg": "Wrong market for this operation"
+    },
+    {
+      "code": 7104,
+      "name": "WrongTrader",
+      "msg": "Wrong trader account"
+    },
+    {
+      "code": 7105,
+      "name": "StaleVersion",
+      "msg": "Stale account version"
+    },
+    {
+      "code": 7200,
+      "name": "SizeBelowMinLot",
+      "msg": "Order size below market minimum lot"
+    },
+    {
+      "code": 7201,
+      "name": "PriceNotOnTick",
+      "msg": "Limit price not aligned to tick size"
+    },
+    {
+      "code": 7202,
+      "name": "ZeroSize",
+      "msg": "Order size is zero"
+    },
+    {
+      "code": 7203,
+      "name": "ZeroPrice",
+      "msg": "Order limit price is zero"
+    },
+    {
+      "code": 7204,
+      "name": "InsufficientCollateral",
+      "msg": "Insufficient collateral for initial margin"
+    },
+    {
+      "code": 7205,
+      "name": "NewPositionsPaused",
+      "msg": "New positions paused — insurance fund below threshold"
+    },
+    {
+      "code": 7206,
+      "name": "LeverageExceeded",
+      "msg": "Order rejected: leverage exceeds market max"
+    },
+    {
+      "code": 7207,
+      "name": "PostOnlyCross",
+      "msg": "Post-only order would have crossed the book"
+    },
+    {
+      "code": 7208,
+      "name": "RateLimited",
+      "msg": "Per-batch order rate limit exceeded"
+    },
+    {
+      "code": 7300,
+      "name": "BufferFull",
+      "msg": "Order book buffer at capacity"
+    },
+    {
+      "code": 7301,
+      "name": "SelfTrade",
+      "msg": "Self-trade prevented"
+    },
+    {
+      "code": 7302,
+      "name": "EmptyBatch",
+      "msg": "No matchable volume in this batch"
+    },
+    {
+      "code": 7303,
+      "name": "MarkOutsideBand",
+      "msg": "Mark price drifted outside oracle band"
+    },
+    {
+      "code": 7400,
+      "name": "TraderLiquidatable",
+      "msg": "Trader is liquidatable; cannot place new opening orders"
+    },
+    {
+      "code": 7401,
+      "name": "TooManyScenarios",
+      "msg": "Stress-lattice scenario count exceeds compute budget"
+    },
+    {
+      "code": 7402,
+      "name": "LiquidationStale",
+      "msg": "Liquidation injection failed: position already closed"
+    },
+    {
+      "code": 7500,
+      "name": "InsuranceBelowFloor",
+      "msg": "Insurance fund balance below threshold"
+    },
+    {
+      "code": 7501,
+      "name": "InsuranceExhausted",
+      "msg": "Insurance fund cannot cover bankruptcy; ADL needed"
+    },
+    {
+      "code": 7600,
+      "name": "CommitMismatch",
+      "msg": "Commit hash does not match revealed payload"
+    },
+    {
+      "code": 7601,
+      "name": "CommitExpired",
+      "msg": "Commit has expired"
+    },
+    {
+      "code": 7602,
+      "name": "CommitDuplicate",
+      "msg": "Duplicate commit hash"
+    },
+    {
+      "code": 7603,
+      "name": "CommitBondRequired",
+      "msg": "Commit bond required"
+    },
+    {
+      "code": 7700,
+      "name": "NotDelegated",
+      "msg": "Account not delegated to ER; instruction must run on L1"
+    },
+    {
+      "code": 7701,
+      "name": "AlreadyDelegated",
+      "msg": "Account already delegated to ER"
+    },
+    {
+      "code": 7702,
+      "name": "DelegationExpired",
+      "msg": "Delegation expired"
+    },
+    {
+      "code": 7703,
+      "name": "ForceIncludeUnsupported",
+      "msg": "Force-include from L1 not yet supported in this build"
+    }
+  ],
+  "types": [
+    {
+      "name": "BatchClearedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "batch_num",
+            "type": "u64"
+          },
+          {
+            "name": "clearing_price",
+            "type": "u64"
+          },
+          {
+            "name": "clearing_volume",
+            "type": "u64"
+          },
+          {
+            "name": "fill_count",
+            "type": "u32"
+          },
+          {
+            "name": "funding_rate_bps_per_sec",
+            "type": "i64"
+          },
+          {
+            "name": "seized_bonds",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CollateralDepositedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "new_balance",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CollateralWithdrawnEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "new_balance",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CommitBufferAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "head",
+            "type": "u32"
+          },
+          {
+            "name": "commits",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "CommitRow"
+                  }
+                },
+                256
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "CommitRow",
+      "docs": [
+        "Commit-reveal entry. Stored as a row in a per-market commit table."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "bond",
+            "type": "u64"
+          },
+          {
+            "name": "committed_at_batch",
+            "type": "u64"
+          },
+          {
+            "name": "expire_at_batch",
+            "type": "u64"
+          },
+          {
+            "name": "valid",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FillAppliedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "maker",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker_side",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "batch_num",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FlpExposureAccount",
+      "docs": [
+        "FLP pool exposure across markets. Single account; per-market sub-positions."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "total_capital_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "realized_pnl",
+            "type": "i64"
+          },
+          {
+            "name": "markets_count",
+            "type": "u8"
+          },
+          {
+            "name": "per_market",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "FlpMarketExposure"
+                  }
+                },
+                16
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "FlpMarketExposure",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "entry_price_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "InsuranceFundAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "balance_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "fee_contribution_bps",
+            "type": "u32"
+          },
+          {
+            "name": "toxicity_tax_contribution_bps",
+            "type": "u32"
+          },
+          {
+            "name": "liq_penalty_contribution_bps",
+            "type": "u32"
+          },
+          {
+            "name": "pause_threshold_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "total_contributions",
+            "type": "u64"
+          },
+          {
+            "name": "total_payouts",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketAccount",
+      "docs": [
+        "Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "flp_pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "base_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "quote_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "base_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "quote_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "oracle_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "insurance_fund",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "status",
+            "type": "u8"
+          },
+          {
+            "name": "current_batch",
+            "type": "u64"
+          },
+          {
+            "name": "last_batch_ms",
+            "type": "u64"
+          },
+          {
+            "name": "oracle_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "oracle_confidence",
+            "type": "u64"
+          },
+          {
+            "name": "mark_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "cum_funding_index",
+            "type": "i128"
+          },
+          {
+            "name": "last_funding_rate_bps_per_sec",
+            "type": "i64"
+          },
+          {
+            "name": "vpin",
+            "type": {
+              "defined": {
+                "name": "VpinState"
+              }
+            }
+          },
+          {
+            "name": "oi_long_lots",
+            "type": "u64"
+          },
+          {
+            "name": "oi_short_lots",
+            "type": "u64"
+          },
+          {
+            "name": "recent_clearing_prices",
+            "type": {
+              "array": [
+                "u64",
+                16
+              ]
+            }
+          },
+          {
+            "name": "recent_clearing_count",
+            "type": "u8"
+          },
+          {
+            "name": "total_fees_collected",
+            "type": "u64"
+          },
+          {
+            "name": "total_toxicity_tax_collected",
+            "type": "u64"
+          },
+          {
+            "name": "total_liquidations",
+            "type": "u64"
+          },
+          {
+            "name": "params",
+            "type": {
+              "defined": {
+                "name": "MarketParams"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketInitializedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "initial_oracle_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketParams",
+      "docs": [
+        "Per-market parameters. Set at market initialization, updated only via",
+        "governance. Mirrors `MarketParams` from the TypeScript reference."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "tick_size",
+            "type": "u64"
+          },
+          {
+            "name": "base_lot_size",
+            "type": "u64"
+          },
+          {
+            "name": "quote_lot_size",
+            "type": "u64"
+          },
+          {
+            "name": "min_base_lots",
+            "type": "u64"
+          },
+          {
+            "name": "taker_fee_bps",
+            "type": "u32"
+          },
+          {
+            "name": "maker_rebate_bps",
+            "type": "u32"
+          },
+          {
+            "name": "toxicity_tax_max_bps",
+            "type": "u32"
+          },
+          {
+            "name": "liq_penalty_bps",
+            "type": "u32"
+          },
+          {
+            "name": "maintenance_margin_ratio_bps",
+            "type": "u32"
+          },
+          {
+            "name": "initial_margin_ratio_bps",
+            "type": "u32"
+          },
+          {
+            "name": "max_leverage",
+            "type": "u32"
+          },
+          {
+            "name": "funding_rate_max_bps_per_sec",
+            "type": "u32"
+          },
+          {
+            "name": "funding_rate_k_bps",
+            "type": "u32"
+          },
+          {
+            "name": "oracle_band_bps",
+            "type": "u32"
+          },
+          {
+            "name": "flp_spread_base_bps",
+            "type": "u32"
+          },
+          {
+            "name": "flp_spread_alpha_bps",
+            "type": "u32"
+          },
+          {
+            "name": "flp_spread_beta_bps",
+            "type": "u32"
+          },
+          {
+            "name": "flp_spread_gamma_bps",
+            "type": "u32"
+          },
+          {
+            "name": "flp_spread_kappa_bps",
+            "type": "u32"
+          },
+          {
+            "name": "flp_spread_delta_bps",
+            "type": "u32"
+          },
+          {
+            "name": "flp_inventory_lambda_bps",
+            "type": "u32"
+          },
+          {
+            "name": "flp_depth_floor_lots",
+            "type": "u64"
+          },
+          {
+            "name": "flp_max_growth_per_batch_bps",
+            "type": "u32"
+          },
+          {
+            "name": "flp_quote_levels",
+            "type": "u8"
+          },
+          {
+            "name": "vpin_bucket_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "vpin_ema_window",
+            "type": "u32"
+          },
+          {
+            "name": "twap_window",
+            "type": "u8"
+          },
+          {
+            "name": "batch_interval_ms",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderBufferAccount",
+      "docs": [
+        "Per-market order buffer: pending limit + revealed-taker orders for the",
+        "next `run_batch`. Cleared after each batch."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "head",
+            "docs": [
+              "Number of valid orders in `slots[..head]`."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "seq_counter",
+            "docs": [
+              "Monotonic sequence counter for FIFO ordering within a batch."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "slots",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "OrderSlot"
+                  }
+                },
+                64
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderSlot",
+      "docs": [
+        "Compact on-chain order representation. Mirrors `matcher::order::Order`",
+        "in the same fields but stored as a flat struct for Borsh serialization."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "valid",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "order_type",
+            "type": "u8"
+          },
+          {
+            "name": "post_only",
+            "type": "u8"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "id",
+            "type": "u64"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "limit_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PositionAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "entry_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "collateral_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "cum_funding_index_at_entry",
+            "type": "i128"
+          },
+          {
+            "name": "realized_pnl_quote_lots",
+            "type": "i64"
+          },
+          {
+            "name": "funding_paid_quote_lots",
+            "type": "i64"
+          },
+          {
+            "name": "last_settlement_batch",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TraderStateAccount",
+      "docs": [
+        "Per-trader state. Holds collateral, last-settled funding marker, and",
+        "position-list pointers (Position PDAs are separate accounts; this is",
+        "a lightweight index)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "collateral_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "realized_pnl_quote_lots",
+            "type": "i64"
+          },
+          {
+            "name": "open_positions",
+            "docs": [
+              "Number of open positions (each in its own Position PDA)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "toxicity_score_bps",
+            "docs": [
+              "Toxicity score in bps; updated post-fill. Used for taker-fee tier."
+            ],
+            "type": "i32"
+          },
+          {
+            "name": "orders_this_batch",
+            "docs": [
+              "Per-batch order count (rate limit)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "last_batch_seen",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VpinState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "buy_pending",
+            "docs": [
+              "Pending buy volume in current open bucket."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "sell_pending",
+            "docs": [
+              "Pending sell volume in current open bucket."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "buckets_observed",
+            "docs": [
+              "Number of buckets observed so far."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "value_q32_32",
+            "docs": [
+              "Q32.32 fixed-point VPIN value (0 = balanced, FIXED_ONE = max imbalance)."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    }
+  ]
+}

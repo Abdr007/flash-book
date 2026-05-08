@@ -4,6 +4,32 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-05-08
+
+### Added — Phase 1 continued (TypeScript SDK)
+
+New package `@flash-book/sdk` at `sdk-ts/`. Wraps the Anchor program
+for downstream TypeScript clients (e.g. `flash-mobile`).
+
+- **PDA derivation helpers**: `marketPda`, `orderBufferPda`,
+  `commitBufferPda`, `insuranceFundPda`, `flpExposurePda`,
+  `traderStatePda`, `positionPda`.
+- **Typed parameters**: `MarketParamsRaw`, `InsuranceFundInitParams`,
+  with `defaultMajorMarketParams()` / `defaultInsuranceFundParams()`
+  calibrated to the Rust program's defaults.
+- **`FlashBookClient`** — Anchor `Program<Idl>` wrapper with one
+  `*Ix()` builder per program instruction (10 builders covering the
+  full instruction surface: initializeInsuranceFund, initializeMarket,
+  openTraderState, depositCollateral, withdrawCollateral,
+  placeLimitOrder, submitCommit, submitReveal, runBatch, applyFill).
+- **Event type definitions** matching Anchor `#[event]` shapes
+  (BatchCleared, FillApplied, MarketInitialized, etc).
+- **`FlashBookErrorCode` enum** + `errorFamily()` / `errorName()`
+  helpers for client-side error classification.
+- IDL bundled at `sdk-ts/idl.json` (sourced from `idl/flash_book.json`).
+
+Strict TypeScript with `exactOptionalPropertyTypes`, `verbatimModuleSyntax`.
+
 ## [0.6.0] — 2026-05-08
 
 ### Added — Phase 1 continued (audit pass + IDL + advanced market making)
