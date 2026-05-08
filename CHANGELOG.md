@@ -4,6 +4,36 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] — 2026-05-08
+
+### Added — Phase 1 continued (SDK risk preview + event subscription)
+
+**`sdk-ts/src/risk-preview.ts`** — off-chain port of the on-chain
+stress-lattice margin assessment.
+
+- `previewPortfolioRisk(positions, markets, collateral)` — predicts
+  liquidation BEFORE submitting. Returns `{ collateral, unrealizedPnl,
+  equity, required, isHealthy, worstScenario, healthRatio }`. The
+  `healthRatio` field gives a clean "% to liquidation" indicator for UIs.
+- `defaultScenarios(markets)` — generates the same 13-scenario lattice
+  as `default_scenarios()` in `programs/flash-book/src/matcher/risk.rs`
+  (flat + 8 single-market shocks + 2 correlated + 2 black-swan).
+- `initialMarginRequired(size, price, market)` — pre-trade IM check.
+- 12 tests including hedge-recognition and corner cases.
+
+This unlocks three downstream consumers:
+- **Liquidation bots** can decide "is this trader actually liquidatable"
+  client-side before paying for a tx that the matcher would reject.
+- **UIs** can render "you're at X% to liquidation" in real time.
+- **Backtests** can replay historical state without re-running the
+  full Anchor program.
+
+**`sdk-ts/src/event-stream.ts`** — `subscribeToProgramEvents(connection,
+callback)` wraps `logsSubscribe` + `decodeEventsFromLogs` so callers
+get typed `FlashBookEvent`s with slot + signature, no log parsing.
+
+### Total test count: 193 (139 TS sim+SDK + 31 Rust unit + 6 Rust property × 2K + 17 E2E integration).
+
 ## [0.16.0] — 2026-05-08
 
 ### Added — Phase 1 continued (SDK becomes a full read+write client)

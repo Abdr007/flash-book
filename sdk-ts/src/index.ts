@@ -54,6 +54,16 @@ export {
   type EventStreamCallback,
 } from './event-decoder.ts';
 
+export { subscribeToProgramEvents } from './event-stream.ts';
+
+export {
+  defaultScenarios,
+  previewPortfolioRisk,
+  initialMarginRequired,
+  type StressScenario,
+  type RiskPreview,
+} from './risk-preview.ts';
+
 export {
   FlashBookErrorCode,
   errorFamily,
