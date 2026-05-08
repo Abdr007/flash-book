@@ -25,6 +25,36 @@ export {
 } from './client.ts';
 
 export {
+  fetchMarket,
+  fetchOrderBuffer,
+  fetchCommitBuffer,
+  fetchInsuranceFund,
+  fetchFlpExposure,
+  fetchTraderState,
+  fetchPosition,
+  decodeAccount,
+  type MarketAccount,
+  type OrderBufferAccount,
+  type CommitBufferAccount,
+  type InsuranceFundAccount,
+  type FlpExposureAccount,
+  type TraderStateAccount,
+  type PositionAccount,
+  type OrderSlot,
+  type CommitRow,
+  type FlpMarketExposure,
+  type VpinState,
+  type MarketParamsAccount,
+} from './accounts.ts';
+
+export {
+  decodeEventsFromLogs,
+  decodeOne,
+  type EventSubscription,
+  type EventStreamCallback,
+} from './event-decoder.ts';
+
+export {
   FlashBookErrorCode,
   errorFamily,
   errorName,

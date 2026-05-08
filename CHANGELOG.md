@@ -4,6 +4,47 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] — 2026-05-08
+
+### Added — Phase 1 continued (SDK becomes a full read+write client)
+
+The SDK was previously write-only — only instruction builders. Now it's
+a complete client with typed account readers + event decoders.
+
+**`sdk-ts/src/accounts.ts`** — typed fetchers + decoders for all 7
+on-chain account types:
+
+- `fetchMarket`, `fetchOrderBuffer`, `fetchCommitBuffer`,
+  `fetchInsuranceFund`, `fetchFlpExposure`, `fetchTraderState`,
+  `fetchPosition` — each returns `T | null` via Anchor's
+  `fetchNullable`.
+- `decodeAccount<T>(name, data)` — for raw buffers from
+  `getProgramAccounts` / RPC subscriptions / snapshots. Backed by
+  `BorshAccountsCoder`.
+- Full TypeScript shape definitions mirroring `programs/flash-book/src/state.rs`:
+  `MarketAccount`, `OrderBufferAccount`, `CommitBufferAccount`,
+  `InsuranceFundAccount`, `FlpExposureAccount`, `TraderStateAccount`,
+  `PositionAccount`, plus nested types `OrderSlot`, `CommitRow`,
+  `FlpMarketExposure`, `VpinState`, `MarketParamsAccount`.
+
+**`sdk-ts/src/event-decoder.ts`** — event log decoder using
+`BorshEventCoder`:
+
+- `decodeEventsFromLogs(logs)` — pass a transaction's `logMessages`,
+  get a typed array of `FlashBookEvent`s in emission order.
+- `decodeOne(line)` — single-line decoder; returns `null` for
+  non-program-data lines or malformed payloads.
+- `EventSubscription` / `EventStreamCallback` types for the
+  `logsSubscribe` integration path.
+
+This is the canonical path for indexers, off-chain monitors, the
+risk engine bot, and the front-end — anyone who needs to read program
+state or react to events.
+
+**8 new SDK tests** covering decoder error paths.
+
+### Total test count: 181 (127 TS sim+SDK + 31 Rust unit + 6 Rust property × 2K + 17 E2E integration).
+
 ## [0.15.0] — 2026-05-08
 
 ### Added — Phase 1 continued (E2E coverage at 17 tests)
