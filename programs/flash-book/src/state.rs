@@ -8,6 +8,7 @@
 
 use crate::constants::{
     MARK_HISTORY_LEN, MAX_FLP_QUOTE_LEVELS, MAX_ORDERS_PER_BATCH, MAX_POSITIONS_PER_TRADER,
+    ORDER_BUFFER_CAP,
 };
 use crate::matcher::funding::FundingIndex;
 use crate::matcher::lot::{BaseLots, Bps, Ticks};
@@ -195,6 +196,70 @@ impl CommitBufferAccount {
     pub const SEED: &'static [u8] = b"commit_buffer";
     pub fn space() -> usize {
         8 + 32 + 1 + 4 + (256 * (32 + 32 + 8 + 8 + 8 + 1))
+    }
+}
+
+/// Per-market order buffer: pending limit + revealed-taker orders for the
+/// next `run_batch`. Cleared after each batch.
+#[account]
+#[derive(Debug)]
+pub struct OrderBufferAccount {
+    pub market: Pubkey,
+    pub bump: u8,
+    /// Number of valid orders in `slots[..head]`.
+    pub head: u32,
+    /// Monotonic sequence counter for FIFO ordering within a batch.
+    pub seq_counter: u64,
+    pub slots: [OrderSlot; ORDER_BUFFER_CAP],
+}
+
+/// Compact on-chain order representation. Mirrors `matcher::order::Order`
+/// in the same fields but stored as a flat struct for Borsh serialization.
+#[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize, Default)]
+pub struct OrderSlot {
+    pub valid: u8,            // 0 = empty, 1 = active
+    pub side: u8,             // 0 long, 1 short
+    pub order_type: u8,       // 0 limit, 1 taker, 2 flp_virtual, 3 liq, 4 adl
+    pub post_only: u8,        // 0 / 1
+    pub seq: u64,
+    pub id: u64,
+    pub trader: Pubkey,
+    pub size_lots: u64,
+    pub limit_ticks: u64,
+}
+
+impl OrderBufferAccount {
+    pub const SEED: &'static [u8] = b"order_buffer";
+    pub fn space() -> usize {
+        // 8 disc + 32 market + 1 bump + 4 head + 8 seq + (CAP × 4+8+8+32+8+8+1+1+1+1) padding-tolerant
+        // OrderSlot: 1+1+1+1 + 8 + 8 + 32 + 8 + 8 = 68 bytes (Borsh; padding-free).
+        8 + 32 + 1 + 4 + 8 + (ORDER_BUFFER_CAP * 68)
+    }
+}
+
+/// Per-trader state. Holds collateral, last-settled funding marker, and
+/// position-list pointers (Position PDAs are separate accounts; this is
+/// a lightweight index).
+#[account]
+#[derive(Debug)]
+pub struct TraderStateAccount {
+    pub trader: Pubkey,
+    pub bump: u8,
+    pub collateral_quote_lots: u64,
+    pub realized_pnl_quote_lots: i64,
+    /// Number of open positions (each in its own Position PDA).
+    pub open_positions: u8,
+    /// Toxicity score in bps; updated post-fill. Used for taker-fee tier.
+    pub toxicity_score_bps: i32,
+    /// Per-batch order count (rate limit).
+    pub orders_this_batch: u32,
+    pub last_batch_seen: u64,
+}
+
+impl TraderStateAccount {
+    pub const SEED: &'static [u8] = b"trader_state";
+    pub fn space() -> usize {
+        8 + 32 + 1 + 8 + 8 + 1 + 4 + 4 + 8 + 8
     }
 }
 

@@ -22,6 +22,10 @@ pub const MAX_FLP_QUOTE_LEVELS: usize = 16;
 /// Maximum orders processed per batch (compute-budget bounded).
 pub const MAX_ORDERS_PER_BATCH: usize = 256;
 
+/// In-program order buffer capacity (per market, per pending batch).
+/// Sized to fit in a regular Anchor account (≤ 10 KB).
+pub const ORDER_BUFFER_CAP: usize = 64;
+
 /// Maximum recent clearing prices retained for TWAP / volatility.
 pub const MARK_HISTORY_LEN: usize = 16;
 

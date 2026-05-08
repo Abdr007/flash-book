@@ -4,6 +4,34 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-08
+
+### Added — Phase 1 continued (Anchor instruction handlers wired)
+
+- `OrderBufferAccount` — per-market 64-slot pending order buffer.
+- `TraderStateAccount` — per-trader collateral, toxicity score, rate-limit
+  counter.
+- Full instruction handlers in `lib.rs`:
+  - `initialize_market` — creates Market, OrderBuffer, CommitBuffer PDAs
+    with full constraints (seeds: `["market", base_mint, quote_mint]`).
+  - `initialize_insurance_fund` — creates the global InsuranceFund PDA.
+  - `open_trader_state` — creates a per-trader state PDA.
+  - `update_oracle` — authority-gated oracle price write.
+  - `place_limit_order` — validates size/price/lot/tick, finds first empty
+    slot, writes with monotonic seq counter.
+  - `submit_commit` — registers a hash in the per-market commit buffer.
+  - `submit_reveal` — verifies hash, synthesizes a taker order in the
+    next batch's buffer.
+  - `run_batch` — the heart: advances funding index, generates FLP
+    virtual quotes, runs FBA Walrasian clearing, updates mark via
+    TWAP-with-oracle-band, updates VPIN per fill, sweeps expired commits,
+    clears buffer, emits `BatchClearedEvent`.
+- Anchor events: `MarketInitializedEvent`, `BatchClearedEvent`.
+- Numbered error codes consistently propagated through `require!` /
+  `require_keys_eq!` / `error!()` macros.
+- All instruction handlers use `Box<Account<>>` for large accounts to
+  keep stack pressure low.
+
 ## [0.3.0] — 2026-05-08
 
 ### Added — Phase 1 continued

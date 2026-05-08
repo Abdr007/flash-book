@@ -39,8 +39,18 @@ Target: deployable to MagicBlock ER devnet.
 - [x] Commit-reveal in Rust with hash check, expiry sweep, bond seizure
       (L1 force-include path is a roadmap item — needs MagicBlock-side support)
 - [x] Property-based testing via `proptest` (6 properties × 2K cases each)
-- [ ] Anchor instruction handlers (currently skeletons only)
-- [ ] Account validation, PDA seeds, signer checks
+- [x] Anchor instruction handlers (initialize_market, initialize_insurance_fund,
+      open_trader_state, update_oracle, place_limit_order, submit_commit,
+      submit_reveal, run_batch)
+- [x] Account validation, PDA seeds, signer checks
+- [x] OrderBufferAccount + TraderStateAccount on-chain types
+- [x] Anchor events: MarketInitializedEvent, BatchClearedEvent
+- [ ] Per-fill position state updates (currently fills emitted as event
+      for off-chain bookkeeper; on-chain per-fill `apply_fill` instruction
+      to land next iteration)
+- [ ] In-loop liquidation injection during run_batch (logic complete, wiring
+      to per-trader iteration via remaining_accounts pending)
+- [ ] Stress-lattice margin enforcement on order intake
 - [ ] Integration with MagicBlock ER `delegate_account` /
       `commit_and_undelegate_accounts` (blocked on `ephemeral-rollups-sdk`
       Solana 2.x compat — upstream issue tracked)
