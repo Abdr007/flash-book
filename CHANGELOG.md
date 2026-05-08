@@ -4,6 +4,30 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] — 2026-05-08
+
+### Added — Phase 1 final polish (verified batch execution + edge case E2E)
+
+Three new E2E integration tests covering the strongest "this works"
+demonstration and order-intake edge cases:
+
+- **`two_traders_crossing_orders_clear_in_batch`** — the canonical
+  end-to-end batch execution test. Two traders place crossing orders
+  (Alice buys at 100,500; Bob sells at 99,500). After `run_batch`:
+  - Buffer is cleared (head = 0)
+  - Market batch counter advanced (current_batch = 1)
+  - Recent clearing prices contains a price ∈ [99,500, 100,500]
+  - Mark price within the configured 100-bps oracle band
+  This proves the whole matcher pipeline runs end-to-end on real
+  Solana runtime: order intake → FBA Walrasian clearing →
+  TWAP-banded mark update.
+- **`place_limit_order_below_min_lot_rejected`** — zero-size order
+  rejected by the `ZeroSize` gate.
+- **`place_limit_order_off_tick_rejected`** — order with limit not
+  aligned to `tick_size` rejected by the `PriceNotOnTick` gate.
+
+### Total test count: 236 (152 TS sim+SDK + 31 Rust unit + 30 Rust property × 2K + 23 E2E integration).
+
 ## [0.23.0] — 2026-05-08
 
 ### Added — Phase 1 final hardening (60,000 fuzz assertions)

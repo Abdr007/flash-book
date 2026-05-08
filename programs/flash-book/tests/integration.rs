@@ -1616,3 +1616,293 @@ async fn second_market_initializes_at_different_oracle_price() {
     assert_eq!(market1.flp_pool, market2.flp_pool);
     assert_eq!(market1.insurance_fund, market2.insurance_fund);
 }
+
+#[tokio::test]
+async fn two_traders_crossing_orders_clear_in_batch() {
+    // Place a crossing long+short pair from two different traders.
+    // After run_batch, the buffer should be cleared and the market's
+    // mark price + recent_clearing_prices should reflect a successful match.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (commit_buf, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+
+    // Two traders — alice will buy, bob will sell.
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    let alice_state = setup_trader(&mut ctx, &payer, &alice, 50_000).await;
+    let bob_state = setup_trader(&mut ctx, &payer, &bob, 50_000).await;
+
+    let (alice_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        alice.pubkey().as_ref(),
+    ]);
+    let (bob_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        bob.pubkey().as_ref(),
+    ]);
+
+    // Alice places a long limit at 100_500 (willing to pay up).
+    let alice_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0, // long
+            size_lots: 1,
+            limit_ticks: 100_500,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(alice_state, false),
+            AccountMeta::new(alice_pos, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[alice_ix],
+            Some(&alice.pubkey()),
+            &[&alice],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Bob places a short limit at 99_500 (willing to sell down).
+    let bob_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 1, // short
+            size_lots: 1,
+            limit_ticks: 99_500,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(bob.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(bob_state, false),
+            AccountMeta::new(bob_pos, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[bob_ix],
+            Some(&bob.pubkey()),
+            &[&bob],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Verify both orders are in the buffer.
+    let buf_before: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(buf_before.head, 2);
+
+    // Run the batch. This should produce a fill at the uniform clearing price.
+    let run_ix = build_ix(
+        flash_book::instruction::RunBatch { now_ms: 1_000_000 },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(commit_buf, false),
+            AccountMeta::new(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[run_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // The buffer should be cleared.
+    let buf_after: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(buf_after.head, 0);
+
+    // The market's batch counter advanced.
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.current_batch, 1);
+
+    // A clearing price should have been recorded in the TWAP buffer.
+    // (clearing price ∈ [99_500, 100_500] from the crossing range.)
+    assert!(market.recent_clearing_count >= 1);
+    let last_cp = market.recent_clearing_prices[0];
+    assert!(
+        last_cp >= 99_500 && last_cp <= 100_500,
+        "clearing price {} outside crossing range [99500, 100500]",
+        last_cp,
+    );
+
+    // Mark price should be within the oracle band (oracle is at 100_000,
+    // band is 100 bps = 1%, so mark ∈ [99_000, 101_000]).
+    let oracle = market.oracle_price_ticks;
+    let band = oracle / 100; // 1%
+    assert!(
+        market.mark_price_ticks >= oracle - band && market.mark_price_ticks <= oracle + band,
+        "mark {} outside oracle band [{}, {}]",
+        market.mark_price_ticks,
+        oracle - band,
+        oracle + band,
+    );
+}
+
+#[tokio::test]
+async fn place_limit_order_below_min_lot_rejected() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    // Order with size_lots = 0 is rejected by ZeroSize check.
+    let ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 0, // below min, should fail
+            limit_ticks: 100_000,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "zero-size order should be rejected");
+}
+
+#[tokio::test]
+async fn place_limit_order_off_tick_rejected() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    // Set up a market with tick_size = 10 so we can test off-tick prices.
+    let (insurance_fund, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+
+    let base_mint = Keypair::new().pubkey();
+    let quote_mint = Keypair::new().pubkey();
+    let base_vault = Keypair::new().pubkey();
+    let quote_vault = Keypair::new().pubkey();
+    let oracle_account = Keypair::new().pubkey();
+
+    let (market_pda, _) = pda(&[
+        MarketAccount::SEED,
+        base_mint.as_ref(),
+        quote_mint.as_ref(),
+    ]);
+    let (order_buf, _) = pda(&[OrderBufferAccount::SEED, market_pda.as_ref()]);
+    let (commit_buffer_pda, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    let mut params = default_params();
+    params.tick_size = 10;
+    let init_ix = build_ix(
+        flash_book::instruction::InitializeMarket {
+            params,
+            initial_oracle_ticks: 100_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(base_vault, false),
+            AccountMeta::new_readonly(quote_vault, false),
+            AccountMeta::new_readonly(oracle_account, false),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(commit_buffer_pda, false),
+            AccountMeta::new_readonly(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    // Off-tick price (100_005 is not a multiple of 10).
+    let ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 1,
+            limit_ticks: 100_005, // not aligned
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "off-tick price should be rejected");
+}
