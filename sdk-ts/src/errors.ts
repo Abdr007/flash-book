@@ -27,6 +27,7 @@ export enum FlashBookErrorCode {
   LeverageExceeded = 1206,
   PostOnlyCross = 1207,
   RateLimited = 1208,
+  PositionSizeCapExceeded = 1209,
 
   // 1300-1399 matcher
   BufferFull = 1300,
@@ -55,6 +56,11 @@ export enum FlashBookErrorCode {
   AlreadyDelegated = 1701,
   DelegationExpired = 1702,
   ForceIncludeUnsupported = 1703,
+
+  // 1800-1899 oracle
+  OracleTooStale = 1800,
+  OracleConfidenceTooWide = 1801,
+  OraclePausedConfidence = 1802,
 }
 
 export function errorFamily(code: number): string {
@@ -66,6 +72,7 @@ export function errorFamily(code: number): string {
   if (code >= 1500 && code < 1600) return 'insurance';
   if (code >= 1600 && code < 1700) return 'commit_reveal';
   if (code >= 1700 && code < 1800) return 'delegation';
+  if (code >= 1800 && code < 1900) return 'oracle';
   return 'unknown';
 }
 

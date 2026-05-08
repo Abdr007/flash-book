@@ -84,6 +84,46 @@ The FLP pool's exposure is bounded:
 | ER outage > timeout (1 h) | Auto-settle on L1 at **last-committed mark**, not current oracle. | Fair valuation; no flash-crash liquidation cascade. |
 | L1 reorg of an ER commit | ER state replays from previous commit; affected fills re-clear. | Identical outcome (FBA is deterministic). |
 
+## Defenses against known production attack patterns
+
+After auditing real 2025 production attacks on major perp DEXes, three
+concrete defenses are wired in:
+
+| Attack pattern | Production casualty | Our defense |
+|---|---|---|
+| Mark-price manipulation via thin upstream sources | Hyperliquid JELLY (Mar 2025), POPCAT (Nov 2025) — ~$5M each | `oracle_staleness_max_seconds` + `oracle_confidence_max_bps` gates on `update_oracle` |
+| Coordinated multi-wallet position buildup | Hyperliquid POPCAT — $20M concentrated long via 19 wallets | `max_position_lots_per_trader` cap on `place_limit_order` (per-wallet) |
+| Liquidation cascades | October 2025 crash, $5B liquidations overwhelmed funds | In-batch FBA clearing (atomic; no sequential walk); insurance-fund-first waterfall before ADL |
+| Funding-tick sniping | Every CEX with discrete funding | Continuous per-block funding via cumulative-index integral |
+| Sequencer front-running | Universal CLOB risk | Commit-reveal (hash hides intent); FBA uniform-clearing within batch |
+| Self-trading wash | Universal | Self-trade prevention in matcher (same-trader pairing skipped) |
+| Oracle gaming via stale prices | DeFi-wide | Pyth-style staleness check; wide-confidence rejection |
+
+## ADL trilemma — documented, not solved
+
+The December 2025 paper [*Autodeleveraging: Impossibilities and
+Optimization*](https://arxiv.org/abs/2512.01112) proves that no ADL
+policy can simultaneously satisfy exchange solvency, revenue, and
+trader fairness. As participation scales, a novel form of moral hazard
+grows asymptotically, rendering "zero-loss" socialization impossible.
+
+Our design choices, with this trade-off explicit:
+
+- **Insurance fund first** — sized to ~1% of OI (governance-tunable);
+  funded by 10% of fees + 50% of toxicity tax + 50% of liq penalty.
+  ADL only fires when the fund is exhausted.
+- **Profit-ratio × leverage ranking for ADL** — the industry standard;
+  most-profitable, highest-leverage positions are deleveraged first.
+  This is gameable in principle (a trader near the top can dust their
+  position to drop in rank) but the dust is its own cost.
+- **Pause-new-positions threshold** — when fund balance falls below
+  configured floor, new opening orders are blocked. Existing positions
+  can still close.
+
+The trilemma cannot be solved; it can only be navigated. Our defaults
+trade slight unfairness to highly-profitable traders for stronger
+solvency guarantees.
+
 ## What this design does *not* protect against
 
 Honest about open problems and what's outside the protocol's scope:

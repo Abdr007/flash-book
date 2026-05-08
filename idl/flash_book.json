@@ -1926,7 +1926,21 @@
       "name": "update_oracle",
       "docs": [
         "Update oracle price (authority-only). In production this is replaced",
-        "by a Pyth read in `run_batch`."
+        "by a Pyth read in `run_batch`.",
+        "",
+        "Hardened against the JELLY/POPCAT class of attacks (Hyperliquid 2025):",
+        "",
+        "1. **Staleness check**: rejects updates where",
+        "`now - published_at > params.oracle_staleness_max_seconds`.",
+        "Prevents using outdated prices when the oracle network has a gap.",
+        "2. **Confidence check**: rejects updates where",
+        "`confidence / price > params.oracle_confidence_max_bps`.",
+        "When upstream sources disagree (typically during low-liquidity",
+        "manipulation), the wider confidence interval is detected and",
+        "the price is rejected rather than acted upon.",
+        "",
+        "`published_at_unix_seconds` is the publisher-attested timestamp",
+        "(matches Pyth's `publish_time` field)."
       ],
       "discriminator": [
         112,
@@ -1980,6 +1994,10 @@
         },
         {
           "name": "confidence",
+          "type": "u64"
+        },
+        {
+          "name": "published_at_unix_seconds",
           "type": "u64"
         }
       ]
@@ -2453,6 +2471,11 @@
       "msg": "Per-batch order rate limit exceeded"
     },
     {
+      "code": 7209,
+      "name": "PositionSizeCapExceeded",
+      "msg": "Position size would exceed per-trader concentration cap"
+    },
+    {
       "code": 7300,
       "name": "BufferFull",
       "msg": "Order book buffer at capacity"
@@ -2541,6 +2564,21 @@
       "code": 7703,
       "name": "ForceIncludeUnsupported",
       "msg": "Force-include from L1 not yet supported in this build"
+    },
+    {
+      "code": 7800,
+      "name": "OracleTooStale",
+      "msg": "Oracle price is too stale to be trusted"
+    },
+    {
+      "code": 7801,
+      "name": "OracleConfidenceTooWide",
+      "msg": "Oracle confidence interval exceeds configured maximum"
+    },
+    {
+      "code": 7802,
+      "name": "OraclePausedConfidence",
+      "msg": "Oracle in fail-safe mode; new positions paused"
     }
   ],
   "types": [
@@ -3010,6 +3048,10 @@
             "type": "u64"
           },
           {
+            "name": "oracle_published_at_unix_seconds",
+            "type": "u64"
+          },
+          {
             "name": "mark_price_ticks",
             "type": "u64"
           },
@@ -3233,6 +3275,33 @@
           {
             "name": "batch_interval_ms",
             "type": "u32"
+          },
+          {
+            "name": "oracle_staleness_max_seconds",
+            "docs": [
+              "Maximum age (in seconds) for an oracle price before it's rejected",
+              "as stale. Mitigates the JELLY-style attack where attackers wait",
+              "for an oracle gap to manipulate the mark."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "oracle_confidence_max_bps",
+            "docs": [
+              "Maximum oracle confidence interval as a fraction of price, in bps.",
+              "E.g. 100 = 1%. When confidence widens beyond this, oracle updates",
+              "are rejected (prevents using uncertain prices for liquidation)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "max_position_lots_per_trader",
+            "docs": [
+              "Per-trader maximum position size on this market, in base lots.",
+              "0 = unlimited. Prevents the POPCAT-style coordinated long buildup",
+              "where a single attacker accumulates outsized concentrated risk."
+            ],
+            "type": "u64"
           }
         ]
       }

@@ -58,6 +58,8 @@ pub enum FlashBookError {
     PostOnlyCross = 1207,
     #[msg("Per-batch order rate limit exceeded")]
     RateLimited = 1208,
+    #[msg("Position size would exceed per-trader concentration cap")]
+    PositionSizeCapExceeded = 1209,
 
     // ── 1300-1399 matcher / clearing ────────────────────────────────
     #[msg("Order book buffer at capacity")]
@@ -104,6 +106,14 @@ pub enum FlashBookError {
     DelegationExpired = 1702,
     #[msg("Force-include from L1 not yet supported in this build")]
     ForceIncludeUnsupported = 1703,
+
+    // ── 1800-1899 oracle ────────────────────────────────────────────
+    #[msg("Oracle price is too stale to be trusted")]
+    OracleTooStale = 1800,
+    #[msg("Oracle confidence interval exceeds configured maximum")]
+    OracleConfidenceTooWide = 1801,
+    #[msg("Oracle in fail-safe mode; new positions paused")]
+    OraclePausedConfidence = 1802,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

@@ -356,9 +356,10 @@ export class FlashBookClient {
     market: PublicKey;
     priceTicks: bigint | number;
     confidence: bigint | number;
+    publishedAtUnixSeconds: bigint | number;
   }): Promise<TransactionInstruction> {
     return this.methods
-      .updateOracle(args.priceTicks, args.confidence)
+      .updateOracle(args.priceTicks, args.confidence, args.publishedAtUnixSeconds)
       .accountsPartial({
         authority: args.authority,
         market: args.market,

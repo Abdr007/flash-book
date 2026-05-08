@@ -117,6 +117,10 @@ fn default_params() -> MarketParams {
 
         twap_window: 5,
         batch_interval_ms: 50,
+
+        oracle_staleness_max_seconds: 0,
+        oracle_confidence_max_bps: 0,
+        max_position_lots_per_trader: 0,
     }
 }
 
@@ -1298,6 +1302,7 @@ async fn update_oracle_authority_only() {
         flash_book::instruction::UpdateOracle {
             price_ticks: 105_000,
             confidence: 50,
+            published_at_unix_seconds: 0,
         },
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
@@ -1339,6 +1344,7 @@ async fn update_oracle_authority_only() {
         flash_book::instruction::UpdateOracle {
             price_ticks: 200_000, // attacker tries
             confidence: 0,
+            published_at_unix_seconds: 0,
         },
         vec![
             AccountMeta::new_readonly(attacker.pubkey(), true),
@@ -1400,6 +1406,7 @@ async fn transfer_market_authority_rotates_keys() {
         flash_book::instruction::UpdateOracle {
             price_ticks: 999_999,
             confidence: 0,
+            published_at_unix_seconds: 0,
         },
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
@@ -2213,4 +2220,294 @@ async fn place_limit_order_per_trader_rate_limit_enforced() {
     // Buffer head unchanged.
     let buf_unchanged: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
     assert_eq!(buf_unchanged.head, 16);
+}
+
+#[tokio::test]
+async fn update_oracle_rejects_stale_price() {
+    // With oracle_staleness_max_seconds = 60, a price published 1 hour ago
+    // must be rejected as too stale.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (insurance_fund, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+
+    let base_mint = Keypair::new().pubkey();
+    let quote_mint = Keypair::new().pubkey();
+    let (market_pda, _) = pda(&[
+        MarketAccount::SEED,
+        base_mint.as_ref(),
+        quote_mint.as_ref(),
+    ]);
+    let (order_buf, _) = pda(&[OrderBufferAccount::SEED, market_pda.as_ref()]);
+    let (cb, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    let mut params = default_params();
+    params.oracle_staleness_max_seconds = 60; // 1-min max age
+
+    let init_ix = build_ix(
+        flash_book::instruction::InitializeMarket {
+            params,
+            initial_oracle_ticks: 100_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(cb, false),
+            AccountMeta::new_readonly(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Try to update oracle with publish_time = 0 (1970, ~55 years stale).
+    let stale_ix = build_ix(
+        flash_book::instruction::UpdateOracle {
+            price_ticks: 105_000,
+            confidence: 0,
+            published_at_unix_seconds: 0,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[stale_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "stale oracle update should fail");
+}
+
+#[tokio::test]
+async fn update_oracle_rejects_wide_confidence() {
+    // With oracle_confidence_max_bps = 100 (1%), an update with
+    // confidence = 5% of price must be rejected.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (insurance_fund, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+
+    let base_mint = Keypair::new().pubkey();
+    let quote_mint = Keypair::new().pubkey();
+    let (market_pda, _) = pda(&[
+        MarketAccount::SEED,
+        base_mint.as_ref(),
+        quote_mint.as_ref(),
+    ]);
+    let (order_buf, _) = pda(&[OrderBufferAccount::SEED, market_pda.as_ref()]);
+    let (cb, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    let mut params = default_params();
+    params.oracle_confidence_max_bps = 100; // 1% max
+
+    let init_ix = build_ix(
+        flash_book::instruction::InitializeMarket {
+            params,
+            initial_oracle_ticks: 100_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(cb, false),
+            AccountMeta::new_readonly(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Confidence 5_000 on price 100_000 = 5% — exceeds the 1% max.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let bad_ix = build_ix(
+        flash_book::instruction::UpdateOracle {
+            price_ticks: 100_000,
+            confidence: 5_000,
+            published_at_unix_seconds: now,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[bad_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "wide-confidence oracle update should fail");
+}
+
+#[tokio::test]
+async fn place_limit_order_rejects_above_position_cap() {
+    // With max_position_lots_per_trader = 5, an 6-lot order must be rejected.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (insurance_fund, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+
+    let base_mint = Keypair::new().pubkey();
+    let quote_mint = Keypair::new().pubkey();
+    let (market_pda, _) = pda(&[
+        MarketAccount::SEED,
+        base_mint.as_ref(),
+        quote_mint.as_ref(),
+    ]);
+    let (order_buf, _) = pda(&[OrderBufferAccount::SEED, market_pda.as_ref()]);
+    let (cb, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    let mut params = default_params();
+    params.max_position_lots_per_trader = 5;
+
+    let init_ix = build_ix(
+        flash_book::instruction::InitializeMarket {
+            params,
+            initial_oracle_ticks: 100_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(cb, false),
+            AccountMeta::new_readonly(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    // 6 lots > cap of 5 — should fail.
+    let bad_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 6,
+            limit_ticks: 100_000,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[bad_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "order exceeding position cap should fail");
+
+    // 5 lots = exactly cap — should succeed.
+    let ok_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 5,
+            limit_ticks: 100_000,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ok_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
 }

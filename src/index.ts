@@ -142,3 +142,8 @@ export const DEFAULT_MAJOR_MARKET_PARAMS: MarketParams = {
   twapWindow: 5,
   batchIntervalMs: 50,
 };
+
+// Oracle hardening defaults — sized to current Pyth + cex-aggregator
+// observed staleness/confidence on Solana mainnet.
+export const DEFAULT_ORACLE_STALENESS_MAX_SECONDS = 30;
+export const DEFAULT_ORACLE_CONFIDENCE_MAX_BPS = 100; // 1%

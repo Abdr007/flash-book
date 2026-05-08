@@ -76,6 +76,7 @@ pub mod flash_book {
         market.last_batch_ms = 0;
         market.oracle_price_ticks = initial_oracle_ticks;
         market.oracle_confidence = 0;
+        market.oracle_published_at_unix_seconds = Clock::get()?.unix_timestamp.max(0) as u64;
         market.mark_price_ticks = initial_oracle_ticks;
         market.cum_funding_index = 0;
         market.last_funding_rate_bps_per_sec = 0;
@@ -372,10 +373,25 @@ pub mod flash_book {
 
     /// Update oracle price (authority-only). In production this is replaced
     /// by a Pyth read in `run_batch`.
+    ///
+    /// Hardened against the JELLY/POPCAT class of attacks (Hyperliquid 2025):
+    ///
+    ///   1. **Staleness check**: rejects updates where
+    ///      `now - published_at > params.oracle_staleness_max_seconds`.
+    ///      Prevents using outdated prices when the oracle network has a gap.
+    ///   2. **Confidence check**: rejects updates where
+    ///      `confidence / price > params.oracle_confidence_max_bps`.
+    ///      When upstream sources disagree (typically during low-liquidity
+    ///      manipulation), the wider confidence interval is detected and
+    ///      the price is rejected rather than acted upon.
+    ///
+    /// `published_at_unix_seconds` is the publisher-attested timestamp
+    /// (matches Pyth's `publish_time` field).
     pub fn update_oracle(
         ctx: Context<UpdateOracle>,
         price_ticks: u64,
         confidence: u64,
+        published_at_unix_seconds: u64,
     ) -> Result<()> {
         require!(price_ticks > 0, FlashBookError::ZeroPrice);
         let market = &mut ctx.accounts.market;
@@ -384,8 +400,30 @@ pub mod flash_book {
             ctx.accounts.authority.key(),
             FlashBookError::Unauthorized
         );
+
+        // Staleness check.
+        let now = Clock::get()?.unix_timestamp.max(0) as u64;
+        let max_age = market.params.oracle_staleness_max_seconds as u64;
+        if max_age > 0 {
+            let age = now.saturating_sub(published_at_unix_seconds);
+            require!(age <= max_age, FlashBookError::OracleTooStale);
+        }
+
+        // Confidence check: confidence_bps = (confidence / price) * 10000.
+        let max_conf = market.params.oracle_confidence_max_bps;
+        if max_conf > 0 {
+            let conf_bps = ((confidence as u128) * (constants::BPS_DENOM as u128))
+                .checked_div(price_ticks as u128)
+                .ok_or_else(|| error!(FlashBookError::DivisionByZero))?;
+            require!(
+                conf_bps <= max_conf as u128,
+                FlashBookError::OracleConfidenceTooWide,
+            );
+        }
+
         market.oracle_price_ticks = price_ticks;
         market.oracle_confidence = confidence;
+        market.oracle_published_at_unix_seconds = published_at_unix_seconds;
         Ok(())
     }
 
@@ -541,6 +579,24 @@ pub mod flash_book {
             size_lots <= FLP_SEQ_RESERVED_OFFSET, // sanity bound
             FlashBookError::OutOfRange
         );
+
+        // Concentration cap: prevent any single trader from building a
+        // position larger than `max_position_lots_per_trader`. Mitigates
+        // the POPCAT-style attack where a single actor uses many wallets
+        // to build outsized concentrated risk. (The per-wallet cap is
+        // bypass-resistant because the signer is enforced; the multi-wallet
+        // bypass requires real capital across each wallet.)
+        let cap = market.params.max_position_lots_per_trader;
+        if cap > 0 {
+            let existing_size = ctx.accounts.position.size_lots;
+            // Add the new order size; in the worst case (same side) this is
+            // the post-fill position size.
+            let new_size = existing_size.saturating_add(size_lots);
+            require!(
+                new_size <= cap,
+                FlashBookError::PositionSizeCapExceeded,
+            );
+        }
 
         // Stress-lattice margin gate. If the trader has an existing position
         // on this market, reject if it would push them past maintenance.

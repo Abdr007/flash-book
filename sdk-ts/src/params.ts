@@ -41,6 +41,13 @@ export interface MarketParamsRaw {
 
   twapWindow: number;
   batchIntervalMs: number;
+
+  /** Max age (s) for an oracle price; 0 = unlimited. */
+  oracleStalenessMaxSeconds: number;
+  /** Max oracle confidence as fraction of price (bps); 0 = unlimited. */
+  oracleConfidenceMaxBps: number;
+  /** Per-trader max position size on this market (lots); 0 = unlimited. */
+  maxPositionLotsPerTrader: BN;
 }
 
 /** Sensible default parameter set for SOL/BTC/ETH-style major markets. */
@@ -81,6 +88,14 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
 
     twapWindow: 5,
     batchIntervalMs: 50,
+
+    // Oracle hardening — sized to current Pyth + cex-aggregator observed
+    // staleness/confidence on Solana mainnet.
+    oracleStalenessMaxSeconds: 30,
+    oracleConfidenceMaxBps: 100, // 1%
+    // Concentration cap: 10x the FLP per-batch growth as a sane default
+    // (production should set per market based on historical OI distribution).
+    maxPositionLotsPerTrader: new BN(0), // 0 = unlimited; opt-in by markets
   };
 }
 

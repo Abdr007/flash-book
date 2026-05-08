@@ -55,6 +55,21 @@ pub struct MarketParams {
 
     pub twap_window: u8,
     pub batch_interval_ms: u32,
+
+    /// Maximum age (in seconds) for an oracle price before it's rejected
+    /// as stale. Mitigates the JELLY-style attack where attackers wait
+    /// for an oracle gap to manipulate the mark.
+    pub oracle_staleness_max_seconds: u32,
+
+    /// Maximum oracle confidence interval as a fraction of price, in bps.
+    /// E.g. 100 = 1%. When confidence widens beyond this, oracle updates
+    /// are rejected (prevents using uncertain prices for liquidation).
+    pub oracle_confidence_max_bps: u32,
+
+    /// Per-trader maximum position size on this market, in base lots.
+    /// 0 = unlimited. Prevents the POPCAT-style coordinated long buildup
+    /// where a single attacker accumulates outsized concentrated risk.
+    pub max_position_lots_per_trader: u64,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).
@@ -75,6 +90,7 @@ pub struct MarketAccount {
     pub last_batch_ms: u64,
     pub oracle_price_ticks: u64,
     pub oracle_confidence: u64,
+    pub oracle_published_at_unix_seconds: u64,
     pub mark_price_ticks: u64,
     pub cum_funding_index: i128,
     pub last_funding_rate_bps_per_sec: i64,
