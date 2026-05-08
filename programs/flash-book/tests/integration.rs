@@ -1348,3 +1348,67 @@ async fn transfer_market_authority_rotates_keys() {
         .await;
     assert!(result.is_err(), "old authority should be revoked");
 }
+
+#[tokio::test]
+async fn liquidate_portfolio_rejects_healthy_trader_zero_remaining() {
+    // Degenerate cross-market case: only the execution market, no other
+    // positions. Should behave identically to liquidate_position — reject
+    // healthy traders.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    // Caller — fund.
+    let caller = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &caller.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Trader has empty position → liquidation should fail (LiquidationStale).
+    let liq_ix = build_ix(
+        flash_book::instruction::LiquidatePortfolio {},
+        vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new_readonly(trader_state, false),
+            AccountMeta::new_readonly(position, false),
+            // No remaining_accounts.
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[liq_ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "liquidate_portfolio should fail on healthy/empty trader",
+    );
+}

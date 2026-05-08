@@ -366,6 +366,50 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /**
+   * Cross-market portfolio liquidation. Walks the trader's positions
+   * across multiple markets via remaining_accounts.
+   *
+   * `crossMargin` is the list of OTHER (market, position) pairs to
+   * include in the cross-margin assessment alongside the execution
+   * market's position. Each entry contributes one Market account
+   * followed by one Position account to remaining_accounts.
+   */
+  liquidatePortfolioIx(args: {
+    caller: PublicKey;
+    executionMarket: PublicKey;
+    trader: PublicKey;
+    crossMargin?: ReadonlyArray<{ market: PublicKey }>;
+  }): Promise<TransactionInstruction> {
+    const buffer = this.orderBuffer(args.executionMarket);
+    const traderState = this.traderState(args.trader);
+    const position = this.position(args.executionMarket, args.trader);
+    const builder = this.methods.liquidatePortfolio().accountsPartial({
+      caller: args.caller,
+      executionMarket: args.executionMarket,
+      executionOrderBuffer: buffer.address,
+      traderState: traderState.address,
+      executionPosition: position.address,
+    });
+    const remaining: Array<{ pubkey: PublicKey; isWritable: boolean; isSigner: boolean }> = [];
+    for (const m of args.crossMargin ?? []) {
+      remaining.push({ pubkey: m.market, isWritable: false, isSigner: false });
+      remaining.push({
+        pubkey: this.position(m.market, args.trader).address,
+        isWritable: false,
+        isSigner: false,
+      });
+    }
+    if (remaining.length > 0) {
+      // anchor's MethodsBuilder shape is loose — cast and call .remainingAccounts.
+      const withRemaining = (builder as unknown as {
+        remainingAccounts: (a: typeof remaining) => typeof builder;
+      }).remainingAccounts(remaining);
+      return withRemaining.instruction();
+    }
+    return builder.instruction();
+  }
+
   liquidatePositionIx(args: {
     caller: PublicKey;
     market: PublicKey;

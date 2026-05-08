@@ -803,6 +803,160 @@
       ]
     },
     {
+      "name": "liquidate_portfolio",
+      "docs": [
+        "Cross-market portfolio liquidation. Walks the trader's positions",
+        "across multiple markets via `remaining_accounts`, runs the matcher's",
+        "cross-margin `assess_margin` against the joint stress lattice, and",
+        "— if the trader is unhealthy — injects a liquidation order on the",
+        "**execution market** specified by the named accounts.",
+        "",
+        "`remaining_accounts` is interpreted as pairs:",
+        "[other_market_0, other_position_0, other_market_1, other_position_1, …]",
+        "Each pair is verified:",
+        "- both accounts owned by this program",
+        "- position.trader == trader_state.trader",
+        "- position.market == market_account.key()",
+        "",
+        "Cross-margin recognition: a long+short pair on different but",
+        "correlated markets cancels in correlated stress scenarios, sharply",
+        "reducing required margin. This is the same algorithm as the off-chain",
+        "`previewPortfolioRisk` SDK helper — they MUST agree."
+      ],
+      "discriminator": [
+        100,
+        17,
+        28,
+        97,
+        193,
+        43,
+        219,
+        183
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "signer": true
+        },
+        {
+          "name": "execution_market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "execution_market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "execution_market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "execution_order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "execution_market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_state",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "execution_position",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "execution_market"
+              },
+              {
+                "kind": "account",
+                "path": "trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "liquidate_position",
       "docs": [
         "Liquidate a specific position. Anyone may call this for any position;",

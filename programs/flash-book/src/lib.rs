@@ -1077,6 +1077,194 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Cross-market portfolio liquidation. Walks the trader's positions
+    /// across multiple markets via `remaining_accounts`, runs the matcher's
+    /// cross-margin `assess_margin` against the joint stress lattice, and
+    /// — if the trader is unhealthy — injects a liquidation order on the
+    /// **execution market** specified by the named accounts.
+    ///
+    /// `remaining_accounts` is interpreted as pairs:
+    ///     [other_market_0, other_position_0, other_market_1, other_position_1, …]
+    /// Each pair is verified:
+    ///   - both accounts owned by this program
+    ///   - position.trader == trader_state.trader
+    ///   - position.market == market_account.key()
+    ///
+    /// Cross-margin recognition: a long+short pair on different but
+    /// correlated markets cancels in correlated stress scenarios, sharply
+    /// reducing required margin. This is the same algorithm as the off-chain
+    /// `previewPortfolioRisk` SDK helper — they MUST agree.
+    pub fn liquidate_portfolio<'info>(
+        ctx: Context<'_, '_, '_, 'info, LiquidatePortfolio<'info>>,
+    ) -> Result<()> {
+        let exec_market = &ctx.accounts.execution_market;
+        let exec_position = &ctx.accounts.execution_position;
+        let trader_state = &ctx.accounts.trader_state;
+        let buffer = &mut ctx.accounts.execution_order_buffer;
+
+        require!(
+            exec_position.size_lots > 0,
+            FlashBookError::LiquidationStale
+        );
+        require!(
+            exec_position.trader == trader_state.trader,
+            FlashBookError::WrongTrader
+        );
+        require!(
+            exec_position.market == exec_market.key(),
+            FlashBookError::WrongMarket
+        );
+
+        // Build snapshot vectors with the execution market+position first.
+        let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
+        let mut position_snaps: Vec<RiskPosSnap> = Vec::new();
+        market_snaps.push(RiskMarketSnap {
+            market: exec_market.key(),
+            mark_price: Ticks(exec_market.mark_price_ticks),
+            cum_funding_index: exec_market.cum_funding_index,
+            maintenance_margin_bps: exec_market.params.maintenance_margin_ratio_bps,
+            tick_size: exec_market.params.tick_size,
+        });
+        position_snaps.push(RiskPosSnap {
+            market: exec_position.market,
+            side: if exec_position.side == 0 { Side::Long } else { Side::Short },
+            size_lots: exec_position.size_lots,
+            entry_price: Ticks(exec_position.entry_price_ticks),
+            cum_funding_index_at_entry: exec_position.cum_funding_index_at_entry,
+        });
+
+        // Walk remaining_accounts in (market, position) pairs.
+        let remaining = ctx.remaining_accounts;
+        require!(
+            remaining.len() % 2 == 0,
+            FlashBookError::OutOfRange
+        );
+        let program_id = ctx.program_id;
+        let mut i = 0usize;
+        while i + 1 < remaining.len() {
+            let market_ai = &remaining[i];
+            let position_ai = &remaining[i + 1];
+
+            // Both accounts must be owned by this program.
+            require_keys_eq!(
+                *market_ai.owner,
+                *program_id,
+                FlashBookError::Unauthorized
+            );
+            require_keys_eq!(
+                *position_ai.owner,
+                *program_id,
+                FlashBookError::Unauthorized
+            );
+
+            // Deserialize.
+            let m_data = market_ai.try_borrow_data()?;
+            let market: MarketAccount =
+                MarketAccount::try_deserialize(&mut &m_data[..])?;
+            let p_data = position_ai.try_borrow_data()?;
+            let position: state::PositionAccount =
+                state::PositionAccount::try_deserialize(&mut &p_data[..])?;
+
+            // Validate trader + market binding.
+            require!(
+                position.trader == trader_state.trader,
+                FlashBookError::WrongTrader
+            );
+            require!(
+                position.market == market_ai.key(),
+                FlashBookError::WrongMarket
+            );
+
+            // Skip empty positions; non-empty contribute to the assessment.
+            if position.size_lots > 0 {
+                market_snaps.push(RiskMarketSnap {
+                    market: market_ai.key(),
+                    mark_price: Ticks(market.mark_price_ticks),
+                    cum_funding_index: market.cum_funding_index,
+                    maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+                    tick_size: market.params.tick_size,
+                });
+                position_snaps.push(RiskPosSnap {
+                    market: position.market,
+                    side: if position.side == 0 { Side::Long } else { Side::Short },
+                    size_lots: position.size_lots,
+                    entry_price: Ticks(position.entry_price_ticks),
+                    cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                });
+            }
+            i += 2;
+        }
+
+        // Build the cross-market scenario lattice.
+        let market_keys: Vec<Pubkey> = market_snaps.iter().map(|m| m.market).collect();
+        let scenarios = default_scenarios_fn(&market_keys);
+
+        let assessment = assess_margin_fn(
+            &position_snaps,
+            &market_snaps,
+            &scenarios,
+            trader_state.collateral_quote_lots,
+        )?;
+        require!(!assessment.is_healthy, FlashBookError::NotLiquidatable);
+
+        // Inject a liquidation order on the execution market only.
+        require!(
+            (buffer.head as usize) < ORDER_BUFFER_CAP,
+            FlashBookError::BufferFull
+        );
+        let pos_side = if exec_position.side == 0 { Side::Long } else { Side::Short };
+        let close_side = pos_side.opposite();
+        let penalty = exec_market.params.liq_penalty_bps as u128;
+        let oracle = exec_market.oracle_price_ticks as u128;
+        let penalty_delta = (oracle * penalty) / constants::BPS_DENOM as u128;
+        let limit = match close_side {
+            Side::Short => oracle.saturating_sub(penalty_delta) as u64,
+            Side::Long => oracle.saturating_add(penalty_delta) as u64,
+        };
+
+        let next_seq = buffer
+            .seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+
+        let trader = exec_position.trader;
+        let mut inserted = false;
+        for slot in buffer.slots.iter_mut() {
+            if slot.valid == 0 {
+                *slot = OrderSlot {
+                    valid: 1,
+                    side: close_side as u8,
+                    order_type: OrderType::Liquidation as u8,
+                    post_only: 0,
+                    seq: next_seq,
+                    id: next_seq,
+                    trader,
+                    size_lots: exec_position.size_lots,
+                    limit_ticks: limit,
+                };
+                inserted = true;
+                break;
+            }
+        }
+        require!(inserted, FlashBookError::BufferFull);
+        buffer.seq_counter = next_seq;
+        buffer.head = buffer
+            .head
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        emit!(LiquidationInjectedEvent {
+            market: exec_market.key(),
+            trader,
+            side: pos_side as u8,
+            size_lots: exec_position.size_lots,
+            limit_ticks: limit,
+            worst_scenario_idx: assessment.worst_scenario_idx,
+        });
+        Ok(())
+    }
+
     // ER delegation (delegate_market / undelegate_market) is intentionally
     // omitted in this build. The upstream `ephemeral-rollups-sdk` is not yet
     // compatible with Solana 2.x; introducing a stub here would create a
@@ -1438,6 +1626,38 @@ pub struct ApplyFlpFill<'info> {
     pub flp_exposure: Account<'info, FlpExposureAccount>,
 
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct LiquidatePortfolio<'info> {
+    pub caller: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, execution_market.base_mint.as_ref(), execution_market.quote_mint.as_ref()],
+        bump = execution_market.bump,
+    )]
+    pub execution_market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [OrderBufferAccount::SEED, execution_market.key().as_ref()],
+        bump = execution_order_buffer.bump,
+    )]
+    pub execution_order_buffer: Account<'info, OrderBufferAccount>,
+
+    #[account(
+        seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
+        bump = trader_state.bump,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        seeds = [state::PositionAccount::SEED, execution_market.key().as_ref(), trader_state.trader.as_ref()],
+        bump = execution_position.bump,
+    )]
+    pub execution_position: Account<'info, state::PositionAccount>,
+    // remaining_accounts: alternating [Market, Position] pairs for the
+    // trader's other markets (cross-margin assessment).
 }
 
 #[derive(Accounts)]

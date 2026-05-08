@@ -75,7 +75,11 @@ Target: deployable to MagicBlock ER devnet.
       withdraw_flp_capital (with open-positions gate)
 - [x] Standalone lifecycle demo via SDK (sdk-ts/examples/full-lifecycle.ts)
 - [x] **E2E integration tests via solana-program-test (5 passing)**
-- [x] SDK builder coverage tests (20 cases — every Ix builder verified)
+- [x] SDK builder coverage tests (22 cases — every Ix builder verified)
+- [x] **`liquidate_portfolio` cross-market portfolio liquidation** — walks
+      remaining_accounts for trader's positions across multiple markets,
+      runs cross-margin assess_margin against joint scenario lattice,
+      injects liquidation order on execution market
 - [ ] In-loop liquidation injection during run_batch (logic complete, wiring
       to per-trader iteration via remaining_accounts pending)
 - [ ] Stress-lattice margin enforcement on order intake

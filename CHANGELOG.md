@@ -4,6 +4,55 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] — 2026-05-08
+
+### Added — Phase 1 closure (cross-market portfolio liquidation)
+
+The last remaining feature item: **`liquidate_portfolio`** — a 20th
+Anchor instruction that walks the trader's positions across multiple
+markets via `remaining_accounts` and runs the matcher's `assess_margin`
+against the joint cross-market stress lattice.
+
+How it works:
+- Named accounts: `caller`, `execution_market`, `execution_order_buffer`,
+  `trader_state`, `execution_position`.
+- `remaining_accounts` = alternating pairs of
+  `[other_market, other_position, …]`.
+- Each pair is verified: both accounts owned by this program;
+  `position.trader == trader_state.trader`; `position.market == market.key()`.
+- Cross-market scenario lattice generated dynamically over the union
+  of all markets seen.
+- `assess_margin` runs with the trader's collateral as the equity input.
+- If `is_healthy = true` → reject with `NotLiquidatable`. Otherwise inject
+  a `Liquidation`-priority order on the execution market (same shape
+  as `liquidate_position`).
+- Emits `LiquidationInjectedEvent`.
+
+**Cross-margin recognition**: a long+short pair on different but
+correlated markets cancels in correlated stress scenarios, sharply
+reducing required margin. The on-chain algorithm is identical to the
+SDK's off-chain `previewPortfolioRisk` — they MUST agree (and do, via
+the same Rust matcher core compiled into both paths).
+
+SDK extended:
+- `liquidatePortfolioIx({ caller, executionMarket, trader, crossMargin? })`
+  builder. `crossMargin` is `Array<{ market }>`; for each entry, the
+  builder appends two readonly accounts to `remainingAccounts`
+  (Market PDA + derived Position PDA).
+- 2 new SDK builder tests: zero-cross-margin (5 keys), 2-market
+  cross-margin (9 keys).
+- Coverage tripwire updated to **20** expected instruction builders.
+
+E2E test:
+- `liquidate_portfolio_rejects_healthy_trader_zero_remaining` —
+  degenerate case: empty position rejected with `LiquidationStale`,
+  matching `liquidate_position` semantics.
+
+IDL regenerated: 3,510 lines (was 3,356).
+
+### Total test count: 195 (141 TS sim+SDK + 31 Rust unit + 6 Rust property × 2K + 18 E2E integration).
+### Total Anchor instruction surface: **20**.
+
 ## [0.17.0] — 2026-05-08
 
 ### Added — Phase 1 continued (SDK risk preview + event subscription)

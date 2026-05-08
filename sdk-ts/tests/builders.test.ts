@@ -188,7 +188,7 @@ describe('Instruction builders', () => {
     expect(ix.keys.length).toBe(6);
   });
 
-  // ─── Liquidation (1) ───────────────────────────────────────────────
+  // ─── Liquidation (2) ───────────────────────────────────────────────
 
   test('liquidatePositionIx', async () => {
     const client = makeClient();
@@ -200,6 +200,34 @@ describe('Instruction builders', () => {
     });
     // caller, market, order_buffer, trader_state, position
     expect(ix.keys.length).toBe(5);
+  });
+
+  test('liquidatePortfolioIx without cross-margin args', async () => {
+    const client = makeClient();
+    const ix = await client.liquidatePortfolioIx({
+      caller: Keypair.generate().publicKey,
+      executionMarket: client.market(SOL, USDC).address,
+      trader: Keypair.generate().publicKey,
+    });
+    // caller, exec_market, exec_order_buffer, trader_state, exec_position
+    expect(ix.keys.length).toBe(5);
+  });
+
+  test('liquidatePortfolioIx with cross-margin remaining_accounts', async () => {
+    const client = makeClient();
+    const otherMint1 = Keypair.generate().publicKey;
+    const otherMint2 = Keypair.generate().publicKey;
+    const ix = await client.liquidatePortfolioIx({
+      caller: Keypair.generate().publicKey,
+      executionMarket: client.market(SOL, USDC).address,
+      trader: Keypair.generate().publicKey,
+      crossMargin: [
+        { market: client.market(otherMint1, USDC).address },
+        { market: client.market(otherMint2, USDC).address },
+      ],
+    });
+    // 5 named + 2 markets × 2 (market + position) = 5 + 4 = 9
+    expect(ix.keys.length).toBe(9);
   });
 
   // ─── Governance (4) ────────────────────────────────────────────────
@@ -252,7 +280,7 @@ describe('Instruction builders', () => {
 
   // ─── Coverage check ────────────────────────────────────────────────
 
-  test('all 19 instruction builders covered', () => {
+  test('all 20 instruction builders covered', () => {
     // This test serves as a tripwire: if a new instruction is added to
     // the program, this list will fall out of sync with the test count
     // above.
@@ -272,12 +300,13 @@ describe('Instruction builders', () => {
       'applyFillIx',
       'applyFlpFillIx',
       'liquidatePositionIx',
+      'liquidatePortfolioIx',
       'updateOracleIx',
       'setMarketStatusIx',
       'updateMarketParamsIx',
       'transferMarketAuthorityIx',
     ];
-    expect(expected.length).toBe(19);
+    expect(expected.length).toBe(20);
     const client = makeClient();
     for (const name of expected) {
       expect(typeof (client as unknown as Record<string, unknown>)[name]).toBe('function');
