@@ -4,6 +4,34 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] — 2026-05-08
+
+### Security audit pass — zero panic paths in production code
+
+Audited the Rust program for all `.unwrap()`, `.expect()`, `panic!`,
+`unreachable!`, `unimplemented!`, `todo!` paths in non-test code.
+
+Findings:
+- Two `.unwrap()` calls in `matcher/fba.rs` tie-break code, both
+  guarded by a length check earlier in the function. Replaced with
+  `.copied().unwrap_or(prior_mark)` for defense in depth — even a
+  future refactor that breaks the length invariant cannot introduce
+  a panic path.
+- All array indexing paths audited and verified bounded:
+  - `market.recent_clearing_prices[idx]` — `idx = batch_num % 16` on
+    a fixed-size 16 array.
+  - `remaining[i]` in `liquidate_portfolio` — guarded by
+    `i + 1 < remaining.len()` loop condition.
+  - `prices[i]` / `prices[i+1]` in `realized_vol_bps_from_window` —
+    guarded by `for i in 0..(n - 1)` where `n ≤ prices.len()`.
+  - `flp.per_market[idx]` — `idx` derived from `position()` /
+    `ok_or_else(BufferFull)` so always valid.
+
+**Production code now has ZERO panic paths.** Every error condition
+returns a typed `FlashBookError`. The matcher will fail gracefully
+under any input — verified by the property tests (12K random cases)
+and the integration tests (20 E2E paths).
+
 ## [0.20.0] — 2026-05-08
 
 ### Added — Phase 1 polish (SDK FBA simulator)

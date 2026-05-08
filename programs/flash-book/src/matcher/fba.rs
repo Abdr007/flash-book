@@ -94,12 +94,24 @@ pub fn clear_batch(orders: &[Order], prior_mark: Ticks) -> Result<ClearResult> {
         });
     }
 
-    // Tie-break.
+    // Tie-break. Defense in depth: even though `best_prices` is guaranteed
+    // non-empty here (we returned early above on empty), use safe fallbacks
+    // instead of `unwrap` so a future refactor can't introduce a panic path.
     let clearing_price = if best_prices.len() == 1 {
         best_prices[0]
     } else {
-        let min_p = best_prices.iter().min_by_key(|t| t.0).unwrap().0;
-        let max_p = best_prices.iter().max_by_key(|t| t.0).unwrap().0;
+        let min_p = best_prices
+            .iter()
+            .min_by_key(|t| t.0)
+            .copied()
+            .unwrap_or(prior_mark)
+            .0;
+        let max_p = best_prices
+            .iter()
+            .max_by_key(|t| t.0)
+            .copied()
+            .unwrap_or(prior_mark)
+            .0;
         if prior_mark.0 >= min_p && prior_mark.0 <= max_p {
             prior_mark
         } else {
