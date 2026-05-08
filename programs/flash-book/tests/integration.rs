@@ -2129,3 +2129,88 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
     assert_eq!(market.oi_long_lots, 1);
     assert_eq!(market.oi_short_lots, 1);
 }
+
+#[tokio::test]
+async fn place_limit_order_per_trader_rate_limit_enforced() {
+    // Per-trader rate limit is 16 orders per batch. The 17th in the
+    // same batch must be rejected with RateLimited.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    // Place 16 orders (the limit).
+    for i in 0..16u64 {
+        let ix = build_ix(
+            flash_book::instruction::PlaceLimitOrder {
+                side: 0,
+                size_lots: 1,
+                limit_ticks: 99_900 + i, // distinct prices to avoid dedup
+                post_only: false,
+            },
+            vec![
+                AccountMeta::new(trader.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(order_buf, false),
+                AccountMeta::new(trader_state, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        );
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&trader.pubkey()),
+                &[&trader],
+                bh,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let buf_at_limit: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(buf_at_limit.head, 16);
+
+    // The 17th order should fail.
+    let bad_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 1,
+            limit_ticks: 99_999,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[bad_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "17th order in same batch should be rate-limited");
+
+    // Buffer head unchanged.
+    let buf_unchanged: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(buf_unchanged.head, 16);
+}

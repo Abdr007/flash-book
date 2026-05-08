@@ -4,6 +4,48 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.0] — 2026-05-08
+
+### Added — Phase 1 final-final polish (test coverage gaps closed)
+
+#### `projectPosition` tests (9 cases)
+
+Extracted and exported `projectPosition` from `preview-trade.ts`.
+Tests cover all four lifecycle paths matching the on-chain
+`apply_fill_to_position`:
+- empty / null current → open new position
+- same side → volume-weighted average entry (tested with symmetric
+  and asymmetric weights)
+- opposite side, smaller fill → reduce
+- opposite side, exact size → close to zero
+- opposite side, larger fill → flip side
+- identity preservation (trader, market) across all cases
+
+#### Rate-limit E2E (1 test)
+
+`place_limit_order_per_trader_rate_limit_enforced` — places 16
+orders successfully, then verifies the 17th in the same batch is
+rejected with `RateLimited`. Verifies buffer head is unchanged after
+rejection. The 16-order-per-batch safety gate is now proven on real
+Solana runtime.
+
+#### Liquidation property tests (6 properties × 2K = 12K assertions)
+
+`programs/flash-book/tests/proptest_liquidation.rs`:
+- `detect_skips_healthy_traders` — massive collateral always healthy
+- `detect_flags_zero_collateral_traders` — non-trivial position with
+  zero collateral always flagged
+- `detect_skips_empty_position_lists` — no positions = no liquidation
+- `liq_orders_one_per_position` — one synthesized order per position
+  in each candidate; correct side (opposite of held); correct type
+  (`Liquidation`)
+- `shortfall_or_recovery_consistent` — `recovered > 0 ∧ shortfall > 0`
+  is impossible (mutually exclusive)
+- `liq_orders_match_position_size` — synthesized order size = held size
+
+### Total fuzz assertions: 72,000 (12K FBA + 14K risk + 34K modules + 12K liquidation).
+### Total test count: 254 (161 TS sim+SDK + 31 Rust unit + 36 Rust property × 2K + 26 E2E integration).
+
 ## [0.26.0] — 2026-05-08
 
 ### Added — Phase 1 polish (composable previewTrade SDK helper)

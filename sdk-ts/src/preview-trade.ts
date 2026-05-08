@@ -95,7 +95,18 @@ function slotToSim(slot: OrderSlot): SimOrder {
   };
 }
 
-function projectPosition(
+/**
+ * Project the post-fill PositionAccount given the current position and
+ * a fill. Mirrors `apply_fill_to_position` in the Rust program:
+ *
+ *   - empty → open(side, size, entry)
+ *   - same side → volume-weighted average entry
+ *   - opposite ≤ existing → reduce
+ *   - opposite > existing → flip
+ *
+ * Exported for testability.
+ */
+export function projectPosition(
   current: PositionAccount | null,
   fillSide: SimSide,
   fillSizeLots: number,

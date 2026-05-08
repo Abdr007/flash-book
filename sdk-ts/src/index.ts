@@ -76,6 +76,7 @@ export {
 
 export {
   previewTrade,
+  projectPosition,
   type PreviewTradeRequest,
   type PreviewTradeResult,
 } from './preview-trade.ts';
