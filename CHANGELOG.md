@@ -4,6 +4,32 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-08
+
+### Added — Phase 1 continued
+
+- `matcher::risk` — stress-lattice maintenance margin in Rust, with
+  `default_scenarios()` generator (per-market ±2/5/10/20%, correlated ±10%,
+  black-swan ±30%).
+- `matcher::liquidation` — `detect_liquidations()`, `generate_liquidation_orders()`,
+  and `compute_shortfall()` for the in-loop liquidation pipeline.
+- `matcher::insurance` — `InsuranceFund` type with three-stream contribution
+  methods + `cover_shortfall()` waterfall + `new_positions_allowed()` gate.
+- `matcher::commit_reveal` — Solana-keccak-based hash protocol with
+  `register_commit()` / `redeem_reveal()` / `sweep_expired()`, operating
+  over the on-chain `CommitRow` array stored in `CommitBufferAccount`.
+- 15 additional Rust unit tests covering all four new modules.
+- 6 property-based tests via `proptest` (2,000 cases each = **12,000 fuzz
+  assertions** on matcher safety):
+  - MEV-neutrality under input permutation
+  - Volume conservation
+  - Self-trade prevention in fills
+  - Eligibility (limit price respects clearing price)
+  - Fills never exceed input order size
+  - Matcher never panics on any input
+
+### Total test count: 108 (71 TypeScript + 31 Rust unit + 6 Rust property × 2K cases).
+
 ## [0.2.0] — 2026-05-08
 
 ### Added — Phase 1 begin (Rust on-chain matcher core)

@@ -2,7 +2,8 @@
 
 > Pool-backed CLOB matched by frequent batch auction on MagicBlock Ephemeral Rollups. Reference design and simulator for Flash Trade's announced Orderbook V3.
 
-[![tests](https://img.shields.io/badge/tests-87%20passing-brightgreen)]()
+[![tests](https://img.shields.io/badge/tests-108%20passing-brightgreen)]()
+[![fuzz](https://img.shields.io/badge/fuzz-12K%20cases-brightgreen)]()
 [![typescript](https://img.shields.io/badge/typescript-strict-blue)]()
 [![rust](https://img.shields.io/badge/rust-stable-orange)]()
 [![license](https://img.shields.io/badge/license-MIT-green)]()
@@ -51,7 +52,9 @@ a Solana program in Rust, deployed to MagicBlock ER and settling to mainnet.
 | Commit-reveal | ✅ implemented & tested |
 | VPIN toxicity signal | ✅ implemented & tested |
 | Synthetic flow simulator | ✅ runs at 42K batches/sec |
-| Rust matcher core (integer arithmetic, checked overflow) | ✅ implemented & 16 tests |
+| Rust matcher core (integer arithmetic, checked overflow) | ✅ 31 unit tests |
+| Rust property-based safety tests (MEV-neutrality, conservation, etc.) | ✅ 6 properties × 2K cases = 12K fuzz |
+| Rust risk + liquidation + insurance + commit-reveal modules | ✅ ported |
 | Anchor program skeleton (instruction shells) | ✅ scaffolded |
 | Anchor program full instruction implementations | 🔲 phase 1 cont. |
 | MagicBlock ER delegation CPI integration | 🔲 phase 1 cont. |
@@ -68,7 +71,8 @@ bun run examples/synthetic-flow.ts
 
 Rust on-chain matcher core:
 ```bash
-cargo test --lib --package flash-book   # 16 tests
+cargo test --lib --package flash-book   # 31 unit tests
+cargo test --package flash-book         # + 6 property tests × 2K cases
 cargo check --lib --package flash-book  # type / borrow check
 ```
 

@@ -1,12 +1,21 @@
 //! Pure-Rust unit tests for the matcher core. Mirror the TypeScript test
 //! suite in `tests/matcher.test.ts` etc.
 
+use super::commit_reveal::{redeem_reveal, register_commit, sweep_expired, RevealPayload};
 use super::fba::{clear_batch, Fill};
 use super::flp_quoter::{generate_quotes, FlpQuoterInputs, FlpQuoterParams};
 use super::funding::advance;
+use super::insurance::InsuranceFund;
+use super::liquidation::{
+    compute_shortfall, detect_liquidations, generate_liquidation_orders,
+};
 use super::lot::{BaseLots, Ticks};
 use super::order::{Order, OrderType, Side};
+use super::risk::{
+    assess_margin, default_scenarios, MarketSnapshot, PositionSnapshot,
+};
 use super::vpin::VpinState;
+use crate::state::CommitRow;
 use anchor_lang::prelude::Pubkey;
 
 fn ord(
@@ -228,6 +237,238 @@ fn vpin_zero_before_first_bucket() {
     let mut v = VpinState::new();
     v.record_fill(Side::Long, 50, 100, 5).unwrap();
     assert_eq!(v.as_bps(), 0);
+}
+
+// ─── risk + liquidation ─────────────────────────────────────────────
+
+fn sol_market() -> MarketSnapshot {
+    MarketSnapshot {
+        market: Pubkey::new_from_array([1; 32]),
+        mark_price: Ticks(100),
+        cum_funding_index: 0,
+        maintenance_margin_bps: 125, // 1.25%
+        tick_size: 1,
+    }
+}
+
+fn long_position(market: Pubkey, size: u64, entry: u64) -> PositionSnapshot {
+    PositionSnapshot {
+        market,
+        side: Side::Long,
+        size_lots: size,
+        entry_price: Ticks(entry),
+        cum_funding_index_at_entry: 0,
+    }
+}
+
+fn short_position(market: Pubkey, size: u64, entry: u64) -> PositionSnapshot {
+    PositionSnapshot {
+        market,
+        side: Side::Short,
+        size_lots: size,
+        entry_price: Ticks(entry),
+        cum_funding_index_at_entry: 0,
+    }
+}
+
+#[test]
+fn risk_healthy_long_with_collateral() {
+    let m = sol_market();
+    let positions = vec![long_position(m.market, 1, 100)];
+    let scenarios = default_scenarios(&[m.market]);
+    let a = assess_margin(&positions, &[m], &scenarios, 50).unwrap();
+    assert!(a.is_healthy);
+}
+
+#[test]
+fn risk_unhealthy_high_leverage() {
+    let m = sol_market();
+    let positions = vec![long_position(m.market, 1000, 100)];
+    let scenarios = default_scenarios(&[m.market]);
+    let a = assess_margin(&positions, &[m], &scenarios, 100).unwrap();
+    assert!(!a.is_healthy);
+    assert!(a.required_quote_lots > 0);
+    assert_ne!(a.worst_scenario_idx, 0); // not the flat scenario
+}
+
+#[test]
+fn risk_hedged_position_collapses_required_margin() {
+    let m = sol_market();
+    let scenarios = default_scenarios(&[m.market]);
+    let unhedged = vec![long_position(m.market, 100, 100)];
+    let hedged = vec![long_position(m.market, 100, 100), short_position(m.market, 100, 100)];
+
+    let a_unhedged = assess_margin(&unhedged, &[m], &scenarios, 0).unwrap();
+    let a_hedged = assess_margin(&hedged, &[m], &scenarios, 0).unwrap();
+
+    // Hedged required margin should be << unhedged.
+    assert!(a_hedged.required_quote_lots < a_unhedged.required_quote_lots / 5);
+}
+
+#[test]
+fn liquidation_detect_unhealthy_traders() {
+    let m = sol_market();
+    let trader_a = Pubkey::new_from_array([10; 32]);
+    let trader_b = Pubkey::new_from_array([11; 32]);
+    let traders = vec![
+        (trader_a, vec![long_position(m.market, 1000, 100)], 100u64),
+        (trader_b, vec![long_position(m.market, 1, 100)], 1000u64), // healthy
+    ];
+    let scenarios = default_scenarios(&[m.market]);
+    let candidates = detect_liquidations(&traders, &[m], &scenarios).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].trader, trader_a);
+}
+
+#[test]
+fn liquidation_orders_have_correct_side_and_priority() {
+    let m = sol_market();
+    let trader = Pubkey::new_from_array([20; 32]);
+    let candidates = vec![super::liquidation::LiquidationCandidate {
+        trader,
+        positions: vec![long_position(m.market, 5, 100)],
+        equity_signed: -10,
+        required: 10,
+        worst_scenario_idx: 1,
+    }];
+    let orders = generate_liquidation_orders(&candidates, &[m], 0, 50).unwrap();
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].side, Side::Short); // closing a long → sell
+    assert_eq!(orders[0].order_type, OrderType::Liquidation);
+    assert_eq!(orders[0].size, BaseLots(5));
+}
+
+#[test]
+fn shortfall_sufficient_collateral_covers() {
+    let m = sol_market();
+    let pos = long_position(m.market, 1, 100);
+    // Liquidated at 99 (price moved against the long); penalty 50bps; lot=1.
+    let r = compute_shortfall(&pos, Ticks(99), 100, &m, 50).unwrap();
+    // realized PnL = 1 * (99 - 100) * 1 = -1; penalty = 1*99*1*50/10000 = 0 (integer trunc)
+    // remaining = 100 - 1 - 0 = 99, recovered.
+    assert_eq!(r.shortfall_quote_lots, 0);
+    assert!(r.collateral_recovered_quote_lots > 0);
+}
+
+#[test]
+fn shortfall_bankruptcy_when_collateral_insufficient() {
+    let m = sol_market();
+    let pos = long_position(m.market, 100, 100);
+    // Liquidated at 50 — massive loss.
+    let r = compute_shortfall(&pos, Ticks(50), 100, &m, 50).unwrap();
+    assert!(r.shortfall_quote_lots > 0);
+    assert_eq!(r.collateral_recovered_quote_lots, 0);
+}
+
+// ─── insurance fund ─────────────────────────────────────────────────
+
+#[test]
+fn insurance_contributions_accumulate() {
+    let mut f = InsuranceFund::new(0, 1000, 5000, 5000, 100);
+    let c = f.contribute_from_fees(1000).unwrap();
+    assert_eq!(c, 100);
+    assert_eq!(f.balance_quote_lots, 100);
+    let c = f.contribute_from_toxicity_tax(200).unwrap();
+    assert_eq!(c, 100);
+    let c = f.contribute_from_liq_penalty(200).unwrap();
+    assert_eq!(c, 100);
+    assert_eq!(f.balance_quote_lots, 300);
+    assert_eq!(f.total_contributions, 300);
+}
+
+#[test]
+fn insurance_cover_full_when_balance_sufficient() {
+    let mut f = InsuranceFund::new(500, 1000, 5000, 5000, 100);
+    let (c, r) = f.cover_shortfall(200);
+    assert_eq!(c, 200);
+    assert_eq!(r, 0);
+    assert_eq!(f.balance_quote_lots, 300);
+}
+
+#[test]
+fn insurance_partial_when_underfunded() {
+    let mut f = InsuranceFund::new(100, 1000, 5000, 5000, 100);
+    let (c, r) = f.cover_shortfall(500);
+    assert_eq!(c, 100);
+    assert_eq!(r, 400);
+    assert_eq!(f.balance_quote_lots, 0);
+}
+
+#[test]
+fn insurance_pause_threshold_gates_new_positions() {
+    let mut f = InsuranceFund::new(50, 1000, 5000, 5000, 100);
+    assert!(!f.new_positions_allowed());
+    f.contribute_from_fees(1000).unwrap();
+    assert!(f.new_positions_allowed());
+}
+
+// ─── commit-reveal ──────────────────────────────────────────────────
+
+fn empty_commits() -> Vec<CommitRow> {
+    vec![CommitRow::default(); 8]
+}
+
+fn payload_for(trader: Pubkey, side: Side, size: u64, limit: u64) -> RevealPayload {
+    RevealPayload {
+        trader,
+        side,
+        size: BaseLots(size),
+        limit: Ticks(limit),
+        nonce: [7u8; 32],
+    }
+}
+
+#[test]
+fn commit_reveal_roundtrip() {
+    let mut commits = empty_commits();
+    let trader = Pubkey::new_from_array([42; 32]);
+    let p = payload_for(trader, Side::Long, 1, 100);
+    let h = p.hash();
+    register_commit(&mut commits, h, trader, 1000, 1, 5).unwrap();
+
+    let order = redeem_reveal(&mut commits, &p, 2, 999).unwrap();
+    assert_eq!(order.trader, trader);
+    assert_eq!(order.side, Side::Long);
+    assert_eq!(order.size, BaseLots(1));
+    assert_eq!(order.order_type, OrderType::Taker);
+}
+
+#[test]
+fn commit_reveal_mismatch_rejected() {
+    let mut commits = empty_commits();
+    let trader = Pubkey::new_from_array([42; 32]);
+    let p = payload_for(trader, Side::Long, 1, 100);
+    register_commit(&mut commits, p.hash(), trader, 1000, 1, 5).unwrap();
+
+    // Tamper.
+    let p_tampered = payload_for(trader, Side::Long, 2, 100);
+    let r = redeem_reveal(&mut commits, &p_tampered, 2, 999);
+    assert!(r.is_err());
+}
+
+#[test]
+fn commit_reveal_expired_rejected_and_swept() {
+    let mut commits = empty_commits();
+    let trader = Pubkey::new_from_array([42; 32]);
+    let p = payload_for(trader, Side::Long, 1, 100);
+    register_commit(&mut commits, p.hash(), trader, 1000, 1, 2).unwrap();
+
+    let r = redeem_reveal(&mut commits, &p, 10, 999);
+    assert!(r.is_err());
+
+    let seized = sweep_expired(&mut commits, 10);
+    assert_eq!(seized, 1000);
+}
+
+#[test]
+fn commit_duplicate_rejected() {
+    let mut commits = empty_commits();
+    let trader = Pubkey::new_from_array([42; 32]);
+    let p = payload_for(trader, Side::Long, 1, 100);
+    let h = p.hash();
+    register_commit(&mut commits, h, trader, 1000, 1, 5).unwrap();
+    let r = register_commit(&mut commits, h, trader, 1000, 1, 5);
+    assert!(r.is_err());
 }
 
 const _: Fill = Fill {

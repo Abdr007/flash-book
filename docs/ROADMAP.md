@@ -32,11 +32,13 @@ Target: deployable to MagicBlock ER devnet.
 - [x] VPIN calculator in Q32.32 fixed-point
 - [x] Type-safe newtype wrappers (BaseLots, QuoteLots, Ticks, Bps)
 - [x] Numbered error code enum (FlashBookError)
-- [x] 16 Rust unit tests with parity to TS suite
-- [ ] Stress-lattice margin in Rust (port from TS)
-- [ ] In-loop liquidation injector in Rust
-- [ ] Insurance fund waterfall in Rust
-- [ ] Commit-reveal in Rust with bond + L1 force-include path
+- [x] 31 Rust unit tests with parity to TS suite
+- [x] Stress-lattice margin in Rust (port from TS)
+- [x] In-loop liquidation injector in Rust
+- [x] Insurance fund waterfall in Rust
+- [x] Commit-reveal in Rust with hash check, expiry sweep, bond seizure
+      (L1 force-include path is a roadmap item — needs MagicBlock-side support)
+- [x] Property-based testing via `proptest` (6 properties × 2K cases each)
 - [ ] Anchor instruction handlers (currently skeletons only)
 - [ ] Account validation, PDA seeds, signer checks
 - [ ] Integration with MagicBlock ER `delegate_account` /
@@ -44,7 +46,7 @@ Target: deployable to MagicBlock ER devnet.
       Solana 2.x compat — upstream issue tracked)
 - [ ] Integration with `@flash_trade/magic-trade-client` session pattern
 - [ ] Anchor IDL generation
-- [ ] Property-based testing via `proptest`
+- [ ] L1 force-include path for censored reveals
 - [ ] Independent security audit (firm to be selected)
 
 **Deliverable:** auditable mainnet-ready program, devnet deployed.
