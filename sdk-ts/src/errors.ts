@@ -38,6 +38,7 @@ export enum FlashBookErrorCode {
   TraderLiquidatable = 1400,
   TooManyScenarios = 1401,
   LiquidationStale = 1402,
+  NotLiquidatable = 1403,
 
   // 1500-1599 insurance fund
   InsuranceBelowFloor = 1500,

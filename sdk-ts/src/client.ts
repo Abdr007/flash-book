@@ -263,6 +263,26 @@ export class FlashBookClient {
       .instruction();
   }
 
+  liquidatePositionIx(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const buffer = this.orderBuffer(args.market);
+    const traderState = this.traderState(args.trader);
+    const position = this.position(args.market, args.trader);
+    return this.methods
+      .liquidatePosition()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        orderBuffer: buffer.address,
+        traderState: traderState.address,
+        position: position.address,
+      })
+      .instruction();
+  }
+
   applyFillIx(args: {
     sequencer: PublicKey;
     market: PublicKey;

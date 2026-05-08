@@ -42,9 +42,19 @@ export interface FillAppliedEvent {
   batchNum: BN;
 }
 
+export interface LiquidationInjectedEvent {
+  market: PublicKey;
+  trader: PublicKey;
+  side: number;
+  sizeLots: BN;
+  limitTicks: BN;
+  worstScenarioIdx: number;
+}
+
 export type FlashBookEvent =
   | { name: 'MarketInitializedEvent'; data: MarketInitializedEvent }
   | { name: 'BatchClearedEvent'; data: BatchClearedEvent }
   | { name: 'CollateralDepositedEvent'; data: CollateralDepositedEvent }
   | { name: 'CollateralWithdrawnEvent'; data: CollateralWithdrawnEvent }
-  | { name: 'FillAppliedEvent'; data: FillAppliedEvent };
+  | { name: 'FillAppliedEvent'; data: FillAppliedEvent }
+  | { name: 'LiquidationInjectedEvent'; data: LiquidationInjectedEvent };

@@ -76,6 +76,8 @@ pub enum FlashBookError {
     TooManyScenarios = 1401,
     #[msg("Liquidation injection failed: position already closed")]
     LiquidationStale = 1402,
+    #[msg("Trader is healthy; no liquidation needed")]
+    NotLiquidatable = 1403,
 
     // ── 1500-1599 insurance fund ────────────────────────────────────
     #[msg("Insurance fund balance below threshold")]

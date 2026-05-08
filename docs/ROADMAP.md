@@ -56,7 +56,12 @@ Target: deployable to MagicBlock ER devnet.
 - [x] Realized-volatility coefficient in Rust FLP quoter (full TS parity)
 - [x] FLP_SEQ_RESERVED_OFFSET constant (no magic numbers)
 - [x] Clippy clean
-- [x] Anchor IDL generated (`idl/flash_book.json`, 2,389 lines)
+- [x] Anchor IDL generated (`idl/flash_book.json`, 2,595 lines)
+- [x] `liquidate_position` permissionless liquidation instruction
+- [x] `LiquidationInjectedEvent` for liquidation telemetry
+- [x] TypeScript SDK package (`@flash-book/sdk`) with 11 typed instruction
+      builders, 7 PDA derivers, error-code enum, default params helpers
+- [x] SDK test suite (28 tests covering PDAs, errors, params)
 - [ ] In-loop liquidation injection during run_batch (logic complete, wiring
       to per-trader iteration via remaining_accounts pending)
 - [ ] Stress-lattice margin enforcement on order intake

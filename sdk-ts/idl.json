@@ -528,6 +528,162 @@
       ]
     },
     {
+      "name": "liquidate_position",
+      "docs": [
+        "Liquidate a specific position. Anyone may call this for any position;",
+        "the matcher determines if the trader is actually unhealthy. If they",
+        "are not, the instruction errors with `NotLiquidatable` — preserving",
+        "the protocol invariant that healthy traders are never force-closed.",
+        "",
+        "On success: a synthetic Liquidation order is appended to the market's",
+        "order buffer. The next `run_batch` clears it at the batch uniform",
+        "price; `apply_fill` then settles the position. Bankruptcy waterfall",
+        "(insurance → ADL) is handled in subsequent steps.",
+        "",
+        "Single-market scope: this instruction assesses margin against the",
+        "trader's position on *this market only*. Cross-market portfolio",
+        "margin will be a separate `liquidate_portfolio` instruction taking",
+        "remaining_accounts (Phase 2)."
+      ],
+      "discriminator": [
+        187,
+        74,
+        229,
+        149,
+        102,
+        81,
+        221,
+        68
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Anyone may call. Future iteration may gate by sequencer or",
+            "liquidator-bond, but in v1 anyone can permissionlessly trigger",
+            "liquidation as long as the trader is genuinely unhealthy."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_state",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "position",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "open_trader_state",
       "docs": [
         "Initialize per-trader state."
@@ -1378,6 +1534,19 @@
       ]
     },
     {
+      "name": "LiquidationInjectedEvent",
+      "discriminator": [
+        164,
+        140,
+        71,
+        160,
+        135,
+        126,
+        192,
+        166
+      ]
+    },
+    {
       "name": "MarketInitializedEvent",
       "discriminator": [
         70,
@@ -1526,6 +1695,11 @@
       "code": 7402,
       "name": "LiquidationStale",
       "msg": "Liquidation injection failed: position already closed"
+    },
+    {
+      "code": 7403,
+      "name": "NotLiquidatable",
+      "msg": "Trader is healthy; no liquidation needed"
     },
     {
       "code": 7500,
@@ -1872,6 +2046,38 @@
           {
             "name": "total_payouts",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LiquidationInjectedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "limit_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "worst_scenario_idx",
+            "type": "u32"
           }
         ]
       }

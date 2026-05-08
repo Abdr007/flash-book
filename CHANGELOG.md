@@ -4,6 +4,44 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-05-08
+
+### Added — Phase 1 continued (liquidation entry point + SDK tests)
+
+**`liquidate_position` instruction.**
+- Permissionless: any caller can trigger liquidation against any position.
+- Validates the trader is *actually* unhealthy via the matcher's
+  `assess_margin` against the configured stress lattice; healthy traders
+  cannot be force-closed (returns `NotLiquidatable` error).
+- On success: synthesizes a `Liquidation`-priority order on the opposite
+  side at oracle ± liq_penalty and appends to the order buffer. The next
+  `run_batch` clears it at the batch uniform price; `apply_fill` then
+  settles the position.
+- Single-market scope: assesses against this market's position only.
+  Cross-market portfolio liquidation is a Phase 2 instruction.
+- New `LiquidationInjectedEvent` for off-chain consumers.
+- New error code `NotLiquidatable = 1403` to gate against unjustified
+  liquidation calls.
+
+**SDK extensions.**
+- `liquidatePositionIx` builder added to `FlashBookClient`.
+- `LiquidationInjectedEvent` type definition.
+- `NotLiquidatable` error code.
+- IDL regenerated (2,595 lines).
+
+**SDK tests (28 cases across 3 files).**
+- `tests/pdas.test.ts` — PDA derivation determinism + uniqueness across
+  10 cases (market deterministic, market differs on swap, order/commit
+  buffers derive from market, insurance + flp are global, trader_state
+  per-trader, position per-(market, trader), all bumps in valid range).
+- `tests/errors.test.ts` — error code family classification + name
+  lookup across all 8 families.
+- `tests/params.test.ts` — sanity-checks default parameters
+  (fee structure, margin tiers, FLP coefficients ≥ 0, batch interval
+  fits ER block range, contribution rates ≤ 10000 bps).
+
+### Total test count: 136 (71 TS sim + 31 Rust unit + 6 Rust property × 2K cases + 28 TS SDK).
+
 ## [0.7.0] — 2026-05-08
 
 ### Added — Phase 1 continued (TypeScript SDK)
