@@ -7,16 +7,22 @@ authoritative reference for what can and cannot go wrong.
 
 These hold at every batch boundary:
 
-| # | Invariant | Where checked |
-|---|---|---|
-| S1 | All collateral, capital, fund balances are finite | `engine.checkInvariants()` |
-| S2 | Insurance fund balance ≥ 0 | `engine.checkInvariants()` |
-| S3 | No trader has negative collateral without an open position | `engine.checkInvariants()` |
-| S4 | Σ trader collateral + FLP capital + insurance fund + protocol reserve = Σ initial endowments + Σ realized proceeds − Σ realized payouts | property test |
-| S5 | OI_long = OI_short (recomputed from authoritative position state) | `recomputeOpenInterest()` |
-| S6 | No position has size ≤ 0 (positions of zero size are removed) | `applyFillToTrader` |
-| S7 | No position has entry price ≤ 0 | order intake guard |
-| S8 | Cumulative funding index is finite and monotonic in the absence of negative premiums | `advanceFundingIndex` |
+| # | Invariant | Where checked (TS sim) | Where checked (Rust program) |
+|---|---|---|---|
+| S1 | All collateral, capital, fund balances are finite | `engine.checkInvariants()` | checked-arithmetic propagation |
+| S2 | Insurance fund balance ≥ 0 | `engine.checkInvariants()` | `InsuranceFund::cover_shortfall` saturates at 0 |
+| S3 | No trader has negative collateral without an open position | `engine.checkInvariants()` | `withdraw_collateral` open_positions gate |
+| S4 | Σ collateral + FLP + insurance ≡ Σ endowments + Σ realized proceeds − Σ realized payouts | property test (12K cases) | property test on matcher core |
+| S5 | OI_long = OI_short | `recomputeOpenInterest()` | `update_oi()` per fill, recomputed on each batch |
+| S6 | No position has size ≤ 0 (zero-size positions cleared) | `applyFillToTrader` | `apply_fill_to_position` clears on size→0 |
+| S7 | No position has entry price ≤ 0 | order intake guard | `place_limit_order` `ZeroPrice` check |
+| S8 | Cum funding index finite | `advanceFundingIndex` | `i128` checked overflow |
+| S9 | Stress-lattice gate prevents unhealthy traders from opening more positions | n/a | `place_limit_order` margin assessment |
+| S10 | Liquidations only fire on actually-unhealthy traders | n/a | `liquidate_position` `assess_margin` check + `NotLiquidatable` reject |
+| S11 | Measurement primitives (tick_size, base_lot_size, quote_lot_size, min_base_lots) are immutable post-market-init | n/a | `update_market_params` enforces equality |
+| S12 | FLP per-batch position growth ≤ pool_capital × max_growth_pct | quoter cap | quoter cap + buffer cap |
+| S13 | User order seq < FLP_SEQ_RESERVED_OFFSET | n/a | `place_limit_order` reject |
+| S14 | Mark price within oracle band (±oracle_band_bps) | `oracleBand()` | `run_batch` clamp |
 
 ## Per-trade guards
 
@@ -107,16 +113,32 @@ Honest about open problems and what's outside the protocol's scope:
    require independent audit before mainnet deployment. The reference
    matcher is a behavioural specification for the audited program.
 
-## Audit checklist (for the eventual Rust program)
+## Audit checklist (for the eventual production deployment)
 
-- [ ] No floating-point arithmetic in matcher path; all integer lot/tick
-- [ ] Re-entrancy guards on every state-mutating instruction
-- [ ] Account ownership checks on every PDA
-- [ ] Signed-vs-unsigned arithmetic correctness in funding integration
-- [ ] Overflow protection on cumulative funding index over multi-year horizons
-- [ ] Per-trader rate limits on commit/reveal/limit submissions
-- [ ] Bond mechanics for orphaned commits (slashing, recoverability)
-- [ ] Fraud-proof challenge window for ER state commits
-- [ ] Force-include path tested under sequencer-down scenarios
-- [ ] Insurance fund cap to prevent over-collection (excess returns to LPs)
+Status of items already in code:
+
+- [x] **No floating-point arithmetic in matcher path** — all `u64`/`u128`/`i128` with checked ops
+- [x] **Account ownership via PDA seeds + bump verification** — Anchor account macros
+- [x] **Signed-vs-unsigned arithmetic correctness in funding** — `i128` cumulative index, sign-aware
+- [x] **Overflow protection on cumulative funding index** — Q64.64 fixed-point i128 — multi-decade headroom
+- [x] **Per-trader rate limit on order submissions** — 16/batch via `TraderState.orders_this_batch`
+- [x] **Bond mechanics for orphaned commits** — `sweep_expired` returns total seized
+- [x] **Stress-lattice margin gate on order intake** — `place_limit_order` rejects unhealthy
+- [x] **Stress-lattice validation on liquidation** — `liquidate_position` rejects healthy
+- [x] **Numbered error families** — easy classification for monitors
+- [x] **Status circuit breaker** — Active / PostOnly / Paused / Closed
+- [x] **Authority transfer with explicit event audit trail**
+- [x] **Property tests** — 6 properties × 2K random cases on the matcher core
+
+Pending for production audit:
+
+- [ ] Re-entrancy guards on every state-mutating instruction (Anchor's borrow checker covers most; explicit verification of CPI paths needed)
+- [ ] Fraud-proof challenge window for ER state commits — depends on MagicBlock-side
+- [ ] Force-include path tested under sequencer-down scenarios — depends on MagicBlock-side
+- [ ] Insurance fund cap to prevent over-collection (excess returns to LPs) — design decision needed
 - [ ] ADL randomization within tied profit-ratio brackets to prevent gaming
+- [ ] Cross-market portfolio liquidation via remaining_accounts iteration
+- [ ] SPL token transfer integration on `deposit_collateral`/`withdraw_collateral` (currently accounting-only)
+- [ ] Real Pyth oracle CPI inside `run_batch` (currently authority-set)
+- [ ] BPF compilation + Mollusk/litesvm integration tests (blocked: upstream platform-tools edition2024)
+- [ ] Independent third-party audit (firm to be selected post-production-readiness)

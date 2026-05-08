@@ -25,3 +25,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.6"
+# solana-program-test integration tests are blocked by an upstream
+# lifetime-signature mismatch between Anchor 0.31's `entry` (which uses
+# `'info` for both the slice and AccountInfo) and solana-program-test's
+# expected HRTB `BuiltinFunctionWithContext` signature. Tracked; will
+# revisit when Anchor releases a compat shim or we build BPF.

@@ -4,6 +4,30 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-05-08
+
+### Added — Phase 1 continued (documentation pass)
+
+- **`docs/INSTRUCTIONS.md`** — full reference for the 16 Anchor
+  instructions. Each entry lists accounts (mode + seed), arguments,
+  gates, errors, and emitted events. The IDL remains the canonical
+  machine-readable source; this is its human-readable companion.
+- **`docs/SAFETY.md` updated** — invariants table now lists 14
+  solvency invariants, each annotated with where it's enforced (TS sim
+  vs Rust program). Audit checklist split into "already in code" (12
+  items, checked) and "pending for production audit" (10 items).
+- **`README.md`** — points to `INSTRUCTIONS.md` in the docs index.
+
+### Investigated and parked — `solana-program-test` integration tests
+
+Attempted integration tests via `solana-program-test` 2.1 hit an upstream
+lifetime-signature mismatch: Anchor 0.31's `entry` function uses `'info`
+for both the `&[AccountInfo<'info>]` slice ref and the `AccountInfo<'info>`
+items, while `solana-program-test`'s `BuiltinFunctionWithContext` HRTB
+expects two independent lifetimes. No safe (non-`unsafe`-transmute)
+workaround in current versions. Tracked as a known gap; revisit when
+Anchor releases a compat shim or BPF build is unblocked.
+
 ## [0.10.0] — 2026-05-08
 
 ### Added — Phase 1 continued (governance + circuit breaker)

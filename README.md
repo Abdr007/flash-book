@@ -148,8 +148,9 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the long-form design.
 ## Documentation
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system design, lifecycle, accounts
+- [`docs/INSTRUCTIONS.md`](docs/INSTRUCTIONS.md) — full reference for the 16 Anchor instructions
 - [`docs/MATH.md`](docs/MATH.md) — formal math: clearing, funding, margin, FLP spread
-- [`docs/SAFETY.md`](docs/SAFETY.md) — invariants, threat model, fault recovery
+- [`docs/SAFETY.md`](docs/SAFETY.md) — 14 solvency invariants, threat model, audit checklist
 - [`docs/COMPARISON.md`](docs/COMPARISON.md) — vs every modern perp DEX
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — staged path to mainnet
 
