@@ -100,6 +100,7 @@ export type {
   MarketAuthorityTransferredEvent,
   FlpExposureInitializedEvent,
   FlpCapitalUpdatedEvent,
+  OrderCancelledEvent,
   FlashBookEvent,
 } from './events.ts';
 export { MarketStatus } from './events.ts';

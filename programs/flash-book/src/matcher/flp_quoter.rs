@@ -77,10 +77,13 @@ pub fn generate_quotes(
         0
     };
 
-    // Inventory fraction in bps.
+    // Inventory fraction in bps. Clamped to ±BPS_DENOM (100%) so even a
+    // catastrophic accounting drift cannot cause i32 truncation to flip
+    // sign or wrap.
     let inv_bps: i32 = if inputs.pool_capital_quote_lots > 0 {
         let prod: i128 = (inputs.pool_net_quote_lots_signed as i128) * BPS_DENOM as i128;
-        (prod / inputs.pool_capital_quote_lots as i128) as i32
+        let raw = prod / inputs.pool_capital_quote_lots as i128;
+        raw.clamp(-(BPS_DENOM as i128), BPS_DENOM as i128) as i32
     } else {
         0
     };

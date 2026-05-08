@@ -4,6 +4,75 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] — 2026-05-08
+
+### Added — Phase 1 final-final-final polish (deep audit pass)
+
+After a second deep research pass studying every major perp DEX (Phoenix,
+Drift, Mango, Hyperliquid, dYdX v4, Manifest), three real correctness
+gaps closed:
+
+#### 1. Maker rebate and taker fee actually collected on-chain
+
+**Gap discovered**: `Fill.takerFee` and `Fill.makerRebate` were computed
+in the matcher's `clearBatch`, emitted in events, but `apply_fill` never
+actually deducted/credited them. Real money was being left on the floor.
+
+**Fix**: `apply_fill` now atomically:
+- Computes `notional = size × price × tick_size`.
+- Computes `taker_fee = notional × taker_fee_bps / 10_000`.
+- Computes `maker_rebate = notional × maker_rebate_bps / 10_000`.
+- Asserts `maker_rebate ≤ taker_fee` (defense against bad governance).
+- Deducts taker_fee from taker collateral.
+- Credits maker_rebate to maker collateral.
+- Contributes `(taker_fee - maker_rebate) × fee_contribution_bps / 10_000`
+  to insurance fund balance and `total_contributions`.
+- Increments `market.total_fees_collected`.
+
+`InsuranceFundAccount` is now a required mut account in `ApplyFill`.
+
+#### 2. `cancel_order` instruction (every real exchange has this)
+
+Orders sat in the buffer until run_batch with no way to retract.
+Manifest, Phoenix, Hyperliquid, dYdX, Drift — every CLOB has a
+cancel. Now we do too.
+
+- Walks buffer slots; finds the one with `seq == arg && trader == signer`.
+- Rejects synthesized orders (FLP_virtual, Liquidation, ADL).
+- Sets `valid = 0`, decrements `head`.
+- Emits `OrderCancelledEvent`.
+- Errors: `WrongTrader`, `OutOfRange` (synth), `LiquidationStale` (not found).
+
+Total Anchor instruction surface: **21**.
+
+#### 3. FLP inventory_bps clamp (defense in depth)
+
+In `flp_quoter.rs`, `inv_bps` was cast from i128 to i32. Even though the
+math couldn't realistically overflow (capital > 0 guard), a future
+refactor that breaks the invariant could cause sign flip on cast.
+
+**Fix**: `raw.clamp(-(BPS_DENOM as i128), BPS_DENOM as i128) as i32` —
+clamps to ±100% before the cast. Mathematically equivalent in normal
+operation; refactor-safe.
+
+### 4 new E2E tests + SDK extensions
+
+- `cancel_order_removes_from_buffer`
+- `cancel_order_rejects_other_traders_order`
+- `apply_fill_settles_two_trader_positions` updated for fee accrual
+- SDK gets `cancelOrderIx` builder, `OrderCancelledEvent` type
+- 21st builder coverage tripwire
+
+### Notes from the manifest research
+
+Manifest's HyperTree (80-byte uniform graph nodes) and "global orders"
+(deferred token movement) achieve essentially what our matcher core
+already does via fixed-size OrderSlot + Anchor's init-if-needed PDAs.
+Their core/wrapper architecture mirrors our matcher::* + lib.rs
+separation.
+
+### Total test count: 260 (162 TS sim+SDK + 31 Rust unit + 36 Rust property × 2K + 31 E2E integration).
+
 ## [0.28.0] — 2026-05-08
 
 ### Security hardening — defenses against 2025 production attack patterns

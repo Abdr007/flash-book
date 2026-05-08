@@ -169,8 +169,21 @@ describe('Instruction builders', () => {
       priceTicks: new BN(99_950),
       takerSide: 'long',
     });
-    // sequencer, market, taker_state, maker_state, taker_pos, maker_pos, sysprog
-    expect(ix.keys.length).toBe(7);
+    // sequencer, market, insurance_fund, taker_state, maker_state,
+    // taker_pos, maker_pos, sysprog
+    expect(ix.keys.length).toBe(8);
+  });
+
+  test('cancelOrderIx', async () => {
+    const client = makeClient();
+    const market = client.market(SOL, USDC).address;
+    const ix = await client.cancelOrderIx({
+      trader: Keypair.generate().publicKey,
+      market,
+      orderSeq: new BN(42),
+    });
+    // trader, market, order_buffer
+    expect(ix.keys.length).toBe(3);
   });
 
   test('applyFlpFillIx', async () => {
@@ -280,7 +293,7 @@ describe('Instruction builders', () => {
 
   // ─── Coverage check ────────────────────────────────────────────────
 
-  test('all 20 instruction builders covered', () => {
+  test('all 21 instruction builders covered', () => {
     // This test serves as a tripwire: if a new instruction is added to
     // the program, this list will fall out of sync with the test count
     // above.
@@ -299,6 +312,7 @@ describe('Instruction builders', () => {
       'runBatchIx',
       'applyFillIx',
       'applyFlpFillIx',
+      'cancelOrderIx',
       'liquidatePositionIx',
       'liquidatePortfolioIx',
       'updateOracleIx',
@@ -306,7 +320,7 @@ describe('Instruction builders', () => {
       'updateMarketParamsIx',
       'transferMarketAuthorityIx',
     ];
-    expect(expected.length).toBe(20);
+    expect(expected.length).toBe(21);
     const client = makeClient();
     for (const name of expected) {
       expect(typeof (client as unknown as Record<string, unknown>)[name]).toBe('function');

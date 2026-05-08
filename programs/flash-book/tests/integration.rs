@@ -2019,6 +2019,7 @@ async fn apply_fill_settles_two_trader_positions() {
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer = payer
             AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund, false), // mut: receives fee contribution
             AccountMeta::new(alice_state, false),
             AccountMeta::new(bob_state, false),
             AccountMeta::new(alice_pos, false),
@@ -2510,4 +2511,153 @@ async fn place_limit_order_rejects_above_position_cap() {
         ))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn cancel_order_removes_from_buffer() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    // Place an order.
+    let place_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 1,
+            limit_ticks: 99_950,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let buf_with_order: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(buf_with_order.head, 1);
+    let placed_seq = buf_with_order.slots[0].seq;
+
+    // Cancel it.
+    let cancel_ix = build_ix(
+        flash_book::instruction::CancelOrder { order_seq: placed_seq },
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[cancel_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let buf_after: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(buf_after.head, 0);
+    // The slot should be cleared.
+    assert_eq!(buf_after.slots[0].valid, 0);
+}
+
+#[tokio::test]
+async fn cancel_order_rejects_other_traders_order() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    let alice_state = setup_trader(&mut ctx, &payer, &alice, 50_000).await;
+    let _bob_state = setup_trader(&mut ctx, &payer, &bob, 50_000).await;
+    let (alice_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        alice.pubkey().as_ref(),
+    ]);
+
+    // Alice places.
+    let place_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 1,
+            limit_ticks: 99_950,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(alice_state, false),
+            AccountMeta::new(alice_pos, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place_ix],
+            Some(&alice.pubkey()),
+            &[&alice],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let buf: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    let alice_seq = buf.slots[0].seq;
+
+    // Bob tries to cancel Alice's order.
+    let cancel_ix = build_ix(
+        flash_book::instruction::CancelOrder { order_seq: alice_seq },
+        vec![
+            AccountMeta::new_readonly(bob.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[cancel_ix],
+            Some(&bob.pubkey()),
+            &[&bob],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "bob should not be able to cancel alice's order");
+
+    // Alice's order is still there.
+    let buf_unchanged: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(buf_unchanged.head, 1);
 }

@@ -32,6 +32,12 @@ export interface CollateralWithdrawnEvent {
   newBalance: BN;
 }
 
+export interface OrderCancelledEvent {
+  market: PublicKey;
+  trader: PublicKey;
+  orderSeq: BN;
+}
+
 export interface FillAppliedEvent {
   market: PublicKey;
   taker: PublicKey;
@@ -108,4 +114,5 @@ export type FlashBookEvent =
   | { name: 'MarketParamsUpdatedEvent'; data: MarketParamsUpdatedEvent }
   | { name: 'MarketAuthorityTransferredEvent'; data: MarketAuthorityTransferredEvent }
   | { name: 'FlpExposureInitializedEvent'; data: FlpExposureInitializedEvent }
-  | { name: 'FlpCapitalUpdatedEvent'; data: FlpCapitalUpdatedEvent };
+  | { name: 'FlpCapitalUpdatedEvent'; data: FlpCapitalUpdatedEvent }
+  | { name: 'OrderCancelledEvent'; data: OrderCancelledEvent };

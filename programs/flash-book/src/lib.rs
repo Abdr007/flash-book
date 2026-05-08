@@ -304,10 +304,81 @@ pub mod flash_book {
         let market_key = market.key();
         let funding_index = market.cum_funding_index;
         let current_batch = market.current_batch;
+
+        // Compute taker fee + maker rebate for this fill.
+        // notional = size × price × tick_size (in quote_lots).
+        let notional_u128 = (size_lots as u128)
+            .checked_mul(price_ticks as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+            .checked_mul(market.params.tick_size as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let taker_fee_u128 =
+            notional_u128.saturating_mul(market.params.taker_fee_bps as u128) / constants::BPS_DENOM as u128;
+        let maker_rebate_u128 =
+            notional_u128.saturating_mul(market.params.maker_rebate_bps as u128) / constants::BPS_DENOM as u128;
+        // Rebate must never exceed fee; defense against bad governance config.
+        require!(
+            maker_rebate_u128 <= taker_fee_u128,
+            FlashBookError::OutOfRange
+        );
+        let taker_fee = if taker_fee_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            taker_fee_u128 as u64
+        };
+        let maker_rebate = if maker_rebate_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            maker_rebate_u128 as u64
+        };
+        let net_fee = taker_fee.saturating_sub(maker_rebate);
         let taker_side_enum = if taker_side == 0 { Side::Long } else { Side::Short };
         let maker_side_enum = taker_side_enum.opposite();
         let taker_trader_pk = ctx.accounts.taker_trader_state.trader;
         let maker_trader_pk = ctx.accounts.maker_trader_state.trader;
+
+        // Apply fees BEFORE position state is mutated, so reads are clean.
+        // Taker pays fee from collateral (must have it; place_limit_order's
+        // margin gate ensured this at intake time, but we double-check).
+        {
+            let taker_state = &mut ctx.accounts.taker_trader_state;
+            taker_state.collateral_quote_lots = taker_state
+                .collateral_quote_lots
+                .checked_sub(taker_fee)
+                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+        }
+        // Maker receives rebate.
+        {
+            let maker_state = &mut ctx.accounts.maker_trader_state;
+            maker_state.collateral_quote_lots = maker_state
+                .collateral_quote_lots
+                .checked_add(maker_rebate)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        }
+        // Net fee to insurance fund (per fee_contribution_bps).
+        {
+            let fund = &mut ctx.accounts.insurance_fund;
+            let contribution = (net_fee as u128)
+                .saturating_mul(fund.fee_contribution_bps as u128)
+                .checked_div(constants::BPS_DENOM as u128)
+                .ok_or_else(|| error!(FlashBookError::DivisionByZero))?;
+            let contribution_u64 = if contribution > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                contribution as u64
+            };
+            fund.balance_quote_lots = fund
+                .balance_quote_lots
+                .checked_add(contribution_u64)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            fund.total_contributions = fund
+                .total_contributions
+                .saturating_add(contribution_u64);
+        }
+        market.total_fees_collected = market
+            .total_fees_collected
+            .checked_add(net_fee)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
 
         let taker_pos = &mut ctx.accounts.taker_position;
         let maker_pos = &mut ctx.accounts.maker_position;
@@ -690,6 +761,46 @@ pub mod flash_book {
             .head
             .checked_add(1)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        Ok(())
+    }
+
+    /// Cancel a pending order from the buffer. Only the original trader can
+    /// cancel; other callers (or stale order_seq values) are rejected. The
+    /// order must still be in the buffer (not yet processed by run_batch).
+    ///
+    /// On success: the slot is cleared (`valid = 0`), `head` decrements,
+    /// and an `OrderCancelledEvent` is emitted.
+    pub fn cancel_order(
+        ctx: Context<CancelOrder>,
+        order_seq: u64,
+    ) -> Result<()> {
+        let buffer = &mut ctx.accounts.order_buffer;
+        let trader_key = ctx.accounts.trader.key();
+
+        let mut found = false;
+        for slot in buffer.slots.iter_mut() {
+            if slot.valid == 1 && slot.seq == order_seq {
+                require!(slot.trader == trader_key, FlashBookError::WrongTrader);
+                // Only allow cancelling user-submitted orders, not synthesized
+                // FLP/liquidation/ADL injections.
+                require!(
+                    slot.order_type == OrderType::Limit as u8
+                        || slot.order_type == OrderType::Taker as u8,
+                    FlashBookError::OutOfRange
+                );
+                *slot = OrderSlot::default();
+                buffer.head = buffer.head.saturating_sub(1);
+                found = true;
+                break;
+            }
+        }
+        require!(found, FlashBookError::LiquidationStale);
+
+        emit!(OrderCancelledEvent {
+            market: buffer.market,
+            trader: trader_key,
+            order_seq,
+        });
         Ok(())
     }
 
@@ -1613,6 +1724,13 @@ pub struct ApplyFill<'info> {
 
     #[account(
         mut,
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(
+        mut,
         seeds = [TraderStateAccount::SEED, taker_trader_state.trader.as_ref()],
         bump = taker_trader_state.bump,
     )]
@@ -1644,6 +1762,24 @@ pub struct ApplyFill<'info> {
     pub maker_position: Account<'info, state::PositionAccount>,
 
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CancelOrder<'info> {
+    pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
+        bump = order_buffer.bump,
+    )]
+    pub order_buffer: Account<'info, OrderBufferAccount>,
 }
 
 #[derive(Accounts)]
@@ -1834,6 +1970,13 @@ pub struct LiquidationInjectedEvent {
     pub size_lots: u64,
     pub limit_ticks: u64,
     pub worst_scenario_idx: u32,
+}
+
+#[event]
+pub struct OrderCancelledEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub order_seq: u64,
 }
 
 #[event]

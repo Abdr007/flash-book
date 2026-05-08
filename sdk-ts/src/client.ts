@@ -472,6 +472,7 @@ export class FlashBookClient {
     const makerState = this.traderState(args.makerTrader);
     const takerPos = this.position(args.market, args.takerTrader);
     const makerPos = this.position(args.market, args.makerTrader);
+    const fund = this.insuranceFund();
     return this.methods
       .applyFill(
         args.sizeLots,
@@ -481,11 +482,28 @@ export class FlashBookClient {
       .accountsPartial({
         sequencer: args.sequencer,
         market: args.market,
+        insuranceFund: fund.address,
         takerTraderState: takerState.address,
         makerTraderState: makerState.address,
         takerPosition: takerPos.address,
         makerPosition: makerPos.address,
         systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  cancelOrderIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    orderSeq: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const buffer = this.orderBuffer(args.market);
+    return this.methods
+      .cancelOrder(args.orderSeq)
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        orderBuffer: buffer.address,
       })
       .instruction();
   }

@@ -64,6 +64,33 @@
           }
         },
         {
+          "name": "insurance_fund",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
           "name": "taker_trader_state",
           "writable": true,
           "pda": {
@@ -361,6 +388,96 @@
         {
           "name": "taker_side",
           "type": "u8"
+        }
+      ]
+    },
+    {
+      "name": "cancel_order",
+      "docs": [
+        "Cancel a pending order from the buffer. Only the original trader can",
+        "cancel; other callers (or stale order_seq values) are rejected. The",
+        "order must still be in the buffer (not yet processed by run_batch).",
+        "",
+        "On success: the slot is cleared (`valid = 0`), `head` decrements,",
+        "and an `OrderCancelledEvent` is emitted."
+      ],
+      "discriminator": [
+        95,
+        129,
+        237,
+        240,
+        8,
+        49,
+        223,
+        132
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "order_seq",
+          "type": "u64"
         }
       ]
     },
@@ -2367,6 +2484,19 @@
         39,
         53
       ]
+    },
+    {
+      "name": "OrderCancelledEvent",
+      "discriminator": [
+        200,
+        73,
+        179,
+        145,
+        247,
+        176,
+        10,
+        101
+      ]
     }
   ],
   "errors": [
@@ -3381,6 +3511,26 @@
                 64
               ]
             }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderCancelledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "order_seq",
+            "type": "u64"
           }
         ]
       }
