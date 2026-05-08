@@ -1192,7 +1192,7 @@ pub mod flash_book {
         // Walk remaining_accounts in (market, position) pairs.
         let remaining = ctx.remaining_accounts;
         require!(
-            remaining.len() % 2 == 0,
+            remaining.len().is_multiple_of(2),
             FlashBookError::OutOfRange
         );
         let program_id = ctx.program_id;

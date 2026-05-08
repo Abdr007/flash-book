@@ -4,6 +4,64 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] — 2026-05-08
+
+### Security hardening — defenses against 2025 production attack patterns
+
+After deep research into how every major perp DEX has actually failed
+in production, three concrete attack defenses are now wired into the
+program:
+
+#### 1. JELLY/POPCAT-style mark-price manipulation (Hyperliquid 2025)
+
+**Attack pattern**: attackers manipulate thin upstream price sources
+to distort the weighted index, then trigger cascading liquidations.
+JELLY (March 2025) and POPCAT (November 2025) cost Hyperliquid ~$5M
+each.
+
+**Defense**: oracle staleness + confidence gates on every update.
+- `MarketParams.oracle_staleness_max_seconds` — rejects updates
+  whose `published_at` is more than N seconds old.
+- `MarketParams.oracle_confidence_max_bps` — rejects updates where
+  `confidence / price > N bps`.
+- `update_oracle(price, confidence, published_at_unix_seconds)`
+  signature.
+- `MarketAccount.oracle_published_at_unix_seconds` field.
+- New errors: `OracleTooStale (1800)`,
+  `OracleConfidenceTooWide (1801)`, `OraclePausedConfidence (1802)`.
+
+This implements Pyth's documented best practice: clamp price updates
+by confidence interval, reject stale, pause when confidence widens.
+
+#### 2. Coordinated multi-wallet position buildup (POPCAT 2025)
+
+**Attack pattern**: distribute capital across many wallets, each
+opening sub-cap positions, accumulate massive concentrated risk that
+single-wallet caps don't catch.
+
+**Defense**: per-trader per-market position size cap.
+- `MarketParams.max_position_lots_per_trader` — 0 = unlimited; non-zero
+  rejects orders that would push position size past the cap.
+- New error: `PositionSizeCapExceeded (1209)`.
+- Enforced in `place_limit_order` *before* the stress-lattice margin gate.
+
+#### 3. ADL trilemma documentation (arxiv 2512.01112, Dec 2025)
+
+The recent paper proves no ADL policy can simultaneously satisfy
+exchange solvency, revenue, and trader fairness. Documented in
+`docs/SAFETY.md` with the explicit trade-off; our design pairs
+profit-ratio × leverage ranking with insurance-fund-first to minimize
+ADL frequency.
+
+### 3 new E2E integration tests
+
+- `update_oracle_rejects_stale_price`
+- `update_oracle_rejects_wide_confidence`
+- `place_limit_order_rejects_above_position_cap`
+  (with positive boundary case)
+
+### Total test count: 257 (161 TS sim+SDK + 31 Rust unit + 36 Rust property × 2K + 29 E2E integration).
+
 ## [0.27.0] — 2026-05-08
 
 ### Added — Phase 1 final-final polish (test coverage gaps closed)
