@@ -509,6 +509,176 @@
       ]
     },
     {
+      "name": "close_trader_ata",
+      "docs": [
+        "Close the trader's quote ATA and refund the rent lamports to",
+        "`rent_destination`. CPIs to SPL Token's `CloseAccount`, which",
+        "enforces an empty token balance — closing a non-empty ATA fails",
+        "with `TokenError::NonNativeHasBalance` from the SPL program.",
+        "",
+        "The trader signs (they are the ATA authority). This is useful when",
+        "a trader is fully exited and wants to reclaim their rent, or when",
+        "the SDK wants to clean up an accidentally-created ATA."
+      ],
+      "discriminator": [
+        160,
+        93,
+        240,
+        189,
+        121,
+        32,
+        244,
+        188
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "docs": [
+            "Trader signs — they are the ATA authority."
+          ],
+          "signer": true
+        },
+        {
+          "name": "insurance_fund",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "trader_quote_ata",
+          "docs": [
+            "The ATA being closed. Constrained to be the canonical ATA for",
+            "(trader, quote_mint). SPL Token's CloseAccount will enforce that",
+            "the token balance is zero before allowing close."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "trader"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "quote_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "rent_destination",
+          "docs": [
+            "Where the freed rent lamports are credited. Caller's choice — for",
+            "most onboarding flows this is the trader; for sponsored flows the",
+            "original payer might want to reclaim."
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "deposit_collateral",
       "docs": [
         "Deposit collateral. Performs an SPL transfer from the trader's",

@@ -259,6 +259,34 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Close the trader's quote ATA and refund rent to `rentDestination`
+  /// (defaults to the trader). The trader signs as ATA authority. The
+  /// SPL Token program enforces that the ATA must hold zero tokens —
+  /// withdraw any remaining balance first.
+  closeTraderAtaIx(args: {
+    trader: PublicKey;
+    quoteMint: PublicKey;
+    /** Optional override; defaults to the trader. */
+    rentDestination?: PublicKey;
+    /** Optional override; defaults to the canonical ATA for (trader, quoteMint). */
+    traderQuoteAta?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const fund = this.insuranceFund();
+    const ata = args.traderQuoteAta ?? associatedTokenAddress(args.trader, args.quoteMint);
+    const dest = args.rentDestination ?? args.trader;
+    return this.methods
+      .closeTraderAta()
+      .accountsPartial({
+        trader: args.trader,
+        insuranceFund: fund.address,
+        quoteMint: args.quoteMint,
+        traderQuoteAta: ata,
+        rentDestination: dest,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
   depositCollateralIx(args: {
     trader: PublicKey;
     amount: bigint | number;

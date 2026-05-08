@@ -837,6 +837,151 @@ async fn init_trader_ata_then_deposit_in_same_tx() {
 }
 
 #[tokio::test]
+async fn close_trader_ata_refunds_rent_and_destroys_account() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let trader = Keypair::new();
+
+    // Fund the trader so they can sign.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &trader.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let trader_ata = create_ata(&mut ctx, &payer, trader.pubkey(), protocol.quote_mint).await;
+
+    let ata_lamports_before = ctx
+        .banks_client
+        .get_account(trader_ata)
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    let trader_lamports_before = ctx
+        .banks_client
+        .get_account(trader.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+
+    let close_ix = build_ix(
+        flash_book::instruction::CloseTraderAta {},
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(trader_ata, false),
+            AccountMeta::new(trader.pubkey(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[close_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // ATA must no longer exist on-chain.
+    assert!(ctx.banks_client.get_account(trader_ata).await.unwrap().is_none());
+
+    // Trader's lamports increased by the ATA rent (minus the tx fee they
+    // paid as fee-payer). Rather than predict the exact fee, assert the
+    // trader's balance gained at least most of the ATA rent.
+    let trader_lamports_after = ctx
+        .banks_client
+        .get_account(trader.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    let net_gain = trader_lamports_after as i128 - trader_lamports_before as i128;
+    // Allow up to 50_000 lamports of fee + base subtraction.
+    assert!(
+        net_gain > (ata_lamports_before as i128) - 50_000,
+        "expected trader to gain ~ata_rent ({}) lamports, got net={}",
+        ata_lamports_before,
+        net_gain,
+    );
+}
+
+#[tokio::test]
+async fn close_trader_ata_rejects_non_empty_balance() {
+    // SPL Token's CloseAccount requires the token balance to be zero.
+    // This test ensures we surface that precondition rather than allow
+    // a silent loss of funds via close.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let trader = Keypair::new();
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &trader.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let trader_ata = create_ata(&mut ctx, &payer, trader.pubkey(), protocol.quote_mint).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, trader_ata, 1).await;
+
+    let close_ix = build_ix(
+        flash_book::instruction::CloseTraderAta {},
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(trader_ata, false),
+            AccountMeta::new(trader.pubkey(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[close_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "close_trader_ata must fail when ATA holds tokens"
+    );
+
+    // ATA must still exist after the failed close.
+    assert!(ctx.banks_client.get_account(trader_ata).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn deposit_collateral_credits_balance_and_emits_event() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;

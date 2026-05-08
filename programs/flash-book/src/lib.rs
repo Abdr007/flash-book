@@ -13,7 +13,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer};
 
 pub mod constants;
 pub mod errors;
@@ -272,6 +272,25 @@ pub mod flash_book {
     /// so this can only be used to create ATAs that Flash Book accepts.
     pub fn init_trader_ata(_ctx: Context<InitTraderAta>) -> Result<()> {
         Ok(())
+    }
+
+    /// Close the trader's quote ATA and refund the rent lamports to
+    /// `rent_destination`. CPIs to SPL Token's `CloseAccount`, which
+    /// enforces an empty token balance — closing a non-empty ATA fails
+    /// with `TokenError::NonNativeHasBalance` from the SPL program.
+    ///
+    /// The trader signs (they are the ATA authority). This is useful when
+    /// a trader is fully exited and wants to reclaim their rent, or when
+    /// the SDK wants to clean up an accidentally-created ATA.
+    pub fn close_trader_ata(ctx: Context<CloseTraderAta>) -> Result<()> {
+        let cpi_accounts = CloseAccount {
+            account: ctx.accounts.trader_quote_ata.to_account_info(),
+            destination: ctx.accounts.rent_destination.to_account_info(),
+            authority: ctx.accounts.trader.to_account_info(),
+        };
+        let cpi_ctx =
+            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+        token::close_account(cpi_ctx)
     }
 
     /// Deposit collateral. Performs an SPL transfer from the trader's
@@ -1861,6 +1880,40 @@ pub struct InitTraderAta<'info> {
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CloseTraderAta<'info> {
+    /// Trader signs — they are the ATA authority.
+    pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// The ATA being closed. Constrained to be the canonical ATA for
+    /// (trader, quote_mint). SPL Token's CloseAccount will enforce that
+    /// the token balance is zero before allowing close.
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = trader,
+    )]
+    pub trader_quote_ata: Account<'info, TokenAccount>,
+
+    /// Where the freed rent lamports are credited. Caller's choice — for
+    /// most onboarding flows this is the trader; for sponsored flows the
+    /// original payer might want to reclaim.
+    /// CHECK: lamport-only credit; account data is not interpreted.
+    #[account(mut)]
+    pub rent_destination: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]

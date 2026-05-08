@@ -107,6 +107,41 @@ describe('Instruction builders', () => {
     expect(ix.keys[4].pubkey.toBase58()).toBe(expectedAta.toBase58());
   });
 
+  test('closeTraderAtaIx', async () => {
+    const client = makeClient();
+    const trader = Keypair.generate().publicKey;
+    const ix = await client.closeTraderAtaIx({
+      trader,
+      quoteMint: Keypair.generate().publicKey,
+    });
+    // trader, insurance_fund, quote_mint, trader_quote_ata,
+    // rent_destination, token_program
+    expect(ix.keys.length).toBe(6);
+  });
+
+  test('closeTraderAtaIx defaults rent destination to trader', async () => {
+    const client = makeClient();
+    const trader = Keypair.generate().publicKey;
+    const ix = await client.closeTraderAtaIx({
+      trader,
+      quoteMint: Keypair.generate().publicKey,
+    });
+    // rent_destination is account index 4.
+    expect(ix.keys[4].pubkey.toBase58()).toBe(trader.toBase58());
+  });
+
+  test('closeTraderAtaIx accepts explicit rent destination', async () => {
+    const client = makeClient();
+    const trader = Keypair.generate().publicKey;
+    const sponsor = Keypair.generate().publicKey;
+    const ix = await client.closeTraderAtaIx({
+      trader,
+      quoteMint: Keypair.generate().publicKey,
+      rentDestination: sponsor,
+    });
+    expect(ix.keys[4].pubkey.toBase58()).toBe(sponsor.toBase58());
+  });
+
   // ─── Lifecycle (4) ─────────────────────────────────────────────────
 
   test('depositCollateralIx', async () => {
