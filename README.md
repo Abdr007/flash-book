@@ -2,7 +2,7 @@
 
 > Pool-backed CLOB matched by frequent batch auction on MagicBlock Ephemeral Rollups. Reference design and simulator for Flash Trade's announced Orderbook V3.
 
-[![tests](https://img.shields.io/badge/tests-198%20passing-brightgreen)]()
+[![tests](https://img.shields.io/badge/tests-209%20passing-brightgreen)]()
 [![fuzz](https://img.shields.io/badge/fuzz-12K%20cases-brightgreen)]()
 [![e2e](https://img.shields.io/badge/e2e-20%20on--chain-brightgreen)]()
 [![ix](https://img.shields.io/badge/instructions-20-blue)]()

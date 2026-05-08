@@ -4,6 +4,42 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] — 2026-05-08
+
+### Added — Phase 1 polish (SDK FBA simulator)
+
+**`sdk-ts/src/order-simulator.ts`** — pure-TypeScript port of the
+on-chain Walrasian clearing algorithm.
+
+- `simulateBatchClearing(orders, priorMarkTicks)` returns
+  `{ clearingPriceTicks, clearingVolumeLots, fills[] }` — the same
+  output shape as `clear_batch` in
+  `programs/flash-book/src/matcher/fba.rs`.
+- `fillForOrder(result, orderId)` — aggregate size + price filled for
+  a specific order in the result.
+- Mirrors all on-chain semantics: priority order
+  (`liquidation > adl > taker > flp_virtual > limit`), FIFO within
+  priority class, self-trade prevention, tie-breaking by proximity to
+  prior mark.
+
+Pairs with `previewPortfolioRisk` for full pre-trade analysis:
+- Fetch the order buffer + market state + your position.
+- Add your prospective order.
+- Simulate the batch → get expected fill price + volume.
+- Project new position, run risk preview against post-fill portfolio.
+- Decide: submit, adjust limit, or back off.
+
+This is the canonical UI feature for any frontend (TradingView-style
+"limit order will fill at ~X with Y% slippage and result in N% to
+liquidation"). It was previously impossible without re-running the
+on-chain matcher in simulation.
+
+11 tests covering: empty batch, non-crossing, crossing, ties, priority,
+FIFO, self-trade, MEV-neutrality (permutation), volume maximization,
+fill aggregation.
+
+### Total test count: 209 (152 TS sim+SDK + 31 Rust unit + 6 Rust property × 2K + 20 E2E integration).
+
 ## [0.19.0] — 2026-05-08
 
 ### Added — Phase 1 polish (multi-market E2E coverage)

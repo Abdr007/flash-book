@@ -65,6 +65,16 @@ export {
 } from './risk-preview.ts';
 
 export {
+  simulateBatchClearing,
+  fillForOrder,
+  SIM_PRIORITY,
+  type SimSide,
+  type SimOrder,
+  type SimFill,
+  type SimResult,
+} from './order-simulator.ts';
+
+export {
   FlashBookErrorCode,
   errorFamily,
   errorName,
