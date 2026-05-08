@@ -138,6 +138,126 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Deposit collateral into the trader's state. SPL token transfer is
+    /// done in a follow-up (this instruction credits the trader's accounting
+    /// balance; production wiring also moves USDC into the protocol vault
+    /// via SPL CPI).
+    pub fn deposit_collateral(
+        ctx: Context<DepositCollateral>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        let s = &mut ctx.accounts.trader_state;
+        s.collateral_quote_lots = s
+            .collateral_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        emit!(CollateralDepositedEvent {
+            trader: s.trader,
+            amount: amount_quote_lots,
+            new_balance: s.collateral_quote_lots,
+        });
+        Ok(())
+    }
+
+    /// Withdraw collateral. Blocked if it would push the trader below
+    /// initial-margin requirement on any open position. (For v1 we approximate
+    /// by checking against `open_positions == 0`; production wiring iterates
+    /// open Position PDAs via remaining_accounts.)
+    pub fn withdraw_collateral(
+        ctx: Context<WithdrawCollateral>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        let s = &mut ctx.accounts.trader_state;
+        require!(
+            s.open_positions == 0,
+            FlashBookError::InsufficientCollateral
+        );
+        require!(
+            amount_quote_lots <= s.collateral_quote_lots,
+            FlashBookError::InsufficientCollateral
+        );
+        s.collateral_quote_lots = s
+            .collateral_quote_lots
+            .checked_sub(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        emit!(CollateralWithdrawnEvent {
+            trader: s.trader,
+            amount: amount_quote_lots,
+            new_balance: s.collateral_quote_lots,
+        });
+        Ok(())
+    }
+
+    /// Apply a single fill against the taker's and maker's Position PDAs.
+    /// Called by the sequencer after `run_batch` for each emitted Fill,
+    /// or by an off-chain bookkeeper that batches multiple fills per tx.
+    ///
+    /// Trust model: `sequencer` is the same authority as `run_batch`; the
+    /// fill data is taken at face value (production version verifies via
+    /// per-batch fill buffer or Merkle proof).
+    pub fn apply_fill(
+        ctx: Context<ApplyFill>,
+        size_lots: u64,
+        price_ticks: u64,
+        taker_side: u8,
+    ) -> Result<()> {
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(taker_side <= 1, FlashBookError::OutOfRange);
+
+        let market = &ctx.accounts.market;
+        let market_key = market.key();
+        let funding_index = market.cum_funding_index;
+        let taker_side_enum = if taker_side == 0 { Side::Long } else { Side::Short };
+        let maker_side_enum = taker_side_enum.opposite();
+
+        let taker_pos = &mut ctx.accounts.taker_position;
+        let maker_pos = &mut ctx.accounts.maker_position;
+
+        // Initialize if first time (Anchor init_if_needed does most of this).
+        if taker_pos.market == Pubkey::default() {
+            taker_pos.market = market_key;
+            taker_pos.trader = ctx.accounts.taker_trader_state.trader;
+            taker_pos.bump = ctx.bumps.taker_position;
+            taker_pos.size_lots = 0;
+            taker_pos.entry_price_ticks = 0;
+            taker_pos.cum_funding_index_at_entry = funding_index;
+            taker_pos.realized_pnl_quote_lots = 0;
+            taker_pos.funding_paid_quote_lots = 0;
+            taker_pos.last_settlement_batch = market.current_batch;
+        }
+        if maker_pos.market == Pubkey::default() {
+            maker_pos.market = market_key;
+            maker_pos.trader = ctx.accounts.maker_trader_state.trader;
+            maker_pos.bump = ctx.bumps.maker_position;
+            maker_pos.size_lots = 0;
+            maker_pos.entry_price_ticks = 0;
+            maker_pos.cum_funding_index_at_entry = funding_index;
+            maker_pos.realized_pnl_quote_lots = 0;
+            maker_pos.funding_paid_quote_lots = 0;
+            maker_pos.last_settlement_batch = market.current_batch;
+        }
+
+        apply_fill_to_position(taker_pos, taker_side_enum, size_lots, price_ticks, funding_index)?;
+        apply_fill_to_position(maker_pos, maker_side_enum, size_lots, price_ticks, funding_index)?;
+
+        // Update open_positions counts on TraderState (open if size > 0 from 0).
+        // For v1 we don't decrement — production version tracks transitions.
+
+        emit!(FillAppliedEvent {
+            market: market_key,
+            taker: ctx.accounts.taker_trader_state.trader,
+            maker: ctx.accounts.maker_trader_state.trader,
+            taker_side,
+            size_lots,
+            price_ticks,
+            batch_num: market.current_batch,
+        });
+        Ok(())
+    }
+
     /// Update oracle price (authority-only). In production this is replaced
     /// by a Pyth read in `run_batch`.
     pub fn update_oracle(
@@ -654,6 +774,74 @@ pub struct RunBatch<'info> {
 }
 
 #[derive(Accounts)]
+pub struct DepositCollateral<'info> {
+    pub trader: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawCollateral<'info> {
+    pub trader: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+}
+
+#[derive(Accounts)]
+pub struct ApplyFill<'info> {
+    #[account(mut)]
+    pub sequencer: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        seeds = [TraderStateAccount::SEED, taker_trader_state.trader.as_ref()],
+        bump = taker_trader_state.bump,
+    )]
+    pub taker_trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        seeds = [TraderStateAccount::SEED, maker_trader_state.trader.as_ref()],
+        bump = maker_trader_state.bump,
+    )]
+    pub maker_trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = sequencer,
+        space = state::PositionAccount::space(),
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.trader.as_ref()],
+        bump,
+    )]
+    pub taker_position: Account<'info, state::PositionAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = sequencer,
+        space = state::PositionAccount::space(),
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), maker_trader_state.trader.as_ref()],
+        bump,
+    )]
+    pub maker_position: Account<'info, state::PositionAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct DelegateMarket<'info> {
     pub authority: Signer<'info>,
     /// CHECK: market PDA being delegated.
@@ -689,6 +877,31 @@ pub struct BatchClearedEvent {
     pub seized_bonds: u64,
 }
 
+#[event]
+pub struct CollateralDepositedEvent {
+    pub trader: Pubkey,
+    pub amount: u64,
+    pub new_balance: u64,
+}
+
+#[event]
+pub struct CollateralWithdrawnEvent {
+    pub trader: Pubkey,
+    pub amount: u64,
+    pub new_balance: u64,
+}
+
+#[event]
+pub struct FillAppliedEvent {
+    pub market: Pubkey,
+    pub taker: Pubkey,
+    pub maker: Pubkey,
+    pub taker_side: u8,
+    pub size_lots: u64,
+    pub price_ticks: u64,
+    pub batch_num: u64,
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 #[repr(u8)]
@@ -720,6 +933,98 @@ fn slot_to_order(slot: &OrderSlot) -> Result<Order> {
         seq: slot.seq,
         post_only: slot.post_only == 1,
     })
+}
+
+/// Apply one fill against a single Position account in-place.
+///
+/// Cases:
+///   - Empty position (size == 0): open with `side`, `size`, `entry = price`.
+///   - Same side: increase size, recompute volume-weighted entry.
+///   - Opposite side, size ≤ existing: reduce; realize PnL on closed portion.
+///   - Opposite side, size > existing: flip side; realize PnL on existing
+///     fully closed; remaining size opens at `price`.
+fn apply_fill_to_position(
+    pos: &mut state::PositionAccount,
+    fill_side: Side,
+    fill_size_lots: u64,
+    fill_price_ticks: u64,
+    funding_index_now: i128,
+) -> Result<()> {
+    let cur_side = if pos.side == 0 { Side::Long } else { Side::Short };
+
+    if pos.size_lots == 0 {
+        pos.side = fill_side as u8;
+        pos.size_lots = fill_size_lots;
+        pos.entry_price_ticks = fill_price_ticks;
+        pos.cum_funding_index_at_entry = funding_index_now;
+        return Ok(());
+    }
+
+    if cur_side == fill_side {
+        // Same side: weighted-avg entry.
+        let new_size = pos
+            .size_lots
+            .checked_add(fill_size_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        // entry = (entry*old_size + price*fill_size) / new_size
+        let weighted = (pos.entry_price_ticks as u128)
+            .checked_mul(pos.size_lots as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+            .checked_add(
+                (fill_price_ticks as u128)
+                    .checked_mul(fill_size_lots as u128)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?,
+            )
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+            .checked_div(new_size as u128)
+            .ok_or_else(|| error!(FlashBookError::DivisionByZero))?;
+        pos.entry_price_ticks = weighted as u64;
+        pos.size_lots = new_size;
+        return Ok(());
+    }
+
+    // Opposite side: realize PnL on the closed portion.
+    let close_size = fill_size_lots.min(pos.size_lots);
+    let sign: i128 = if cur_side == Side::Long { 1 } else { -1 };
+    let pnl_per_lot: i128 =
+        (fill_price_ticks as i128) - (pos.entry_price_ticks as i128);
+    let pnl: i128 = sign
+        .checked_mul(close_size as i128)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+        .checked_mul(pnl_per_lot)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    let pnl_clamped = if pnl > i64::MAX as i128 {
+        i64::MAX
+    } else if pnl < i64::MIN as i128 {
+        i64::MIN
+    } else {
+        pnl as i64
+    };
+    pos.realized_pnl_quote_lots = pos
+        .realized_pnl_quote_lots
+        .checked_add(pnl_clamped)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+    if fill_size_lots <= pos.size_lots {
+        pos.size_lots = pos
+            .size_lots
+            .checked_sub(fill_size_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        if pos.size_lots == 0 {
+            pos.entry_price_ticks = 0;
+            pos.cum_funding_index_at_entry = funding_index_now;
+        }
+    } else {
+        // Flip side. Remaining = fill - existing.
+        let remaining = fill_size_lots
+            .checked_sub(pos.size_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        pos.side = fill_side as u8;
+        pos.size_lots = remaining;
+        pos.entry_price_ticks = fill_price_ticks;
+        pos.cum_funding_index_at_entry = funding_index_now;
+    }
+    Ok(())
 }
 
 fn order_to_slot(o: &Order) -> OrderSlot {

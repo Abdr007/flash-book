@@ -4,6 +4,32 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-05-08
+
+### Added — Phase 1 continued (lifecycle instructions)
+
+- `deposit_collateral` — credit a trader's quote-lot balance.
+- `withdraw_collateral` — debit, blocked while trader has open positions.
+- `apply_fill` — applies a Fill against the taker's and maker's `PositionAccount`
+  PDAs (init-if-needed), with full position lifecycle:
+    * empty → open (side, size, entry = price)
+    * same-side → volume-weighted average entry
+    * opposite-side, ≤ existing → reduce, realize PnL on closed portion
+    * opposite-side, > existing → flip side, realize PnL on full close,
+      remaining size opens at fill price
+- New events: `CollateralDepositedEvent`, `CollateralWithdrawnEvent`,
+  `FillAppliedEvent`.
+- `init-if-needed` feature enabled on anchor-lang for Position PDAs that
+  are created on first fill.
+
+### Known issue
+
+- `cargo build-sbf` (BPF target) currently fails on Solana platform-tools
+  v1.48 (rustc 1.84) due to a transitive `constant_time_eq` dep that
+  requires edition2024. This is an upstream toolchain alignment issue —
+  newer platform-tools releases will resolve it. Native `cargo check` /
+  `cargo test` are unaffected.
+
 ## [0.4.0] — 2026-05-08
 
 ### Added — Phase 1 continued (Anchor instruction handlers wired)

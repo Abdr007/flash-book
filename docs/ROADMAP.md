@@ -41,13 +41,14 @@ Target: deployable to MagicBlock ER devnet.
 - [x] Property-based testing via `proptest` (6 properties × 2K cases each)
 - [x] Anchor instruction handlers (initialize_market, initialize_insurance_fund,
       open_trader_state, update_oracle, place_limit_order, submit_commit,
-      submit_reveal, run_batch)
+      submit_reveal, run_batch, deposit_collateral, withdraw_collateral,
+      apply_fill)
 - [x] Account validation, PDA seeds, signer checks
 - [x] OrderBufferAccount + TraderStateAccount on-chain types
-- [x] Anchor events: MarketInitializedEvent, BatchClearedEvent
-- [ ] Per-fill position state updates (currently fills emitted as event
-      for off-chain bookkeeper; on-chain per-fill `apply_fill` instruction
-      to land next iteration)
+- [x] Anchor events: MarketInitializedEvent, BatchClearedEvent,
+      CollateralDepositedEvent, CollateralWithdrawnEvent, FillAppliedEvent
+- [x] Per-fill position state updates via `apply_fill` (init-if-needed Position PDAs)
+- [x] Position lifecycle math (open / add / reduce / flip with realized PnL)
 - [ ] In-loop liquidation injection during run_batch (logic complete, wiring
       to per-trader iteration via remaining_accounts pending)
 - [ ] Stress-lattice margin enforcement on order intake
