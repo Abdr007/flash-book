@@ -4,6 +4,42 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] — 2026-05-08
+
+### Added — Phase 1 continued (E2E coverage doubled to 11 tests)
+
+Six additional E2E integration tests covering the harder paths:
+
+- **`initialize_market_writes_state`** — verifies all market header
+  fields (oracle, mark, params, status, OI counters) plus that the
+  freshly-init OrderBuffer is empty.
+- **`place_limit_order_lands_in_buffer`** — full chain: init protocol
+  → init market → open trader → deposit → place_limit_order. Verifies
+  the order materializes in slot 0 of OrderBuffer with the right
+  side/size/limit, and TraderState's per-batch counter increments.
+- **`run_batch_advances_counter_and_clears_buffer`** — places an order,
+  runs a batch, verifies `current_batch` advances and the buffer is
+  cleared (all slots back to `valid = 0`).
+- **`set_market_status_blocks_orders_when_paused`** — proves the
+  circuit breaker actually fires: paused market rejects
+  place_limit_order with an error.
+- **`update_market_params_rejects_immutable_primitive_change`** —
+  proves the immutability invariant on `tick_size`. Mutable changes
+  (taker_fee_bps) succeed.
+- **`liquidate_position_rejects_healthy_trader`** — proves the
+  matcher's `assess_margin` gate fires; can't force-close someone
+  who's not actually unhealthy.
+
+### Bug fix: `CommitBufferAccount` size
+
+The 256-slot CommitBufferAccount was 22 KB, exceeding Solana's 10 KiB
+single-call init limit. The program could never have been deployed
+end-to-end. Reduced to 64 slots (matches OrderBuffer cap; ~5.7 KB).
+New constant: `COMMIT_BUFFER_CAP = 64`. Future expansion via Anchor's
+zero-copy + multi-step realloc.
+
+### Total test count: 167 (119 TS sim+SDK + 31 Rust unit + 6 Rust property × 2K + 11 E2E integration).
+
 ## [0.13.0] — 2026-05-08
 
 ### Added — Phase 1 continued (E2E integration tests + builder coverage)

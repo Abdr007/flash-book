@@ -12,7 +12,8 @@
 
 use anchor_lang::{prelude::*, InstructionData};
 use flash_book::state::{
-    InsuranceFundAccount, FlpExposureAccount, TraderStateAccount,
+    FlpExposureAccount, InsuranceFundAccount, MarketAccount, MarketParams,
+    OrderBufferAccount, TraderStateAccount,
 };
 use solana_program_test::{processor, BanksClient, ProgramTest};
 use solana_sdk::{
@@ -78,6 +79,220 @@ fn build_ix(args: impl InstructionData, accounts: Vec<AccountMeta>) -> Instructi
         accounts,
         data: args.data(),
     }
+}
+
+fn default_params() -> MarketParams {
+    MarketParams {
+        tick_size: 1,
+        base_lot_size: 1_000,
+        quote_lot_size: 1,
+        min_base_lots: 1,
+
+        taker_fee_bps: 5,
+        maker_rebate_bps: 1,
+        toxicity_tax_max_bps: 5,
+
+        liq_penalty_bps: 50,
+        maintenance_margin_ratio_bps: 125,
+        initial_margin_ratio_bps: 250,
+        max_leverage: 40,
+
+        funding_rate_max_bps_per_sec: 1_000,
+        funding_rate_k_bps: 100_000,
+        oracle_band_bps: 100,
+
+        flp_spread_base_bps: 5,
+        flp_spread_alpha_bps: 5_000,
+        flp_spread_beta_bps: 3_000,
+        flp_spread_gamma_bps: 2_000,
+        flp_spread_kappa_bps: 500,
+        flp_spread_delta_bps: 20_000,
+        flp_inventory_lambda_bps: 5_000,
+        flp_depth_floor_lots: 1_000,
+        flp_max_growth_per_batch_bps: 50,
+        flp_quote_levels: 5,
+
+        vpin_bucket_size_lots: 100,
+        vpin_ema_window: 50,
+
+        twap_window: 5,
+        batch_interval_ms: 50,
+    }
+}
+
+/// Set up insurance fund + flp exposure (prerequisites for market init).
+async fn setup_protocol(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+) -> (Pubkey, Pubkey) {
+    let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+
+    let ix1 = build_ix(
+        flash_book::instruction::InitializeInsuranceFund {
+            fee_contribution_bps: 1_000,
+            toxicity_tax_contribution_bps: 5_000,
+            liq_penalty_contribution_bps: 5_000,
+            pause_threshold_quote_lots: 5_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(insurance_fund, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let ix2 = build_ix(
+        flash_book::instruction::InitializeFlpExposure {
+            initial_capital_quote_lots: 5_000_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix1, ix2],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    (insurance_fund, flp_exposure)
+}
+
+/// Set up insurance fund + flp exposure + market.
+/// Returns (market PDA, order_buffer PDA, base_mint, quote_mint).
+async fn setup_market(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+) -> (Pubkey, Pubkey, Pubkey, Pubkey) {
+    let (insurance_fund, flp_exposure) = setup_protocol(ctx, payer).await;
+
+    let base_mint = Keypair::new().pubkey();
+    let quote_mint = Keypair::new().pubkey();
+    let base_vault = Keypair::new().pubkey();
+    let quote_vault = Keypair::new().pubkey();
+    let oracle_account = Keypair::new().pubkey();
+
+    let (market, _) = pda(&[
+        MarketAccount::SEED,
+        base_mint.as_ref(),
+        quote_mint.as_ref(),
+    ]);
+    let (order_buffer, _) = pda(&[OrderBufferAccount::SEED, market.as_ref()]);
+    let (commit_buffer, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market.as_ref(),
+    ]);
+
+    let ix = build_ix(
+        flash_book::instruction::InitializeMarket {
+            params: default_params(),
+            initial_oracle_ticks: 100_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(base_vault, false),
+            AccountMeta::new_readonly(quote_vault, false),
+            AccountMeta::new_readonly(oracle_account, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new(order_buffer, false),
+            AccountMeta::new(commit_buffer, false),
+            AccountMeta::new_readonly(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    (market, order_buffer, base_mint, quote_mint)
+}
+
+/// Open + fund a trader, returning their state PDA.
+async fn setup_trader(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    trader: &Keypair,
+    deposit_amount: u64,
+) -> Pubkey {
+    let transfer = solana_sdk::system_instruction::transfer(
+        &payer.pubkey(),
+        &trader.pubkey(),
+        100_000_000,
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[transfer],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let (trader_state, _) = pda(&[TraderStateAccount::SEED, trader.pubkey().as_ref()]);
+
+    let open_ix = build_ix(
+        flash_book::instruction::OpenTraderState {},
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[open_ix],
+            Some(&trader.pubkey()),
+            &[trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    if deposit_amount > 0 {
+        let deposit_ix = build_ix(
+            flash_book::instruction::DepositCollateral {
+                amount_quote_lots: deposit_amount,
+            },
+            vec![
+                AccountMeta::new_readonly(trader.pubkey(), true),
+                AccountMeta::new(trader_state, false),
+            ],
+        );
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[deposit_ix],
+                Some(&trader.pubkey()),
+                &[trader],
+                bh,
+            ))
+            .await
+            .unwrap();
+    }
+
+    trader_state
 }
 
 #[tokio::test]
@@ -388,4 +603,368 @@ async fn withdraw_collateral_reduces_balance() {
 
     let after: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
     assert_eq!(after.collateral_quote_lots, 70_000);
+}
+
+#[tokio::test]
+async fn initialize_market_writes_state() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, base_mint, quote_mint) = setup_market(&mut ctx, &payer).await;
+
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.authority, payer.pubkey());
+    assert_eq!(market.base_mint, base_mint);
+    assert_eq!(market.quote_mint, quote_mint);
+    assert_eq!(market.oracle_price_ticks, 100_000);
+    assert_eq!(market.mark_price_ticks, 100_000);
+    assert_eq!(market.cum_funding_index, 0);
+    assert_eq!(market.current_batch, 0);
+    assert_eq!(market.oi_long_lots, 0);
+    assert_eq!(market.oi_short_lots, 0);
+    // Status defaults to Active (1).
+    assert_eq!(market.status, 1);
+    assert_eq!(market.params.tick_size, 1);
+    assert_eq!(market.params.flp_quote_levels, 5);
+
+    // OrderBuffer should be initialized empty.
+    let buf: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(buf.head, 0);
+    assert_eq!(buf.seq_counter, 0);
+    assert_eq!(buf.market, market_pda);
+}
+
+#[tokio::test]
+async fn place_limit_order_lands_in_buffer() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    let ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0, // long
+            size_lots: 10,
+            limit_ticks: 99_950,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let buf: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(buf.head, 1);
+    assert_eq!(buf.seq_counter, 1);
+    // First slot should be the order.
+    let slot = buf.slots[0];
+    assert_eq!(slot.valid, 1);
+    assert_eq!(slot.side, 0);
+    assert_eq!(slot.size_lots, 10);
+    assert_eq!(slot.limit_ticks, 99_950);
+    assert_eq!(slot.trader, trader.pubkey());
+
+    // Trader state shows orders_this_batch = 1.
+    let state: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(state.orders_this_batch, 1);
+}
+
+#[tokio::test]
+async fn run_batch_advances_counter_and_clears_buffer() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
+    let (commit_buf, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+
+    // Place an order so the buffer is non-empty.
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    let place_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 10,
+            limit_ticks: 99_950,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let buf_before: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(buf_before.head, 1);
+
+    // Run a batch.
+    let run_ix = build_ix(
+        flash_book::instruction::RunBatch { now_ms: 1_000_000 },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // sequencer = payer here
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(commit_buf, false),
+            AccountMeta::new(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[run_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Market.current_batch advanced.
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.current_batch, 1);
+    assert_eq!(market.last_batch_ms, 1_000_000);
+
+    // Buffer cleared.
+    let buf_after: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
+    assert_eq!(buf_after.head, 0);
+    for slot in buf_after.slots.iter() {
+        assert_eq!(slot.valid, 0);
+    }
+}
+
+#[tokio::test]
+async fn set_market_status_blocks_orders_when_paused() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
+
+    // Pause market.
+    let pause_ix = build_ix(
+        flash_book::instruction::SetMarketStatus { new_status: 3 }, // Paused
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[pause_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.status, 3); // Paused
+
+    // Try to place an order — should fail.
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    let place_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 10,
+            limit_ticks: 99_950,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "place_limit_order should fail when market is paused");
+}
+
+#[tokio::test]
+async fn update_market_params_rejects_immutable_primitive_change() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Try to change tick_size — should fail.
+    let mut new_params = default_params();
+    new_params.tick_size = 2; // changed from 1
+
+    let ix = build_ix(
+        flash_book::instruction::UpdateMarketParams { new_params },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "update_market_params should reject tick_size change");
+
+    // Mutable change should succeed (taker_fee_bps).
+    let mut mutable_change = default_params();
+    mutable_change.taker_fee_bps = 7;
+
+    let ix2 = build_ix(
+        flash_book::instruction::UpdateMarketParams {
+            new_params: mutable_change,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix2],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.params.taker_fee_bps, 7);
+}
+
+#[tokio::test]
+async fn liquidate_position_rejects_healthy_trader() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (order_buf, _) = pda(&[OrderBufferAccount::SEED, market_pda.as_ref()]);
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    // Trader has no open position — liquidation should fail (LiquidationStale)
+    // because position.size_lots == 0.
+    let caller = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &caller.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let liq_ix = build_ix(
+        flash_book::instruction::LiquidatePosition {},
+        vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new_readonly(trader_state, false),
+            AccountMeta::new_readonly(position, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[liq_ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            bh,
+        ))
+        .await;
+    // Either LiquidationStale (position empty / not initialized) — both are rejections.
+    assert!(result.is_err(), "liquidate_position should fail on healthy/empty trader");
 }

@@ -184,19 +184,23 @@ pub struct CommitRow {
     pub valid: u8, // 0 = empty slot, 1 = active
 }
 
+/// Capacity of the per-market commit-reveal table. Sized to fit a single
+/// `init` call within Solana's 10 KiB max account allocation.
+pub const COMMIT_BUFFER_CAP: usize = 64;
+
 #[account]
 #[derive(Debug)]
 pub struct CommitBufferAccount {
     pub market: Pubkey,
     pub bump: u8,
     pub head: u32,
-    pub commits: [CommitRow; 256],
+    pub commits: [CommitRow; COMMIT_BUFFER_CAP],
 }
 
 impl CommitBufferAccount {
     pub const SEED: &'static [u8] = b"commit_buffer";
     pub fn space() -> usize {
-        8 + 32 + 1 + 4 + (256 * (32 + 32 + 8 + 8 + 8 + 1))
+        8 + 32 + 1 + 4 + (COMMIT_BUFFER_CAP * (32 + 32 + 8 + 8 + 8 + 1))
     }
 }
 

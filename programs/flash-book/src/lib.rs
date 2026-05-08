@@ -100,7 +100,7 @@ pub mod flash_book {
         commit_buf.market = market.key();
         commit_buf.bump = ctx.bumps.commit_buffer;
         commit_buf.head = 0;
-        commit_buf.commits = [state::CommitRow::default(); 256];
+        commit_buf.commits = [state::CommitRow::default(); state::COMMIT_BUFFER_CAP];
 
         emit!(MarketInitializedEvent {
             market: market.key(),
