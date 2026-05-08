@@ -18,23 +18,33 @@ Staged path from this reference simulator to mainnet.
 
 **Deliverable:** behavioural reference for the Rust program.
 
-## Phase 1 — Production Rust program (next)
+## Phase 1 — Production Rust program (in progress)
 
 Target: deployable to MagicBlock ER devnet.
 
-- [ ] Solana program in Rust (no Anchor — light framework, integer lot space)
-- [ ] Account types matching Flash V2 conventions (FLP custody, position
-      PDA, market account)
-- [ ] FBA matcher in Rust with property-test parity to TS reference
-- [ ] FLP virtual quoter as deterministic CPI from FLP pool state
-- [ ] Funding integration via cumulative index (u128)
-- [ ] Stress-lattice margin computed in compute-budget bounds
-- [ ] In-loop liquidation injector
-- [ ] Insurance fund PDA with three contribution streams
-- [ ] Commit-reveal with bond + L1 force-include path
+- [x] Cargo workspace with `programs/flash-book` Anchor crate
+- [x] Account types matching Flash V2 conventions (FLP custody, position
+      PDA, market account, insurance fund PDA, commit buffer)
+- [x] FBA matcher in Rust with property-test parity to TS reference
+- [x] FLP virtual quoter as deterministic pure-Rust function (callable as
+      CPI from FLP pool state)
+- [x] Funding integration via Q64.64 cumulative index (i128)
+- [x] VPIN calculator in Q32.32 fixed-point
+- [x] Type-safe newtype wrappers (BaseLots, QuoteLots, Ticks, Bps)
+- [x] Numbered error code enum (FlashBookError)
+- [x] 16 Rust unit tests with parity to TS suite
+- [ ] Stress-lattice margin in Rust (port from TS)
+- [ ] In-loop liquidation injector in Rust
+- [ ] Insurance fund waterfall in Rust
+- [ ] Commit-reveal in Rust with bond + L1 force-include path
+- [ ] Anchor instruction handlers (currently skeletons only)
+- [ ] Account validation, PDA seeds, signer checks
+- [ ] Integration with MagicBlock ER `delegate_account` /
+      `commit_and_undelegate_accounts` (blocked on `ephemeral-rollups-sdk`
+      Solana 2.x compat — upstream issue tracked)
 - [ ] Integration with `@flash_trade/magic-trade-client` session pattern
-- [ ] Unit tests in Rust mirroring the TS test suite
-- [ ] Anchor IDL or hand-rolled type stubs for TS client
+- [ ] Anchor IDL generation
+- [ ] Property-based testing via `proptest`
 - [ ] Independent security audit (firm to be selected)
 
 **Deliverable:** auditable mainnet-ready program, devnet deployed.

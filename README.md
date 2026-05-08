@@ -2,8 +2,9 @@
 
 > Pool-backed CLOB matched by frequent batch auction on MagicBlock Ephemeral Rollups. Reference design and simulator for Flash Trade's announced Orderbook V3.
 
-[![tests](https://img.shields.io/badge/tests-71%20passing-brightgreen)]()
+[![tests](https://img.shields.io/badge/tests-87%20passing-brightgreen)]()
 [![typescript](https://img.shields.io/badge/typescript-strict-blue)]()
+[![rust](https://img.shields.io/badge/rust-stable-orange)]()
 [![license](https://img.shields.io/badge/license-MIT-green)]()
 
 ## What this is
@@ -50,15 +51,25 @@ a Solana program in Rust, deployed to MagicBlock ER and settling to mainnet.
 | Commit-reveal | ✅ implemented & tested |
 | VPIN toxicity signal | ✅ implemented & tested |
 | Synthetic flow simulator | ✅ runs at 42K batches/sec |
-| Rust on-chain program | 🔲 next phase |
-| Mainnet shadow mode | 🔲 next phase |
+| Rust matcher core (integer arithmetic, checked overflow) | ✅ implemented & 16 tests |
+| Anchor program skeleton (instruction shells) | ✅ scaffolded |
+| Anchor program full instruction implementations | 🔲 phase 1 cont. |
+| MagicBlock ER delegation CPI integration | 🔲 phase 1 cont. |
+| Mainnet shadow mode | 🔲 phase 2 |
 
 ## Quick start
 
+TypeScript reference simulator:
 ```bash
 bun install
 bun test                          # 71 tests
 bun run examples/synthetic-flow.ts
+```
+
+Rust on-chain matcher core:
+```bash
+cargo test --lib --package flash-book   # 16 tests
+cargo check --lib --package flash-book  # type / borrow check
 ```
 
 Sample output from the synthetic flow demo:
@@ -141,23 +152,38 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the long-form design.
 ## Layout
 
 ```
-src/
-  types.ts           Domain types (Order, Position, MarketState, ...)
-  math.ts            Clamp, EMA, deterministic PRNG, hash, banding
-  matcher.ts         FBA Walrasian uniform-price clearing
-  flp-quoter.ts      Virtual FLP quote ladder (Avellaneda-Stoikov)
-  funding.ts         Continuous funding via cumulative index
-  risk.ts            Stress-lattice maintenance margin
-  liquidation.ts     Detection, order injection, shortfall, events
-  insurance.ts       Bankruptcy waterfall
-  commit-reveal.ts   Taker order commit/reveal protocol
-  vpin.ts            Volume-synchronized toxicity signal
-  engine.ts          Top-level orchestrator
-  index.ts           Public API + DEFAULT_MAJOR_MARKET_PARAMS
+src/                          TypeScript reference simulator
+  types.ts                    Domain types (Order, Position, MarketState, ...)
+  math.ts                     Clamp, EMA, deterministic PRNG, hash, banding
+  matcher.ts                  FBA Walrasian uniform-price clearing
+  flp-quoter.ts               Virtual FLP quote ladder (Avellaneda-Stoikov)
+  funding.ts                  Continuous funding via cumulative index
+  risk.ts                     Stress-lattice maintenance margin
+  liquidation.ts              Detection, order injection, shortfall, events
+  insurance.ts                Bankruptcy waterfall
+  commit-reveal.ts            Taker order commit/reveal protocol
+  vpin.ts                     Volume-synchronized toxicity signal
+  engine.ts                   Top-level orchestrator
+  index.ts                    Public API + DEFAULT_MAJOR_MARKET_PARAMS
 
-tests/               71 unit tests across all modules
-examples/            Runnable simulation scenarios
-docs/                Architecture, math, safety, comparison docs
+programs/flash-book/          Production Solana program (Rust + Anchor)
+  src/
+    lib.rs                    Anchor program — declare_id, instructions, contexts
+    constants.rs              USD_DECIMALS, BPS_DENOM, compute-budget caps
+    errors.rs                 FlashBookError code enum (numbered families)
+    state.rs                  On-chain account types (Market, Position, ...)
+    matcher/
+      lot.rs                  Type-safe BaseLots, QuoteLots, Ticks, Bps wrappers
+      order.rs                Order + OrderType + Side, FIFO key computation
+      fba.rs                  Walrasian clearing in integer space (no floats)
+      flp_quoter.rs           FLP virtual quote ladder, integer arithmetic
+      funding.rs              Cum funding index (Q64.64 fixed-point)
+      vpin.rs                 VPIN (Q32.32 fixed-point EMA)
+      tests.rs                16 unit tests parity-checked vs TS reference
+
+tests/                        71 TS unit tests
+examples/                     Runnable simulation scenarios
+docs/                         Architecture, math, safety, comparison docs
 ```
 
 ## Acknowledgements

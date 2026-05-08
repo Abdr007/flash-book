@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["programs/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdr007/flash-book"
+
+[workspace.dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+# ephemeral-rollups-sdk: pinned to a version compatible with Solana 2.x once
+# the upstream crate ships an Agave-compatible release. Tracked in ROADMAP
+# Phase 1; for now the program is structured so that delegation CPIs are
+# additive — no architectural impact.
+# borsh is re-exported via anchor_lang::prelude — do NOT add it as a
+# top-level dep; it triggers a derive-macro ambiguity error.
+bytemuck = { version = "1.21", features = ["derive"] }
+thiserror = "2.0"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+incremental = false
+
+[profile.release.build-override]
+opt-level = 3
+incremental = false
+codegen-units = 1

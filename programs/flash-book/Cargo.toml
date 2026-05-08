@@ -1,0 +1,27 @@
+[package]
+name = "flash-book"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Flash Book — pool-backed CLOB matched by FBA on MagicBlock ER."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "flash_book"
+
+[features]
+default = []
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true }
+anchor-spl = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.6"

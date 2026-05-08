@@ -4,6 +4,32 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-05-08
+
+### Added — Phase 1 begin (Rust on-chain matcher core)
+
+- Cargo workspace with `programs/flash-book` Anchor crate.
+- Pure-Rust matcher core (no Solana runtime dep), tested standalone:
+  - `matcher::lot` — type-safe `BaseLots` / `QuoteLots` / `Ticks` / `Bps` newtypes
+    with checked arithmetic.
+  - `matcher::order` — `Order` / `OrderType` / `Side` with FIFO priority keys.
+  - `matcher::fba` — Walrasian uniform-price clearing in integer space, with
+    self-trade prevention and within-batch MEV-neutrality property test.
+  - `matcher::flp_quoter` — virtual FLP quote ladder using bps integer math.
+  - `matcher::funding` — Q64.64 cumulative funding index with rate clamping.
+  - `matcher::vpin` — Q32.32 fixed-point VPIN calculator.
+- `state` module with on-chain account types (Market, Position, InsuranceFund,
+  FlpExposure, CommitBuffer).
+- `errors` module with numbered error families (1000–1799).
+- Anchor program skeleton in `lib.rs` with seven instruction shells:
+  `initialize_market`, `place_limit_order`, `submit_commit`, `submit_reveal`,
+  `run_batch`, `delegate_market`, `undelegate_market`.
+- 16 Rust unit tests covering FBA, FLP quoter, funding, VPIN.
+- All financial arithmetic uses checked u128 / i128 with overflow propagation
+  via `OrOverflow` trait — zero integer wraparound paths.
+
+### Total test count: 87 (71 TypeScript + 16 Rust).
+
 ## [0.1.0] — 2026-05-08
 
 ### Added
