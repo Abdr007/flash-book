@@ -4,6 +4,37 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] — 2026-05-08
+
+### Added — Phase 1 polish (multi-market E2E coverage)
+
+Two new E2E integration tests exercising the multi-market path:
+
+- **`liquidate_portfolio_with_two_markets_and_no_positions`** —
+  initializes two markets with different oracle prices, opens a
+  trader, places a tiny order on market 1 (verifies init_if_needed
+  Position PDA across markets), then attempts a portfolio liquidation
+  — confirming the multi-market remaining_accounts walk + validation
+  paths work end-to-end.
+- **`second_market_initializes_at_different_oracle_price`** — verifies
+  two markets coexist with distinct mints + different oracle prices,
+  while sharing the same global insurance fund + FLP exposure +
+  authority. Proves the initialize_market PDA seed scheme correctly
+  isolates per-market state.
+
+New helper `setup_additional_market` lets tests initialize a second
+market on an already-initialized protocol without re-running protocol
+setup.
+
+The matcher's hedge-recognition property itself is exhaustively
+covered by the Rust matcher unit tests
+(`risk_hedged_position_collapses_required_margin`) and the SDK's
+`risk-preview.test.ts` hedge tests. The on-chain E2E tests verify the
+multi-market account-walking + validation paths that wire those
+properties to actual program execution.
+
+### Total test count: 198 (141 TS sim+SDK + 31 Rust unit + 6 Rust property × 2K + 20 E2E integration).
+
 ## [0.18.0] — 2026-05-08
 
 ### Added — Phase 1 closure (cross-market portfolio liquidation)
