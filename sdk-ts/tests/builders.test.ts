@@ -34,10 +34,16 @@ describe('Instruction builders', () => {
   test('initializeInsuranceFundIx', async () => {
     const client = makeClient();
     const authority = Keypair.generate().publicKey;
-    const ix = await client.initializeInsuranceFundIx(authority, defaultInsuranceFundParams());
+    const ix = await client.initializeInsuranceFundIx({
+      authority,
+      params: defaultInsuranceFundParams(),
+      quoteMint: Keypair.generate().publicKey,
+      quoteVault: Keypair.generate().publicKey,
+    });
     expect(ix.programId.equals(FLASH_BOOK_PROGRAM_ID)).toBe(true);
     expect(ix.data.length).toBeGreaterThan(0);
-    expect(ix.keys.length).toBe(3); // authority, fund, sysprog
+    // authority, fund, quote_mint, quote_vault, token_program, rent, sysprog
+    expect(ix.keys.length).toBe(7);
   });
 
   test('initializeFlpExposureIx', async () => {
@@ -77,26 +83,48 @@ describe('Instruction builders', () => {
 
   test('depositCollateralIx', async () => {
     const client = makeClient();
-    const ix = await client.depositCollateralIx(Keypair.generate().publicKey, new BN(1_000));
-    expect(ix.keys.length).toBe(2); // trader, trader_state
+    const ix = await client.depositCollateralIx({
+      trader: Keypair.generate().publicKey,
+      amount: new BN(1_000),
+      traderQuoteAta: Keypair.generate().publicKey,
+      quoteVault: Keypair.generate().publicKey,
+    });
+    // trader, trader_state, insurance_fund, trader_quote_ata, quote_vault, token_program
+    expect(ix.keys.length).toBe(6);
   });
 
   test('withdrawCollateralIx', async () => {
     const client = makeClient();
-    const ix = await client.withdrawCollateralIx(Keypair.generate().publicKey, new BN(500));
-    expect(ix.keys.length).toBe(2);
+    const ix = await client.withdrawCollateralIx({
+      trader: Keypair.generate().publicKey,
+      amount: new BN(500),
+      traderQuoteAta: Keypair.generate().publicKey,
+      quoteVault: Keypair.generate().publicKey,
+    });
+    expect(ix.keys.length).toBe(6);
   });
 
   test('depositFlpCapitalIx', async () => {
     const client = makeClient();
-    const ix = await client.depositFlpCapitalIx(Keypair.generate().publicKey, new BN(1_000_000));
-    expect(ix.keys.length).toBe(2); // authority, flp
+    const ix = await client.depositFlpCapitalIx({
+      authority: Keypair.generate().publicKey,
+      amountQuoteLots: new BN(1_000_000),
+      authorityQuoteAta: Keypair.generate().publicKey,
+      quoteVault: Keypair.generate().publicKey,
+    });
+    // authority, flp, insurance_fund, authority_quote_ata, quote_vault, token_program
+    expect(ix.keys.length).toBe(6);
   });
 
   test('withdrawFlpCapitalIx', async () => {
     const client = makeClient();
-    const ix = await client.withdrawFlpCapitalIx(Keypair.generate().publicKey, new BN(500_000));
-    expect(ix.keys.length).toBe(2);
+    const ix = await client.withdrawFlpCapitalIx({
+      authority: Keypair.generate().publicKey,
+      amountQuoteLots: new BN(500_000),
+      authorityQuoteAta: Keypair.generate().publicKey,
+      quoteVault: Keypair.generate().publicKey,
+    });
+    expect(ix.keys.length).toBe(6);
   });
 
   // ─── Order intake (3) ──────────────────────────────────────────────

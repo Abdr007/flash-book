@@ -511,10 +511,10 @@
     {
       "name": "deposit_collateral",
       "docs": [
-        "Deposit collateral into the trader's state. SPL token transfer is",
-        "done in a follow-up (this instruction credits the trader's accounting",
-        "balance; production wiring also moves USDC into the protocol vault",
-        "via SPL CPI)."
+        "Deposit collateral. Performs an SPL transfer from the trader's",
+        "quote ATA into the global protocol vault, then credits the trader's",
+        "accounting balance. Both the SPL transfer and the accounting bump",
+        "happen atomically — partial failure rolls back the whole tx."
       ],
       "discriminator": [
         156,
@@ -559,6 +559,50 @@
               }
             ]
           }
+        },
+        {
+          "name": "insurance_fund",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_quote_ata",
+          "docs": [
+            "Trader's USDC ATA — authority must be `trader`, mint must match."
+          ],
+          "writable": true
+        },
+        {
+          "name": "quote_vault",
+          "docs": [
+            "Global vault — must be the one stored on the insurance_fund."
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": [
@@ -571,8 +615,8 @@
     {
       "name": "deposit_flp_capital",
       "docs": [
-        "LP deposits capital into the FLP pool. SPL transfer integration",
-        "is a follow-up; v1 increments the accounting balance."
+        "LP deposits capital into the FLP pool. SPL transfer is performed",
+        "from the LP's USDC ATA into the protocol vault before accounting."
       ],
       "discriminator": [
         70,
@@ -613,6 +657,53 @@
               }
             ]
           }
+        },
+        {
+          "name": "insurance_fund",
+          "docs": [
+            "Insurance fund PDA — owns the protocol vault and signs withdrawals."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority_quote_ata",
+          "docs": [
+            "LP's USDC ATA — source on deposit, destination on withdraw."
+          ],
+          "writable": true
+        },
+        {
+          "name": "quote_vault",
+          "docs": [
+            "Global protocol vault."
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": [
@@ -685,7 +776,10 @@
     {
       "name": "initialize_insurance_fund",
       "docs": [
-        "Initialize an insurance fund (one per protocol)."
+        "Initialize an insurance fund (one per protocol). Also creates the",
+        "global protocol quote vault — a TokenAccount for `quote_mint` whose",
+        "authority is the insurance_fund PDA itself. All trader collateral",
+        "and FLP capital flows through this vault."
       ],
       "discriminator": [
         2,
@@ -729,6 +823,29 @@
               }
             ]
           }
+        },
+        {
+          "name": "quote_mint",
+          "docs": [
+            "The protocol's quote currency mint (typically USDC)."
+          ]
+        },
+        {
+          "name": "quote_vault",
+          "docs": [
+            "Global protocol vault. Created with `insurance_fund` PDA as",
+            "authority so the program can sign transfers out."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111"
         },
         {
           "name": "system_program",
@@ -2244,10 +2361,10 @@
     {
       "name": "withdraw_collateral",
       "docs": [
-        "Withdraw collateral. Blocked if it would push the trader below",
-        "initial-margin requirement on any open position. (For v1 we approximate",
-        "by checking against `open_positions == 0`; production wiring iterates",
-        "open Position PDAs via remaining_accounts.)"
+        "Withdraw collateral. Decrements accounting + transfers from the",
+        "vault back to the trader's ATA. The program signs as the",
+        "insurance_fund PDA (which owns the vault). Blocked while the",
+        "trader has open positions."
       ],
       "discriminator": [
         115,
@@ -2292,6 +2409,48 @@
               }
             ]
           }
+        },
+        {
+          "name": "insurance_fund",
+          "docs": [
+            "Insurance fund PDA — authority over the vault. The program signs",
+            "transfers out using its seeds."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_quote_ata",
+          "writable": true
+        },
+        {
+          "name": "quote_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": [
@@ -2347,6 +2506,53 @@
               }
             ]
           }
+        },
+        {
+          "name": "insurance_fund",
+          "docs": [
+            "Insurance fund PDA — owns the protocol vault and signs withdrawals."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority_quote_ata",
+          "docs": [
+            "LP's USDC ATA — source on deposit, destination on withdraw."
+          ],
+          "writable": true
+        },
+        {
+          "name": "quote_vault",
+          "docs": [
+            "Global protocol vault."
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": [
@@ -3204,6 +3410,23 @@
           {
             "name": "total_payouts",
             "type": "u64"
+          },
+          {
+            "name": "quote_mint",
+            "docs": [
+              "SPL mint for the protocol's quote currency (typically USDC). All",
+              "collateral and FLP capital moves through this mint."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "quote_vault",
+            "docs": [
+              "Global protocol vault TokenAccount. Owned by the InsuranceFundAccount",
+              "PDA (which signs transfers out via known seeds). Holds all trader",
+              "collateral + FLP capital."
+            ],
+            "type": "pubkey"
           }
         ]
       }

@@ -13,7 +13,13 @@ import {
   type Idl,
   type Wallet,
 } from '@coral-xyz/anchor';
-import { Connection, PublicKey, SystemProgram, type TransactionInstruction } from '@solana/web3.js';
+import {
+  Connection,
+  PublicKey,
+  SystemProgram,
+  SYSVAR_RENT_PUBKEY,
+  type TransactionInstruction,
+} from '@solana/web3.js';
 import idlJson from '../idl.json' assert { type: 'json' };
 import {
   commitBufferPda,
@@ -28,6 +34,12 @@ import {
 import type { InsuranceFundInitParams, MarketParamsRaw } from './params.ts';
 
 export const IDL = idlJson as unknown as Idl;
+
+/// SPL Token program ID. Hardcoded to avoid a runtime dependency on
+/// `@solana/spl-token` for a single constant.
+export const TOKEN_PROGRAM_ID = new PublicKey(
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+);
 
 interface MethodsBuilder {
   accountsPartial: (accounts: Record<string, PublicKey>) => MethodsBuilder;
@@ -98,49 +110,69 @@ export class FlashBookClient {
       .instruction();
   }
 
-  depositFlpCapitalIx(
-    authority: PublicKey,
-    amountQuoteLots: bigint | number,
-  ): Promise<TransactionInstruction> {
+  depositFlpCapitalIx(args: {
+    authority: PublicKey;
+    amountQuoteLots: bigint | number;
+    authorityQuoteAta: PublicKey;
+    quoteVault: PublicKey;
+  }): Promise<TransactionInstruction> {
     const flp = this.flpExposure();
+    const fund = this.insuranceFund();
     return this.methods
-      .depositFlpCapital(amountQuoteLots)
+      .depositFlpCapital(args.amountQuoteLots)
       .accountsPartial({
-        authority,
+        authority: args.authority,
         flpExposure: flp.address,
+        insuranceFund: fund.address,
+        authorityQuoteAta: args.authorityQuoteAta,
+        quoteVault: args.quoteVault,
+        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .instruction();
   }
 
-  withdrawFlpCapitalIx(
-    authority: PublicKey,
-    amountQuoteLots: bigint | number,
-  ): Promise<TransactionInstruction> {
+  withdrawFlpCapitalIx(args: {
+    authority: PublicKey;
+    amountQuoteLots: bigint | number;
+    authorityQuoteAta: PublicKey;
+    quoteVault: PublicKey;
+  }): Promise<TransactionInstruction> {
     const flp = this.flpExposure();
+    const fund = this.insuranceFund();
     return this.methods
-      .withdrawFlpCapital(amountQuoteLots)
+      .withdrawFlpCapital(args.amountQuoteLots)
       .accountsPartial({
-        authority,
+        authority: args.authority,
         flpExposure: flp.address,
+        insuranceFund: fund.address,
+        authorityQuoteAta: args.authorityQuoteAta,
+        quoteVault: args.quoteVault,
+        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .instruction();
   }
 
-  initializeInsuranceFundIx(
-    authority: PublicKey,
-    params: InsuranceFundInitParams,
-  ): Promise<TransactionInstruction> {
+  initializeInsuranceFundIx(args: {
+    authority: PublicKey;
+    params: InsuranceFundInitParams;
+    quoteMint: PublicKey;
+    quoteVault: PublicKey;
+  }): Promise<TransactionInstruction> {
     const fund = this.insuranceFund();
     return this.methods
       .initializeInsuranceFund(
-        params.feeContributionBps,
-        params.toxicityTaxContributionBps,
-        params.liqPenaltyContributionBps,
-        params.pauseThresholdQuoteLots,
+        args.params.feeContributionBps,
+        args.params.toxicityTaxContributionBps,
+        args.params.liqPenaltyContributionBps,
+        args.params.pauseThresholdQuoteLots,
       )
       .accountsPartial({
-        authority,
+        authority: args.authority,
         insuranceFund: fund.address,
+        quoteMint: args.quoteMint,
+        quoteVault: args.quoteVault,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        rent: SYSVAR_RENT_PUBKEY,
         systemProgram: SystemProgram.programId,
       })
       .instruction();
@@ -193,24 +225,44 @@ export class FlashBookClient {
       .instruction();
   }
 
-  depositCollateralIx(trader: PublicKey, amount: bigint | number): Promise<TransactionInstruction> {
-    const state = this.traderState(trader);
+  depositCollateralIx(args: {
+    trader: PublicKey;
+    amount: bigint | number;
+    traderQuoteAta: PublicKey;
+    quoteVault: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const state = this.traderState(args.trader);
+    const fund = this.insuranceFund();
     return this.methods
-      .depositCollateral(amount)
+      .depositCollateral(args.amount)
       .accountsPartial({
-        trader,
+        trader: args.trader,
         traderState: state.address,
+        insuranceFund: fund.address,
+        traderQuoteAta: args.traderQuoteAta,
+        quoteVault: args.quoteVault,
+        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .instruction();
   }
 
-  withdrawCollateralIx(trader: PublicKey, amount: bigint | number): Promise<TransactionInstruction> {
-    const state = this.traderState(trader);
+  withdrawCollateralIx(args: {
+    trader: PublicKey;
+    amount: bigint | number;
+    traderQuoteAta: PublicKey;
+    quoteVault: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const state = this.traderState(args.trader);
+    const fund = this.insuranceFund();
     return this.methods
-      .withdrawCollateral(amount)
+      .withdrawCollateral(args.amount)
       .accountsPartial({
-        trader,
+        trader: args.trader,
         traderState: state.address,
+        insuranceFund: fund.address,
+        traderQuoteAta: args.traderQuoteAta,
+        quoteVault: args.quoteVault,
+        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .instruction();
   }

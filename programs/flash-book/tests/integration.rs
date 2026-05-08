@@ -125,13 +125,137 @@ fn default_params() -> MarketParams {
     }
 }
 
-/// Set up insurance fund + flp exposure (prerequisites for market init).
+/// Bundle of protocol-level pubkeys returned by `setup_protocol`. Used by
+/// tests that need to call deposit/withdraw with real SPL transfers.
+#[derive(Clone, Copy)]
+struct Protocol {
+    insurance_fund: Pubkey,
+    flp_exposure: Pubkey,
+    quote_mint: Pubkey,
+    quote_vault: Pubkey,
+}
+
+/// Create a fresh SPL Token mint with `payer` as the mint authority.
+async fn create_mint(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+) -> Pubkey {
+    let mint = Keypair::new();
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    let space: usize = 82; // SPL Token Mint::LEN
+    let lamports = rent.minimum_balance(space);
+
+    let ixs = vec![
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &mint.pubkey(),
+            lamports,
+            space as u64,
+            &spl_token::id(),
+        ),
+        spl_token::instruction::initialize_mint(
+            &spl_token::id(),
+            &mint.pubkey(),
+            &payer.pubkey(),
+            None,
+            6,
+        )
+        .unwrap(),
+    ];
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &ixs,
+            Some(&payer.pubkey()),
+            &[payer, &mint],
+            bh,
+        ))
+        .await
+        .unwrap();
+    mint.pubkey()
+}
+
+/// Create a TokenAccount for `mint` owned by `owner_authority`.
+async fn create_token_account(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    mint: Pubkey,
+    owner_authority: Pubkey,
+) -> Pubkey {
+    let acct = Keypair::new();
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    let space: usize = 165; // SPL Token Account::LEN
+    let lamports = rent.minimum_balance(space);
+
+    let ixs = vec![
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &acct.pubkey(),
+            lamports,
+            space as u64,
+            &spl_token::id(),
+        ),
+        spl_token::instruction::initialize_account(
+            &spl_token::id(),
+            &acct.pubkey(),
+            &mint,
+            &owner_authority,
+        )
+        .unwrap(),
+    ];
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &ixs,
+            Some(&payer.pubkey()),
+            &[payer, &acct],
+            bh,
+        ))
+        .await
+        .unwrap();
+    acct.pubkey()
+}
+
+/// Mint `amount` tokens to `dest` (assumes payer is mint authority).
+async fn mint_tokens(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    mint: Pubkey,
+    dest: Pubkey,
+    amount: u64,
+) {
+    let ix = spl_token::instruction::mint_to(
+        &spl_token::id(),
+        &mint,
+        &dest,
+        &payer.pubkey(),
+        &[],
+        amount,
+    )
+    .unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+}
+
+/// Set up insurance fund + FLP exposure + protocol-wide quote mint and vault.
 async fn setup_protocol(
     ctx: &mut solana_program_test::ProgramTestContext,
     payer: &Keypair,
-) -> (Pubkey, Pubkey) {
+) -> Protocol {
     let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
     let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+
+    let quote_mint = create_mint(ctx, payer).await;
+    let quote_vault_kp = Keypair::new();
 
     let ix1 = build_ix(
         flash_book::instruction::InitializeInsuranceFund {
@@ -143,6 +267,10 @@ async fn setup_protocol(
         vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new(insurance_fund, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(quote_vault_kp.pubkey(), true),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::rent::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -162,13 +290,27 @@ async fn setup_protocol(
         .process_transaction(Transaction::new_signed_with_payer(
             &[ix1, ix2],
             Some(&payer.pubkey()),
-            &[payer],
+            &[payer, &quote_vault_kp],
             bh,
         ))
         .await
         .unwrap();
 
-    (insurance_fund, flp_exposure)
+    Protocol {
+        insurance_fund,
+        flp_exposure,
+        quote_mint,
+        quote_vault: quote_vault_kp.pubkey(),
+    }
+}
+
+/// Backward-compat shim — many existing tests destructure `(insurance, flp)`.
+async fn setup_protocol_pair(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+) -> (Pubkey, Pubkey) {
+    let p = setup_protocol(ctx, payer).await;
+    (p.insurance_fund, p.flp_exposure)
 }
 
 /// Set up insurance fund + flp exposure + market.
@@ -176,8 +318,10 @@ async fn setup_protocol(
 async fn setup_market(
     ctx: &mut solana_program_test::ProgramTestContext,
     payer: &Keypair,
-) -> (Pubkey, Pubkey, Pubkey, Pubkey) {
-    let (insurance_fund, flp_exposure) = setup_protocol(ctx, payer).await;
+) -> (Protocol, Pubkey, Pubkey, Pubkey, Pubkey) {
+    let protocol = setup_protocol(ctx, payer).await;
+    let insurance_fund = protocol.insurance_fund;
+    let flp_exposure = protocol.flp_exposure;
 
     let base_mint = Keypair::new().pubkey();
     let quote_mint = Keypair::new().pubkey();
@@ -228,7 +372,7 @@ async fn setup_market(
         .await
         .unwrap();
 
-    (market, order_buffer, base_mint, quote_mint)
+    (protocol, market, order_buffer, base_mint, quote_mint)
 }
 
 /// Initialize an additional market on an already-initialized protocol.
@@ -301,12 +445,15 @@ async fn setup_additional_market(
 // E2E tests below verify the multi-market account-walking and
 // validation paths.
 
-/// Open + fund a trader, returning their state PDA.
+/// Open + fund a trader, returning their state PDA. When `deposit_amount > 0`,
+/// creates a trader USDC ATA, mints USDC to it, and routes through
+/// `deposit_collateral` so balance is reflected on-chain via real SPL transfer.
 async fn setup_trader(
     ctx: &mut solana_program_test::ProgramTestContext,
     payer: &Keypair,
     trader: &Keypair,
     deposit_amount: u64,
+    protocol: &Protocol,
 ) -> Pubkey {
     let transfer = solana_sdk::system_instruction::transfer(
         &payer.pubkey(),
@@ -346,6 +493,10 @@ async fn setup_trader(
         .unwrap();
 
     if deposit_amount > 0 {
+        let trader_ata =
+            create_token_account(ctx, payer, protocol.quote_mint, trader.pubkey()).await;
+        mint_tokens(ctx, payer, protocol.quote_mint, trader_ata, deposit_amount).await;
+
         let deposit_ix = build_ix(
             flash_book::instruction::DepositCollateral {
                 amount_quote_lots: deposit_amount,
@@ -353,6 +504,10 @@ async fn setup_trader(
             vec![
                 AccountMeta::new_readonly(trader.pubkey(), true),
                 AccountMeta::new(trader_state, false),
+                AccountMeta::new_readonly(protocol.insurance_fund, false),
+                AccountMeta::new(trader_ata, false),
+                AccountMeta::new(protocol.quote_vault, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
         );
         let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -376,36 +531,17 @@ async fn initialize_insurance_fund_writes_state() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
+    let protocol = setup_protocol(&mut ctx, &payer).await;
 
-    let ix = build_ix(
-        flash_book::instruction::InitializeInsuranceFund {
-            fee_contribution_bps: 1_000,
-            toxicity_tax_contribution_bps: 5_000,
-            liq_penalty_contribution_bps: 5_000,
-            pause_threshold_quote_lots: 5_000,
-        },
-        vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(insurance_fund, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-    );
-
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
-    );
-    ctx.banks_client.process_transaction(tx).await.unwrap();
-
-    let fund: InsuranceFundAccount = fetch(&mut ctx.banks_client, insurance_fund).await;
+    let fund: InsuranceFundAccount =
+        fetch(&mut ctx.banks_client, protocol.insurance_fund).await;
     assert_eq!(fund.balance_quote_lots, 0);
     assert_eq!(fund.fee_contribution_bps, 1_000);
     assert_eq!(fund.pause_threshold_quote_lots, 5_000);
     assert_eq!(fund.total_contributions, 0);
     assert_eq!(fund.total_payouts, 0);
+    assert_eq!(fund.quote_mint, protocol.quote_mint);
+    assert_eq!(fund.quote_vault, protocol.quote_vault);
 }
 
 #[tokio::test]
@@ -508,67 +644,29 @@ async fn deposit_collateral_credits_balance_and_emits_event() {
     let payer = ctx.payer.insecure_clone();
     let trader = Keypair::new();
 
-    // Fund + open trader state.
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[solana_sdk::system_instruction::transfer(
-                &payer.pubkey(),
-                &trader.pubkey(),
-                100_000_000,
-            )],
-            Some(&payer.pubkey()),
-            &[&payer],
-            ctx.last_blockhash,
-        ))
-        .await
-        .unwrap();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
 
-    let (trader_state, _) = pda(&[TraderStateAccount::SEED, trader.pubkey().as_ref()]);
-
-    let open_ix = build_ix(
-        flash_book::instruction::OpenTraderState {},
-        vec![
-            AccountMeta::new(trader.pubkey(), true),
-            AccountMeta::new(trader_state, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-    );
-    let bh1 = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[open_ix],
-            Some(&trader.pubkey()),
-            &[&trader],
-            bh1,
-        ))
-        .await
-        .unwrap();
-
-    // First deposit.
-    let deposit_ix = build_ix(
-        flash_book::instruction::DepositCollateral {
-            amount_quote_lots: 50_000,
-        },
-        vec![
-            AccountMeta::new_readonly(trader.pubkey(), true),
-            AccountMeta::new(trader_state, false),
-        ],
-    );
-    let bh2 = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[deposit_ix],
-            Some(&trader.pubkey()),
-            &[&trader],
-            bh2,
-        ))
-        .await
-        .unwrap();
+    // First deposit (50_000) routed via setup_trader's real SPL path.
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
 
     let after: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
     assert_eq!(after.collateral_quote_lots, 50_000);
 
-    // Second deposit accumulates.
+    let vault_after_first = ctx
+        .banks_client
+        .get_account(protocol.quote_vault)
+        .await
+        .unwrap()
+        .unwrap();
+    let vault_first =
+        <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&vault_after_first.data).unwrap();
+    assert_eq!(vault_first.amount, 50_000);
+
+    // Second deposit: fresh trader-owned token account, mint, deposit.
+    let trader_ata2 =
+        create_token_account(&mut ctx, &payer, protocol.quote_mint, trader.pubkey()).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, trader_ata2, 25_000).await;
+
     let deposit_ix2 = build_ix(
         flash_book::instruction::DepositCollateral {
             amount_quote_lots: 25_000,
@@ -576,6 +674,10 @@ async fn deposit_collateral_credits_balance_and_emits_event() {
         vec![
             AccountMeta::new_readonly(trader.pubkey(), true),
             AccountMeta::new(trader_state, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new(trader_ata2, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
     let bh3 = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -591,6 +693,16 @@ async fn deposit_collateral_credits_balance_and_emits_event() {
 
     let after2: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
     assert_eq!(after2.collateral_quote_lots, 75_000);
+
+    let vault_after_second = ctx
+        .banks_client
+        .get_account(protocol.quote_vault)
+        .await
+        .unwrap()
+        .unwrap();
+    let vault_second =
+        <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&vault_after_second.data).unwrap();
+    assert_eq!(vault_second.amount, 75_000);
 }
 
 #[tokio::test]
@@ -600,61 +712,14 @@ async fn withdraw_collateral_reduces_balance() {
     let payer = ctx.payer.insecure_clone();
     let trader = Keypair::new();
 
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[solana_sdk::system_instruction::transfer(
-                &payer.pubkey(),
-                &trader.pubkey(),
-                100_000_000,
-            )],
-            Some(&payer.pubkey()),
-            &[&payer],
-            ctx.last_blockhash,
-        ))
-        .await
-        .unwrap();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 100_000, &protocol).await;
 
-    let (trader_state, _) = pda(&[TraderStateAccount::SEED, trader.pubkey().as_ref()]);
-
-    let open_ix = build_ix(
-        flash_book::instruction::OpenTraderState {},
-        vec![
-            AccountMeta::new(trader.pubkey(), true),
-            AccountMeta::new(trader_state, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-    );
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[open_ix],
-            Some(&trader.pubkey()),
-            &[&trader],
-            bh,
-        ))
-        .await
-        .unwrap();
-
-    // Deposit, then withdraw.
-    let deposit_ix = build_ix(
-        flash_book::instruction::DepositCollateral {
-            amount_quote_lots: 100_000,
-        },
-        vec![
-            AccountMeta::new_readonly(trader.pubkey(), true),
-            AccountMeta::new(trader_state, false),
-        ],
-    );
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[deposit_ix],
-            Some(&trader.pubkey()),
-            &[&trader],
-            bh,
-        ))
-        .await
-        .unwrap();
+    // Re-derive the trader's ATA used by setup_trader. setup_trader creates a
+    // throwaway keypair-owned token account; for withdraw we need a destination
+    // ATA — create a fresh one owned by the trader.
+    let trader_dest_ata =
+        create_token_account(&mut ctx, &payer, protocol.quote_mint, trader.pubkey()).await;
 
     let withdraw_ix = build_ix(
         flash_book::instruction::WithdrawCollateral {
@@ -663,6 +728,10 @@ async fn withdraw_collateral_reduces_balance() {
         vec![
             AccountMeta::new_readonly(trader.pubkey(), true),
             AccountMeta::new(trader_state, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new(trader_dest_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -678,6 +747,28 @@ async fn withdraw_collateral_reduces_balance() {
 
     let after: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
     assert_eq!(after.collateral_quote_lots, 70_000);
+
+    // Vault should hold the remaining 70_000.
+    let vault_after = ctx
+        .banks_client
+        .get_account(protocol.quote_vault)
+        .await
+        .unwrap()
+        .unwrap();
+    let vault_state =
+        <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&vault_after.data).unwrap();
+    assert_eq!(vault_state.amount, 70_000);
+
+    // Trader's destination ATA should hold the withdrawn 30_000.
+    let dest_after = ctx
+        .banks_client
+        .get_account(trader_dest_ata)
+        .await
+        .unwrap()
+        .unwrap();
+    let dest_state =
+        <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&dest_after.data).unwrap();
+    assert_eq!(dest_state.amount, 30_000);
 }
 
 #[tokio::test]
@@ -686,7 +777,7 @@ async fn initialize_market_writes_state() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, base_mint, quote_mint) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, base_mint, quote_mint) = setup_market(&mut ctx, &payer).await;
 
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(market.authority, payer.pubkey());
@@ -716,10 +807,10 @@ async fn place_limit_order_lands_in_buffer() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
 
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (position, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -775,7 +866,7 @@ async fn run_batch_advances_counter_and_clears_buffer() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
     let (commit_buf, _) = pda(&[
         flash_book::state::CommitBufferAccount::SEED,
         market_pda.as_ref(),
@@ -785,7 +876,7 @@ async fn run_batch_advances_counter_and_clears_buffer() {
 
     // Place an order so the buffer is non-empty.
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (position, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -864,7 +955,7 @@ async fn set_market_status_blocks_orders_when_paused() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
 
     // Pause market.
     let pause_ix = build_ix(
@@ -890,7 +981,7 @@ async fn set_market_status_blocks_orders_when_paused() {
 
     // Try to place an order — should fail.
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (position, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -932,7 +1023,7 @@ async fn update_market_params_rejects_immutable_primitive_change() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     // Try to change tick_size — should fail.
     let mut new_params = default_params();
@@ -991,11 +1082,11 @@ async fn liquidate_position_rejects_healthy_trader() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     let (order_buf, _) = pda(&[OrderBufferAccount::SEED, market_pda.as_ref()]);
 
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (position, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -1050,10 +1141,15 @@ async fn deposit_flp_capital_grows_pool() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (_, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+    let protocol = setup_protocol(&mut ctx, &payer).await;
 
-    let initial: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
+    let initial: FlpExposureAccount =
+        fetch(&mut ctx.banks_client, protocol.flp_exposure).await;
     assert_eq!(initial.total_capital_quote_lots, 5_000_000);
+
+    // LP needs a USDC ATA with enough tokens to deposit.
+    let lp_ata = create_token_account(&mut ctx, &payer, protocol.quote_mint, payer.pubkey()).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp_ata, 1_000_000).await;
 
     let ix = build_ix(
         flash_book::instruction::DepositFlpCapital {
@@ -1061,7 +1157,11 @@ async fn deposit_flp_capital_grows_pool() {
         },
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
-            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new(lp_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -1075,8 +1175,21 @@ async fn deposit_flp_capital_grows_pool() {
         .await
         .unwrap();
 
-    let after: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
+    let after: FlpExposureAccount =
+        fetch(&mut ctx.banks_client, protocol.flp_exposure).await;
     assert_eq!(after.total_capital_quote_lots, 6_000_000);
+
+    let vault_after = ctx
+        .banks_client
+        .get_account(protocol.quote_vault)
+        .await
+        .unwrap()
+        .unwrap();
+    let vs = <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(
+        &vault_after.data,
+    )
+    .unwrap();
+    assert_eq!(vs.amount, 1_000_000);
 }
 
 #[tokio::test]
@@ -1087,21 +1200,29 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (_, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+    let protocol = setup_protocol(&mut ctx, &payer).await;
 
-    let ix = build_ix(
-        flash_book::instruction::WithdrawFlpCapital {
+    // Pre-fund the vault so withdraw has tokens to take. The simplest path is
+    // to deposit first via the SPL deposit_flp_capital instruction itself.
+    let lp_ata = create_token_account(&mut ctx, &payer, protocol.quote_mint, payer.pubkey()).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp_ata, 1_000_000).await;
+    let dep_ix = build_ix(
+        flash_book::instruction::DepositFlpCapital {
             amount_quote_lots: 1_000_000,
         },
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
-            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new(lp_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[ix],
+            &[dep_ix],
             Some(&payer.pubkey()),
             &[&payer],
             bh,
@@ -1109,8 +1230,41 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
         .await
         .unwrap();
 
-    let after: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
-    assert_eq!(after.total_capital_quote_lots, 4_000_000);
+    let withdraw_ix = build_ix(
+        flash_book::instruction::WithdrawFlpCapital {
+            amount_quote_lots: 1_000_000,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new(lp_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[withdraw_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let after: FlpExposureAccount =
+        fetch(&mut ctx.banks_client, protocol.flp_exposure).await;
+    // Deposited 1M (5M -> 6M), then withdrew 1M back to LP -> back to 5M.
+    assert_eq!(after.total_capital_quote_lots, 5_000_000);
+
+    let lp_after = ctx.banks_client.get_account(lp_ata).await.unwrap().unwrap();
+    let lp_state = <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(
+        &lp_after.data,
+    )
+    .unwrap();
+    assert_eq!(lp_state.amount, 1_000_000);
 }
 
 #[tokio::test]
@@ -1119,14 +1273,14 @@ async fn submit_commit_and_reveal_full_flow() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
     let (commit_buf, _) = pda(&[
         flash_book::state::CommitBufferAccount::SEED,
         market_pda.as_ref(),
     ]);
 
     let trader = Keypair::new();
-    let _trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let _trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
 
     // Build a reveal payload + its hash matching the program's keccak rule.
     let nonce = [7u8; 32];
@@ -1218,14 +1372,14 @@ async fn submit_reveal_with_wrong_payload_fails() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
     let (commit_buf, _) = pda(&[
         flash_book::state::CommitBufferAccount::SEED,
         market_pda.as_ref(),
     ]);
 
     let trader = Keypair::new();
-    let _trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let _trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
 
     let nonce = [7u8; 32];
     let side: u8 = 0;
@@ -1296,7 +1450,7 @@ async fn update_oracle_authority_only() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     // Authority can update.
     let ok_ix = build_ix(
@@ -1375,7 +1529,7 @@ async fn transfer_market_authority_rotates_keys() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     let new_authority = Keypair::new();
 
@@ -1436,10 +1590,10 @@ async fn liquidate_portfolio_rejects_healthy_trader_zero_remaining() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
 
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (position, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -1503,12 +1657,12 @@ async fn liquidate_portfolio_with_two_markets_and_no_positions() {
     let payer = ctx.payer.insecure_clone();
 
     // Market 1.
-    let (market1_pda, order_buf1, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market1_pda, order_buf1, _, _) = setup_market(&mut ctx, &payer).await;
     // Market 2.
     let (market2_pda, _, _, _) = setup_additional_market(&mut ctx, &payer, 200_000).await;
 
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
 
     let (position1, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
@@ -1609,7 +1763,7 @@ async fn second_market_initializes_at_different_oracle_price() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (m1, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, m1, _, _, _) = setup_market(&mut ctx, &payer).await;
     let (m2, _, _, _) = setup_additional_market(&mut ctx, &payer, 200_000).await;
 
     let market1: MarketAccount = fetch(&mut ctx.banks_client, m1).await;
@@ -1634,7 +1788,7 @@ async fn two_traders_crossing_orders_clear_in_batch() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
     let (commit_buf, _) = pda(&[
         flash_book::state::CommitBufferAccount::SEED,
         market_pda.as_ref(),
@@ -1645,8 +1799,8 @@ async fn two_traders_crossing_orders_clear_in_batch() {
     // Two traders — alice will buy, bob will sell.
     let alice = Keypair::new();
     let bob = Keypair::new();
-    let alice_state = setup_trader(&mut ctx, &payer, &alice, 50_000).await;
-    let bob_state = setup_trader(&mut ctx, &payer, &bob, 50_000).await;
+    let alice_state = setup_trader(&mut ctx, &payer, &alice, 50_000, &protocol).await;
+    let bob_state = setup_trader(&mut ctx, &payer, &bob, 50_000, &protocol).await;
 
     let (alice_pos, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
@@ -1779,9 +1933,9 @@ async fn place_limit_order_below_min_lot_rejected() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (position, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -1825,7 +1979,9 @@ async fn place_limit_order_off_tick_rejected() {
     let payer = ctx.payer.insecure_clone();
 
     // Set up a market with tick_size = 10 so we can test off-tick prices.
-    let (insurance_fund, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let insurance_fund = protocol.insurance_fund;
+    let flp_exposure = protocol.flp_exposure;
 
     let base_mint = Keypair::new().pubkey();
     let quote_mint = Keypair::new().pubkey();
@@ -1878,7 +2034,7 @@ async fn place_limit_order_off_tick_rejected() {
         .unwrap();
 
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (position, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -1923,7 +2079,7 @@ async fn apply_fill_settles_two_trader_positions() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
     let (commit_buf, _) = pda(&[
         flash_book::state::CommitBufferAccount::SEED,
         market_pda.as_ref(),
@@ -1933,8 +2089,8 @@ async fn apply_fill_settles_two_trader_positions() {
 
     let alice = Keypair::new();
     let bob = Keypair::new();
-    let alice_state = setup_trader(&mut ctx, &payer, &alice, 50_000).await;
-    let bob_state = setup_trader(&mut ctx, &payer, &bob, 50_000).await;
+    let alice_state = setup_trader(&mut ctx, &payer, &alice, 50_000, &protocol).await;
+    let bob_state = setup_trader(&mut ctx, &payer, &bob, 50_000, &protocol).await;
 
     let (alice_pos, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
@@ -2076,11 +2232,11 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
 
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (taker_pos, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -2149,10 +2305,10 @@ async fn place_limit_order_per_trader_rate_limit_enforced() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
 
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (position, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -2234,7 +2390,7 @@ async fn update_oracle_rejects_stale_price() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (insurance_fund, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+    let (insurance_fund, flp_exposure) = setup_protocol_pair(&mut ctx, &payer).await;
 
     let base_mint = Keypair::new().pubkey();
     let quote_mint = Keypair::new().pubkey();
@@ -2316,7 +2472,7 @@ async fn update_oracle_rejects_wide_confidence() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (insurance_fund, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+    let (insurance_fund, flp_exposure) = setup_protocol_pair(&mut ctx, &payer).await;
 
     let base_mint = Keypair::new().pubkey();
     let quote_mint = Keypair::new().pubkey();
@@ -2401,7 +2557,9 @@ async fn place_limit_order_rejects_above_position_cap() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (insurance_fund, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let insurance_fund = protocol.insurance_fund;
+    let flp_exposure = protocol.flp_exposure;
 
     let base_mint = Keypair::new().pubkey();
     let quote_mint = Keypair::new().pubkey();
@@ -2451,7 +2609,7 @@ async fn place_limit_order_rejects_above_position_cap() {
         .unwrap();
 
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (position, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -2522,10 +2680,10 @@ async fn cancel_order_removes_from_buffer() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
 
     let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (position, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -2596,12 +2754,12 @@ async fn cancel_order_rejects_other_traders_order() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
 
     let alice = Keypair::new();
     let bob = Keypair::new();
-    let alice_state = setup_trader(&mut ctx, &payer, &alice, 50_000).await;
-    let _bob_state = setup_trader(&mut ctx, &payer, &bob, 50_000).await;
+    let alice_state = setup_trader(&mut ctx, &payer, &alice, 50_000, &protocol).await;
+    let _bob_state = setup_trader(&mut ctx, &payer, &bob, 50_000, &protocol).await;
     let (alice_pos, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -2671,7 +2829,7 @@ async fn update_oracle_quorum_writes_median_with_three_close_sources() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2714,7 +2872,7 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (insurance_fund, flp_exposure) = setup_protocol(&mut ctx, &payer).await;
+    let (insurance_fund, flp_exposure) = setup_protocol_pair(&mut ctx, &payer).await;
 
     let base_mint = Keypair::new().pubkey();
     let quote_mint = Keypair::new().pubkey();

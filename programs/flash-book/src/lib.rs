@@ -12,6 +12,7 @@
 #![allow(unexpected_cfgs)]
 
 use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 pub mod constants;
 pub mod errors;
@@ -136,19 +137,29 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// LP deposits capital into the FLP pool. SPL transfer integration
-    /// is a follow-up; v1 increments the accounting balance.
+    /// LP deposits capital into the FLP pool. SPL transfer is performed
+    /// from the LP's USDC ATA into the protocol vault before accounting.
     pub fn deposit_flp_capital(
         ctx: Context<UpdateFlpCapital>,
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-        let flp = &mut ctx.accounts.flp_exposure;
         require_keys_eq!(
-            flp.authority,
+            ctx.accounts.flp_exposure.authority,
             ctx.accounts.authority.key(),
             FlashBookError::Unauthorized
         );
+
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.authority_quote_ata.to_account_info(),
+            to: ctx.accounts.quote_vault.to_account_info(),
+            authority: ctx.accounts.authority.to_account_info(),
+        };
+        let cpi_ctx =
+            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        let flp = &mut ctx.accounts.flp_exposure;
         flp.total_capital_quote_lots = flp
             .total_capital_quote_lots
             .checked_add(amount_quote_lots)
@@ -168,26 +179,40 @@ pub mod flash_book {
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-        let flp = &mut ctx.accounts.flp_exposure;
         require_keys_eq!(
-            flp.authority,
+            ctx.accounts.flp_exposure.authority,
             ctx.accounts.authority.key(),
             FlashBookError::Unauthorized
         );
-        let new_total = flp
+        let new_total = ctx
+            .accounts
+            .flp_exposure
             .total_capital_quote_lots
             .checked_sub(amount_quote_lots)
             .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
-        // Capital must always strictly exceed gross exposure so the pool
-        // can absorb a max-shock loss without going insolvent.
-        // Gross exposure is the sum of |size × entry_price × tick_size|.
-        // For v1 we approximate against zero (open positions block
-        // withdrawals); a Phase 2 instruction takes remaining_accounts to
-        // verify against actual market mark prices.
+        // Open positions block withdrawals — Phase 2 reads remaining_accounts
+        // to verify against actual market mark prices.
         require!(
-            flp.markets_count == 0,
+            ctx.accounts.flp_exposure.markets_count == 0,
             FlashBookError::InsufficientCollateral
         );
+
+        let bump = ctx.accounts.insurance_fund.bump;
+        let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
+        let signers = &[signer_seeds];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.quote_vault.to_account_info(),
+            to: ctx.accounts.authority_quote_ata.to_account_info(),
+            authority: ctx.accounts.insurance_fund.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signers,
+        );
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        let flp = &mut ctx.accounts.flp_exposure;
         flp.total_capital_quote_lots = new_total;
         emit!(FlpCapitalUpdatedEvent {
             new_total,
@@ -196,7 +221,10 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Initialize an insurance fund (one per protocol).
+    /// Initialize an insurance fund (one per protocol). Also creates the
+    /// global protocol quote vault — a TokenAccount for `quote_mint` whose
+    /// authority is the insurance_fund PDA itself. All trader collateral
+    /// and FLP capital flows through this vault.
     pub fn initialize_insurance_fund(
         ctx: Context<InitializeInsuranceFund>,
         fee_contribution_bps: u32,
@@ -214,6 +242,8 @@ pub mod flash_book {
         f.pause_threshold_quote_lots = pause_threshold_quote_lots;
         f.total_contributions = 0;
         f.total_payouts = 0;
+        f.quote_mint = ctx.accounts.quote_mint.key();
+        f.quote_vault = ctx.accounts.quote_vault.key();
         Ok(())
     }
 
@@ -231,15 +261,29 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Deposit collateral into the trader's state. SPL token transfer is
-    /// done in a follow-up (this instruction credits the trader's accounting
-    /// balance; production wiring also moves USDC into the protocol vault
-    /// via SPL CPI).
+    /// Deposit collateral. Performs an SPL transfer from the trader's
+    /// quote ATA into the global protocol vault, then credits the trader's
+    /// accounting balance. Both the SPL transfer and the accounting bump
+    /// happen atomically — partial failure rolls back the whole tx.
     pub fn deposit_collateral(
         ctx: Context<DepositCollateral>,
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+
+        // SPL transfer: trader_quote_ata → quote_vault. Trader signs.
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.trader_quote_ata.to_account_info(),
+            to: ctx.accounts.quote_vault.to_account_info(),
+            authority: ctx.accounts.trader.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+        );
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        // Accounting.
         let s = &mut ctx.accounts.trader_state;
         s.collateral_quote_lots = s
             .collateral_quote_lots
@@ -253,24 +297,45 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Withdraw collateral. Blocked if it would push the trader below
-    /// initial-margin requirement on any open position. (For v1 we approximate
-    /// by checking against `open_positions == 0`; production wiring iterates
-    /// open Position PDAs via remaining_accounts.)
+    /// Withdraw collateral. Decrements accounting + transfers from the
+    /// vault back to the trader's ATA. The program signs as the
+    /// insurance_fund PDA (which owns the vault). Blocked while the
+    /// trader has open positions.
     pub fn withdraw_collateral(
         ctx: Context<WithdrawCollateral>,
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+
+        // Pre-flight checks (do these before the transfer so we don't
+        // mutate vault state on a rejected withdrawal).
+        {
+            let s = &ctx.accounts.trader_state;
+            require!(s.open_positions == 0, FlashBookError::InsufficientCollateral);
+            require!(
+                amount_quote_lots <= s.collateral_quote_lots,
+                FlashBookError::InsufficientCollateral,
+            );
+        }
+
+        // SPL transfer: quote_vault → trader_quote_ata. Program signs.
+        let bump = ctx.accounts.insurance_fund.bump;
+        let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
+        let signers = &[signer_seeds];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.quote_vault.to_account_info(),
+            to: ctx.accounts.trader_quote_ata.to_account_info(),
+            authority: ctx.accounts.insurance_fund.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signers,
+        );
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        // Accounting.
         let s = &mut ctx.accounts.trader_state;
-        require!(
-            s.open_positions == 0,
-            FlashBookError::InsufficientCollateral
-        );
-        require!(
-            amount_quote_lots <= s.collateral_quote_lots,
-            FlashBookError::InsufficientCollateral
-        );
         s.collateral_quote_lots = s
             .collateral_quote_lots
             .checked_sub(amount_quote_lots)
@@ -1672,6 +1737,30 @@ pub struct UpdateFlpCapital<'info> {
         bump = flp_exposure.bump,
     )]
     pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+
+    /// Insurance fund PDA — owns the protocol vault and signs withdrawals.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    /// LP's USDC ATA — source on deposit, destination on withdraw.
+    #[account(
+        mut,
+        token::mint = insurance_fund.quote_mint,
+        token::authority = authority,
+    )]
+    pub authority_quote_ata: Account<'info, TokenAccount>,
+
+    /// Global protocol vault.
+    #[account(
+        mut,
+        address = insurance_fund.quote_vault,
+    )]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -1686,6 +1775,22 @@ pub struct InitializeInsuranceFund<'info> {
         bump,
     )]
     pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
+
+    /// The protocol's quote currency mint (typically USDC).
+    pub quote_mint: Account<'info, Mint>,
+
+    /// Global protocol vault. Created with `insurance_fund` PDA as
+    /// authority so the program can sign transfers out.
+    #[account(
+        init,
+        payer = authority,
+        token::mint = quote_mint,
+        token::authority = insurance_fund,
+    )]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1837,6 +1942,7 @@ pub struct RunBatch<'info> {
 #[derive(Accounts)]
 pub struct DepositCollateral<'info> {
     pub trader: Signer<'info>,
+
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
@@ -1844,11 +1950,35 @@ pub struct DepositCollateral<'info> {
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    /// Trader's USDC ATA — authority must be `trader`, mint must match.
+    #[account(
+        mut,
+        token::mint = insurance_fund.quote_mint,
+        token::authority = trader,
+    )]
+    pub trader_quote_ata: Account<'info, TokenAccount>,
+
+    /// Global vault — must be the one stored on the insurance_fund.
+    #[account(
+        mut,
+        address = insurance_fund.quote_vault,
+    )]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
 pub struct WithdrawCollateral<'info> {
     pub trader: Signer<'info>,
+
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
@@ -1856,6 +1986,29 @@ pub struct WithdrawCollateral<'info> {
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
+
+    /// Insurance fund PDA — authority over the vault. The program signs
+    /// transfers out using its seeds.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(
+        mut,
+        token::mint = insurance_fund.quote_mint,
+        token::authority = trader,
+    )]
+    pub trader_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        address = insurance_fund.quote_vault,
+    )]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]

@@ -159,12 +159,21 @@ pub struct InsuranceFundAccount {
     pub pause_threshold_quote_lots: u64,
     pub total_contributions: u64,
     pub total_payouts: u64,
+    /// SPL mint for the protocol's quote currency (typically USDC). All
+    /// collateral and FLP capital moves through this mint.
+    pub quote_mint: Pubkey,
+    /// Global protocol vault TokenAccount. Owned by the InsuranceFundAccount
+    /// PDA (which signs transfers out via known seeds). Holds all trader
+    /// collateral + FLP capital.
+    pub quote_vault: Pubkey,
 }
 
 impl InsuranceFundAccount {
     pub const SEED: &'static [u8] = b"insurance_fund";
     pub fn space() -> usize {
-        8 + 128
+        // 8 (disc) + 32 + 1 + 8 + 4 + 4 + 4 + 8 + 8 + 8 + 32 + 32 = 149.
+        // Round up generously.
+        8 + 192
     }
 }
 
