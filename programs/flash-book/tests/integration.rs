@@ -2087,6 +2087,7 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
     ]);
 
     // Apply a fill where trader buys 1 lot @ 100,000 from FLP.
+    let (insurance_fund_pda_for_flpfill, _) = pda(&[InsuranceFundAccount::SEED]);
     let ix = build_ix(
         flash_book::instruction::ApplyFlpFill {
             size_lots: 1,
@@ -2096,6 +2097,7 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer
             AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda_for_flpfill, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(flp_exposure, false),

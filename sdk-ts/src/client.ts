@@ -442,6 +442,7 @@ export class FlashBookClient {
     const takerState = this.traderState(args.takerTrader);
     const takerPos = this.position(args.market, args.takerTrader);
     const flp = this.flpExposure();
+    const fund = this.insuranceFund();
     return this.methods
       .applyFlpFill(
         args.sizeLots,
@@ -451,6 +452,7 @@ export class FlashBookClient {
       .accountsPartial({
         sequencer: args.sequencer,
         market: args.market,
+        insuranceFund: fund.address,
         takerTraderState: takerState.address,
         takerPosition: takerPos.address,
         flpExposure: flp.address,

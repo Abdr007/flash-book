@@ -1083,6 +1083,70 @@ pub mod flash_book {
         let flp_side_enum = taker_side_enum.opposite();
         let taker_trader_pk = ctx.accounts.taker_trader_state.trader;
 
+        // Fee + rebate accrual (parity with apply_fill).
+        // FLP is the maker — rebate accrues to FLP capital instead of a maker
+        // TraderState. Net fee still flows to the insurance fund.
+        let notional_u128 = (size_lots as u128)
+            .checked_mul(price_ticks as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+            .checked_mul(market.params.tick_size as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let taker_fee_u128 =
+            notional_u128.saturating_mul(market.params.taker_fee_bps as u128) / constants::BPS_DENOM as u128;
+        let maker_rebate_u128 =
+            notional_u128.saturating_mul(market.params.maker_rebate_bps as u128) / constants::BPS_DENOM as u128;
+        require!(maker_rebate_u128 <= taker_fee_u128, FlashBookError::OutOfRange);
+        let taker_fee = if taker_fee_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            taker_fee_u128 as u64
+        };
+        let maker_rebate = if maker_rebate_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            maker_rebate_u128 as u64
+        };
+        let net_fee = taker_fee.saturating_sub(maker_rebate);
+
+        // Deduct fee from taker.
+        {
+            let taker_state = &mut ctx.accounts.taker_trader_state;
+            taker_state.collateral_quote_lots = taker_state
+                .collateral_quote_lots
+                .checked_sub(taker_fee)
+                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+        }
+        // Credit rebate to FLP capital (FLP is the maker here).
+        {
+            let flp = &mut ctx.accounts.flp_exposure;
+            flp.total_capital_quote_lots = flp
+                .total_capital_quote_lots
+                .checked_add(maker_rebate)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        }
+        // Net fee to insurance fund.
+        {
+            let fund = &mut ctx.accounts.insurance_fund;
+            let contribution = (net_fee as u128)
+                .saturating_mul(fund.fee_contribution_bps as u128)
+                .checked_div(constants::BPS_DENOM as u128)
+                .ok_or_else(|| error!(FlashBookError::DivisionByZero))?;
+            let contribution_u64 = if contribution > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                contribution as u64
+            };
+            fund.balance_quote_lots = fund
+                .balance_quote_lots
+                .checked_add(contribution_u64)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            fund.total_contributions = fund.total_contributions.saturating_add(contribution_u64);
+        }
+        market.total_fees_collected = market
+            .total_fees_collected
+            .checked_add(net_fee)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
         let taker_pos = &mut ctx.accounts.taker_position;
         if taker_pos.market == Pubkey::default() {
             taker_pos.market = market_key;
@@ -1793,6 +1857,13 @@ pub struct ApplyFlpFill<'info> {
         bump = market.bump,
     )]
     pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
 
     #[account(
         mut,

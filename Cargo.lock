@@ -1637,6 +1637,8 @@ dependencies = [
  "anchor-spl",
  "bytemuck",
  "proptest",
+ "serde",
+ "serde_json",
  "solana-program-test",
  "solana-sdk",
  "thiserror 2.0.18",
