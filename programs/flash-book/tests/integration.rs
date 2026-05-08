@@ -1906,3 +1906,226 @@ async fn place_limit_order_off_tick_rejected() {
         .await;
     assert!(result.is_err(), "off-tick price should be rejected");
 }
+
+#[tokio::test]
+async fn apply_fill_settles_two_trader_positions() {
+    // Full settlement flow: two traders cross, run_batch matches them,
+    // apply_fill mutates both Position PDAs to reflect the trade.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (commit_buf, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    let alice_state = setup_trader(&mut ctx, &payer, &alice, 50_000).await;
+    let bob_state = setup_trader(&mut ctx, &payer, &bob, 50_000).await;
+
+    let (alice_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        alice.pubkey().as_ref(),
+    ]);
+    let (bob_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        bob.pubkey().as_ref(),
+    ]);
+
+    // Place crossing orders.
+    for (signer, state, pos, side, limit) in [
+        (&alice, alice_state, alice_pos, 0u8, 100_500u64),
+        (&bob, bob_state, bob_pos, 1u8, 99_500u64),
+    ] {
+        let ix = build_ix(
+            flash_book::instruction::PlaceLimitOrder {
+                side,
+                size_lots: 1,
+                limit_ticks: limit,
+                post_only: false,
+            },
+            vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(order_buf, false),
+                AccountMeta::new(state, false),
+                AccountMeta::new(pos, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        );
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signer.pubkey()),
+                &[signer],
+                bh,
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Run batch.
+    let run_ix = build_ix(
+        flash_book::instruction::RunBatch { now_ms: 1_000_000 },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(commit_buf, false),
+            AccountMeta::new(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[run_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Read the clearing price from the market.
+    let market_after_batch: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    let clearing_price = market_after_batch.recent_clearing_prices[0];
+    assert!(clearing_price >= 99_500 && clearing_price <= 100_500);
+
+    // Settle: apply_fill with alice as taker, bob as maker.
+    // (In a production run_batch this would be derived from the emitted
+    // FillAppliedEvent. For deterministic E2E we feed the known values.)
+    let apply_ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: clearing_price,
+            taker_side: 0, // alice is long taker
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // sequencer = payer
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(alice_state, false),
+            AccountMeta::new(bob_state, false),
+            AccountMeta::new(alice_pos, false),
+            AccountMeta::new(bob_pos, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[apply_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Verify positions.
+    let alice_position: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, alice_pos).await;
+    let bob_position: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, bob_pos).await;
+
+    assert_eq!(alice_position.side, 0); // long
+    assert_eq!(alice_position.size_lots, 1);
+    assert_eq!(alice_position.entry_price_ticks, clearing_price);
+
+    assert_eq!(bob_position.side, 1); // short
+    assert_eq!(bob_position.size_lots, 1);
+    assert_eq!(bob_position.entry_price_ticks, clearing_price);
+
+    // Verify TraderState open_positions counters.
+    let alice_state_after: TraderStateAccount =
+        fetch(&mut ctx.banks_client, alice_state).await;
+    let bob_state_after: TraderStateAccount =
+        fetch(&mut ctx.banks_client, bob_state).await;
+    assert_eq!(alice_state_after.open_positions, 1);
+    assert_eq!(bob_state_after.open_positions, 1);
+
+    // Verify market OI.
+    let market_after_apply: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market_after_apply.oi_long_lots, 1);
+    assert_eq!(market_after_apply.oi_short_lots, 1);
+}
+
+#[tokio::test]
+async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
+    // Settlement path where FLP is the maker. Apply_flp_fill mutates the
+    // taker's position + the FlpExposureAccount.per_market entry on the
+    // opposite side.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    // Apply a fill where trader buys 1 lot @ 100,000 from FLP.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFlpFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0, // long
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // sequencer
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Verify trader position: long 1 @ 100k.
+    let position: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(position.side, 0);
+    assert_eq!(position.size_lots, 1);
+    assert_eq!(position.entry_price_ticks, 100_000);
+
+    // Verify FLP took the opposite side: short 1 @ 100k on this market.
+    let flp: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
+    assert_eq!(flp.markets_count, 1);
+    let entry = flp
+        .per_market
+        .iter()
+        .find(|e| e.side != 255 && e.market == market_pda)
+        .expect("FLP should have an entry on this market");
+    assert_eq!(entry.side, 1); // short
+    assert_eq!(entry.size_lots, 1);
+    assert_eq!(entry.entry_price_ticks, 100_000);
+
+    // Verify market OI: 1 long (trader) + 1 short (FLP).
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.oi_long_lots, 1);
+    assert_eq!(market.oi_short_lots, 1);
+}

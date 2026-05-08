@@ -4,6 +4,44 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] — 2026-05-08
+
+### Added — Phase 1 closure (100% instruction E2E coverage)
+
+Two final E2E tests covering the remaining settlement paths:
+
+- **`apply_fill_settles_two_trader_positions`** — the canonical full
+  settlement test. Two traders cross, run_batch matches them, then
+  `apply_fill` is invoked with the clearing price from the market's
+  TWAP buffer. Verifies both Position PDAs, both TraderState
+  open_positions counters, and market OI all reflect the trade
+  atomically. **The complete intake → match → settle → state-write
+  pipeline runs end-to-end on real Solana runtime.**
+- **`apply_flp_fill_creates_taker_position_and_flp_entry`** — FLP
+  settlement path. Trader buys from FLP; verifies the taker's
+  Position PDA, the FLP's per-market entry on the opposite side, and
+  market OI all updated. **Proves the FLP becomes a counterparty
+  on-chain.**
+
+### 100% instruction E2E coverage milestone
+
+All 20 Anchor instructions now have E2E tests on a real Solana runtime:
+
+```
+Setup:        initialize_insurance_fund ✓ initialize_flp_exposure ✓
+              initialize_market ✓ open_trader_state ✓
+Lifecycle:    deposit_collateral ✓ withdraw_collateral ✓
+              deposit_flp_capital ✓ withdraw_flp_capital ✓
+Order intake: place_limit_order ✓ submit_commit ✓ submit_reveal ✓
+Batch:        run_batch ✓ (with verified clearing price)
+Settlement:   apply_fill ✓ apply_flp_fill ✓
+Liquidation:  liquidate_position ✓ liquidate_portfolio ✓
+Governance:   update_oracle ✓ set_market_status ✓
+              update_market_params ✓ transfer_market_authority ✓
+```
+
+### Total test count: 238 (152 TS sim+SDK + 31 Rust unit + 30 Rust property × 2K + 25 E2E integration).
+
 ## [0.24.0] — 2026-05-08
 
 ### Added — Phase 1 final polish (verified batch execution + edge case E2E)
