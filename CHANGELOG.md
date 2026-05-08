@@ -4,6 +4,55 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] — 2026-05-08
+
+### Added — Phase 1 final hardening (60,000 fuzz assertions)
+
+`programs/flash-book/tests/proptest_modules.rs` — 17 property tests
+across the remaining matcher modules. Each runs 2,000 random cases.
+Total fuzz assertions across all proptests now stands at **60,000**:
+
+- **FBA matcher (proptest_fba.rs)** — 6 × 2K = 12K
+- **Risk (proptest_risk.rs)** — 7 × 2K = 14K
+- **Modules (proptest_modules.rs)** — 17 × 2K = 34K
+
+By module:
+
+#### `flp_quoter` (5 properties)
+- `flp_bid_below_ask_always` — bid ≤ fair_value ≤ ask at every level
+- `flp_vpin_widens_spread` — high-VPIN bid ≤ low-VPIN bid; high-VPIN
+  ask ≥ low-VPIN ask. **Spread is monotonic in VPIN.**
+- `flp_zero_capital_emits_no_orders` — protects against div-by-zero
+- `flp_short_pool_lifts_fair_value` — net-short pool has skew ≥ 0
+- `flp_long_pool_lowers_fair_value` — net-long pool has skew ≤ 0
+
+#### `funding` (3 properties)
+- `funding_rate_sign_matches_premium_sign` — mark > oracle ⇒ rate ≥ 0;
+  mark < oracle ⇒ rate ≤ 0; mark = oracle ⇒ rate = 0
+- `funding_zero_delta_no_change` — Δt = 0 leaves cum_index unchanged
+- `funding_rate_bounded_by_max` — clamping holds for any input
+
+#### `vpin` (3 properties)
+- `vpin_bounded` — `as_bps()` always in [0, 10_000]
+- `vpin_one_sided_flow_high` — pure long flow → VPIN > 50% bps
+- `vpin_no_fills_zero` — empty stream stays at 0
+
+#### `insurance fund` (3 properties)
+- `insurance_cover_conserves_value` — covered + remaining = shortfall
+  always; balance after = balance before − covered
+- `insurance_contributions_sum` — three-stream contributions add up
+  exactly to balance + total_contributions
+- `insurance_pause_threshold_monotonic` — adding to balance can only
+  flip false→true on the pause gate (never true→false)
+
+#### `commit_reveal` (3 properties)
+- `commit_reveal_roundtrip` — committed payload → identical revealed Order
+- `commit_reveal_tamper_rejected` — any tampered field fails the hash
+- `commit_sweep_returns_bond` — expired commits release their bond
+
+### Total test count: 233 (152 TS sim+SDK + 31 Rust unit + 30 Rust property × 2K cases + 20 E2E integration).
+### Total fuzz assertions: **~60,000**.
+
 ## [0.22.0] — 2026-05-08
 
 ### Added — Phase 1 polish (matcher::risk property tests + integer-math findings)
