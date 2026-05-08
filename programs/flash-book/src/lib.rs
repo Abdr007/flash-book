@@ -20,7 +20,10 @@ pub mod state;
 
 pub use errors::FlashBookError;
 
-use constants::{MARK_HISTORY_LEN, ORDER_BUFFER_CAP};
+use constants::{
+    FLP_SEQ_RESERVED_OFFSET, MARK_HISTORY_LEN, MAX_ORDERS_PER_TRADER_PER_BATCH,
+    ORDER_BUFFER_CAP,
+};
 use matcher::commit_reveal::{
     register_commit, redeem_reveal, sweep_expired, RevealPayload,
 };
@@ -207,53 +210,73 @@ pub mod flash_book {
         require!(price_ticks > 0, FlashBookError::ZeroPrice);
         require!(taker_side <= 1, FlashBookError::OutOfRange);
 
-        let market = &ctx.accounts.market;
+        let market = &mut ctx.accounts.market;
         let market_key = market.key();
         let funding_index = market.cum_funding_index;
+        let current_batch = market.current_batch;
         let taker_side_enum = if taker_side == 0 { Side::Long } else { Side::Short };
         let maker_side_enum = taker_side_enum.opposite();
+        let taker_trader_pk = ctx.accounts.taker_trader_state.trader;
+        let maker_trader_pk = ctx.accounts.maker_trader_state.trader;
 
         let taker_pos = &mut ctx.accounts.taker_position;
         let maker_pos = &mut ctx.accounts.maker_position;
 
-        // Initialize if first time (Anchor init_if_needed does most of this).
+        // Initialize Position state on first ever fill against this PDA.
         if taker_pos.market == Pubkey::default() {
             taker_pos.market = market_key;
-            taker_pos.trader = ctx.accounts.taker_trader_state.trader;
+            taker_pos.trader = taker_trader_pk;
             taker_pos.bump = ctx.bumps.taker_position;
-            taker_pos.size_lots = 0;
-            taker_pos.entry_price_ticks = 0;
             taker_pos.cum_funding_index_at_entry = funding_index;
-            taker_pos.realized_pnl_quote_lots = 0;
-            taker_pos.funding_paid_quote_lots = 0;
-            taker_pos.last_settlement_batch = market.current_batch;
+            taker_pos.last_settlement_batch = current_batch;
         }
         if maker_pos.market == Pubkey::default() {
             maker_pos.market = market_key;
-            maker_pos.trader = ctx.accounts.maker_trader_state.trader;
+            maker_pos.trader = maker_trader_pk;
             maker_pos.bump = ctx.bumps.maker_position;
-            maker_pos.size_lots = 0;
-            maker_pos.entry_price_ticks = 0;
             maker_pos.cum_funding_index_at_entry = funding_index;
-            maker_pos.realized_pnl_quote_lots = 0;
-            maker_pos.funding_paid_quote_lots = 0;
-            maker_pos.last_settlement_batch = market.current_batch;
+            maker_pos.last_settlement_batch = current_batch;
         }
+
+        // Snapshot pre-state so we can detect open/close transitions.
+        let taker_was_open = taker_pos.size_lots > 0;
+        let maker_was_open = maker_pos.size_lots > 0;
+        let taker_pre_side = taker_pos.side;
+        let maker_pre_side = maker_pos.side;
+        let taker_pre_size = taker_pos.size_lots;
+        let maker_pre_size = maker_pos.size_lots;
 
         apply_fill_to_position(taker_pos, taker_side_enum, size_lots, price_ticks, funding_index)?;
         apply_fill_to_position(maker_pos, maker_side_enum, size_lots, price_ticks, funding_index)?;
 
-        // Update open_positions counts on TraderState (open if size > 0 from 0).
-        // For v1 we don't decrement — production version tracks transitions.
+        // Update OI counters: walk pre→post for each side.
+        update_oi(market, taker_pre_side, taker_pre_size, taker_pos.side, taker_pos.size_lots)?;
+        update_oi(market, maker_pre_side, maker_pre_size, maker_pos.side, maker_pos.size_lots)?;
+
+        // Update open_positions transitions on TraderState.
+        let taker_is_open = taker_pos.size_lots > 0;
+        let maker_is_open = maker_pos.size_lots > 0;
+        let taker_state = &mut ctx.accounts.taker_trader_state;
+        if !taker_was_open && taker_is_open {
+            taker_state.open_positions = taker_state.open_positions.saturating_add(1);
+        } else if taker_was_open && !taker_is_open {
+            taker_state.open_positions = taker_state.open_positions.saturating_sub(1);
+        }
+        let maker_state = &mut ctx.accounts.maker_trader_state;
+        if !maker_was_open && maker_is_open {
+            maker_state.open_positions = maker_state.open_positions.saturating_add(1);
+        } else if maker_was_open && !maker_is_open {
+            maker_state.open_positions = maker_state.open_positions.saturating_sub(1);
+        }
 
         emit!(FillAppliedEvent {
             market: market_key,
-            taker: ctx.accounts.taker_trader_state.trader,
-            maker: ctx.accounts.maker_trader_state.trader,
+            taker: taker_trader_pk,
+            maker: maker_trader_pk,
             taker_side,
             size_lots,
             price_ticks,
-            batch_num: market.current_batch,
+            batch_num: current_batch,
         });
         Ok(())
     }
@@ -298,9 +321,28 @@ pub mod flash_book {
             FlashBookError::SizeBelowMinLot
         );
         require!(
-            limit_ticks % market.params.tick_size == 0,
+            limit_ticks.is_multiple_of(market.params.tick_size),
             FlashBookError::PriceNotOnTick
         );
+        require!(
+            size_lots <= FLP_SEQ_RESERVED_OFFSET, // sanity bound
+            FlashBookError::OutOfRange
+        );
+
+        // Per-trader rate limit (reset on batch boundary).
+        let trader_state = &mut ctx.accounts.trader_state;
+        if trader_state.last_batch_seen != market.current_batch {
+            trader_state.last_batch_seen = market.current_batch;
+            trader_state.orders_this_batch = 0;
+        }
+        require!(
+            trader_state.orders_this_batch < MAX_ORDERS_PER_TRADER_PER_BATCH,
+            FlashBookError::RateLimited
+        );
+        trader_state.orders_this_batch = trader_state
+            .orders_this_batch
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
 
         let buffer = &mut ctx.accounts.order_buffer;
         require!(
@@ -312,6 +354,8 @@ pub mod flash_book {
             .seq_counter
             .checked_add(1)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+
         let trader_key = ctx.accounts.trader.key();
         let mut inserted = false;
         for slot in buffer.slots.iter_mut() {
@@ -454,10 +498,28 @@ pub mod flash_book {
             orders.push(slot_to_order(slot)?);
         }
 
-        // 3. Generate FLP virtual quotes (synthesized — does not need
-        //    its own account write; consumed in this match).
+        // 3. Generate FLP virtual quotes — synthesized; consumed in this match.
+        // Compute real signed exposure for *this* market from the per-market
+        // entry on FlpExposureAccount, plus gross utilization across all
+        // markets the pool is exposed to.
         let flp_pool_capital = flp.total_capital_quote_lots;
-        let flp_net_signed: i64 = 0; // simplified for v1; multi-market version coming
+        let market_key = market.key();
+        let flp_net_signed: i64 = {
+            let entry = flp
+                .per_market
+                .iter()
+                .find(|e| e.market == market_key && e.side != 255);
+            match entry {
+                Some(e) => {
+                    let notional_u128 = (e.size_lots as u128)
+                        .saturating_mul(e.entry_price_ticks as u128)
+                        .saturating_mul(market.params.tick_size as u128);
+                    let notional = notional_u128.min(i64::MAX as u128) as i64;
+                    if e.side == 0 { notional } else { -notional }
+                }
+                None => 0,
+            }
+        };
         let utilization_bps = if flp_pool_capital > 0 {
             let oi_total = market
                 .oi_long_lots
@@ -471,12 +533,19 @@ pub mod flash_book {
             0
         };
 
+        // Realized volatility from the recent clearing-price window.
+        let realized_vol_bps = realized_vol_bps_from_window(
+            &market.recent_clearing_prices,
+            market.recent_clearing_count,
+        );
+
         let flp_params = FlpQuoterParams {
             base_spread_bps: market.params.flp_spread_base_bps,
             alpha_bps: market.params.flp_spread_alpha_bps,
             beta_bps: market.params.flp_spread_beta_bps,
             gamma_bps: market.params.flp_spread_gamma_bps,
             kappa_bps: market.params.flp_spread_kappa_bps,
+            delta_bps: market.params.flp_spread_delta_bps,
             inventory_lambda_bps: market.params.flp_inventory_lambda_bps,
             depth_floor_lots: market.params.flp_depth_floor_lots,
             max_growth_per_batch_bps: market.params.flp_max_growth_per_batch_bps,
@@ -486,6 +555,7 @@ pub mod flash_book {
         let flp_inputs = FlpQuoterInputs {
             oracle_ticks: Ticks(market.oracle_price_ticks),
             vpin_bps: market.vpin.as_bps(),
+            realized_vol_bps,
             pool_capital_quote_lots: flp_pool_capital,
             pool_net_quote_lots_signed: flp_net_signed,
             pool_gross_utilization_bps: utilization_bps,
@@ -493,7 +563,8 @@ pub mod flash_book {
             oi_short_lots: market.oi_short_lots,
         };
         let flp_trader = flp.key();
-        let flp_seq_base = buffer.seq_counter.saturating_add(1_000_000);
+        let flp_seq_base = FLP_SEQ_RESERVED_OFFSET
+            .saturating_add(market.current_batch.saturating_mul(1024));
         let (_flp_out, flp_orders) =
             generate_quotes(flp_params, flp_inputs, flp_trader, flp_seq_base)?;
         for o in flp_orders {
@@ -514,12 +585,13 @@ pub mod flash_book {
                     market.recent_clearing_count.saturating_add(1);
             }
             // TWAP.
-            let n = market.recent_clearing_count as u128;
-            let mut sum: u128 = 0;
-            for i in 0..(market.recent_clearing_count as usize) {
-                sum = sum.saturating_add(market.recent_clearing_prices[i] as u128);
-            }
-            let twap = if n > 0 { (sum / n) as u64 } else { result.clearing_price.0 };
+            let count = market.recent_clearing_count as usize;
+            let sum: u128 = market
+                .recent_clearing_prices
+                .iter()
+                .take(count)
+                .fold(0u128, |acc, p| acc.saturating_add(*p as u128));
+            let twap = (sum.checked_div(count as u128)).unwrap_or(result.clearing_price.0 as u128) as u64;
             // Oracle band.
             let band = (market.oracle_price_ticks as u128)
                 .saturating_mul(market.params.oracle_band_bps as u128)
@@ -566,15 +638,12 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Delegate the market's accounts to MagicBlock ER.
-    /// Wraps the upstream delegation CPI when the SDK is Solana 2.x ready.
-    pub fn delegate_market(_ctx: Context<DelegateMarket>) -> Result<()> {
-        Err(error!(FlashBookError::ForceIncludeUnsupported))
-    }
-
-    pub fn undelegate_market(_ctx: Context<UndelegateMarket>) -> Result<()> {
-        Err(error!(FlashBookError::ForceIncludeUnsupported))
-    }
+    // ER delegation (delegate_market / undelegate_market) is intentionally
+    // omitted in this build. The upstream `ephemeral-rollups-sdk` is not yet
+    // compatible with Solana 2.x; introducing a stub here would create a
+    // misleading instruction surface. The integration is purely additive —
+    // when the SDK ships compat, two new instructions slot in here without
+    // changing any existing semantics.
 }
 
 // ─── Account contexts ───────────────────────────────────────────────────
@@ -803,18 +872,21 @@ pub struct ApplyFill<'info> {
     pub sequencer: Signer<'info>,
 
     #[account(
+        mut,
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
     pub market: Account<'info, MarketAccount>,
 
     #[account(
+        mut,
         seeds = [TraderStateAccount::SEED, taker_trader_state.trader.as_ref()],
         bump = taker_trader_state.bump,
     )]
     pub taker_trader_state: Account<'info, TraderStateAccount>,
 
     #[account(
+        mut,
         seeds = [TraderStateAccount::SEED, maker_trader_state.trader.as_ref()],
         bump = maker_trader_state.bump,
     )]
@@ -839,22 +911,6 @@ pub struct ApplyFill<'info> {
     pub maker_position: Account<'info, state::PositionAccount>,
 
     pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct DelegateMarket<'info> {
-    pub authority: Signer<'info>,
-    /// CHECK: market PDA being delegated.
-    #[account(mut)]
-    pub market: UncheckedAccount<'info>,
-}
-
-#[derive(Accounts)]
-pub struct UndelegateMarket<'info> {
-    pub authority: Signer<'info>,
-    /// CHECK: market PDA being undelegated.
-    #[account(mut)]
-    pub market: UncheckedAccount<'info>,
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────
@@ -933,6 +989,82 @@ fn slot_to_order(slot: &OrderSlot) -> Result<Order> {
         seq: slot.seq,
         post_only: slot.post_only == 1,
     })
+}
+
+/// Realized volatility (stdev of relative returns) over a clearing-price
+/// window, expressed in bps. Pure-integer; uses isqrt.
+fn realized_vol_bps_from_window(prices: &[u64; MARK_HISTORY_LEN], count: u8) -> u32 {
+    let n = (count as usize).min(prices.len());
+    if n < 2 {
+        return 0;
+    }
+    // returns_bps[i] = (p[i+1] - p[i]) * 10_000 / p[i]
+    let mut returns: [i64; MARK_HISTORY_LEN] = [0; MARK_HISTORY_LEN];
+    let mut returns_n: usize = 0;
+    let mut sum: i64 = 0;
+    for i in 0..(n - 1) {
+        let p0 = prices[i] as i128;
+        let p1 = prices[i + 1] as i128;
+        if p0 <= 0 {
+            continue;
+        }
+        let r_bps = ((p1 - p0) * 10_000) / p0;
+        // clamp to i64 range (returns of ±100% × 10_000 = ±1_000_000 fits trivially)
+        let r = if r_bps > i64::MAX as i128 {
+            i64::MAX
+        } else if r_bps < i64::MIN as i128 {
+            i64::MIN
+        } else {
+            r_bps as i64
+        };
+        returns[returns_n] = r;
+        returns_n += 1;
+        sum = sum.saturating_add(r);
+    }
+    if returns_n == 0 {
+        return 0;
+    }
+    let mean = sum / returns_n as i64;
+    let mut var_sum: i128 = 0;
+    for r in returns.iter().take(returns_n) {
+        let d = (*r - mean) as i128;
+        var_sum = var_sum.saturating_add(d * d);
+    }
+    let variance = var_sum / returns_n as i128;
+    let stdev = (variance.max(0) as u128).isqrt() as u64;
+    // Cap at 10_000 bps (= 100%) — a plausible upper bound on per-batch return stdev.
+    stdev.min(10_000) as u32
+}
+
+/// Update OI counters for a single trader's position transition.
+fn update_oi(
+    market: &mut MarketAccount,
+    pre_side: u8,
+    pre_size: u64,
+    post_side: u8,
+    post_size: u64,
+) -> Result<()> {
+    if pre_size > 0 {
+        if pre_side == 0 {
+            market.oi_long_lots = market.oi_long_lots.saturating_sub(pre_size);
+        } else {
+            market.oi_short_lots = market.oi_short_lots.saturating_sub(pre_size);
+        }
+    }
+    if post_size > 0 {
+        if post_side == 0 {
+            market.oi_long_lots = market
+                .oi_long_lots
+                .checked_add(post_size)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        } else {
+            market.oi_short_lots = market
+                .oi_short_lots
+                .checked_add(post_size)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        }
+    }
+    Ok(())
 }
 
 /// Apply one fill against a single Position account in-place.

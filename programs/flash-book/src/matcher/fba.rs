@@ -232,7 +232,7 @@ fn sum_sells_at_or_below(sells: &[&Order], p: Ticks) -> Result<BaseLots> {
 }
 
 fn abs_diff(a: u64, b: u64) -> u64 {
-    if a > b { a - b } else { b - a }
+    a.abs_diff(b)
 }
 
 /// Used by the engine to know which orders went unfilled.

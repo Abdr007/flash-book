@@ -19,10 +19,11 @@ use anchor_lang::prelude::*;
 #[derive(Debug, Clone, Copy)]
 pub struct FlpQuoterParams {
     pub base_spread_bps: u32,
-    pub alpha_bps: u32,
-    pub beta_bps: u32,
-    pub gamma_bps: u32,
-    pub kappa_bps: u32,
+    pub alpha_bps: u32,           // VPIN coefficient
+    pub beta_bps: u32,            // utilization coefficient
+    pub gamma_bps: u32,           // OI imbalance coefficient
+    pub kappa_bps: u32,           // depth amortization (Q/depth_floor)
+    pub delta_bps: u32,           // realized-volatility coefficient
     pub inventory_lambda_bps: u32,
     pub depth_floor_lots: u64,
     pub max_growth_per_batch_bps: u32,
@@ -34,6 +35,7 @@ pub struct FlpQuoterParams {
 pub struct FlpQuoterInputs {
     pub oracle_ticks: Ticks,
     pub vpin_bps: u32,
+    pub realized_vol_bps: u32,
     pub pool_capital_quote_lots: u64,
     pub pool_net_quote_lots_signed: i64,
     pub pool_gross_utilization_bps: u32,
@@ -149,6 +151,7 @@ pub fn generate_quotes(
         } else {
             0
         };
+        let vol_term = (params.delta_bps as u64 * inputs.realized_vol_bps as u64) / BPS_DENOM as u64;
         let s_bps = (params.base_spread_bps as u64)
             .checked_add((params.alpha_bps as u64 * inputs.vpin_bps as u64) / BPS_DENOM as u64)
             .or_overflow()?
@@ -157,6 +160,8 @@ pub fn generate_quotes(
             .checked_add(oi_term)
             .or_overflow()?
             .checked_add(depth_term)
+            .or_overflow()?
+            .checked_add(vol_term)
             .or_overflow()?;
         // Cap spread at 50% (ridiculous floor).
         let s_bps = s_bps.min(5000) as u32;

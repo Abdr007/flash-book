@@ -128,6 +128,7 @@ fn flp_quoter_emits_balanced_ladder_when_flat() {
         beta_bps: 3_000,
         gamma_bps: 2_000,
         kappa_bps: 500,
+        delta_bps: 20_000,
         inventory_lambda_bps: 5_000,
         depth_floor_lots: 1_000,
         max_growth_per_batch_bps: 50, // 0.5%
@@ -137,6 +138,7 @@ fn flp_quoter_emits_balanced_ladder_when_flat() {
     let inputs = FlpQuoterInputs {
         oracle_ticks: Ticks(100_000), // arbitrary tick units
         vpin_bps: 0,
+        realized_vol_bps: 0,
         pool_capital_quote_lots: 1_000_000_000,
         pool_net_quote_lots_signed: 0,
         pool_gross_utilization_bps: 0,
@@ -162,6 +164,7 @@ fn flp_quoter_inventory_skew_short_pool_lifts_fair_value() {
         beta_bps: 3_000,
         gamma_bps: 2_000,
         kappa_bps: 500,
+        delta_bps: 20_000,
         inventory_lambda_bps: 5_000,
         depth_floor_lots: 1_000,
         max_growth_per_batch_bps: 50,
@@ -171,6 +174,7 @@ fn flp_quoter_inventory_skew_short_pool_lifts_fair_value() {
     let inputs = FlpQuoterInputs {
         oracle_ticks: Ticks(100_000),
         vpin_bps: 0,
+        realized_vol_bps: 0,
         pool_capital_quote_lots: 1_000_000_000,
         pool_net_quote_lots_signed: -100_000_000, // pool is net short
         pool_gross_utilization_bps: 1_000,

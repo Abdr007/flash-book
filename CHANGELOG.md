@@ -4,6 +4,49 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-08
+
+### Added — Phase 1 continued (audit pass + IDL + advanced market making)
+
+**Realized-volatility coefficient in FLP quoter (Avellaneda-Stoikov parity).**
+- New `flp_spread_delta_bps` parameter in `MarketParams` and `FlpQuoterParams`.
+- New `realized_vol_bps` input field to the FLP quoter.
+- New `realized_vol_bps_from_window()` helper computes std-dev of returns
+  in pure integer arithmetic over the recent clearing-price window
+  (uses `u128::isqrt`, no floats).
+- Spread function now: `s = base + α·VPIN + β·u + γ·|oi_imb| + κ·Q/D + δ·σ`
+  — full parity with the TS reference implementation.
+
+**Wired previously-dead state into real semantics.**
+- `place_limit_order` now enforces per-trader per-batch rate limit
+  (`MAX_ORDERS_PER_TRADER_PER_BATCH = 16`) using `TraderState.last_batch_seen`
+  and `orders_this_batch` counters that were previously initialized but unused.
+- `apply_fill` now updates Open Interest counters via new `update_oi()` helper
+  with full pre→post transition handling (no double-counting on flips).
+- `apply_fill` now updates `TraderState.open_positions` on
+  open/close transitions, gating `withdraw_collateral` correctly.
+- `run_batch` now reads real signed FLP exposure for the market from
+  `FlpExposureAccount.per_market` (replaces the previous hardcoded `0`).
+
+**Removed dead code.**
+- Removed `delegate_market` / `undelegate_market` instruction stubs that
+  returned errors. Replaced with a comment documenting that the integration
+  is purely additive — no misleading instruction surface.
+- Removed associated `DelegateMarket` / `UndelegateMarket` Account contexts.
+
+**Cleanup.**
+- Replaced magic-number `1_000_000` FLP seq base with the explicit
+  `FLP_SEQ_RESERVED_OFFSET = 1 << 56` constant; user orders strictly below,
+  FLP virtual orders strictly above.
+- Place_limit_order rejects user orders that would collide with the FLP
+  reserved range.
+- Clippy clean (zero non-upstream warnings).
+
+**IDL** — `idl/flash_book.json` (2,389 lines) committed; downstream TS
+clients can now consume the Anchor instruction surface.
+
+### Test status: 108 (71 TS + 31 Rust unit + 6 Rust property × 2K cases). All green.
+
 ## [0.5.0] — 2026-05-08
 
 ### Added — Phase 1 continued (lifecycle instructions)

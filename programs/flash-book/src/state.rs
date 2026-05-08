@@ -44,6 +44,7 @@ pub struct MarketParams {
     pub flp_spread_beta_bps: u32,
     pub flp_spread_gamma_bps: u32,
     pub flp_spread_kappa_bps: u32,
+    pub flp_spread_delta_bps: u32,    // realized-vol coefficient
     pub flp_inventory_lambda_bps: u32,
     pub flp_depth_floor_lots: u64,
     pub flp_max_growth_per_batch_bps: u32,

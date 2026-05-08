@@ -61,11 +61,7 @@ impl VpinState {
             let sell_chunk = bucket_size.saturating_sub(buy_chunk);
 
             // imbalance = |buy - sell| / bucket_size, expressed in Q32.32.
-            let abs_diff = if buy_chunk > sell_chunk {
-                buy_chunk - sell_chunk
-            } else {
-                sell_chunk - buy_chunk
-            };
+            let abs_diff = buy_chunk.abs_diff(sell_chunk);
             // imbalance_q = abs_diff * FIXED_ONE / bucket_size
             let imbalance_q = (abs_diff as u128)
                 .checked_mul(VPIN_FIXED_ONE as u128)

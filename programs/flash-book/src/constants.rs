@@ -39,3 +39,12 @@ pub const VPIN_FIXED_ONE: u64 = 1u64 << VPIN_FRACTIONAL_BITS;
 
 /// Lot epsilon — sizes below this are treated as zero (rounding noise).
 pub const LOT_EPSILON: u64 = 1;
+
+/// Reserved sequence-number range for synthesized FLP virtual orders.
+/// User-submitted orders use [0, FLP_SEQ_RESERVED_OFFSET); FLP virtual
+/// quotes use [FLP_SEQ_RESERVED_OFFSET, ∞). Keeps user FIFO ordering
+/// untouched by FLP injection.
+pub const FLP_SEQ_RESERVED_OFFSET: u64 = 1u64 << 56;
+
+/// Per-trader per-batch limit on submitted orders. Spam-protection.
+pub const MAX_ORDERS_PER_TRADER_PER_BATCH: u32 = 16;
