@@ -671,6 +671,172 @@ async fn open_trader_state_initializes_zero_balance() {
 }
 
 #[tokio::test]
+async fn init_trader_ata_creates_canonical_ata_idempotently() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let trader = Keypair::new();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let expected_ata = ata_for(&trader.pubkey(), &protocol.quote_mint);
+
+    // Pre-condition: ATA does not yet exist.
+    assert!(ctx
+        .banks_client
+        .get_account(expected_ata)
+        .await
+        .unwrap()
+        .is_none());
+
+    let init_ix = build_ix(
+        flash_book::instruction::InitTraderAta {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(trader.pubkey(), false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(expected_ata, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_associated_token_account::id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix.clone()],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Post-condition: ATA exists at the canonical address, owned by SPL Token,
+    // mint = quote_mint, authority = trader.
+    let ata_acc = ctx
+        .banks_client
+        .get_account(expected_ata)
+        .await
+        .unwrap()
+        .expect("ATA should exist after init_trader_ata");
+    assert_eq!(ata_acc.owner, spl_token::id());
+    let ata_state =
+        <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&ata_acc.data)
+            .unwrap();
+    assert_eq!(ata_state.mint, protocol.quote_mint);
+    assert_eq!(ata_state.owner, trader.pubkey());
+    assert_eq!(ata_state.amount, 0);
+
+    // Idempotency: calling again must succeed (init_if_needed semantics).
+    let bh2 = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh2,
+        ))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn init_trader_ata_then_deposit_in_same_tx() {
+    // Onboarding flow: in one transaction, create the ATA, mint USDC into it,
+    // and deposit collateral. Validates that the freshly-created ATA is
+    // immediately usable by the deposit instruction.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let trader = Keypair::new();
+
+    // Fund the trader so they can sign the open + deposit txs.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &trader.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let trader_ata = ata_for(&trader.pubkey(), &protocol.quote_mint);
+    let (trader_state, _) = pda(&[TraderStateAccount::SEED, trader.pubkey().as_ref()]);
+
+    // Open trader state + create ATA (single tx, payer funds both).
+    let open_ix = build_ix(
+        flash_book::instruction::OpenTraderState {},
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let init_ata_ix = build_ix(
+        flash_book::instruction::InitTraderAta {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(trader.pubkey(), false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(trader_ata, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_associated_token_account::id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[open_ix, init_ata_ix],
+            Some(&payer.pubkey()),
+            &[&payer, &trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Mint USDC to the freshly-created ATA, then deposit.
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, trader_ata, 25_000).await;
+    let deposit_ix = build_ix(
+        flash_book::instruction::DepositCollateral {
+            amount_quote_lots: 25_000,
+        },
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(trader_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[deposit_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let state: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(state.collateral_quote_lots, 25_000);
+}
+
+#[tokio::test]
 async fn deposit_collateral_credits_balance_and_emits_event() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;

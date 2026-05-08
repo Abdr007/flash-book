@@ -24,6 +24,10 @@ export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
   'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
 );
 
+/// SPL Associated Token Account program — used as the program account when
+/// CPI-creating ATAs.
+export const ATA_PROGRAM_ID = ASSOCIATED_TOKEN_PROGRAM_ID;
+
 /// Derive the canonical Associated Token Account address for (owner, mint).
 /// Equivalent to `getAssociatedTokenAddressSync` from `@solana/spl-token`,
 /// inlined to avoid pulling that package as a runtime dependency.

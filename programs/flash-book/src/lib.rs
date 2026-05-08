@@ -12,7 +12,7 @@
 #![allow(unexpected_cfgs)]
 
 use anchor_lang::prelude::*;
-use anchor_spl::associated_token::{self, AssociatedToken};
+use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 pub mod constants;
@@ -259,6 +259,18 @@ pub mod flash_book {
         s.toxicity_score_bps = 0;
         s.orders_this_batch = 0;
         s.last_batch_seen = 0;
+        Ok(())
+    }
+
+    /// Idempotently create the trader's quote ATA. Anchor's `init_if_needed`
+    /// + `associated_token::*` constraints handle the AssociatedToken CPI:
+    /// if the ATA already exists, this is a no-op; otherwise it's created
+    /// at the canonical address with `payer` funding rent.
+    ///
+    /// Owner doesn't need to sign — anyone can fund someone else's ATA
+    /// creation. The mint is constrained to the protocol's `quote_mint`
+    /// so this can only be used to create ATAs that Flash Book accepts.
+    pub fn init_trader_ata(_ctx: Context<InitTraderAta>) -> Result<()> {
         Ok(())
     }
 
@@ -1811,6 +1823,43 @@ pub struct OpenTraderState<'info> {
         bump,
     )]
     pub trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitTraderAta<'info> {
+    /// Funds the ATA rent. Doesn't have to be the trader — onboarding flows
+    /// often have the protocol or a sponsor pay.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// Owner of the ATA being created. Doesn't sign: ATA creation is
+    /// permissionless under the AssociatedToken program.
+    /// CHECK: used only as the seed/authority for the ATA derivation.
+    pub trader: UncheckedAccount<'info>,
+
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// Created idempotently if missing. Anchor CPIs the AssociatedToken
+    /// program when this account doesn't yet exist; the canonical address
+    /// is derived from (trader, quote_mint).
+    #[account(
+        init_if_needed,
+        payer = payer,
+        associated_token::mint = quote_mint,
+        associated_token::authority = trader,
+    )]
+    pub trader_quote_ata: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 

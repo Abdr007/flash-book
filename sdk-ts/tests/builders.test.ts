@@ -13,6 +13,7 @@ import BN from 'bn.js';
 import {
   FLASH_BOOK_PROGRAM_ID,
   FlashBookClient,
+  associatedTokenAddress,
   defaultInsuranceFundParams,
   defaultMajorMarketParams,
   MarketStatus,
@@ -77,6 +78,33 @@ describe('Instruction builders', () => {
     const trader = Keypair.generate().publicKey;
     const ix = await client.openTraderStateIx(trader);
     expect(ix.keys.length).toBe(3); // trader, trader_state, sysprog
+  });
+
+  test('initTraderAtaIx', async () => {
+    const client = makeClient();
+    const trader = Keypair.generate().publicKey;
+    const ix = await client.initTraderAtaIx({
+      payer: Keypair.generate().publicKey,
+      trader,
+      quoteMint: Keypair.generate().publicKey,
+    });
+    // payer, trader, insurance_fund, quote_mint, trader_quote_ata,
+    // token_program, ata_program, system_program
+    expect(ix.keys.length).toBe(8);
+  });
+
+  test('initTraderAtaIx auto-derives the canonical ATA when not provided', async () => {
+    const client = makeClient();
+    const trader = Keypair.generate().publicKey;
+    const quoteMint = Keypair.generate().publicKey;
+    const ix = await client.initTraderAtaIx({
+      payer: Keypair.generate().publicKey,
+      trader,
+      quoteMint,
+    });
+    // The trader_quote_ata key (index 4) must equal associatedTokenAddress(trader, quoteMint).
+    const expectedAta = associatedTokenAddress(trader, quoteMint);
+    expect(ix.keys[4].pubkey.toBase58()).toBe(expectedAta.toBase58());
   });
 
   // ─── Lifecycle (4) ─────────────────────────────────────────────────

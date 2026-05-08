@@ -22,6 +22,7 @@ import {
 } from '@solana/web3.js';
 import idlJson from '../idl.json' assert { type: 'json' };
 import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
   associatedTokenAddress,
   commitBufferPda,
   flpExposurePda,
@@ -224,6 +225,35 @@ export class FlashBookClient {
       .accountsPartial({
         trader,
         traderState: state.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Idempotently create the trader's quote ATA on-chain. Wraps a CPI to
+  /// the AssociatedToken program via Anchor's `init_if_needed`. Safe to
+  /// call repeatedly: existing ATAs are accepted as no-ops. The mint is
+  /// constrained to `insurance_fund.quote_mint`, so this can only create
+  /// ATAs that Flash Book recognizes for collateral.
+  initTraderAtaIx(args: {
+    payer: PublicKey;
+    trader: PublicKey;
+    quoteMint: PublicKey;
+    /** Optional override; defaults to the canonical ATA for (trader, quoteMint). */
+    traderQuoteAta?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const fund = this.insuranceFund();
+    const ata = args.traderQuoteAta ?? associatedTokenAddress(args.trader, args.quoteMint);
+    return this.methods
+      .initTraderAta()
+      .accountsPartial({
+        payer: args.payer,
+        trader: args.trader,
+        insuranceFund: fund.address,
+        quoteMint: args.quoteMint,
+        traderQuoteAta: ata,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
       .instruction();
