@@ -145,11 +145,98 @@ matcher faults, no measurable user-impact regressions.
 
 ## Phase 5 — Continuous improvement
 
-- [ ] Multi-oracle quorum (Pyth + Switchboard + on-chain median)
-- [ ] Cross-market netting at the matcher level (basket orders)
-- [ ] Maker rebate distribution from toxicity tax pool
-- [ ] Spot trading on the same matcher (single-asset markets)
-- [ ] Lending integration (cross-margin against spot collateral)
+- [x] Multi-oracle quorum (`update_oracle_quorum` — median + dispersion)
+- [x] Cross-market netting at the matcher level (`place_basket_order_n`)
+- [x] Maker rebate distribution from toxicity tax pool
+- [x] Spot trading on the same matcher (`defaultSpotMarketParams`)
+- [ ] Lending integration (cross-margin against spot collateral) — deferred
+
+## Phase 6 — Hyperliquid parity + Flash-specific math wins (waves 6-13, **complete**)
+
+Shipped after the original phase 5 list. Every item below is a NEW
+on-chain primitive added since the original "feature-complete" mark.
+
+### Native order types (HL parity)
+- [x] Trigger orders w/ OCO + reduce_only + GTT (`place_trigger_order`)
+- [x] TWAP orders w/ permissionless slice exec (`place_twap_order`)
+- [x] Bracket orders — atomic parent + 2 OCO triggers (`place_bracket_order`)
+- [x] Trailing stops w/ permissionless ratchet (`update_trailing_stop`)
+- [x] Iceberg orders w/ permissionless replenish (`place_iceberg_order`)
+- [x] Mass cancel — single-tx flatten (`cancel_all_orders_in_market`)
+- [x] GTT order expiry on every order (`expires_at_slot`)
+- [x] STP modes — CancelNewest / CancelOldest / CancelBoth
+
+### Permissionless markets (HIP-3)
+- [x] `permissionless_initialize_market` w/ envelope-clamped params
+- [x] Pre-launch market flag (`is_pre_launch`)
+- [x] Slashable HIP-3 deployer bond (`MarketBondAccount`)
+- [x] 7-day unbond delay
+- [x] `slash_market_bond` (governance-gated)
+
+### Capital primitives
+- [x] User-managed trading vaults (`VaultAccount` + `VaultPositionAccount`)
+- [x] HWM perf-fee in shares (`settle_vault_perf_fee`)
+- [x] Mark-to-market vault NAV (market walk in remaining_accounts)
+- [x] Cross-margin sweep (`sweep_collateral`) — position-aware
+- [x] Per-position leverage cap (`set_position_leverage`)
+
+### Fee + reward primitives
+- [x] Builder codes (`set_trader_builder` + `BuilderFeeOwedEvent`)
+- [x] Referral program (`set_trader_referrer` — one-time-write)
+- [x] Negative-fee top tier (discount up to 12_000 bps)
+- [x] Trading-rewards eligibility (`TradingRewardEligibleEvent`)
+- [x] Multi-threshold pre-liq margin alerts
+
+### Liquidation safety
+- [x] Auto-Deleverage (`auto_deleverage`) w/ bankruptcy-price math
+- [x] Mark-price sanity cap (`mark_change_max_bps`)
+- [x] Whole-market OI cap (`max_oi_base_lots`)
+
+### Smarter-than-HL math (Flash Book specific)
+- [x] CME-style concentration margin tier (FLP-capital-keyed)
+- [x] Funding-premium TWAP dampener (kills 50ms cadence microbursts)
+- [x] Symmetric-OI funding dampener (balanced book → 0 funding)
+
+### View ixs (UI primitives via tx simulation)
+- [x] `view_predicted_funding`
+- [x] `view_quote_ladder`
+- [x] `view_portfolio_risk` (cross-market, single-call)
+
+### Bot suite (`@flash-book/bot`)
+- [x] AdlKeeper (off-chain ranking, on-chain eligibility)
+- [x] TrailingStopKeeper
+- [x] IcebergKeeper
+- [x] BondMonitorKeeper (read-only alerts, governance owns slash)
+
+### Math hardening
+- [x] 9 new property tests (~18K cases) for OI dampener +
+      concentration-tier invariants
+
+**Status:** 35 native ixs, 149 Rust tests, 263 TypeScript tests,
+zero warnings, ER-compatible. Architecture doc (`docs/ARCHITECTURE.md`)
++ comparison doc (`docs/COMPARISON.md`) refreshed to current state.
+
+## Phase 7 — Production hardening (in progress)
+
+### Required to ship
+- [ ] End-to-end integration tests for ADL / vault MTM / bracket OCO /
+      iceberg replenish / sweep-with-positions (math is proptested,
+      flows aren't yet)
+- [ ] Mainnet deployment scripts + upgrade-authority handling
+- [ ] Threat-model coverage matrix (audit prep)
+- [ ] Multi-sig market-pause governance (currently single-authority)
+
+### Strongly desired
+- [ ] Liquidity bootstrap auction for HIP-3 (Dutch-style price
+      discovery for the first hour of a permissionless deploy)
+- [ ] Multi-tier (N=4) concentration margin (we have single-tier)
+- [ ] Funding-per-period cap (anti-gouge over 24h windows)
+
+### Not required (different scope)
+- Cross-asset cross-collateral (stress-lattice rework)
+- Subaccount as separate type (covered by delegate slot)
+- HYPE-style governance token (tokenomics decision)
+- Block-trade RFQ (off-chain matching layer)
 
 ## Open research questions
 
