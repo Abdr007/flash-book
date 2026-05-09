@@ -16,6 +16,7 @@ use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer};
 
 pub mod constants;
+pub mod er;
 pub mod errors;
 pub mod matcher;
 pub mod state;
