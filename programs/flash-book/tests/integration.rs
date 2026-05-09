@@ -127,6 +127,8 @@ fn default_params() -> MarketParams {
         liquidation_cooldown_slots: 0,
         liquidation_auction_duration_slots: 0,
         jit_bonus_rebate_bps: 0,
+        referrer_share_bps: 0,
+        builder_share_bps: 0,
     }
 }
 

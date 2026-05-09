@@ -460,6 +460,26 @@ pub mod flash_book {
         s.last_batch_seen = 0;
         s.fee_discount_bps = 0;
         s.delegate = Pubkey::default();
+        s.referrer = Pubkey::default();
+        Ok(())
+    }
+
+    /// Set the trader's referrer. ONE-TIME-WRITE: once set to a non-default
+    /// pubkey, the field cannot be rewritten. Anti-rotation griefing —
+    /// referrers earn off the trader for the lifetime of the account, no
+    /// "rug your referrer" attack vector. Set to Pubkey::default() to
+    /// opt out PERMANENTLY (also one-time-write).
+    pub fn set_trader_referrer(
+        ctx: Context<SetTraderReferrer>,
+        referrer: Pubkey,
+    ) -> Result<()> {
+        let s = &mut ctx.accounts.trader_state;
+        require!(s.referrer == Pubkey::default(), FlashBookError::OutOfRange);
+        s.referrer = referrer;
+        emit!(TraderReferrerSetEvent {
+            trader: s.trader,
+            referrer,
+        });
         Ok(())
     }
 
@@ -838,6 +858,25 @@ pub mod flash_book {
             .total_fees_collected
             .checked_add(net_fee)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // ── Referral attribution (Hyperliquid affiliate model) ───────
+        // When the taker has a referrer set, emit ReferralOwedEvent
+        // with the share so off-chain integrators can credit referrer
+        // balances. Pull-based (no on-chain referrer account walk) keeps
+        // ApplyFill's account list bounded; off-chain ledger pays out.
+        let taker_referrer = ctx.accounts.taker_trader_state.referrer;
+        if taker_referrer != Pubkey::default() && market.params.referrer_share_bps > 0 {
+            let share = ((net_fee as u128)
+                .saturating_mul(market.params.referrer_share_bps as u128)
+                / (constants::BPS_DENOM as u128)) as u64;
+            if share > 0 {
+                emit!(ReferralOwedEvent {
+                    taker: ctx.accounts.taker_trader_state.trader,
+                    referrer: taker_referrer,
+                    amount_quote_lots: share,
+                });
+            }
+        }
 
         // ── Toxicity tax (VPIN-scaled) ────────────────────────────────
         // Charges the taker an extra fee proportional to the market's
@@ -2966,6 +3005,21 @@ pub struct OpenTraderState<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetTraderReferrer<'info> {
+    /// Trader signs to set their own referrer. One-time-write enforced
+    /// inside the handler.
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+}
+
+#[derive(Accounts)]
 pub struct SetTraderDelegate<'info> {
     /// The trader signs to set/clear their own delegate. Only the trader
     /// can change this field — the delegate cannot rotate themselves out.
@@ -3777,6 +3831,26 @@ pub struct TraderDelegateUpdatedEvent {
     pub trader: Pubkey,
     pub previous: Pubkey,
     pub new: Pubkey,
+}
+
+#[event]
+pub struct TraderReferrerSetEvent {
+    pub trader: Pubkey,
+    pub referrer: Pubkey,
+}
+
+#[event]
+pub struct ReferralPaidEvent {
+    pub taker: Pubkey,
+    pub referrer: Pubkey,
+    pub amount_quote_lots: u64,
+}
+
+#[event]
+pub struct ReferralOwedEvent {
+    pub taker: Pubkey,
+    pub referrer: Pubkey,
+    pub amount_quote_lots: u64,
 }
 
 #[event]

@@ -116,6 +116,19 @@ pub struct MarketParams {
     /// added on top of the base maker_rebate_bps. Encourages MMs to
     /// preferentially quote against tagged flow.
     pub jit_bonus_rebate_bps: u32,
+
+    /// Hyperliquid-style affiliate program: when a taker has a referrer
+    /// set on their TraderState, this many bps of the protocol's NET fee
+    /// (post-rebate, post-discount) is credited to the referrer's
+    /// TraderState collateral. 0 = referral program off. Typical: 1000-
+    /// 2500 bps (10-25% of net fee).
+    pub referrer_share_bps: u32,
+
+    /// Builder code share — bps of net fee credited to the `builder` pubkey
+    /// passed on the order. Frontends earn this for routing flow. 0 = off.
+    /// Typical: 500-1500 bps (5-15% of net fee). Distinct from referral
+    /// (referrer is per-trader; builder is per-order).
+    pub builder_share_bps: u32,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).
@@ -406,14 +419,22 @@ pub struct TraderStateAccount {
     /// itself ALWAYS retains authority — delegate is additive, not
     /// exclusive (the trader can revoke at any time).
     pub delegate: Pubkey,
+    /// Referrer pubkey. When non-default, on every fill where this trader
+    /// is the taker, `market.params.referrer_share_bps` of the protocol's
+    /// net fee revenue is credited to the referrer's TraderState
+    /// collateral. Hyperliquid affiliate model. Pubkey::default() = no
+    /// referrer (default for all new trader_state). Set once via
+    /// `set_trader_referrer` — immutable after first set (anti-rotation
+    /// griefing).
+    pub referrer: Pubkey,
 }
 
 impl TraderStateAccount {
     pub const SEED: &'static [u8] = b"trader_state";
     pub fn space() -> usize {
-        // 8 (disc) + 32 (trader) + 1 + 8 + 8 + 1 + 4 + 4 + 8 + 8 + 4 + 32 (delegate) = 118.
-        // Round up.
-        8 + 128
+        // 8 (disc) + 32 + 1 + 8 + 8 + 1 + 4 + 4 + 8 + 8 + 4 + 32 (delegate) +
+        // 32 (referrer) = 150. Round up.
+        8 + 160
     }
 
     /// Returns true if `signer` is authorized to act on this trader's

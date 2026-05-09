@@ -878,6 +878,23 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// One-time-write referrer. Hyperliquid affiliate model: while the
+  /// taker has a referrer set, every fill emits a ReferralOwedEvent
+  /// off-chain integrators credit. Cannot be rotated — anti-grief.
+  setTraderReferrerIx(args: {
+    trader: PublicKey;
+    referrer: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const state = this.traderState(args.trader);
+    return this.methods
+      .setTraderReferrer(args.referrer)
+      .accountsPartial({
+        trader: args.trader,
+        traderState: state.address,
+      })
+      .instruction();
+  }
+
   /// Set or clear the trader's delegate authority. The trader signs;
   /// the delegate is the new pubkey allowed to act on the trader's
   /// behalf for trader-bound ix. Clear with PublicKey.default().

@@ -3116,6 +3116,71 @@
       ]
     },
     {
+      "name": "set_trader_referrer",
+      "docs": [
+        "Set the trader's referrer. ONE-TIME-WRITE: once set to a non-default",
+        "pubkey, the field cannot be rewritten. Anti-rotation griefing —",
+        "referrers earn off the trader for the lifetime of the account, no",
+        "\"rug your referrer\" attack vector. Set to Pubkey::default() to",
+        "opt out PERMANENTLY (also one-time-write)."
+      ],
+      "discriminator": [
+        212,
+        78,
+        210,
+        176,
+        111,
+        140,
+        87,
+        233
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "docs": [
+            "Trader signs to set their own referrer. One-time-write enforced",
+            "inside the handler."
+          ],
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "referrer",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
       "name": "settle_funding",
       "docs": [
         "Settle accrued funding for a single position. Computes funding owed",
@@ -4785,6 +4850,32 @@
       ]
     },
     {
+      "name": "ReferralOwedEvent",
+      "discriminator": [
+        132,
+        144,
+        116,
+        137,
+        128,
+        54,
+        175,
+        54
+      ]
+    },
+    {
+      "name": "ReferralPaidEvent",
+      "discriminator": [
+        30,
+        170,
+        23,
+        66,
+        51,
+        224,
+        41,
+        32
+      ]
+    },
+    {
       "name": "ToxicityTaxAppliedEvent",
       "discriminator": [
         72,
@@ -4821,6 +4912,19 @@
         58,
         104,
         248
+      ]
+    },
+    {
+      "name": "TraderReferrerSetEvent",
+      "discriminator": [
+        223,
+        246,
+        142,
+        180,
+        126,
+        244,
+        43,
+        49
       ]
     }
   ],
@@ -6107,6 +6211,27 @@
               "preferentially quote against tagged flow."
             ],
             "type": "u32"
+          },
+          {
+            "name": "referrer_share_bps",
+            "docs": [
+              "Hyperliquid-style affiliate program: when a taker has a referrer",
+              "set on their TraderState, this many bps of the protocol's NET fee",
+              "(post-rebate, post-discount) is credited to the referrer's",
+              "TraderState collateral. 0 = referral program off. Typical: 1000-",
+              "2500 bps (10-25% of net fee)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "builder_share_bps",
+            "docs": [
+              "Builder code share — bps of net fee credited to the `builder` pubkey",
+              "passed on the order. Frontends earn this for routing flow. 0 = off.",
+              "Typical: 500-1500 bps (5-15% of net fee). Distinct from referral",
+              "(referrer is per-trader; builder is per-order)."
+            ],
+            "type": "u32"
           }
         ]
       }
@@ -6331,6 +6456,46 @@
       }
     },
     {
+      "name": "ReferralOwedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "referrer",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReferralPaidEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "referrer",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "ToxicityTaxAppliedEvent",
       "type": {
         "kind": "struct",
@@ -6402,6 +6567,22 @@
           {
             "name": "discount_bps",
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TraderReferrerSetEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "referrer",
+            "type": "pubkey"
           }
         ]
       }
@@ -6481,6 +6662,19 @@
               "Cleared by setting back to Pubkey::default(). The trader pubkey",
               "itself ALWAYS retains authority — delegate is additive, not",
               "exclusive (the trader can revoke at any time)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "referrer",
+            "docs": [
+              "Referrer pubkey. When non-default, on every fill where this trader",
+              "is the taker, `market.params.referrer_share_bps` of the protocol's",
+              "net fee revenue is credited to the referrer's TraderState",
+              "collateral. Hyperliquid affiliate model. Pubkey::default() = no",
+              "referrer (default for all new trader_state). Set once via",
+              "`set_trader_referrer` — immutable after first set (anti-rotation",
+              "griefing)."
             ],
             "type": "pubkey"
           }
