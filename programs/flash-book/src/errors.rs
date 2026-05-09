@@ -62,6 +62,10 @@ pub enum FlashBookError {
     PositionSizeCapExceeded = 1209,
     #[msg("Open interest invariant violated: oi_long != oi_short")]
     OpenInterestImbalance = 1210,
+    #[msg("Withdraw would leave FLP NAV below required exposure coverage")]
+    FlpWithdrawUndercollateralized = 1211,
+    #[msg("Required market account missing from remaining_accounts")]
+    MissingMarketAccount = 1212,
 
     // ── 1300-1399 matcher / clearing ────────────────────────────────
     #[msg("Order book buffer at capacity")]

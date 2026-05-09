@@ -2293,6 +2293,105 @@ async fn lp_units_withdraw_burns_shares_and_distributes_nav() {
 }
 
 #[tokio::test]
+async fn flp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure() {
+    // Inject an FLP position into per_market with 10_000 lots at mark 1_000
+    // tick_size=1 → gross_exposure = 10_000_000 quote_lots.
+    // Total capital is 5_000_000; an LP burns ALL their shares would leave
+    // capital ~0, far below exposure. Withdraw must reject.
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Inject one FLP exposure entry into per_market.
+    let flp_acc = ctx.banks_client.get_account(protocol.flp_exposure).await.unwrap().unwrap();
+    let mut flp_state =
+        flash_book::state::FlpExposureAccount::try_deserialize(&mut flp_acc.data.as_slice())
+            .unwrap();
+    flp_state.markets_count = 1;
+    flp_state.per_market[0] = flash_book::state::FlpMarketExposure {
+        market: market_pda,
+        side: 0, // long
+        size_lots: 10_000,
+        entry_price_ticks: 1_000,
+    };
+    let mut nd = Vec::new();
+    flp_state.try_serialize(&mut nd).unwrap();
+    nd.resize(flp_acc.data.len(), 0);
+    ctx.set_account(
+        &protocol.flp_exposure,
+        &SolAccount {
+            lamports: flp_acc.lamports,
+            data: nd,
+            owner: flp_acc.owner,
+            executable: flp_acc.executable,
+            rent_epoch: flp_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    // Also bump market.mark_price_ticks so exposure has a nonzero price.
+    let m_acc = ctx.banks_client.get_account(market_pda).await.unwrap().unwrap();
+    let mut m_state =
+        flash_book::state::MarketAccount::try_deserialize(&mut m_acc.data.as_slice()).unwrap();
+    m_state.mark_price_ticks = 1_000;
+    let mut nmd = Vec::new();
+    m_state.try_serialize(&mut nmd).unwrap();
+    nmd.resize(m_acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: m_acc.lamports,
+            data: nmd,
+            owner: m_acc.owner,
+            executable: m_acc.executable,
+            rent_epoch: m_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    // Authority owns 5_000_000 shares from setup. Try to burn all → would
+    // leave capital = 0 < exposure 10_000_000 → reject.
+    let auth_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
+    let (auth_pos, _) = pda(&[
+        flash_book::state::LpPositionAccount::SEED,
+        payer.pubkey().as_ref(),
+    ]);
+    let withdraw_ix = Instruction {
+        program_id: program_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(auth_pos, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(auth_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            // remaining_accounts: the active market.
+            AccountMeta::new_readonly(market_pda, false),
+        ],
+        data: flash_book::instruction::WithdrawFlpCapital {
+            shares_to_burn: 5_000_000,
+        }
+        .data(),
+    };
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[withdraw_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "withdraw must fail when post-NAV < gross exposure");
+}
+
+#[tokio::test]
 async fn lp_units_withdraw_rejects_other_lps_shares() {
     // Bob cannot burn Alice's shares — the lp_position constraint enforces
     // that the signer matches the lp field.

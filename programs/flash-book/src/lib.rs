@@ -227,10 +227,16 @@ pub mod flash_book {
     /// by the insurance_fund PDA (vault authority).
     ///
     /// Amount returned = shares_to_burn × NAV / shares_outstanding.
-    /// Open positions block withdrawals (markets_count guard) — Phase 2
-    /// will replace this with a position-aware exposure check.
-    pub fn withdraw_flp_capital(
-        ctx: Context<WithdrawFlpCapital>,
+    ///
+    /// Position-aware solvency guard: when the FLP has open positions
+    /// (markets_count > 0), the caller must pass each active market as
+    /// `remaining_accounts`. We compute gross_exposure = Σ |size × mark|
+    /// across all per_market entries and require post-withdraw NAV ≥
+    /// gross_exposure. This lets LPs withdraw while the FLP carries
+    /// positions, as long as enough NAV remains to absorb a max-shock
+    /// loss. The empty-pool case (markets_count == 0) skips the walk.
+    pub fn withdraw_flp_capital<'info>(
+        ctx: Context<'_, '_, '_, 'info, WithdrawFlpCapital<'info>>,
         shares_to_burn: u64,
     ) -> Result<()> {
         require!(shares_to_burn > 0, FlashBookError::ZeroSize);
@@ -259,12 +265,51 @@ pub mod flash_book {
         let amount_quote_lots = amount_u128 as u64;
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
 
-        // Phase 1 guard: any open FLP position blocks withdrawals.
-        // Phase 2 will accept remaining_accounts and check exposure vs capital.
-        require!(
-            flp_ro.markets_count == 0,
-            FlashBookError::InsufficientCollateral
-        );
+        // Compute new total_capital up-front so the solvency check below can
+        // reason about post-withdraw NAV.
+        let new_total = flp_ro
+            .total_capital_quote_lots
+            .checked_sub(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+
+        // Position-aware solvency check. If the FLP has open positions
+        // across markets, walk remaining_accounts to compute gross
+        // exposure at current marks and ensure post-withdraw NAV stays
+        // above it.
+        if flp_ro.markets_count > 0 {
+            let remaining = ctx.remaining_accounts;
+            let mut gross_exposure: u128 = 0;
+            let mut matched: u8 = 0;
+            for slot in flp_ro.per_market.iter() {
+                if slot.side == 255 {
+                    continue;
+                }
+                // Find the matching market in remaining_accounts.
+                let market_ai = remaining
+                    .iter()
+                    .find(|ai| ai.key() == slot.market)
+                    .ok_or_else(|| error!(FlashBookError::MissingMarketAccount))?;
+                let m_data = market_ai.try_borrow_data()?;
+                let m_state = MarketAccount::try_deserialize(&mut &m_data[..])?;
+                let notional = (slot.size_lots as u128)
+                    .saturating_mul(m_state.mark_price_ticks as u128)
+                    .saturating_mul(m_state.params.tick_size as u128);
+                gross_exposure = gross_exposure.saturating_add(notional);
+                matched += 1;
+            }
+            require!(
+                matched == flp_ro.markets_count,
+                FlashBookError::MissingMarketAccount
+            );
+            // Post-withdraw NAV = (new_total_capital + realized_pnl) must
+            // cover gross exposure. realized_pnl is signed; cap at 0 if
+            // negative for the conservative direction (don't credit).
+            let post_nav: i128 = (new_total as i128) + (flp_ro.realized_pnl as i128);
+            require!(
+                post_nav >= 0 && (post_nav as u128) >= gross_exposure,
+                FlashBookError::FlpWithdrawUndercollateralized
+            );
+        }
 
         // Vault must have enough quote tokens to satisfy the withdrawal.
         // The vault's amount field is the authoritative source.
@@ -272,13 +317,6 @@ pub mod flash_book {
             ctx.accounts.quote_vault.amount >= amount_quote_lots,
             FlashBookError::InsufficientCollateral
         );
-
-        // Compute new total_capital. NAV semantics: total_capital decreases
-        // by exactly the withdrawn amount; realized_pnl is unaffected.
-        let new_total = flp_ro
-            .total_capital_quote_lots
-            .checked_sub(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
 
         let bump = ctx.accounts.insurance_fund.bump;
         let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];

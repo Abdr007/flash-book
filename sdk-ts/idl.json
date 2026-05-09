@@ -3393,8 +3393,14 @@
         "by the insurance_fund PDA (vault authority).",
         "",
         "Amount returned = shares_to_burn × NAV / shares_outstanding.",
-        "Open positions block withdrawals (markets_count guard) — Phase 2",
-        "will replace this with a position-aware exposure check."
+        "",
+        "Position-aware solvency guard: when the FLP has open positions",
+        "(markets_count > 0), the caller must pass each active market as",
+        "`remaining_accounts`. We compute gross_exposure = Σ |size × mark|",
+        "across all per_market entries and require post-withdraw NAV ≥",
+        "gross_exposure. This lets LPs withdraw while the FLP carries",
+        "positions, as long as enough NAV remains to absorb a max-shock",
+        "loss. The empty-pool case (markets_count == 0) skips the walk."
       ],
       "discriminator": [
         207,
@@ -4187,6 +4193,16 @@
       "code": 7210,
       "name": "OpenInterestImbalance",
       "msg": "Open interest invariant violated: oi_long != oi_short"
+    },
+    {
+      "code": 7211,
+      "name": "FlpWithdrawUndercollateralized",
+      "msg": "Withdraw would leave FLP NAV below required exposure coverage"
+    },
+    {
+      "code": 7212,
+      "name": "MissingMarketAccount",
+      "msg": "Required market account missing from remaining_accounts"
     },
     {
       "code": 7300,
