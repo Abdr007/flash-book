@@ -5569,10 +5569,19 @@ fn initialize_market_inner(
     market.period_started_at_unix = 0;
     market.period_funding_paid_abs_bps = 0;
     market.params = params;
-    // Order + commit buffers are now initialized in a SEPARATE
-    // `initialize_market_buffers` ix to dodge the Anchor 0.31 BPF
-    // "Overlapping copy" invariant when 3 large boxed accounts init
-    // in one ix. See InitializeMarket context (no longer Boxes them).
+
+    let buffer = &mut ctx.accounts.order_buffer;
+    buffer.market = market.key();
+    buffer.bump = ctx.bumps.order_buffer;
+    buffer.head = 0;
+    buffer.seq_counter = 0;
+    buffer.slots = [OrderSlot::default(); ORDER_BUFFER_CAP];
+
+    let commit_buf = &mut ctx.accounts.commit_buffer;
+    commit_buf.market = market.key();
+    commit_buf.bump = ctx.bumps.commit_buffer;
+    commit_buf.head = 0;
+    commit_buf.commits = [state::CommitRow::default(); state::COMMIT_BUFFER_CAP];
 
     emit!(MarketInitializedEvent {
         market: market.key(),
@@ -5616,6 +5625,28 @@ pub struct InitializeMarket<'info> {
         bump,
     )]
     pub market: Box<Account<'info, MarketAccount>>,
+
+    /// Buffers init in the same ix again — works because we shrunk
+    /// ORDER_BUFFER_CAP / COMMIT_BUFFER_CAP from 64 to 16. At CAP=16
+    /// each buffer is ~1.5KB instead of ~5KB, comfortably under BPF's
+    /// 4KB stack frame on Anchor's auto-deserialize.
+    #[account(
+        init,
+        payer = authority,
+        space = OrderBufferAccount::space(),
+        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub order_buffer: Box<Account<'info, OrderBufferAccount>>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = CommitBufferAccount::space(),
+        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
 
     #[account(
         seeds = [InsuranceFundAccount::SEED],

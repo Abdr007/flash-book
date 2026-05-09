@@ -603,9 +603,11 @@ pub struct CommitRow {
     pub valid: u8, // 0 = empty slot, 1 = active
 }
 
-/// Capacity of the per-market commit-reveal table. Sized to fit a single
-/// `init` call within Solana's 10 KiB max account allocation.
-pub const COMMIT_BUFFER_CAP: usize = 64;
+/// Capacity of the per-market commit-reveal table. Reduced from 64 →
+/// 16 to keep the CommitBufferAccount struct under BPF's 4 KB stack
+/// frame on Anchor's deserialize. At CAP=16 the struct is ~1.5 KB.
+/// Commits expire after a few batches, so 16 in-flight is plenty.
+pub const COMMIT_BUFFER_CAP: usize = 16;
 
 #[account]
 #[derive(Debug)]

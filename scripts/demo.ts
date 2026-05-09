@@ -283,27 +283,11 @@ describeIx('initializeMarketIx (BTC/USDC perp, oracle = 100_000)', initMarket);
 const initSig2 = await sendTx([initMarket]);
 console.log(`  → tx ${initSig2.slice(0, 16)}... ✓`);
 
-// NOTE: order_buffer + commit_buffer init is currently blocked by
-// an Anchor 0.31 BPF stack overflow in the auto-generated
-// AccountDeserialize for accounts > ~4KB. The fix is to refactor
-// OrderBufferAccount + CommitBufferAccount to use AccountLoader<T>
-// (zero-copy via bytemuck) — tracked as a follow-up. Without buffer
-// init, place_limit_order / run_batch can't run, but every other ix
-// (view ixs, vault, trigger orders, sweep, etc.) works against the
-// initialized market + insurance fund + FLP.
-console.log('  ⚠  Skipping order/commit buffer init (Anchor 0.31 stack');
-console.log('     overflow on >4KB Account deserialize — tracked for');
-console.log('     AccountLoader refactor). View ixs below work fine.');
-const initOrderBufBuilt = await client.initializeOrderBufferIx({
-  authority: walletKp.publicKey,
-  market,
-});
-describeIx('initializeOrderBufferIx (built but not sent)', initOrderBufBuilt);
-const initCommitBufBuilt = await client.initializeCommitBufferIx({
-  authority: walletKp.publicKey,
-  market,
-});
-describeIx('initializeCommitBufferIx (built but not sent)', initCommitBufBuilt);
+// Buffers (order_buffer + commit_buffer) are now init'd as PART OF
+// initializeMarketIx — we shrank ORDER_BUFFER_CAP / COMMIT_BUFFER_CAP
+// from 64 to 16 so the buffers fit in BPF's 4KB stack frame on
+// Anchor's auto-deserialize. No separate buffer-init ixs needed.
+console.log('  ✓ order_buffer + commit_buffer initialized as part of initializeMarketIx');
 
 const openTrader = await client.openTraderStateIx(trader);
 describeIx('openTraderStateIx (trader account)', openTrader);
