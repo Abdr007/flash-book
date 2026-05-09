@@ -2077,7 +2077,7 @@ pub mod flash_book {
             FlashBookError::SizeBelowMinLot
         );
         require!(
-            limit_ticks.is_multiple_of(market.params.tick_size),
+            (limit_ticks % market.params.tick_size == 0),
             FlashBookError::PriceNotOnTick
         );
         require!(
@@ -2600,11 +2600,11 @@ pub mod flash_book {
             FlashBookError::SizeBelowMinLot
         );
         require!(
-            limit_price_ticks.is_multiple_of(market.params.tick_size),
+            (limit_price_ticks % market.params.tick_size == 0),
             FlashBookError::PriceNotOnTick
         );
         require!(
-            trigger_price_ticks.is_multiple_of(market.params.tick_size),
+            (trigger_price_ticks % market.params.tick_size == 0),
             FlashBookError::PriceNotOnTick
         );
 
@@ -2849,23 +2849,23 @@ pub mod flash_book {
             FlashBookError::SizeBelowMinLot
         );
         require!(
-            parent_limit_ticks.is_multiple_of(market.params.tick_size),
+            (parent_limit_ticks % market.params.tick_size == 0),
             FlashBookError::PriceNotOnTick
         );
         require!(
-            tp_trigger_price_ticks.is_multiple_of(market.params.tick_size),
+            (tp_trigger_price_ticks % market.params.tick_size == 0),
             FlashBookError::PriceNotOnTick
         );
         require!(
-            sl_trigger_price_ticks.is_multiple_of(market.params.tick_size),
+            (sl_trigger_price_ticks % market.params.tick_size == 0),
             FlashBookError::PriceNotOnTick
         );
         require!(
-            tp_limit_ticks.is_multiple_of(market.params.tick_size),
+            (tp_limit_ticks % market.params.tick_size == 0),
             FlashBookError::PriceNotOnTick
         );
         require!(
-            sl_limit_ticks.is_multiple_of(market.params.tick_size),
+            (sl_limit_ticks % market.params.tick_size == 0),
             FlashBookError::PriceNotOnTick
         );
 
@@ -3124,7 +3124,7 @@ pub mod flash_book {
             FlashBookError::SizeBelowMinLot
         );
         require!(
-            limit_price_ticks.is_multiple_of(market.params.tick_size),
+            (limit_price_ticks % market.params.tick_size == 0),
             FlashBookError::PriceNotOnTick
         );
 
@@ -3307,7 +3307,7 @@ pub mod flash_book {
             FlashBookError::SizeBelowMinLot
         );
         require!(
-            limit_ticks.is_multiple_of(market.params.tick_size),
+            (limit_ticks % market.params.tick_size == 0),
             FlashBookError::PriceNotOnTick
         );
 
@@ -5233,7 +5233,7 @@ pub mod flash_book {
         // Walk remaining_accounts in (market, position) pairs.
         let remaining = ctx.remaining_accounts;
         require!(
-            remaining.len().is_multiple_of(2),
+            remaining.len() % 2 == 0,
             FlashBookError::OutOfRange
         );
         let program_id = ctx.program_id;
@@ -7905,7 +7905,7 @@ fn validate_leg_intake(market: &MarketAccount, leg: &BasketLeg) -> Result<()> {
         FlashBookError::SizeBelowMinLot
     );
     require!(
-        leg.limit_ticks.is_multiple_of(market.params.tick_size),
+        leg.limit_ticks % market.params.tick_size == 0,
         FlashBookError::PriceNotOnTick
     );
     require!(

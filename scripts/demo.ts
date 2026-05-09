@@ -207,7 +207,7 @@ const initMarket = await client.initializeMarketIx({
   quoteVault,
   oracleAccount,
   params: defaultMajorMarketParams(),
-  initialOracleTicks: 100_000,
+  initialOracleTicks: new BN(100_000),
 });
 describeIx('initializeMarketIx (BTC/USDC perp, oracle = 100_000)', initMarket);
 

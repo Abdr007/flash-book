@@ -33,5 +33,10 @@
   "engines": {
     "bun": ">=1.3.0",
     "node": ">=22"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/web3.js": "^1.98.4",
+    "bn.js": "^5.2.3"
   }
 }

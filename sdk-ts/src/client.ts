@@ -1086,7 +1086,7 @@ export class FlashBookClient {
         args.sliceSizeLots,
         args.limitPriceTicks,
         args.slotInterval,
-        args.endSlot ?? 0,
+        args.endSlot ?? new BN(0),
       )
       .accountsPartial({
         trader: args.trader,
@@ -1315,7 +1315,7 @@ export class FlashBookClient {
         args.slTriggerId,
         args.slTriggerPriceTicks,
         args.slLimitTicks,
-        args.expiresAtSlot ?? 0,
+        args.expiresAtSlot ?? new BN(0),
       )
       .accountsPartial({
         trader: args.trader,

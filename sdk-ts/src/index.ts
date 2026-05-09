@@ -66,6 +66,16 @@ export {
   type EventStreamCallback,
 } from './event-decoder.ts';
 
+/// Bitfield flag constants for `placeLimitOrderIx({ flags })`.
+/// Bits 0-3 are order semantics (post_only, reduce_only, ioc, jit).
+/// Bits 4-5 are STP mode (0=cancel-newest default, 1=cancel-oldest, 2=cancel-both).
+export const ORDER_FLAG_POST_ONLY = 1 << 0;
+export const ORDER_FLAG_REDUCE_ONLY = 1 << 1;
+export const ORDER_FLAG_IOC = 1 << 2;
+export const ORDER_FLAG_JIT = 1 << 3;
+export const ORDER_FLAG_STP_CANCEL_OLDEST = 1 << 4;
+export const ORDER_FLAG_STP_CANCEL_BOTH = 2 << 4;
+
 export { subscribeToProgramEvents } from './event-stream.ts';
 
 export {
