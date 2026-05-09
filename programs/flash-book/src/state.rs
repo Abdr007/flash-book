@@ -356,12 +356,18 @@ pub struct TraderStateAccount {
     /// Per-batch order count (rate limit).
     pub orders_this_batch: u32,
     pub last_batch_seen: u64,
+    /// Fee tier discount in bps off the base taker fee. 0 = standard
+    /// fees; e.g. 1000 = 10% discount. Set by `set_trader_fee_tier`
+    /// (authority-only) based on off-chain 30-day rolling volume —
+    /// universal pattern at every CEX (Binance, OKX, Bybit, Hyperliquid).
+    pub fee_discount_bps: u32,
 }
 
 impl TraderStateAccount {
     pub const SEED: &'static [u8] = b"trader_state";
     pub fn space() -> usize {
-        8 + 32 + 1 + 8 + 8 + 1 + 4 + 4 + 8 + 8
+        // 8 (disc) + 32 + 1 + 8 + 8 + 1 + 4 + 4 + 8 + 8 + 4 = 86. Round up.
+        8 + 96
     }
 }
 

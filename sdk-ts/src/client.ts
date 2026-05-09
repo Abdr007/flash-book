@@ -257,6 +257,27 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Authority-only: set a trader's per-trader fee discount in bps off
+  /// the base taker fee. 0..10_000 (cap = 100% discount = zero fee).
+  /// Universal CEX pattern (Binance, OKX, Bybit, Hyperliquid) — wired
+  /// to off-chain 30-day rolling-volume tier tables.
+  setTraderFeeTierIx(args: {
+    authority: PublicKey;
+    trader: PublicKey;
+    discountBps: number;
+  }): Promise<TransactionInstruction> {
+    const fund = this.insuranceFund();
+    const state = this.traderState(args.trader);
+    return this.methods
+      .setTraderFeeTier(args.discountBps)
+      .accountsPartial({
+        authority: args.authority,
+        insuranceFund: fund.address,
+        traderState: state.address,
+      })
+      .instruction();
+  }
+
   /// Idempotently create the trader's quote ATA on-chain. Wraps a CPI to
   /// the AssociatedToken program via Anchor's `init_if_needed`. Safe to
   /// call repeatedly: existing ATAs are accepted as no-ops. The mint is

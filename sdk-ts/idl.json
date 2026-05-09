@@ -2931,6 +2931,105 @@
       ]
     },
     {
+      "name": "set_trader_fee_tier",
+      "docs": [
+        "Set a trader's per-trader fee discount in bps off the base taker",
+        "fee. Authority-only. Off-chain volume tracking sets this based on",
+        "30-day rolling notional — the universal pattern at every CEX",
+        "(Binance, OKX, Bybit, Hyperliquid).",
+        "",
+        "`discount_bps` is bounded to BPS_DENOM (10_000) — a 100% discount",
+        "makes the taker fee zero; the chain refuses values above 10_000",
+        "to prevent negative fees."
+      ],
+      "discriminator": [
+        119,
+        55,
+        138,
+        70,
+        200,
+        98,
+        147,
+        10
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "Protocol authority (the same authority that runs init_insurance_fund).",
+            "Off-chain volume tracker → governance updates each trader's tier."
+          ],
+          "signer": true
+        },
+        {
+          "name": "insurance_fund",
+          "docs": [
+            "The insurance_fund holds the canonical authority pubkey we",
+            "validate against — single source of truth."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "discount_bps",
+          "type": "u32"
+        }
+      ]
+    },
+    {
       "name": "settle_funding",
       "docs": [
         "Settle accrued funding for a single position. Computes funding owed",
@@ -4611,6 +4710,19 @@
         219,
         190
       ]
+    },
+    {
+      "name": "TraderFeeTierUpdatedEvent",
+      "discriminator": [
+        40,
+        100,
+        218,
+        234,
+        40,
+        58,
+        104,
+        248
+      ]
     }
   ],
   "errors": [
@@ -6105,6 +6217,22 @@
       }
     },
     {
+      "name": "TraderFeeTierUpdatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "discount_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
       "name": "TraderStateAccount",
       "docs": [
         "Per-trader state. Holds collateral, last-settled funding marker, and",
@@ -6154,6 +6282,16 @@
           {
             "name": "last_batch_seen",
             "type": "u64"
+          },
+          {
+            "name": "fee_discount_bps",
+            "docs": [
+              "Fee tier discount in bps off the base taker fee. 0 = standard",
+              "fees; e.g. 1000 = 10% discount. Set by `set_trader_fee_tier`",
+              "(authority-only) based on off-chain 30-day rolling volume —",
+              "universal pattern at every CEX (Binance, OKX, Bybit, Hyperliquid)."
+            ],
+            "type": "u32"
           }
         ]
       }

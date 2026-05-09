@@ -458,6 +458,32 @@ pub mod flash_book {
         s.toxicity_score_bps = 0;
         s.orders_this_batch = 0;
         s.last_batch_seen = 0;
+        s.fee_discount_bps = 0;
+        Ok(())
+    }
+
+    /// Set a trader's per-trader fee discount in bps off the base taker
+    /// fee. Authority-only. Off-chain volume tracking sets this based on
+    /// 30-day rolling notional — the universal pattern at every CEX
+    /// (Binance, OKX, Bybit, Hyperliquid).
+    ///
+    /// `discount_bps` is bounded to BPS_DENOM (10_000) — a 100% discount
+    /// makes the taker fee zero; the chain refuses values above 10_000
+    /// to prevent negative fees.
+    pub fn set_trader_fee_tier(
+        ctx: Context<SetTraderFeeTier>,
+        discount_bps: u32,
+    ) -> Result<()> {
+        require!(
+            discount_bps <= constants::BPS_DENOM as u32,
+            FlashBookError::OutOfRange
+        );
+        let s = &mut ctx.accounts.trader_state;
+        s.fee_discount_bps = discount_bps;
+        emit!(TraderFeeTierUpdatedEvent {
+            trader: s.trader,
+            discount_bps,
+        });
         Ok(())
     }
 
@@ -695,15 +721,24 @@ pub mod flash_book {
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
             .checked_mul(market.params.tick_size as u128)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        let taker_fee_u128 =
+        let mut taker_fee_u128 =
             notional_u128.saturating_mul(market.params.taker_fee_bps as u128) / constants::BPS_DENOM as u128;
+        // Apply taker's per-trader fee tier discount (0..10_000 bps).
+        // Capped at 10_000 (100%) so the discount never inverts to a
+        // negative fee. Discount is fee × (10_000 - discount_bps) / 10_000.
+        let discount_bps =
+            ctx.accounts.taker_trader_state.fee_discount_bps.min(constants::BPS_DENOM as u32) as u128;
+        if discount_bps > 0 {
+            taker_fee_u128 = taker_fee_u128
+                .saturating_mul((constants::BPS_DENOM as u128).saturating_sub(discount_bps))
+                / constants::BPS_DENOM as u128;
+        }
         let maker_rebate_u128 =
             notional_u128.saturating_mul(market.params.maker_rebate_bps as u128) / constants::BPS_DENOM as u128;
-        // Rebate must never exceed fee; defense against bad governance config.
-        require!(
-            maker_rebate_u128 <= taker_fee_u128,
-            FlashBookError::OutOfRange
-        );
+        // Rebate must never exceed fee; defense against bad governance config
+        // AND against discounts pushing fee below rebate. If discount drops
+        // taker_fee below maker_rebate, cap rebate at the (discounted) fee.
+        let maker_rebate_u128 = maker_rebate_u128.min(taker_fee_u128);
         let taker_fee = if taker_fee_u128 > u64::MAX as u128 {
             u64::MAX
         } else {
@@ -2832,6 +2867,29 @@ pub struct OpenTraderState<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetTraderFeeTier<'info> {
+    /// Protocol authority (the same authority that runs init_insurance_fund).
+    /// Off-chain volume tracker → governance updates each trader's tier.
+    pub authority: Signer<'info>,
+
+    /// The insurance_fund holds the canonical authority pubkey we
+    /// validate against — single source of truth.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+        constraint = insurance_fund.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
+        bump = trader_state.bump,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+}
+
+#[derive(Accounts)]
 pub struct InitTraderAta<'info> {
     /// Funds the ATA rent. Doesn't have to be the trader — onboarding flows
     /// often have the protocol or a sponsor pay.
@@ -3592,6 +3650,12 @@ pub struct BasketOrderPlacedEvent {
     pub side_b: u8,
     pub size_lots_a: u64,
     pub size_lots_b: u64,
+}
+
+#[event]
+pub struct TraderFeeTierUpdatedEvent {
+    pub trader: Pubkey,
+    pub discount_bps: u32,
 }
 
 #[event]
