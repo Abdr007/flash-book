@@ -93,55 +93,9 @@ export {
   errorName,
 } from './errors.ts';
 
-export {
-  computeQuote,
-  checkRiskGates,
-  MarketMaker,
-  FlashBookVenue,
-  type Venue,
-  type MarketSnapshot,
-  type TraderSnapshot,
-  type PositionSnapshot,
-  type QuoteParams,
-  type QuoteOutput,
-  type RiskLimits,
-  type RiskGateOutput,
-  type MarketMakerConfig,
-  type MarketMakerStats,
-} from './market-maker.ts';
-
-export {
-  Keeper,
-  LiquidationKeeper,
-  FundingKeeper,
-  InvariantMonitor,
-  AtaCleanupKeeper,
-  estimateFundingOwed,
-  type KeeperBaseConfig,
-  type KeeperStats,
-  type LiquidationKeeperConfig,
-  type FundingKeeperConfig,
-  type InvariantMonitorConfig,
-  type AtaCleanupKeeperConfig,
-} from './keepers.ts';
-
-export {
-  FlashV2Venue,
-  V2_SIDE_LONG,
-  V2_SIDE_SHORT,
-  type FlashV2VenueConfig,
-  type MagicTradeClient,
-  type V2Side,
-  type V2OraclePrice,
-  type V2PoolConfig,
-  type V2PlaceLimitOrderParams,
-  type V2EditLimitOrderParams,
-  type V2InstructionResult,
-  type V2BasketAccount,
-  type V2MarketAccount,
-  type V2PositionMeta,
-  type V2OrderMeta,
-} from './flash-v2-venue.ts';
+// Bot framework (MarketMaker, keepers, venues, multi-market) lives in
+// the @flash-book/bot package — see ../bot/. The SDK is intentionally
+// ignorant of bots so it stays a clean on-chain client surface.
 
 export type {
   MarketInitializedEvent,

@@ -19,9 +19,10 @@
     "./insurance": "./src/insurance.ts",
     "./commit-reveal": "./src/commit-reveal.ts"
   },
+  "workspaces": ["sdk-ts", "bot"],
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "bun test",
+    "typecheck": "tsc --noEmit && bun --cwd sdk-ts run typecheck && bun --cwd bot run typecheck",
+    "test": "bun test && bun --cwd bot test",
     "example": "bun run examples/synthetic-flow.ts",
     "example:flash": "bun run examples/replay-flash.ts"
   },

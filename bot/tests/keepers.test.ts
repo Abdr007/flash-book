@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import BN from 'bn.js';
 import { PublicKey } from '@solana/web3.js';
 import { estimateFundingOwed } from '../src/keepers.ts';
-import type { MarketAccount, PositionAccount } from '../src/accounts.ts';
+import type { MarketAccount, PositionAccount } from '../../sdk-ts/src/accounts.ts';
 
 const MARKET = new PublicKey('11111111111111111111111111111112');
 const TRADER = new PublicKey('11111111111111111111111111111113');

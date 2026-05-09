@@ -33,15 +33,15 @@ import {
   Transaction,
   type TransactionInstruction,
 } from '@solana/web3.js';
-import { FlashBookClient } from './client.ts';
+import { FlashBookClient } from '../../sdk-ts/src/client.ts';
 import {
   fetchMarket,
   fetchPosition,
   fetchTraderState,
   type MarketAccount as MarketAcc,
   type PositionAccount as PositionAcc,
-} from './accounts.ts';
-import { previewPortfolioRisk } from './risk-preview.ts';
+} from '../../sdk-ts/src/accounts.ts';
+import { previewPortfolioRisk } from '../../sdk-ts/src/risk-preview.ts';
 
 // ─── Shared base ──────────────────────────────────────────────────────
 
