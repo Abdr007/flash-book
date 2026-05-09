@@ -7184,6 +7184,92 @@
       "args": []
     },
     {
+      "name": "view_book_depth_v2",
+      "docs": [
+        "V2 read-side: emit the top-N levels of the hypertree-backed book",
+        "as an event. Walks `for_each_bid_best_first` / `for_each_ask_best_first`",
+        "and packs the first BOOK_DEPTH_LEVELS=4 of each side into a single",
+        "`BookDepthV2Event`. Pure read — never mutates state.",
+        "",
+        "This is the wave-18e validation that the RBT iteration is correct:",
+        "after a series of `place_limit_order_v2` calls, the bids-best-first",
+        "walk must yield highest-priced bids first and asks-best-first walk",
+        "must yield lowest-priced asks first. The wave-18f matcher consumes",
+        "these same iterators when clearing crossed orders."
+      ],
+      "discriminator": [
+        210,
+        87,
+        61,
+        69,
+        86,
+        157,
+        202,
+        136
+      ],
+      "accounts": [
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "happens inside the handler via `MarketBookHandle::from_account_data`."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "view_portfolio_risk",
       "docs": [
         "View ix: cross-market portfolio risk for a trader. Walks the",
@@ -8466,6 +8552,19 @@
       ]
     },
     {
+      "name": "BookDepthV2Event",
+      "discriminator": [
+        223,
+        44,
+        226,
+        111,
+        32,
+        147,
+        9,
+        112
+      ]
+    },
+    {
       "name": "BracketOrderPlacedEvent",
       "discriminator": [
         232,
@@ -9646,6 +9745,66 @@
           {
             "name": "seized_bonds",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BookDepthV2Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "total_orders_active",
+            "type": "u32"
+          },
+          {
+            "name": "bids",
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "BookLevelV2"
+                }
+              }
+            }
+          },
+          {
+            "name": "asks",
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "BookLevelV2"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BookLevelV2",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
           }
         ]
       }

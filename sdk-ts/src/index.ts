@@ -128,6 +128,10 @@ export type {
   FlpExposureInitializedEvent,
   FlpCapitalUpdatedEvent,
   OrderCancelledEvent,
+  MarketBookInitializedEvent,
+  OrderPlacedV2Event,
+  BookLevelV2,
+  BookDepthV2Event,
   FlashBookEvent,
 } from './events.ts';
 export { MarketStatus } from './events.ts';

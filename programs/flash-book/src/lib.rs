@@ -268,6 +268,59 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// V2 read-side: emit the top-N levels of the hypertree-backed book
+    /// as an event. Walks `for_each_bid_best_first` / `for_each_ask_best_first`
+    /// and packs the first BOOK_DEPTH_LEVELS=4 of each side into a single
+    /// `BookDepthV2Event`. Pure read — never mutates state.
+    ///
+    /// This is the wave-18e validation that the RBT iteration is correct:
+    /// after a series of `place_limit_order_v2` calls, the bids-best-first
+    /// walk must yield highest-priced bids first and asks-best-first walk
+    /// must yield lowest-priced asks first. The wave-18f matcher consumes
+    /// these same iterators when clearing crossed orders.
+    pub fn view_book_depth_v2(ctx: Context<ViewBookDepthV2>) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let book_data = ctx.accounts.market_book.try_borrow_data()?;
+        // Local Vec — hot path is fine since this is a view ix called
+        // out-of-band (not on the matcher hot path).
+        let mut book_data_owned = book_data.to_vec();
+        let handle = state_v2::MarketBookHandle::from_account_data(&mut book_data_owned)?;
+        require!(
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+
+        let mut bids: Vec<BookLevelV2> = Vec::with_capacity(BOOK_DEPTH_LEVELS);
+        handle.for_each_bid_best_first(|_idx, order| {
+            bids.push(BookLevelV2 {
+                price_ticks: order.price_ticks,
+                size_lots: order.size_lots,
+                seq: order.seq,
+                trader: order.trader,
+            });
+            bids.len() < BOOK_DEPTH_LEVELS
+        });
+
+        let mut asks: Vec<BookLevelV2> = Vec::with_capacity(BOOK_DEPTH_LEVELS);
+        handle.for_each_ask_best_first(|_idx, order| {
+            asks.push(BookLevelV2 {
+                price_ticks: order.price_ticks,
+                size_lots: order.size_lots,
+                seq: order.seq,
+                trader: order.trader,
+            });
+            asks.len() < BOOK_DEPTH_LEVELS
+        });
+
+        emit!(BookDepthV2Event {
+            market: market_key,
+            total_orders_active: handle.header.total_orders_active,
+            bids,
+            asks,
+        });
+        Ok(())
+    }
+
     /// Initialize the FLP exposure account (one per protocol). Must run
     /// before `initialize_market`. Mints `initial_capital_quote_lots` shares
     /// to the authority at 1:1 (treasury endowment); these shares can later
@@ -5858,6 +5911,23 @@ pub struct PlaceLimitOrderV2<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ViewBookDepthV2<'info> {
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: read-only view of the market_book PDA. Disc validation
+    /// happens inside the handler via `MarketBookHandle::from_account_data`.
+    #[account(
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitMarketBook<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -7649,6 +7719,28 @@ pub struct OrderPlacedV2Event {
     pub size_lots: u64,
     pub node_index: u32,
     pub total_orders_after: u32,
+}
+
+/// How many price levels per side `view_book_depth_v2` returns.
+/// Capped to keep the event log payload bounded; off-chain depth
+/// reconstruction watches `OrderPlacedV2Event` + `OrderCancelledV2Event`
+/// for the long tail.
+pub const BOOK_DEPTH_LEVELS: usize = 4;
+
+#[derive(Clone, AnchorSerialize, AnchorDeserialize)]
+pub struct BookLevelV2 {
+    pub price_ticks: u64,
+    pub size_lots: u64,
+    pub seq: u64,
+    pub trader: Pubkey,
+}
+
+#[event]
+pub struct BookDepthV2Event {
+    pub market: Pubkey,
+    pub total_orders_active: u32,
+    pub bids: Vec<BookLevelV2>,
+    pub asks: Vec<BookLevelV2>,
 }
 
 #[event]

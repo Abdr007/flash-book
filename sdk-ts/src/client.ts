@@ -326,6 +326,24 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// V2 read-side: emit the top-N levels of the hypertree-backed book as
+  /// a `BookDepthV2Event`. Pure read — never mutates state. Walks the bid
+  /// + ask RBTs in best-first order via the same iterators the wave-18f
+  /// matcher will consume. Use this from off-chain tools to validate
+  /// orderbook state without parsing the raw account bytes.
+  viewBookDepthV2Ix(args: {
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    return this.methods
+      .viewBookDepthV2()
+      .accountsPartial({
+        market: args.market,
+        marketBook: book.address,
+      })
+      .instruction();
+  }
+
   /// MUST be called after `initializeMarketIx` (and before any
   /// `submitCommit` / `submitReveal`). Initializes the commit_buffer
   /// for the market. Split from order_buffer init to dodge an Anchor

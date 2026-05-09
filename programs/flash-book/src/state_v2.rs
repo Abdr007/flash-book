@@ -25,7 +25,8 @@ use anchor_lang::prelude::*;
 
 use crate::hypertree::{
     DataIndex, FreeList, FreeListNode, Get, HyperTreeReadOperations,
-    HyperTreeWriteOperations, RBNode, RedBlackTree, NIL,
+    HyperTreeWriteOperations, Payload, RBNode, RedBlackTree, RedBlackTreeReadOnly,
+    RedBlackTreeReadOperationsHelpers, NIL,
 };
 
 /// Bytes available for hypertree nodes after the fixed header. 100 nodes
@@ -383,49 +384,83 @@ impl<'a> MarketBookHandle<'a> {
 
     /// Insert a `RestingOrderV2` into the bids RBT. Allocates a node
     /// first, writes the payload, then inserts into the tree. Updates
-    /// the bid root + max indices on the header.
+    /// the bid root + best (= MIN-of-tree, which is the highest-priced
+    /// bid given our inverted encoding) indices on the header.
     pub fn insert_bid(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
         let idx = self.alloc_node()?;
         // Write the RBNode<RestingOrderV2> payload at idx. RedBlackTree's
         // `insert` will fill in the RBT-bookkeeping fields (left/right/
         // parent/color) and call `value = order` internally.
         let new_root;
-        let new_max;
         {
+            // Pass NIL for the RBT's max-tracking slot — we don't use the
+            // RBT's notion of MAX. Our "best" is the MIN of the tree (see
+            // `encode_order_id` for why), recomputed below.
             let mut tree = RedBlackTree::<RestingOrderV2>::new(
                 self.data,
                 self.header.bids_root_index,
-                self.header.bids_best_index,
+                NIL,
             );
             tree.insert(idx, order);
             new_root = tree.get_root_index();
-            new_max = tree.get_max_index();
         }
         self.header.bids_root_index = new_root;
-        self.header.bids_best_index = new_max;
+        self.header.bids_best_index = lookup_min_index::<RestingOrderV2>(self.data, new_root);
         self.header.total_orders_active = self.header.total_orders_active.saturating_add(1);
         Ok(idx)
     }
 
     /// Insert a `RestingOrderV2` into the asks RBT. Mirror of `insert_bid`.
+    /// "Best" = MIN of tree = lowest-priced ask (asks are NOT inverted, so
+    /// natural ascending order — smallest order_id is the best ask).
     pub fn insert_ask(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
         let idx = self.alloc_node()?;
         let new_root;
-        let new_max;
         {
             let mut tree = RedBlackTree::<RestingOrderV2>::new(
                 self.data,
                 self.header.asks_root_index,
-                self.header.asks_best_index,
+                NIL,
             );
             tree.insert(idx, order);
             new_root = tree.get_root_index();
-            new_max = tree.get_max_index();
         }
         self.header.asks_root_index = new_root;
-        self.header.asks_best_index = new_max;
+        self.header.asks_best_index = lookup_min_index::<RestingOrderV2>(self.data, new_root);
         self.header.total_orders_active = self.header.total_orders_active.saturating_add(1);
         Ok(idx)
+    }
+
+    /// Walk the bids RBT in BEST → WORST order (highest price first). Calls
+    /// `f(idx, order)` for each resting bid. Stops early if `f` returns
+    /// `false`. Read-only; safe to call from a view ix.
+    ///
+    /// Wave 18e's read-side primitive — wave 18f's matcher walks the tree
+    /// via this same helper to consume liquidity in price-time priority.
+    pub fn for_each_bid_best_first<F>(&self, mut f: F)
+    where
+        F: FnMut(DataIndex, &RestingOrderV2) -> bool,
+    {
+        for_each_best_first::<RestingOrderV2, F>(
+            &self.data[..],
+            self.header.bids_root_index,
+            self.header.bids_best_index,
+            &mut f,
+        );
+    }
+
+    /// Walk the asks RBT in BEST → WORST order (lowest price first). Mirror
+    /// of `for_each_bid_best_first`.
+    pub fn for_each_ask_best_first<F>(&self, mut f: F)
+    where
+        F: FnMut(DataIndex, &RestingOrderV2) -> bool,
+    {
+        for_each_best_first::<RestingOrderV2, F>(
+            &self.data[..],
+            self.header.asks_root_index,
+            self.header.asks_best_index,
+            &mut f,
+        );
     }
 
     /// Insert a claimed seat into the seats RBT.
@@ -462,3 +497,241 @@ const _: () = assert!(std::mem::size_of::<FreeListNode<FreeListPadding>>() == 84
 /// nodes". When `FreeList::remove()` returns this, the bump-alloc
 /// fallback kicks in.
 const FREE_LIST_END: DataIndex = u32::MAX;
+
+// ─── RBT walk helpers ────────────────────────────────────────────────
+//
+// The vendored hypertree exposes `lookup_max_index` + `get_next_lower_index`
+// (full predecessor) but only a half-case `get_next_higher_index` (used
+// internally by remove). We need a real ascending iterator from the
+// MIN of the tree — that's the natural walk for both books since our
+// `encode_order_id` puts the BEST (highest-priced bid / lowest-priced
+// ask) at the smallest order_id for both sides.
+
+/// Walk `idx` and all left descendants until the leftmost node. Returns
+/// `idx` if it has no left child. Caller passes a non-NIL starting index.
+fn leftmost_descendant<V: Payload>(
+    tree: &RedBlackTreeReadOnly<V>,
+    mut idx: DataIndex,
+) -> DataIndex {
+    loop {
+        let left = tree.get_left_index::<V>(idx);
+        if left == NIL {
+            return idx;
+        }
+        idx = left;
+    }
+}
+
+/// Find the MIN (leftmost) node of an RBT given its root. Returns `NIL`
+/// if the tree is empty. O(log n).
+pub fn lookup_min_index<V: Payload>(data: &[u8], root: DataIndex) -> DataIndex {
+    if root == NIL {
+        return NIL;
+    }
+    let tree = RedBlackTreeReadOnly::<V>::new(data, root, NIL);
+    leftmost_descendant::<V>(&tree, root)
+}
+
+/// In-order successor in an RBT view. General-purpose (handles both the
+/// right-child case and the walk-up-while-right-child case). The vendored
+/// `get_next_higher_index` only handles the first case (debug-asserts a
+/// right child exists) because remove never calls it on leaves.
+fn successor_index<V: Payload>(
+    tree: &RedBlackTreeReadOnly<V>,
+    idx: DataIndex,
+) -> DataIndex {
+    if idx == NIL {
+        return NIL;
+    }
+    // Case 1: right subtree exists → leftmost of right subtree.
+    let right = tree.get_right_index::<V>(idx);
+    if right != NIL {
+        return leftmost_descendant::<V>(tree, right);
+    }
+    // Case 2: walk up while we are a right child.
+    let mut cur = idx;
+    loop {
+        let parent = tree.get_parent_index::<V>(cur);
+        if parent == NIL {
+            return NIL;
+        }
+        if tree.is_left_child::<V>(cur) {
+            return parent;
+        }
+        cur = parent;
+    }
+}
+
+/// Internal: walk an RBT in BEST → WORST (ascending order_id) order,
+/// calling `f` on each. `cached_min` is consulted first for O(1) start;
+/// if `NIL`, falls back to walking from `root`.
+fn for_each_best_first<V, F>(
+    data: &[u8],
+    root: DataIndex,
+    cached_min: DataIndex,
+    f: &mut F,
+) where
+    V: Payload,
+    F: FnMut(DataIndex, &V) -> bool,
+{
+    if root == NIL {
+        return;
+    }
+    let tree = RedBlackTreeReadOnly::<V>::new(data, root, NIL);
+    let mut idx = if cached_min != NIL {
+        cached_min
+    } else {
+        leftmost_descendant::<V>(&tree, root)
+    };
+    while idx != NIL {
+        let value: &V = tree.get_value::<V>(idx);
+        if !f(idx, value) {
+            return;
+        }
+        idx = successor_index::<V>(&tree, idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_book() -> Vec<u8> {
+        let mut data = vec![0u8; MARKET_BOOK_TOTAL_BYTES];
+        MarketBookHandle::write_disc_and_init_header(
+            &mut data,
+            255,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        )
+        .expect("init header");
+        data
+    }
+
+    fn make_order(price: u64, seq: u64, side_is_bid: bool) -> RestingOrderV2 {
+        RestingOrderV2 {
+            order_id: encode_order_id(price, seq, side_is_bid),
+            seq,
+            price_ticks: price,
+            size_lots: 100,
+            expires_at_slot: 0,
+            trader: Pubkey::default(),
+            last_valid_slot: 0,
+            side: if side_is_bid { 0 } else { 1 },
+            order_type: 0,
+            flags: 0,
+            _pad: 0,
+        }
+    }
+
+    fn collect_bids(handle: &MarketBookHandle) -> Vec<u64> {
+        let mut prices = Vec::new();
+        handle.for_each_bid_best_first(|_idx, o| {
+            prices.push(o.price_ticks);
+            true
+        });
+        prices
+    }
+
+    fn collect_asks(handle: &MarketBookHandle) -> Vec<u64> {
+        let mut prices = Vec::new();
+        handle.for_each_ask_best_first(|_idx, o| {
+            prices.push(o.price_ticks);
+            true
+        });
+        prices
+    }
+
+    #[test]
+    fn empty_book_iterates_nothing() {
+        let mut data = make_book();
+        let handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        assert!(collect_bids(&handle).is_empty());
+        assert!(collect_asks(&handle).is_empty());
+        assert_eq!(handle.header.bids_root_index, NIL);
+        assert_eq!(handle.header.asks_root_index, NIL);
+        assert_eq!(handle.header.bids_best_index, NIL);
+        assert_eq!(handle.header.asks_best_index, NIL);
+    }
+
+    #[test]
+    fn bids_iterate_highest_price_first() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        // Insert in scrambled order — iteration must still yield best first.
+        handle.insert_bid(make_order(100, 1, true)).unwrap();
+        handle.insert_bid(make_order(200, 2, true)).unwrap();
+        handle.insert_bid(make_order(150, 3, true)).unwrap();
+        handle.insert_bid(make_order(175, 4, true)).unwrap();
+        handle.insert_bid(make_order(125, 5, true)).unwrap();
+        assert_eq!(collect_bids(&handle), vec![200, 175, 150, 125, 100]);
+        assert_eq!(handle.header.total_orders_active, 5);
+    }
+
+    #[test]
+    fn asks_iterate_lowest_price_first() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        handle.insert_ask(make_order(200, 1, false)).unwrap();
+        handle.insert_ask(make_order(100, 2, false)).unwrap();
+        handle.insert_ask(make_order(175, 3, false)).unwrap();
+        handle.insert_ask(make_order(125, 4, false)).unwrap();
+        handle.insert_ask(make_order(150, 5, false)).unwrap();
+        assert_eq!(collect_asks(&handle), vec![100, 125, 150, 175, 200]);
+        assert_eq!(handle.header.total_orders_active, 5);
+    }
+
+    #[test]
+    fn best_index_tracks_best_price_through_inserts() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+
+        // First bid at 100 → that's the best.
+        handle.insert_bid(make_order(100, 1, true)).unwrap();
+        let best_node_first = handle.header.bids_best_index;
+        assert_ne!(best_node_first, NIL);
+
+        // Insert a HIGHER bid at 200 → best should switch to it.
+        handle.insert_bid(make_order(200, 2, true)).unwrap();
+        let best_node_after = handle.header.bids_best_index;
+        assert_ne!(best_node_after, best_node_first);
+
+        // Insert a LOWER bid at 50 → best stays at 200.
+        handle.insert_bid(make_order(50, 3, true)).unwrap();
+        assert_eq!(handle.header.bids_best_index, best_node_after);
+
+        // Confirm walk order matches.
+        assert_eq!(collect_bids(&handle), vec![200, 100, 50]);
+    }
+
+    #[test]
+    fn iteration_short_circuits_when_callback_returns_false() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        for (i, p) in [100u64, 200, 150, 175, 125].iter().enumerate() {
+            handle
+                .insert_bid(make_order(*p, (i + 1) as u64, true))
+                .unwrap();
+        }
+        let mut visited = Vec::new();
+        handle.for_each_bid_best_first(|_idx, o| {
+            visited.push(o.price_ticks);
+            visited.len() < 2
+        });
+        assert_eq!(visited, vec![200, 175]);
+    }
+
+    #[test]
+    fn bids_and_asks_share_storage_independently() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        handle.insert_bid(make_order(100, 1, true)).unwrap();
+        handle.insert_ask(make_order(200, 2, false)).unwrap();
+        handle.insert_bid(make_order(99, 3, true)).unwrap();
+        handle.insert_ask(make_order(201, 4, false)).unwrap();
+        assert_eq!(collect_bids(&handle), vec![100, 99]);
+        assert_eq!(collect_asks(&handle), vec![200, 201]);
+        assert_eq!(handle.header.total_orders_active, 4);
+    }
+}
