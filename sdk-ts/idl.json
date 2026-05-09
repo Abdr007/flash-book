@@ -2805,6 +2805,71 @@
           }
         },
         {
+          "name": "order_buffer",
+          "docs": [
+            "Buffers init in the same ix again — works because we shrunk",
+            "ORDER_BUFFER_CAP / COMMIT_BUFFER_CAP from 64 to 16. At CAP=16",
+            "each buffer is ~1.5KB instead of ~5KB, comfortably under BPF's",
+            "4KB stack frame on Anchor's auto-deserialize."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "commit_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
           "name": "insurance_fund",
           "pda": {
             "seeds": [
@@ -3484,6 +3549,71 @@
               {
                 "kind": "account",
                 "path": "quote_mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "docs": [
+            "Buffers init in the same ix again — works because we shrunk",
+            "ORDER_BUFFER_CAP / COMMIT_BUFFER_CAP from 64 to 16. At CAP=16",
+            "each buffer is ~1.5KB instead of ~5KB, comfortably under BPF's",
+            "4KB stack frame on Anchor's auto-deserialize."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "commit_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
               }
             ]
           }
@@ -9431,7 +9561,7 @@
                     "name": "CommitRow"
                   }
                 },
-                64
+                16
               ]
             }
           }
@@ -11035,7 +11165,7 @@
                     "name": "OrderSlot"
                   }
                 },
-                64
+                16
               ]
             }
           }

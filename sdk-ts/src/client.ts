@@ -228,6 +228,8 @@ export class FlashBookClient {
     initialOracleTicks: bigint | number;
   }): Promise<TransactionInstruction> {
     const market = this.market(args.baseMint, args.quoteMint);
+    const orderBuffer = this.orderBuffer(market.address);
+    const commitBuffer = this.commitBuffer(market.address);
     const fund = this.insuranceFund();
     const flp = this.flpExposure();
 
@@ -241,6 +243,8 @@ export class FlashBookClient {
         quoteVault: args.quoteVault,
         oracleAccount: args.oracleAccount,
         market: market.address,
+        orderBuffer: orderBuffer.address,
+        commitBuffer: commitBuffer.address,
         insuranceFund: fund.address,
         flpExposure: flp.address,
         systemProgram: SystemProgram.programId,
