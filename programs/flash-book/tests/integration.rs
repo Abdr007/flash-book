@@ -129,6 +129,8 @@ fn default_params() -> MarketParams {
         jit_bonus_rebate_bps: 0,
         referrer_share_bps: 0,
         builder_share_bps: 0,
+        creator_share_bps: 0,
+        is_pre_launch: false,
     }
 }
 
@@ -183,7 +185,10 @@ async fn create_mint(
     mint.pubkey()
 }
 
-/// Create a TokenAccount for `mint` owned by `owner_authority`.
+/// Create a TokenAccount for `mint` owned by `owner_authority`. Kept
+/// for tests that exercise raw token-account flows without going through
+/// the ATA program; current suite uses the ATA path.
+#[allow(dead_code)]
 async fn create_token_account(
     ctx: &mut solana_program_test::ProgramTestContext,
     payer: &Keypair,
@@ -1341,7 +1346,7 @@ async fn initialize_market_writes_state() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (protocol, market_pda, order_buf, base_mint, quote_mint) = setup_market(&mut ctx, &payer).await;
+    let (_protocol, market_pda, order_buf, base_mint, quote_mint) = setup_market(&mut ctx, &payer).await;
 
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(market.authority, payer.pubkey());
@@ -1562,7 +1567,7 @@ async fn settle_funding_long_pays_when_premium_positive() {
     // batch+apply_fill pipeline because this test is purely about funding
     // settlement math.
     let pos_acc = ctx.banks_client.get_account(position).await.unwrap().unwrap();
-    let mut pos_data = pos_acc.data.clone();
+    let pos_data = pos_acc.data.clone();
     let mut pos_state = flash_book::state::PositionAccount::try_deserialize(
         &mut pos_data.as_slice(),
     )
@@ -1591,7 +1596,7 @@ async fn settle_funding_long_pays_when_premium_positive() {
     // notional = 100 × 100_000 × tick_size(=1) = 10_000_000, the funding
     // owed = (10_000_000 × (1<<60)) >> 64 = 10_000_000 / 16 = 625_000.
     let m_acc = ctx.banks_client.get_account(market_pda).await.unwrap().unwrap();
-    let mut m_data = m_acc.data.clone();
+    let m_data = m_acc.data.clone();
     let mut m_state = flash_book::state::MarketAccount::try_deserialize(
         &mut m_data.as_slice(),
     )
@@ -1819,7 +1824,7 @@ async fn update_market_params_rejects_immutable_primitive_change() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     // Try to change tick_size — should fail.
     let mut new_params = default_params();
@@ -2640,7 +2645,7 @@ async fn update_oracle_authority_only() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     // Authority can update.
     let ok_ix = build_ix(
@@ -2719,7 +2724,7 @@ async fn transfer_market_authority_rotates_keys() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     let new_authority = Keypair::new();
 
@@ -3391,7 +3396,7 @@ async fn second_market_initializes_at_different_oracle_price() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (protocol, m1, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (_protocol, m1, _, _, _) = setup_market(&mut ctx, &payer).await;
     let (m2, _, _, _) = setup_additional_market(&mut ctx, &payer, 200_000).await;
 
     let market1: MarketAccount = fetch(&mut ctx.banks_client, m1).await;
@@ -4909,7 +4914,7 @@ async fn update_oracle_quorum_writes_median_with_three_close_sources() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -129,6 +129,23 @@ pub struct MarketParams {
     /// Typical: 500-1500 bps (5-15% of net fee). Distinct from referral
     /// (referrer is per-trader; builder is per-order).
     pub builder_share_bps: u32,
+
+    /// HIP-3 / permissionless-deployer share. When the market was created
+    /// permissionlessly, `MarketAccount.creator` is the deployer pubkey and
+    /// this is the share of net fees credited to them. 0 = no creator
+    /// share (typical for protocol-deployed core markets). Typical for
+    /// permissionless: 1000-3000 bps. Stacks with referrer + builder
+    /// (the *protocol* takes the residual into the insurance fund).
+    pub creator_share_bps: u32,
+
+    /// Pre-launch market flag. When true, this market is trading a
+    /// pre-TGE asset whose oracle is supplied by `update_oracle` (manual /
+    /// quorum) rather than Pyth. Off-chain UIs show a "PRE-LAUNCH"
+    /// badge. Hyperliquid pattern: enables price discovery on a perp
+    /// before its spot exists. On-chain semantics are identical to a
+    /// regular market — governance is expected to set tighter limits
+    /// (lower max_leverage, lower max_position_lots_per_trader) at init.
+    pub is_pre_launch: bool,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).
@@ -136,6 +153,12 @@ pub struct MarketParams {
 #[derive(Debug)]
 pub struct MarketAccount {
     pub authority: Pubkey,
+    /// HIP-3 deployer pubkey. Default = no creator (protocol-deployed).
+    /// When non-default, every fill on this market emits a
+    /// CreatorFeeOwedEvent crediting the deployer with
+    /// `params.creator_share_bps` of net fee. Set by
+    /// `permissionless_initialize_market`.
+    pub creator: Pubkey,
     pub flp_pool: Pubkey,
     pub base_mint: Pubkey,
     pub quote_mint: Pubkey,

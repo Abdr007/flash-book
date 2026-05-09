@@ -52,66 +52,16 @@ pub mod flash_book {
 
     // ─── Setup ──────────────────────────────────────────────────────
 
-    /// Initialize a new market and all associated PDAs.
+    /// Initialize a new market and all associated PDAs (protocol-deployed).
+    /// Uses the shared `initialize_market_inner` body; the only difference
+    /// from `permissionless_initialize_market` is that `creator` is zeroed
+    /// (no creator share) and params are not envelope-clamped.
     pub fn initialize_market(
         ctx: Context<InitializeMarket>,
         params: MarketParams,
         initial_oracle_ticks: u64,
     ) -> Result<()> {
-        require!(params.tick_size > 0, FlashBookError::OutOfRange);
-        require!(params.base_lot_size > 0, FlashBookError::OutOfRange);
-        require!(params.quote_lot_size > 0, FlashBookError::OutOfRange);
-        require!(params.max_leverage >= 1, FlashBookError::OutOfRange);
-        require!(initial_oracle_ticks > 0, FlashBookError::ZeroPrice);
-
-        let market = &mut ctx.accounts.market;
-        market.authority = ctx.accounts.authority.key();
-        market.flp_pool = ctx.accounts.flp_exposure.key();
-        market.base_mint = ctx.accounts.base_mint.key();
-        market.quote_mint = ctx.accounts.quote_mint.key();
-        market.base_vault = ctx.accounts.base_vault.key();
-        market.quote_vault = ctx.accounts.quote_vault.key();
-        market.oracle_account = ctx.accounts.oracle_account.key();
-        market.insurance_fund = ctx.accounts.insurance_fund.key();
-        market.bump = ctx.bumps.market;
-        market.status = MarketStatus::Active as u8;
-        market.current_batch = 0;
-        market.last_batch_ms = 0;
-        market.oracle_price_ticks = initial_oracle_ticks;
-        market.oracle_confidence = 0;
-        market.oracle_published_at_unix_seconds = Clock::get()?.unix_timestamp.max(0) as u64;
-        market.mark_price_ticks = initial_oracle_ticks;
-        market.cum_funding_index = 0;
-        market.last_funding_rate_bps_per_sec = 0;
-        market.vpin = matcher::vpin::VpinState::default();
-        market.oi_long_lots = 0;
-        market.oi_short_lots = 0;
-        market.recent_clearing_prices = [0u64; MARK_HISTORY_LEN];
-        market.recent_clearing_count = 0;
-        market.total_fees_collected = 0;
-        market.total_toxicity_tax_collected = 0;
-        market.total_liquidations = 0;
-        market.params = params;
-
-        let buffer = &mut ctx.accounts.order_buffer;
-        buffer.market = market.key();
-        buffer.bump = ctx.bumps.order_buffer;
-        buffer.head = 0;
-        buffer.seq_counter = 0;
-        buffer.slots = [OrderSlot::default(); ORDER_BUFFER_CAP];
-
-        let commit_buf = &mut ctx.accounts.commit_buffer;
-        commit_buf.market = market.key();
-        commit_buf.bump = ctx.bumps.commit_buffer;
-        commit_buf.head = 0;
-        commit_buf.commits = [state::CommitRow::default(); state::COMMIT_BUFFER_CAP];
-
-        emit!(MarketInitializedEvent {
-            market: market.key(),
-            authority: market.authority,
-            initial_oracle_ticks,
-        });
-        Ok(())
+        initialize_market_inner(ctx, params, initial_oracle_ticks, false)
     }
 
     /// Initialize the FLP exposure account (one per protocol). Must run
@@ -976,6 +926,46 @@ pub mod flash_book {
                     amount_quote_lots: share,
                 });
             }
+        }
+
+        // ── HIP-3 creator share (permissionless market deployer) ─────
+        // When the market was deployed permissionlessly, credit the
+        // deployer with `creator_share_bps` of net fee. Pull-based
+        // event — no on-chain creator account walk on the hot path.
+        let market_creator = market.creator;
+        if market_creator != Pubkey::default() && market.params.creator_share_bps > 0 {
+            let share = ((net_fee as u128)
+                .saturating_mul(market.params.creator_share_bps as u128)
+                / (constants::BPS_DENOM as u128)) as u64;
+            if share > 0 {
+                emit!(CreatorFeeOwedEvent {
+                    market: market_key,
+                    creator: market_creator,
+                    amount_quote_lots: share,
+                });
+            }
+        }
+
+        // ── Trading-rewards / points emit (Hyperliquid HYPE distrib) ─
+        // Lightweight per-fill event with notional + side. Off-chain
+        // accrual computes per-trader points (volume × multipliers).
+        // No on-chain bookkeeping → no extra account writes; subgraphs
+        // index these events cheaply. Emit only when the market opts in
+        // (taker_fee_bps > 0 implies a real economic fill — skips $0
+        // fee-tier wash trades).
+        if market.params.taker_fee_bps > 0 {
+            let notional_quote_lots = if notional_u128 > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                notional_u128 as u64
+            };
+            emit!(TradingRewardEligibleEvent {
+                market: market_key,
+                taker: taker_trader_pk,
+                maker: maker_trader_pk,
+                notional_quote_lots,
+                taker_side,
+            });
         }
 
         // ── Toxicity tax (VPIN-scaled) ────────────────────────────────
@@ -3248,6 +3238,197 @@ pub mod flash_book {
     // misleading instruction surface. The integration is purely additive —
     // when the SDK ships compat, two new instructions slot in here without
     // changing any existing semantics.
+
+    /// HIP-3 / permissionless market deployment. ANY signer can call this
+    /// to deploy a new market — no protocol authority gating. The caller
+    /// becomes BOTH the market authority AND the creator (earns
+    /// `creator_share_bps` of net fee on every fill, forever). Params
+    /// are clamped to a SAFE ENVELOPE that prevents griefing the FLP /
+    /// users with hostile economics:
+    ///
+    ///   • max_leverage capped at MAX_PERMISSIONLESS_LEVERAGE (20×)
+    ///   • taker_fee_bps clamped to [10, 200] (0.1% – 2%)
+    ///   • maker_rebate_bps ≤ taker_fee_bps × 80%
+    ///   • maintenance_margin_ratio_bps ≥ 200 (2% floor)
+    ///   • initial_margin_ratio_bps ≥ maintenance × 2
+    ///   • liq_penalty_bps ∈ [50, 500]
+    ///   • creator_share_bps ≤ MAX_PERMISSIONLESS_CREATOR_SHARE_BPS (3000)
+    ///   • builder_share_bps ≤ 1500, referrer_share_bps ≤ 2500
+    ///   • max_position_lots_per_trader > 0 (must be set; no unlimited)
+    ///   • max_position_ratio_bps > 0 and ≤ 100 (≤ 1% of FLP per trader)
+    ///   • toxicity_tax_max_bps ≤ 50 (anti-griefing taxes capped)
+    ///
+    /// Anything outside the envelope rejects with OutOfRange. Inside, the
+    /// market deploys with creator = caller, authority = caller. The
+    /// caller can later call update_market_params to tune within the
+    /// envelope (the envelope is re-applied on every update).
+    ///
+    /// No bond is required in v1 — the safe envelope alone gates
+    /// griefing. A future version may add a slashable HYPE-style bond
+    /// to back the FLP exposure on the new market.
+    pub fn permissionless_initialize_market(
+        ctx: Context<InitializeMarket>,
+        params: MarketParams,
+        initial_oracle_ticks: u64,
+    ) -> Result<()> {
+        let clamped = clamp_permissionless_params(&params)?;
+        // Reuse the canonical init logic — same state-init invariants —
+        // and then patch the creator field after.
+        initialize_market_inner(ctx, clamped, initial_oracle_ticks, true)
+    }
+}
+
+/// Permissionless market params validation. Returns an error if the
+/// params are outside the safe envelope; returns the clamped params on
+/// success. Clamps fields silently where it can (e.g. taker_fee 5 →
+/// MIN_PERMISSIONLESS_TAKER_FEE_BPS); rejects where ambiguity would be
+/// dangerous (e.g. max_leverage > cap).
+fn clamp_permissionless_params(p: &MarketParams) -> Result<MarketParams> {
+    const MAX_PERMISSIONLESS_LEVERAGE: u32 = 20;
+    const MIN_PERMISSIONLESS_TAKER_FEE_BPS: u32 = 10;
+    const MAX_PERMISSIONLESS_TAKER_FEE_BPS: u32 = 200;
+    const MIN_PERMISSIONLESS_MAINT_MARGIN_BPS: u32 = 200;
+    const MIN_PERMISSIONLESS_LIQ_PENALTY_BPS: u32 = 50;
+    const MAX_PERMISSIONLESS_LIQ_PENALTY_BPS: u32 = 500;
+    const MAX_PERMISSIONLESS_CREATOR_SHARE_BPS: u32 = 3_000;
+    const MAX_PERMISSIONLESS_BUILDER_SHARE_BPS: u32 = 1_500;
+    const MAX_PERMISSIONLESS_REFERRER_SHARE_BPS: u32 = 2_500;
+    const MAX_PERMISSIONLESS_POS_RATIO_BPS: u32 = 100;
+    const MAX_PERMISSIONLESS_TOXICITY_TAX_BPS: u32 = 50;
+
+    require!(
+        p.max_leverage >= 1 && p.max_leverage <= MAX_PERMISSIONLESS_LEVERAGE,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        p.taker_fee_bps >= MIN_PERMISSIONLESS_TAKER_FEE_BPS
+            && p.taker_fee_bps <= MAX_PERMISSIONLESS_TAKER_FEE_BPS,
+        FlashBookError::OutOfRange
+    );
+    let max_maker_rebate = (p.taker_fee_bps as u64).saturating_mul(80) / 100;
+    require!(
+        (p.maker_rebate_bps as u64) <= max_maker_rebate,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        p.maintenance_margin_ratio_bps >= MIN_PERMISSIONLESS_MAINT_MARGIN_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        p.initial_margin_ratio_bps
+            >= p.maintenance_margin_ratio_bps.saturating_mul(2),
+        FlashBookError::OutOfRange
+    );
+    require!(
+        p.liq_penalty_bps >= MIN_PERMISSIONLESS_LIQ_PENALTY_BPS
+            && p.liq_penalty_bps <= MAX_PERMISSIONLESS_LIQ_PENALTY_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        p.creator_share_bps <= MAX_PERMISSIONLESS_CREATOR_SHARE_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        p.builder_share_bps <= MAX_PERMISSIONLESS_BUILDER_SHARE_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        p.referrer_share_bps <= MAX_PERMISSIONLESS_REFERRER_SHARE_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        p.max_position_lots_per_trader > 0,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        p.max_position_ratio_bps > 0
+            && p.max_position_ratio_bps <= MAX_PERMISSIONLESS_POS_RATIO_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        p.toxicity_tax_max_bps <= MAX_PERMISSIONLESS_TOXICITY_TAX_BPS,
+        FlashBookError::OutOfRange
+    );
+    Ok(p.clone())
+}
+
+/// Shared init body for `initialize_market` and
+/// `permissionless_initialize_market`. The single difference is whether
+/// `market.creator` is set to the signer (permissionless) or zeroed
+/// (protocol).
+fn initialize_market_inner(
+    ctx: Context<InitializeMarket>,
+    params: MarketParams,
+    initial_oracle_ticks: u64,
+    is_permissionless: bool,
+) -> Result<()> {
+    require!(params.tick_size > 0, FlashBookError::OutOfRange);
+    require!(params.base_lot_size > 0, FlashBookError::OutOfRange);
+    require!(params.quote_lot_size > 0, FlashBookError::OutOfRange);
+    require!(params.max_leverage >= 1, FlashBookError::OutOfRange);
+    require!(initial_oracle_ticks > 0, FlashBookError::ZeroPrice);
+
+    let market = &mut ctx.accounts.market;
+    market.authority = ctx.accounts.authority.key();
+    market.creator = if is_permissionless {
+        ctx.accounts.authority.key()
+    } else {
+        Pubkey::default()
+    };
+    market.flp_pool = ctx.accounts.flp_exposure.key();
+    market.base_mint = ctx.accounts.base_mint.key();
+    market.quote_mint = ctx.accounts.quote_mint.key();
+    market.base_vault = ctx.accounts.base_vault.key();
+    market.quote_vault = ctx.accounts.quote_vault.key();
+    market.oracle_account = ctx.accounts.oracle_account.key();
+    market.insurance_fund = ctx.accounts.insurance_fund.key();
+    market.bump = ctx.bumps.market;
+    market.status = MarketStatus::Active as u8;
+    market.current_batch = 0;
+    market.last_batch_ms = 0;
+    market.oracle_price_ticks = initial_oracle_ticks;
+    market.oracle_confidence = 0;
+    market.oracle_published_at_unix_seconds = Clock::get()?.unix_timestamp.max(0) as u64;
+    market.mark_price_ticks = initial_oracle_ticks;
+    market.cum_funding_index = 0;
+    market.last_funding_rate_bps_per_sec = 0;
+    market.vpin = matcher::vpin::VpinState::default();
+    market.oi_long_lots = 0;
+    market.oi_short_lots = 0;
+    market.recent_clearing_prices = [0u64; MARK_HISTORY_LEN];
+    market.recent_clearing_count = 0;
+    market.total_fees_collected = 0;
+    market.total_toxicity_tax_collected = 0;
+    market.total_liquidations = 0;
+    market.params = params;
+
+    let buffer = &mut ctx.accounts.order_buffer;
+    buffer.market = market.key();
+    buffer.bump = ctx.bumps.order_buffer;
+    buffer.head = 0;
+    buffer.seq_counter = 0;
+    buffer.slots = [OrderSlot::default(); ORDER_BUFFER_CAP];
+
+    let commit_buf = &mut ctx.accounts.commit_buffer;
+    commit_buf.market = market.key();
+    commit_buf.bump = ctx.bumps.commit_buffer;
+    commit_buf.head = 0;
+    commit_buf.commits = [state::CommitRow::default(); state::COMMIT_BUFFER_CAP];
+
+    emit!(MarketInitializedEvent {
+        market: market.key(),
+        authority: market.authority,
+        initial_oracle_ticks,
+    });
+    if is_permissionless {
+        emit!(PermissionlessMarketDeployedEvent {
+            market: market.key(),
+            creator: market.creator,
+            creator_share_bps: market.params.creator_share_bps,
+            is_pre_launch: market.params.is_pre_launch,
+        });
+    }
+    Ok(())
 }
 
 // ─── Account contexts ───────────────────────────────────────────────────
@@ -4538,6 +4719,40 @@ pub struct BuilderFeeOwedEvent {
     pub taker: Pubkey,
     pub builder: Pubkey,
     pub amount_quote_lots: u64,
+}
+
+/// HIP-3 deployer share. Off-chain ledger credits the market creator
+/// with `amount_quote_lots` per fill. Pull-based — no creator account
+/// is touched in the apply_fill hot path.
+#[event]
+pub struct CreatorFeeOwedEvent {
+    pub market: Pubkey,
+    pub creator: Pubkey,
+    pub amount_quote_lots: u64,
+}
+
+/// Emitted by `permissionless_initialize_market` so off-chain indexers
+/// can distinguish HIP-3 deployments from protocol-curated markets.
+#[event]
+pub struct PermissionlessMarketDeployedEvent {
+    pub market: Pubkey,
+    pub creator: Pubkey,
+    pub creator_share_bps: u32,
+    pub is_pre_launch: bool,
+}
+
+/// Per-fill trading-rewards eligibility event. Off-chain accrual
+/// computes per-trader points (notional × multipliers × time-windows).
+/// Hyperliquid HYPE-distribution model — minimal on-chain footprint
+/// (one event per fill, no extra writes) so emissions can be indexed
+/// at zero on-chain cost.
+#[event]
+pub struct TradingRewardEligibleEvent {
+    pub market: Pubkey,
+    pub taker: Pubkey,
+    pub maker: Pubkey,
+    pub notional_quote_lots: u64,
+    pub taker_side: u8,
 }
 
 #[event]

@@ -52,6 +52,23 @@ export interface MarketParamsRaw {
   oracleQuorumMaxDispersionBps: number;
   /** Per-trader max notional as bps of FLP capital; 0 = unlimited. */
   maxPositionRatioBps: number;
+
+  /** Bps of liq penalty paid to the keeper that triggers it. 0 = off. */
+  liquidatorRewardBps: number;
+  /** Cooldown (slots) between consecutive liquidations on a position. */
+  liquidationCooldownSlots: number;
+  /** Slots over which the liquidator reward Dutch-grows from base→full. */
+  liquidationAuctionDurationSlots: number;
+  /** JIT bonus rebate (bps) for makers filling JIT-flagged taker orders. */
+  jitBonusRebateBps: number;
+  /** Bps of net fee credited to a taker's referrer (Hyperliquid affiliate). */
+  referrerShareBps: number;
+  /** Bps of net fee credited to a taker's approved builder (HL builder codes). */
+  builderShareBps: number;
+  /** Bps of net fee credited to a permissionless market's deployer (HIP-3). */
+  creatorShareBps: number;
+  /** Pre-launch market flag — Hyperliquid pre-TGE perp pattern. */
+  isPreLaunch: boolean;
 }
 
 /** Sensible default parameter set for SOL/BTC/ETH-style major markets. */
@@ -106,6 +123,19 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
     // Capital-relative cap: 0 = unlimited. Set per market based on the
     // FLP's tolerable concentration risk (e.g. 100 = 1% of pool).
     maxPositionRatioBps: 0,
+
+    // Liquidation incentives (off by default; opt-in per market).
+    liquidatorRewardBps: 0,
+    liquidationCooldownSlots: 0,
+    liquidationAuctionDurationSlots: 0,
+    // JIT auction (off by default).
+    jitBonusRebateBps: 0,
+    // Affiliate / builder / creator (off by default).
+    referrerShareBps: 0,
+    builderShareBps: 0,
+    creatorShareBps: 0,
+    // Pre-launch flag (off — set true only for pre-TGE markets).
+    isPreLaunch: false,
   };
 }
 

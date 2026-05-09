@@ -1754,7 +1754,10 @@
     {
       "name": "initialize_market",
       "docs": [
-        "Initialize a new market and all associated PDAs."
+        "Initialize a new market and all associated PDAs (protocol-deployed).",
+        "Uses the shared `initialize_market_inner` body; the only difference",
+        "from `permissionless_initialize_market` is that `creator` is zeroed",
+        "(no creator share) and params are not envelope-clamped."
       ],
       "discriminator": [
         35,
@@ -2378,6 +2381,224 @@
         }
       ],
       "args": []
+    },
+    {
+      "name": "permissionless_initialize_market",
+      "docs": [
+        "HIP-3 / permissionless market deployment. ANY signer can call this",
+        "to deploy a new market — no protocol authority gating. The caller",
+        "becomes BOTH the market authority AND the creator (earns",
+        "`creator_share_bps` of net fee on every fill, forever). Params",
+        "are clamped to a SAFE ENVELOPE that prevents griefing the FLP /",
+        "users with hostile economics:",
+        "",
+        "• max_leverage capped at MAX_PERMISSIONLESS_LEVERAGE (20×)",
+        "• taker_fee_bps clamped to [10, 200] (0.1% – 2%)",
+        "• maker_rebate_bps ≤ taker_fee_bps × 80%",
+        "• maintenance_margin_ratio_bps ≥ 200 (2% floor)",
+        "• initial_margin_ratio_bps ≥ maintenance × 2",
+        "• liq_penalty_bps ∈ [50, 500]",
+        "• creator_share_bps ≤ MAX_PERMISSIONLESS_CREATOR_SHARE_BPS (3000)",
+        "• builder_share_bps ≤ 1500, referrer_share_bps ≤ 2500",
+        "• max_position_lots_per_trader > 0 (must be set; no unlimited)",
+        "• max_position_ratio_bps > 0 and ≤ 100 (≤ 1% of FLP per trader)",
+        "• toxicity_tax_max_bps ≤ 50 (anti-griefing taxes capped)",
+        "",
+        "Anything outside the envelope rejects with OutOfRange. Inside, the",
+        "market deploys with creator = caller, authority = caller. The",
+        "caller can later call update_market_params to tune within the",
+        "envelope (the envelope is re-applied on every update).",
+        "",
+        "No bond is required in v1 — the safe envelope alone gates",
+        "griefing. A future version may add a slashable HYPE-style bond",
+        "to back the FLP exposure on the new market."
+      ],
+      "discriminator": [
+        170,
+        186,
+        200,
+        244,
+        168,
+        101,
+        252,
+        3
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "base_mint"
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "base_vault"
+        },
+        {
+          "name": "quote_vault"
+        },
+        {
+          "name": "oracle_account"
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "base_mint"
+              },
+              {
+                "kind": "account",
+                "path": "quote_mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "commit_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "MarketParams"
+            }
+          }
+        },
+        {
+          "name": "initial_oracle_ticks",
+          "type": "u64"
+        }
+      ]
     },
     {
       "name": "place_basket_order",
@@ -5267,6 +5488,19 @@
       ]
     },
     {
+      "name": "CreatorFeeOwedEvent",
+      "discriminator": [
+        213,
+        94,
+        11,
+        147,
+        76,
+        205,
+        59,
+        57
+      ]
+    },
+    {
       "name": "FillAppliedEvent",
       "discriminator": [
         138,
@@ -5449,6 +5683,19 @@
       ]
     },
     {
+      "name": "PermissionlessMarketDeployedEvent",
+      "discriminator": [
+        30,
+        227,
+        23,
+        78,
+        10,
+        74,
+        34,
+        200
+      ]
+    },
+    {
       "name": "ReferralOwedEvent",
       "discriminator": [
         132,
@@ -5537,6 +5784,19 @@
         244,
         43,
         49
+      ]
+    },
+    {
+      "name": "TradingRewardEligibleEvent",
+      "discriminator": [
+        16,
+        0,
+        119,
+        253,
+        231,
+        8,
+        92,
+        28
       ]
     },
     {
@@ -6107,6 +6367,31 @@
       }
     },
     {
+      "name": "CreatorFeeOwedEvent",
+      "docs": [
+        "HIP-3 deployer share. Off-chain ledger credits the market creator",
+        "with `amount_quote_lots` per fill. Pull-based — no creator account",
+        "is touched in the apply_fill hot path."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "creator",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "FillAppliedEvent",
       "type": {
         "kind": "struct",
@@ -6582,6 +6867,17 @@
             "type": "pubkey"
           },
           {
+            "name": "creator",
+            "docs": [
+              "HIP-3 deployer pubkey. Default = no creator (protocol-deployed).",
+              "When non-default, every fill on this market emits a",
+              "CreatorFeeOwedEvent crediting the deployer with",
+              "`params.creator_share_bps` of net fee. Set by",
+              "`permissionless_initialize_market`."
+            ],
+            "type": "pubkey"
+          },
+          {
             "name": "flp_pool",
             "type": "pubkey"
           },
@@ -6979,6 +7275,31 @@
               "(referrer is per-trader; builder is per-order)."
             ],
             "type": "u32"
+          },
+          {
+            "name": "creator_share_bps",
+            "docs": [
+              "HIP-3 / permissionless-deployer share. When the market was created",
+              "permissionlessly, `MarketAccount.creator` is the deployer pubkey and",
+              "this is the share of net fees credited to them. 0 = no creator",
+              "share (typical for protocol-deployed core markets). Typical for",
+              "permissionless: 1000-3000 bps. Stacks with referrer + builder",
+              "(the *protocol* takes the residual into the insurance fund)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "is_pre_launch",
+            "docs": [
+              "Pre-launch market flag. When true, this market is trading a",
+              "pre-TGE asset whose oracle is supplied by `update_oracle` (manual /",
+              "quorum) rather than Pyth. Off-chain UIs show a \"PRE-LAUNCH\"",
+              "badge. Hyperliquid pattern: enables price discovery on a perp",
+              "before its spot exists. On-chain semantics are identical to a",
+              "regular market — governance is expected to set tighter limits",
+              "(lower max_leverage, lower max_position_lots_per_trader) at init."
+            ],
+            "type": "bool"
           }
         ]
       }
@@ -7126,6 +7447,34 @@
           {
             "name": "limit_ticks",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PermissionlessMarketDeployedEvent",
+      "docs": [
+        "Emitted by `permissionless_initialize_market` so off-chain indexers",
+        "can distinguish HIP-3 deployments from protocol-curated markets."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "creator",
+            "type": "pubkey"
+          },
+          {
+            "name": "creator_share_bps",
+            "type": "u32"
+          },
+          {
+            "name": "is_pre_launch",
+            "type": "bool"
           }
         ]
       }
@@ -7474,6 +7823,41 @@
               "conservative cap below whatever the protocol rate is."
             ],
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TradingRewardEligibleEvent",
+      "docs": [
+        "Per-fill trading-rewards eligibility event. Off-chain accrual",
+        "computes per-trader points (notional × multipliers × time-windows).",
+        "Hyperliquid HYPE-distribution model — minimal on-chain footprint",
+        "(one event per fill, no extra writes) so emissions can be indexed",
+        "at zero on-chain cost."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "maker",
+            "type": "pubkey"
+          },
+          {
+            "name": "notional_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "taker_side",
+            "type": "u8"
           }
         ]
       }

@@ -247,6 +247,49 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// HIP-3 / permissionless market deployment. ANY signer can call this;
+  /// they become BOTH the market authority and the creator (and earn
+  /// `params.creatorShareBps` of net fee on every fill, forever). Params
+  /// are clamped to a SAFE ENVELOPE on chain — see
+  /// `permissionless_initialize_market` in lib.rs for the full clamp
+  /// list (max_leverage ≤ 20×, fees in [10, 200] bps, maint margin ≥ 2%,
+  /// per-trader notional ≤ 1% of FLP, etc.). Anything outside the
+  /// envelope rejects with OutOfRange.
+  permissionlessInitializeMarketIx(args: {
+    authority: PublicKey;
+    baseMint: PublicKey;
+    quoteMint: PublicKey;
+    baseVault: PublicKey;
+    quoteVault: PublicKey;
+    oracleAccount: PublicKey;
+    params: MarketParamsRaw;
+    initialOracleTicks: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const market = this.market(args.baseMint, args.quoteMint);
+    const orderBuffer = this.orderBuffer(market.address);
+    const commitBuffer = this.commitBuffer(market.address);
+    const fund = this.insuranceFund();
+    const flp = this.flpExposure();
+
+    return this.methods
+      .permissionlessInitializeMarket(args.params, args.initialOracleTicks)
+      .accountsPartial({
+        authority: args.authority,
+        baseMint: args.baseMint,
+        quoteMint: args.quoteMint,
+        baseVault: args.baseVault,
+        quoteVault: args.quoteVault,
+        oracleAccount: args.oracleAccount,
+        market: market.address,
+        orderBuffer: orderBuffer.address,
+        commitBuffer: commitBuffer.address,
+        insuranceFund: fund.address,
+        flpExposure: flp.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
   openTraderStateIx(trader: PublicKey): Promise<TransactionInstruction> {
     const state = this.traderState(trader);
     return this.methods
