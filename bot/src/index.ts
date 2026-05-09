@@ -98,6 +98,18 @@ export {
   type V2OrderMeta,
 } from './flash-v2-venue.ts';
 
+// ─── Telemetry + hot config reload ───────────────────────────────────
+export {
+  MetricsRegistry,
+  TelemetryFlusher,
+  StdoutSink,
+  NoopSink,
+  HttpPushSink,
+  type MetricsSink,
+  type MetricLabels,
+} from './telemetry.ts';
+export { HotConfigReloader, type HotConfigReloaderOptions } from './hot-config.ts';
+
 // ─── Advanced order types (OCO / Iceberg / Trailing) ────────────────
 export {
   OcoOrder,
