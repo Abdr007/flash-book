@@ -345,6 +345,69 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Authority withdraws excess insurance fund balance. Cannot push the
+    /// balance below `pause_threshold_quote_lots` — that gate keeps the
+    /// fund solvent enough to absorb a max-shock loss without triggering
+    /// the new-positions-paused state.
+    ///
+    /// Use case: governance rebalancing surplus contributions. The amount
+    /// is transferred from the protocol vault (PDA-signed) to the
+    /// authority's quote ATA. This does NOT route through the LP pool;
+    /// the insurance fund is governance-owned, not LP-owned.
+    pub fn withdraw_insurance_fund(
+        ctx: Context<WithdrawInsuranceFund>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        require_keys_eq!(
+            ctx.accounts.insurance_fund.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+
+        let new_balance = ctx
+            .accounts
+            .insurance_fund
+            .balance_quote_lots
+            .checked_sub(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        // Cannot withdraw below the pause threshold — that's the protocol's
+        // solvency floor.
+        require!(
+            new_balance >= ctx.accounts.insurance_fund.pause_threshold_quote_lots,
+            FlashBookError::InsufficientCollateral
+        );
+
+        // Vault must hold enough tokens to satisfy the withdrawal.
+        require!(
+            ctx.accounts.quote_vault.amount >= amount_quote_lots,
+            FlashBookError::InsufficientCollateral
+        );
+
+        let bump = ctx.accounts.insurance_fund.bump;
+        let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
+        let signers = &[signer_seeds];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.quote_vault.to_account_info(),
+            to: ctx.accounts.authority_quote_ata.to_account_info(),
+            authority: ctx.accounts.insurance_fund.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signers,
+        );
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        let f = &mut ctx.accounts.insurance_fund;
+        f.balance_quote_lots = new_balance;
+        f.total_payouts = f
+            .total_payouts
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        Ok(())
+    }
+
     /// Initialize per-trader state.
     pub fn open_trader_state(ctx: Context<OpenTraderState>) -> Result<()> {
         let s = &mut ctx.accounts.trader_state;
@@ -2074,6 +2137,34 @@ pub struct InitializeInsuranceFund<'info> {
     pub token_program: Program<'info, Token>,
     pub rent: Sysvar<'info, Rent>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawInsuranceFund<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// Authority's USDC ATA — destination for withdrawn rent.
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = authority,
+    )]
+    pub authority_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(mut, address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]

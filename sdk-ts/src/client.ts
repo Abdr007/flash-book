@@ -276,6 +276,30 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Authority withdraws excess insurance fund balance. Cannot push the
+  /// fund below `pause_threshold_quote_lots`. Authority signs.
+  withdrawInsuranceFundIx(args: {
+    authority: PublicKey;
+    amountQuoteLots: bigint | number;
+    quoteMint: PublicKey;
+    quoteVault: PublicKey;
+    authorityQuoteAta?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const fund = this.insuranceFund();
+    const ata = args.authorityQuoteAta ?? associatedTokenAddress(args.authority, args.quoteMint);
+    return this.methods
+      .withdrawInsuranceFund(args.amountQuoteLots)
+      .accountsPartial({
+        authority: args.authority,
+        insuranceFund: fund.address,
+        quoteMint: args.quoteMint,
+        authorityQuoteAta: ata,
+        quoteVault: args.quoteVault,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
   /// Settle accrued funding for a single position. Permissionless — any
   /// signer can poke a position; `caller` pays the tx fee. The trader
   /// being settled doesn't need to sign. Idempotent: calling repeatedly

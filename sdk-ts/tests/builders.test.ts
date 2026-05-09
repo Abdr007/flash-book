@@ -108,6 +108,19 @@ describe('Instruction builders', () => {
     expect(ix.keys[4].pubkey.toBase58()).toBe(expectedAta.toBase58());
   });
 
+  test('withdrawInsuranceFundIx', async () => {
+    const client = makeClient();
+    const ix = await client.withdrawInsuranceFundIx({
+      authority: Keypair.generate().publicKey,
+      amountQuoteLots: new BN(50_000),
+      quoteMint: Keypair.generate().publicKey,
+      quoteVault: Keypair.generate().publicKey,
+    });
+    // authority, insurance_fund, quote_mint, authority_quote_ata,
+    // quote_vault, token_program
+    expect(ix.keys.length).toBe(6);
+  });
+
   test('settleFundingIx', async () => {
     const client = makeClient();
     const ix = await client.settleFundingIx({

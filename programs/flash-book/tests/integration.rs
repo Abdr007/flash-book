@@ -583,6 +583,209 @@ async fn initialize_insurance_fund_writes_state() {
 }
 
 #[tokio::test]
+async fn withdraw_insurance_fund_succeeds_above_pause_threshold() {
+    // Inject balance synthetically (production: balance accrues from fees).
+    // pause_threshold is 5_000 from setup_protocol. Set balance to 100_000;
+    // withdraw 50_000; assert new balance = 50_000 (still > threshold).
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+
+    // Inject 100_000 balance into insurance_fund account state.
+    let if_acc = ctx
+        .banks_client
+        .get_account(protocol.insurance_fund)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut fund_state =
+        flash_book::state::InsuranceFundAccount::try_deserialize(&mut if_acc.data.as_slice())
+            .unwrap();
+    fund_state.balance_quote_lots = 100_000;
+    let mut new_data = Vec::new();
+    fund_state.try_serialize(&mut new_data).unwrap();
+    new_data.resize(if_acc.data.len(), 0);
+    ctx.set_account(
+        &protocol.insurance_fund,
+        &SolAccount {
+            lamports: if_acc.lamports,
+            data: new_data,
+            owner: if_acc.owner,
+            executable: if_acc.executable,
+            rent_epoch: if_acc.rent_epoch,
+        }
+        .into(),
+    );
+    // Mint matching tokens to the vault so the SPL transfer can succeed.
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, protocol.quote_vault, 100_000).await;
+
+    // Authority needs an ATA to receive.
+    let auth_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
+
+    let withdraw_ix = build_ix(
+        flash_book::instruction::WithdrawInsuranceFund {
+            amount_quote_lots: 50_000,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(auth_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[withdraw_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let fund_after: flash_book::state::InsuranceFundAccount =
+        fetch(&mut ctx.banks_client, protocol.insurance_fund).await;
+    assert_eq!(fund_after.balance_quote_lots, 50_000);
+    assert_eq!(fund_after.total_payouts, 50_000);
+
+    let ata_after = ctx.banks_client.get_account(auth_ata).await.unwrap().unwrap();
+    let ata_state = <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(
+        &ata_after.data,
+    )
+    .unwrap();
+    assert_eq!(ata_state.amount, 50_000);
+}
+
+#[tokio::test]
+async fn withdraw_insurance_fund_blocked_below_pause_threshold() {
+    // pause_threshold is 5_000. Inject balance 6_000. Try to withdraw
+    // 2_000 — would leave 4_000 < threshold. Must reject.
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+
+    let if_acc = ctx
+        .banks_client
+        .get_account(protocol.insurance_fund)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut fund_state =
+        flash_book::state::InsuranceFundAccount::try_deserialize(&mut if_acc.data.as_slice())
+            .unwrap();
+    fund_state.balance_quote_lots = 6_000;
+    let mut new_data = Vec::new();
+    fund_state.try_serialize(&mut new_data).unwrap();
+    new_data.resize(if_acc.data.len(), 0);
+    ctx.set_account(
+        &protocol.insurance_fund,
+        &SolAccount {
+            lamports: if_acc.lamports,
+            data: new_data,
+            owner: if_acc.owner,
+            executable: if_acc.executable,
+            rent_epoch: if_acc.rent_epoch,
+        }
+        .into(),
+    );
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, protocol.quote_vault, 6_000).await;
+    let auth_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
+
+    let withdraw_ix = build_ix(
+        flash_book::instruction::WithdrawInsuranceFund {
+            amount_quote_lots: 2_000,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(auth_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[withdraw_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "withdraw must reject when it would push below pause_threshold"
+    );
+
+    // Balance unchanged after failed withdraw.
+    let fund_after: flash_book::state::InsuranceFundAccount =
+        fetch(&mut ctx.banks_client, protocol.insurance_fund).await;
+    assert_eq!(fund_after.balance_quote_lots, 6_000);
+}
+
+#[tokio::test]
+async fn withdraw_insurance_fund_rejects_non_authority() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+
+    // Random non-authority signer.
+    let attacker = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &attacker.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let attacker_ata = create_ata(&mut ctx, &payer, attacker.pubkey(), protocol.quote_mint).await;
+
+    let withdraw_ix = build_ix(
+        flash_book::instruction::WithdrawInsuranceFund {
+            amount_quote_lots: 100,
+        },
+        vec![
+            AccountMeta::new_readonly(attacker.pubkey(), true),
+            AccountMeta::new(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(attacker_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[withdraw_ix],
+            Some(&attacker.pubkey()),
+            &[&attacker],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "non-authority must not be able to withdraw insurance fund");
+}
+
+#[tokio::test]
 async fn initialize_flp_exposure_writes_state_and_empty_slots() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
