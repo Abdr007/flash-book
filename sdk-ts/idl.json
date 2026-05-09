@@ -673,6 +673,65 @@
       ]
     },
     {
+      "name": "cancel_all_orders_in_market",
+      "docs": [
+        "Mass-cancel: clears EVERY pending limit/taker order belonging to",
+        "the caller in this market's buffer. Single tx, single signer.",
+        "O(n) over the buffer (n ≤ ORDER_BUFFER_CAP = 64). FLP-virtual,",
+        "liquidation, and ADL system orders are skipped (only user-",
+        "submitted orders are eligible). Reduces failed-cancel UX",
+        "thrash for active traders / MMs that need to flatten quotes",
+        "before a reconfig."
+      ],
+      "discriminator": [
+        61,
+        148,
+        114,
+        57,
+        201,
+        35,
+        8,
+        39
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "order_buffer.market",
+                "account": "OrderBufferAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "cancel_order",
       "docs": [
         "Cancel a pending order from the buffer. Only the original trader can",
@@ -4135,6 +4194,10 @@
         {
           "name": "flags",
           "type": "u8"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
         }
       ]
     },
@@ -7716,6 +7779,19 @@
       ]
     },
     {
+      "name": "OrdersMassCancelledEvent",
+      "discriminator": [
+        79,
+        0,
+        7,
+        214,
+        112,
+        87,
+        209,
+        216
+      ]
+    },
+    {
       "name": "PermissionlessMarketDeployedEvent",
       "discriminator": [
         30,
@@ -9830,7 +9906,18 @@
       "name": "OrderSlot",
       "docs": [
         "Compact on-chain order representation. Mirrors `matcher::order::Order`",
-        "in the same fields but stored as a flat struct for Borsh serialization."
+        "in the same fields but stored as a flat struct for Borsh serialization.",
+        "",
+        "The `post_only` field is now a flag bitfield (bit 0 = post_only, bit",
+        "1 = reduce_only, bit 2 = ioc, bit 3 = jit). The name is kept for",
+        "account-layout compatibility — values 0 or 1 are forward-compatible",
+        "with the legacy boolean reading. Higher bits (4-7) reserved.",
+        "",
+        "`expires_at_slot` enables Good-Till-Time (GTT) limit orders. 0 means",
+        "the order rests until cancelled or filled (legacy / GTC behavior);",
+        "otherwise the matcher skips the order once `current_slot >",
+        "expires_at_slot` and `cancel_order` will accept the cancellation",
+        "without further checks (cleanup keepers can sweep them)."
       ],
       "type": {
         "kind": "struct",
@@ -9870,6 +9957,33 @@
           {
             "name": "limit_ticks",
             "type": "u64"
+          },
+          {
+            "name": "expires_at_slot",
+            "docs": [
+              "Good-Till-Time expiry slot. 0 = GTC (no expiry)."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrdersMassCancelledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "cancelled_count",
+            "type": "u32"
           }
         ]
       }

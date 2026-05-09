@@ -154,6 +154,7 @@ export {
   FundingKeeper,
   InvariantMonitor,
   AtaCleanupKeeper,
+  AdlKeeper,
   estimateFundingOwed,
   type KeeperBaseConfig,
   type KeeperStats,
@@ -161,4 +162,5 @@ export {
   type FundingKeeperConfig,
   type InvariantMonitorConfig,
   type AtaCleanupKeeperConfig,
+  type AdlKeeperConfig,
 } from './keepers.ts';

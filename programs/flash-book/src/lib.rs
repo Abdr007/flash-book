@@ -1953,10 +1953,18 @@ pub mod flash_book {
         limit_ticks: u64,
         post_only: bool,
         flags: u8,
+        expires_at_slot: u64,
     ) -> Result<()> {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(limit_ticks > 0, FlashBookError::ZeroPrice);
         require!(side <= 1, FlashBookError::OutOfRange);
+        // GTT (Good-Till-Time): when non-zero, the order auto-expires at
+        // this slot. Matcher skips expired orders during the walk; cleanup
+        // keepers can sweep them via cancel_order. 0 = GTC (legacy).
+        if expires_at_slot > 0 {
+            let now = Clock::get()?.slot;
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
 
         // Compose final flags: legacy `post_only` arg OR'd in for
         // backwards compat, then any caller-supplied bits.
@@ -2166,6 +2174,7 @@ pub mod flash_book {
                     trader: trader_key,
                     size_lots,
                     limit_ticks,
+                    expires_at_slot,
                 };
                 inserted = true;
                 break;
@@ -2599,6 +2608,7 @@ pub mod flash_book {
                     trader: trigger.trader,
                     size_lots: trigger.size_lots,
                     limit_ticks: trigger.limit_price_ticks,
+                    expires_at_slot: 0,
                 };
                 inserted = true;
                 break;
@@ -2799,6 +2809,7 @@ pub mod flash_book {
                     trader: trader_pk,
                     size_lots,
                     limit_ticks: parent_limit_ticks,
+                    expires_at_slot: 0,
                 };
                 inserted = true;
                 break;
@@ -2997,6 +3008,7 @@ pub mod flash_book {
                     trader: twap.trader,
                     size_lots: slice_size,
                     limit_ticks: twap.limit_price_ticks,
+                    expires_at_slot: 0,
                 };
                 inserted = true;
                 break;
@@ -3087,6 +3099,46 @@ pub mod flash_book {
             market: buffer.market,
             trader: trader_key,
             order_seq,
+        });
+        Ok(())
+    }
+
+    /// Mass-cancel: clears EVERY pending limit/taker order belonging to
+    /// the caller in this market's buffer. Single tx, single signer.
+    /// O(n) over the buffer (n ≤ ORDER_BUFFER_CAP = 64). FLP-virtual,
+    /// liquidation, and ADL system orders are skipped (only user-
+    /// submitted orders are eligible). Reduces failed-cancel UX
+    /// thrash for active traders / MMs that need to flatten quotes
+    /// before a reconfig.
+    pub fn cancel_all_orders_in_market(
+        ctx: Context<CancelAllOrders>,
+    ) -> Result<()> {
+        let buffer = &mut ctx.accounts.order_buffer;
+        let trader_key = ctx.accounts.trader.key();
+        let mut cancelled: u32 = 0;
+        for slot in buffer.slots.iter_mut() {
+            if slot.valid == 1
+                && slot.trader == trader_key
+                && (slot.order_type == OrderType::Limit as u8
+                    || slot.order_type == OrderType::Taker as u8)
+            {
+                *slot = OrderSlot::default();
+                cancelled = cancelled.saturating_add(1);
+            }
+        }
+        // head = number of valid slots; recompute by walking. Cheaper +
+        // safer than maintaining a delta when bursts of cancels happen.
+        let mut head: u32 = 0;
+        for slot in buffer.slots.iter() {
+            if slot.valid == 1 {
+                head = head.saturating_add(1);
+            }
+        }
+        buffer.head = head;
+        emit!(OrdersMassCancelledEvent {
+            market: buffer.market,
+            trader: trader_key,
+            cancelled_count: cancelled,
         });
         Ok(())
     }
@@ -3196,10 +3248,17 @@ pub mod flash_book {
         market.cum_funding_index = new_index;
         market.last_funding_rate_bps_per_sec = ftick.rate_bps_per_sec;
 
-        // 2. Load buffered orders.
+        // 2. Load buffered orders. SKIP GTT-expired orders — the slot
+        //    stays valid (cleanup keepers reclaim rent later via
+        //    cancel_order) but the matcher pretends the order isn't
+        //    there. Lazy expiry: no per-slot tx cost for the trader.
+        let now_slot = Clock::get()?.slot;
         let mut orders: Vec<Order> = Vec::with_capacity(buffer.head as usize);
         for slot in buffer.slots.iter().take(ORDER_BUFFER_CAP) {
             if slot.valid != 1 {
+                continue;
+            }
+            if slot.expires_at_slot > 0 && now_slot > slot.expires_at_slot {
                 continue;
             }
             orders.push(slot_to_order(slot)?);
@@ -3753,6 +3812,7 @@ pub mod flash_book {
                     trader,
                     size_lots: close_size,
                     limit_ticks: limit,
+                    expires_at_slot: 0,
                 };
                 inserted = true;
                 break;
@@ -4384,6 +4444,7 @@ pub mod flash_book {
                     trader,
                     size_lots: exec_position.size_lots,
                     limit_ticks: limit,
+                    expires_at_slot: 0,
                 };
                 inserted = true;
                 break;
@@ -5900,6 +5961,18 @@ pub struct CancelOrder<'info> {
 }
 
 #[derive(Accounts)]
+pub struct CancelAllOrders<'info> {
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [OrderBufferAccount::SEED, order_buffer.market.as_ref()],
+        bump = order_buffer.bump,
+    )]
+    pub order_buffer: Account<'info, OrderBufferAccount>,
+}
+
+#[derive(Accounts)]
 pub struct ApplyFlpFill<'info> {
     #[account(mut)]
     pub sequencer: Signer<'info>,
@@ -6297,6 +6370,13 @@ pub struct LiquidationInjectedEvent {
     pub size_lots: u64,
     pub limit_ticks: u64,
     pub worst_scenario_idx: u32,
+}
+
+#[event]
+pub struct OrdersMassCancelledEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub cancelled_count: u32,
 }
 
 #[event]
@@ -6795,6 +6875,7 @@ fn insert_into_buffer(
                 trader,
                 size_lots: leg.size_lots,
                 limit_ticks: leg.limit_ticks,
+                expires_at_slot: 0,
             };
             inserted = true;
             break;
@@ -7267,5 +7348,6 @@ fn order_to_slot(o: &Order) -> OrderSlot {
         trader: o.trader,
         size_lots: o.size.0,
         limit_ticks: o.limit_price.0,
+        expires_at_slot: 0,
     }
 }

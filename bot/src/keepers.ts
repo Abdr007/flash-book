@@ -385,3 +385,149 @@ export class AtaCleanupKeeper extends Keeper {
     return { shouldClose: true, reason: 'no positions, no collateral' };
   }
 }
+
+// ─── ADL keeper ───────────────────────────────────────────────────────
+
+export interface AdlKeeperConfig extends KeeperBaseConfig {
+  /// Markets to monitor for ADL conditions.
+  markets: ReadonlyArray<PublicKey>;
+  /// Off-chain candidate set: traders the keeper considers as either
+  /// underwater OR potential counter-traders. Production deployments
+  /// hydrate this from a subgraph indexing FillAppliedEvent +
+  /// CollateralDepositedEvent; the bot does not auto-discover via
+  /// getProgramAccounts to keep RPC load predictable.
+  candidates: ReadonlyArray<PublicKey>;
+  /// Minimum insurance-fund-balance / pause-threshold ratio below which
+  /// we even consider ADL. 0.0–1.0; 0.5 means "trigger when insurance
+  /// is below 50% of pause threshold." Default 1.0 (chain enforces
+  /// `< pause_threshold` strictly; this is a bot-side guard against
+  /// firing too eagerly when the gap is narrow).
+  insuranceRatioFloor?: number;
+}
+
+interface AdlScored {
+  trader: PublicKey;
+  position: PositionAcc;
+  unrealizedPnl: number;
+  leverage: number;
+  rank: number;
+}
+
+/// Monitors a set of markets; when insurance falls below the chain
+/// trigger AND an underwater position exists, ranks profitable counter-
+/// traders by (unrealized_pnl × leverage) and submits the top-ranked
+/// candidate to `auto_deleverage`. Eligibility (counter profitable at
+/// the bankruptcy price; underwater actually sick; insurance below
+/// pause threshold) is re-checked on chain — invalid ranking just
+/// rejects so the bot retries with the next candidate.
+export class AdlKeeper extends Keeper {
+  readonly name = 'adl-keeper';
+
+  constructor(
+    client: FlashBookClient,
+    connection: Connection,
+    private readonly cfg: AdlKeeperConfig,
+  ) {
+    super(client, connection, cfg);
+  }
+
+  protected async iterate(): Promise<void> {
+    for (const market of this.cfg.markets) {
+      await this.iterateMarket(market);
+    }
+  }
+
+  private async iterateMarket(market: PublicKey): Promise<void> {
+    // 1. Insurance-fund trigger gate (off-chain pre-check; chain
+    //    re-checks `balance < pause_threshold` strictly).
+    const fund = await this.fetchInsuranceFund();
+    if (!fund) return;
+    const ratioFloor = this.cfg.insuranceRatioFloor ?? 1.0;
+    const ratio = Number(fund.balanceQuoteLots.toString())
+      / Math.max(Number(fund.pauseThresholdQuoteLots.toString()), 1);
+    if (ratio >= ratioFloor) return; // no ADL warranted
+
+    // 2. Snapshot every candidate's position on this market.
+    const marketAcc = await fetchMarket(this.client, market);
+    if (!marketAcc) return;
+
+    const longs: AdlScored[] = [];
+    const shorts: AdlScored[] = [];
+    let underwater: { trader: PublicKey; position: PositionAcc } | null = null;
+    for (const trader of this.cfg.candidates) {
+      const pos = await fetchPosition(
+        this.client,
+        this.client.position(market, trader).address,
+      );
+      if (!pos || pos.sizeLots.isZero()) continue;
+      const ts = await fetchTraderState(
+        this.client,
+        this.client.traderState(trader).address,
+      );
+      if (!ts) continue;
+
+      // Health check (single-position approx, mirroring chain's stress
+      // lattice for a single-market view).
+      const markets = new Map([[market.toBase58(), marketAcc]]);
+      const preview = previewPortfolioRisk(
+        [pos],
+        markets,
+        Number(ts.collateralQuoteLots.toString()),
+      );
+      if (preview.healthRatio <= 1.0) {
+        // First sick wins for this iteration.
+        if (!underwater) underwater = { trader, position: pos };
+        continue;
+      }
+
+      // Score for ranking: (unrealized_pnl × leverage). Larger = higher
+      // priority for ADL (HL-style ranking).
+      const tickSize = Number(marketAcc.params.tickSize.toString());
+      const mark = Number(marketAcc.markPriceTicks.toString());
+      const entry = Number(pos.entryPriceTicks.toString());
+      const size = Number(pos.sizeLots.toString());
+      const sign = pos.side === 0 ? 1 : -1;
+      const upnl = sign * size * (mark - entry) * tickSize;
+      if (upnl <= 0) continue; // only profitable counter-traders are eligible
+      const collateral = Number(ts.collateralQuoteLots.toString());
+      const notional = size * mark * tickSize;
+      const leverage = collateral > 0 ? notional / collateral : 0;
+      const scored: AdlScored = { trader, position: pos, unrealizedPnl: upnl, leverage, rank: upnl * leverage };
+      (pos.side === 0 ? longs : shorts).push(scored);
+    }
+
+    if (!underwater) return;
+    // Counter-side is opposite of underwater.
+    const candidates = underwater.position.side === 0 ? shorts : longs;
+    candidates.sort((a, b) => b.rank - a.rank);
+    const top = candidates[0];
+    if (!top) return; // no profitable counter — only normal liq path remains
+
+    const closeSize = bigMin(
+      BigInt(underwater.position.sizeLots.toString()),
+      BigInt(top.position.sizeLots.toString()),
+    );
+    if (closeSize === 0n) return;
+
+    const ix = await this.client.autoDeleverageIx({
+      caller: this.base.signer.publicKey,
+      market,
+      underwaterTrader: underwater.trader,
+      counterTrader: top.trader,
+      closeSizeLots: closeSize,
+    });
+    const sig = await this.sendIxs([ix]);
+    if (sig) this.stats.actionsTaken += 1;
+  }
+
+  private async fetchInsuranceFund(): Promise<
+    { balanceQuoteLots: { toString(): string }; pauseThresholdQuoteLots: { toString(): string } } | null
+  > {
+    const { fetchInsuranceFund } = await import('../../sdk-ts/src/accounts.ts');
+    return fetchInsuranceFund(this.client, this.client.insuranceFund().address);
+  }
+}
+
+function bigMin(a: bigint, b: bigint): bigint {
+  return a < b ? a : b;
+}

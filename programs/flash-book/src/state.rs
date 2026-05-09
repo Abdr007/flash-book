@@ -499,25 +499,39 @@ pub struct OrderBufferAccount {
 
 /// Compact on-chain order representation. Mirrors `matcher::order::Order`
 /// in the same fields but stored as a flat struct for Borsh serialization.
+///
+/// The `post_only` field is now a flag bitfield (bit 0 = post_only, bit
+/// 1 = reduce_only, bit 2 = ioc, bit 3 = jit). The name is kept for
+/// account-layout compatibility — values 0 or 1 are forward-compatible
+/// with the legacy boolean reading. Higher bits (4-7) reserved.
+///
+/// `expires_at_slot` enables Good-Till-Time (GTT) limit orders. 0 means
+/// the order rests until cancelled or filled (legacy / GTC behavior);
+/// otherwise the matcher skips the order once `current_slot >
+/// expires_at_slot` and `cancel_order` will accept the cancellation
+/// without further checks (cleanup keepers can sweep them).
 #[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize, Default)]
 pub struct OrderSlot {
     pub valid: u8,            // 0 = empty, 1 = active
     pub side: u8,             // 0 long, 1 short
     pub order_type: u8,       // 0 limit, 1 taker, 2 flp_virtual, 3 liq, 4 adl
-    pub post_only: u8,        // 0 / 1
+    pub post_only: u8,        // flag bitfield: bit0 post_only, 1 reduce_only, 2 ioc, 3 jit
     pub seq: u64,
     pub id: u64,
     pub trader: Pubkey,
     pub size_lots: u64,
     pub limit_ticks: u64,
+    /// Good-Till-Time expiry slot. 0 = GTC (no expiry).
+    pub expires_at_slot: u64,
 }
 
 impl OrderBufferAccount {
     pub const SEED: &'static [u8] = b"order_buffer";
     pub fn space() -> usize {
-        // 8 disc + 32 market + 1 bump + 4 head + 8 seq + (CAP × 4+8+8+32+8+8+1+1+1+1) padding-tolerant
-        // OrderSlot: 1+1+1+1 + 8 + 8 + 32 + 8 + 8 = 68 bytes (Borsh; padding-free).
-        8 + 32 + 1 + 4 + 8 + (ORDER_BUFFER_CAP * 68)
+        // 8 disc + 32 market + 1 bump + 4 head + 8 seq +
+        // (CAP × OrderSlot Borsh size). OrderSlot:
+        //   1+1+1+1 + 8 + 8 + 32 + 8 + 8 + 8 (expires_at_slot) = 76 bytes.
+        8 + 32 + 1 + 4 + 8 + (ORDER_BUFFER_CAP * 76)
     }
 }
 

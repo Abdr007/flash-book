@@ -588,7 +588,12 @@ export class FlashBookClient {
   ///   bit 0 — post_only (also via the explicit `postOnly` arg)
   ///   bit 1 — reduce_only: order can only shrink the trader's position
   ///   bit 2 — ioc: immediate-or-cancel; don't rest after batch
+  ///   bit 3 — jit (drift JIT auction tag)
   ///   higher bits — reserved (chain rejects)
+  ///
+  /// `expiresAtSlot` enables Good-Till-Time (GTT). 0 = GTC. Otherwise
+  /// the matcher skips the order once `current_slot > expiresAtSlot`
+  /// (cleanup keepers can sweep them via cancelOrder for rent reclaim).
   placeLimitOrderIx(args: {
     trader: PublicKey;
     market: PublicKey;
@@ -598,6 +603,8 @@ export class FlashBookClient {
     postOnly?: boolean;
     /// Bitfield of flags. Use {ORDER_FLAG_*} constants.
     flags?: number;
+    /// 0 = GTC; otherwise the slot at which the order auto-expires.
+    expiresAtSlot?: bigint | number;
   }): Promise<TransactionInstruction> {
     const buffer = this.orderBuffer(args.market);
     const state = this.traderState(args.trader);
@@ -610,6 +617,7 @@ export class FlashBookClient {
         args.limitTicks,
         args.postOnly ?? false,
         args.flags ?? 0,
+        args.expiresAtSlot ?? new BN(0),
       )
       .accountsPartial({
         trader: args.trader,
@@ -619,6 +627,24 @@ export class FlashBookClient {
         position: position.address,
         flpExposure: flp.address,
         systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Mass-cancel: drop EVERY pending limit/taker order belonging to the
+  /// caller in this market. Single signer, single tx. Single O(n) walk
+  /// over the order_buffer (n ≤ 64). FLP-virtual / liq / ADL system
+  /// orders are skipped.
+  cancelAllOrdersInMarketIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const buffer = this.orderBuffer(args.market);
+    return this.methods
+      .cancelAllOrdersInMarket()
+      .accountsPartial({
+        trader: args.trader,
+        orderBuffer: buffer.address,
       })
       .instruction();
   }

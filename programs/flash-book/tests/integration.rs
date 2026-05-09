@@ -1393,6 +1393,7 @@ async fn place_limit_order_lands_in_buffer() {
             limit_ticks: 99_950,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -1455,6 +1456,7 @@ async fn open_long_position(
             limit_ticks,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -1687,6 +1689,7 @@ async fn run_batch_advances_counter_and_clears_buffer() {
             limit_ticks: 99_950,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -1794,6 +1797,7 @@ async fn set_market_status_blocks_orders_when_paused() {
             limit_ticks: 99_950,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -2879,6 +2883,7 @@ async fn liquidate_portfolio_with_two_markets_and_no_positions() {
             limit_ticks: 99_950,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -2974,6 +2979,7 @@ async fn place_limit_order_rejects_reduce_only_without_position() {
             limit_ticks: 100_000,
             post_only: false,
             flags: 1 << 1, // reduce_only
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -3018,6 +3024,7 @@ async fn place_limit_order_rejects_post_only_plus_ioc() {
             limit_ticks: 100_000,
             post_only: true,
             flags: 1 << 2, // ioc
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -3062,6 +3069,7 @@ async fn place_limit_order_rejects_unknown_flag_bits() {
             limit_ticks: 100_000,
             post_only: false,
             flags: 1 << 7, // reserved bit
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -3123,6 +3131,7 @@ async fn place_basket_order_n_lands_three_legs_via_remaining_accounts() {
                 limit_ticks: 100,
                 post_only: false,
                 flags: 0,
+            expires_at_slot: 0,
             },
             vec![
                 AccountMeta::new(trader.pubkey(), true),
@@ -3216,6 +3225,7 @@ async fn place_basket_order_n_rejects_duplicate_markets() {
     let init_ix = build_ix(
         flash_book::instruction::PlaceLimitOrder {
             side: 0, size_lots: 1, limit_ticks: 100, post_only: false, flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -3454,6 +3464,7 @@ async fn two_traders_crossing_orders_clear_in_batch() {
             limit_ticks: 100_500,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(alice.pubkey(), true),
@@ -3484,6 +3495,7 @@ async fn two_traders_crossing_orders_clear_in_batch() {
             limit_ticks: 99_500,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(bob.pubkey(), true),
@@ -3587,6 +3599,7 @@ async fn place_limit_order_below_min_lot_rejected() {
             limit_ticks: 100_000,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -3792,6 +3805,7 @@ async fn place_limit_order_off_tick_rejected() {
             limit_ticks: 100_005, // not aligned
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -3860,6 +3874,7 @@ async fn apply_fill_settles_two_trader_positions() {
                 limit_ticks: limit,
                 post_only: false,
             flags: 0,
+            expires_at_slot: 0,
             },
             vec![
                 AccountMeta::new(signer.pubkey(), true),
@@ -4017,6 +4032,7 @@ async fn apply_fill_charges_toxicity_tax_when_vpin_positive() {
                 limit_ticks: limit,
                 post_only: false,
             flags: 0,
+            expires_at_slot: 0,
             },
             vec![
                 AccountMeta::new(signer.pubkey(), true),
@@ -4265,6 +4281,7 @@ async fn place_limit_order_per_trader_rate_limit_enforced() {
                 limit_ticks: 99_900 + i, // distinct prices to avoid dedup
                 post_only: false,
             flags: 0,
+            expires_at_slot: 0,
             },
             vec![
                 AccountMeta::new(trader.pubkey(), true),
@@ -4299,6 +4316,7 @@ async fn place_limit_order_per_trader_rate_limit_enforced() {
             limit_ticks: 99_999,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4569,6 +4587,7 @@ async fn place_limit_order_rejects_above_position_cap() {
             limit_ticks: 100_000,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4600,6 +4619,7 @@ async fn place_limit_order_rejects_above_position_cap() {
             limit_ticks: 100_000,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4701,6 +4721,7 @@ async fn place_limit_order_rejects_above_capital_ratio_cap() {
             limit_ticks: 1_000,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4732,6 +4753,7 @@ async fn place_limit_order_rejects_above_capital_ratio_cap() {
             limit_ticks: 500,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4779,6 +4801,7 @@ async fn cancel_order_removes_from_buffer() {
             limit_ticks: 99_950,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4857,6 +4880,7 @@ async fn cancel_order_rejects_other_traders_order() {
             limit_ticks: 99_950,
             post_only: false,
             flags: 0,
+            expires_at_slot: 0,
         },
         vec![
             AccountMeta::new(alice.pubkey(), true),
