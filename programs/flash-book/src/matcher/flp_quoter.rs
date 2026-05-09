@@ -185,6 +185,7 @@ pub fn generate_quotes(
                 limit_price: bid,
                 seq: base_seq + (i * 2),
                 post_only: false,
+                stp_mode: crate::matcher::order::StpMode::CancelNewest,
             });
         }
         if ask.0 > 0 {
@@ -198,6 +199,7 @@ pub fn generate_quotes(
                 limit_price: ask,
                 seq: base_seq + (i * 2) + 1,
                 post_only: false,
+                stp_mode: crate::matcher::order::StpMode::CancelNewest,
             });
         }
     }

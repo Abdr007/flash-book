@@ -4296,6 +4296,10 @@
         {
           "name": "expires_at_slot",
           "type": "u64"
+        },
+        {
+          "name": "trailing_offset_bps",
+          "type": "u32"
         }
       ]
     },
@@ -5945,14 +5949,13 @@
         "source.collateral_quote_lots to dest.collateral_quote_lots",
         "atomically.",
         "",
-        "Source must be FLAT (no open positions). Future iterations may",
-        "add a position-aware variant that walks positions in",
-        "`remaining_accounts` to enforce post-sweep margin — for v1 the",
-        "flat-source rule is a clean safety property: a trader with open",
-        "positions cannot accidentally drain collateral they need for",
-        "margin. To rebalance with positions, the trader closes first.",
+        "Source can hold OPEN POSITIONS — caller passes [market, position]",
+        "pairs in remaining_accounts (count must equal source.open_positions).",
+        "Post-sweep margin is evaluated against the joint stress-lattice;",
+        "rejects if the source would become unhealthy after the withdrawal.",
+        "Source flat → pass `[]` for remaining_accounts (the legacy fast path).",
         "",
-        "Cannot sweep to/from the same account (caller error)."
+        "Cannot sweep to/from the same account."
       ],
       "discriminator": [
         175,
@@ -6344,6 +6347,84 @@
           }
         }
       ]
+    },
+    {
+      "name": "update_trailing_stop",
+      "docs": [
+        "Ratchet a trailing-stop trigger order — permissionless. Reads the",
+        "current oracle and updates the trigger's anchor + price if the",
+        "oracle has moved in the trader's favour. Hyperliquid trailing-stop",
+        "pattern, generalised: works for both sides + both trigger kinds.",
+        "",
+        "Math (offset = trailing_offset_bps × oracle / 10_000):",
+        "• kind=0 (fire on ≤): SL for a long position. Best = MAX oracle.",
+        "If oracle > anchor: anchor ← oracle; trigger ← anchor − offset.",
+        "• kind=1 (fire on ≥): SL for a short position. Best = MIN oracle.",
+        "If oracle < anchor (or anchor==0): anchor ← oracle;",
+        "trigger ← anchor + offset.",
+        "",
+        "Tick-aligns the new trigger price (rounds toward the more",
+        "conservative side: kind=0 floors, kind=1 ceils so the trigger",
+        "is never less protective than intended).",
+        "",
+        "Rejects when the trigger isn't trailing (offset == 0) or already",
+        "inactive. Idempotent — calling on a \"no-progress\" oracle is a",
+        "no-op (no events emitted)."
+      ],
+      "discriminator": [
+        9,
+        64,
+        172,
+        21,
+        17,
+        22,
+        27,
+        226
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Permissionless. Caller pays tx fee. Production deployments wire",
+            "this to a per-market keeper that reads oracle ticks and calls",
+            "the ix when the favourable-direction move ≥ 1 tick."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trigger_order",
+          "writable": true
+        }
+      ],
+      "args": []
     },
     {
       "name": "verify_market_invariants",
@@ -7919,6 +8000,19 @@
         8,
         92,
         28
+      ]
+    },
+    {
+      "name": "TrailingStopRatchetedEvent",
+      "discriminator": [
+        180,
+        153,
+        238,
+        37,
+        134,
+        194,
+        134,
+        125
       ]
     },
     {
@@ -10436,6 +10530,38 @@
       }
     },
     {
+      "name": "TrailingStopRatchetedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "trigger_id",
+            "type": "u8"
+          },
+          {
+            "name": "previous_trigger_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "new_trigger_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "anchor_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "TriggerOrderAccount",
       "docs": [
         "Native on-chain trigger order — Hyperliquid pattern. The trader pre-funds",
@@ -10540,6 +10666,30 @@
               "account on `execute_trigger_order` / `cancel_trigger_order`."
             ],
             "type": "pubkey"
+          },
+          {
+            "name": "trailing_offset_bps",
+            "docs": [
+              "Trailing-stop offset in bps. 0 = static trigger (legacy). When",
+              "non-zero, the trigger price RATCHETS in the favourable direction",
+              "as the oracle moves: kind=0 (fire on ≤) tracks the oracle MAX",
+              "minus offset; kind=1 (fire on ≥) tracks oracle MIN plus offset.",
+              "Hyperliquid trailing-stop pattern. Permissionless `update_trailing_stop`",
+              "keepers ratchet the trigger price; on fire, the existing",
+              "execute_trigger_order path runs unchanged."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "trailing_anchor_ticks",
+            "docs": [
+              "Best (most-favorable-to-trader) oracle price observed since",
+              "trigger placement. Used as the anchor for trailing math:",
+              "kind=0 (sl-for-long): trigger = best_price × (1 - offset_bps)",
+              "kind=1 (sl-for-short): trigger = best_price × (1 + offset_bps)",
+              "0 = unset (first update_trailing_stop initialises from current oracle)."
+            ],
+            "type": "u64"
           }
         ]
       }

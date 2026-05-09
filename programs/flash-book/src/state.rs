@@ -371,6 +371,20 @@ pub struct TriggerOrderAccount {
     /// The partner account is passed via the optional `oco_pair`
     /// account on `execute_trigger_order` / `cancel_trigger_order`.
     pub oco_pair: Pubkey,
+    /// Trailing-stop offset in bps. 0 = static trigger (legacy). When
+    /// non-zero, the trigger price RATCHETS in the favourable direction
+    /// as the oracle moves: kind=0 (fire on ≤) tracks the oracle MAX
+    /// minus offset; kind=1 (fire on ≥) tracks oracle MIN plus offset.
+    /// Hyperliquid trailing-stop pattern. Permissionless `update_trailing_stop`
+    /// keepers ratchet the trigger price; on fire, the existing
+    /// execute_trigger_order path runs unchanged.
+    pub trailing_offset_bps: u32,
+    /// Best (most-favorable-to-trader) oracle price observed since
+    /// trigger placement. Used as the anchor for trailing math:
+    ///   kind=0 (sl-for-long): trigger = best_price × (1 - offset_bps)
+    ///   kind=1 (sl-for-short): trigger = best_price × (1 + offset_bps)
+    /// 0 = unset (first update_trailing_stop initialises from current oracle).
+    pub trailing_anchor_ticks: u64,
 }
 
 impl TriggerOrderAccount {
@@ -381,8 +395,10 @@ impl TriggerOrderAccount {
     /// OCO behaviour keys off `oco_pair != Pubkey::default()`.
     pub const FLAG_BRACKET_LEG: u8 = 1 << 2;
     pub fn space() -> usize {
-        // 8 disc + 32+32+1+1+1+1+1 + 8+8+8 + 8+8 + 32 (oco) = 149. Round up.
-        8 + 168
+        // 8 disc + 32+32+1+1+1+1+1 + 8+8+8 + 8+8 + 32 (oco)
+        // + 4 (trailing_offset_bps) + 8 (trailing_anchor_ticks) = 161.
+        // Round to 192.
+        8 + 192
     }
 }
 
@@ -747,4 +763,5 @@ const _: Order = Order {
     limit_price: Ticks(0),
     seq: 0,
     post_only: false,
+    stp_mode: crate::matcher::order::StpMode::CancelNewest,
 };

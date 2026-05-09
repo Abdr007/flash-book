@@ -159,15 +159,43 @@ pub fn clear_batch(orders: &[Order], prior_mark: Ticks) -> Result<ClearResult> {
         let buy = &eligible_buys[buy_idx];
         let sell = &eligible_sells[sell_idx];
 
-        // Self-trade prevention.
+        // Self-trade prevention. Apply the STP mode of the NEWER order
+        // (larger seq); it's the order being placed against the resting
+        // book, so its trader's preference wins.
         if buy.trader == sell.trader {
-            // Advance the lower-priority side; keep the higher-priority order.
-            if buy.order_type.priority() >= sell.order_type.priority() {
-                buy_idx += 1;
-                buy_remaining = eligible_buys.get(buy_idx).map(|o| o.size.0).unwrap_or(0);
-            } else {
-                sell_idx += 1;
-                sell_remaining = eligible_sells.get(sell_idx).map(|o| o.size.0).unwrap_or(0);
+            let newer_is_buy = buy.seq > sell.seq;
+            let mode = if newer_is_buy { buy.stp_mode } else { sell.stp_mode };
+            match mode {
+                crate::matcher::order::StpMode::CancelNewest => {
+                    if newer_is_buy {
+                        buy_idx += 1;
+                        buy_remaining =
+                            eligible_buys.get(buy_idx).map(|o| o.size.0).unwrap_or(0);
+                    } else {
+                        sell_idx += 1;
+                        sell_remaining =
+                            eligible_sells.get(sell_idx).map(|o| o.size.0).unwrap_or(0);
+                    }
+                }
+                crate::matcher::order::StpMode::CancelOldest => {
+                    if newer_is_buy {
+                        sell_idx += 1;
+                        sell_remaining =
+                            eligible_sells.get(sell_idx).map(|o| o.size.0).unwrap_or(0);
+                    } else {
+                        buy_idx += 1;
+                        buy_remaining =
+                            eligible_buys.get(buy_idx).map(|o| o.size.0).unwrap_or(0);
+                    }
+                }
+                crate::matcher::order::StpMode::CancelBoth => {
+                    buy_idx += 1;
+                    sell_idx += 1;
+                    buy_remaining =
+                        eligible_buys.get(buy_idx).map(|o| o.size.0).unwrap_or(0);
+                    sell_remaining =
+                        eligible_sells.get(sell_idx).map(|o| o.size.0).unwrap_or(0);
+                }
             }
             continue;
         }

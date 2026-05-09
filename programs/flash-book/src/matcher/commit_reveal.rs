@@ -113,6 +113,7 @@ pub fn redeem_reveal(
         limit_price: payload.limit,
         seq,
         post_only: false,
+        stp_mode: crate::matcher::order::StpMode::CancelNewest,
     })
 }
 

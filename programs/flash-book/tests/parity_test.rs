@@ -84,6 +84,7 @@ fn raw_to_order(raw: &RawOrder) -> Order {
         limit_price: Ticks(raw.limit),
         seq: raw.seq,
         post_only: false,
+        stp_mode: flash_book::matcher::order::StpMode::CancelNewest,
     }
 }
 

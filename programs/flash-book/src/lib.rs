@@ -530,16 +530,15 @@ pub mod flash_book {
     /// source.collateral_quote_lots to dest.collateral_quote_lots
     /// atomically.
     ///
-    /// Source must be FLAT (no open positions). Future iterations may
-    /// add a position-aware variant that walks positions in
-    /// `remaining_accounts` to enforce post-sweep margin — for v1 the
-    /// flat-source rule is a clean safety property: a trader with open
-    /// positions cannot accidentally drain collateral they need for
-    /// margin. To rebalance with positions, the trader closes first.
+    /// Source can hold OPEN POSITIONS — caller passes [market, position]
+    /// pairs in remaining_accounts (count must equal source.open_positions).
+    /// Post-sweep margin is evaluated against the joint stress-lattice;
+    /// rejects if the source would become unhealthy after the withdrawal.
+    /// Source flat → pass `[]` for remaining_accounts (the legacy fast path).
     ///
-    /// Cannot sweep to/from the same account (caller error).
-    pub fn sweep_collateral(
-        ctx: Context<SweepCollateral>,
+    /// Cannot sweep to/from the same account.
+    pub fn sweep_collateral<'info>(
+        ctx: Context<'_, '_, 'info, 'info, SweepCollateral<'info>>,
         amount: u64,
     ) -> Result<()> {
         require!(amount > 0, FlashBookError::ZeroSize);
@@ -549,7 +548,68 @@ pub mod flash_book {
         let signer = ctx.accounts.authority.key();
         require!(from.is_authorized(&signer), FlashBookError::Unauthorized);
         require!(to.is_authorized(&signer), FlashBookError::Unauthorized);
-        require!(from.open_positions == 0, FlashBookError::SweepRequiresFlat);
+
+        // Position-aware margin gate. If source has open positions:
+        //   1. Walk remaining_accounts as [market, position] pairs.
+        //   2. Verify count matches from.open_positions exactly.
+        //   3. Build snapshots and assess against the stress lattice
+        //      using POST-sweep collateral (`from.collateral - amount`).
+        //   4. Reject if not healthy.
+        // No open positions → skip the walk (cheap fast path).
+        if from.open_positions > 0 {
+            let post_sweep_collateral = from
+                .collateral_quote_lots
+                .checked_sub(amount)
+                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+            let expected = from.open_positions as usize;
+            require!(
+                ctx.remaining_accounts.len() == expected * 2,
+                FlashBookError::OutOfRange
+            );
+
+            let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(expected);
+            let mut market_snaps: Vec<RiskMarketSnap> = Vec::with_capacity(expected);
+            let mut market_keys: Vec<Pubkey> = Vec::with_capacity(expected);
+            for i in 0..expected {
+                let market_ai = &ctx.remaining_accounts[i * 2];
+                let position_ai = &ctx.remaining_accounts[i * 2 + 1];
+                require!(market_ai.owner == ctx.program_id, FlashBookError::OutOfRange);
+                require!(position_ai.owner == ctx.program_id, FlashBookError::OutOfRange);
+
+                let market_data = market_ai.try_borrow_data()?;
+                let market_acct: MarketAccount =
+                    MarketAccount::try_deserialize(&mut &market_data[..])?;
+                let position_data = position_ai.try_borrow_data()?;
+                let position: state::PositionAccount =
+                    state::PositionAccount::try_deserialize(&mut &position_data[..])?;
+                require!(position.trader == from.trader, FlashBookError::WrongTrader);
+                require!(position.market == market_ai.key(), FlashBookError::WrongMarket);
+
+                snaps.push(RiskPosSnap {
+                    market: position.market,
+                    side: if position.side == 0 { Side::Long } else { Side::Short },
+                    size_lots: position.size_lots,
+                    entry_price: Ticks(position.entry_price_ticks),
+                    cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                });
+                market_snaps.push(RiskMarketSnap {
+                    market: market_ai.key(),
+                    mark_price: Ticks(market_acct.mark_price_ticks),
+                    cum_funding_index: market_acct.cum_funding_index,
+                    maintenance_margin_bps: market_acct.params.maintenance_margin_ratio_bps,
+                    tick_size: market_acct.params.tick_size,
+                });
+                market_keys.push(market_ai.key());
+            }
+            let scenarios = default_scenarios_fn(&market_keys);
+            let assessment = assess_margin_fn(
+                &snaps,
+                &market_snaps,
+                &scenarios,
+                post_sweep_collateral,
+            )?;
+            require!(assessment.is_healthy, FlashBookError::TraderLiquidatable);
+        }
 
         let from = &mut ctx.accounts.from_state;
         from.collateral_quote_lots = from
@@ -1973,8 +2033,12 @@ pub mod flash_book {
         let reduce_only = (final_flags & (1 << 1)) != 0;
         let ioc = (final_flags & (1 << 2)) != 0;
         // Reject unknown flag bits to keep the bitfield strict.
-        // Bits 0-3 are now defined (post_only, reduce_only, ioc, jit).
-        require!(final_flags & !0b0000_1111 == 0, FlashBookError::OutOfRange);
+        // Bits 0-3: post_only, reduce_only, ioc, jit
+        // Bits 4-5: stp_mode (0 cancel-newest, 1 cancel-oldest, 2 cancel-both)
+        //           value 3 (binary 11) is reserved → reject.
+        require!(final_flags & !0b0011_1111 == 0, FlashBookError::OutOfRange);
+        let stp_bits = (final_flags >> 4) & 0b11;
+        require!(stp_bits <= 2, FlashBookError::OutOfRange);
 
         // Reduce-only gate: order can only oppose + not exceed position.
         if reduce_only {
@@ -2485,12 +2549,20 @@ pub mod flash_book {
         limit_price_ticks: u64,
         reduce_only: bool,
         expires_at_slot: u64,
+        trailing_offset_bps: u32,
     ) -> Result<()> {
         require!(side <= 1, FlashBookError::OutOfRange);
         require!(kind <= 1, FlashBookError::OutOfRange);
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(trigger_price_ticks > 0, FlashBookError::ZeroPrice);
         require!(limit_price_ticks > 0, FlashBookError::ZeroPrice);
+        // Trailing offset is a positive bps offset; cap at half the price
+        // (5_000 bps = 50%). An offset > 50% is operationally nonsense
+        // (trigger would jump to/below zero on the first ratchet).
+        require!(
+            trailing_offset_bps <= constants::BPS_DENOM as u32 / 2,
+            FlashBookError::OutOfRange
+        );
 
         let market = &ctx.accounts.market;
         require!(
@@ -2529,6 +2601,10 @@ pub mod flash_book {
         }
         t.flags = flags;
         t.oco_pair = Pubkey::default();
+        t.trailing_offset_bps = trailing_offset_bps;
+        // Anchor unset; first update_trailing_stop seeds it from current
+        // oracle. This avoids needing the market account here.
+        t.trailing_anchor_ticks = 0;
 
         emit!(TriggerOrderPlacedEvent {
             market: t.market,
@@ -2852,6 +2928,8 @@ pub mod flash_book {
         tp.created_at_slot = now;
         tp.expires_at_slot = expires_at_slot;
         tp.oco_pair = sl_key;
+        tp.trailing_offset_bps = 0;
+        tp.trailing_anchor_ticks = 0;
 
         sl.trader = trader_pk;
         sl.market = market_key;
@@ -2866,6 +2944,8 @@ pub mod flash_book {
         sl.created_at_slot = now;
         sl.expires_at_slot = expires_at_slot;
         sl.oco_pair = tp_key;
+        sl.trailing_offset_bps = 0;
+        sl.trailing_anchor_ticks = 0;
 
         emit!(BracketOrderPlacedEvent {
             market: market_key,
@@ -2878,6 +2958,109 @@ pub mod flash_book {
             sl_trigger_id,
             tp_trigger_price_ticks,
             sl_trigger_price_ticks,
+        });
+        Ok(())
+    }
+
+    /// Ratchet a trailing-stop trigger order — permissionless. Reads the
+    /// current oracle and updates the trigger's anchor + price if the
+    /// oracle has moved in the trader's favour. Hyperliquid trailing-stop
+    /// pattern, generalised: works for both sides + both trigger kinds.
+    ///
+    /// Math (offset = trailing_offset_bps × oracle / 10_000):
+    ///   • kind=0 (fire on ≤): SL for a long position. Best = MAX oracle.
+    ///     If oracle > anchor: anchor ← oracle; trigger ← anchor − offset.
+    ///   • kind=1 (fire on ≥): SL for a short position. Best = MIN oracle.
+    ///     If oracle < anchor (or anchor==0): anchor ← oracle;
+    ///     trigger ← anchor + offset.
+    ///
+    /// Tick-aligns the new trigger price (rounds toward the more
+    /// conservative side: kind=0 floors, kind=1 ceils so the trigger
+    /// is never less protective than intended).
+    ///
+    /// Rejects when the trigger isn't trailing (offset == 0) or already
+    /// inactive. Idempotent — calling on a "no-progress" oracle is a
+    /// no-op (no events emitted).
+    pub fn update_trailing_stop(ctx: Context<UpdateTrailingStop>) -> Result<()> {
+        let trigger = &ctx.accounts.trigger_order;
+        let market = &ctx.accounts.market;
+        require!(trigger.trailing_offset_bps > 0, FlashBookError::OutOfRange);
+        require!(
+            trigger.flags & state::TriggerOrderAccount::FLAG_ACTIVE != 0,
+            FlashBookError::OutOfRange
+        );
+
+        let oracle = market.oracle_price_ticks;
+        require!(oracle > 0, FlashBookError::ZeroPrice);
+        let tick_size = market.params.tick_size;
+        require!(tick_size > 0, FlashBookError::ZeroPrice);
+        let offset_bps = trigger.trailing_offset_bps as u128;
+        let offset_ticks: u128 = (oracle as u128).saturating_mul(offset_bps)
+            / constants::BPS_DENOM as u128;
+
+        let prev_anchor = trigger.trailing_anchor_ticks;
+        let (new_anchor, raw_new_trigger): (u64, i128) = if trigger.kind == 0 {
+            // Long-side SL: anchor = max oracle. Ratchet up only.
+            if prev_anchor != 0 && oracle <= prev_anchor {
+                return Ok(()); // no progress
+            }
+            let new_trigger = (oracle as i128) - (offset_ticks as i128);
+            (oracle, new_trigger)
+        } else {
+            // Short-side SL: anchor = min oracle. Ratchet down only.
+            if prev_anchor != 0 && oracle >= prev_anchor {
+                return Ok(()); // no progress
+            }
+            let new_trigger = (oracle as i128) + (offset_ticks as i128);
+            (oracle, new_trigger)
+        };
+
+        // Tick alignment with conservative rounding (don't make the
+        // trigger MORE aggressive than offset_bps would allow).
+        let new_trigger_clamped = if raw_new_trigger < tick_size as i128 {
+            tick_size as i128
+        } else {
+            raw_new_trigger
+        };
+        let new_trigger_unsigned = new_trigger_clamped as u128;
+        let aligned: u64 = if trigger.kind == 0 {
+            // Floor to nearest tick (more protective: trigger fires SOONER if
+            // oracle drops; conservative for an SL on a long).
+            let floored = (new_trigger_unsigned / tick_size as u128) * tick_size as u128;
+            // But floor would make trigger LOWER → less protective. Use ceil
+            // to keep the SL tighter (fires EARLIER on a drop).
+            let ceiled = floored.saturating_add(if new_trigger_unsigned % tick_size as u128 != 0 {
+                tick_size as u128
+            } else { 0 });
+            if ceiled > u64::MAX as u128 { u64::MAX } else { ceiled as u64 }
+        } else {
+            // Floor — keeps trigger LOWER for a short-side SL (fires earlier
+            // on a rally).
+            let floored = (new_trigger_unsigned / tick_size as u128) * tick_size as u128;
+            if floored > u64::MAX as u128 { u64::MAX } else { floored as u64 }
+        };
+
+        // Bail if alignment didn't actually change the trigger (oracle
+        // moved within one tick).
+        if aligned == trigger.trigger_price_ticks && new_anchor == prev_anchor {
+            return Ok(());
+        }
+
+        let trigger_id = trigger.trigger_id;
+        let trader = trigger.trader;
+        let market_key = market.key();
+        let prev_trigger_price = trigger.trigger_price_ticks;
+        let trigger = &mut ctx.accounts.trigger_order;
+        trigger.trailing_anchor_ticks = new_anchor;
+        trigger.trigger_price_ticks = aligned;
+
+        emit!(TrailingStopRatchetedEvent {
+            market: market_key,
+            trader,
+            trigger_id,
+            previous_trigger_price_ticks: prev_trigger_price,
+            new_trigger_price_ticks: aligned,
+            anchor_ticks: new_anchor,
         });
         Ok(())
     }
@@ -5787,6 +5970,32 @@ pub struct ExecuteTriggerOrder<'info> {
 }
 
 #[derive(Accounts)]
+pub struct UpdateTrailingStop<'info> {
+    /// Permissionless. Caller pays tx fee. Production deployments wire
+    /// this to a per-market keeper that reads oracle ticks and calls
+    /// the ix when the favourable-direction move ≥ 1 tick.
+    pub caller: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::TriggerOrderAccount::SEED,
+            market.key().as_ref(),
+            trigger_order.trader.as_ref(),
+            &[trigger_order.trigger_id],
+        ],
+        bump = trigger_order.bump,
+    )]
+    pub trigger_order: Account<'info, state::TriggerOrderAccount>,
+}
+
+#[derive(Accounts)]
 pub struct CancelTriggerOrder<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
@@ -6600,6 +6809,16 @@ pub struct TriggerOrderCancelledEvent {
 }
 
 #[event]
+pub struct TrailingStopRatchetedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub trigger_id: u8,
+    pub previous_trigger_price_ticks: u64,
+    pub new_trigger_price_ticks: u64,
+    pub anchor_ticks: u64,
+}
+
+#[event]
 pub struct BracketOrderPlacedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
@@ -6909,6 +7128,11 @@ fn slot_to_order(slot: &OrderSlot) -> Result<Order> {
         4 => OrderType::Adl,
         _ => return Err(error!(FlashBookError::OutOfRange)),
     };
+    // Decode STP mode from flags bits 4-5 of the OrderSlot.post_only
+    // bitfield. 0..2 are valid; 3 is reserved/invalid → fall back to
+    // CancelNewest defensively.
+    let stp_bits = (slot.post_only >> 4) & 0b11;
+    let stp_mode = matcher::order::StpMode::from_u8(stp_bits);
     Ok(Order {
         id: slot.id,
         trader: slot.trader,
@@ -6917,7 +7141,8 @@ fn slot_to_order(slot: &OrderSlot) -> Result<Order> {
         size: BaseLots(slot.size_lots),
         limit_price: Ticks(slot.limit_ticks),
         seq: slot.seq,
-        post_only: slot.post_only == 1,
+        post_only: (slot.post_only & 1) == 1,
+        stp_mode,
     })
 }
 

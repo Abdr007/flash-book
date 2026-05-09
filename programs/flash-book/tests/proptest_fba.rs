@@ -41,6 +41,7 @@ fn order_strategy() -> impl Strategy<Value = Order> {
             limit_price: Ticks(price),
             seq,
             post_only: false,
+            stp_mode: flash_book::matcher::order::StpMode::CancelNewest,
         })
 }
 

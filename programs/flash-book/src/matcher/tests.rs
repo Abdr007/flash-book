@@ -36,6 +36,7 @@ fn ord(
         limit_price: Ticks(price),
         seq,
         post_only: false,
+        stp_mode: crate::matcher::order::StpMode::CancelNewest,
     }
 }
 

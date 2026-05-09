@@ -968,6 +968,10 @@ export class FlashBookClient {
     limitPriceTicks: bigint | number;
     reduceOnly?: boolean;
     expiresAtSlot?: bigint | number;
+    /// Trailing-stop offset in bps (0 = static trigger). Capped at 5_000
+    /// (50%). When set, a permissionless `updateTrailingStopIx` keeper
+    /// ratchets the trigger price as the oracle moves favourably.
+    trailingOffsetBps?: number;
   }): Promise<TransactionInstruction> {
     const trigger = triggerOrderPda(args.market, args.trader, args.triggerId);
     return this.methods
@@ -979,13 +983,37 @@ export class FlashBookClient {
         args.triggerPriceTicks,
         args.limitPriceTicks,
         args.reduceOnly ?? false,
-        args.expiresAtSlot ?? 0,
+        args.expiresAtSlot ?? new BN(0),
+        args.trailingOffsetBps ?? 0,
       )
       .accountsPartial({
         trader: args.trader,
         market: args.market,
         triggerOrder: trigger.address,
         systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Ratchet a trailing-stop trigger order. Permissionless keeper ix —
+  /// reads the oracle and updates the trigger price + anchor when the
+  /// favorable-direction move is enough to change the tick-aligned
+  /// trigger. No-op when the oracle hasn't moved past the anchor (or
+  /// alignment doesn't change), so the keeper can call cheaply on every
+  /// tick without burning fees on no-progress slots.
+  updateTrailingStopIx(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+    triggerId: number;
+  }): Promise<TransactionInstruction> {
+    const trigger = triggerOrderPda(args.market, args.trader, args.triggerId);
+    return this.methods
+      .updateTrailingStop()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        triggerOrder: trigger.address,
       })
       .instruction();
   }
@@ -1182,17 +1210,26 @@ export class FlashBookClient {
   }
 
   /// Cross-margin sweep between two trader accounts under a common
-  /// authority (master signs as delegate of both). Source must be FLAT
-  /// (no open positions). Useful for prop traders rebalancing capital
-  /// between subaccount-style trader_states.
+  /// authority (master signs as delegate of both).
+  ///
+  /// Source can hold OPEN POSITIONS — pass `[market, position]` pairs in
+  /// `openPositions` (count must equal source.open_positions). Post-
+  /// sweep margin is evaluated against the joint stress-lattice; rejects
+  /// if source becomes unhealthy. Source flat → pass `[]` (legacy fast
+  /// path).
   sweepCollateralIx(args: {
     authority: PublicKey;
     fromTrader: PublicKey;
     toTrader: PublicKey;
     amountQuoteLots: bigint | number;
+    openPositions?: ReadonlyArray<{ market: PublicKey; position: PublicKey }>;
   }): Promise<TransactionInstruction> {
     const from = this.traderState(args.fromTrader);
     const to = this.traderState(args.toTrader);
+    const remaining = (args.openPositions ?? []).flatMap((p) => [
+      { pubkey: p.market, isWritable: false, isSigner: false },
+      { pubkey: p.position, isWritable: false, isSigner: false },
+    ]);
     return this.methods
       .sweepCollateral(args.amountQuoteLots)
       .accountsPartial({
@@ -1200,6 +1237,7 @@ export class FlashBookClient {
         fromState: from.address,
         toState: to.address,
       })
+      .remainingAccounts(remaining)
       .instruction();
   }
 

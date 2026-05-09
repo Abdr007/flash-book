@@ -102,6 +102,7 @@ pub fn generate_liquidation_orders(
                 limit_price: Ticks(limit),
                 seq,
                 post_only: false,
+                stp_mode: crate::matcher::order::StpMode::CancelNewest,
             });
         }
     }

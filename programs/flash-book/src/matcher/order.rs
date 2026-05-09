@@ -57,6 +57,33 @@ impl OrderType {
     }
 }
 
+/// Self-trade prevention mode. Carried per-order; the mode of the NEWER
+/// order (higher seq) wins when the matcher detects two same-trader
+/// orders that would cross.
+///
+///   • CancelNewest — cancel the order with the larger seq (the new one).
+///     Default. Best-effort "don't trade with myself" behaviour.
+///   • CancelOldest — cancel the older resting order; the new one stays.
+///     Useful for MMs replacing quotes — they want the new quote up.
+///   • CancelBoth — drop both, no fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AnchorSerialize, AnchorDeserialize)]
+#[repr(u8)]
+pub enum StpMode {
+    CancelNewest = 0,
+    CancelOldest = 1,
+    CancelBoth = 2,
+}
+
+impl StpMode {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => StpMode::CancelOldest,
+            2 => StpMode::CancelBoth,
+            _ => StpMode::CancelNewest,
+        }
+    }
+}
+
 /// Order in the matcher's integer space. Trader is a 32-byte Pubkey-equivalent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AnchorSerialize, AnchorDeserialize)]
 pub struct Order {
@@ -70,6 +97,7 @@ pub struct Order {
     /// priority class.
     pub seq: u64,
     pub post_only: bool,
+    pub stp_mode: StpMode,
 }
 
 impl Order {
