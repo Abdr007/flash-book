@@ -34,6 +34,7 @@ import {
   positionPda,
   traderStatePda,
   triggerOrderPda,
+  twapOrderPda,
   FLASH_BOOK_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from './pdas.ts';

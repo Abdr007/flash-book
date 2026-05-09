@@ -1,7 +1,10 @@
 # Flash Book vs every modern orderbook DEX
 
 How Flash Book compares to the state of the art (2026 Q2 snapshot).
-Updated to reflect everything shipped through commit `c6ca0fc`.
+Updated to reflect everything shipped through commit `7beda3a`
+(waves 1–5: native trigger/TWAP orders, builder codes, negative-fee
+tier, HIP-3 permissionless markets, multi-threshold margin alerts,
+trading-rewards eligibility events).
 
 ## TL;DR
 
@@ -45,8 +48,16 @@ Updated to reflect everything shipped through commit `c6ca0fc`.
 | Multi-oracle quorum | yes | partial | yes | yes | n/a | n/a | partial | yes | **median-of-3 + dispersion gate** |
 | Real-time invariant monitor | partial | no | no | no | no | no | no | no | **`verify_market_invariants` + auto-pause** |
 | Reduce-only / IOC / JIT flags | yes | yes | yes | yes | yes | partial | partial | yes | **yes (flag bitfield)** |
-| Tiered fees | volume tiers | volume tiers | volume tiers | volume tiers | n/a | n/a | volume tiers | volume tiers | **per-trader discount (off-chain volume tier)** |
-| Trader delegate / subaccount | yes | subaccounts | subaccounts | sub | n/a | n/a | partial | yes | **delegate slot (foundation)** |
+| Tiered fees | volume tiers | volume tiers | volume tiers | volume tiers | n/a | n/a | volume tiers | volume tiers | **discount + NEGATIVE-fee top tier (-20% of base)** |
+| Native on-chain trigger (SL/TP) orders | yes | partial | partial | partial | no | no | partial | partial | **yes (`place_trigger_order`)** |
+| Native on-chain TWAP orders | yes | no | no | no | no | no | no | no | **yes (`place_twap_order` + permissionless slice exec)** |
+| Builder codes (frontend fee share) | yes | no | no | no | no | no | no | no | **yes (`set_trader_builder` + `BuilderFeeOwedEvent`)** |
+| Referral / affiliate program | yes | no | no | no | no | no | no | no | **yes (`set_trader_referrer`, one-time-write, anti-rotation)** |
+| Multi-threshold pre-liq margin alerts | yes | partial | partial | no | no | no | no | no | **yes (3 tiers, on-chain emit per fill)** |
+| Permissionless market creation (HIP-3) | **yes** | no | no | no | no | no | no | no | **yes (`permissionless_initialize_market`, safe envelope)** |
+| Pre-launch (pre-TGE) perp markets | yes | no | no | no | no | no | no | no | **yes (`is_pre_launch` flag)** |
+| Trading rewards / points eligibility | yes (HYPE) | no | no | no | no | no | no | partial | **yes (per-fill `TradingRewardEligibleEvent`)** |
+| Trader delegate / subaccount | yes | subaccounts | subaccounts | sub | n/a | n/a | partial | yes | **delegate slot (master/hot-key split)** |
 | Decentralized | mostly | yes | yes | partial | yes | yes | yes | yes | **yes** |
 | Settles to Solana mainnet | no | yes | no | no | yes | yes | no | no | **yes** |
 
@@ -202,6 +213,46 @@ runs an internal oracle aggregation; Pyth itself uses publisher quorum.
 Flash Book brings the quorum check to the consumer side — even with a
 single Pyth feed, additional sources can be wired by the operator.
 
+### 13. Native trigger + TWAP orders that survive bot downtime
+
+Hyperliquid is the only other venue where stop-loss and TWAP orders live
+on-chain (most DEXes leave them as off-chain bot logic — your stop fires
+ONLY if your bot is online). Flash Book matches this: `place_trigger_order`
+and `place_twap_order` create durable PDAs; permissionless keepers
+(`execute_trigger_order` / `execute_twap_slice`) fire them when the
+condition is met. Trigger orders support reduce-only + expiry. TWAPs
+slice into time-spaced limit orders at a capped price. Both gracefully
+handle the final-slice residual to preserve `min_base_lots` invariants.
+
+### 14. HIP-3 + Flash V2's pool backing — the synthesis
+
+Hyperliquid's HIP-3 is the gold standard for permissionless market
+deployment: anyone stakes HYPE, deploys a market, earns fees forever.
+Flash Book matches the deployment surface (`permissionless_initialize_market`,
+caller becomes creator + earns `creator_share_bps` of net fee) but
+backs it with Flash V2's pool model — every quote level is real LP
+capital, not a vAMM or a virtual book. The result: anyone can list a
+market, the FLP backstops liquidity from day one, and the deployer
+earns alongside the LPs and protocol.
+
+The on-chain safe envelope (max 20× leverage, fees in [10, 200] bps,
+maint margin ≥ 2%, ≤1% of FLP per trader, etc.) prevents the obvious
+griefing attacks that other "permissionless" venues quietly enable.
+
+### 15. Builder codes + negative-fee top tier — making professional flow profitable
+
+Builder codes (`set_trader_builder`): a frontend/aggregator earns up to
+the user's approved cap (`builder_max_fee_share_bps`) per fill. Trader
+signs the install — protocol authority cannot install a builder against
+the user's will (anti-rug). HL parity.
+
+Negative-fee top tier: `set_trader_fee_tier` accepts up to 12_000 bps
+(120%). Values > 10_000 enable rebates *to the taker* — the protocol
+pays the top-volume MMs out of its own insurance contribution (never
+from maker rebates, never overdrawing insurance). Direct port of the
+HL VIP / MM-pro tier model. Backward-compatible: 0..10_000 still works
+as a positive-fee discount.
+
 ## Where Flash Book is NOT first
 
 Honest about what's not novel:
@@ -267,9 +318,14 @@ already know?
 | MEV-resistant matching | yes (centralized) | **yes (FBA + commit-reveal)** |
 | Insurance fund | yes | **yes (with governance withdraw cap)** |
 | Live PnL / position UI | yes | (separate `flash-ui` repo) |
-| Volume rebates | yes | **partial (off-chain volume tracker → on-chain tier)** |
+| Volume rebates | yes | **yes (off-chain tier table → `set_trader_fee_tier` on-chain, with negative-fee top tier)** |
 | Custody | centralized (counterparty risk) | **non-custodial (you sign)** |
-| Permissionless market creation | no | **roadmap (HIP-3-style)** |
+| Permissionless market creation | no | **yes (HIP-3-style: `permissionless_initialize_market` with safe envelope)** |
+| Pre-TGE perp listings | partial | **yes (`is_pre_launch` flag, governance-set oracle)** |
+| Native stop-loss / TWAP that survive bot downtime | yes | **yes (on-chain `TriggerOrderAccount` + `TwapOrderAccount`)** |
+| Frontend revenue share / builder codes | n/a | **yes (`set_trader_builder` + `BuilderFeeOwedEvent`)** |
+| Referral / affiliate program | yes | **yes (`set_trader_referrer`, one-time-write)** |
+| Trading-rewards / points eligibility (HYPE-style) | n/a (token rewards) | **yes (per-fill `TradingRewardEligibleEvent`)** |
 | Open-source matcher | no | **yes (this repo)** |
 | Open-source MM bot | no | **yes (`@flash-book/bot`)** |
 
@@ -308,3 +364,36 @@ Flash Book V3 fixes both:
 The Pareto improvement claim: retail UX is identical-or-better than today,
 LP yield is structurally higher, the protocol gains real price discovery,
 and Flash Trade gains the most advanced on-chain matcher ever shipped.
+
+## What we deliberately did NOT clone from Hyperliquid
+
+To stay honest about scope:
+
+- **Subaccounts as a separate account type.** HL's subaccounts are a UX
+  pattern; we cover the same functionality via the existing
+  `delegate` slot on TraderStateAccount (master keypair holds funds,
+  delegate keypair trades). A separate SubaccountAccount type with
+  cross-margin sweep adds a lot of state and account permutations for
+  what users can already get from "create a second wallet." If demand
+  appears, the slot is reserved.
+- **Position-specific leverage cap.** HL lets you set a leverage cap
+  per position; we use stress-lattice cross-margin per portfolio plus
+  per-market `max_leverage`. Adding per-position leverage requires
+  reworking the lattice gate. Tracked but not yet a user pain point.
+- **HYPE-style governance token.** We emit `TradingRewardEligibleEvent`
+  per fill so any token launch can compute eligibility; the token
+  itself is a governance + tokenomics decision, not an engineering
+  one.
+- **Slashable HIP-3 deployer bond.** Our v1 envelope (max leverage,
+  margin floors, position caps) prevents the obvious griefing without
+  requiring a bond. A slashable bond can be added on top of the
+  existing creator slot when the HYPE-equivalent token exists.
+- **User-managed trading vaults.** Achievable with the existing LP-
+  share NAV math + delegate slot (a vault is a TraderState with
+  delegate = strategist). A first-party "deploy a vault" flow adds
+  significant UX surface and is deferred until a real strategist
+  wants to ship one.
+
+These exclusions are deliberate scope discipline, not gaps. Each is
+documented with the existing primitive that covers most of the value
+and the seam where the full feature would slot in.
