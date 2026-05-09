@@ -21,6 +21,7 @@ pub mod errors;
 pub mod hypertree;
 pub mod matcher;
 pub mod state;
+pub mod state_v2;
 
 pub use errors::FlashBookError;
 

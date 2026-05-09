@@ -2,7 +2,7 @@
 // lifetimes, debug-only methods). Hygiene is upstream Manifest's concern;
 // our crate's "zero warnings ever" rule applies to first-party code only.
 #![allow(dead_code)]
-#![allow(elided_named_lifetimes)]
+#![allow(mismatched_lifetime_syntaxes)]
 
 // VENDORED FROM Manifest's `lib/src/lib.rs` (commit @ 2026-05-10)
 // Source: https://github.com/Bonasa-Tech/manifest/tree/main/lib
