@@ -2,11 +2,11 @@
 
 > Pool-backed CLOB matched by frequent batch auction on MagicBlock Ephemeral Rollups. Reference design and simulator for Flash Trade's announced Orderbook V3.
 
-[![tests](https://img.shields.io/badge/tests-273%20passing-brightgreen)]()
+[![tests](https://img.shields.io/badge/tests-308%20passing-brightgreen)]()
 [![parity](https://img.shields.io/badge/Rust%E2%86%94TS-byte--equivalent-brightgreen)]()
 [![fuzz](https://img.shields.io/badge/fuzz-72K%20cases-brightgreen)]()
-[![e2e](https://img.shields.io/badge/e2e-33%20on--chain-brightgreen)]()
-[![ix](https://img.shields.io/badge/instructions-22%2F22%20covered-blue)]()
+[![e2e](https://img.shields.io/badge/e2e-49%20on--chain-brightgreen)]()
+[![ix](https://img.shields.io/badge/instructions-29%2F29%20covered-blue)]()
 [![typescript](https://img.shields.io/badge/typescript-strict-blue)]()
 [![rust](https://img.shields.io/badge/rust-stable-orange)]()
 [![license](https://img.shields.io/badge/license-MIT-green)]()
@@ -48,27 +48,42 @@ a Solana program in Rust, deployed to MagicBlock ER and settling to mainnet.
 | FBA Walrasian matcher | ✅ implemented & tested |
 | Virtual FLP quoter | ✅ implemented & tested |
 | Continuous funding | ✅ implemented & tested |
+| **Funding settlement on-chain** (debits/credits collateral) | ✅ `settle_funding` ix |
 | Stress-lattice margin | ✅ implemented & tested |
 | In-loop liquidations | ✅ implemented & tested |
 | Insurance fund waterfall | ✅ implemented & tested |
+| **Insurance fund withdraw** (governance, pause-threshold guard) | ✅ `withdraw_insurance_fund` ix |
 | ADL | ✅ implemented & tested |
 | Commit-reveal | ✅ implemented & tested |
 | VPIN toxicity signal | ✅ implemented & tested |
+| Multi-oracle quorum (median-of-3 + dispersion) | ✅ `update_oracle_quorum` ix |
+| **LP unit accounting** (NAV-based vault, multi-LP) | ✅ ERC-4626-style shares |
+| **Position-aware FLP withdraw guard** (mark-to-market exposure) | ✅ remaining_accounts walk |
+| **Capital-relative position cap** (% of FLP capital) | ✅ `max_position_ratio_bps` |
+| **Real-time invariant monitor** (kill-switch signal) | ✅ `verify_market_invariants` ix |
+| **Spot markets** (param recipe, no leverage/funding) | ✅ `defaultSpotMarketParams()` |
+| **SPL token transfer integration** (vault, ATA-only) | ✅ deposit/withdraw all on-chain |
+| **ATA management** (init/close, idempotent) | ✅ `init_trader_ata`, `close_trader_ata` |
 | Synthetic flow simulator | ✅ runs at 42K batches/sec |
 | Rust matcher core (integer arithmetic, checked overflow) | ✅ 31 unit tests |
-| Rust property-based safety tests (MEV-neutrality, conservation, etc.) | ✅ 6 properties × 2K cases = 12K fuzz |
+| Rust property-based safety tests | ✅ 6 properties × 2K cases = 12K fuzz |
+| Rust integration tests (E2E on-chain) | ✅ 49 tests |
 | Rust risk + liquidation + insurance + commit-reveal modules | ✅ ported |
-| Anchor program skeleton (instruction shells) | ✅ scaffolded |
-| Anchor program full instruction implementations | 🔲 phase 1 cont. |
-| MagicBlock ER delegation CPI integration | 🔲 phase 1 cont. |
-| Mainnet shadow mode | 🔲 phase 2 |
+| Anchor program — 29 instructions | ✅ all implemented + tested |
+| Maker rebate distribution from toxicity tax | 🔲 design ready, deferred |
+| Cross-market basket orders | 🔲 design ready, deferred |
+| MagicBlock ER delegation CPI integration | 🔲 blocked: ephemeral-rollups-sdk Solana 2.x mismatch |
+| BPF compilation | 🔲 blocked: Solana platform-tools v1.48 |
+| Devnet deployment | 🔲 blocked on the above |
+| Mainnet shadow mode (replay Flash V2 trades) | 🔲 phase 2 |
+| Independent security audit | 🔲 phase 2 |
 
 ## Quick start
 
-TypeScript reference simulator:
+TypeScript reference simulator + SDK:
 ```bash
 bun install
-bun test                          # 71 tests
+bun test                          # 190 tests
 bun run examples/synthetic-flow.ts
 ```
 
