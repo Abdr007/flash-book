@@ -132,6 +132,26 @@ export type {
   OrderPlacedV2Event,
   BookLevelV2,
   BookDepthV2Event,
+  OrderCancelledV2Event,
   FlashBookEvent,
 } from './events.ts';
+
+/// Compose the encoded `order_id` used by the v2 hypertree book.
+/// Mirrors `encode_order_id` in programs/flash-book/src/state_v2.rs:
+/// high 48 bits = price, low 16 bits = seq mod 2^16, then bid-side gets
+/// the whole u64 inverted so a single ascending sort serves both books.
+/// Pass to `cancelOrderV2Ix({ orderId: ... })`.
+export function encodeOrderIdV2(
+  priceTicks: bigint,
+  seq: bigint,
+  sideIsBid: boolean,
+): bigint {
+  const PRICE_MASK = (1n << 48n) - 1n;
+  const SEQ_MASK = (1n << 16n) - 1n;
+  const U64_MASK = (1n << 64n) - 1n;
+  const price = priceTicks & PRICE_MASK;
+  const seqLow = seq & SEQ_MASK;
+  const raw = (price << 16n) | seqLow;
+  return sideIsBid ? raw ^ U64_MASK : raw;
+}
 export { MarketStatus } from './events.ts';

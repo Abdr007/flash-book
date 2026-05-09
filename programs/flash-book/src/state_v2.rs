@@ -24,9 +24,9 @@
 use anchor_lang::prelude::*;
 
 use crate::hypertree::{
-    DataIndex, FreeList, FreeListNode, Get, HyperTreeReadOperations,
-    HyperTreeWriteOperations, Payload, RBNode, RedBlackTree, RedBlackTreeReadOnly,
-    RedBlackTreeReadOperationsHelpers, NIL,
+    get_helper, get_mut_helper, DataIndex, FreeList, FreeListNode, Get,
+    HyperTreeReadOperations, HyperTreeWriteOperations, Payload, RBNode, RedBlackTree,
+    RedBlackTreeReadOnly, RedBlackTreeReadOperationsHelpers, NIL,
 };
 
 /// Bytes available for hypertree nodes after the fixed header. 100 nodes
@@ -178,6 +178,25 @@ pub fn encode_order_id(price_ticks: u64, seq: u64, side_is_bid: bool) -> u64 {
     let seq_low = seq & ((1u64 << 16) - 1);
     let raw = (price << 16) | seq_low;
     if side_is_bid { !raw } else { raw }
+}
+
+/// Build a probe `RestingOrderV2` whose only meaningful field is `order_id`,
+/// used to look up a node in an RBT by encoded id. `RestingOrderV2::cmp`
+/// compares only `order_id`, so the other fields are inert for the lookup.
+pub fn probe_order(order_id: u64) -> RestingOrderV2 {
+    RestingOrderV2 {
+        order_id,
+        seq: 0,
+        price_ticks: 0,
+        size_lots: 0,
+        expires_at_slot: 0,
+        trader: Pubkey::default(),
+        last_valid_slot: 0,
+        side: 0,
+        order_type: 0,
+        flags: 0,
+        _pad: 0,
+    }
 }
 
 // ─── ClaimedSeatV2 ───────────────────────────────────────────────────
@@ -463,6 +482,100 @@ impl<'a> MarketBookHandle<'a> {
         );
     }
 
+    /// Decrement the `size_lots` of the `RestingOrderV2` at `idx` by `delta`.
+    /// Caller must guarantee `idx` is a live node in either the bids or asks
+    /// RBT. Returns the new size_lots. Used by the matcher to apply partial
+    /// fills without removing the order from the book.
+    ///
+    /// Saturating sub: a delta larger than current size lands at zero (caller
+    /// should then remove the node).
+    pub fn decrement_size_at(&mut self, idx: DataIndex, delta: u64) -> u64 {
+        let node: &mut RBNode<RestingOrderV2> =
+            get_mut_helper::<RBNode<RestingOrderV2>>(self.data, idx);
+        let new_size = node.get_value().size_lots.saturating_sub(delta);
+        node.get_mut_value().size_lots = new_size;
+        new_size
+    }
+
+    /// Read-only access to the `RestingOrderV2` at `idx`. Caller must
+    /// guarantee `idx` is a live node.
+    pub fn order_at(&self, idx: DataIndex) -> &RestingOrderV2 {
+        let node: &RBNode<RestingOrderV2> =
+            get_helper::<RBNode<RestingOrderV2>>(&self.data[..], idx);
+        node.get_value()
+    }
+
+    /// Remove a node from the bids RBT, free its slot to the free-list,
+    /// and refresh the cached best/root indices. The matcher calls this
+    /// when a bid is fully consumed (size hits zero) and for permissionless
+    /// expired-order cleanup.
+    pub fn remove_bid_node(&mut self, idx: DataIndex) {
+        let new_root;
+        {
+            let mut tree = RedBlackTree::<RestingOrderV2>::new(
+                self.data,
+                self.header.bids_root_index,
+                NIL,
+            );
+            tree.remove_by_index(idx);
+            new_root = tree.get_root_index();
+        }
+        self.header.bids_root_index = new_root;
+        self.header.bids_best_index = lookup_min_index::<RestingOrderV2>(self.data, new_root);
+        self.header.total_orders_active =
+            self.header.total_orders_active.saturating_sub(1);
+        self.free_node(idx);
+    }
+
+    /// Mirror of `remove_bid_node` for the asks RBT.
+    pub fn remove_ask_node(&mut self, idx: DataIndex) {
+        let new_root;
+        {
+            let mut tree = RedBlackTree::<RestingOrderV2>::new(
+                self.data,
+                self.header.asks_root_index,
+                NIL,
+            );
+            tree.remove_by_index(idx);
+            new_root = tree.get_root_index();
+        }
+        self.header.asks_root_index = new_root;
+        self.header.asks_best_index = lookup_min_index::<RestingOrderV2>(self.data, new_root);
+        self.header.total_orders_active =
+            self.header.total_orders_active.saturating_sub(1);
+        self.free_node(idx);
+    }
+
+    /// Find the node in the bids RBT whose `order_id` matches `order_id`.
+    /// O(log n). Returns `NIL` if not found. Used by `cancel_order_v2` to
+    /// translate (trader, side, seq) → DataIndex.
+    pub fn lookup_bid_by_order_id(&self, order_id: u64) -> DataIndex {
+        if self.header.bids_root_index == NIL {
+            return NIL;
+        }
+        let probe = probe_order(order_id);
+        let tree = RedBlackTreeReadOnly::<RestingOrderV2>::new(
+            &self.data[..],
+            self.header.bids_root_index,
+            NIL,
+        );
+        tree.lookup_index::<RestingOrderV2>(&probe)
+    }
+
+    /// Mirror of `lookup_bid_by_order_id` for the asks RBT.
+    pub fn lookup_ask_by_order_id(&self, order_id: u64) -> DataIndex {
+        if self.header.asks_root_index == NIL {
+            return NIL;
+        }
+        let probe = probe_order(order_id);
+        let tree = RedBlackTreeReadOnly::<RestingOrderV2>::new(
+            &self.data[..],
+            self.header.asks_root_index,
+            NIL,
+        );
+        tree.lookup_index::<RestingOrderV2>(&probe)
+    }
+
     /// Insert a claimed seat into the seats RBT.
     pub fn insert_seat(&mut self, seat: ClaimedSeatV2) -> Result<DataIndex> {
         let idx = self.alloc_node()?;
@@ -610,13 +723,22 @@ mod tests {
     }
 
     fn make_order(price: u64, seq: u64, side_is_bid: bool) -> RestingOrderV2 {
+        make_order_for(price, seq, side_is_bid, Pubkey::default())
+    }
+
+    fn make_order_for(
+        price: u64,
+        seq: u64,
+        side_is_bid: bool,
+        trader: Pubkey,
+    ) -> RestingOrderV2 {
         RestingOrderV2 {
             order_id: encode_order_id(price, seq, side_is_bid),
             seq,
             price_ticks: price,
             size_lots: 100,
             expires_at_slot: 0,
-            trader: Pubkey::default(),
+            trader,
             last_valid_slot: 0,
             side: if side_is_bid { 0 } else { 1 },
             order_type: 0,
@@ -733,5 +855,214 @@ mod tests {
         assert_eq!(collect_bids(&handle), vec![100, 99]);
         assert_eq!(collect_asks(&handle), vec![200, 201]);
         assert_eq!(handle.header.total_orders_active, 4);
+    }
+
+    #[test]
+    fn lookup_by_order_id_finds_inserted_nodes() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        let bid_idx = handle.insert_bid(make_order(150, 7, true)).unwrap();
+        let ask_idx = handle.insert_ask(make_order(160, 8, false)).unwrap();
+        let bid_id = encode_order_id(150, 7, true);
+        let ask_id = encode_order_id(160, 8, false);
+        assert_eq!(handle.lookup_bid_by_order_id(bid_id), bid_idx);
+        assert_eq!(handle.lookup_ask_by_order_id(ask_id), ask_idx);
+        // Cross-side lookup must return NIL.
+        assert_eq!(handle.lookup_bid_by_order_id(ask_id), NIL);
+        assert_eq!(handle.lookup_ask_by_order_id(bid_id), NIL);
+        // Unknown id returns NIL.
+        assert_eq!(handle.lookup_bid_by_order_id(0xDEAD), NIL);
+    }
+
+    #[test]
+    fn decrement_size_at_partial_fill() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        let idx = handle.insert_bid(make_order(100, 1, true)).unwrap();
+        assert_eq!(handle.order_at(idx).size_lots, 100);
+        let new_size = handle.decrement_size_at(idx, 30);
+        assert_eq!(new_size, 70);
+        assert_eq!(handle.order_at(idx).size_lots, 70);
+        // Saturating sub: delta > size lands at zero.
+        let zeroed = handle.decrement_size_at(idx, 999);
+        assert_eq!(zeroed, 0);
+        assert_eq!(handle.order_at(idx).size_lots, 0);
+    }
+
+    #[test]
+    fn remove_bid_node_releases_slot_and_updates_best() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        let _low = handle.insert_bid(make_order(100, 1, true)).unwrap();
+        let high = handle.insert_bid(make_order(200, 2, true)).unwrap();
+        let _mid = handle.insert_bid(make_order(150, 3, true)).unwrap();
+        assert_eq!(collect_bids(&handle), vec![200, 150, 100]);
+        assert_eq!(handle.header.total_orders_active, 3);
+
+        // Remove the highest bid; best must now be 150.
+        handle.remove_bid_node(high);
+        assert_eq!(collect_bids(&handle), vec![150, 100]);
+        assert_eq!(handle.header.total_orders_active, 2);
+        let new_best = handle.header.bids_best_index;
+        assert_ne!(new_best, NIL);
+        assert_eq!(handle.order_at(new_best).price_ticks, 150);
+
+        // The freed slot must be reusable on the next insert.
+        let reused = handle.insert_bid(make_order(175, 4, true)).unwrap();
+        assert_eq!(reused, high);
+        assert_eq!(collect_bids(&handle), vec![175, 150, 100]);
+    }
+
+    #[test]
+    fn remove_ask_node_releases_slot_and_updates_best() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        let low = handle.insert_ask(make_order(100, 1, false)).unwrap();
+        let _high = handle.insert_ask(make_order(200, 2, false)).unwrap();
+        let _mid = handle.insert_ask(make_order(150, 3, false)).unwrap();
+        assert_eq!(collect_asks(&handle), vec![100, 150, 200]);
+
+        // Remove the best (lowest) ask; new best must be 150.
+        handle.remove_ask_node(low);
+        assert_eq!(collect_asks(&handle), vec![150, 200]);
+        let new_best = handle.header.asks_best_index;
+        assert_ne!(new_best, NIL);
+        assert_eq!(handle.order_at(new_best).price_ticks, 150);
+    }
+
+    #[test]
+    fn remove_last_node_clears_root_and_best() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        let only = handle.insert_bid(make_order(100, 1, true)).unwrap();
+        handle.remove_bid_node(only);
+        assert_eq!(handle.header.bids_root_index, NIL);
+        assert_eq!(handle.header.bids_best_index, NIL);
+        assert_eq!(handle.header.total_orders_active, 0);
+        assert!(collect_bids(&handle).is_empty());
+    }
+
+    #[test]
+    fn matcher_pipeline_consumes_crossed_orders() {
+        // Wave 18f end-to-end: place 3 bids + 3 asks that cross, run the
+        // FBA matcher, then mutate filled orders back into the hypertree.
+        // Mirrors what `run_batch_v2` does in lib.rs.
+        use crate::matcher::{
+            fba::clear_batch,
+            lot::{BaseLots, Ticks},
+            order::{Order, OrderType, Side, StpMode},
+        };
+
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+
+        // Bids at 100, 95, 90 (best = 100). Asks at 92, 96, 110.
+        // Crossing region: 92..=100. Walrasian price will land somewhere
+        // in that band (integer-tick). Each order gets a unique trader so
+        // the matcher's self-trade prevention doesn't suppress the cross.
+        let alice = Pubkey::new_unique();
+        let bob = Pubkey::new_unique();
+        let carol = Pubkey::new_unique();
+        let dave = Pubkey::new_unique();
+        let eve = Pubkey::new_unique();
+        let frank = Pubkey::new_unique();
+        let bid100 = handle.insert_bid(make_order_for(100, 1, true, alice)).unwrap();
+        let bid95 = handle.insert_bid(make_order_for(95, 2, true, bob)).unwrap();
+        let bid90 = handle.insert_bid(make_order_for(90, 3, true, carol)).unwrap();
+        let ask92 = handle.insert_ask(make_order_for(92, 4, false, dave)).unwrap();
+        let ask96 = handle.insert_ask(make_order_for(96, 5, false, eve)).unwrap();
+        let _ask110 = handle.insert_ask(make_order_for(110, 6, false, frank)).unwrap();
+        assert_eq!(handle.header.total_orders_active, 6);
+
+        // Build matcher input by walking the book best-first.
+        let mut orders: Vec<Order> = Vec::new();
+        let mut sources: Vec<(u64, DataIndex, bool)> = Vec::new();
+        handle.for_each_bid_best_first(|idx, o| {
+            orders.push(Order {
+                id: o.order_id,
+                trader: o.trader,
+                side: Side::Long,
+                order_type: OrderType::Limit,
+                size: BaseLots(o.size_lots),
+                limit_price: Ticks(o.price_ticks),
+                seq: o.seq,
+                post_only: false,
+                stp_mode: StpMode::CancelNewest,
+            });
+            sources.push((o.order_id, idx, true));
+            true
+        });
+        handle.for_each_ask_best_first(|idx, o| {
+            orders.push(Order {
+                id: o.order_id,
+                trader: o.trader,
+                side: Side::Short,
+                order_type: OrderType::Limit,
+                size: BaseLots(o.size_lots),
+                limit_price: Ticks(o.price_ticks),
+                seq: o.seq,
+                post_only: false,
+                stp_mode: StpMode::CancelNewest,
+            });
+            sources.push((o.order_id, idx, false));
+            true
+        });
+
+        // Clear the FBA — prior_mark = 95.
+        let result = clear_batch(&orders, Ticks(95)).expect("clear_batch");
+        assert!(result.clearing_volume.0 > 0, "expected at least one fill");
+        assert!(!result.fills.is_empty(), "expected at least one Fill");
+
+        // Apply fills back to the hypertree (mirror of run_batch_v2 phase 3).
+        let mut consumed: Vec<(u64, DataIndex, bool, u64)> = Vec::new();
+        for fill in &result.fills {
+            for id in [fill.maker_id, fill.taker_id] {
+                let found = sources.iter().find(|(oid, _, _)| *oid == id);
+                let Some((sid, sidx, sib)) = found else { continue };
+                if let Some(slot) = consumed.iter_mut().find(|(c, _, _, _)| *c == *sid)
+                {
+                    slot.3 = slot.3.saturating_add(fill.size.0);
+                } else {
+                    consumed.push((*sid, *sidx, *sib, fill.size.0));
+                }
+            }
+        }
+        for (_, idx, side_is_bid, total_filled) in &consumed {
+            let new_size = handle.decrement_size_at(*idx, *total_filled);
+            if new_size == 0 {
+                if *side_is_bid {
+                    handle.remove_bid_node(*idx);
+                } else {
+                    handle.remove_ask_node(*idx);
+                }
+            }
+        }
+
+        // Invariants: at minimum, the best bid (100) and best ask (92) crossed,
+        // so each was consumed for `min(bid_size, ask_size) = 100` lots.
+        // Both started at size 100 so both should be removed.
+        assert_eq!(
+            handle.lookup_bid_by_order_id(encode_order_id(100, 1, true)),
+            NIL,
+            "bid@100 must be fully filled and removed"
+        );
+        assert_eq!(
+            handle.lookup_ask_by_order_id(encode_order_id(92, 4, false)),
+            NIL,
+            "ask@92 must be fully filled and removed"
+        );
+        // The non-crossing orders (bid@90, ask@110) must remain.
+        assert_ne!(handle.lookup_bid_by_order_id(encode_order_id(90, 3, true)), NIL);
+        assert_ne!(handle.lookup_ask_by_order_id(encode_order_id(110, 6, false)), NIL);
+        // Total active = 6 - (consumed full fills). Minimum 2 orders fully
+        // consumed (the crossing pair), so ≤ 4 remaining.
+        assert!(
+            handle.header.total_orders_active <= 4,
+            "expected ≤4 orders remaining, got {}",
+            handle.header.total_orders_active,
+        );
+        // Suppress unused-binding warnings (these exist to label the
+        // initial book state in the test).
+        let _ = (bid100, bid95, bid90, ask92, ask96);
     }
 }

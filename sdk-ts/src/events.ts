@@ -130,6 +130,15 @@ export interface BookDepthV2Event {
   asks: BookLevelV2[];
 }
 
+export interface OrderCancelledV2Event {
+  market: PublicKey;
+  trader: PublicKey;
+  orderSeq: BN;
+  side: number;
+  nodeIndex: number;
+  totalOrdersAfter: number;
+}
+
 export enum MarketStatus {
   Inactive = 0,
   Active = 1,
@@ -154,4 +163,5 @@ export type FlashBookEvent =
   | { name: 'OrderCancelledEvent'; data: OrderCancelledEvent }
   | { name: 'MarketBookInitializedEvent'; data: MarketBookInitializedEvent }
   | { name: 'OrderPlacedV2Event'; data: OrderPlacedV2Event }
-  | { name: 'BookDepthV2Event'; data: BookDepthV2Event };
+  | { name: 'BookDepthV2Event'; data: BookDepthV2Event }
+  | { name: 'OrderCancelledV2Event'; data: OrderCancelledV2Event };

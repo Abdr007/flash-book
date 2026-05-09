@@ -268,6 +268,66 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// V2 cancel: remove a resting order from the hypertree. Validates
+    /// that the caller is the original trader (orders carry trader pubkey
+    /// inline in wave 18 — wave 19 indirects through a seat). Refunds no
+    /// SPL tokens — the v2 book has no escrow yet (wave 19's free-funds
+    /// optimisation handles that).
+    ///
+    /// The off-chain SDK derives `order_id` via
+    /// `encode_order_id(price_ticks, seq, side == 0)` from the
+    /// `OrderPlacedV2Event` fields.
+    pub fn cancel_order_v2(
+        ctx: Context<CancelOrderV2>,
+        side: u8,
+        order_id: u64,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        let trader_pk = ctx.accounts.trader.key();
+        let market_key = ctx.accounts.market.key();
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        require!(
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+
+        let side_is_bid = side == 0;
+        let idx = if side_is_bid {
+            handle.lookup_bid_by_order_id(order_id)
+        } else {
+            handle.lookup_ask_by_order_id(order_id)
+        };
+        require!(
+            idx != crate::hypertree::NIL,
+            FlashBookError::LiquidationStale
+        );
+
+        // Ownership check — only the original trader can cancel.
+        let order_seq = {
+            let order = handle.order_at(idx);
+            require!(order.trader == trader_pk, FlashBookError::WrongTrader);
+            order.seq
+        };
+
+        if side_is_bid {
+            handle.remove_bid_node(idx);
+        } else {
+            handle.remove_ask_node(idx);
+        }
+
+        emit!(OrderCancelledV2Event {
+            market: market_key,
+            trader: trader_pk,
+            order_seq,
+            side,
+            node_index: idx,
+            total_orders_after: handle.header.total_orders_active,
+        });
+        Ok(())
+    }
+
     /// V2 read-side: emit the top-N levels of the hypertree-backed book
     /// as an event. Walks `for_each_bid_best_first` / `for_each_ask_best_first`
     /// and packs the first BOOK_DEPTH_LEVELS=4 of each side into a single
@@ -317,6 +377,157 @@ pub mod flash_book {
             total_orders_active: handle.header.total_orders_active,
             bids,
             asks,
+        });
+        Ok(())
+    }
+
+    /// V2 matcher tick: run an FBA Walrasian clearing over the resting
+    /// hypertree book, mutate filled orders in place (decrement on partial,
+    /// remove + free on full), update the market mark price, and emit a
+    /// `BatchClearedEvent`.
+    ///
+    /// Wave 18f scope: pure book mechanics + FBA clearing. The complex
+    /// bookkeeping that lives in v1's `run_batch` (funding advance, VPIN,
+    /// insurance fund, FLP virtual-quote generation, oracle band, mark-
+    /// change clamp, commit sweep) intentionally does NOT run here yet —
+    /// those layer on in waves 18g+ once the matcher migration is proven
+    /// correct against integration tests. v1's `run_batch` continues to
+    /// exist for markets still on the legacy buffer.
+    ///
+    /// Off-chain settlement: identical to v1 — fills are applied to
+    /// Position PDAs via per-fill `apply_fill` / `apply_flp_fill` ixs the
+    /// sequencer dispatches after this batch tick, reading the
+    /// `FillAppliedEvent`s emitted in this ix.
+    pub fn run_batch_v2(ctx: Context<RunBatchV2>, now_ms: u64) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+
+        // Phase 1: walk the hypertree to harvest live orders (read-only
+        // borrow on market_book). We also drop GTT-expired orders from
+        // the matcher input — lazy expiry, the keeper reclaims rent later
+        // via cancel_order_v2.
+        let now_slot = Clock::get()?.slot;
+        let max_per_side = MAX_BATCH_ORDERS_PER_SIDE_V2;
+        let mut orders: Vec<matcher::order::Order> = Vec::with_capacity(2 * max_per_side);
+        let mut sources: Vec<(u64, hypertree::DataIndex, bool)> =
+            Vec::with_capacity(2 * max_per_side);
+        {
+            let book_data = ctx.accounts.market_book.try_borrow_data()?;
+            let mut book_data_owned = book_data.to_vec();
+            let handle =
+                state_v2::MarketBookHandle::from_account_data(&mut book_data_owned)?;
+            require!(
+                handle.header.market_pubkey == market_key,
+                FlashBookError::WrongMarket
+            );
+            handle.for_each_bid_best_first(|idx, o| {
+                if orders.len() >= max_per_side
+                    || (o.expires_at_slot > 0 && now_slot > o.expires_at_slot)
+                {
+                    return orders.len() < max_per_side;
+                }
+                orders.push(matcher::order::Order {
+                    id: o.order_id,
+                    trader: o.trader,
+                    side: matcher::order::Side::Long,
+                    order_type: matcher::order::OrderType::Limit,
+                    size: matcher::lot::BaseLots(o.size_lots),
+                    limit_price: matcher::lot::Ticks(o.price_ticks),
+                    seq: o.seq,
+                    post_only: (o.flags & 0b0000_0001) != 0,
+                    stp_mode: matcher::order::StpMode::from_u8((o.flags >> 4) & 0b11),
+                });
+                sources.push((o.order_id, idx, true));
+                true
+            });
+            let bids_loaded = orders.len();
+            handle.for_each_ask_best_first(|idx, o| {
+                if (orders.len() - bids_loaded) >= max_per_side
+                    || (o.expires_at_slot > 0 && now_slot > o.expires_at_slot)
+                {
+                    return (orders.len() - bids_loaded) < max_per_side;
+                }
+                orders.push(matcher::order::Order {
+                    id: o.order_id,
+                    trader: o.trader,
+                    side: matcher::order::Side::Short,
+                    order_type: matcher::order::OrderType::Limit,
+                    size: matcher::lot::BaseLots(o.size_lots),
+                    limit_price: matcher::lot::Ticks(o.price_ticks),
+                    seq: o.seq,
+                    post_only: (o.flags & 0b0000_0001) != 0,
+                    stp_mode: matcher::order::StpMode::from_u8((o.flags >> 4) & 0b11),
+                });
+                sources.push((o.order_id, idx, false));
+                true
+            });
+        }
+
+        // Phase 2: FBA clearing.
+        let market_acct = &mut ctx.accounts.market;
+        let prior_mark = matcher::lot::Ticks(market_acct.mark_price_ticks);
+        let result = matcher::fba::clear_batch(&orders, prior_mark)?;
+
+        // Phase 3: apply fills back to the hypertree. Aggregate per source
+        // order (multiple fills can reference the same maker), so we mutate
+        // each node exactly once — cheaper than per-fill RBT lookups and
+        // avoids the "remove first, then partial fill from the second fill
+        // hits NIL" hazard.
+        let mut consumed: Vec<(u64, hypertree::DataIndex, bool, u64)> =
+            Vec::with_capacity(sources.len());
+        for fill in &result.fills {
+            for id in [fill.maker_id, fill.taker_id] {
+                let found = sources.iter().find(|(oid, _, _)| *oid == id);
+                let Some((src_id, src_idx, src_is_bid)) = found else {
+                    continue;
+                };
+                if let Some(slot) = consumed
+                    .iter_mut()
+                    .find(|(cid, _, _, _)| *cid == *src_id)
+                {
+                    slot.3 = slot.3.saturating_add(fill.size.0);
+                } else {
+                    consumed.push((*src_id, *src_idx, *src_is_bid, fill.size.0));
+                }
+            }
+        }
+
+        if !consumed.is_empty() {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let mut handle =
+                state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            for (_, idx, side_is_bid, total_filled) in &consumed {
+                let new_size = handle.decrement_size_at(*idx, *total_filled);
+                if new_size == 0 {
+                    if *side_is_bid {
+                        handle.remove_bid_node(*idx);
+                    } else {
+                        handle.remove_ask_node(*idx);
+                    }
+                }
+            }
+        }
+
+        // Phase 4: update mark price (raw clearing price — wave 18g layers
+        // back the TWAP / oracle band / mark-change clamp from v1).
+        if result.clearing_volume.0 > 0 {
+            market_acct.mark_price_ticks = result.clearing_price.0;
+        }
+
+        // Phase 5: bookkeeping.
+        market_acct.current_batch = market_acct
+            .current_batch
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        market_acct.last_batch_ms = now_ms;
+
+        emit!(BatchClearedEvent {
+            market: market_key,
+            batch_num: market_acct.current_batch,
+            clearing_price: result.clearing_price.0,
+            clearing_volume: result.clearing_volume.0,
+            fill_count: result.fills.len() as u32,
+            funding_rate_bps_per_sec: 0,
+            seized_bonds: 0,
         });
         Ok(())
     }
@@ -5928,6 +6139,48 @@ pub struct ViewBookDepthV2<'info> {
 }
 
 #[derive(Accounts)]
+pub struct CancelOrderV2<'info> {
+    pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at the market_book seed; disc validated inside handler.
+    /// Mut because we remove a node + update header indices + free-list.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RunBatchV2<'info> {
+    pub sequencer: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA at the market_book seed; disc validated inside handler.
+    /// Mut because the matcher mutates filled-order sizes + removes
+    /// fully-filled nodes back to the free-list.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitMarketBook<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -7726,6 +7979,22 @@ pub struct OrderPlacedV2Event {
 /// reconstruction watches `OrderPlacedV2Event` + `OrderCancelledV2Event`
 /// for the long tail.
 pub const BOOK_DEPTH_LEVELS: usize = 4;
+
+/// Per-side ceiling on orders fed into a single `run_batch_v2` clearing.
+/// The matcher is O(N²) in candidate prices × order count; capping keeps
+/// CU usage bounded. Wave 18g lifts this when the matcher is refactored
+/// to a streaming O(N log N) walk over the price ladder.
+pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 64;
+
+#[event]
+pub struct OrderCancelledV2Event {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub order_seq: u64,
+    pub side: u8,
+    pub node_index: u32,
+    pub total_orders_after: u32,
+}
 
 #[derive(Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct BookLevelV2 {

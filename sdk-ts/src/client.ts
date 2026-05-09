@@ -329,7 +329,7 @@ export class FlashBookClient {
   /// V2 read-side: emit the top-N levels of the hypertree-backed book as
   /// a `BookDepthV2Event`. Pure read — never mutates state. Walks the bid
   /// + ask RBTs in best-first order via the same iterators the wave-18f
-  /// matcher will consume. Use this from off-chain tools to validate
+  /// matcher consumes. Use this from off-chain tools to validate
   /// orderbook state without parsing the raw account bytes.
   viewBookDepthV2Ix(args: {
     market: PublicKey;
@@ -338,6 +338,50 @@ export class FlashBookClient {
     return this.methods
       .viewBookDepthV2()
       .accountsPartial({
+        market: args.market,
+        marketBook: book.address,
+      })
+      .instruction();
+  }
+
+  /// V2 cancel: remove a resting order from the hypertree-backed book.
+  /// `orderId` is the encoded Phoenix-style id from `OrderPlacedV2Event`
+  /// (= `(price << 16) | (seq & 0xffff)`, inverted for bids). The SDK
+  /// computes it via `encodeOrderIdV2(price, seq, side === 'long')`.
+  cancelOrderV2Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    side: 'long' | 'short';
+    orderId: bigint | BN;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    const sideU8 = args.side === 'long' ? 0 : 1;
+    const orderIdBn =
+      args.orderId instanceof BN ? args.orderId : new BN(args.orderId.toString());
+    return this.methods
+      .cancelOrderV2(sideU8, orderIdBn)
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        marketBook: book.address,
+      })
+      .instruction();
+  }
+
+  /// V2 matcher tick: run an FBA Walrasian clearing over the resting
+  /// hypertree book. Mutates filled-order sizes / removes fully-filled
+  /// nodes, updates the market mark price, emits BatchClearedEvent.
+  /// Permissionless — any signer can call it (sequencer in production).
+  runBatchV2Ix(args: {
+    sequencer: PublicKey;
+    market: PublicKey;
+    nowMs: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    return this.methods
+      .runBatchV2(args.nowMs)
+      .accountsPartial({
+        sequencer: args.sequencer,
         market: args.market,
         marketBook: book.address,
       })

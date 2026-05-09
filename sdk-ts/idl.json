@@ -881,6 +881,105 @@
       ]
     },
     {
+      "name": "cancel_order_v2",
+      "docs": [
+        "V2 cancel: remove a resting order from the hypertree. Validates",
+        "that the caller is the original trader (orders carry trader pubkey",
+        "inline in wave 18 — wave 19 indirects through a seat). Refunds no",
+        "SPL tokens — the v2 book has no escrow yet (wave 19's free-funds",
+        "optimisation handles that).",
+        "",
+        "The off-chain SDK derives `order_id` via",
+        "`encode_order_id(price_ticks, seq, side == 0)` from the",
+        "`OrderPlacedV2Event` fields."
+      ],
+      "discriminator": [
+        110,
+        83,
+        130,
+        136,
+        146,
+        136,
+        66,
+        67
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "Mut because we remove a node + update header indices + free-list."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "order_id",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "cancel_trigger_order",
       "docs": [
         "Cancel a trigger order. Trader signs; account is closed and rent",
@@ -5548,6 +5647,111 @@
       ]
     },
     {
+      "name": "run_batch_v2",
+      "docs": [
+        "V2 matcher tick: run an FBA Walrasian clearing over the resting",
+        "hypertree book, mutate filled orders in place (decrement on partial,",
+        "remove + free on full), update the market mark price, and emit a",
+        "`BatchClearedEvent`.",
+        "",
+        "Wave 18f scope: pure book mechanics + FBA clearing. The complex",
+        "bookkeeping that lives in v1's `run_batch` (funding advance, VPIN,",
+        "insurance fund, FLP virtual-quote generation, oracle band, mark-",
+        "change clamp, commit sweep) intentionally does NOT run here yet —",
+        "those layer on in waves 18g+ once the matcher migration is proven",
+        "correct against integration tests. v1's `run_batch` continues to",
+        "exist for markets still on the legacy buffer.",
+        "",
+        "Off-chain settlement: identical to v1 — fills are applied to",
+        "Position PDAs via per-fill `apply_fill` / `apply_flp_fill` ixs the",
+        "sequencer dispatches after this batch tick, reading the",
+        "`FillAppliedEvent`s emitted in this ix."
+      ],
+      "discriminator": [
+        153,
+        212,
+        246,
+        135,
+        131,
+        133,
+        130,
+        154
+      ],
+      "accounts": [
+        {
+          "name": "sequencer",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "Mut because the matcher mutates filled-order sizes + removes",
+            "fully-filled nodes back to the free-list."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "now_ms",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "set_market_status",
       "docs": [
         "Update market status (authority-only).",
@@ -8955,6 +9159,19 @@
       ]
     },
     {
+      "name": "OrderCancelledV2Event",
+      "discriminator": [
+        143,
+        55,
+        206,
+        4,
+        22,
+        91,
+        9,
+        150
+      ]
+    },
+    {
       "name": "OrderPlacedV2Event",
       "discriminator": [
         45,
@@ -11618,6 +11835,38 @@
           {
             "name": "order_seq",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderCancelledV2Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "order_seq",
+            "type": "u64"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "node_index",
+            "type": "u32"
+          },
+          {
+            "name": "total_orders_after",
+            "type": "u32"
           }
         ]
       }
