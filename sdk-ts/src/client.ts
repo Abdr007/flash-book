@@ -273,12 +273,11 @@ export class FlashBookClient {
   }
 
   /// Initialize the v2 hypertree-backed orderbook for a market.
-  /// Allocates an 8264-byte PDA at [b"market_book", market]. Wave-18
-  /// foundation — the actual matcher migration happens in waves
-  /// 18d-e. Once shipped, this will replace `initializeOrderBufferIx`
-  /// + the legacy `OrderBufferAccount` (16-order cap forced by BPF
-  /// stack); the v2 book carries 50+ orders/side comfortably and is
-  /// realloc-extensible.
+  /// Allocates a 9864-byte PDA at [b"market_book", market]. Wave-18
+  /// foundation — the actual matcher migration happens in wave 18e.
+  /// Once shipped, this will replace `initializeOrderBufferIx` + the
+  /// legacy `OrderBufferAccount` (16-order cap forced by BPF stack);
+  /// the v2 book carries 50+ orders/side and is realloc-extensible.
   initMarketBookIx(args: {
     authority: PublicKey;
     market: PublicKey;
@@ -291,6 +290,38 @@ export class FlashBookClient {
         market: args.market,
         marketBook: book.address,
         systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// V2 limit-order placement against the hypertree-backed orderbook.
+  /// Runs ALONGSIDE the legacy `placeLimitOrderIx`. Validates intake
+  /// (status, min lots, tick alignment, OI cap), computes a Phoenix-
+  /// style order_id, and inserts into the bid or ask RBT inside the
+  /// market_book account. No SPL token CPI on the hot path (free-funds
+  /// settlement comes in wave 19).
+  placeLimitOrderV2Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    side: 'long' | 'short';
+    sizeLots: bigint | number;
+    limitTicks: bigint | number;
+    flags?: number;
+    expiresAtSlot?: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    return this.methods
+      .placeLimitOrderV2(
+        args.side === 'long' ? 0 : 1,
+        args.sizeLots,
+        args.limitTicks,
+        args.flags ?? 0,
+        args.expiresAtSlot ?? new BN(0),
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        marketBook: book.address,
       })
       .instruction();
   }

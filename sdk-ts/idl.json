@@ -4676,6 +4676,124 @@
       ]
     },
     {
+      "name": "place_limit_order_v2",
+      "docs": [
+        "V2 limit-order placement against the hypertree-backed orderbook.",
+        "Runs ALONGSIDE the legacy `place_limit_order` for now — operators",
+        "pick which book each market uses by calling `init_market_book`",
+        "(v2) vs `initialize_order_buffer` (legacy).",
+        "",
+        "Validation mirrors the legacy ix's intake: status-active gate,",
+        "min-base-lots, tick alignment, size cap. Then constructs a",
+        "`RestingOrderV2` carrying the trader pubkey inline (free-funds",
+        "indirection comes in wave 19) and inserts into the bids or asks",
+        "RBT inside the `MarketBookHandle`.",
+        "",
+        "`flags` accepts the same bitfield as v1: bit0 post_only, bit1",
+        "reduce_only, bit2 ioc, bit3 jit, bits 4-5 stp_mode."
+      ],
+      "discriminator": [
+        248,
+        244,
+        137,
+        13,
+        136,
+        63,
+        227,
+        240
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "8-byte custom disc inside the handler via `MarketBookHandle::",
+            "from_account_data`. Mut because we write the new resting order",
+            "node + update the header indices."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "flags",
+          "type": "u8"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "place_trigger_order",
       "docs": [
         "Place a NATIVE on-chain trigger order — Hyperliquid pattern. Trader",
@@ -8738,6 +8856,19 @@
       ]
     },
     {
+      "name": "OrderPlacedV2Event",
+      "discriminator": [
+        45,
+        52,
+        178,
+        220,
+        247,
+        196,
+        144,
+        105
+      ]
+    },
+    {
       "name": "OrdersMassCancelledEvent",
       "discriminator": [
         79,
@@ -11328,6 +11459,46 @@
           {
             "name": "order_seq",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderPlacedV2Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "node_index",
+            "type": "u32"
+          },
+          {
+            "name": "total_orders_after",
+            "type": "u32"
           }
         ]
       }

@@ -160,6 +160,114 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// V2 limit-order placement against the hypertree-backed orderbook.
+    /// Runs ALONGSIDE the legacy `place_limit_order` for now — operators
+    /// pick which book each market uses by calling `init_market_book`
+    /// (v2) vs `initialize_order_buffer` (legacy).
+    ///
+    /// Validation mirrors the legacy ix's intake: status-active gate,
+    /// min-base-lots, tick alignment, size cap. Then constructs a
+    /// `RestingOrderV2` carrying the trader pubkey inline (free-funds
+    /// indirection comes in wave 19) and inserts into the bids or asks
+    /// RBT inside the `MarketBookHandle`.
+    ///
+    /// `flags` accepts the same bitfield as v1: bit0 post_only, bit1
+    /// reduce_only, bit2 ioc, bit3 jit, bits 4-5 stp_mode.
+    pub fn place_limit_order_v2(
+        ctx: Context<PlaceLimitOrderV2>,
+        side: u8,
+        size_lots: u64,
+        limit_ticks: u64,
+        flags: u8,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(limit_ticks > 0, FlashBookError::ZeroPrice);
+        // Reject unknown flag bits.
+        require!(flags & !0b0011_1111 == 0, FlashBookError::OutOfRange);
+        if expires_at_slot > 0 {
+            let now = Clock::get()?.slot;
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
+
+        let market = &ctx.accounts.market;
+        require!(
+            market.status == MarketStatus::Active as u8
+                || market.status == MarketStatus::PostOnly as u8,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            limit_ticks % market.params.tick_size == 0,
+            FlashBookError::PriceNotOnTick
+        );
+
+        // Per-market OI hard cap (mirror v1).
+        let oi_cap = market.params.max_oi_base_lots;
+        if oi_cap > 0 {
+            let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
+            let projected = cur.saturating_add(size_lots);
+            require!(projected <= oi_cap, FlashBookError::OpenInterestCapExceeded);
+        }
+
+        let trader_pk = ctx.accounts.trader.key();
+        let market_key = market.key();
+        let now_slot = Clock::get()?.slot;
+
+        // Borrow the market_book account data + load the handle.
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        require!(
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+
+        // Allocate seq + build the resting order.
+        let seq = handle
+            .header
+            .order_seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        handle.header.order_seq_counter = seq;
+
+        let side_is_bid = side == 0;
+        let order = state_v2::RestingOrderV2 {
+            order_id: state_v2::encode_order_id(limit_ticks, seq, side_is_bid),
+            seq,
+            price_ticks: limit_ticks,
+            size_lots,
+            expires_at_slot,
+            trader: trader_pk,
+            last_valid_slot: now_slot as u32,
+            side,
+            order_type: 0, // 0 = limit (the only kind for now)
+            flags,
+            _pad: 0,
+        };
+
+        let inserted_idx = if side_is_bid {
+            handle.insert_bid(order)?
+        } else {
+            handle.insert_ask(order)?
+        };
+
+        emit!(OrderPlacedV2Event {
+            market: market_key,
+            trader: trader_pk,
+            seq,
+            side,
+            price_ticks: limit_ticks,
+            size_lots,
+            node_index: inserted_idx,
+            total_orders_after: handle.header.total_orders_active,
+        });
+        Ok(())
+    }
+
     /// Initialize the FLP exposure account (one per protocol). Must run
     /// before `initialize_market`. Mints `initial_capital_quote_lots` shares
     /// to the authority at 1:1 (treasury endowment); these shares can later
@@ -5727,6 +5835,29 @@ pub struct InitializeMarket<'info> {
 }
 
 #[derive(Accounts)]
+pub struct PlaceLimitOrderV2<'info> {
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at the market_book seed; we own + validate the
+    /// 8-byte custom disc inside the handler via `MarketBookHandle::
+    /// from_account_data`. Mut because we write the new resting order
+    /// node + update the header indices.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitMarketBook<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -7506,6 +7637,18 @@ pub struct MarketBookInitializedEvent {
     pub market_book: Pubkey,
     pub total_bytes: u32,
     pub data_bytes: u32,
+}
+
+#[event]
+pub struct OrderPlacedV2Event {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub seq: u64,
+    pub side: u8,
+    pub price_ticks: u64,
+    pub size_lots: u64,
+    pub node_index: u32,
+    pub total_orders_after: u32,
 }
 
 #[event]

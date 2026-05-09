@@ -29,15 +29,18 @@ use crate::hypertree::{
 };
 
 /// Bytes available for hypertree nodes after the fixed header. 100 nodes
-/// of 80 bytes each. Enough for ~50 orders per side + 50 claimed seats
-/// in the v1 layout. Realloc-to-grow ix follows in wave 18c.
-pub const MARKET_BOOK_DATA_BYTES: usize = 8_000;
+/// of 96 bytes each. Enough for ~50 orders per side + 50 claimed seats
+/// in the v1 layout. Realloc-to-grow ix follows in wave 18d.
+pub const MARKET_BOOK_DATA_BYTES: usize = 9_600;
 
 /// Each RBNode<V> = 16-byte RBT header + V (the payload).
-/// We size payloads at 64 bytes so each node = 80 bytes total — same as
-/// Manifest's hypertree, lets us reuse all upstream invariants.
-pub const NODE_PAYLOAD_BYTES: usize = 64;
-pub const NODE_TOTAL_BYTES: usize = 80;
+/// We size payloads at 80 bytes so each node = 96 bytes total — wider
+/// than Manifest (64+16=80) because OUR resting orders carry the
+/// trader Pubkey inline (Manifest indirects through a seat). Wave 19's
+/// free-funds optimisation will move trader off the order onto the
+/// seat and shrink back to 80B.
+pub const NODE_PAYLOAD_BYTES: usize = 80;
+pub const NODE_TOTAL_BYTES: usize = 96;
 pub const MAX_NODES: usize = MARKET_BOOK_DATA_BYTES / NODE_TOTAL_BYTES;
 
 // ─── Header ──────────────────────────────────────────────────────────
@@ -103,9 +106,9 @@ const _: () = assert!(std::mem::size_of::<MarketBookHeader>() == 256);
 /// RBT uses this for sort.
 #[zero_copy]
 pub struct RestingOrderV2 {
-    /// `(price << 1) | side_bit`. For bids, the resulting u64 is INVERTED
-    /// (`!`) so natural ascending sort still puts the highest-price
-    /// bids first. Phoenix's exact pattern.
+    /// `(price << 16) | (seq mod 2^16)`. For bids, the resulting u64
+    /// is INVERTED (`!`) so natural ascending sort still puts the
+    /// highest-price bids first. Phoenix's exact pattern.
     pub order_id: u64,
     /// Per-batch monotonic sequence — used for FIFO tie-breaking within
     /// a price level (price-time priority).
@@ -118,9 +121,13 @@ pub struct RestingOrderV2 {
     /// 0 = GTC. Otherwise the slot at which the matcher silently skips
     /// this order. Cleanup keepers reclaim rent via cancel.
     pub expires_at_slot: u64,
-    /// Pointer at the trader's claimed seat node in the same byte
-    /// array. O(1) seat lookup on every match.
-    pub trader_index: u32,
+
+    /// Trader pubkey (32 B). In wave 19's free-funds optimisation this
+    /// will be replaced by `trader_index: u32` pointing at the trader's
+    /// seat in the same byte array; for now we carry the pubkey inline
+    /// so wave 18d can ship without seat-claim plumbing.
+    pub trader: Pubkey,
+
     /// Anti-replay guard for off-chain replay tools.
     pub last_valid_slot: u32,
 
@@ -129,16 +136,9 @@ pub struct RestingOrderV2 {
     /// Bitfield: bit0 reduce_only, bit1 post_only-shortcut, bits 2-3 STP mode.
     pub flags: u8,
     pub _pad: u8,
-
-    /// Client-side order id (off-chain reconciliation; zero if unset).
-    pub client_order_id: u32,
-
-    /// 8-byte reserved tail for fields we may add (HIP-3 builder ref,
-    /// referrer ref, …) without breaking the 64-byte layout.
-    pub _reserved: [u8; 8],
 }
 
-const _: () = assert!(std::mem::size_of::<RestingOrderV2>() == 64);
+const _: () = assert!(std::mem::size_of::<RestingOrderV2>() == 80);
 
 // Make RestingOrderV2 usable as an RBT payload (Hypertree's `Payload`
 // requires `Ord + Eq + Display`).
@@ -204,11 +204,12 @@ pub struct ClaimedSeatV2 {
     /// uses it to detect missed events.
     pub last_seq_assigned: u32,
 
-    /// 8-byte reserved tail.
-    pub _reserved: [u8; 8],
+    /// 24-byte reserved tail (split into ≤32-byte chunks for bytemuck).
+    pub _reserved_a: [u8; 16],
+    pub _reserved_b: [u8; 8],
 }
 
-const _: () = assert!(std::mem::size_of::<ClaimedSeatV2>() == 64);
+const _: () = assert!(std::mem::size_of::<ClaimedSeatV2>() == 80);
 
 impl PartialEq for ClaimedSeatV2 {
     fn eq(&self, other: &Self) -> bool { self.trader == other.trader }
@@ -250,10 +251,10 @@ impl Get for ClaimedSeatV2 {}
 // `init_market_book` ix lands in wave 18c.
 
 // Compile-time sanity: RBNode<RestingOrderV2> and RBNode<ClaimedSeatV2>
-// are exactly 80 bytes (= NODE_TOTAL_BYTES), so they fit the same
-// FreeList allocator as Manifest's hypertree.
-const _: () = assert!(std::mem::size_of::<RBNode<RestingOrderV2>>() == 80);
-const _: () = assert!(std::mem::size_of::<RBNode<ClaimedSeatV2>>() == 80);
+// are exactly NODE_TOTAL_BYTES (96), so they fit the same FreeList
+// allocator. RBNode = 16-byte RBT header + 80-byte payload = 96.
+const _: () = assert!(std::mem::size_of::<RBNode<RestingOrderV2>>() == NODE_TOTAL_BYTES);
+const _: () = assert!(std::mem::size_of::<RBNode<ClaimedSeatV2>>() == NODE_TOTAL_BYTES);
 
 // ─── MarketBookHandle ────────────────────────────────────────────────
 //
@@ -445,16 +446,17 @@ impl<'a> MarketBookHandle<'a> {
     }
 }
 
-/// 64-byte payload for the FreeList — pure padding. Manifest's pattern.
+/// 80-byte payload for the FreeList — pure padding. Manifest's pattern.
 #[zero_copy]
 pub struct FreeListPadding {
     pub _padding_a: [u8; 32],
     pub _padding_b: [u8; 32],
+    pub _padding_c: [u8; 16],
 }
 impl Get for FreeListPadding {}
 
-const _: () = assert!(std::mem::size_of::<FreeListPadding>() == 64);
-const _: () = assert!(std::mem::size_of::<FreeListNode<FreeListPadding>>() == 68);
+const _: () = assert!(std::mem::size_of::<FreeListPadding>() == 80);
+const _: () = assert!(std::mem::size_of::<FreeListNode<FreeListPadding>>() == 84);
 
 /// FreeList sentinel — Manifest uses `u32::MAX` to mean "no more free
 /// nodes". When `FreeList::remove()` returns this, the bump-alloc
