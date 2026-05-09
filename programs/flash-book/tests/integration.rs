@@ -122,6 +122,7 @@ fn default_params() -> MarketParams {
         oracle_confidence_max_bps: 0,
         max_position_lots_per_trader: 0,
         oracle_quorum_max_dispersion_bps: 0,
+        max_position_ratio_bps: 0,
     }
 }
 
@@ -1387,6 +1388,7 @@ async fn place_limit_order_lands_in_buffer() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -1427,6 +1429,7 @@ async fn open_long_position(
     trader_state: Pubkey,
     size_lots: u64,
     limit_ticks: u64,
+    protocol: &Protocol,
 ) -> Pubkey {
     let (position, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
@@ -1446,6 +1449,7 @@ async fn open_long_position(
             AccountMeta::new(order_buf, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -1486,7 +1490,7 @@ async fn settle_funding_no_op_when_index_unchanged() {
         trader.pubkey().as_ref(),
     ]);
     // Place an order to init the position PDA via init_if_needed.
-    let _ = open_long_position(&mut ctx, market_pda, order_buf, &trader, trader_state, 1, 100_000).await;
+    let _ = open_long_position(&mut ctx, market_pda, order_buf, &trader, trader_state, 1, 100_000, &protocol).await;
 
     let collateral_before: TraderStateAccount =
         fetch(&mut ctx.banks_client, trader_state).await;
@@ -1543,7 +1547,7 @@ async fn settle_funding_long_pays_when_premium_positive() {
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 1_000_000, &protocol).await;
     // Open a 100-lot long at price 100_000 ticks. Position PDA initialized.
     let position =
-        open_long_position(&mut ctx, market_pda, order_buf, &trader, trader_state, 100, 100_000).await;
+        open_long_position(&mut ctx, market_pda, order_buf, &trader, trader_state, 100, 100_000, &protocol).await;
 
     // Simulate that the trader's position was filled by directly mutating
     // the position account: set size, side, entry_price. We bypass the full
@@ -1676,6 +1680,7 @@ async fn run_batch_advances_counter_and_clears_buffer() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -1781,6 +1786,7 @@ async fn set_market_status_blocks_orders_when_paused() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -2758,6 +2764,7 @@ async fn liquidate_portfolio_with_two_markets_and_no_positions() {
             AccountMeta::new(order_buf1, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(position1, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -2895,6 +2902,7 @@ async fn two_traders_crossing_orders_clear_in_batch() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(alice_state, false),
             AccountMeta::new(alice_pos, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -2923,6 +2931,7 @@ async fn two_traders_crossing_orders_clear_in_batch() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(bob_state, false),
             AccountMeta::new(bob_pos, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -3024,6 +3033,7 @@ async fn place_limit_order_below_min_lot_rejected() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -3123,6 +3133,7 @@ async fn place_limit_order_off_tick_rejected() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -3189,6 +3200,7 @@ async fn apply_fill_settles_two_trader_positions() {
                 AccountMeta::new(order_buf, false),
                 AccountMeta::new(state, false),
                 AccountMeta::new(pos, false),
+                AccountMeta::new_readonly(protocol.flp_exposure, false),
                 AccountMeta::new_readonly(system_program::ID, false),
             ],
         );
@@ -3398,6 +3410,7 @@ async fn place_limit_order_per_trader_rate_limit_enforced() {
                 AccountMeta::new(order_buf, false),
                 AccountMeta::new(trader_state, false),
                 AccountMeta::new(position, false),
+                AccountMeta::new_readonly(protocol.flp_exposure, false),
                 AccountMeta::new_readonly(system_program::ID, false),
             ],
         );
@@ -3430,6 +3443,7 @@ async fn place_limit_order_per_trader_rate_limit_enforced() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -3698,6 +3712,7 @@ async fn place_limit_order_rejects_above_position_cap() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -3727,6 +3742,137 @@ async fn place_limit_order_rejects_above_position_cap() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ok_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn place_limit_order_rejects_above_capital_ratio_cap() {
+    // FLP capital is 5_000_000 quote lots from setup. With ratio cap = 1 bps
+    // (0.01%), max trader notional = 500. A 1-lot order at price 1000
+    // (notional = 1000) is rejected; a 1-lot order at price 500 (notional
+    // = 500) is exactly at cap.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let insurance_fund = protocol.insurance_fund;
+    let flp_exposure = protocol.flp_exposure;
+
+    let base_mint = Keypair::new().pubkey();
+    let quote_mint = Keypair::new().pubkey();
+    let (market_pda, _) = pda(&[
+        MarketAccount::SEED,
+        base_mint.as_ref(),
+        quote_mint.as_ref(),
+    ]);
+    let (order_buf, _) = pda(&[OrderBufferAccount::SEED, market_pda.as_ref()]);
+    let (cb, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    let mut params = default_params();
+    params.max_position_ratio_bps = 1; // 0.01% of 5M = 500
+    params.tick_size = 1;
+
+    let init_ix = build_ix(
+        flash_book::instruction::InitializeMarket {
+            params,
+            initial_oracle_ticks: 1_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(cb, false),
+            AccountMeta::new_readonly(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    // Notional = 1 × 1000 × 1 = 1000 > cap (500). Reject.
+    let bad_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 1,
+            limit_ticks: 1_000,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[bad_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "notional exceeding capital-ratio cap should fail");
+
+    // Notional = 1 × 500 × 1 = 500 = cap exactly. Accept.
+    let ok_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 1,
+            limit_ticks: 500,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -3772,6 +3918,7 @@ async fn cancel_order_removes_from_buffer() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -3848,6 +3995,7 @@ async fn cancel_order_rejects_other_traders_order() {
             AccountMeta::new(order_buf, false),
             AccountMeta::new(alice_state, false),
             AccountMeta::new(alice_pos, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );

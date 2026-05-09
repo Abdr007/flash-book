@@ -76,6 +76,15 @@ pub struct MarketParams {
     /// is rejected because oracles disagree. 0 = no dispersion check.
     /// Used by `update_oracle_quorum`.
     pub oracle_quorum_max_dispersion_bps: u32,
+
+    /// Per-trader maximum position notional as bps of FLP capital.
+    /// E.g. 10 = 0.1% of FLP capital. 0 = unlimited (only the absolute
+    /// `max_position_lots_per_trader` gate applies). Computed at order
+    /// placement against the trader's projected post-fill notional and
+    /// the FLP's `total_capital_quote_lots`. Defends against cap-relative
+    /// concentration risk that the absolute lots cap can't enforce when
+    /// the pool grows or shrinks.
+    pub max_position_ratio_bps: u32,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).

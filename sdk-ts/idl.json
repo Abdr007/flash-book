@@ -2170,6 +2170,34 @@
           }
         },
         {
+          "name": "flp_exposure",
+          "docs": [
+            "FLP capital pool — read-only here; we only need",
+            "`total_capital_quote_lots` for the capital-relative position cap."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
           "name": "system_program",
           "address": "11111111111111111111111111111111"
         }
@@ -5024,6 +5052,19 @@
               "E.g. 50 = if max-source - min-source > 0.5% of median, the update",
               "is rejected because oracles disagree. 0 = no dispersion check.",
               "Used by `update_oracle_quorum`."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "max_position_ratio_bps",
+            "docs": [
+              "Per-trader maximum position notional as bps of FLP capital.",
+              "E.g. 10 = 0.1% of FLP capital. 0 = unlimited (only the absolute",
+              "`max_position_lots_per_trader` gate applies). Computed at order",
+              "placement against the trader's projected post-fill notional and",
+              "the FLP's `total_capital_quote_lots`. Defends against cap-relative",
+              "concentration risk that the absolute lots cap can't enforce when",
+              "the pool grows or shrinks."
             ],
             "type": "u32"
           }

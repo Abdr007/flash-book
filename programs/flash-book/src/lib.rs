@@ -1097,6 +1097,35 @@ pub mod flash_book {
             );
         }
 
+        // Capital-relative concentration cap: prevent any single trader's
+        // notional from exceeding `max_position_ratio_bps` of FLP capital.
+        // Distinct from the absolute lots cap above — this scales with the
+        // pool. As the pool grows, larger positions are allowed; if the
+        // pool shrinks, existing positions don't shrink but new orders
+        // are bound by the new cap.
+        let ratio_cap = market.params.max_position_ratio_bps;
+        if ratio_cap > 0 {
+            let flp_capital = ctx.accounts.flp_exposure.total_capital_quote_lots;
+            // 0 capital → no cap (bootstrap; should be rare).
+            if flp_capital > 0 {
+                let cap_quote_lots = (flp_capital as u128)
+                    .saturating_mul(ratio_cap as u128)
+                    / (constants::BPS_DENOM as u128);
+                let existing_size = ctx.accounts.position.size_lots;
+                let new_size = existing_size.saturating_add(size_lots);
+                // Use the limit price as the worst-case fill price for
+                // notional estimation. mark_price would be tighter but the
+                // limit is what the trader is willing to pay.
+                let new_notional = (new_size as u128)
+                    .saturating_mul(limit_ticks as u128)
+                    .saturating_mul(market.params.tick_size as u128);
+                require!(
+                    new_notional <= cap_quote_lots,
+                    FlashBookError::PositionSizeCapExceeded,
+                );
+            }
+        }
+
         // Stress-lattice margin gate. If the trader has an existing position
         // on this market, reject if it would push them past maintenance.
         // Empty position (first ever order) is trivially healthy.
@@ -2308,6 +2337,15 @@ pub struct PlaceOrder<'info> {
         bump,
     )]
     pub position: Account<'info, state::PositionAccount>,
+
+    /// FLP capital pool — read-only here; we only need
+    /// `total_capital_quote_lots` for the capital-relative position cap.
+    #[account(
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
+    )]
+    pub flp_exposure: Account<'info, FlpExposureAccount>,
+
     pub system_program: Program<'info, System>,
 }
 
