@@ -155,6 +155,8 @@ export {
   InvariantMonitor,
   AtaCleanupKeeper,
   AdlKeeper,
+  TrailingStopKeeper,
+  IcebergKeeper,
   estimateFundingOwed,
   type KeeperBaseConfig,
   type KeeperStats,
@@ -163,4 +165,6 @@ export {
   type InvariantMonitorConfig,
   type AtaCleanupKeeperConfig,
   type AdlKeeperConfig,
+  type TrailingStopKeeperConfig,
+  type IcebergKeeperConfig,
 } from './keepers.ts';

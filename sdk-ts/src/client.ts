@@ -35,6 +35,7 @@ import {
   traderStatePda,
   triggerOrderPda,
   twapOrderPda,
+  icebergOrderPda,
   vaultPda,
   vaultPositionPda,
   marketBondPda,
@@ -1131,6 +1132,85 @@ export class FlashBookClient {
       .accountsPartial({
         trader: args.trader,
         twapOrder: twap.address,
+      })
+      .instruction();
+  }
+
+  /// Place an ICEBERG order (Hyperliquid pattern). Hides total size by
+  /// displaying `displayedSizeLots` at a time at `limitTicks`. When the
+  /// visible chunk fills, a permissionless `replenishIcebergIx` keeper
+  /// inserts the next chunk from the hidden reservoir. Tick-aligned;
+  /// displayed must be ≥ market.minBaseLots and ≤ totalSizeLots.
+  placeIcebergOrderIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    icebergId: number;
+    side: 'long' | 'short';
+    totalSizeLots: bigint | number;
+    displayedSizeLots: bigint | number;
+    limitTicks: bigint | number;
+    expiresAtSlot?: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const buffer = this.orderBuffer(args.market);
+    const ice = icebergOrderPda(args.market, args.trader, args.icebergId);
+    return this.methods
+      .placeIcebergOrder(
+        args.icebergId,
+        args.side === 'long' ? 0 : 1,
+        args.totalSizeLots,
+        args.displayedSizeLots,
+        args.limitTicks,
+        args.expiresAtSlot ?? new BN(0),
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        orderBuffer: buffer.address,
+        icebergOrder: ice.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Replenish an iceberg's visible chunk — permissionless keeper.
+  /// No-op when the current child is still resting (cheap to poll).
+  /// Keepers can call on every batch boundary; the chain only does
+  /// real work when the previous chunk has filled.
+  replenishIcebergIx(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+    icebergId: number;
+  }): Promise<TransactionInstruction> {
+    const buffer = this.orderBuffer(args.market);
+    const ice = icebergOrderPda(args.market, args.trader, args.icebergId);
+    return this.methods
+      .replenishIceberg()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        orderBuffer: buffer.address,
+        icebergOrder: ice.address,
+      })
+      .instruction();
+  }
+
+  /// Cancel an iceberg order — trader signs. Removes any active child
+  /// from the OrderBuffer and closes the IcebergOrderAccount, refunding
+  /// rent.
+  cancelIcebergIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    icebergId: number;
+  }): Promise<TransactionInstruction> {
+    const buffer = this.orderBuffer(args.market);
+    const ice = icebergOrderPda(args.market, args.trader, args.icebergId);
+    return this.methods
+      .cancelIceberg()
+      .accountsPartial({
+        trader: args.trader,
+        orderBuffer: buffer.address,
+        icebergOrder: ice.address,
       })
       .instruction();
   }

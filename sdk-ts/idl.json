@@ -732,6 +732,65 @@
       "args": []
     },
     {
+      "name": "cancel_iceberg",
+      "docs": [
+        "Cancel an iceberg order. Trader signs. Removes any active child",
+        "from the OrderBuffer and closes the IcebergOrderAccount."
+      ],
+      "discriminator": [
+        199,
+        243,
+        20,
+        164,
+        55,
+        201,
+        177,
+        195
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "iceberg_order.market",
+                "account": "IcebergOrderAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "iceberg_order",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "cancel_order",
       "docs": [
         "Cancel a pending order from the buffer. Only the original trader can",
@@ -3980,6 +4039,129 @@
       ]
     },
     {
+      "name": "place_iceberg_order",
+      "docs": [
+        "Place an ICEBERG order (Hyperliquid pattern). Trader pre-funds rent",
+        "on an IcebergOrderAccount, places the first visible chunk into",
+        "the OrderBuffer, and stows the rest in a hidden reservoir. When",
+        "the visible chunk fills, a permissionless `replenish_iceberg`",
+        "keeper inserts the next chunk at the same limit price.",
+        "",
+        "Hides total order size from the matcher AND from competing",
+        "traders — large orders can be worked through a market without",
+        "telegraphing intent. Survives bot downtime: the reservoir is on",
+        "chain; replenishment is permissionless."
+      ],
+      "discriminator": [
+        146,
+        111,
+        167,
+        176,
+        225,
+        53,
+        237,
+        171
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "iceberg_order",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "iceberg_id",
+          "type": "u8"
+        },
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "total_size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "displayed_size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "place_limit_order",
       "docs": [
         "Submit a resting limit order. Routed to the order buffer for the",
@@ -4630,6 +4812,99 @@
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "replenish_iceberg",
+      "docs": [
+        "Replenish an iceberg's visible chunk — PERMISSIONLESS keeper.",
+        "Reads the IcebergOrderAccount and the OrderBuffer; if the current",
+        "child is no longer in the buffer (filled or matcher-cleared) AND",
+        "remaining_lots > 0, inserts a new child of size",
+        "min(displayed_size_lots, remaining_lots). Decrements",
+        "remaining_lots and updates child_order_seq.",
+        "",
+        "No-op if the child is still resting (returns Ok). This lets a",
+        "keeper poll on every batch boundary without burning fees on",
+        "non-replenish slots. Marks iceberg inactive when fully drained."
+      ],
+      "discriminator": [
+        69,
+        159,
+        168,
+        68,
+        255,
+        65,
+        251,
+        29
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "iceberg_order",
+          "writable": true
+        }
+      ],
+      "args": []
     },
     {
       "name": "request_unbond_market_bond",
@@ -7351,6 +7626,19 @@
       ]
     },
     {
+      "name": "IcebergOrderAccount",
+      "discriminator": [
+        159,
+        201,
+        201,
+        114,
+        59,
+        221,
+        119,
+        47
+      ]
+    },
+    {
       "name": "InsuranceFundAccount",
       "discriminator": [
         207,
@@ -7691,6 +7979,45 @@
       ]
     },
     {
+      "name": "IcebergCancelledEvent",
+      "discriminator": [
+        64,
+        48,
+        178,
+        46,
+        191,
+        188,
+        230,
+        62
+      ]
+    },
+    {
+      "name": "IcebergOrderPlacedEvent",
+      "discriminator": [
+        165,
+        166,
+        133,
+        184,
+        247,
+        83,
+        30,
+        73
+      ]
+    },
+    {
+      "name": "IcebergReplenishedEvent",
+      "discriminator": [
+        213,
+        34,
+        135,
+        222,
+        239,
+        109,
+        70,
+        217
+      ]
+    },
+    {
       "name": "InvariantBreachDetectedEvent",
       "discriminator": [
         116,
@@ -7740,6 +8067,19 @@
         242,
         145,
         194
+      ]
+    },
+    {
+      "name": "MarkChangeClampedEvent",
+      "discriminator": [
+        101,
+        166,
+        121,
+        237,
+        221,
+        22,
+        52,
+        243
       ]
     },
     {
@@ -8321,6 +8661,16 @@
       "code": 7223,
       "name": "VaultNavMarketMismatch",
       "msg": "Vault NAV market mismatch — passed market doesn't match position"
+    },
+    {
+      "code": 7224,
+      "name": "OpenInterestCapExceeded",
+      "msg": "Order would push gross OI past the market's `max_oi_base_lots` cap"
+    },
+    {
+      "code": 7225,
+      "name": "MarkChangeClamped",
+      "msg": "Mark-price change clamped — batch produced an outlier post-clearing mark"
     },
     {
       "code": 7300,
@@ -9054,6 +9404,201 @@
       }
     },
     {
+      "name": "IcebergCancelledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "iceberg_id",
+            "type": "u8"
+          },
+          {
+            "name": "unfilled_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "IcebergOrderAccount",
+      "docs": [
+        "Native on-chain ICEBERG order — Hyperliquid pattern. Hides total",
+        "size by displaying only `displayed_size_lots` at a time. When the",
+        "visible child fills, a permissionless `replenish_iceberg` keeper",
+        "inserts the next chunk of `displayed_size_lots` (or the residual)",
+        "from the hidden reservoir at the same `limit_ticks`.",
+        "",
+        "PDA seeds: [b\"iceberg\", market, trader, iceberg_id]. iceberg_id is",
+        "u8 → up to 256 active icebergs per (trader, market) pair."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "iceberg_id",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "flags",
+            "docs": [
+              "bit 0 = active. Cleared when remaining_lots == 0 OR cancelled."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "_pad0",
+            "type": {
+              "array": [
+                "u8",
+                5
+              ]
+            }
+          },
+          {
+            "name": "limit_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "total_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "remaining_lots",
+            "docs": [
+              "Lots not yet displayed in the orderbook (the hidden reservoir)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "displayed_size_lots",
+            "docs": [
+              "Size of each visible chunk. Last chunk may be smaller (residual)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "child_order_seq",
+            "docs": [
+              "Sequence of the current child order in the OrderBuffer. 0 = no",
+              "active child (about to replenish or fully drained)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "created_at_slot",
+            "type": "u64"
+          },
+          {
+            "name": "expires_at_slot",
+            "docs": [
+              "0 = never expires."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "IcebergOrderPlacedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "iceberg_id",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "total_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "displayed_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "limit_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "first_child_seq",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "IcebergReplenishedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "iceberg_id",
+            "type": "u8"
+          },
+          {
+            "name": "executor",
+            "type": "pubkey"
+          },
+          {
+            "name": "chunk_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "remaining_lots",
+            "type": "u64"
+          },
+          {
+            "name": "new_child_seq",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "InsuranceFundAccount",
       "type": {
         "kind": "struct",
@@ -9281,6 +9826,40 @@
               "Position equity / required margin, in bps (e.g. 12_500 = 125%)."
             ],
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarkChangeClampedEvent",
+      "docs": [
+        "Anti-flash-crash event. Emitted when the post-batch mark would have",
+        "moved further than `params.mark_change_max_bps` and was clamped.",
+        "Off-chain monitors page operators on repeated emissions (a sign",
+        "either liquidity has thinned dramatically or the cap is too tight)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "batch_num",
+            "type": "u64"
+          },
+          {
+            "name": "unclamped_mark_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "clamped_mark_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "prior_mark_ticks",
+            "type": "u64"
           }
         ]
       }
@@ -9893,6 +10472,34 @@
               "(lower max_leverage, lower max_position_lots_per_trader) at init."
             ],
             "type": "bool"
+          },
+          {
+            "name": "max_oi_base_lots",
+            "docs": [
+              "Maximum gross open interest in base lots (per side: long lots OR",
+              "short lots, whichever is larger). 0 = unlimited. Acts as a hard",
+              "circuit breaker against runaway exposure on a single market —",
+              "new orders that would push OI past the cap are rejected at",
+              "place_limit_order intake. Distinct from `max_position_lots_per_trader`",
+              "(per-trader) and `max_position_ratio_bps` (per-trader as % of FLP);",
+              "this caps the WHOLE-MARKET aggregate. Typical: scaled with FLP",
+              "capital × leverage so worst-case insurance draw stays bounded."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "mark_change_max_bps",
+            "docs": [
+              "Maximum allowed mark-price change per batch in bps. 0 = unlimited",
+              "(legacy / pre-launch markets often run open). When set, the",
+              "matcher clamps the post-batch mark to ±this fraction of the",
+              "previous mark. Hyperliquid-style anti-flash-crash defense:",
+              "prevents a single thin-liquidity batch (or oracle spike that",
+              "passed the band gate) from setting an outlier mark that would",
+              "liquidate a swathe of healthy positions on the next assess.",
+              "Typical: 200-1000 bps (2%-10% per batch ≈ per 50ms)."
+            ],
+            "type": "u32"
           }
         ]
       }

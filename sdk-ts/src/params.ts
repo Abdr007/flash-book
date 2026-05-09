@@ -69,6 +69,10 @@ export interface MarketParamsRaw {
   creatorShareBps: number;
   /** Pre-launch market flag — Hyperliquid pre-TGE perp pattern. */
   isPreLaunch: boolean;
+  /** Whole-market gross OI cap in base lots (per side). 0 = unlimited. */
+  maxOiBaseLots: BN;
+  /** Max post-batch mark change in bps (anti-flash-crash). 0 = unlimited. */
+  markChangeMaxBps: number;
 }
 
 /** Sensible default parameter set for SOL/BTC/ETH-style major markets. */
@@ -136,6 +140,12 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
     creatorShareBps: 0,
     // Pre-launch flag (off — set true only for pre-TGE markets).
     isPreLaunch: false,
+    // Whole-market OI hard cap (off by default; production should set
+    // based on insurance coverage capacity).
+    maxOiBaseLots: new BN(0),
+    // Anti-flash-crash mark cap (off by default; production should set
+    // 200-1000 bps depending on liquidity profile).
+    markChangeMaxBps: 0,
   };
 }
 

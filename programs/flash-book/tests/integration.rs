@@ -131,6 +131,8 @@ fn default_params() -> MarketParams {
         builder_share_bps: 0,
         creator_share_bps: 0,
         is_pre_launch: false,
+        max_oi_base_lots: 0,
+        mark_change_max_bps: 0,
     }
 }
 

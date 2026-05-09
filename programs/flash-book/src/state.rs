@@ -146,6 +146,26 @@ pub struct MarketParams {
     /// regular market — governance is expected to set tighter limits
     /// (lower max_leverage, lower max_position_lots_per_trader) at init.
     pub is_pre_launch: bool,
+
+    /// Maximum gross open interest in base lots (per side: long lots OR
+    /// short lots, whichever is larger). 0 = unlimited. Acts as a hard
+    /// circuit breaker against runaway exposure on a single market —
+    /// new orders that would push OI past the cap are rejected at
+    /// place_limit_order intake. Distinct from `max_position_lots_per_trader`
+    /// (per-trader) and `max_position_ratio_bps` (per-trader as % of FLP);
+    /// this caps the WHOLE-MARKET aggregate. Typical: scaled with FLP
+    /// capital × leverage so worst-case insurance draw stays bounded.
+    pub max_oi_base_lots: u64,
+
+    /// Maximum allowed mark-price change per batch in bps. 0 = unlimited
+    /// (legacy / pre-launch markets often run open). When set, the
+    /// matcher clamps the post-batch mark to ±this fraction of the
+    /// previous mark. Hyperliquid-style anti-flash-crash defense:
+    /// prevents a single thin-liquidity batch (or oracle spike that
+    /// passed the band gate) from setting an outlier mark that would
+    /// liquidate a swathe of healthy positions on the next assess.
+    /// Typical: 200-1000 bps (2%-10% per batch ≈ per 50ms).
+    pub mark_change_max_bps: u32,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).
@@ -399,6 +419,48 @@ impl TriggerOrderAccount {
         // + 4 (trailing_offset_bps) + 8 (trailing_anchor_ticks) = 161.
         // Round to 192.
         8 + 192
+    }
+}
+
+/// Native on-chain ICEBERG order — Hyperliquid pattern. Hides total
+/// size by displaying only `displayed_size_lots` at a time. When the
+/// visible child fills, a permissionless `replenish_iceberg` keeper
+/// inserts the next chunk of `displayed_size_lots` (or the residual)
+/// from the hidden reservoir at the same `limit_ticks`.
+///
+/// PDA seeds: [b"iceberg", market, trader, iceberg_id]. iceberg_id is
+/// u8 → up to 256 active icebergs per (trader, market) pair.
+#[account]
+#[derive(Debug)]
+pub struct IcebergOrderAccount {
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub bump: u8,
+    pub iceberg_id: u8,
+    pub side: u8,
+    /// bit 0 = active. Cleared when remaining_lots == 0 OR cancelled.
+    pub flags: u8,
+    pub _pad0: [u8; 5],
+    pub limit_ticks: u64,
+    pub total_size_lots: u64,
+    /// Lots not yet displayed in the orderbook (the hidden reservoir).
+    pub remaining_lots: u64,
+    /// Size of each visible chunk. Last chunk may be smaller (residual).
+    pub displayed_size_lots: u64,
+    /// Sequence of the current child order in the OrderBuffer. 0 = no
+    /// active child (about to replenish or fully drained).
+    pub child_order_seq: u64,
+    pub created_at_slot: u64,
+    /// 0 = never expires.
+    pub expires_at_slot: u64,
+}
+
+impl IcebergOrderAccount {
+    pub const SEED: &'static [u8] = b"iceberg";
+    pub const FLAG_ACTIVE: u8 = 1 << 0;
+    pub fn space() -> usize {
+        // 8 disc + 32+32+1+1+1+1+5 + 8+8+8+8+8+8+8 = 137. Round to 168.
+        8 + 168
     }
 }
 

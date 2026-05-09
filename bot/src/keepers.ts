@@ -531,3 +531,86 @@ export class AdlKeeper extends Keeper {
 function bigMin(a: bigint, b: bigint): bigint {
   return a < b ? a : b;
 }
+
+// ─── Trailing-stop keeper ─────────────────────────────────────────────
+
+export interface TrailingStopKeeperConfig extends KeeperBaseConfig {
+  /// Triggers to monitor — ratchets when oracle moves favourably.
+  /// Production deployments hydrate this from
+  /// TriggerOrderPlacedEvent (filtered on trailing_offset_bps > 0).
+  watchlist: ReadonlyArray<{
+    market: PublicKey;
+    trader: PublicKey;
+    triggerId: number;
+  }>;
+}
+
+/// Calls `update_trailing_stop` on each watched trigger every iteration.
+/// The chain is a no-op when the oracle hasn't progressed past the
+/// anchor or when the new tick-aligned trigger equals the current one,
+/// so polling cheaply on every batch boundary is safe — only real
+/// ratchets cost a tx fee.
+export class TrailingStopKeeper extends Keeper {
+  readonly name = 'trailing-stop-keeper';
+
+  constructor(
+    client: FlashBookClient,
+    connection: Connection,
+    private readonly cfg: TrailingStopKeeperConfig,
+  ) {
+    super(client, connection, cfg);
+  }
+
+  protected async iterate(): Promise<void> {
+    for (const w of this.cfg.watchlist) {
+      const ix = await this.client.updateTrailingStopIx({
+        caller: this.base.signer.publicKey,
+        market: w.market,
+        trader: w.trader,
+        triggerId: w.triggerId,
+      });
+      const sig = await this.sendIxs([ix]);
+      if (sig) this.stats.actionsTaken += 1;
+    }
+  }
+}
+
+// ─── Iceberg replenishment keeper ─────────────────────────────────────
+
+export interface IcebergKeeperConfig extends KeeperBaseConfig {
+  /// Icebergs to replenish — chain is a no-op when the active child is
+  /// still resting, so polling cheaply on every batch boundary is safe.
+  watchlist: ReadonlyArray<{
+    market: PublicKey;
+    trader: PublicKey;
+    icebergId: number;
+  }>;
+}
+
+/// Calls `replenish_iceberg` on each watched iceberg. The chain replenishes
+/// only when the current child has filled and remaining_lots > 0,
+/// otherwise it's a free no-op.
+export class IcebergKeeper extends Keeper {
+  readonly name = 'iceberg-keeper';
+
+  constructor(
+    client: FlashBookClient,
+    connection: Connection,
+    private readonly cfg: IcebergKeeperConfig,
+  ) {
+    super(client, connection, cfg);
+  }
+
+  protected async iterate(): Promise<void> {
+    for (const w of this.cfg.watchlist) {
+      const ix = await this.client.replenishIcebergIx({
+        caller: this.base.signer.publicKey,
+        market: w.market,
+        trader: w.trader,
+        icebergId: w.icebergId,
+      });
+      const sig = await this.sendIxs([ix]);
+      if (sig) this.stats.actionsTaken += 1;
+    }
+  }
+}

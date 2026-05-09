@@ -2154,6 +2154,17 @@ pub mod flash_book {
             }
         }
 
+        // Per-market OI hard cap (whole-market circuit breaker). Order is
+        // rejected if its worst-case fill (entire size on the same side)
+        // would push the side's OI past the cap. Distinct from per-trader
+        // caps; defends against runaway exposure across many traders.
+        let oi_cap = market.params.max_oi_base_lots;
+        if oi_cap > 0 {
+            let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
+            let projected = cur.saturating_add(size_lots);
+            require!(projected <= oi_cap, FlashBookError::OpenInterestCapExceeded);
+        }
+
         // Stress-lattice margin gate. If the trader has an existing position
         // on this market, reject if it would push them past maintenance.
         // Empty position (first ever order) is trivially healthy.
@@ -3246,6 +3257,238 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Place an ICEBERG order (Hyperliquid pattern). Trader pre-funds rent
+    /// on an IcebergOrderAccount, places the first visible chunk into
+    /// the OrderBuffer, and stows the rest in a hidden reservoir. When
+    /// the visible chunk fills, a permissionless `replenish_iceberg`
+    /// keeper inserts the next chunk at the same limit price.
+    ///
+    /// Hides total order size from the matcher AND from competing
+    /// traders — large orders can be worked through a market without
+    /// telegraphing intent. Survives bot downtime: the reservoir is on
+    /// chain; replenishment is permissionless.
+    pub fn place_iceberg_order(
+        ctx: Context<PlaceIcebergOrder>,
+        iceberg_id: u8,
+        side: u8,
+        total_size_lots: u64,
+        displayed_size_lots: u64,
+        limit_ticks: u64,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(total_size_lots > 0, FlashBookError::ZeroSize);
+        require!(displayed_size_lots > 0, FlashBookError::ZeroSize);
+        require!(displayed_size_lots <= total_size_lots, FlashBookError::OutOfRange);
+        require!(limit_ticks > 0, FlashBookError::ZeroPrice);
+
+        let market = &ctx.accounts.market;
+        require!(
+            displayed_size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            limit_ticks.is_multiple_of(market.params.tick_size),
+            FlashBookError::PriceNotOnTick
+        );
+
+        let now = Clock::get()?.slot;
+        if expires_at_slot > 0 {
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
+
+        // Insert the first visible child into the OrderBuffer.
+        let buffer = &mut ctx.accounts.order_buffer;
+        require!((buffer.head as usize) < ORDER_BUFFER_CAP, FlashBookError::BufferFull);
+        let next_seq = buffer
+            .seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+        let trader_pk = ctx.accounts.trader.key();
+        let first_chunk = displayed_size_lots.min(total_size_lots);
+        let mut inserted = false;
+        for slot in buffer.slots.iter_mut() {
+            if slot.valid == 0 {
+                *slot = OrderSlot {
+                    valid: 1,
+                    side,
+                    order_type: OrderType::Limit as u8,
+                    post_only: 0,
+                    seq: next_seq,
+                    id: next_seq,
+                    trader: trader_pk,
+                    size_lots: first_chunk,
+                    limit_ticks,
+                    expires_at_slot,
+                };
+                inserted = true;
+                break;
+            }
+        }
+        require!(inserted, FlashBookError::BufferFull);
+        buffer.seq_counter = next_seq;
+        buffer.head = buffer
+            .head
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        let iceberg = &mut ctx.accounts.iceberg_order;
+        iceberg.trader = trader_pk;
+        iceberg.market = market.key();
+        iceberg.bump = ctx.bumps.iceberg_order;
+        iceberg.iceberg_id = iceberg_id;
+        iceberg.side = side;
+        iceberg.flags = state::IcebergOrderAccount::FLAG_ACTIVE;
+        iceberg._pad0 = [0u8; 5];
+        iceberg.limit_ticks = limit_ticks;
+        iceberg.total_size_lots = total_size_lots;
+        iceberg.remaining_lots = total_size_lots.saturating_sub(first_chunk);
+        iceberg.displayed_size_lots = displayed_size_lots;
+        iceberg.child_order_seq = next_seq;
+        iceberg.created_at_slot = now;
+        iceberg.expires_at_slot = expires_at_slot;
+
+        emit!(IcebergOrderPlacedEvent {
+            market: market.key(),
+            trader: trader_pk,
+            iceberg_id,
+            side,
+            total_size_lots,
+            displayed_size_lots,
+            limit_ticks,
+            first_child_seq: next_seq,
+        });
+        Ok(())
+    }
+
+    /// Replenish an iceberg's visible chunk — PERMISSIONLESS keeper.
+    /// Reads the IcebergOrderAccount and the OrderBuffer; if the current
+    /// child is no longer in the buffer (filled or matcher-cleared) AND
+    /// remaining_lots > 0, inserts a new child of size
+    /// min(displayed_size_lots, remaining_lots). Decrements
+    /// remaining_lots and updates child_order_seq.
+    ///
+    /// No-op if the child is still resting (returns Ok). This lets a
+    /// keeper poll on every batch boundary without burning fees on
+    /// non-replenish slots. Marks iceberg inactive when fully drained.
+    pub fn replenish_iceberg(ctx: Context<ReplenishIceberg>) -> Result<()> {
+        let iceberg = &ctx.accounts.iceberg_order;
+        let market = &ctx.accounts.market;
+        require!(
+            iceberg.flags & state::IcebergOrderAccount::FLAG_ACTIVE != 0,
+            FlashBookError::OutOfRange
+        );
+
+        let now = Clock::get()?.slot;
+        if iceberg.expires_at_slot > 0 {
+            require!(iceberg.expires_at_slot >= now, FlashBookError::OutOfRange);
+        }
+        require!(iceberg.remaining_lots > 0, FlashBookError::OutOfRange);
+
+        let buffer = &mut ctx.accounts.order_buffer;
+        // Probe the buffer for the current child seq. If still resting,
+        // no-op. Lazy poll-friendly.
+        let child_seq = iceberg.child_order_seq;
+        let still_resting = buffer
+            .slots
+            .iter()
+            .any(|s| s.valid == 1 && s.seq == child_seq);
+        if still_resting {
+            return Ok(());
+        }
+
+        // Insert next chunk.
+        require!((buffer.head as usize) < ORDER_BUFFER_CAP, FlashBookError::BufferFull);
+        let next_seq = buffer
+            .seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+        let chunk = iceberg.displayed_size_lots.min(iceberg.remaining_lots);
+        // The final residual chunk may be below min_base_lots — allow it
+        // (otherwise the iceberg would strand its tail).
+        let mut inserted = false;
+        for slot in buffer.slots.iter_mut() {
+            if slot.valid == 0 {
+                *slot = OrderSlot {
+                    valid: 1,
+                    side: iceberg.side,
+                    order_type: OrderType::Limit as u8,
+                    post_only: 0,
+                    seq: next_seq,
+                    id: next_seq,
+                    trader: iceberg.trader,
+                    size_lots: chunk,
+                    limit_ticks: iceberg.limit_ticks,
+                    expires_at_slot: iceberg.expires_at_slot,
+                };
+                inserted = true;
+                break;
+            }
+        }
+        require!(inserted, FlashBookError::BufferFull);
+        buffer.seq_counter = next_seq;
+        buffer.head = buffer
+            .head
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        let market_key = market.key();
+        let iceberg = &mut ctx.accounts.iceberg_order;
+        iceberg.remaining_lots = iceberg.remaining_lots.saturating_sub(chunk);
+        iceberg.child_order_seq = next_seq;
+        if iceberg.remaining_lots == 0 {
+            iceberg.flags &= !state::IcebergOrderAccount::FLAG_ACTIVE;
+        }
+
+        emit!(IcebergReplenishedEvent {
+            market: market_key,
+            trader: iceberg.trader,
+            iceberg_id: iceberg.iceberg_id,
+            executor: ctx.accounts.caller.key(),
+            chunk_size_lots: chunk,
+            remaining_lots: iceberg.remaining_lots,
+            new_child_seq: next_seq,
+        });
+        Ok(())
+    }
+
+    /// Cancel an iceberg order. Trader signs. Removes any active child
+    /// from the OrderBuffer and closes the IcebergOrderAccount.
+    pub fn cancel_iceberg(ctx: Context<CancelIceberg>) -> Result<()> {
+        let trader = ctx.accounts.trader.key();
+        require!(
+            ctx.accounts.iceberg_order.trader == trader,
+            FlashBookError::WrongTrader
+        );
+
+        // Best-effort child removal: if the child is still resting,
+        // clear its slot. If already filled, no-op.
+        let child_seq = ctx.accounts.iceberg_order.child_order_seq;
+        let buffer = &mut ctx.accounts.order_buffer;
+        for slot in buffer.slots.iter_mut() {
+            if slot.valid == 1 && slot.seq == child_seq && slot.trader == trader {
+                *slot = OrderSlot::default();
+                buffer.head = buffer.head.saturating_sub(1);
+                break;
+            }
+        }
+
+        let unfilled = ctx
+            .accounts
+            .iceberg_order
+            .remaining_lots
+            .saturating_add(ctx.accounts.iceberg_order.displayed_size_lots);
+        emit!(IcebergCancelledEvent {
+            market: ctx.accounts.iceberg_order.market,
+            trader,
+            iceberg_id: ctx.accounts.iceberg_order.iceberg_id,
+            unfilled_lots: unfilled.min(ctx.accounts.iceberg_order.total_size_lots),
+        });
+        Ok(())
+    }
+
     /// Cancel a pending order from the buffer. Only the original trader can
     /// cancel; other callers (or stale order_seq values) are rejected. The
     /// order must still be in the buffer (not yet processed by run_batch).
@@ -3547,7 +3790,35 @@ pub mod flash_book {
                 / constants::BPS_DENOM as u128;
             let lo = (market.oracle_price_ticks as u128).saturating_sub(band) as u64;
             let hi = (market.oracle_price_ticks as u128).saturating_add(band) as u64;
-            market.mark_price_ticks = twap.max(lo).min(hi);
+            let banded = twap.max(lo).min(hi);
+
+            // Mark-change sanity cap (anti-flash-crash). When set, clamp
+            // the new mark to within `mark_change_max_bps` of the prior
+            // mark. Defends against a single thin-liquidity batch (or a
+            // band-passing oracle spike) producing an outlier mark that
+            // would liquidate a swathe of healthy positions on the next
+            // assess. 0 = unlimited (legacy / pre-launch).
+            let prior = market.mark_price_ticks as u128;
+            let cap_bps = market.params.mark_change_max_bps as u128;
+            let new_mark = if cap_bps > 0 && prior > 0 {
+                let cap_delta = prior.saturating_mul(cap_bps) / constants::BPS_DENOM as u128;
+                let cap_lo = prior.saturating_sub(cap_delta) as u64;
+                let cap_hi = prior.saturating_add(cap_delta).min(u64::MAX as u128) as u64;
+                let clamped = banded.max(cap_lo).min(cap_hi);
+                if clamped != banded {
+                    emit!(MarkChangeClampedEvent {
+                        market: market.key(),
+                        batch_num: market.current_batch,
+                        unclamped_mark_ticks: banded,
+                        clamped_mark_ticks: clamped,
+                        prior_mark_ticks: prior as u64,
+                    });
+                }
+                clamped
+            } else {
+                banded
+            };
+            market.mark_price_ticks = new_mark;
         }
 
         // 6. Update VPIN. Snapshot params before mutable borrow on vpin.
@@ -6152,6 +6423,98 @@ pub struct CancelTwapOrder<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(iceberg_id: u8)]
+pub struct PlaceIcebergOrder<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
+        bump = order_buffer.bump,
+    )]
+    pub order_buffer: Account<'info, OrderBufferAccount>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state::IcebergOrderAccount::space(),
+        seeds = [
+            state::IcebergOrderAccount::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[iceberg_id],
+        ],
+        bump,
+    )]
+    pub iceberg_order: Account<'info, state::IcebergOrderAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ReplenishIceberg<'info> {
+    pub caller: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
+        bump = order_buffer.bump,
+    )]
+    pub order_buffer: Account<'info, OrderBufferAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::IcebergOrderAccount::SEED,
+            market.key().as_ref(),
+            iceberg_order.trader.as_ref(),
+            &[iceberg_order.iceberg_id],
+        ],
+        bump = iceberg_order.bump,
+    )]
+    pub iceberg_order: Account<'info, state::IcebergOrderAccount>,
+}
+
+#[derive(Accounts)]
+pub struct CancelIceberg<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [OrderBufferAccount::SEED, iceberg_order.market.as_ref()],
+        bump = order_buffer.bump,
+    )]
+    pub order_buffer: Account<'info, OrderBufferAccount>,
+
+    #[account(
+        mut,
+        close = trader,
+        seeds = [
+            state::IcebergOrderAccount::SEED,
+            iceberg_order.market.as_ref(),
+            iceberg_order.trader.as_ref(),
+            &[iceberg_order.iceberg_id],
+        ],
+        bump = iceberg_order.bump,
+    )]
+    pub iceberg_order: Account<'info, state::IcebergOrderAccount>,
+}
+
+#[derive(Accounts)]
 pub struct CancelOrder<'info> {
     pub trader: Signer<'info>,
 
@@ -6582,6 +6945,37 @@ pub struct LiquidationInjectedEvent {
 }
 
 #[event]
+pub struct IcebergOrderPlacedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub iceberg_id: u8,
+    pub side: u8,
+    pub total_size_lots: u64,
+    pub displayed_size_lots: u64,
+    pub limit_ticks: u64,
+    pub first_child_seq: u64,
+}
+
+#[event]
+pub struct IcebergReplenishedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub iceberg_id: u8,
+    pub executor: Pubkey,
+    pub chunk_size_lots: u64,
+    pub remaining_lots: u64,
+    pub new_child_seq: u64,
+}
+
+#[event]
+pub struct IcebergCancelledEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub iceberg_id: u8,
+    pub unfilled_lots: u64,
+}
+
+#[event]
 pub struct OrdersMassCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
@@ -6806,6 +7200,19 @@ pub struct TriggerOrderCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub trigger_id: u8,
+}
+
+/// Anti-flash-crash event. Emitted when the post-batch mark would have
+/// moved further than `params.mark_change_max_bps` and was clamped.
+/// Off-chain monitors page operators on repeated emissions (a sign
+/// either liquidity has thinned dramatically or the cap is too tight).
+#[event]
+pub struct MarkChangeClampedEvent {
+    pub market: Pubkey,
+    pub batch_num: u64,
+    pub unclamped_mark_ticks: u64,
+    pub clamped_mark_ticks: u64,
+    pub prior_mark_ticks: u64,
 }
 
 #[event]

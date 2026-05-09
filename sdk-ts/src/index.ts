@@ -16,6 +16,7 @@ export {
   traderStatePda,
   triggerOrderPda,
   twapOrderPda,
+  icebergOrderPda,
   vaultPda,
   vaultPositionPda,
   marketBondPda,

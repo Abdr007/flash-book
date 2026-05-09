@@ -88,6 +88,10 @@ pub enum FlashBookError {
     BondUnbondingDelay = 1222,
     #[msg("Vault NAV market mismatch — passed market doesn't match position")]
     VaultNavMarketMismatch = 1223,
+    #[msg("Order would push gross OI past the market's `max_oi_base_lots` cap")]
+    OpenInterestCapExceeded = 1224,
+    #[msg("Mark-price change clamped — batch produced an outlier post-clearing mark")]
+    MarkChangeClamped = 1225,
 
     // ── 1300-1399 matcher / clearing ────────────────────────────────
     #[msg("Order book buffer at capacity")]
