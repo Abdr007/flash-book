@@ -111,6 +111,21 @@ export {
 } from './market-maker.ts';
 
 export {
+  Keeper,
+  LiquidationKeeper,
+  FundingKeeper,
+  InvariantMonitor,
+  AtaCleanupKeeper,
+  estimateFundingOwed,
+  type KeeperBaseConfig,
+  type KeeperStats,
+  type LiquidationKeeperConfig,
+  type FundingKeeperConfig,
+  type InvariantMonitorConfig,
+  type AtaCleanupKeeperConfig,
+} from './keepers.ts';
+
+export {
   FlashV2Venue,
   V2_SIDE_LONG,
   V2_SIDE_SHORT,
