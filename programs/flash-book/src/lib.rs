@@ -64,6 +64,39 @@ pub mod flash_book {
         initialize_market_inner(ctx, params, initial_oracle_ticks, false)
     }
 
+    /// Initialize the order_buffer for an existing market. MUST be
+    /// called after `initialize_market`. Separate from
+    /// `initialize_commit_buffer` to avoid Anchor 0.31's BPF
+    /// "Overlapping copy" invariant when two large (~5KB) boxed
+    /// accounts init in one ix.
+    pub fn initialize_order_buffer(
+        ctx: Context<InitializeOrderBuffer>,
+    ) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let buffer = &mut ctx.accounts.order_buffer;
+        buffer.market = market_key;
+        buffer.bump = ctx.bumps.order_buffer;
+        buffer.head = 0;
+        buffer.seq_counter = 0;
+        buffer.slots = [OrderSlot::default(); ORDER_BUFFER_CAP];
+        Ok(())
+    }
+
+    /// Initialize the commit_buffer for an existing market. MUST be
+    /// called after `initialize_market`. See `initialize_order_buffer`
+    /// docstring for the split rationale.
+    pub fn initialize_commit_buffer(
+        ctx: Context<InitializeCommitBuffer>,
+    ) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let commit_buf = &mut ctx.accounts.commit_buffer;
+        commit_buf.market = market_key;
+        commit_buf.bump = ctx.bumps.commit_buffer;
+        commit_buf.head = 0;
+        commit_buf.commits = [state::CommitRow::default(); state::COMMIT_BUFFER_CAP];
+        Ok(())
+    }
+
     /// Initialize the FLP exposure account (one per protocol). Must run
     /// before `initialize_market`. Mints `initial_capital_quote_lots` shares
     /// to the authority at 1:1 (treasury endowment); these shares can later
@@ -5536,19 +5569,10 @@ fn initialize_market_inner(
     market.period_started_at_unix = 0;
     market.period_funding_paid_abs_bps = 0;
     market.params = params;
-
-    let buffer = &mut ctx.accounts.order_buffer;
-    buffer.market = market.key();
-    buffer.bump = ctx.bumps.order_buffer;
-    buffer.head = 0;
-    buffer.seq_counter = 0;
-    buffer.slots = [OrderSlot::default(); ORDER_BUFFER_CAP];
-
-    let commit_buf = &mut ctx.accounts.commit_buffer;
-    commit_buf.market = market.key();
-    commit_buf.bump = ctx.bumps.commit_buffer;
-    commit_buf.head = 0;
-    commit_buf.commits = [state::CommitRow::default(); state::COMMIT_BUFFER_CAP];
+    // Order + commit buffers are now initialized in a SEPARATE
+    // `initialize_market_buffers` ix to dodge the Anchor 0.31 BPF
+    // "Overlapping copy" invariant when 3 large boxed accounts init
+    // in one ix. See InitializeMarket context (no longer Boxes them).
 
     emit!(MarketInitializedEvent {
         market: market.key(),
@@ -5594,24 +5618,6 @@ pub struct InitializeMarket<'info> {
     pub market: Box<Account<'info, MarketAccount>>,
 
     #[account(
-        init,
-        payer = authority,
-        space = OrderBufferAccount::space(),
-        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub order_buffer: Box<Account<'info, OrderBufferAccount>>,
-
-    #[account(
-        init,
-        payer = authority,
-        space = CommitBufferAccount::space(),
-        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
-
-    #[account(
         seeds = [InsuranceFundAccount::SEED],
         bump = insurance_fund.bump,
     )]
@@ -5622,6 +5628,52 @@ pub struct InitializeMarket<'info> {
         bump = flp_exposure.bump,
     )]
     pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeOrderBuffer<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = OrderBufferAccount::space(),
+        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub order_buffer: Box<Account<'info, OrderBufferAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeCommitBuffer<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = CommitBufferAccount::space(),
+        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
 
     pub system_program: Program<'info, System>,
 }

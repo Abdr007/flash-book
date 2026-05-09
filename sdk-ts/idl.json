@@ -2461,6 +2461,94 @@
       "args": []
     },
     {
+      "name": "initialize_commit_buffer",
+      "docs": [
+        "Initialize the commit_buffer for an existing market. MUST be",
+        "called after `initialize_market`. See `initialize_order_buffer`",
+        "docstring for the split rationale."
+      ],
+      "discriminator": [
+        158,
+        101,
+        98,
+        14,
+        38,
+        231,
+        58,
+        245
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "commit_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "initialize_flp_exposure",
       "docs": [
         "Initialize the FLP exposure account (one per protocol). Must run",
@@ -2717,65 +2805,6 @@
           }
         },
         {
-          "name": "order_buffer",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  111,
-                  114,
-                  100,
-                  101,
-                  114,
-                  95,
-                  98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "commit_buffer",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  109,
-                  109,
-                  105,
-                  116,
-                  95,
-                  98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
           "name": "insurance_fund",
           "pda": {
             "seeds": [
@@ -2844,6 +2873,95 @@
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "initialize_order_buffer",
+      "docs": [
+        "Initialize the order_buffer for an existing market. MUST be",
+        "called after `initialize_market`. Separate from",
+        "`initialize_commit_buffer` to avoid Anchor 0.31's BPF",
+        "\"Overlapping copy\" invariant when two large (~5KB) boxed",
+        "accounts init in one ix."
+      ],
+      "discriminator": [
+        216,
+        7,
+        68,
+        242,
+        102,
+        120,
+        129,
+        36
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
     },
     {
       "name": "liquidate_portfolio",
@@ -3366,65 +3484,6 @@
               {
                 "kind": "account",
                 "path": "quote_mint"
-              }
-            ]
-          }
-        },
-        {
-          "name": "order_buffer",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  111,
-                  114,
-                  100,
-                  101,
-                  114,
-                  95,
-                  98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "commit_buffer",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  109,
-                  109,
-                  105,
-                  116,
-                  95,
-                  98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
               }
             ]
           }

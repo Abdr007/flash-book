@@ -228,8 +228,6 @@ export class FlashBookClient {
     initialOracleTicks: bigint | number;
   }): Promise<TransactionInstruction> {
     const market = this.market(args.baseMint, args.quoteMint);
-    const orderBuffer = this.orderBuffer(market.address);
-    const commitBuffer = this.commitBuffer(market.address);
     const fund = this.insuranceFund();
     const flp = this.flpExposure();
 
@@ -243,10 +241,47 @@ export class FlashBookClient {
         quoteVault: args.quoteVault,
         oracleAccount: args.oracleAccount,
         market: market.address,
-        orderBuffer: orderBuffer.address,
-        commitBuffer: commitBuffer.address,
         insuranceFund: fund.address,
         flpExposure: flp.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// MUST be called after `initializeMarketIx` (and before any
+  /// `placeLimitOrderIx` / `runBatchIx`). Initializes the order_buffer
+  /// for the market.
+  initializeOrderBufferIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const orderBuffer = this.orderBuffer(args.market);
+    return this.methods
+      .initializeOrderBuffer()
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        orderBuffer: orderBuffer.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// MUST be called after `initializeMarketIx` (and before any
+  /// `submitCommit` / `submitReveal`). Initializes the commit_buffer
+  /// for the market. Split from order_buffer init to dodge an Anchor
+  /// 0.31 BPF "Overlapping copy" invariant.
+  initializeCommitBufferIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const commitBuffer = this.commitBuffer(args.market);
+    return this.methods
+      .initializeCommitBuffer()
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        commitBuffer: commitBuffer.address,
         systemProgram: SystemProgram.programId,
       })
       .instruction();
