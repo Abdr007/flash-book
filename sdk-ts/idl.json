@@ -16,7 +16,12 @@
         "",
         "Trust model: `sequencer` is the same authority as `run_batch`; the",
         "fill data is taken at face value (production version verifies via",
-        "per-batch fill buffer or Merkle proof)."
+        "per-batch fill buffer or Merkle proof).",
+        "`taker_was_jit`: set to true if the matched taker order was",
+        "JIT-tagged (flag bit 3 on place_limit_order). The sequencer reads",
+        "this from the order's stored flags. When true, the maker earns",
+        "`market.params.jit_bonus_rebate_bps` extra rebate on top of the",
+        "base maker_rebate_bps. Passing false preserves legacy behaviour."
       ],
       "discriminator": [
         201,
@@ -227,6 +232,10 @@
         {
           "name": "taker_side",
           "type": "u8"
+        },
+        {
+          "name": "taker_was_jit",
+          "type": "bool"
         }
       ]
     },
@@ -2495,13 +2504,20 @@
         "next batch.",
         "",
         "`flags` is a bitfield encoding TIF + safety flags (Phoenix v1",
-        "patterns + dYdX / Binance / Hyperliquid):",
+        "patterns + dYdX / Binance / Hyperliquid + Drift JIT):",
         "",
         "bit 0: post_only       — reject if would cross spread on entry",
         "bit 1: reduce_only     — order can only shrink trader position",
         "bit 2: ioc             — immediate-or-cancel: don't rest after batch",
         "(the matcher fills as much as possible",
         "this batch, the rest is dropped)",
+        "bit 3: jit             — \"Just In Time\" auction tag. JIT-tagged",
+        "taker orders earn a BONUS rebate",
+        "(`market.params.jit_bonus_rebate_bps`)",
+        "for the maker that fills them. Drift-",
+        "style economic incentive: MMs preferentially",
+        "quote against JIT-tagged flow because the",
+        "rebate beats organic order flow.",
         "",
         "Pass 0 for a vanilla GTC limit. The legacy boolean `post_only`",
         "argument continues to work transparently — it is mapped to",
@@ -2927,6 +2943,76 @@
         {
           "name": "new_status",
           "type": "u8"
+        }
+      ]
+    },
+    {
+      "name": "set_trader_delegate",
+      "docs": [
+        "Set or clear the trader's delegate authority. The delegate is a",
+        "pubkey allowed to sign trader-bound ix on the trader's behalf.",
+        "Pass Pubkey::default() to clear. The trader's own signature",
+        "always works regardless — delegate is additive, not exclusive.",
+        "",
+        "Use cases:",
+        "• Master/hot-key split: master holds funds; hot key trades",
+        "(Hyperliquid + dYdX standard pattern).",
+        "• Multi-sig subaccount manager.",
+        "• MM bot keypair authorized to manage a vault's positions."
+      ],
+      "discriminator": [
+        133,
+        28,
+        39,
+        176,
+        29,
+        94,
+        7,
+        188
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "docs": [
+            "The trader signs to set/clear their own delegate. Only the trader",
+            "can change this field — the delegate cannot rotate themselves out."
+          ],
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "new_delegate",
+          "type": "pubkey"
         }
       ]
     },
@@ -4712,6 +4798,19 @@
       ]
     },
     {
+      "name": "TraderDelegateUpdatedEvent",
+      "discriminator": [
+        40,
+        214,
+        33,
+        142,
+        18,
+        204,
+        128,
+        23
+      ]
+    },
+    {
       "name": "TraderFeeTierUpdatedEvent",
       "discriminator": [
         40,
@@ -5973,6 +6072,41 @@
               "through the existing insurance-fund waterfall."
             ],
             "type": "u32"
+          },
+          {
+            "name": "liquidation_cooldown_slots",
+            "docs": [
+              "Cooldown in slots between consecutive liquidate_position calls on",
+              "the same position. Anti-cascade: prevents one underwater position",
+              "from getting hit repeatedly in adjacent blocks (each costs the",
+              "liquidatee a separate liquidation order + fee). Typical setting:",
+              "4-8 slots (~2-4 seconds). 0 = no cooldown (legacy behavior)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "liquidation_auction_duration_slots",
+            "docs": [
+              "Slots over which the liquidator reward grows from base to full.",
+              "Dutch-style auction on the REWARD: first responders get a smaller",
+              "reward, later responders progressively larger up to the full",
+              "`liquidator_reward_bps`. 0 = reward is always full (legacy).",
+              "Typical setting: 8-16 slots (~4-8 seconds). Encourages a",
+              "competitive keeper pool to spread out instead of all racing the",
+              "same block."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "jit_bonus_rebate_bps",
+            "docs": [
+              "Drift-style JIT bonus: extra bps of rebate the maker earns when",
+              "filling a JIT-tagged taker order (flag bit 3 on place_limit_order).",
+              "0 = JIT inactive. Typical setting: 5-20 bps (0.05-0.2% of notional)",
+              "added on top of the base maker_rebate_bps. Encourages MMs to",
+              "preferentially quote against tagged flow."
+            ],
+            "type": "u32"
           }
         ]
       }
@@ -6172,6 +6306,26 @@
           {
             "name": "last_settlement_batch",
             "type": "u64"
+          },
+          {
+            "name": "unhealthy_since_slot",
+            "docs": [
+              "Slot at which this position was first detected as unhealthy by a",
+              "`liquidate_position` call. 0 = healthy (or has never been",
+              "liquidated). Used to compute the Dutch-auction reward curve and",
+              "to enforce the per-position cooldown. Reset to 0 once the",
+              "position closes (size_lots → 0)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_liquidated_at_slot",
+            "docs": [
+              "Slot at which the most recent liquidate_position call against",
+              "this position landed. 0 = never liquidated. Used by the cooldown",
+              "gate."
+            ],
+            "type": "u64"
           }
         ]
       }
@@ -6212,6 +6366,26 @@
           {
             "name": "maker_share",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TraderDelegateUpdatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous",
+            "type": "pubkey"
+          },
+          {
+            "name": "new",
+            "type": "pubkey"
           }
         ]
       }
@@ -6292,6 +6466,23 @@
               "universal pattern at every CEX (Binance, OKX, Bybit, Hyperliquid)."
             ],
             "type": "u32"
+          },
+          {
+            "name": "delegate",
+            "docs": [
+              "Delegate authority. When non-default, the delegate may sign",
+              "trader-bound instructions (place_limit_order, cancel_order,",
+              "settle_funding, etc.) on the trader's behalf. Foundation for",
+              "subaccount / portfolio-margin patterns:",
+              "• Master keypair holds funds, delegates trading authority to a",
+              "hot key (Hyperliquid / dYdX standard).",
+              "• Multi-sig \"subaccount manager\" can act on behalf of the",
+              "trader without holding their funds.",
+              "Cleared by setting back to Pubkey::default(). The trader pubkey",
+              "itself ALWAYS retains authority — delegate is additive, not",
+              "exclusive (the trader can revoke at any time)."
+            ],
+            "type": "pubkey"
           }
         ]
       }

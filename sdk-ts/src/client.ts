@@ -46,6 +46,7 @@ export { TOKEN_PROGRAM_ID, associatedTokenAddress };
 export const ORDER_FLAG_POST_ONLY = 1 << 0;
 export const ORDER_FLAG_REDUCE_ONLY = 1 << 1;
 export const ORDER_FLAG_IOC = 1 << 2;
+export const ORDER_FLAG_JIT = 1 << 3;
 
 interface MethodsBuilder {
   accountsPartial: (accounts: Record<string, PublicKey>) => MethodsBuilder;
@@ -838,6 +839,10 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// `takerWasJit`: set to true when the matched taker order was
+  /// JIT-tagged (flag bit 3). Sequencer reads from the order's stored
+  /// flags. When true, maker earns market.params.jit_bonus_rebate_bps
+  /// extra rebate (Drift JIT incentive).
   applyFillIx(args: {
     sequencer: PublicKey;
     market: PublicKey;
@@ -846,6 +851,7 @@ export class FlashBookClient {
     sizeLots: bigint | number;
     priceTicks: bigint | number;
     takerSide: 'long' | 'short';
+    takerWasJit?: boolean;
   }): Promise<TransactionInstruction> {
     const takerState = this.traderState(args.takerTrader);
     const makerState = this.traderState(args.makerTrader);
@@ -857,6 +863,7 @@ export class FlashBookClient {
         args.sizeLots,
         args.priceTicks,
         args.takerSide === 'long' ? 0 : 1,
+        args.takerWasJit ?? false,
       )
       .accountsPartial({
         sequencer: args.sequencer,
@@ -867,6 +874,23 @@ export class FlashBookClient {
         takerPosition: takerPos.address,
         makerPosition: makerPos.address,
         systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Set or clear the trader's delegate authority. The trader signs;
+  /// the delegate is the new pubkey allowed to act on the trader's
+  /// behalf for trader-bound ix. Clear with PublicKey.default().
+  setTraderDelegateIx(args: {
+    trader: PublicKey;
+    delegate: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const state = this.traderState(args.trader);
+    return this.methods
+      .setTraderDelegate(args.delegate)
+      .accountsPartial({
+        trader: args.trader,
+        traderState: state.address,
       })
       .instruction();
   }

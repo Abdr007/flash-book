@@ -124,6 +124,9 @@ fn default_params() -> MarketParams {
         oracle_quorum_max_dispersion_bps: 0,
         max_position_ratio_bps: 0,
         liquidator_reward_bps: 0,
+        liquidation_cooldown_slots: 0,
+        liquidation_auction_duration_slots: 0,
+        jit_bonus_rebate_bps: 0,
     }
 }
 
@@ -3909,6 +3912,7 @@ async fn apply_fill_settles_two_trader_positions() {
             size_lots: 1,
             price_ticks: clearing_price,
             taker_side: 0, // alice is long taker
+            taker_was_jit: false,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer = payer
@@ -4087,6 +4091,7 @@ async fn apply_fill_charges_toxicity_tax_when_vpin_positive() {
             size_lots: 1,
             price_ticks: clearing_price,
             taker_side: 0,
+            taker_was_jit: false,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),

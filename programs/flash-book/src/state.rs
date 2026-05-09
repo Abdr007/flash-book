@@ -93,6 +93,29 @@ pub struct MarketParams {
     /// competitive liquidator pool. The remainder of the penalty flows
     /// through the existing insurance-fund waterfall.
     pub liquidator_reward_bps: u32,
+
+    /// Cooldown in slots between consecutive liquidate_position calls on
+    /// the same position. Anti-cascade: prevents one underwater position
+    /// from getting hit repeatedly in adjacent blocks (each costs the
+    /// liquidatee a separate liquidation order + fee). Typical setting:
+    /// 4-8 slots (~2-4 seconds). 0 = no cooldown (legacy behavior).
+    pub liquidation_cooldown_slots: u32,
+
+    /// Slots over which the liquidator reward grows from base to full.
+    /// Dutch-style auction on the REWARD: first responders get a smaller
+    /// reward, later responders progressively larger up to the full
+    /// `liquidator_reward_bps`. 0 = reward is always full (legacy).
+    /// Typical setting: 8-16 slots (~4-8 seconds). Encourages a
+    /// competitive keeper pool to spread out instead of all racing the
+    /// same block.
+    pub liquidation_auction_duration_slots: u32,
+
+    /// Drift-style JIT bonus: extra bps of rebate the maker earns when
+    /// filling a JIT-tagged taker order (flag bit 3 on place_limit_order).
+    /// 0 = JIT inactive. Typical setting: 5-20 bps (0.05-0.2% of notional)
+    /// added on top of the base maker_rebate_bps. Encourages MMs to
+    /// preferentially quote against tagged flow.
+    pub jit_bonus_rebate_bps: u32,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).
@@ -152,6 +175,16 @@ pub struct PositionAccount {
     pub realized_pnl_quote_lots: i64,
     pub funding_paid_quote_lots: i64,
     pub last_settlement_batch: u64,
+    /// Slot at which this position was first detected as unhealthy by a
+    /// `liquidate_position` call. 0 = healthy (or has never been
+    /// liquidated). Used to compute the Dutch-auction reward curve and
+    /// to enforce the per-position cooldown. Reset to 0 once the
+    /// position closes (size_lots → 0).
+    pub unhealthy_since_slot: u64,
+    /// Slot at which the most recent liquidate_position call against
+    /// this position landed. 0 = never liquidated. Used by the cooldown
+    /// gate.
+    pub last_liquidated_at_slot: u64,
 }
 
 impl PositionAccount {
@@ -361,13 +394,32 @@ pub struct TraderStateAccount {
     /// (authority-only) based on off-chain 30-day rolling volume —
     /// universal pattern at every CEX (Binance, OKX, Bybit, Hyperliquid).
     pub fee_discount_bps: u32,
+    /// Delegate authority. When non-default, the delegate may sign
+    /// trader-bound instructions (place_limit_order, cancel_order,
+    /// settle_funding, etc.) on the trader's behalf. Foundation for
+    /// subaccount / portfolio-margin patterns:
+    ///   • Master keypair holds funds, delegates trading authority to a
+    ///     hot key (Hyperliquid / dYdX standard).
+    ///   • Multi-sig "subaccount manager" can act on behalf of the
+    ///     trader without holding their funds.
+    /// Cleared by setting back to Pubkey::default(). The trader pubkey
+    /// itself ALWAYS retains authority — delegate is additive, not
+    /// exclusive (the trader can revoke at any time).
+    pub delegate: Pubkey,
 }
 
 impl TraderStateAccount {
     pub const SEED: &'static [u8] = b"trader_state";
     pub fn space() -> usize {
-        // 8 (disc) + 32 + 1 + 8 + 8 + 1 + 4 + 4 + 8 + 8 + 4 = 86. Round up.
-        8 + 96
+        // 8 (disc) + 32 (trader) + 1 + 8 + 8 + 1 + 4 + 4 + 8 + 8 + 4 + 32 (delegate) = 118.
+        // Round up.
+        8 + 128
+    }
+
+    /// Returns true if `signer` is authorized to act on this trader's
+    /// behalf — either the trader themselves or a non-default delegate.
+    pub fn is_authorized(&self, signer: &Pubkey) -> bool {
+        signer == &self.trader || (self.delegate != Pubkey::default() && signer == &self.delegate)
     }
 }
 

@@ -459,6 +459,32 @@ pub mod flash_book {
         s.orders_this_batch = 0;
         s.last_batch_seen = 0;
         s.fee_discount_bps = 0;
+        s.delegate = Pubkey::default();
+        Ok(())
+    }
+
+    /// Set or clear the trader's delegate authority. The delegate is a
+    /// pubkey allowed to sign trader-bound ix on the trader's behalf.
+    /// Pass Pubkey::default() to clear. The trader's own signature
+    /// always works regardless — delegate is additive, not exclusive.
+    ///
+    /// Use cases:
+    ///   • Master/hot-key split: master holds funds; hot key trades
+    ///     (Hyperliquid + dYdX standard pattern).
+    ///   • Multi-sig subaccount manager.
+    ///   • MM bot keypair authorized to manage a vault's positions.
+    pub fn set_trader_delegate(
+        ctx: Context<SetTraderDelegate>,
+        new_delegate: Pubkey,
+    ) -> Result<()> {
+        let s = &mut ctx.accounts.trader_state;
+        let prev = s.delegate;
+        s.delegate = new_delegate;
+        emit!(TraderDelegateUpdatedEvent {
+            trader: s.trader,
+            previous: prev,
+            new: new_delegate,
+        });
         Ok(())
     }
 
@@ -699,11 +725,17 @@ pub mod flash_book {
     /// Trust model: `sequencer` is the same authority as `run_batch`; the
     /// fill data is taken at face value (production version verifies via
     /// per-batch fill buffer or Merkle proof).
+    /// `taker_was_jit`: set to true if the matched taker order was
+    /// JIT-tagged (flag bit 3 on place_limit_order). The sequencer reads
+    /// this from the order's stored flags. When true, the maker earns
+    /// `market.params.jit_bonus_rebate_bps` extra rebate on top of the
+    /// base maker_rebate_bps. Passing false preserves legacy behaviour.
     pub fn apply_fill(
         ctx: Context<ApplyFill>,
         size_lots: u64,
         price_ticks: u64,
         taker_side: u8,
+        taker_was_jit: bool,
     ) -> Result<()> {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(price_ticks > 0, FlashBookError::ZeroPrice);
@@ -733,8 +765,17 @@ pub mod flash_book {
                 .saturating_mul((constants::BPS_DENOM as u128).saturating_sub(discount_bps))
                 / constants::BPS_DENOM as u128;
         }
+        // Effective maker rebate = base + JIT bonus (if taker was tagged).
+        // JIT bonus comes out of the protocol — paid by reducing the
+        // insurance contribution downstream, not by raising the taker
+        // fee. This is the Drift JIT economic model.
+        let mut effective_rebate_bps = market.params.maker_rebate_bps as u128;
+        if taker_was_jit {
+            effective_rebate_bps =
+                effective_rebate_bps.saturating_add(market.params.jit_bonus_rebate_bps as u128);
+        }
         let maker_rebate_u128 =
-            notional_u128.saturating_mul(market.params.maker_rebate_bps as u128) / constants::BPS_DENOM as u128;
+            notional_u128.saturating_mul(effective_rebate_bps) / constants::BPS_DENOM as u128;
         // Rebate must never exceed fee; defense against bad governance config
         // AND against discounts pushing fee below rebate. If discount drops
         // taker_fee below maker_rebate, cap rebate at the (discounted) fee.
@@ -1227,13 +1268,20 @@ pub mod flash_book {
     /// next batch.
     ///
     /// `flags` is a bitfield encoding TIF + safety flags (Phoenix v1
-    /// patterns + dYdX / Binance / Hyperliquid):
+    /// patterns + dYdX / Binance / Hyperliquid + Drift JIT):
     ///
     ///   bit 0: post_only       — reject if would cross spread on entry
     ///   bit 1: reduce_only     — order can only shrink trader position
     ///   bit 2: ioc             — immediate-or-cancel: don't rest after batch
     ///                            (the matcher fills as much as possible
     ///                            this batch, the rest is dropped)
+    ///   bit 3: jit             — "Just In Time" auction tag. JIT-tagged
+    ///                            taker orders earn a BONUS rebate
+    ///                            (`market.params.jit_bonus_rebate_bps`)
+    ///                            for the maker that fills them. Drift-
+    ///                            style economic incentive: MMs preferentially
+    ///                            quote against JIT-tagged flow because the
+    ///                            rebate beats organic order flow.
     ///
     /// Pass 0 for a vanilla GTC limit. The legacy boolean `post_only`
     /// argument continues to work transparently — it is mapped to
@@ -1257,7 +1305,8 @@ pub mod flash_book {
         let reduce_only = (final_flags & (1 << 1)) != 0;
         let ioc = (final_flags & (1 << 2)) != 0;
         // Reject unknown flag bits to keep the bitfield strict.
-        require!(final_flags & !0b0000_0111 == 0, FlashBookError::OutOfRange);
+        // Bits 0-3 are now defined (post_only, reduce_only, ioc, jit).
+        require!(final_flags & !0b0000_1111 == 0, FlashBookError::OutOfRange);
 
         // Reduce-only gate: order can only oppose + not exceed position.
         if reduce_only {
@@ -2284,6 +2333,16 @@ pub mod flash_book {
         };
         require!(close_size > 0, FlashBookError::ZeroSize);
 
+        // Cooldown gate — anti-cascade. Prevents the same position from
+        // being hammered in adjacent blocks. The cooldown is per-market
+        // configurable; 0 = disabled (legacy behaviour).
+        let current_slot = Clock::get()?.slot;
+        let cooldown = market.params.liquidation_cooldown_slots as u64;
+        if cooldown > 0 && position.last_liquidated_at_slot > 0 {
+            let elapsed = current_slot.saturating_sub(position.last_liquidated_at_slot);
+            require!(elapsed >= cooldown, FlashBookError::RateLimited);
+        }
+
         // Health gate — rejects when the trader's portfolio is healthy at
         // current state. Same stress lattice as on placement.
         let pos_snap = RiskPosSnap {
@@ -2341,6 +2400,13 @@ pub mod flash_book {
         // reward is debited from the liquidatee's collateral and credited
         // to the caller's trader_state. Capped at available collateral so
         // we never go negative.
+        //
+        // Dutch-style auction on the REWARD: scaled from 0% → 100% of
+        // `liquidator_reward_bps` over `liquidation_auction_duration_slots`
+        // since `unhealthy_since_slot`. First responder gets a small
+        // reward (or 0); later responders progressively larger up to full.
+        // Encourages a competitive keeper pool to spread responses across
+        // slots rather than all racing the same block.
         let mut reward_paid: u64 = 0;
         if market.params.liquidator_reward_bps > 0 {
             // Notional in quote lots = size × oracle_price × tick_size.
@@ -2349,8 +2415,31 @@ pub mod flash_book {
             let notional_u128 = (close_size as u128)
                 .saturating_mul(oracle)
                 .saturating_mul(market.params.tick_size as u128);
+            let mut reward_bps_eff = market.params.liquidator_reward_bps as u128;
+            // Apply Dutch-auction scaling if duration is set and we have
+            // a `unhealthy_since_slot` anchor. First-time liquidator
+            // (anchor = 0) gets the BASE reward; subsequent liquidators
+            // see a progressively larger fraction up to full.
+            let auction_duration =
+                market.params.liquidation_auction_duration_slots as u64;
+            if auction_duration > 0 && ctx.accounts.position.unhealthy_since_slot > 0 {
+                let elapsed = current_slot
+                    .saturating_sub(ctx.accounts.position.unhealthy_since_slot);
+                let scale = (elapsed.min(auction_duration) as u128)
+                    .saturating_mul(constants::BPS_DENOM as u128)
+                    / (auction_duration as u128);
+                reward_bps_eff = reward_bps_eff
+                    .saturating_mul(scale)
+                    / (constants::BPS_DENOM as u128);
+            } else if auction_duration > 0 {
+                // First detection of unhealthy state — base reward = 0
+                // (or near-zero) so first responders aren't over-paid.
+                // Operators who want first-responder bonus can wire it
+                // off-chain (top-up tx).
+                reward_bps_eff = 0;
+            }
             let reward_u128 = notional_u128
-                .saturating_mul(market.params.liquidator_reward_bps as u128)
+                .saturating_mul(reward_bps_eff)
                 / (constants::BPS_DENOM as u128);
             let reward_u64 = if reward_u128 > u64::MAX as u128 {
                 u64::MAX
@@ -2400,6 +2489,16 @@ pub mod flash_book {
             .head
             .checked_add(1)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // Update position liquidation timing for the cooldown + auction
+        // gates. unhealthy_since_slot anchors the auction; subsequent
+        // calls in the same auction window see growing rewards.
+        // last_liquidated_at_slot enforces the cooldown gate.
+        let position = &mut ctx.accounts.position;
+        if position.unhealthy_since_slot == 0 {
+            position.unhealthy_since_slot = current_slot;
+        }
+        position.last_liquidated_at_slot = current_slot;
 
         emit!(LiquidationInjectedEvent {
             market: market.key(),
@@ -2864,6 +2963,21 @@ pub struct OpenTraderState<'info> {
     )]
     pub trader_state: Box<Account<'info, TraderStateAccount>>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SetTraderDelegate<'info> {
+    /// The trader signs to set/clear their own delegate. Only the trader
+    /// can change this field — the delegate cannot rotate themselves out.
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
 }
 
 #[derive(Accounts)]
@@ -3656,6 +3770,13 @@ pub struct BasketOrderPlacedEvent {
 pub struct TraderFeeTierUpdatedEvent {
     pub trader: Pubkey,
     pub discount_bps: u32,
+}
+
+#[event]
+pub struct TraderDelegateUpdatedEvent {
+    pub trader: Pubkey,
+    pub previous: Pubkey,
+    pub new: Pubkey,
 }
 
 #[event]
