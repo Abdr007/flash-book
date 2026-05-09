@@ -49,6 +49,9 @@ export const ORDER_FLAG_IOC = 1 << 2;
 
 interface MethodsBuilder {
   accountsPartial: (accounts: Record<string, PublicKey>) => MethodsBuilder;
+  remainingAccounts: (
+    metas: ReadonlyArray<{ pubkey: PublicKey; isWritable: boolean; isSigner: boolean }>,
+  ) => MethodsBuilder;
   instruction: () => Promise<TransactionInstruction>;
 }
 

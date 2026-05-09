@@ -98,6 +98,31 @@ export {
   type V2OrderMeta,
 } from './flash-v2-venue.ts';
 
+// ─── Advanced order types (OCO / Iceberg / Trailing) ────────────────
+export {
+  OcoOrder,
+  IcebergOrder,
+  TrailingStopOrder,
+  type OcoConfig,
+  type OcoState,
+  type IcebergConfig,
+  type IcebergState,
+  type TrailingStopConfig,
+  type TrailingStopState,
+  type OrderTypeAction,
+  type OrderTypeObservation,
+  type Side as OrderTypeSide,
+} from './order-types.ts';
+
+// ─── WebSocket subscriptions ─────────────────────────────────────────
+export {
+  subscribeAccount,
+  subscribeProgram,
+  SubscriptionManager,
+  type AccountSubscription,
+  type SubscriptionOptions,
+} from './subscriptions.ts';
+
 // ─── Smart router (multi-venue) ──────────────────────────────────────
 export { SmartRouter, type SmartRouterConfig, type RoutingPolicy } from './smart-router.ts';
 
