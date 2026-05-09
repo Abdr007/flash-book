@@ -2085,6 +2085,15 @@ pub mod flash_book {
             FlashBookError::OutOfRange
         );
 
+        // Bootstrap guardrails: in the first N batches after a
+        // permissionless deploy, both per-trader and whole-market caps
+        // are tightened by 4× to defend against snipers in the
+        // price-discovery window. Caller sees the same error codes;
+        // the EFFECTIVE limit is `cap / 4` during bootstrap.
+        let in_bootstrap = market.params.bootstrap_period_batches > 0
+            && market.current_batch < market.params.bootstrap_period_batches as u64;
+        let bootstrap_div: u64 = if in_bootstrap { 4 } else { 1 };
+
         // Concentration cap: prevent any single trader from building a
         // position larger than `max_position_lots_per_trader`. Mitigates
         // the POPCAT-style attack where a single actor uses many wallets
@@ -2097,8 +2106,9 @@ pub mod flash_book {
             // Add the new order size; in the worst case (same side) this is
             // the post-fill position size.
             let new_size = existing_size.saturating_add(size_lots);
+            let effective_cap = cap / bootstrap_div;
             require!(
-                new_size <= cap,
+                new_size <= effective_cap,
                 FlashBookError::PositionSizeCapExceeded,
             );
         }
@@ -2164,7 +2174,8 @@ pub mod flash_book {
         if oi_cap > 0 {
             let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
             let projected = cur.saturating_add(size_lots);
-            require!(projected <= oi_cap, FlashBookError::OpenInterestCapExceeded);
+            let effective_cap = oi_cap / bootstrap_div;
+            require!(projected <= effective_cap, FlashBookError::OpenInterestCapExceeded);
         }
 
         // Stress-lattice margin gate. If the trader has an existing position
@@ -4028,6 +4039,76 @@ pub mod flash_book {
         market.cum_funding_index = new_index;
         market.last_funding_rate_bps_per_sec = dampened_rate;
 
+        // Funding-per-period cap (anti-gouge). When set, the absolute
+        // cumulative funding paid over a rolling `funding_period_seconds`
+        // window cannot exceed `funding_per_period_max_bps` of position
+        // notional. Once hit, the index advance for the rest of the
+        // window is scaled to fit. Smarter than HL — extended one-way
+        // funding can't drain a position past the daily ceiling.
+        if market.params.funding_per_period_max_bps > 0
+            && market.params.funding_period_seconds > 0
+        {
+            let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            // Period rollover: reset accumulator when window elapsed.
+            if market.period_started_at_unix == 0 {
+                market.period_started_at_unix = now_unix;
+                market.period_funding_paid_abs_bps = 0;
+            } else if now_unix.saturating_sub(market.period_started_at_unix)
+                >= market.params.funding_period_seconds as u64
+            {
+                market.period_started_at_unix = now_unix;
+                market.period_funding_paid_abs_bps = 0;
+            }
+            // Convert this batch's index_delta into a bps-of-notional
+            // contribution. ΔI is Q64.64 of (rate_bps_per_sec × Δt /
+            // 10_000); the bps contribution per unit notional is
+            // |ΔI| / 2^64 × 10_000.
+            let raw_delta = new_index.saturating_sub(market.cum_funding_index);
+            let abs_delta = raw_delta.unsigned_abs();
+            let abs_bps_u128 = abs_delta
+                .saturating_mul(constants::BPS_DENOM as u128)
+                >> constants::FUNDING_INDEX_FRACTIONAL_BITS;
+            let abs_bps = if abs_bps_u128 > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                abs_bps_u128 as u64
+            };
+            let cap = market.params.funding_per_period_max_bps as u64;
+            let prior = market.period_funding_paid_abs_bps;
+            let projected = prior.saturating_add(abs_bps);
+            if projected > cap {
+                // Scale index advance so we land exactly at the cap.
+                let allowed = cap.saturating_sub(prior) as u128;
+                let scale_num = allowed;
+                let scale_den = abs_bps as u128;
+                if scale_den == 0 {
+                    // Already at cap; nothing to do (index unchanged).
+                } else {
+                    let scaled_delta = (raw_delta as i128)
+                        .saturating_mul(scale_num as i128)
+                        / scale_den as i128;
+                    market.cum_funding_index = market
+                        .cum_funding_index
+                        .saturating_add(scaled_delta);
+                    market.period_funding_paid_abs_bps = cap;
+                    // Rate also scales (off-chain monitors see the
+                    // attenuated rate, not the unattenuated one).
+                    let rate_scale = ((dampened_rate as i128)
+                        .saturating_mul(scale_num as i128))
+                        / scale_den.max(1) as i128;
+                    market.last_funding_rate_bps_per_sec = clamp_i128_to_i64(rate_scale);
+                    emit!(FundingPeriodCapHitEvent {
+                        market: market.key(),
+                        period_started_at_unix: market.period_started_at_unix,
+                        cap_bps: cap,
+                        attenuated_rate_bps_per_sec: market.last_funding_rate_bps_per_sec,
+                    });
+                }
+            } else {
+                market.period_funding_paid_abs_bps = projected;
+            }
+        }
+
         // 2. Load buffered orders. SKIP GTT-expired orders — the slot
         //    stays valid (cleanup keepers reclaim rent later via
         //    cancel_order) but the matcher pretends the order isn't
@@ -5452,6 +5533,8 @@ fn initialize_market_inner(
     market.total_fees_collected = 0;
     market.total_toxicity_tax_collected = 0;
     market.total_liquidations = 0;
+    market.period_started_at_unix = 0;
+    market.period_funding_paid_abs_bps = 0;
     market.params = params;
 
     let buffer = &mut ctx.accounts.order_buffer;
@@ -7637,6 +7720,18 @@ pub struct QuoteLadderSnapshotEvent {
     pub top_bid_size_lots: u64,
     pub top_ask_size_lots: u64,
     pub level_count: u8,
+}
+
+/// Emitted when funding hits the per-period cap and is scaled to fit.
+/// Off-chain monitors page operators on repeated emissions (sign that
+/// the cap is too tight or that the market is in extended one-way
+/// funding stress).
+#[event]
+pub struct FundingPeriodCapHitEvent {
+    pub market: Pubkey,
+    pub period_started_at_unix: u64,
+    pub cap_bps: u64,
+    pub attenuated_rate_bps_per_sec: i64,
 }
 
 /// Anti-flash-crash event. Emitted when the post-batch mark would have

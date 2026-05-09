@@ -187,6 +187,28 @@ pub struct MarketParams {
     /// Capped at MARK_HISTORY_LEN (16). Typical: 4-8 batches.
     pub funding_premium_twap_window: u8,
 
+    /// Funding-per-period cap (anti-gouge). When non-zero, the absolute
+    /// cumulative funding paid in a rolling window of
+    /// `funding_period_seconds` cannot exceed `funding_per_period_max_bps`
+    /// (in bps of position notional). Once the cap is hit, the funding
+    /// rate is scaled down for the remainder of the window so the
+    /// total stays at or under the cap. Smarter than HL where extended
+    /// one-way funding can drain a position without a daily ceiling.
+    /// Bookkeeping fields live on MarketAccount (period_*).
+    /// 0 = disabled (legacy / HL-equivalent).
+    pub funding_per_period_max_bps: u32,
+    /// Period length for the funding cap, in seconds. Typical: 86_400
+    /// (24h). Ignored if `funding_per_period_max_bps == 0`.
+    pub funding_period_seconds: u32,
+
+    /// Bootstrap-period batches for permissionless markets. Within the
+    /// first N batches after a market is initialized, all per-trader
+    /// and whole-market position/OI caps are tightened by a factor of
+    /// 4 to defend against snipers in the price-discovery window. After
+    /// `current_batch >= bootstrap_period_batches`, normal caps apply.
+    /// 0 = disabled (legacy markets and protocol-curated deploys).
+    pub bootstrap_period_batches: u32,
+
     /// Symmetric-OI funding dampener. When true, the funding rate is
     /// scaled by the OI imbalance:
     ///   skew_bps = |oi_long − oi_short| × 10_000 / (oi_long + oi_short)
@@ -237,6 +259,13 @@ pub struct MarketAccount {
     pub total_fees_collected: u64,
     pub total_toxicity_tax_collected: u64,
     pub total_liquidations: u64,
+    /// Period bookkeeping for the funding-per-period cap. The
+    /// `period_funding_paid_abs_bps` accumulator advances with every
+    /// `settle_funding` call; resets at the start of each new period.
+    /// `period_started_at_unix == 0` means uninitialised — first
+    /// settlement seeds it from the current clock.
+    pub period_started_at_unix: u64,
+    pub period_funding_paid_abs_bps: u64,
     pub params: MarketParams,
 }
 

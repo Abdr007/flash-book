@@ -81,6 +81,12 @@ export interface MarketParamsRaw {
   fundingPremiumTwapWindow: number;
   /** Symmetric-OI funding dampener (smarter than HL — balanced book → 0 funding). */
   fundingOiDampening: boolean;
+  /** Funding-per-period cap in bps of notional. 0 = no cap. */
+  fundingPerPeriodMaxBps: number;
+  /** Period length (seconds) for the funding cap. Typical 86_400 (24h). */
+  fundingPeriodSeconds: number;
+  /** Bootstrap period (batches) for permissionless markets — caps tightened 4×. */
+  bootstrapPeriodBatches: number;
 }
 
 /** Sensible default parameter set for SOL/BTC/ETH-style major markets. */
@@ -168,6 +174,13 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
     // for non-HIP-3 markets where balanced flow is the norm. Smarter
     // than HL — funding only kicks in when the book actually leans.
     fundingOiDampening: false,
+    // Funding-per-period cap (off by default). Production: 5_000 bps over
+    // 86_400s (24h) is a reasonable starting envelope.
+    fundingPerPeriodMaxBps: 0,
+    fundingPeriodSeconds: 0,
+    // Bootstrap guardrails (off by default). HIP-3 deploys should set
+    // ~720 batches (~36s) to clamp first-window snipers.
+    bootstrapPeriodBatches: 0,
   };
 }
 

@@ -137,6 +137,9 @@ fn default_params() -> MarketParams {
         concentration_extra_mmr_bps: 0,
         funding_premium_twap_window: 0,
         funding_oi_dampening: false,
+        funding_per_period_max_bps: 0,
+        funding_period_seconds: 0,
+        bootstrap_period_batches: 0,
     }
 }
 
