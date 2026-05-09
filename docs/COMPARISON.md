@@ -1,10 +1,15 @@
 # Flash Book vs every modern orderbook DEX
 
 How Flash Book compares to the state of the art (2026 Q2 snapshot).
-Updated to reflect everything shipped through commit `7beda3a`
-(waves 1–5: native trigger/TWAP orders, builder codes, negative-fee
-tier, HIP-3 permissionless markets, multi-threshold margin alerts,
-trading-rewards eligibility events).
+Updated to reflect everything shipped through wave 11 — beyond the
+wave-5 baseline this adds: bracket orders, user-managed trading vaults
+(MTM NAV), cross-margin sweep (position-aware), per-position leverage
+caps, native ADL with off-chain ranking + on-chain bankruptcy-price
+math, slashable HIP-3 deployer bond, mass cancel, GTT order expiry,
+4-mode self-trade prevention, on-chain trailing stops, native iceberg
+orders, anti-flash-crash mark-cap + whole-market OI cap, 7 keepers
+shipped in `@flash-book/bot`, view ixs for predicted funding + FLP
+quote ladder snapshot.
 
 ## TL;DR
 
@@ -49,14 +54,29 @@ trading-rewards eligibility events).
 | Real-time invariant monitor | partial | no | no | no | no | no | no | no | **`verify_market_invariants` + auto-pause** |
 | Reduce-only / IOC / JIT flags | yes | yes | yes | yes | yes | partial | partial | yes | **yes (flag bitfield)** |
 | Tiered fees | volume tiers | volume tiers | volume tiers | volume tiers | n/a | n/a | volume tiers | volume tiers | **discount + NEGATIVE-fee top tier (-20% of base)** |
-| Native on-chain trigger (SL/TP) orders | yes | partial | partial | partial | no | no | partial | partial | **yes (`place_trigger_order`)** |
+| Native on-chain trigger (SL/TP) orders | yes | partial | partial | partial | no | no | partial | partial | **yes (`place_trigger_order` + reduce_only + GTT)** |
 | Native on-chain TWAP orders | yes | no | no | no | no | no | no | no | **yes (`place_twap_order` + permissionless slice exec)** |
+| Native on-chain bracket orders (atomic OCO TP+SL) | partial | no | no | no | no | no | no | no | **yes (`place_bracket_order` — single-tx parent + 2 OCO triggers)** |
+| Native on-chain trailing stops | yes | no | no | no | no | no | no | no | **yes (`update_trailing_stop` permissionless ratchet)** |
+| Native on-chain iceberg orders | yes | no | no | no | no | no | no | no | **yes (`place_iceberg_order` + permissionless replenish)** |
+| Mass cancel (single-tx flatten) | yes | partial | partial | partial | no | no | partial | partial | **yes (`cancel_all_orders_in_market`)** |
+| GTT order expiry | yes | partial | partial | yes | no | no | partial | yes | **yes (`expires_at_slot` on every order)** |
+| Self-trade prevention modes | 4 modes | partial | partial | partial | partial | no | partial | partial | **3 modes (CancelNewest / CancelOldest / CancelBoth)** |
 | Builder codes (frontend fee share) | yes | no | no | no | no | no | no | no | **yes (`set_trader_builder` + `BuilderFeeOwedEvent`)** |
 | Referral / affiliate program | yes | no | no | no | no | no | no | no | **yes (`set_trader_referrer`, one-time-write, anti-rotation)** |
 | Multi-threshold pre-liq margin alerts | yes | partial | partial | no | no | no | no | no | **yes (3 tiers, on-chain emit per fill)** |
 | Permissionless market creation (HIP-3) | **yes** | no | no | no | no | no | no | no | **yes (`permissionless_initialize_market`, safe envelope)** |
+| HIP-3 slashable deployer bond | yes | n/a | n/a | n/a | n/a | n/a | n/a | n/a | **yes (`MarketBondAccount` + 7-day unbond delay)** |
 | Pre-launch (pre-TGE) perp markets | yes | no | no | no | no | no | no | no | **yes (`is_pre_launch` flag)** |
 | Trading rewards / points eligibility | yes (HYPE) | no | no | no | no | no | no | partial | **yes (per-fill `TradingRewardEligibleEvent`)** |
+| User-managed trading vaults (with HWM perf fee) | yes | no | no | no | no | no | no | no | **yes (`VaultAccount`, MTM NAV via market walk)** |
+| Auto-Deleverage (ADL) | yes | partial | yes | partial | n/a | n/a | partial | partial | **yes (`auto_deleverage` + bankruptcy-price math)** |
+| Per-position leverage cap | yes | no | no | no | no | no | no | no | **yes (`set_position_leverage`)** |
+| Cross-margin sweep between subaccounts | yes | yes | yes | partial | n/a | n/a | partial | yes | **yes (`sweep_collateral` — position-aware via MTM walk)** |
+| Anti-flash-crash mark sanity cap | yes | partial | partial | partial | n/a | n/a | partial | partial | **yes (`mark_change_max_bps` per-batch clamp)** |
+| Whole-market OI hard cap | yes | yes | yes | yes | n/a | n/a | yes | yes | **yes (`max_oi_base_lots`)** |
+| View: predicted funding | yes | partial | partial | partial | n/a | n/a | partial | partial | **yes (`view_predicted_funding` ix + simulate)** |
+| View: orderbook quote ladder | yes | yes | yes | yes | yes | yes | yes | yes | **yes (`view_quote_ladder` ix — deterministic re-quote)** |
 | Trader delegate / subaccount | yes | subaccounts | subaccounts | sub | n/a | n/a | partial | yes | **delegate slot (master/hot-key split)** |
 | Decentralized | mostly | yes | yes | partial | yes | yes | yes | yes | **yes** |
 | Settles to Solana mainnet | no | yes | no | no | yes | yes | no | no | **yes** |
@@ -290,11 +310,14 @@ Flash Book ships:
 | Funding sweep keeper | n/a (lazy) | n/a (lazy) | n/a (lazy) | **`FundingKeeper` ships** |
 | Invariant monitor keeper | community | community | community | **`InvariantMonitor` ships** |
 | ATA cleanup keeper | n/a (no SPL ATA) | community | n/a | **`AtaCleanupKeeper` ships** |
+| ADL keeper | n/a (centralized) | community | community | **`AdlKeeper` ships (off-chain ranking, on-chain eligibility)** |
+| Trailing-stop ratchet keeper | n/a (in MM bot) | community | community | **`TrailingStopKeeper` ships** |
+| Iceberg replenishment keeper | n/a (in MM bot) | community | community | **`IcebergKeeper` ships** |
 | Keeper auto-discovery | community | community | community | **`getProgramAccounts` scanner ships** |
 | Multi-venue smart router | community | community | community | **`SmartRouter` (V2+V3)** |
 | Telemetry (Prometheus) | community | community | community | **`MetricsRegistry` + push** |
 | Hot config reload | community | community | community | **`HotConfigReloader`** |
-| Advanced order types (OCO/Iceberg/Trailing) | community | partial | community | **`OcoOrder`, `IcebergOrder`, `TrailingStopOrder`** |
+| Advanced order types (OCO/Iceberg/Trailing) | community | partial | community | **NATIVE on chain + bot-side `OcoOrder`/`IcebergOrder`/`TrailingStopOrder` for cross-venue** |
 
 Flash Book is the only protocol where every box above is shipped first-party,
 audited together, and tested against the on-chain state machine in the same
@@ -367,33 +390,33 @@ and Flash Trade gains the most advanced on-chain matcher ever shipped.
 
 ## What we deliberately did NOT clone from Hyperliquid
 
-To stay honest about scope:
+The wave-5-era exclusion list got obsoleted as we shipped the items.
+Updated honest list (still genuinely deferred or non-engineering):
 
-- **Subaccounts as a separate account type.** HL's subaccounts are a UX
-  pattern; we cover the same functionality via the existing
-  `delegate` slot on TraderStateAccount (master keypair holds funds,
-  delegate keypair trades). A separate SubaccountAccount type with
-  cross-margin sweep adds a lot of state and account permutations for
-  what users can already get from "create a second wallet." If demand
-  appears, the slot is reserved.
-- **Position-specific leverage cap.** HL lets you set a leverage cap
-  per position; we use stress-lattice cross-margin per portfolio plus
-  per-market `max_leverage`. Adding per-position leverage requires
-  reworking the lattice gate. Tracked but not yet a user pain point.
+- **Subaccounts as a separate account type.** Achievable today via the
+  existing `delegate` slot on TraderStateAccount (master keypair holds
+  funds + delegates trading authority). Plus `sweep_collateral` (now
+  position-aware) handles cross-margin rebalance. A separate
+  SubaccountAccount type adds duplicated state and account
+  permutations for negligible UX gain — every subaccount need is
+  already coverable.
 - **HYPE-style governance token.** We emit `TradingRewardEligibleEvent`
-  per fill so any token launch can compute eligibility; the token
-  itself is a governance + tokenomics decision, not an engineering
-  one.
-- **Slashable HIP-3 deployer bond.** Our v1 envelope (max leverage,
-  margin floors, position caps) prevents the obvious griefing without
-  requiring a bond. A slashable bond can be added on top of the
-  existing creator slot when the HYPE-equivalent token exists.
-- **User-managed trading vaults.** Achievable with the existing LP-
-  share NAV math + delegate slot (a vault is a TraderState with
-  delegate = strategist). A first-party "deploy a vault" flow adds
-  significant UX surface and is deferred until a real strategist
-  wants to ship one.
+  per fill so any token launch can compute eligibility off-chain; the
+  token itself is a governance + tokenomics decision, not an
+  engineering one. Trading-rewards plumbing is wired.
+- **Cross-asset cross-collateral** (e.g. SOL collateral backing SOL
+  perp). Requires per-asset oracle weighting in every margin
+  computation — substantial refactor of the stress lattice. Tracked
+  for a future architectural pass.
+- **CME-style margin tier scaling** (margin requirement scales with
+  position size). We use a single per-market maintenance margin ratio
+  + the per-trader leverage cap; tier scaling would touch the
+  property-tested risk module surface. Tracked.
+- **Block-trade RFQ.** Whales can negotiate via OTC desks today and
+  settle via existing trade ixs. A native RFQ surface is mostly an
+  off-chain matching layer; on-chain primitives are already
+  sufficient.
 
-These exclusions are deliberate scope discipline, not gaps. Each is
-documented with the existing primitive that covers most of the value
-and the seam where the full feature would slot in.
+The previously-listed "deferred" items (HIP-3 bond, user vaults,
+position-specific leverage) all SHIPPED. Updates inline in the matrix
+above.

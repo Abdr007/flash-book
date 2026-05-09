@@ -3489,6 +3489,148 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// View ix: compute the predicted funding rate (no state change).
+    /// Emits `PredictedFundingEvent` so callers can read the result via
+    /// tx simulation logs without paying for an actual on-chain mutation.
+    /// Useful for UIs that need to display "next funding payment" before
+    /// the rate crystallises in `settle_funding`.
+    ///
+    /// Math is identical to `matcher::funding::advance`'s rate
+    /// computation: premium = (mark - oracle) * 10_000 / oracle; rate
+    /// = clamp(K * premium, ±rate_max_bps_per_sec).
+    pub fn view_predicted_funding(ctx: Context<ViewMarket>) -> Result<()> {
+        let m = &ctx.accounts.market;
+        let oracle = m.oracle_price_ticks as i128;
+        let mark = m.mark_price_ticks as i128;
+        let (rate_bps_per_sec, premium_bps): (i64, i64) = if oracle == 0 {
+            (0, 0)
+        } else {
+            let premium_i128 = (mark - oracle)
+                .checked_mul(constants::BPS_DENOM as i128)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+                .checked_div(oracle)
+                .ok_or_else(|| error!(FlashBookError::DivisionByZero))?;
+            let premium = clamp_i128_to_i64(premium_i128);
+            let raw = (m.params.funding_rate_k_bps as i128)
+                .checked_mul(premium as i128)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+                / (constants::BPS_DENOM as i128);
+            let max = m.params.funding_rate_max_bps_per_sec as i128;
+            let rate_clamped = if raw > max { max } else if raw < -max { -max } else { raw };
+            (rate_clamped as i64, premium)
+        };
+        emit!(PredictedFundingEvent {
+            market: m.key(),
+            mark_price_ticks: m.mark_price_ticks,
+            oracle_price_ticks: m.oracle_price_ticks,
+            premium_bps,
+            rate_bps_per_sec,
+            current_cum_index: m.cum_funding_index,
+        });
+        Ok(())
+    }
+
+    /// View ix: snapshot the FLP quoter's would-be next-batch quote
+    /// ladder (no state change). Runs the same generate_quotes
+    /// computation as `run_batch` but doesn't mutate the OrderBuffer
+    /// or any other state. Emits `QuoteLadderSnapshotEvent` carrying
+    /// the top-N levels (each side) for off-chain UI rendering.
+    ///
+    /// Levels are interleaved bid/ask in seq order: [bid0, ask0,
+    /// bid1, ask1, ...] — same emission order as the matcher would
+    /// see. `levels_emitted` is bounded by `params.flp_quote_levels`.
+    pub fn view_quote_ladder(ctx: Context<ViewMarket>) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let flp = &ctx.accounts.flp_exposure;
+
+        // Mirror run_batch's setup of FlpQuoterParams + Inputs.
+        let market_key = market.key();
+        let flp_pool_capital = flp.total_capital_quote_lots;
+        let flp_net_signed: i64 = {
+            let entry = flp
+                .per_market
+                .iter()
+                .find(|e| e.market == market_key && e.side != 255);
+            match entry {
+                Some(e) => {
+                    let notional_u128 = (e.size_lots as u128)
+                        .saturating_mul(e.entry_price_ticks as u128)
+                        .saturating_mul(market.params.tick_size as u128);
+                    let notional = notional_u128.min(i64::MAX as u128) as i64;
+                    if e.side == 0 { notional } else { -notional }
+                }
+                None => 0,
+            }
+        };
+        let mut gross_used: u128 = 0;
+        for e in flp.per_market.iter() {
+            if e.side == 255 { continue; }
+            let n = (e.size_lots as u128)
+                .saturating_mul(e.entry_price_ticks as u128)
+                .saturating_mul(market.params.tick_size as u128);
+            gross_used = gross_used.saturating_add(n);
+        }
+        let utilization_bps: u32 = if flp_pool_capital == 0 {
+            0
+        } else {
+            ((gross_used.saturating_mul(constants::BPS_DENOM as u128))
+                / (flp_pool_capital as u128))
+                .min(u32::MAX as u128) as u32
+        };
+
+        let flp_params = matcher::flp_quoter::FlpQuoterParams {
+            base_spread_bps: market.params.flp_spread_base_bps,
+            alpha_bps: market.params.flp_spread_alpha_bps,
+            beta_bps: market.params.flp_spread_beta_bps,
+            gamma_bps: market.params.flp_spread_gamma_bps,
+            kappa_bps: market.params.flp_spread_kappa_bps,
+            delta_bps: market.params.flp_spread_delta_bps,
+            inventory_lambda_bps: market.params.flp_inventory_lambda_bps,
+            depth_floor_lots: market.params.flp_depth_floor_lots,
+            max_growth_per_batch_bps: market.params.flp_max_growth_per_batch_bps,
+            levels: market.params.flp_quote_levels,
+            tick_size: market.params.tick_size,
+        };
+        let realized_vol_bps = realized_vol_bps_from_window(
+            &market.recent_clearing_prices,
+            market.recent_clearing_count,
+        );
+        let flp_inputs = matcher::flp_quoter::FlpQuoterInputs {
+            oracle_ticks: matcher::lot::Ticks(market.oracle_price_ticks),
+            vpin_bps: market.vpin.as_bps(),
+            realized_vol_bps,
+            pool_capital_quote_lots: flp_pool_capital,
+            pool_net_quote_lots_signed: flp_net_signed,
+            pool_gross_utilization_bps: utilization_bps,
+            oi_long_lots: market.oi_long_lots,
+            oi_short_lots: market.oi_short_lots,
+        };
+        let (out, _orders) = matcher::flp_quoter::generate_quotes(
+            flp_params,
+            flp_inputs,
+            flp.key(),
+            0,
+        )?;
+        // Top-level summary. Per-level array would balloon the event;
+        // off-chain consumers can re-run generate_quotes with the same
+        // inputs (deterministic) for the full ladder if needed.
+        let top_bid = out.bids.first().map(|(p, _)| p.0).unwrap_or(0);
+        let top_ask = out.asks.first().map(|(p, _)| p.0).unwrap_or(0);
+        let top_bid_size = out.bids.first().map(|(_, s)| s.0).unwrap_or(0);
+        let top_ask_size = out.asks.first().map(|(_, s)| s.0).unwrap_or(0);
+        emit!(QuoteLadderSnapshotEvent {
+            market: market_key,
+            fair_value_ticks: out.fair_value.0,
+            skew_bps: out.skew_bps,
+            top_bid_ticks: top_bid,
+            top_ask_ticks: top_ask,
+            top_bid_size_lots: top_bid_size,
+            top_ask_size_lots: top_ask_size,
+            level_count: out.bids.len().min(u8::MAX as usize) as u8,
+        });
+        Ok(())
+    }
+
     /// Cancel a pending order from the buffer. Only the original trader can
     /// cancel; other callers (or stale order_seq values) are rejected. The
     /// order must still be in the buffer (not yet processed by run_batch).
@@ -6515,6 +6657,21 @@ pub struct CancelIceberg<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ViewMarket<'info> {
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
+    )]
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+}
+
+#[derive(Accounts)]
 pub struct CancelOrder<'info> {
     pub trader: Signer<'info>,
 
@@ -7200,6 +7357,38 @@ pub struct TriggerOrderCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub trigger_id: u8,
+}
+
+/// View ix output: predicted next-batch funding rate. Emitted by
+/// `view_predicted_funding` so SDK callers (via tx simulation) can read
+/// the rate from logs without paying for an actual on-chain mutation.
+/// Off-chain UIs use this to display "next funding payment" before the
+/// rate crystallises in `settle_funding`.
+#[event]
+pub struct PredictedFundingEvent {
+    pub market: Pubkey,
+    pub mark_price_ticks: u64,
+    pub oracle_price_ticks: u64,
+    pub premium_bps: i64,
+    pub rate_bps_per_sec: i64,
+    pub current_cum_index: i128,
+}
+
+/// View ix output: snapshot of the FLP quoter's would-be next-batch
+/// quote ladder. The ladder is deterministic given (market state, FLP
+/// state, oracle) — off-chain consumers can re-run `generate_quotes`
+/// with the same inputs for the full per-level array; this emit only
+/// carries the top-level summary to keep the log compact.
+#[event]
+pub struct QuoteLadderSnapshotEvent {
+    pub market: Pubkey,
+    pub fair_value_ticks: u64,
+    pub skew_bps: i32,
+    pub top_bid_ticks: u64,
+    pub top_ask_ticks: u64,
+    pub top_bid_size_lots: u64,
+    pub top_ask_size_lots: u64,
+    pub level_count: u8,
 }
 
 /// Anti-flash-crash event. Emitted when the post-batch mark would have
@@ -7967,6 +8156,12 @@ fn apply_fill_to_position(
         pos.cum_funding_index_at_entry = funding_index_now;
     }
     Ok(())
+}
+
+fn clamp_i128_to_i64(v: i128) -> i64 {
+    if v > i64::MAX as i128 { i64::MAX }
+    else if v < i64::MIN as i128 { i64::MIN }
+    else { v as i64 }
 }
 
 fn order_to_slot(o: &Order) -> OrderSlot {

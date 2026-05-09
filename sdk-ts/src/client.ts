@@ -1215,6 +1215,42 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// View ix: predicted next-batch funding rate. Compose into a tx and
+  /// `connection.simulateTransaction` to read the emit log without
+  /// landing on chain. The PredictedFundingEvent in the logs carries
+  /// (rate_bps_per_sec, premium_bps, current_cum_index).
+  viewPredictedFundingIx(args: {
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const flp = this.flpExposure();
+    return this.methods
+      .viewPredictedFunding()
+      .accountsPartial({
+        market: args.market,
+        flpExposure: flp.address,
+      })
+      .instruction();
+  }
+
+  /// View ix: snapshot the FLP quoter's would-be next-batch quote
+  /// ladder (top-level summary). Same simulation pattern as
+  /// viewPredictedFundingIx — the QuoteLadderSnapshotEvent in the logs
+  /// carries (fair_value, top bid/ask, top sizes, level_count). For the
+  /// full per-level array, off-chain consumers can re-run
+  /// `generate_quotes` with the same inputs (deterministic).
+  viewQuoteLadderIx(args: {
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const flp = this.flpExposure();
+    return this.methods
+      .viewQuoteLadder()
+      .accountsPartial({
+        market: args.market,
+        flpExposure: flp.address,
+      })
+      .instruction();
+  }
+
   /// Place a BRACKET order (Hyperliquid pattern): atomic parent limit +
   /// reduce-only TP + reduce-only SL, with the two triggers wired OCO
   /// (one fires, the other auto-deactivates). For long parent: TP must

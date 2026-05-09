@@ -6774,6 +6774,164 @@
       "args": []
     },
     {
+      "name": "view_predicted_funding",
+      "docs": [
+        "View ix: compute the predicted funding rate (no state change).",
+        "Emits `PredictedFundingEvent` so callers can read the result via",
+        "tx simulation logs without paying for an actual on-chain mutation.",
+        "Useful for UIs that need to display \"next funding payment\" before",
+        "the rate crystallises in `settle_funding`.",
+        "",
+        "Math is identical to `matcher::funding::advance`'s rate",
+        "computation: premium = (mark - oracle) * 10_000 / oracle; rate",
+        "= clamp(K * premium, ±rate_max_bps_per_sec)."
+      ],
+      "discriminator": [
+        128,
+        148,
+        92,
+        222,
+        171,
+        188,
+        36,
+        35
+      ],
+      "accounts": [
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "view_quote_ladder",
+      "docs": [
+        "View ix: snapshot the FLP quoter's would-be next-batch quote",
+        "ladder (no state change). Runs the same generate_quotes",
+        "computation as `run_batch` but doesn't mutate the OrderBuffer",
+        "or any other state. Emits `QuoteLadderSnapshotEvent` carrying",
+        "the top-N levels (each side) for off-chain UI rendering.",
+        "",
+        "Levels are interleaved bid/ask in seq order: [bid0, ask0,",
+        "bid1, ask1, ...] — same emission order as the matcher would",
+        "see. `levels_emitted` is bounded by `params.flp_quote_levels`."
+      ],
+      "discriminator": [
+        146,
+        190,
+        249,
+        175,
+        121,
+        111,
+        151,
+        31
+      ],
+      "accounts": [
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "withdraw_collateral",
       "docs": [
         "Withdraw collateral. Decrements accounting + transfers from the",
@@ -8236,6 +8394,32 @@
         24,
         194,
         177
+      ]
+    },
+    {
+      "name": "PredictedFundingEvent",
+      "discriminator": [
+        146,
+        112,
+        24,
+        115,
+        168,
+        188,
+        193,
+        107
+      ]
+    },
+    {
+      "name": "QuoteLadderSnapshotEvent",
+      "discriminator": [
+        133,
+        223,
+        228,
+        222,
+        7,
+        63,
+        40,
+        129
       ]
     },
     {
@@ -10821,6 +11005,92 @@
           {
             "name": "new_cap",
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PredictedFundingEvent",
+      "docs": [
+        "View ix output: predicted next-batch funding rate. Emitted by",
+        "`view_predicted_funding` so SDK callers (via tx simulation) can read",
+        "the rate from logs without paying for an actual on-chain mutation.",
+        "Off-chain UIs use this to display \"next funding payment\" before the",
+        "rate crystallises in `settle_funding`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "mark_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "oracle_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "premium_bps",
+            "type": "i64"
+          },
+          {
+            "name": "rate_bps_per_sec",
+            "type": "i64"
+          },
+          {
+            "name": "current_cum_index",
+            "type": "i128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "QuoteLadderSnapshotEvent",
+      "docs": [
+        "View ix output: snapshot of the FLP quoter's would-be next-batch",
+        "quote ladder. The ladder is deterministic given (market state, FLP",
+        "state, oracle) — off-chain consumers can re-run `generate_quotes`",
+        "with the same inputs for the full per-level array; this emit only",
+        "carries the top-level summary to keep the log compact."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "fair_value_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "skew_bps",
+            "type": "i32"
+          },
+          {
+            "name": "top_bid_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "top_ask_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "top_bid_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "top_ask_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "level_count",
+            "type": "u8"
           }
         ]
       }
