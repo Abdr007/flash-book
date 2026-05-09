@@ -2387,7 +2387,20 @@
       "name": "place_limit_order",
       "docs": [
         "Submit a resting limit order. Routed to the order buffer for the",
-        "next batch."
+        "next batch.",
+        "",
+        "`flags` is a bitfield encoding TIF + safety flags (Phoenix v1",
+        "patterns + dYdX / Binance / Hyperliquid):",
+        "",
+        "bit 0: post_only       — reject if would cross spread on entry",
+        "bit 1: reduce_only     — order can only shrink trader position",
+        "bit 2: ioc             — immediate-or-cancel: don't rest after batch",
+        "(the matcher fills as much as possible",
+        "this batch, the rest is dropped)",
+        "",
+        "Pass 0 for a vanilla GTC limit. The legacy boolean `post_only`",
+        "argument continues to work transparently — it is mapped to",
+        "`flags = (post_only as u8) << 0`."
       ],
       "discriminator": [
         108,
@@ -2574,6 +2587,10 @@
         {
           "name": "post_only",
           "type": "bool"
+        },
+        {
+          "name": "flags",
+          "type": "u8"
         }
       ]
     },

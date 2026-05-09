@@ -1382,6 +1382,7 @@ async fn place_limit_order_lands_in_buffer() {
             size_lots: 10,
             limit_ticks: 99_950,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -1443,6 +1444,7 @@ async fn open_long_position(
             size_lots,
             limit_ticks,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -1674,6 +1676,7 @@ async fn run_batch_advances_counter_and_clears_buffer() {
             size_lots: 10,
             limit_ticks: 99_950,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -1780,6 +1783,7 @@ async fn set_market_status_blocks_orders_when_paused() {
             size_lots: 10,
             limit_ticks: 99_950,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -2864,6 +2868,7 @@ async fn liquidate_portfolio_with_two_markets_and_no_positions() {
             size_lots: 1,
             limit_ticks: 99_950,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -2937,6 +2942,138 @@ async fn liquidate_portfolio_with_two_markets_and_no_positions() {
         "liquidate_portfolio on empty position should fail",
     );
     let _ = position2;
+}
+
+#[tokio::test]
+async fn place_limit_order_rejects_reduce_only_without_position() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+    let ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 1,
+            limit_ticks: 100_000,
+            post_only: false,
+            flags: 1 << 1, // reduce_only
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "reduce_only without position must reject");
+}
+
+#[tokio::test]
+async fn place_limit_order_rejects_post_only_plus_ioc() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+    let ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 1,
+            limit_ticks: 100_000,
+            post_only: true,
+            flags: 1 << 2, // ioc
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "post_only + ioc must reject");
+}
+
+#[tokio::test]
+async fn place_limit_order_rejects_unknown_flag_bits() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+    let ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0,
+            size_lots: 1,
+            limit_ticks: 100_000,
+            post_only: false,
+            flags: 1 << 7, // reserved bit
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "reserved flag bits must reject");
 }
 
 #[tokio::test]
@@ -3135,6 +3272,7 @@ async fn two_traders_crossing_orders_clear_in_batch() {
             size_lots: 1,
             limit_ticks: 100_500,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(alice.pubkey(), true),
@@ -3164,6 +3302,7 @@ async fn two_traders_crossing_orders_clear_in_batch() {
             size_lots: 1,
             limit_ticks: 99_500,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(bob.pubkey(), true),
@@ -3266,6 +3405,7 @@ async fn place_limit_order_below_min_lot_rejected() {
             size_lots: 0, // below min, should fail
             limit_ticks: 100_000,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -3470,6 +3610,7 @@ async fn place_limit_order_off_tick_rejected() {
             size_lots: 1,
             limit_ticks: 100_005, // not aligned
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -3537,6 +3678,7 @@ async fn apply_fill_settles_two_trader_positions() {
                 size_lots: 1,
                 limit_ticks: limit,
                 post_only: false,
+            flags: 0,
             },
             vec![
                 AccountMeta::new(signer.pubkey(), true),
@@ -3692,6 +3834,7 @@ async fn apply_fill_charges_toxicity_tax_when_vpin_positive() {
                 size_lots: 1,
                 limit_ticks: limit,
                 post_only: false,
+            flags: 0,
             },
             vec![
                 AccountMeta::new(signer.pubkey(), true),
@@ -3938,6 +4081,7 @@ async fn place_limit_order_per_trader_rate_limit_enforced() {
                 size_lots: 1,
                 limit_ticks: 99_900 + i, // distinct prices to avoid dedup
                 post_only: false,
+            flags: 0,
             },
             vec![
                 AccountMeta::new(trader.pubkey(), true),
@@ -3971,6 +4115,7 @@ async fn place_limit_order_per_trader_rate_limit_enforced() {
             size_lots: 1,
             limit_ticks: 99_999,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4240,6 +4385,7 @@ async fn place_limit_order_rejects_above_position_cap() {
             size_lots: 6,
             limit_ticks: 100_000,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4270,6 +4416,7 @@ async fn place_limit_order_rejects_above_position_cap() {
             size_lots: 5,
             limit_ticks: 100_000,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4370,6 +4517,7 @@ async fn place_limit_order_rejects_above_capital_ratio_cap() {
             size_lots: 1,
             limit_ticks: 1_000,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4400,6 +4548,7 @@ async fn place_limit_order_rejects_above_capital_ratio_cap() {
             size_lots: 1,
             limit_ticks: 500,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4446,6 +4595,7 @@ async fn cancel_order_removes_from_buffer() {
             size_lots: 1,
             limit_ticks: 99_950,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(trader.pubkey(), true),
@@ -4523,6 +4673,7 @@ async fn cancel_order_rejects_other_traders_order() {
             size_lots: 1,
             limit_ticks: 99_950,
             post_only: false,
+            flags: 0,
         },
         vec![
             AccountMeta::new(alice.pubkey(), true),

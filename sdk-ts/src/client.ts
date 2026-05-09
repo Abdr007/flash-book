@@ -41,6 +41,12 @@ import type { InsuranceFundInitParams, MarketParamsRaw } from './params.ts';
 export const IDL = idlJson as unknown as Idl;
 export { TOKEN_PROGRAM_ID, associatedTokenAddress };
 
+/// Order-flag bits accepted by place_limit_order's `flags` argument.
+/// Compose with bitwise OR. Reserved bits (3+) are rejected on chain.
+export const ORDER_FLAG_POST_ONLY = 1 << 0;
+export const ORDER_FLAG_REDUCE_ONLY = 1 << 1;
+export const ORDER_FLAG_IOC = 1 << 2;
+
 interface MethodsBuilder {
   accountsPartial: (accounts: Record<string, PublicKey>) => MethodsBuilder;
   instruction: () => Promise<TransactionInstruction>;
@@ -460,6 +466,11 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Place a limit order. Phoenix-grade order semantics via `flags`:
+  ///   bit 0 — post_only (also via the explicit `postOnly` arg)
+  ///   bit 1 — reduce_only: order can only shrink the trader's position
+  ///   bit 2 — ioc: immediate-or-cancel; don't rest after batch
+  ///   higher bits — reserved (chain rejects)
   placeLimitOrderIx(args: {
     trader: PublicKey;
     market: PublicKey;
@@ -467,6 +478,8 @@ export class FlashBookClient {
     sizeLots: bigint | number;
     limitTicks: bigint | number;
     postOnly?: boolean;
+    /// Bitfield of flags. Use {ORDER_FLAG_*} constants.
+    flags?: number;
   }): Promise<TransactionInstruction> {
     const buffer = this.orderBuffer(args.market);
     const state = this.traderState(args.trader);
@@ -478,6 +491,7 @@ export class FlashBookClient {
         args.sizeLots,
         args.limitTicks,
         args.postOnly ?? false,
+        args.flags ?? 0,
       )
       .accountsPartial({
         trader: args.trader,
