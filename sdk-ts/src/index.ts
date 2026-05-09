@@ -9,6 +9,7 @@ export {
   commitBufferPda,
   flpExposurePda,
   insuranceFundPda,
+  lpPositionPda,
   marketPda,
   orderBufferPda,
   positionPda,

@@ -879,8 +879,12 @@
     {
       "name": "deposit_flp_capital",
       "docs": [
-        "LP deposits capital into the FLP pool. SPL transfer is performed",
-        "from the LP's USDC ATA into the protocol vault before accounting."
+        "Deposit capital into the FLP pool and mint shares at the current",
+        "NAV/share price. Permissionless — any signer can become an LP.",
+        "Their LpPositionAccount is created lazily via init_if_needed.",
+        "",
+        "Shares minted = amount × shares_outstanding / NAV. Bootstrap",
+        "(NAV ≤ 0 or shares_outstanding == 0) mints 1:1."
       ],
       "discriminator": [
         70,
@@ -895,6 +899,7 @@
       "accounts": [
         {
           "name": "authority",
+          "writable": true,
           "signer": true
         },
         {
@@ -923,9 +928,40 @@
           }
         },
         {
+          "name": "lp_position",
+          "docs": [
+            "LP's per-LP share account. Created lazily on first deposit."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "authority"
+              }
+            ]
+          }
+        },
+        {
           "name": "insurance_fund",
           "docs": [
-            "Insurance fund PDA — owns the protocol vault and signs withdrawals."
+            "Insurance fund PDA — owns the protocol vault."
           ],
           "pda": {
             "seeds": [
@@ -956,10 +992,6 @@
         },
         {
           "name": "authority_quote_ata",
-          "docs": [
-            "LP's USDC ATA — source on deposit, destination on withdraw. Must be",
-            "the canonical associated token account for (authority, quote_mint)."
-          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -1050,14 +1082,15 @@
         },
         {
           "name": "quote_vault",
-          "docs": [
-            "Global protocol vault."
-          ],
           "writable": true
         },
         {
           "name": "token_program",
           "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": [
@@ -1249,8 +1282,9 @@
       "name": "initialize_flp_exposure",
       "docs": [
         "Initialize the FLP exposure account (one per protocol). Must run",
-        "before `initialize_market`. Tracks the FLP pool's total capital",
-        "and per-market net positions."
+        "before `initialize_market`. Mints `initial_capital_quote_lots` shares",
+        "to the authority at 1:1 (treasury endowment); these shares can later",
+        "be redeemed via `withdraw_flp_capital`."
       ],
       "discriminator": [
         121,
@@ -1289,6 +1323,37 @@
                   114,
                   101
                 ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority_lp_position",
+          "docs": [
+            "Treasury LpPositionAccount — initial shares are minted here."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "authority"
               }
             ]
           }
@@ -3086,7 +3151,14 @@
       "docs": [
         "LP withdraws capital from the FLP pool. Blocked if it would push",
         "utilization past 100% (current gross exposure must remain ≤ new",
-        "capital)."
+        "capital).",
+        "Burn `shares_to_burn` LP shares and withdraw the proportional NAV",
+        "claim. Caller must own the shares. Returns USDC via SPL CPI signed",
+        "by the insurance_fund PDA (vault authority).",
+        "",
+        "Amount returned = shares_to_burn × NAV / shares_outstanding.",
+        "Open positions block withdrawals (markets_count guard) — Phase 2",
+        "will replace this with a position-aware exposure check."
       ],
       "discriminator": [
         207,
@@ -3129,9 +3201,41 @@
           }
         },
         {
+          "name": "lp_position",
+          "docs": [
+            "LP's per-LP share account. Must already exist (no init_if_needed",
+            "— withdrawals require pre-existing shares)."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "authority"
+              }
+            ]
+          }
+        },
+        {
           "name": "insurance_fund",
           "docs": [
-            "Insurance fund PDA — owns the protocol vault and signs withdrawals."
+            "Insurance fund PDA — owns the vault and signs withdrawals."
           ],
           "pda": {
             "seeds": [
@@ -3162,10 +3266,6 @@
         },
         {
           "name": "authority_quote_ata",
-          "docs": [
-            "LP's USDC ATA — source on deposit, destination on withdraw. Must be",
-            "the canonical associated token account for (authority, quote_mint)."
-          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -3256,9 +3356,6 @@
         },
         {
           "name": "quote_vault",
-          "docs": [
-            "Global protocol vault."
-          ],
           "writable": true
         },
         {
@@ -3268,7 +3365,7 @@
       ],
       "args": [
         {
-          "name": "amount_quote_lots",
+          "name": "shares_to_burn",
           "type": "u64"
         }
       ]
@@ -3312,6 +3409,19 @@
         72,
         98,
         52
+      ]
+    },
+    {
+      "name": "LpPositionAccount",
+      "discriminator": [
+        101,
+        177,
+        26,
+        44,
+        161,
+        242,
+        87,
+        136
       ]
     },
     {
@@ -3960,13 +4070,24 @@
     {
       "name": "FlpExposureAccount",
       "docs": [
-        "FLP pool exposure across markets. Single account; per-market sub-positions."
+        "FLP pool exposure across markets and per-LP share accounting.",
+        "",
+        "The pool's NAV (Net Asset Value) is `total_capital_quote_lots +",
+        "realized_pnl`. LPs own `shares` of `lp_shares_outstanding`; their",
+        "claim on NAV is `shares / lp_shares_outstanding`. Deposits mint",
+        "shares at the prevailing NAV/share price; withdrawals burn shares",
+        "for proportional NAV. This is the standard ERC-4626 vault model",
+        "adapted for Solana."
       ],
       "type": {
         "kind": "struct",
         "fields": [
           {
             "name": "authority",
+            "docs": [
+              "Protocol admin — manages FLP-level governance ops (initial endowment,",
+              "future emergency pause). Distinct from LPs, who own shares."
+            ],
             "type": "pubkey"
           },
           {
@@ -3975,15 +4096,31 @@
           },
           {
             "name": "total_capital_quote_lots",
+            "docs": [
+              "Aggregate quote-lot deposits + maker rebate accrual. Used as one",
+              "term of NAV; does NOT represent a single LP's claim."
+            ],
             "type": "u64"
           },
           {
             "name": "realized_pnl",
+            "docs": [
+              "Cumulative realized P&L from FLP fills across all markets. Signed.",
+              "The other term of NAV."
+            ],
             "type": "i64"
           },
           {
             "name": "markets_count",
             "type": "u8"
+          },
+          {
+            "name": "lp_shares_outstanding",
+            "docs": [
+              "Total shares issued across all LpPositionAccounts. NAV/share = NAV",
+              "/ lp_shares_outstanding when nonzero."
+            ],
+            "type": "u64"
           },
           {
             "name": "per_market",
@@ -4170,6 +4307,48 @@
           {
             "name": "worst_scenario_idx",
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LpPositionAccount",
+      "docs": [
+        "Per-LP share holding. PDA seeded `[b\"lp_position\", lp.key()]`. Created",
+        "lazily on first deposit via `init_if_needed`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "lp",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "shares",
+            "docs": [
+              "Shares of FlpExposureAccount.lp_shares_outstanding owned by this LP."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_deposited_quote_lots",
+            "docs": [
+              "Cumulative quote-lot deposits over the lifetime of this LP. Cost",
+              "basis for off-chain PnL display; does not affect on-chain math."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_withdrawn_quote_lots",
+            "docs": [
+              "Cumulative quote-lot withdrawals."
+            ],
+            "type": "u64"
           }
         ]
       }

@@ -177,15 +177,31 @@ impl InsuranceFundAccount {
     }
 }
 
-/// FLP pool exposure across markets. Single account; per-market sub-positions.
+/// FLP pool exposure across markets and per-LP share accounting.
+///
+/// The pool's NAV (Net Asset Value) is `total_capital_quote_lots +
+/// realized_pnl`. LPs own `shares` of `lp_shares_outstanding`; their
+/// claim on NAV is `shares / lp_shares_outstanding`. Deposits mint
+/// shares at the prevailing NAV/share price; withdrawals burn shares
+/// for proportional NAV. This is the standard ERC-4626 vault model
+/// adapted for Solana.
 #[account]
 #[derive(Debug)]
 pub struct FlpExposureAccount {
+    /// Protocol admin — manages FLP-level governance ops (initial endowment,
+    /// future emergency pause). Distinct from LPs, who own shares.
     pub authority: Pubkey,
     pub bump: u8,
+    /// Aggregate quote-lot deposits + maker rebate accrual. Used as one
+    /// term of NAV; does NOT represent a single LP's claim.
     pub total_capital_quote_lots: u64,
+    /// Cumulative realized P&L from FLP fills across all markets. Signed.
+    /// The other term of NAV.
     pub realized_pnl: i64,
     pub markets_count: u8,
+    /// Total shares issued across all LpPositionAccounts. NAV/share = NAV
+    /// / lp_shares_outstanding when nonzero.
+    pub lp_shares_outstanding: u64,
     pub per_market: [FlpMarketExposure; 16],
 }
 
@@ -200,7 +216,40 @@ pub struct FlpMarketExposure {
 impl FlpExposureAccount {
     pub const SEED: &'static [u8] = b"flp_exposure";
     pub fn space() -> usize {
-        8 + 32 + 1 + 8 + 8 + 1 + (16 * (32 + 1 + 8 + 8))
+        // Original: 8 + 32 + 1 + 8 + 8 + 1 + 16*49 = 842.
+        // Add 8 for lp_shares_outstanding. Round up generously.
+        8 + 32 + 1 + 8 + 8 + 1 + 8 + (16 * (32 + 1 + 8 + 8))
+    }
+
+    /// Net Asset Value in quote lots. Returns i128 because realized_pnl can
+    /// drive NAV negative in worst-case insolvency; callers should clamp
+    /// or fail on negative NAV.
+    pub fn nav(&self) -> i128 {
+        (self.total_capital_quote_lots as i128) + (self.realized_pnl as i128)
+    }
+}
+
+/// Per-LP share holding. PDA seeded `[b"lp_position", lp.key()]`. Created
+/// lazily on first deposit via `init_if_needed`.
+#[account]
+#[derive(Debug)]
+pub struct LpPositionAccount {
+    pub lp: Pubkey,
+    pub bump: u8,
+    /// Shares of FlpExposureAccount.lp_shares_outstanding owned by this LP.
+    pub shares: u64,
+    /// Cumulative quote-lot deposits over the lifetime of this LP. Cost
+    /// basis for off-chain PnL display; does not affect on-chain math.
+    pub total_deposited_quote_lots: u64,
+    /// Cumulative quote-lot withdrawals.
+    pub total_withdrawn_quote_lots: u64,
+}
+
+impl LpPositionAccount {
+    pub const SEED: &'static [u8] = b"lp_position";
+    pub fn space() -> usize {
+        // 8 disc + 32 + 1 + 8 + 8 + 8 = 65. Round up.
+        8 + 96
     }
 }
 

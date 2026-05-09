@@ -51,6 +51,7 @@ const INSURANCE_FUND_SEED = Buffer.from('insurance_fund');
 const FLP_EXPOSURE_SEED = Buffer.from('flp_exposure');
 const TRADER_STATE_SEED = Buffer.from('trader_state');
 const POSITION_SEED = Buffer.from('position');
+const LP_POSITION_SEED = Buffer.from('lp_position');
 
 export interface DerivedPda {
   readonly address: PublicKey;
@@ -105,4 +106,11 @@ export function positionPda(
   programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
 ): DerivedPda {
   return derive([POSITION_SEED, market.toBuffer(), trader.toBuffer()], programId);
+}
+
+export function lpPositionPda(
+  lp: PublicKey,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
+): DerivedPda {
+  return derive([LP_POSITION_SEED, lp.toBuffer()], programId);
 }

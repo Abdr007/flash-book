@@ -52,7 +52,8 @@ describe('Instruction builders', () => {
     const authority = Keypair.generate().publicKey;
     const ix = await client.initializeFlpExposureIx(authority, new BN(1_000_000));
     expect(ix.programId.equals(FLASH_BOOK_PROGRAM_ID)).toBe(true);
-    expect(ix.keys.length).toBe(3); // authority, flp, sysprog
+    // authority, flp, authority_lp_position, sysprog
+    expect(ix.keys.length).toBe(4);
   });
 
   test('initializeMarketIx', async () => {
@@ -175,19 +176,22 @@ describe('Instruction builders', () => {
       quoteMint: Keypair.generate().publicKey,
       quoteVault: Keypair.generate().publicKey,
     });
-    // authority, flp, insurance_fund, quote_mint, authority_quote_ata, quote_vault, token_program
-    expect(ix.keys.length).toBe(7);
+    // authority, flp, lp_position, insurance_fund, quote_mint,
+    // authority_quote_ata, quote_vault, token_program, system_program
+    expect(ix.keys.length).toBe(9);
   });
 
   test('withdrawFlpCapitalIx', async () => {
     const client = makeClient();
     const ix = await client.withdrawFlpCapitalIx({
       authority: Keypair.generate().publicKey,
-      amountQuoteLots: new BN(500_000),
+      sharesToBurn: new BN(500_000),
       quoteMint: Keypair.generate().publicKey,
       quoteVault: Keypair.generate().publicKey,
     });
-    expect(ix.keys.length).toBe(7);
+    // authority, flp, lp_position, insurance_fund, quote_mint,
+    // authority_quote_ata, quote_vault, token_program
+    expect(ix.keys.length).toBe(8);
   });
 
   // ─── Order intake (3) ──────────────────────────────────────────────

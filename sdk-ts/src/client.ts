@@ -27,6 +27,7 @@ import {
   commitBufferPda,
   flpExposurePda,
   insuranceFundPda,
+  lpPositionPda,
   marketPda,
   orderBufferPda,
   positionPda,
@@ -90,6 +91,9 @@ export class FlashBookClient {
   position(market: PublicKey, trader: PublicKey) {
     return positionPda(market, trader, this.programId);
   }
+  lpPosition(lp: PublicKey) {
+    return lpPositionPda(lp, this.programId);
+  }
 
   // ─── Instruction builders ────────────────────────────────────────
 
@@ -98,16 +102,21 @@ export class FlashBookClient {
     initialCapitalQuoteLots: bigint | number,
   ): Promise<TransactionInstruction> {
     const flp = this.flpExposure();
+    const lpPos = this.lpPosition(authority);
     return this.methods
       .initializeFlpExposure(initialCapitalQuoteLots)
       .accountsPartial({
         authority,
         flpExposure: flp.address,
+        authorityLpPosition: lpPos.address,
         systemProgram: SystemProgram.programId,
       })
       .instruction();
   }
 
+  /// Deposit `amountQuoteLots` into the FLP pool. Mints LP shares at the
+  /// prevailing NAV/share price (1:1 if pool empty, NAV-weighted otherwise).
+  /// LpPositionAccount is created lazily via init_if_needed.
   depositFlpCapitalIx(args: {
     authority: PublicKey;
     amountQuoteLots: bigint | number;
@@ -118,36 +127,44 @@ export class FlashBookClient {
   }): Promise<TransactionInstruction> {
     const flp = this.flpExposure();
     const fund = this.insuranceFund();
+    const lpPos = this.lpPosition(args.authority);
     const ata = args.authorityQuoteAta ?? associatedTokenAddress(args.authority, args.quoteMint);
     return this.methods
       .depositFlpCapital(args.amountQuoteLots)
       .accountsPartial({
         authority: args.authority,
         flpExposure: flp.address,
+        lpPosition: lpPos.address,
         insuranceFund: fund.address,
         quoteMint: args.quoteMint,
         authorityQuoteAta: ata,
         quoteVault: args.quoteVault,
         tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
       })
       .instruction();
   }
 
+  /// Burn `sharesToBurn` LP shares and withdraw the proportional NAV claim.
+  /// Caller must already own an LpPositionAccount with at least that many
+  /// shares.
   withdrawFlpCapitalIx(args: {
     authority: PublicKey;
-    amountQuoteLots: bigint | number;
+    sharesToBurn: bigint | number;
     quoteMint: PublicKey;
     quoteVault: PublicKey;
     authorityQuoteAta?: PublicKey;
   }): Promise<TransactionInstruction> {
     const flp = this.flpExposure();
     const fund = this.insuranceFund();
+    const lpPos = this.lpPosition(args.authority);
     const ata = args.authorityQuoteAta ?? associatedTokenAddress(args.authority, args.quoteMint);
     return this.methods
-      .withdrawFlpCapital(args.amountQuoteLots)
+      .withdrawFlpCapital(args.sharesToBurn)
       .accountsPartial({
         authority: args.authority,
         flpExposure: flp.address,
+        lpPosition: lpPos.address,
         insuranceFund: fund.address,
         quoteMint: args.quoteMint,
         authorityQuoteAta: ata,

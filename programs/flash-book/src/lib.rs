@@ -114,8 +114,9 @@ pub mod flash_book {
     }
 
     /// Initialize the FLP exposure account (one per protocol). Must run
-    /// before `initialize_market`. Tracks the FLP pool's total capital
-    /// and per-market net positions.
+    /// before `initialize_market`. Mints `initial_capital_quote_lots` shares
+    /// to the authority at 1:1 (treasury endowment); these shares can later
+    /// be redeemed via `withdraw_flp_capital`.
     pub fn initialize_flp_exposure(
         ctx: Context<InitializeFlpExposure>,
         initial_capital_quote_lots: u64,
@@ -126,11 +127,20 @@ pub mod flash_book {
         flp.total_capital_quote_lots = initial_capital_quote_lots;
         flp.realized_pnl = 0;
         flp.markets_count = 0;
+        flp.lp_shares_outstanding = initial_capital_quote_lots;
         flp.per_market = [state::FlpMarketExposure::default(); 16];
-        // Mark every slot empty (side = 255 means "no entry").
         for slot in flp.per_market.iter_mut() {
             slot.side = 255;
         }
+
+        // Treasury endowment: authority owns the initial shares 1:1.
+        let lp_pos = &mut ctx.accounts.authority_lp_position;
+        lp_pos.lp = ctx.accounts.authority.key();
+        lp_pos.bump = ctx.bumps.authority_lp_position;
+        lp_pos.shares = initial_capital_quote_lots;
+        lp_pos.total_deposited_quote_lots = initial_capital_quote_lots;
+        lp_pos.total_withdrawn_quote_lots = 0;
+
         emit!(FlpExposureInitializedEvent {
             authority: flp.authority,
             initial_capital: initial_capital_quote_lots,
@@ -138,19 +148,19 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// LP deposits capital into the FLP pool. SPL transfer is performed
-    /// from the LP's USDC ATA into the protocol vault before accounting.
+    /// Deposit capital into the FLP pool and mint shares at the current
+    /// NAV/share price. Permissionless — any signer can become an LP.
+    /// Their LpPositionAccount is created lazily via init_if_needed.
+    ///
+    /// Shares minted = amount × shares_outstanding / NAV. Bootstrap
+    /// (NAV ≤ 0 or shares_outstanding == 0) mints 1:1.
     pub fn deposit_flp_capital(
-        ctx: Context<UpdateFlpCapital>,
+        ctx: Context<DepositFlpCapital>,
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-        require_keys_eq!(
-            ctx.accounts.flp_exposure.authority,
-            ctx.accounts.authority.key(),
-            FlashBookError::Unauthorized
-        );
 
+        // SPL transfer from LP's ATA to protocol vault.
         let cpi_accounts = Transfer {
             from: ctx.accounts.authority_quote_ata.to_account_info(),
             to: ctx.accounts.quote_vault.to_account_info(),
@@ -161,10 +171,47 @@ pub mod flash_book {
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
         let flp = &mut ctx.accounts.flp_exposure;
+        let nav = flp.nav();
+        let shares_outstanding = flp.lp_shares_outstanding;
+
+        // Compute shares to mint. Bootstrap (no shares yet OR NAV <= 0)
+        // mints 1:1 — first depositor sets the share price.
+        let shares_to_mint: u64 = if shares_outstanding == 0 || nav <= 0 {
+            amount_quote_lots
+        } else {
+            let prod = (amount_quote_lots as u128)
+                .checked_mul(shares_outstanding as u128)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            let s = prod / (nav as u128);
+            require!(s <= u64::MAX as u128, FlashBookError::ArithmeticOverflow);
+            s as u64
+        };
+        require!(shares_to_mint > 0, FlashBookError::ZeroSize);
+
         flp.total_capital_quote_lots = flp
             .total_capital_quote_lots
             .checked_add(amount_quote_lots)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        flp.lp_shares_outstanding = flp
+            .lp_shares_outstanding
+            .checked_add(shares_to_mint)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        let lp_pos = &mut ctx.accounts.lp_position;
+        // First-time depositor: initialize identity fields.
+        if lp_pos.lp == Pubkey::default() {
+            lp_pos.lp = ctx.accounts.authority.key();
+            lp_pos.bump = ctx.bumps.lp_position;
+        }
+        lp_pos.shares = lp_pos
+            .shares
+            .checked_add(shares_to_mint)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        lp_pos.total_deposited_quote_lots = lp_pos
+            .total_deposited_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
         emit!(FlpCapitalUpdatedEvent {
             new_total: flp.total_capital_quote_lots,
             delta: amount_quote_lots as i64,
@@ -175,28 +222,63 @@ pub mod flash_book {
     /// LP withdraws capital from the FLP pool. Blocked if it would push
     /// utilization past 100% (current gross exposure must remain ≤ new
     /// capital).
+    /// Burn `shares_to_burn` LP shares and withdraw the proportional NAV
+    /// claim. Caller must own the shares. Returns USDC via SPL CPI signed
+    /// by the insurance_fund PDA (vault authority).
+    ///
+    /// Amount returned = shares_to_burn × NAV / shares_outstanding.
+    /// Open positions block withdrawals (markets_count guard) — Phase 2
+    /// will replace this with a position-aware exposure check.
     pub fn withdraw_flp_capital(
-        ctx: Context<UpdateFlpCapital>,
-        amount_quote_lots: u64,
+        ctx: Context<WithdrawFlpCapital>,
+        shares_to_burn: u64,
     ) -> Result<()> {
-        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        require!(shares_to_burn > 0, FlashBookError::ZeroSize);
         require_keys_eq!(
-            ctx.accounts.flp_exposure.authority,
+            ctx.accounts.lp_position.lp,
             ctx.accounts.authority.key(),
             FlashBookError::Unauthorized
         );
-        let new_total = ctx
-            .accounts
-            .flp_exposure
+        require!(
+            shares_to_burn <= ctx.accounts.lp_position.shares,
+            FlashBookError::InsufficientCollateral
+        );
+
+        let flp_ro = &ctx.accounts.flp_exposure;
+        let nav = flp_ro.nav();
+        require!(nav > 0, FlashBookError::InsufficientCollateral);
+        let shares_outstanding = flp_ro.lp_shares_outstanding;
+        require!(shares_outstanding > 0, FlashBookError::InsufficientCollateral);
+
+        // amount = shares_to_burn × NAV / shares_outstanding
+        let prod = (shares_to_burn as u128)
+            .checked_mul(nav as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let amount_u128 = prod / (shares_outstanding as u128);
+        require!(amount_u128 <= u64::MAX as u128, FlashBookError::ArithmeticOverflow);
+        let amount_quote_lots = amount_u128 as u64;
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+
+        // Phase 1 guard: any open FLP position blocks withdrawals.
+        // Phase 2 will accept remaining_accounts and check exposure vs capital.
+        require!(
+            flp_ro.markets_count == 0,
+            FlashBookError::InsufficientCollateral
+        );
+
+        // Vault must have enough quote tokens to satisfy the withdrawal.
+        // The vault's amount field is the authoritative source.
+        require!(
+            ctx.accounts.quote_vault.amount >= amount_quote_lots,
+            FlashBookError::InsufficientCollateral
+        );
+
+        // Compute new total_capital. NAV semantics: total_capital decreases
+        // by exactly the withdrawn amount; realized_pnl is unaffected.
+        let new_total = flp_ro
             .total_capital_quote_lots
             .checked_sub(amount_quote_lots)
             .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
-        // Open positions block withdrawals — Phase 2 reads remaining_accounts
-        // to verify against actual market mark prices.
-        require!(
-            ctx.accounts.flp_exposure.markets_count == 0,
-            FlashBookError::InsufficientCollateral
-        );
 
         let bump = ctx.accounts.insurance_fund.bump;
         let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
@@ -215,6 +297,21 @@ pub mod flash_book {
 
         let flp = &mut ctx.accounts.flp_exposure;
         flp.total_capital_quote_lots = new_total;
+        flp.lp_shares_outstanding = flp
+            .lp_shares_outstanding
+            .checked_sub(shares_to_burn)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+
+        let lp_pos = &mut ctx.accounts.lp_position;
+        lp_pos.shares = lp_pos
+            .shares
+            .checked_sub(shares_to_burn)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        lp_pos.total_withdrawn_quote_lots = lp_pos
+            .total_withdrawn_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
         emit!(FlpCapitalUpdatedEvent {
             new_total,
             delta: -(amount_quote_lots as i64),
@@ -1757,12 +1854,25 @@ pub struct InitializeFlpExposure<'info> {
         bump,
     )]
     pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+
+    /// Treasury LpPositionAccount — initial shares are minted here.
+    #[account(
+        init,
+        payer = authority,
+        space = state::LpPositionAccount::space(),
+        seeds = [state::LpPositionAccount::SEED, authority.key().as_ref()],
+        bump,
+    )]
+    pub authority_lp_position: Box<Account<'info, state::LpPositionAccount>>,
+
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct UpdateFlpCapital<'info> {
+pub struct DepositFlpCapital<'info> {
+    #[account(mut)]
     pub authority: Signer<'info>,
+
     #[account(
         mut,
         seeds = [FlpExposureAccount::SEED],
@@ -1770,7 +1880,17 @@ pub struct UpdateFlpCapital<'info> {
     )]
     pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
 
-    /// Insurance fund PDA — owns the protocol vault and signs withdrawals.
+    /// LP's per-LP share account. Created lazily on first deposit.
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = state::LpPositionAccount::space(),
+        seeds = [state::LpPositionAccount::SEED, authority.key().as_ref()],
+        bump,
+    )]
+    pub lp_position: Box<Account<'info, state::LpPositionAccount>>,
+
+    /// Insurance fund PDA — owns the protocol vault.
     #[account(
         seeds = [InsuranceFundAccount::SEED],
         bump = insurance_fund.bump,
@@ -1780,8 +1900,6 @@ pub struct UpdateFlpCapital<'info> {
     #[account(address = insurance_fund.quote_mint)]
     pub quote_mint: Account<'info, Mint>,
 
-    /// LP's USDC ATA — source on deposit, destination on withdraw. Must be
-    /// the canonical associated token account for (authority, quote_mint).
     #[account(
         mut,
         associated_token::mint = quote_mint,
@@ -1789,11 +1907,52 @@ pub struct UpdateFlpCapital<'info> {
     )]
     pub authority_quote_ata: Account<'info, TokenAccount>,
 
-    /// Global protocol vault.
+    #[account(mut, address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawFlpCapital<'info> {
+    pub authority: Signer<'info>,
+
     #[account(
         mut,
-        address = insurance_fund.quote_vault,
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
     )]
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+
+    /// LP's per-LP share account. Must already exist (no init_if_needed
+    /// — withdrawals require pre-existing shares).
+    #[account(
+        mut,
+        seeds = [state::LpPositionAccount::SEED, authority.key().as_ref()],
+        bump = lp_position.bump,
+        constraint = lp_position.lp == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub lp_position: Box<Account<'info, state::LpPositionAccount>>,
+
+    /// Insurance fund PDA — owns the vault and signs withdrawals.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = authority,
+    )]
+    pub authority_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(mut, address = insurance_fund.quote_vault)]
     pub quote_vault: Account<'info, TokenAccount>,
 
     pub token_program: Program<'info, Token>,
