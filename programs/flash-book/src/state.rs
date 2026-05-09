@@ -166,6 +166,26 @@ pub struct MarketParams {
     /// liquidate a swathe of healthy positions on the next assess.
     /// Typical: 200-1000 bps (2%-10% per batch ≈ per 50ms).
     pub mark_change_max_bps: u32,
+
+    /// CME-style concentration margin tier. When a position's size_lots
+    /// crosses `concentration_threshold_lots`, its effective maintenance
+    /// margin becomes `maintenance_margin_ratio_bps +
+    /// concentration_extra_mmr_bps`. Penalises whales whose size is
+    /// harder to liquidate without market impact. 0 threshold = tier
+    /// disabled (single-MMR for the whole market). Smarter than HL's
+    /// flat per-market MMR.
+    /// Typical: threshold sized to 1-5% of FLP capital; extra 100-500 bps.
+    pub concentration_threshold_lots: u64,
+    pub concentration_extra_mmr_bps: u32,
+
+    /// TWAP window length (in batches) for the funding-premium dampener.
+    /// 0 = disabled (legacy single-tick premium). When > 0, the funding
+    /// rate uses the average of the last N batches' (mark - oracle)
+    /// premium instead of the instantaneous one — kills funding spikes
+    /// from microbursts of toxic flow that move the mark for one batch.
+    /// HL uses single-tick premium; this is mathematically smarter.
+    /// Capped at MARK_HISTORY_LEN (16). Typical: 4-8 batches.
+    pub funding_premium_twap_window: u8,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).

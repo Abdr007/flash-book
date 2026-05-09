@@ -614,3 +614,84 @@ export class IcebergKeeper extends Keeper {
     }
   }
 }
+
+// ─── Bond monitor keeper ──────────────────────────────────────────────
+
+export interface BondMonitorKeeperConfig extends KeeperBaseConfig {
+  /// (market, depositor) bonds to monitor.
+  watchlist: ReadonlyArray<{ market: PublicKey; depositor: PublicKey }>;
+  /// Ratio (insurance balance / pause threshold) below which the
+  /// keeper alerts via callback. 1.0 = alert when insurance dipped
+  /// below the pause threshold (close to the slash window).
+  alertRatioFloor?: number;
+  /// Called when an alert condition is detected. Operators wire this
+  /// to PagerDuty / Slack. Keeper does NOT itself initiate slashes —
+  /// slash is governance-gated (slash_market_bond is authority-only).
+  onAlert?: (info: {
+    market: PublicKey;
+    depositor: PublicKey;
+    bondAmountQuoteLots: bigint;
+    insuranceRatio: number;
+    reason: string;
+  }) => void;
+}
+
+/// Read-only keeper. Monitors HIP-3 deployer bonds + the insurance
+/// fund's health; emits an operator-facing alert when conditions
+/// converge that would justify governance slashing (oracle staleness,
+/// insurance below threshold, market paused). Does NOT submit slash
+/// txs — slash is authority-gated by design.
+export class BondMonitorKeeper extends Keeper {
+  readonly name = 'bond-monitor-keeper';
+
+  constructor(
+    client: FlashBookClient,
+    connection: Connection,
+    private readonly cfg: BondMonitorKeeperConfig,
+  ) {
+    super(client, connection, cfg);
+  }
+
+  protected async iterate(): Promise<void> {
+    const { fetchInsuranceFund } = await import('../../sdk-ts/src/accounts.ts');
+    const fund = await fetchInsuranceFund(
+      this.client,
+      this.client.insuranceFund().address,
+    );
+    if (!fund) return;
+    const ratio = Number(fund.balanceQuoteLots.toString())
+      / Math.max(Number(fund.pauseThresholdQuoteLots.toString()), 1);
+    const floor = this.cfg.alertRatioFloor ?? 1.0;
+    if (ratio >= floor) return;
+
+    for (const { market, depositor } of this.cfg.watchlist) {
+      const marketAcc = await fetchMarket(this.client, market);
+      if (!marketAcc) continue;
+      // Reasons: insurance below threshold (always true here), or
+      // additionally market paused (status=3) or oracle stale.
+      const status = marketAcc.status;
+      const reason = status === 3 ? 'market paused + insurance low'
+        : 'insurance below threshold';
+      // Bond amount lookup is best-effort: reads the BondAccount via
+      // PDA derivation. If the account doesn't exist (no bond posted),
+      // skip silently.
+      const [bondAddr] = PublicKey.findProgramAddressSync(
+        [Buffer.from('market_bond'), market.toBuffer(), depositor.toBuffer()],
+        this.client.programId,
+      );
+      const acct = await this.connection.getAccountInfo(bondAddr);
+      if (!acct) continue;
+      // Anchor account layout: 8 disc + 32 (market) + 32 (depositor)
+      // + 1 (bump) + 7 (pad) + 8 (amount). amount at offset 88.
+      const amount = acct.data.readBigUInt64LE(88);
+      this.cfg.onAlert?.({
+        market,
+        depositor,
+        bondAmountQuoteLots: amount,
+        insuranceRatio: ratio,
+        reason,
+      });
+      this.stats.actionsTaken += 1;
+    }
+  }
+}

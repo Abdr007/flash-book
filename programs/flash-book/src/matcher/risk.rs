@@ -50,6 +50,29 @@ pub struct MarketSnapshot {
     pub maintenance_margin_bps: u32,
     /// `tick_size` for notional computation.
     pub tick_size: u64,
+    /// CME-style concentration tier: positions with `size_lots >=
+    /// concentration_threshold_lots` use `maintenance_margin_bps +
+    /// concentration_extra_mmr_bps` as their effective MMR. Penalises
+    /// whales whose size is harder to liquidate without market impact.
+    /// 0 threshold = tier disabled (legacy single-mmr behaviour).
+    pub concentration_threshold_lots: u64,
+    pub concentration_extra_mmr_bps: u32,
+}
+
+impl MarketSnapshot {
+    /// Effective maintenance margin in bps for a position of size
+    /// `size_lots` on this market. Applies the concentration tier
+    /// extra if the position crosses the threshold.
+    pub fn effective_mmr_bps(&self, size_lots: u64) -> u32 {
+        if self.concentration_threshold_lots > 0
+            && size_lots >= self.concentration_threshold_lots
+        {
+            self.maintenance_margin_bps
+                .saturating_add(self.concentration_extra_mmr_bps)
+        } else {
+            self.maintenance_margin_bps
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,8 +203,9 @@ pub fn assess_margin(
                 .or_overflow()?
                 .checked_mul(m.tick_size as i128)
                 .or_overflow()?;
+            let eff_mmr = m.effective_mmr_bps(pos.size_lots);
             let mm = stressed_notional
-                .checked_mul(m.maintenance_margin_bps as i128)
+                .checked_mul(eff_mmr as i128)
                 .or_overflow()?
                 .checked_div(BPS_DENOM as i128)
                 .or_div_zero()?;

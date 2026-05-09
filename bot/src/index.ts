@@ -157,6 +157,7 @@ export {
   AdlKeeper,
   TrailingStopKeeper,
   IcebergKeeper,
+  BondMonitorKeeper,
   estimateFundingOwed,
   type KeeperBaseConfig,
   type KeeperStats,
@@ -167,4 +168,5 @@ export {
   type AdlKeeperConfig,
   type TrailingStopKeeperConfig,
   type IcebergKeeperConfig,
+  type BondMonitorKeeperConfig,
 } from './keepers.ts';

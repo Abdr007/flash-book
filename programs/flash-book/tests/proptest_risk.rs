@@ -32,6 +32,8 @@ fn market(mark: u64, maintenance_bps: u32) -> MarketSnapshot {
         cum_funding_index: 0,
         maintenance_margin_bps: maintenance_bps,
         tick_size: 1,
+        concentration_threshold_lots: 0,
+        concentration_extra_mmr_bps: 0,
     }
 }
 

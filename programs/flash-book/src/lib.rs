@@ -598,6 +598,8 @@ pub mod flash_book {
                     cum_funding_index: market_acct.cum_funding_index,
                     maintenance_margin_bps: market_acct.params.maintenance_margin_ratio_bps,
                     tick_size: market_acct.params.tick_size,
+                    concentration_threshold_lots: market_acct.params.concentration_threshold_lots,
+                    concentration_extra_mmr_bps: market_acct.params.concentration_extra_mmr_bps,
                 });
                 market_keys.push(market_ai.key());
             }
@@ -2191,6 +2193,8 @@ pub mod flash_book {
                 cum_funding_index: market.cum_funding_index,
                 maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
                 tick_size: market.params.tick_size,
+                concentration_threshold_lots: market.params.concentration_threshold_lots,
+                concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
             };
             let scenarios = default_scenarios_fn(&[market.key()]);
             let assessment = assess_margin_fn(
@@ -2343,6 +2347,8 @@ pub mod flash_book {
                 cum_funding_index: market.cum_funding_index,
                 maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
                 tick_size: market.params.tick_size,
+                concentration_threshold_lots: market.params.concentration_threshold_lots,
+                concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
             });
         }
         if !snaps.is_empty() {
@@ -2488,6 +2494,8 @@ pub mod flash_book {
                 cum_funding_index: markets[i].cum_funding_index,
                 maintenance_margin_bps: markets[i].params.maintenance_margin_ratio_bps,
                 tick_size: markets[i].params.tick_size,
+                concentration_threshold_lots: markets[i].params.concentration_threshold_lots,
+                concentration_extra_mmr_bps: markets[i].params.concentration_extra_mmr_bps,
             });
         }
         if !snaps.is_empty() {
@@ -3800,14 +3808,49 @@ pub mod flash_book {
         let flp = &ctx.accounts.flp_exposure;
 
         // 1. Advance funding index.
+        //
+        // Smarter than HL: when params.funding_premium_twap_window > 0, we
+        // use a TWAP of the last N batches' clearing prices as the "mark"
+        // input to the premium calculation, instead of the instantaneous
+        // mark. This kills funding spikes from microbursts of toxic flow
+        // that move the mark for one batch — at our 50ms FBA cadence,
+        // single-tick premium is too noisy to be a fair funding signal.
+        // 0 window = legacy single-tick (HL-equivalent).
         let block_delta_ms = if market.last_batch_ms == 0 {
             0
         } else {
             now_ms.saturating_sub(market.last_batch_ms)
         };
+        let mark_for_funding = if market.params.funding_premium_twap_window > 0 {
+            let win = (market.params.funding_premium_twap_window as usize)
+                .min(MARK_HISTORY_LEN)
+                .min(market.recent_clearing_count as usize);
+            if win == 0 {
+                Ticks(market.mark_price_ticks)
+            } else {
+                // Walk the last `win` entries from `recent_clearing_prices`,
+                // wrapping. The newest entry is at
+                // (current_batch - 1) % MARK_HISTORY_LEN.
+                let mut sum: u128 = 0;
+                let len = MARK_HISTORY_LEN;
+                let newest_idx = if market.current_batch == 0 {
+                    0
+                } else {
+                    ((market.current_batch as usize - 1) % len) as usize
+                };
+                for k in 0..win {
+                    let idx = (newest_idx + len - k) % len;
+                    sum = sum.saturating_add(market.recent_clearing_prices[idx] as u128);
+                }
+                let avg = (sum / win as u128).min(u64::MAX as u128) as u64;
+                if avg == 0 { Ticks(market.mark_price_ticks) } else { Ticks(avg) }
+            }
+        } else {
+            Ticks(market.mark_price_ticks)
+        };
         let (new_index, ftick) = advance(
             market.cum_funding_index,
-            Ticks(market.mark_price_ticks),
+            mark_for_funding,
             Ticks(market.oracle_price_ticks),
             block_delta_ms,
             market.params.funding_rate_k_bps,
@@ -4288,6 +4331,8 @@ pub mod flash_book {
             cum_funding_index: market.cum_funding_index,
             maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
             tick_size: market.params.tick_size,
+                concentration_threshold_lots: market.params.concentration_threshold_lots,
+                concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         let assessment = assess_margin_fn(
@@ -4723,6 +4768,8 @@ pub mod flash_book {
             cum_funding_index: market.cum_funding_index,
             maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
             tick_size: market.params.tick_size,
+                concentration_threshold_lots: market.params.concentration_threshold_lots,
+                concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         let assessment = assess_margin_fn(
@@ -4922,6 +4969,8 @@ pub mod flash_book {
             cum_funding_index: exec_market.cum_funding_index,
             maintenance_margin_bps: exec_market.params.maintenance_margin_ratio_bps,
             tick_size: exec_market.params.tick_size,
+            concentration_threshold_lots: exec_market.params.concentration_threshold_lots,
+            concentration_extra_mmr_bps: exec_market.params.concentration_extra_mmr_bps,
         });
         position_snaps.push(RiskPosSnap {
             market: exec_position.market,
@@ -4981,6 +5030,8 @@ pub mod flash_book {
                     cum_funding_index: market.cum_funding_index,
                     maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
                     tick_size: market.params.tick_size,
+                    concentration_threshold_lots: market.params.concentration_threshold_lots,
+                    concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
                 });
                 position_snaps.push(RiskPosSnap {
                     market: position.market,

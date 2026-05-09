@@ -73,6 +73,12 @@ export interface MarketParamsRaw {
   maxOiBaseLots: BN;
   /** Max post-batch mark change in bps (anti-flash-crash). 0 = unlimited. */
   markChangeMaxBps: number;
+  /** CME-style concentration tier threshold. 0 = disabled. */
+  concentrationThresholdLots: BN;
+  /** Extra MMR bps applied to positions above the concentration threshold. */
+  concentrationExtraMmrBps: number;
+  /** TWAP window (batches) for funding-premium dampening. 0 = single-tick (legacy). */
+  fundingPremiumTwapWindow: number;
 }
 
 /** Sensible default parameter set for SOL/BTC/ETH-style major markets. */
@@ -146,6 +152,16 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
     // Anti-flash-crash mark cap (off by default; production should set
     // 200-1000 bps depending on liquidity profile).
     markChangeMaxBps: 0,
+    // Concentration tier (off by default). Production: threshold sized
+    // to 1-5% of FLP capital; extra 100-500 bps. Smarter than HL's
+    // flat per-market MMR — penalises whales whose size is harder to
+    // liquidate without market impact.
+    concentrationThresholdLots: new BN(0),
+    concentrationExtraMmrBps: 0,
+    // Funding-premium TWAP dampener (off by default). Production:
+    // 4-8 batches at our 50ms FBA cadence. Smarter than HL's
+    // single-tick premium — kills funding spikes from microbursts.
+    fundingPremiumTwapWindow: 0,
   };
 }
 
