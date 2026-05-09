@@ -99,6 +99,67 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Initialize the v2 hypertree-backed orderbook for a market.
+    /// Allocates a fresh PDA at `[b"market_book", market]` of exactly
+    /// MARKET_BOOK_TOTAL_BYTES (8264 B), stamps the v2 discriminator,
+    /// and writes an empty header with all RBT root indices = NIL.
+    ///
+    /// This is the foundation for the wave-18 orderbook rewrite. The
+    /// account is `UncheckedAccount` because the data layout
+    /// (256-byte header + 8000-byte dynamic node array) is large
+    /// enough that Anchor's `#[account(zero_copy)]` derive choke on
+    /// the `[u8; 8000]` field. Manifest's exact pattern.
+    ///
+    /// This ix runs ALONGSIDE the legacy `initialize_order_buffer` for
+    /// now; once the matcher is fully migrated (wave 18d-e), the
+    /// legacy ix is deprecated and removed.
+    pub fn init_market_book(ctx: Context<InitMarketBook>) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let base_mint = ctx.accounts.market.base_mint;
+        let quote_mint = ctx.accounts.market.quote_mint;
+        let bump = ctx.bumps.market_book;
+
+        let space = state_v2::MARKET_BOOK_TOTAL_BYTES;
+        let rent = Rent::get()?;
+        let lamports = rent.minimum_balance(space);
+
+        // CPI to System Program — create the PDA at the right seed
+        // owned by our program. The PDA's seeds (`market_book` ‖ market)
+        // make the address deterministic; the bump comes from Anchor's
+        // constraint derivation in InitMarketBook below.
+        let signer_seeds: &[&[u8]] =
+            &[state_v2::MARKET_BOOK_SEED, market_key.as_ref(), &[bump]];
+        anchor_lang::solana_program::program::invoke_signed(
+            &anchor_lang::solana_program::system_instruction::create_account(
+                &ctx.accounts.authority.key(),
+                &ctx.accounts.market_book.key(),
+                lamports,
+                space as u64,
+                ctx.program_id,
+            ),
+            &[
+                ctx.accounts.authority.to_account_info(),
+                ctx.accounts.market_book.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            &[signer_seeds],
+        )?;
+
+        // Write the v2 discriminator + zero-init the header.
+        let mut data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        state_v2::MarketBookHandle::write_disc_and_init_header(
+            &mut data, bump, market_key, base_mint, quote_mint,
+        )?;
+
+        emit!(MarketBookInitializedEvent {
+            market: market_key,
+            market_book: ctx.accounts.market_book.key(),
+            total_bytes: space as u32,
+            data_bytes: state_v2::MARKET_BOOK_DATA_BYTES as u32,
+        });
+        Ok(())
+    }
+
     /// Initialize the FLP exposure account (one per protocol). Must run
     /// before `initialize_market`. Mints `initial_capital_quote_lots` shares
     /// to the authority at 1:1 (treasury endowment); these shares can later
@@ -5666,6 +5727,32 @@ pub struct InitializeMarket<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitMarketBook<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; allocated via SystemProgram CPI in the
+    /// handler. Anchor's `init` constraint can't size this (8264 B
+    /// with the [u8; 8000] field), and `#[account(zero_copy)]` rejects
+    /// large array fields in its derive expansion. Manifest's pattern.
+    /// Owner check happens implicitly via the seeds derivation.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct InitializeOrderBuffer<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -7412,6 +7499,14 @@ pub struct AutoDeleverage<'info> {
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────
+
+#[event]
+pub struct MarketBookInitializedEvent {
+    pub market: Pubkey,
+    pub market_book: Pubkey,
+    pub total_bytes: u32,
+    pub data_bytes: u32,
+}
 
 #[event]
 pub struct MarketInitializedEvent {

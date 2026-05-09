@@ -58,6 +58,7 @@ const ICEBERG_ORDER_SEED = Buffer.from('iceberg');
 const VAULT_SEED = Buffer.from('vault');
 const VAULT_POSITION_SEED = Buffer.from('vault_position');
 const MARKET_BOND_SEED = Buffer.from('market_bond');
+const MARKET_BOOK_SEED = Buffer.from('market_book');
 
 export interface DerivedPda {
   readonly address: PublicKey;
@@ -185,4 +186,12 @@ export function marketBondPda(
   programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
 ): DerivedPda {
   return derive([MARKET_BOND_SEED, market.toBuffer(), depositor.toBuffer()], programId);
+}
+
+/// Hypertree-backed v2 orderbook account. PDA seeds [b"market_book", market].
+export function marketBookPda(
+  market: PublicKey,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
+): DerivedPda {
+  return derive([MARKET_BOOK_SEED, market.toBuffer()], programId);
 }

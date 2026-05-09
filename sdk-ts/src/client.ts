@@ -39,6 +39,7 @@ import {
   vaultPda,
   vaultPositionPda,
   marketBondPda,
+  marketBookPda,
   FLASH_BOOK_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from './pdas.ts';
@@ -266,6 +267,29 @@ export class FlashBookClient {
         authority: args.authority,
         market: args.market,
         orderBuffer: orderBuffer.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Initialize the v2 hypertree-backed orderbook for a market.
+  /// Allocates an 8264-byte PDA at [b"market_book", market]. Wave-18
+  /// foundation — the actual matcher migration happens in waves
+  /// 18d-e. Once shipped, this will replace `initializeOrderBufferIx`
+  /// + the legacy `OrderBufferAccount` (16-order cap forced by BPF
+  /// stack); the v2 book carries 50+ orders/side comfortably and is
+  /// realloc-extensible.
+  initMarketBookIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    return this.methods
+      .initMarketBook()
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        marketBook: book.address,
         systemProgram: SystemProgram.programId,
       })
       .instruction();

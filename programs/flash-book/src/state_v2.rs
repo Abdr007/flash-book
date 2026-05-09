@@ -23,7 +23,10 @@
 
 use anchor_lang::prelude::*;
 
-use crate::hypertree::{DataIndex, Get, RBNode};
+use crate::hypertree::{
+    DataIndex, FreeList, FreeListNode, Get, HyperTreeReadOperations,
+    HyperTreeWriteOperations, RBNode, RedBlackTree, NIL,
+};
 
 /// Bytes available for hypertree nodes after the fixed header. 100 nodes
 /// of 80 bytes each. Enough for ~50 orders per side + 50 claimed seats
@@ -54,17 +57,17 @@ pub struct MarketBookHeader {
     pub quote_mint: Pubkey,
 
     /// Root index of the bid RBT (bids ordered descending by price).
-    pub bids_root_index: DataIndex,
+    pub bids_root_index: u32,
     /// Cached pointer to the highest-price bid for O(1) best-bid reads.
-    pub bids_best_index: DataIndex,
+    pub bids_best_index: u32,
     /// Root index of the ask RBT (asks ordered ascending).
-    pub asks_root_index: DataIndex,
+    pub asks_root_index: u32,
     /// Cached pointer to the lowest-price ask for O(1) best-ask reads.
-    pub asks_best_index: DataIndex,
+    pub asks_best_index: u32,
     /// Root index of the claimed-seats RBT (per-trader state).
-    pub claimed_seats_root_index: DataIndex,
+    pub claimed_seats_root_index: u32,
     /// Head of the free-list (linked list of evictable 80-byte slots).
-    pub free_list_head_index: DataIndex,
+    pub free_list_head_index: u32,
 
     /// Bytes of the dynamic array currently in use. Grows monotonically
     /// until `expand_market_book` is called or all slots freed and
@@ -117,7 +120,7 @@ pub struct RestingOrderV2 {
     pub expires_at_slot: u64,
     /// Pointer at the trader's claimed seat node in the same byte
     /// array. O(1) seat lookup on every match.
-    pub trader_index: DataIndex,
+    pub trader_index: u32,
     /// Anti-replay guard for off-chain replay tools.
     pub last_valid_slot: u32,
 
@@ -251,3 +254,209 @@ impl Get for ClaimedSeatV2 {}
 // FreeList allocator as Manifest's hypertree.
 const _: () = assert!(std::mem::size_of::<RBNode<RestingOrderV2>>() == 80);
 const _: () = assert!(std::mem::size_of::<RBNode<ClaimedSeatV2>>() == 80);
+
+// ─── MarketBookHandle ────────────────────────────────────────────────
+//
+// Newtype over a raw `&mut [u8]` account-data slice. Exposes the header
+// + dynamic byte array as separate borrowed regions so that the
+// hypertree's RBT/FreeList ops can take `&mut data` without aliasing
+// `&mut header`.
+//
+// The handle is constructed inside an ix handler from
+// `ctx.accounts.market_book.try_borrow_mut_data()?` (the underlying
+// account is `UncheckedAccount<'info>`, owner-checked at the context
+// level). It validates the 8-byte discriminator on construction.
+
+/// PDA seed for the market_book account: `["market_book", market.key()]`.
+pub const MARKET_BOOK_SEED: &[u8] = b"market_book";
+
+/// 8-byte discriminator marking an account as a MarketBookAccount.
+/// NOT an Anchor sighash — we own it. Picked to be visually distinct
+/// in raw account dumps. "FB BK MK BK 01 …" = Flash Book / Book / Market.
+pub const MARKET_BOOK_DISC: [u8; 8] = [0xFB, 0xBA, 0x00, 0x4B, 0x4D, 0x4B, 0x42, 0x01];
+
+/// Total byte size of a MarketBookAccount (disc + header + data).
+/// = 8 + 256 + 8000 = 8264 bytes.
+pub const MARKET_BOOK_TOTAL_BYTES: usize = 8 + 256 + MARKET_BOOK_DATA_BYTES;
+
+pub struct MarketBookHandle<'a> {
+    pub header: &'a mut MarketBookHeader,
+    pub data: &'a mut [u8],
+}
+
+impl<'a> MarketBookHandle<'a> {
+    /// Validate the 8-byte discriminator and split a market_book account's
+    /// raw data into header + dynamic-array slices.
+    pub fn from_account_data(data: &'a mut [u8]) -> Result<Self> {
+        require!(
+            data.len() == MARKET_BOOK_TOTAL_BYTES,
+            crate::errors::FlashBookError::OutOfRange
+        );
+        require!(
+            data[..8] == MARKET_BOOK_DISC,
+            crate::errors::FlashBookError::WrongTrader,
+        );
+        let (header_bytes, dyn_data) = data[8..].split_at_mut(256);
+        let header: &mut MarketBookHeader = bytemuck::from_bytes_mut(header_bytes);
+        Ok(MarketBookHandle { header, data: dyn_data })
+    }
+
+    /// Stamp the discriminator + zero-init the header + data. Call this
+    /// ONCE inside `init_market_book` after CreateAccount.
+    pub fn write_disc_and_init_header(
+        data: &mut [u8],
+        bump: u8,
+        market_pubkey: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+    ) -> Result<()> {
+        require!(
+            data.len() == MARKET_BOOK_TOTAL_BYTES,
+            crate::errors::FlashBookError::OutOfRange
+        );
+        data[..8].copy_from_slice(&MARKET_BOOK_DISC);
+        let header_bytes = &mut data[8..8 + 256];
+        let header: &mut MarketBookHeader = bytemuck::from_bytes_mut(header_bytes);
+        header.bump = bump;
+        header.version = 1;
+        header._pad0 = [0; 6];
+        header.market_pubkey = market_pubkey;
+        header.base_mint = base_mint;
+        header.quote_mint = quote_mint;
+        header.bids_root_index = NIL;
+        header.bids_best_index = NIL;
+        header.asks_root_index = NIL;
+        header.asks_best_index = NIL;
+        header.claimed_seats_root_index = NIL;
+        header.free_list_head_index = NIL;
+        header.num_bytes_allocated = 0;
+        header.total_orders_active = 0;
+        header.order_seq_counter = 0;
+        header._reserved_a = [0; 32];
+        header._reserved_b = [0; 32];
+        header._reserved_c = [0; 32];
+        header._reserved_d = [0; 16];
+        // Dynamic array stays zero — that's what Solana::CreateAccount
+        // hands us, no extra zeroing needed.
+        Ok(())
+    }
+
+    /// Allocate a new 80-byte node from the free-list (or grow the
+    /// allocated region if the free-list is empty). Returns the byte
+    /// offset where the caller can write a 64-byte payload.
+    pub fn alloc_node(&mut self) -> Result<DataIndex> {
+        // Try free-list first.
+        let free_idx = {
+            let mut fl = FreeList::<FreeListPadding>::new(
+                self.data,
+                self.header.free_list_head_index,
+            );
+            let popped = fl.remove();
+            self.header.free_list_head_index = fl.get_head();
+            popped
+        };
+        if free_idx != NIL && free_idx != FREE_LIST_END {
+            return Ok(free_idx);
+        }
+        // Bump-alloc from the unused tail.
+        let next_offset = self.header.num_bytes_allocated;
+        let end = next_offset.saturating_add(NODE_TOTAL_BYTES as u32);
+        require!(
+            (end as usize) <= MARKET_BOOK_DATA_BYTES,
+            crate::errors::FlashBookError::BufferFull
+        );
+        self.header.num_bytes_allocated = end;
+        Ok(next_offset)
+    }
+
+    /// Return a node to the free-list. Caller is responsible for having
+    /// removed the node from any tree it lived in first.
+    pub fn free_node(&mut self, idx: DataIndex) {
+        let mut fl = FreeList::<FreeListPadding>::new(
+            self.data,
+            self.header.free_list_head_index,
+        );
+        fl.add(idx);
+        self.header.free_list_head_index = fl.get_head();
+    }
+
+    /// Insert a `RestingOrderV2` into the bids RBT. Allocates a node
+    /// first, writes the payload, then inserts into the tree. Updates
+    /// the bid root + max indices on the header.
+    pub fn insert_bid(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
+        let idx = self.alloc_node()?;
+        // Write the RBNode<RestingOrderV2> payload at idx. RedBlackTree's
+        // `insert` will fill in the RBT-bookkeeping fields (left/right/
+        // parent/color) and call `value = order` internally.
+        let new_root;
+        let new_max;
+        {
+            let mut tree = RedBlackTree::<RestingOrderV2>::new(
+                self.data,
+                self.header.bids_root_index,
+                self.header.bids_best_index,
+            );
+            tree.insert(idx, order);
+            new_root = tree.get_root_index();
+            new_max = tree.get_max_index();
+        }
+        self.header.bids_root_index = new_root;
+        self.header.bids_best_index = new_max;
+        self.header.total_orders_active = self.header.total_orders_active.saturating_add(1);
+        Ok(idx)
+    }
+
+    /// Insert a `RestingOrderV2` into the asks RBT. Mirror of `insert_bid`.
+    pub fn insert_ask(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
+        let idx = self.alloc_node()?;
+        let new_root;
+        let new_max;
+        {
+            let mut tree = RedBlackTree::<RestingOrderV2>::new(
+                self.data,
+                self.header.asks_root_index,
+                self.header.asks_best_index,
+            );
+            tree.insert(idx, order);
+            new_root = tree.get_root_index();
+            new_max = tree.get_max_index();
+        }
+        self.header.asks_root_index = new_root;
+        self.header.asks_best_index = new_max;
+        self.header.total_orders_active = self.header.total_orders_active.saturating_add(1);
+        Ok(idx)
+    }
+
+    /// Insert a claimed seat into the seats RBT.
+    pub fn insert_seat(&mut self, seat: ClaimedSeatV2) -> Result<DataIndex> {
+        let idx = self.alloc_node()?;
+        let new_root;
+        {
+            let mut tree = RedBlackTree::<ClaimedSeatV2>::new(
+                self.data,
+                self.header.claimed_seats_root_index,
+                NIL,
+            );
+            tree.insert(idx, seat);
+            new_root = tree.get_root_index();
+        }
+        self.header.claimed_seats_root_index = new_root;
+        Ok(idx)
+    }
+}
+
+/// 64-byte payload for the FreeList — pure padding. Manifest's pattern.
+#[zero_copy]
+pub struct FreeListPadding {
+    pub _padding_a: [u8; 32],
+    pub _padding_b: [u8; 32],
+}
+impl Get for FreeListPadding {}
+
+const _: () = assert!(std::mem::size_of::<FreeListPadding>() == 64);
+const _: () = assert!(std::mem::size_of::<FreeListNode<FreeListPadding>>() == 68);
+
+/// FreeList sentinel — Manifest uses `u32::MAX` to mean "no more free
+/// nodes". When `FreeList::remove()` returns this, the bump-alloc
+/// fallback kicks in.
+const FREE_LIST_END: DataIndex = u32::MAX;

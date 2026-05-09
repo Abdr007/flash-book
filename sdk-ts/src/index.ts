@@ -20,6 +20,7 @@ export {
   vaultPda,
   vaultPositionPda,
   marketBondPda,
+  marketBookPda,
   type DerivedPda,
 } from './pdas.ts';
 

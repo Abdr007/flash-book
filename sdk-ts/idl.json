@@ -2283,6 +2283,109 @@
       "args": []
     },
     {
+      "name": "init_market_book",
+      "docs": [
+        "Initialize the v2 hypertree-backed orderbook for a market.",
+        "Allocates a fresh PDA at `[b\"market_book\", market]` of exactly",
+        "MARKET_BOOK_TOTAL_BYTES (8264 B), stamps the v2 discriminator,",
+        "and writes an empty header with all RBT root indices = NIL.",
+        "",
+        "This is the foundation for the wave-18 orderbook rewrite. The",
+        "account is `UncheckedAccount` because the data layout",
+        "(256-byte header + 8000-byte dynamic node array) is large",
+        "enough that Anchor's `#[account(zero_copy)]` derive choke on",
+        "the `[u8; 8000]` field. Manifest's exact pattern.",
+        "",
+        "This ix runs ALONGSIDE the legacy `initialize_order_buffer` for",
+        "now; once the matcher is fully migrated (wave 18d-e), the",
+        "legacy ix is deprecated and removed."
+      ],
+      "discriminator": [
+        74,
+        209,
+        255,
+        35,
+        95,
+        214,
+        17,
+        112
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "handler. Anchor's `init` constraint can't size this (8264 B",
+            "with the [u8; 8000] field), and `#[account(zero_copy)]` rejects",
+            "large array fields in its derive expansion. Manifest's pattern.",
+            "Owner check happens implicitly via the seeds derivation."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "init_trader_ata",
       "docs": [
         "Idempotently create the trader's quote ATA. Anchor's `init_if_needed`",
@@ -8570,6 +8673,19 @@
       ]
     },
     {
+      "name": "MarketBookInitializedEvent",
+      "discriminator": [
+        23,
+        29,
+        138,
+        141,
+        39,
+        125,
+        216,
+        242
+      ]
+    },
+    {
       "name": "MarketInitializedEvent",
       "discriminator": [
         70,
@@ -10691,6 +10807,30 @@
           {
             "name": "claimable_at_unix",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketBookInitializedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "market_book",
+            "type": "pubkey"
+          },
+          {
+            "name": "total_bytes",
+            "type": "u32"
+          },
+          {
+            "name": "data_bytes",
+            "type": "u32"
           }
         ]
       }
