@@ -108,6 +108,17 @@ describe('Instruction builders', () => {
     expect(ix.keys[4].pubkey.toBase58()).toBe(expectedAta.toBase58());
   });
 
+  test('settleFundingIx', async () => {
+    const client = makeClient();
+    const ix = await client.settleFundingIx({
+      caller: Keypair.generate().publicKey,
+      market: Keypair.generate().publicKey,
+      trader: Keypair.generate().publicKey,
+    });
+    // caller, market, trader, trader_state, position
+    expect(ix.keys.length).toBe(5);
+  });
+
   test('closeTraderAtaIx', async () => {
     const client = makeClient();
     const trader = Keypair.generate().publicKey;

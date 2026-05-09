@@ -1214,6 +1214,229 @@ async fn place_limit_order_lands_in_buffer() {
     assert_eq!(state.orders_this_batch, 1);
 }
 
+/// Helper: open a long position via place_limit_order. Returns the position PDA.
+/// Trader must already exist and have collateral.
+async fn open_long_position(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    market_pda: Pubkey,
+    order_buf: Pubkey,
+    trader: &Keypair,
+    trader_state: Pubkey,
+    size_lots: u64,
+    limit_ticks: u64,
+) -> Pubkey {
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+    let ix = build_ix(
+        flash_book::instruction::PlaceLimitOrder {
+            side: 0, // long
+            size_lots,
+            limit_ticks,
+            post_only: false,
+        },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&trader.pubkey()),
+            &[trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+    position
+}
+
+#[tokio::test]
+async fn settle_funding_no_op_when_index_unchanged() {
+    // Open a position; market.cum_funding_index was set to 0 at the time of
+    // position open (no run_batch, so no advance has happened). Calling
+    // settle_funding immediately must be a no-op: no collateral change, no
+    // funding_paid increment, but cum_funding_index_at_entry is reset to
+    // market's current value (still 0).
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, order_buf, _b, _q) = setup_market(&mut ctx, &payer).await;
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    // Note: Cannot actually open a position via place_limit_order alone —
+    // it goes into the order buffer. Position PDAs are created by
+    // place_limit_order via init_if_needed but size_lots starts at 0.
+    // For this test we just verify settle_funding handles a zero-size
+    // position correctly.
+    let (position, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+    // Place an order to init the position PDA via init_if_needed.
+    let _ = open_long_position(&mut ctx, market_pda, order_buf, &trader, trader_state, 1, 100_000).await;
+
+    let collateral_before: TraderStateAccount =
+        fetch(&mut ctx.banks_client, trader_state).await;
+
+    let settle_ix = build_ix(
+        flash_book::instruction::SettleFunding {},
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new_readonly(trader.pubkey(), false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[settle_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let collateral_after: TraderStateAccount =
+        fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(
+        collateral_after.collateral_quote_lots,
+        collateral_before.collateral_quote_lots,
+        "no-delta settle must not move collateral"
+    );
+
+    let pos_after: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, position).await;
+    assert_eq!(pos_after.funding_paid_quote_lots, 0);
+    // Position is in the order buffer (size_lots = 0 until apply_fill);
+    // settle_funding for a zero-size position is a degenerate no-op.
+    assert_eq!(pos_after.size_lots, 0);
+}
+
+#[tokio::test]
+async fn settle_funding_long_pays_when_premium_positive() {
+    // Synthetic test: inject a nonzero cum_funding_index into the market
+    // account directly (bypassing run_batch), then settle a long position.
+    // A positive index delta on a long means the long owes funding.
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, order_buf, _b, _q) = setup_market(&mut ctx, &payer).await;
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 1_000_000, &protocol).await;
+    // Open a 100-lot long at price 100_000 ticks. Position PDA initialized.
+    let position =
+        open_long_position(&mut ctx, market_pda, order_buf, &trader, trader_state, 100, 100_000).await;
+
+    // Simulate that the trader's position was filled by directly mutating
+    // the position account: set size, side, entry_price. We bypass the full
+    // batch+apply_fill pipeline because this test is purely about funding
+    // settlement math.
+    let pos_acc = ctx.banks_client.get_account(position).await.unwrap().unwrap();
+    let mut pos_data = pos_acc.data.clone();
+    let mut pos_state = flash_book::state::PositionAccount::try_deserialize(
+        &mut pos_data.as_slice(),
+    )
+    .unwrap();
+    pos_state.size_lots = 100;
+    pos_state.side = 0; // long
+    pos_state.entry_price_ticks = 100_000;
+    pos_state.cum_funding_index_at_entry = 0;
+    pos_state.funding_paid_quote_lots = 0;
+    let mut new_data = Vec::new();
+    pos_state.try_serialize(&mut new_data).unwrap();
+    new_data.resize(pos_acc.data.len(), 0);
+    ctx.set_account(
+        &position,
+        &SolAccount {
+            lamports: pos_acc.lamports,
+            data: new_data,
+            owner: pos_acc.owner,
+            executable: pos_acc.executable,
+            rent_epoch: pos_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    // Inject a positive cum_funding_index of 1 << 60 (Q64.64). With
+    // notional = 100 × 100_000 × tick_size(=1) = 10_000_000, the funding
+    // owed = (10_000_000 × (1<<60)) >> 64 = 10_000_000 / 16 = 625_000.
+    let m_acc = ctx.banks_client.get_account(market_pda).await.unwrap().unwrap();
+    let mut m_data = m_acc.data.clone();
+    let mut m_state = flash_book::state::MarketAccount::try_deserialize(
+        &mut m_data.as_slice(),
+    )
+    .unwrap();
+    m_state.cum_funding_index = 1i128 << 60;
+    let mut new_m_data = Vec::new();
+    m_state.try_serialize(&mut new_m_data).unwrap();
+    new_m_data.resize(m_acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: m_acc.lamports,
+            data: new_m_data,
+            owner: m_acc.owner,
+            executable: m_acc.executable,
+            rent_epoch: m_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    let trader_before: TraderStateAccount =
+        fetch(&mut ctx.banks_client, trader_state).await;
+    let collateral_before = trader_before.collateral_quote_lots;
+
+    let settle_ix = build_ix(
+        flash_book::instruction::SettleFunding {},
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new_readonly(trader.pubkey(), false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(position, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[settle_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let trader_after: TraderStateAccount =
+        fetch(&mut ctx.banks_client, trader_state).await;
+    let pos_after: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, position).await;
+
+    let expected_owed: i64 = 625_000;
+    assert_eq!(
+        trader_after.collateral_quote_lots,
+        collateral_before - expected_owed as u64,
+        "long pays funding when index delta > 0"
+    );
+    assert_eq!(pos_after.funding_paid_quote_lots, expected_owed);
+    assert_eq!(pos_after.cum_funding_index_at_entry, 1i128 << 60);
+}
+
 #[tokio::test]
 async fn run_batch_advances_counter_and_clears_buffer() {
     let pt = make_program_test();

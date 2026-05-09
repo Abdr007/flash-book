@@ -2425,6 +2425,142 @@
       ]
     },
     {
+      "name": "settle_funding",
+      "docs": [
+        "Settle accrued funding for a single position. Computes funding owed",
+        "since the last settlement using `funding_owed(side, notional, now,",
+        "at_entry)`, debits or credits the trader's collateral_quote_lots,",
+        "accumulates `position.funding_paid_quote_lots`, and resets the",
+        "position's `cum_funding_index_at_entry` to the market's current",
+        "index. Idempotent — calling again immediately is a no-op (delta=0).",
+        "",
+        "Permissionless: anyone can poke a position to settle. This protects",
+        "the protocol against traders who never close — funding accrues into",
+        "the margin calc forever otherwise. Off-chain keepers will sweep",
+        "stale positions periodically.",
+        "",
+        "On insufficient collateral to cover positive funding owed, the",
+        "position's collateral is drained to zero (it will be liquidated on",
+        "the next risk check). We do not fail the tx because that would let",
+        "underwater positions block keepers from settling them."
+      ],
+      "discriminator": [
+        11,
+        251,
+        12,
+        161,
+        199,
+        228,
+        133,
+        87
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Permissionless — any signer can settle funding for any position.",
+            "The position's owner is determined by the position PDA's seeds,",
+            "not by who signs the tx."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader",
+          "docs": [
+            "The trader being settled. Doesn't need to sign — settle is",
+            "permissionless. Used as a seed to derive trader_state and position."
+          ]
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "submit_commit",
       "docs": [
         "Submit a commit hash for a future taker reveal."
@@ -3570,6 +3706,19 @@
       ]
     },
     {
+      "name": "FundingSettledEvent",
+      "discriminator": [
+        107,
+        72,
+        100,
+        52,
+        85,
+        59,
+        199,
+        56
+      ]
+    },
+    {
       "name": "LiquidationInjectedEvent",
       "discriminator": [
         164,
@@ -4213,6 +4362,34 @@
           },
           {
             "name": "entry_price_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FundingSettledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "owed_quote_lots",
+            "docs": [
+              "Signed funding owed in quote lots: positive = trader paid, negative",
+              "= trader received."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "new_collateral",
             "type": "u64"
           }
         ]

@@ -276,6 +276,29 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Settle accrued funding for a single position. Permissionless — any
+  /// signer can poke a position; `caller` pays the tx fee. The trader
+  /// being settled doesn't need to sign. Idempotent: calling repeatedly
+  /// is safe (delta=0 for an already-up-to-date position).
+  settleFundingIx(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const traderState = this.traderState(args.trader);
+    const position = this.position(args.market, args.trader);
+    return this.methods
+      .settleFunding()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        trader: args.trader,
+        traderState: traderState.address,
+        position: position.address,
+      })
+      .instruction();
+  }
+
   /// Close the trader's quote ATA and refund rent to `rentDestination`
   /// (defaults to the trader). The trader signs as ATA authority. The
   /// SPL Token program enforces that the ATA must hold zero tokens —

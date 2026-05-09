@@ -31,7 +31,7 @@ use matcher::commit_reveal::{
 };
 use matcher::fba::clear_batch;
 use matcher::flp_quoter::{generate_quotes, FlpQuoterInputs, FlpQuoterParams};
-use matcher::funding::advance;
+use matcher::funding::{advance, funding_owed};
 use matcher::lot::{BaseLots, Ticks};
 use matcher::order::{Order, OrderType, Side};
 use matcher::risk::{
@@ -474,6 +474,93 @@ pub mod flash_book {
             amount: amount_quote_lots,
             new_balance: s.collateral_quote_lots,
         });
+        Ok(())
+    }
+
+    /// Settle accrued funding for a single position. Computes funding owed
+    /// since the last settlement using `funding_owed(side, notional, now,
+    /// at_entry)`, debits or credits the trader's collateral_quote_lots,
+    /// accumulates `position.funding_paid_quote_lots`, and resets the
+    /// position's `cum_funding_index_at_entry` to the market's current
+    /// index. Idempotent — calling again immediately is a no-op (delta=0).
+    ///
+    /// Permissionless: anyone can poke a position to settle. This protects
+    /// the protocol against traders who never close — funding accrues into
+    /// the margin calc forever otherwise. Off-chain keepers will sweep
+    /// stale positions periodically.
+    ///
+    /// On insufficient collateral to cover positive funding owed, the
+    /// position's collateral is drained to zero (it will be liquidated on
+    /// the next risk check). We do not fail the tx because that would let
+    /// underwater positions block keepers from settling them.
+    pub fn settle_funding(ctx: Context<SettleFunding>) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let position = &mut ctx.accounts.position;
+        let trader_state = &mut ctx.accounts.trader_state;
+
+        // No-op for empty positions.
+        if position.size_lots == 0 {
+            position.cum_funding_index_at_entry = market.cum_funding_index;
+            return Ok(());
+        }
+
+        // notional = size × entry_price × tick_size, in quote lots
+        let notional_u128 = (position.size_lots as u128)
+            .checked_mul(position.entry_price_ticks as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+            .checked_mul(market.params.tick_size as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(
+            notional_u128 <= u64::MAX as u128,
+            FlashBookError::ArithmeticOverflow
+        );
+        let notional = notional_u128 as u64;
+
+        let is_long = position.side == 0;
+        let owed_i128 = funding_owed(
+            is_long,
+            notional,
+            market.cum_funding_index,
+            position.cum_funding_index_at_entry,
+        )?;
+
+        // Apply settlement: positive owed → trader pays, negative → receives.
+        // Clamp owed to i64 range; rounded values that overflow i64 are
+        // capped (extreme case only reachable with insane funding rates).
+        let owed_i64 = if owed_i128 > i64::MAX as i128 {
+            i64::MAX
+        } else if owed_i128 < i64::MIN as i128 {
+            i64::MIN
+        } else {
+            owed_i128 as i64
+        };
+
+        if owed_i64 > 0 {
+            // Trader owes funding. Drain up to current collateral; never fail.
+            let pay = (owed_i64 as u64).min(trader_state.collateral_quote_lots);
+            trader_state.collateral_quote_lots -= pay;
+        } else if owed_i64 < 0 {
+            // Trader receives funding from the protocol.
+            let recv = owed_i64.unsigned_abs();
+            trader_state.collateral_quote_lots = trader_state
+                .collateral_quote_lots
+                .checked_add(recv)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        }
+
+        position.funding_paid_quote_lots = position
+            .funding_paid_quote_lots
+            .checked_add(owed_i64)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        position.cum_funding_index_at_entry = market.cum_funding_index;
+
+        emit!(FundingSettledEvent {
+            market: market.key(),
+            trader: position.trader,
+            owed_quote_lots: owed_i64,
+            new_collateral: trader_state.collateral_quote_lots,
+        });
+
         Ok(())
     }
 
@@ -2287,6 +2374,39 @@ pub struct WithdrawCollateral<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SettleFunding<'info> {
+    /// Permissionless — any signer can settle funding for any position.
+    /// The position's owner is determined by the position PDA's seeds,
+    /// not by who signs the tx.
+    pub caller: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// The trader being settled. Doesn't need to sign — settle is
+    /// permissionless. Used as a seed to derive trader_state and position.
+    /// CHECK: identity check is enforced by PDA seed derivation below.
+    pub trader: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        mut,
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader.key().as_ref()],
+        bump,
+    )]
+    pub position: Account<'info, state::PositionAccount>,
+}
+
+#[derive(Accounts)]
 pub struct ApplyFill<'info> {
     #[account(mut)]
     pub sequencer: Signer<'info>,
@@ -2571,6 +2691,16 @@ pub struct FillAppliedEvent {
     pub size_lots: u64,
     pub price_ticks: u64,
     pub batch_num: u64,
+}
+
+#[event]
+pub struct FundingSettledEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    /// Signed funding owed in quote lots: positive = trader paid, negative
+    /// = trader received.
+    pub owed_quote_lots: i64,
+    pub new_collateral: u64,
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
