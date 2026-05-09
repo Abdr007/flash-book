@@ -1068,6 +1068,28 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Approve, rotate, or revoke a builder code (Hyperliquid model).
+  /// `builder` = the third-party UI/wallet/aggregator pubkey routing
+  /// flow on the trader's behalf. `maxFeeShareBps` caps the share of
+  /// net protocol fee the builder may collect — the on-chain emit
+  /// clamps `min(market.builder_share_bps, maxFeeShareBps)`. Pass
+  /// `PublicKey.default` to revoke (max share is forced to 0). Trader
+  /// signs — only the user can install/rotate/revoke.
+  setTraderBuilderIx(args: {
+    trader: PublicKey;
+    builder: PublicKey;
+    maxFeeShareBps: number;
+  }): Promise<TransactionInstruction> {
+    const state = this.traderState(args.trader);
+    return this.methods
+      .setTraderBuilder(args.builder, args.maxFeeShareBps)
+      .accountsPartial({
+        trader: args.trader,
+        traderState: state.address,
+      })
+      .instruction();
+  }
+
   cancelOrderIx(args: {
     trader: PublicKey;
     market: PublicKey;

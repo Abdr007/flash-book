@@ -3413,6 +3413,83 @@
       ]
     },
     {
+      "name": "set_trader_builder",
+      "docs": [
+        "Set or rotate the trader's builder pubkey + the maximum fee share",
+        "(in bps of net fee) the trader authorizes the builder to collect.",
+        "Pass Pubkey::default() to revoke. Hyperliquid builder-codes model:",
+        "a third-party UI/wallet/aggregator routing flow earns a share of",
+        "the protocol fee, capped by the user's approved max. Trader signs",
+        "— neither the protocol authority nor the builder can install one",
+        "unilaterally.",
+        "",
+        "`max_fee_share_bps` capped at BPS_DENOM (10_000 = 100% of net fee).",
+        "The on-chain emit clamps `min(market.params.builder_share_bps,",
+        "max_fee_share_bps)`."
+      ],
+      "discriminator": [
+        91,
+        76,
+        105,
+        14,
+        198,
+        243,
+        130,
+        95
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "docs": [
+            "Trader signs — the user is the only one who can install or rotate",
+            "the builder for their account. Protocol authority does NOT have",
+            "this power (otherwise builders could be installed against the",
+            "user's will)."
+          ],
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "builder",
+          "type": "pubkey"
+        },
+        {
+          "name": "max_fee_share_bps",
+          "type": "u32"
+        }
+      ]
+    },
+    {
       "name": "set_trader_delegate",
       "docs": [
         "Set or clear the trader's delegate authority. The delegate is a",
@@ -3490,9 +3567,13 @@
         "30-day rolling notional — the universal pattern at every CEX",
         "(Binance, OKX, Bybit, Hyperliquid).",
         "",
-        "`discount_bps` is bounded to BPS_DENOM (10_000) — a 100% discount",
-        "makes the taker fee zero; the chain refuses values above 10_000",
-        "to prevent negative fees."
+        "`discount_bps` is bounded to `MAX_FEE_DISCOUNT_BPS` = 12_000 (120%).",
+        "Values up to 10_000 are a normal discount (down to zero fee);",
+        "10_000..12_000 enable HL/MM-pro top-tier NEGATIVE fees — the",
+        "taker is *paid* for routing flow, with the rebate sourced from",
+        "the protocol's own insurance contribution. Apply_fill clamps the",
+        "rebate so the trader never extracts more than `max(rebate)` of",
+        "notional, and the math respects the maker rebate priority."
       ],
       "discriminator": [
         119,
@@ -5147,6 +5228,19 @@
       ]
     },
     {
+      "name": "BuilderFeeOwedEvent",
+      "discriminator": [
+        15,
+        151,
+        236,
+        181,
+        162,
+        162,
+        168,
+        136
+      ]
+    },
+    {
       "name": "CollateralDepositedEvent",
       "discriminator": [
         76,
@@ -5277,6 +5371,19 @@
       ]
     },
     {
+      "name": "MarginThresholdCrossedEvent",
+      "discriminator": [
+        22,
+        171,
+        243,
+        86,
+        181,
+        242,
+        145,
+        194
+      ]
+    },
+    {
       "name": "MarketAuthorityTransferredEvent",
       "discriminator": [
         19,
@@ -5378,6 +5485,19 @@
         52,
         219,
         190
+      ]
+    },
+    {
+      "name": "TraderBuilderUpdatedEvent",
+      "discriminator": [
+        21,
+        188,
+        251,
+        213,
+        187,
+        124,
+        125,
+        160
       ]
     },
     {
@@ -5848,6 +5968,26 @@
           },
           {
             "name": "seized_bonds",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BuilderFeeOwedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "builder",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
             "type": "u64"
           }
         ]
@@ -6388,6 +6528,43 @@
               "Cumulative quote-lot withdrawals."
             ],
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarginThresholdCrossedEvent",
+      "docs": [
+        "Multi-threshold margin warning. Emitted when a trader's account-level",
+        "margin ratio crosses an alert threshold (75% → caution, 50% → warn,",
+        "25% → critical) so off-chain UIs can push notifications BEFORE",
+        "liquidation. Hyperliquid pattern: gives users runway to add collateral",
+        "or de-risk instead of being surprised by an MMR breach."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "level",
+            "docs": [
+              "0 = caution (75% of MMR headroom), 1 = warn (50%), 2 = critical (25%)"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "equity_to_mmr_bps",
+            "docs": [
+              "Position equity / required margin, in bps (e.g. 12_500 = 125%)."
+            ],
+            "type": "u32"
           }
         ]
       }
@@ -7106,6 +7283,30 @@
       }
     },
     {
+      "name": "TraderBuilderUpdatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous",
+            "type": "pubkey"
+          },
+          {
+            "name": "new",
+            "type": "pubkey"
+          },
+          {
+            "name": "max_fee_share_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
       "name": "TraderDelegateUpdatedEvent",
       "type": {
         "kind": "struct",
@@ -7247,6 +7448,32 @@
               "griefing)."
             ],
             "type": "pubkey"
+          },
+          {
+            "name": "builder",
+            "docs": [
+              "Approved builder pubkey. When non-default, on every fill where this",
+              "trader is the taker, `min(market.params.builder_share_bps,",
+              "builder_max_fee_share_bps)` of the protocol's net fee revenue is",
+              "credited to the builder via `BuilderFeeOwedEvent` (off-chain",
+              "pull-based). Hyperliquid builder-codes model: a third-party UI/",
+              "wallet/aggregator that routes flow earns a share of the fee from",
+              "the user's trades. Set/rotated/revoked freely via",
+              "`set_trader_builder`; the trader's CAP on the share keeps builders",
+              "from extracting more than the user agreed to."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "builder_max_fee_share_bps",
+            "docs": [
+              "Maximum fee share (in bps of net fee) the trader has authorized",
+              "the builder to take. The on-chain emit clamps the protocol-side",
+              "builder_share_bps by this. 0 = builder set but no share approved",
+              "(functionally the same as no builder). Allows the trader to set a",
+              "conservative cap below whatever the protocol rate is."
+            ],
+            "type": "u32"
           }
         ]
       }

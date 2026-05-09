@@ -523,14 +523,33 @@ pub struct TraderStateAccount {
     /// `set_trader_referrer` — immutable after first set (anti-rotation
     /// griefing).
     pub referrer: Pubkey,
+    /// Approved builder pubkey. When non-default, on every fill where this
+    /// trader is the taker, `min(market.params.builder_share_bps,
+    /// builder_max_fee_share_bps)` of the protocol's net fee revenue is
+    /// credited to the builder via `BuilderFeeOwedEvent` (off-chain
+    /// pull-based). Hyperliquid builder-codes model: a third-party UI/
+    /// wallet/aggregator that routes flow earns a share of the fee from
+    /// the user's trades. Set/rotated/revoked freely via
+    /// `set_trader_builder`; the trader's CAP on the share keeps builders
+    /// from extracting more than the user agreed to.
+    pub builder: Pubkey,
+    /// Maximum fee share (in bps of net fee) the trader has authorized
+    /// the builder to take. The on-chain emit clamps the protocol-side
+    /// builder_share_bps by this. 0 = builder set but no share approved
+    /// (functionally the same as no builder). Allows the trader to set a
+    /// conservative cap below whatever the protocol rate is.
+    pub builder_max_fee_share_bps: u32,
 }
 
 impl TraderStateAccount {
     pub const SEED: &'static [u8] = b"trader_state";
     pub fn space() -> usize {
-        // 8 (disc) + 32 + 1 + 8 + 8 + 1 + 4 + 4 + 8 + 8 + 4 + 32 (delegate) +
-        // 32 (referrer) = 150. Round up.
-        8 + 160
+        // body = 32 (trader) + 1 (bump) + 8 (collateral) + 8 (realized_pnl)
+        // + 1 (open_positions) + 4 (toxicity) + 4 (orders_this_batch)
+        // + 8 (last_batch_seen) + 4 (fee_discount_bps) + 32 (delegate)
+        // + 32 (referrer) + 32 (builder) + 4 (builder_max_fee_share_bps)
+        // = 170 bytes. + 8 disc = 178. Round to 192 for headroom.
+        8 + 192
     }
 
     /// Returns true if `signer` is authorized to act on this trader's

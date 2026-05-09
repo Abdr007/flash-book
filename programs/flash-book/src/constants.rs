@@ -9,6 +9,15 @@ pub const USD_UNIT: u64 = 1_000_000;
 /// Basis points denominator. 1 bp = 1/10_000.
 pub const BPS_DENOM: u32 = 10_000;
 
+/// Maximum fee discount allowed via `set_trader_fee_tier`. Values up to
+/// 10_000 (100%) zero out the taker fee; values 10_001..=12_000 enable
+/// HL/MM-pro top-tier NEGATIVE fees — the taker is *paid* for routing
+/// flow. Apply_fill clamps the resulting rebate so the protocol never
+/// pays out more than its insurance contribution can absorb. 12_000 =
+/// 120% means the maximum negative fee is 20% of the base taker fee
+/// (e.g. 5 bps base × -0.2 = -1 bps rebate to taker).
+pub const MAX_FEE_DISCOUNT_BPS: u32 = 12_000;
+
 /// Maximum stress scenarios per batch — capped to keep margin compute bounded.
 /// At 60 scenarios × 8 markets × 16 positions = 7680 evaluations per batch.
 pub const MAX_STRESS_SCENARIOS: usize = 64;

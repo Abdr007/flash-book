@@ -461,6 +461,8 @@ pub mod flash_book {
         s.fee_discount_bps = 0;
         s.delegate = Pubkey::default();
         s.referrer = Pubkey::default();
+        s.builder = Pubkey::default();
+        s.builder_max_fee_share_bps = 0;
         Ok(())
     }
 
@@ -513,15 +515,19 @@ pub mod flash_book {
     /// 30-day rolling notional — the universal pattern at every CEX
     /// (Binance, OKX, Bybit, Hyperliquid).
     ///
-    /// `discount_bps` is bounded to BPS_DENOM (10_000) — a 100% discount
-    /// makes the taker fee zero; the chain refuses values above 10_000
-    /// to prevent negative fees.
+    /// `discount_bps` is bounded to `MAX_FEE_DISCOUNT_BPS` = 12_000 (120%).
+    /// Values up to 10_000 are a normal discount (down to zero fee);
+    /// 10_000..12_000 enable HL/MM-pro top-tier NEGATIVE fees — the
+    /// taker is *paid* for routing flow, with the rebate sourced from
+    /// the protocol's own insurance contribution. Apply_fill clamps the
+    /// rebate so the trader never extracts more than `max(rebate)` of
+    /// notional, and the math respects the maker rebate priority.
     pub fn set_trader_fee_tier(
         ctx: Context<SetTraderFeeTier>,
         discount_bps: u32,
     ) -> Result<()> {
         require!(
-            discount_bps <= constants::BPS_DENOM as u32,
+            discount_bps <= constants::MAX_FEE_DISCOUNT_BPS,
             FlashBookError::OutOfRange
         );
         let s = &mut ctx.accounts.trader_state;
@@ -529,6 +535,43 @@ pub mod flash_book {
         emit!(TraderFeeTierUpdatedEvent {
             trader: s.trader,
             discount_bps,
+        });
+        Ok(())
+    }
+
+    /// Set or rotate the trader's builder pubkey + the maximum fee share
+    /// (in bps of net fee) the trader authorizes the builder to collect.
+    /// Pass Pubkey::default() to revoke. Hyperliquid builder-codes model:
+    /// a third-party UI/wallet/aggregator routing flow earns a share of
+    /// the protocol fee, capped by the user's approved max. Trader signs
+    /// — neither the protocol authority nor the builder can install one
+    /// unilaterally.
+    ///
+    /// `max_fee_share_bps` capped at BPS_DENOM (10_000 = 100% of net fee).
+    /// The on-chain emit clamps `min(market.params.builder_share_bps,
+    /// max_fee_share_bps)`.
+    pub fn set_trader_builder(
+        ctx: Context<SetTraderBuilder>,
+        builder: Pubkey,
+        max_fee_share_bps: u32,
+    ) -> Result<()> {
+        require!(
+            max_fee_share_bps <= constants::BPS_DENOM as u32,
+            FlashBookError::OutOfRange
+        );
+        let s = &mut ctx.accounts.trader_state;
+        let prev = s.builder;
+        s.builder = builder;
+        s.builder_max_fee_share_bps = if builder == Pubkey::default() {
+            0
+        } else {
+            max_fee_share_bps
+        };
+        emit!(TraderBuilderUpdatedEvent {
+            trader: s.trader,
+            previous: prev,
+            new: builder,
+            max_fee_share_bps: s.builder_max_fee_share_bps,
         });
         Ok(())
     }
@@ -773,17 +816,31 @@ pub mod flash_book {
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
             .checked_mul(market.params.tick_size as u128)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        let mut taker_fee_u128 =
+        let base_taker_fee_u128 =
             notional_u128.saturating_mul(market.params.taker_fee_bps as u128) / constants::BPS_DENOM as u128;
-        // Apply taker's per-trader fee tier discount (0..10_000 bps).
-        // Capped at 10_000 (100%) so the discount never inverts to a
-        // negative fee. Discount is fee × (10_000 - discount_bps) / 10_000.
-        let discount_bps =
-            ctx.accounts.taker_trader_state.fee_discount_bps.min(constants::BPS_DENOM as u32) as u128;
-        if discount_bps > 0 {
-            taker_fee_u128 = taker_fee_u128
-                .saturating_mul((constants::BPS_DENOM as u128).saturating_sub(discount_bps))
+        // Apply taker's per-trader fee tier discount.
+        //   discount ≤ 10_000 (100%) → standard discount, fee ≥ 0
+        //   discount ∈ (10_000, 12_000] → NEGATIVE fee (rebate to taker)
+        // Capped at MAX_FEE_DISCOUNT_BPS = 12_000 (120%). Negative fee
+        // resolves to a credit on taker collateral; the rebate is sourced
+        // from the protocol's insurance contribution downstream so it
+        // can't push the insurance fund negative.
+        let discount_bps_full = ctx.accounts.taker_trader_state.fee_discount_bps as u128;
+        let discount_bps = discount_bps_full.min(constants::MAX_FEE_DISCOUNT_BPS as u128);
+        let mut taker_fee_u128 = base_taker_fee_u128;
+        let mut taker_negative_rebate_u128: u128 = 0;
+        if discount_bps <= constants::BPS_DENOM as u128 {
+            if discount_bps > 0 {
+                taker_fee_u128 = base_taker_fee_u128
+                    .saturating_mul((constants::BPS_DENOM as u128).saturating_sub(discount_bps))
+                    / constants::BPS_DENOM as u128;
+            }
+        } else {
+            // Negative-fee tier: fee = 0, rebate = base × (discount - 10_000) / 10_000
+            let neg_bps = discount_bps - constants::BPS_DENOM as u128;
+            taker_negative_rebate_u128 = base_taker_fee_u128.saturating_mul(neg_bps)
                 / constants::BPS_DENOM as u128;
+            taker_fee_u128 = 0;
         }
         // Effective maker rebate = base + JIT bonus (if taker was tagged).
         // JIT bonus comes out of the protocol — paid by reducing the
@@ -819,12 +876,27 @@ pub mod flash_book {
         // Apply fees BEFORE position state is mutated, so reads are clean.
         // Taker pays fee from collateral (must have it; place_limit_order's
         // margin gate ensured this at intake time, but we double-check).
+        // For NEGATIVE-fee tier traders, taker_fee == 0 and we credit the
+        // taker the rebate sourced from the protocol contribution.
         {
             let taker_state = &mut ctx.accounts.taker_trader_state;
-            taker_state.collateral_quote_lots = taker_state
-                .collateral_quote_lots
-                .checked_sub(taker_fee)
-                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+            if taker_fee > 0 {
+                taker_state.collateral_quote_lots = taker_state
+                    .collateral_quote_lots
+                    .checked_sub(taker_fee)
+                    .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+            }
+            if taker_negative_rebate_u128 > 0 {
+                let neg_rebate_u64 = if taker_negative_rebate_u128 > u64::MAX as u128 {
+                    u64::MAX
+                } else {
+                    taker_negative_rebate_u128 as u64
+                };
+                taker_state.collateral_quote_lots = taker_state
+                    .collateral_quote_lots
+                    .checked_add(neg_rebate_u64)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            }
         }
         // Maker receives rebate.
         {
@@ -835,12 +907,16 @@ pub mod flash_book {
                 .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         }
         // Net fee to insurance fund (per fee_contribution_bps).
+        // For negative-fee tier the contribution is reduced by what we
+        // paid out as taker rebate — protocol absorbs the cost from its
+        // share, never from maker rebate or insurance balance.
         {
             let fund = &mut ctx.accounts.insurance_fund;
             let contribution = (net_fee as u128)
                 .saturating_mul(fund.fee_contribution_bps as u128)
                 .checked_div(constants::BPS_DENOM as u128)
                 .ok_or_else(|| error!(FlashBookError::DivisionByZero))?;
+            let contribution = contribution.saturating_sub(taker_negative_rebate_u128);
             let contribution_u64 = if contribution > u64::MAX as u128 {
                 u64::MAX
             } else {
@@ -873,6 +949,30 @@ pub mod flash_book {
                 emit!(ReferralOwedEvent {
                     taker: ctx.accounts.taker_trader_state.trader,
                     referrer: taker_referrer,
+                    amount_quote_lots: share,
+                });
+            }
+        }
+
+        // ── Builder code attribution (Hyperliquid builder-codes) ─────
+        // When the taker has approved a builder, emit BuilderFeeOwedEvent
+        // for off-chain accrual. Rate = min(market builder_share_bps,
+        // trader-approved cap). Pull-based (no on-chain builder account
+        // walk) keeps ApplyFill's account list bounded.
+        let taker_builder = ctx.accounts.taker_trader_state.builder;
+        let trader_builder_cap = ctx.accounts.taker_trader_state.builder_max_fee_share_bps;
+        if taker_builder != Pubkey::default()
+            && market.params.builder_share_bps > 0
+            && trader_builder_cap > 0
+        {
+            let effective_bps =
+                market.params.builder_share_bps.min(trader_builder_cap) as u128;
+            let share =
+                ((net_fee as u128).saturating_mul(effective_bps) / (constants::BPS_DENOM as u128)) as u64;
+            if share > 0 {
+                emit!(BuilderFeeOwedEvent {
+                    taker: ctx.accounts.taker_trader_state.trader,
+                    builder: taker_builder,
                     amount_quote_lots: share,
                 });
             }
@@ -1003,6 +1103,39 @@ pub mod flash_book {
             price_ticks,
             batch_num: current_batch,
         });
+
+        // ── Multi-threshold margin warning ──────────────────────────
+        // Single-position equity-vs-MMR view (cheap, no portfolio walk):
+        //   equity   = collateral + unrealized_pnl(pos, mark)
+        //   required = position_notional × mmr_bps / 10_000
+        // Emit on threshold crossings (250%/200%/125%) so off-chain UIs
+        // can push pre-liquidation alerts. Hyperliquid pattern.
+        for (pos, trader_pk, collateral) in [
+            (
+                &*ctx.accounts.taker_position,
+                taker_trader_pk,
+                ctx.accounts.taker_trader_state.collateral_quote_lots,
+            ),
+            (
+                &*ctx.accounts.maker_position,
+                maker_trader_pk,
+                ctx.accounts.maker_trader_state.collateral_quote_lots,
+            ),
+        ] {
+            if pos.size_lots == 0 {
+                continue;
+            }
+            emit_margin_threshold_if_crossed(
+                trader_pk,
+                market_key,
+                pos,
+                market.mark_price_ticks,
+                market.params.tick_size,
+                market.params.maintenance_margin_ratio_bps,
+                collateral,
+            );
+        }
+
         Ok(())
     }
 
@@ -3421,6 +3554,23 @@ pub struct SetTraderFeeTier<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetTraderBuilder<'info> {
+    /// Trader signs — the user is the only one who can install or rotate
+    /// the builder for their account. Protocol authority does NOT have
+    /// this power (otherwise builders could be installed against the
+    /// user's will).
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+}
+
+#[derive(Accounts)]
 pub struct InitTraderAta<'info> {
     /// Funds the ATA rent. Doesn't have to be the trader — onboarding flows
     /// often have the protocol or a sponsor pay.
@@ -4384,6 +4534,36 @@ pub struct ReferralOwedEvent {
 }
 
 #[event]
+pub struct BuilderFeeOwedEvent {
+    pub taker: Pubkey,
+    pub builder: Pubkey,
+    pub amount_quote_lots: u64,
+}
+
+#[event]
+pub struct TraderBuilderUpdatedEvent {
+    pub trader: Pubkey,
+    pub previous: Pubkey,
+    pub new: Pubkey,
+    pub max_fee_share_bps: u32,
+}
+
+/// Multi-threshold margin warning. Emitted when a trader's account-level
+/// margin ratio crosses an alert threshold (75% → caution, 50% → warn,
+/// 25% → critical) so off-chain UIs can push notifications BEFORE
+/// liquidation. Hyperliquid pattern: gives users runway to add collateral
+/// or de-risk instead of being surprised by an MMR breach.
+#[event]
+pub struct MarginThresholdCrossedEvent {
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    /// 0 = caution (75% of MMR headroom), 1 = warn (50%), 2 = critical (25%)
+    pub level: u8,
+    /// Position equity / required margin, in bps (e.g. 12_500 = 125%).
+    pub equity_to_mmr_bps: u32,
+}
+
+#[event]
 pub struct TriggerOrderPlacedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
@@ -4874,6 +5054,74 @@ fn update_oi(
 ///   - Opposite side, size ≤ existing: reduce; realize PnL on closed portion.
 ///   - Opposite side, size > existing: flip side; realize PnL on existing
 ///     fully closed; remaining size opens at `price`.
+/// Single-position margin-threshold check. Cheap (no portfolio walk):
+/// computes equity = collateral + unrealized_pnl(pos, mark) and required
+/// = pos_notional × mmr_bps / 10_000, then emits a
+/// MarginThresholdCrossedEvent on threshold crossings (250%, 200%, 125%).
+/// Off-chain UIs subscribe and push pre-liquidation alerts. Hyperliquid
+/// pattern. Silent when required == 0 or numbers don't fit.
+fn emit_margin_threshold_if_crossed(
+    trader: Pubkey,
+    market: Pubkey,
+    pos: &state::PositionAccount,
+    mark_ticks: u64,
+    tick_size: u64,
+    mmr_bps: u32,
+    collateral_quote_lots: u64,
+) {
+    if pos.size_lots == 0 || mark_ticks == 0 || mmr_bps == 0 {
+        return;
+    }
+    let notional_u128 = (pos.size_lots as u128)
+        .saturating_mul(mark_ticks as u128)
+        .saturating_mul(tick_size as u128);
+    let required = notional_u128.saturating_mul(mmr_bps as u128) / constants::BPS_DENOM as u128;
+    if required == 0 {
+        return;
+    }
+    // Unrealized PnL: (mark - entry) × size × ±1
+    let pnl_per_lot_ticks = (mark_ticks as i128) - (pos.entry_price_ticks as i128);
+    let sign: i128 = if pos.side == 0 { 1 } else { -1 };
+    let unrealized = sign
+        .saturating_mul(pos.size_lots as i128)
+        .saturating_mul(pnl_per_lot_ticks)
+        .saturating_mul(tick_size as i128);
+    let equity_signed = (collateral_quote_lots as i128).saturating_add(unrealized);
+    if equity_signed <= 0 {
+        emit!(MarginThresholdCrossedEvent {
+            trader,
+            market,
+            level: 2,
+            equity_to_mmr_bps: 0,
+        });
+        return;
+    }
+    let ratio_bps_u128 = (equity_signed as u128).saturating_mul(constants::BPS_DENOM as u128) / required;
+    let ratio_bps: u32 = if ratio_bps_u128 > u32::MAX as u128 {
+        u32::MAX
+    } else {
+        ratio_bps_u128 as u32
+    };
+    // Threshold ladder. Higher ratio = healthier. Critical first wins.
+    let level: Option<u8> = if ratio_bps < 12_500 {
+        Some(2) // critical (< 125% of MMR)
+    } else if ratio_bps < 20_000 {
+        Some(1) // warn (< 200%)
+    } else if ratio_bps < 25_000 {
+        Some(0) // caution (< 250%)
+    } else {
+        None
+    };
+    if let Some(level) = level {
+        emit!(MarginThresholdCrossedEvent {
+            trader,
+            market,
+            level,
+            equity_to_mmr_bps: ratio_bps,
+        });
+    }
+}
+
 fn apply_fill_to_position(
     pos: &mut state::PositionAccount,
     fill_side: Side,
