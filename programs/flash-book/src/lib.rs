@@ -18,6 +18,7 @@ use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer}
 pub mod constants;
 pub mod er;
 pub mod errors;
+pub mod hypertree;
 pub mod matcher;
 pub mod state;
 
