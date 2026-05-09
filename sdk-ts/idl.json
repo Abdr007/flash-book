@@ -2384,6 +2384,111 @@
       ]
     },
     {
+      "name": "place_basket_order_n",
+      "docs": [
+        "N-leg basket order. Place K orders across K distinct markets in",
+        "one transaction with a SINGLE cross-market stress-lattice gate.",
+        "Generalises `place_basket_order` (which is hard-coded for K=2).",
+        "",
+        "`legs.len()` must equal the number of (market, order_buffer,",
+        "position) triples in `remaining_accounts` (so 3 × K accounts).",
+        "All markets must be distinct. Position PDAs MUST already exist —",
+        "callers init them via a no-op place_limit_order on each market",
+        "first (init_if_needed isn't safe with remaining_accounts).",
+        "",
+        "Hard caps: legs.len() ≤ MAX_BASKET_LEGS_N (4). Larger baskets",
+        "can land via repeated 2-leg or N-leg calls.",
+        "",
+        "Atomicity: any failure (cap breach, buffer full, distinct-market",
+        "guard, basket margin gate, rate limit) rolls back the whole tx."
+      ],
+      "discriminator": [
+        31,
+        154,
+        234,
+        152,
+        222,
+        154,
+        50,
+        156
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "docs": [
+            "Read for the capital-relative position cap (per-leg) and the",
+            "joint stress-lattice gate."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "legs",
+          "type": {
+            "vec": {
+              "defined": {
+                "name": "BasketLeg"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "place_limit_order",
       "docs": [
         "Submit a resting limit order. Routed to the order buffer for the",
@@ -4261,6 +4366,19 @@
   ],
   "events": [
     {
+      "name": "BasketOrderNPlacedEvent",
+      "discriminator": [
+        19,
+        153,
+        141,
+        135,
+        48,
+        6,
+        0,
+        31
+      ]
+    },
+    {
       "name": "BasketOrderPlacedEvent",
       "discriminator": [
         118,
@@ -4752,6 +4870,28 @@
           {
             "name": "post_only",
             "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BasketOrderNPlacedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "leg_count",
+            "type": "u8"
+          },
+          {
+            "name": "markets",
+            "type": {
+              "vec": "pubkey"
+            }
           }
         ]
       }

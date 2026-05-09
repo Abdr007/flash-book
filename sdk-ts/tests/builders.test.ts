@@ -127,6 +127,26 @@ describe('Instruction builders', () => {
     expect(ix.keys.length).toBe(10);
   });
 
+  test('placeBasketOrderNIx with 3 legs has correct account count', async () => {
+    const client = makeClient();
+    const trader = Keypair.generate().publicKey;
+    const m1 = client.market(SOL, USDC).address;
+    // Distinct second + third markets (use SOL/SOL and USDC/USDC pairings to
+    // avoid colliding with m1).
+    const m2 = client.market(USDC, SOL).address;
+    const m3 = client.market(SOL, SOL).address;
+    const ix = await client.placeBasketOrderNIx({
+      trader,
+      legs: [
+        { market: m1, side: 'long', sizeLots: new BN(1), limitTicks: new BN(100_000) },
+        { market: m2, side: 'short', sizeLots: new BN(1), limitTicks: new BN(200_000) },
+        { market: m3, side: 'long', sizeLots: new BN(1), limitTicks: new BN(50_000) },
+      ],
+    });
+    // trader, trader_state, flp_exposure + (market, order_buffer, position) × 3
+    expect(ix.keys.length).toBe(3 + 3 * 3);
+  });
+
   test('verifyMarketInvariantsIx', async () => {
     const client = makeClient();
     const ix = await client.verifyMarketInvariantsIx({

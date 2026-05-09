@@ -323,6 +323,51 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// N-leg basket order (≤ MAX_BASKET_LEGS_N = 4). Generalises the
+  /// fixed 2-leg `placeBasketOrderIx` via remaining_accounts walking.
+  /// Position PDAs MUST already exist on each market — call a no-op
+  /// place_limit_order first to init.
+  placeBasketOrderNIx(args: {
+    trader: PublicKey;
+    legs: ReadonlyArray<{
+      market: PublicKey;
+      side: 'long' | 'short';
+      sizeLots: bigint | number;
+      limitTicks: bigint | number;
+      postOnly?: boolean;
+    }>;
+  }): Promise<TransactionInstruction> {
+    const flp = this.flpExposure();
+    const state = this.traderState(args.trader);
+    const ixLegs = args.legs.map((l) => ({
+      side: l.side === 'long' ? 0 : 1,
+      sizeLots: l.sizeLots,
+      limitTicks: l.limitTicks,
+      postOnly: l.postOnly ?? false,
+    }));
+    // Build remaining_accounts as triples [market, order_buffer, position]
+    // per leg. Caller delivers the same array order as legs.
+    const remaining: { pubkey: PublicKey; isWritable: boolean; isSigner: boolean }[] = [];
+    for (const leg of args.legs) {
+      const buf = this.orderBuffer(leg.market);
+      const pos = this.position(leg.market, args.trader);
+      remaining.push(
+        { pubkey: leg.market, isWritable: false, isSigner: false },
+        { pubkey: buf.address, isWritable: true, isSigner: false },
+        { pubkey: pos.address, isWritable: true, isSigner: false },
+      );
+    }
+    return this.methods
+      .placeBasketOrderN(ixLegs)
+      .accountsPartial({
+        trader: args.trader,
+        traderState: state.address,
+        flpExposure: flp.address,
+      })
+      .remainingAccounts(remaining)
+      .instruction();
+  }
+
   /// Permissionlessly check market solvency invariants. Currently
   /// verifies open-interest balance (S5: oi_long == oi_short). On
   /// breach, the tx fails and an InvariantBreachDetectedEvent is

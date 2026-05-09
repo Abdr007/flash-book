@@ -48,3 +48,10 @@ pub const FLP_SEQ_RESERVED_OFFSET: u64 = 1u64 << 56;
 
 /// Per-trader per-batch limit on submitted orders. Spam-protection.
 pub const MAX_ORDERS_PER_TRADER_PER_BATCH: u32 = 16;
+
+/// Hard cap on legs in a single `place_basket_order_n` call. Bounded
+/// because remaining_accounts traversal is linear in legs and each leg
+/// costs ~3 account deserialisations + a buffer re-serialise. Production
+/// CLOBs typically size baskets at ≤4 legs (a long-short pair plus a
+/// hedge); larger baskets land via repeated calls.
+pub const MAX_BASKET_LEGS_N: usize = 4;

@@ -24,8 +24,8 @@ pub mod state;
 pub use errors::FlashBookError;
 
 use constants::{
-    FLP_SEQ_RESERVED_OFFSET, MARK_HISTORY_LEN, MAX_ORDERS_PER_TRADER_PER_BATCH,
-    ORDER_BUFFER_CAP,
+    FLP_SEQ_RESERVED_OFFSET, MARK_HISTORY_LEN, MAX_BASKET_LEGS_N,
+    MAX_ORDERS_PER_TRADER_PER_BATCH, ORDER_BUFFER_CAP,
 };
 use matcher::commit_reveal::{
     register_commit, redeem_reveal, sweep_expired, RevealPayload,
@@ -1538,6 +1538,156 @@ pub mod flash_book {
             side_b: leg_b.side,
             size_lots_a: leg_a.size_lots,
             size_lots_b: leg_b.size_lots,
+        });
+        Ok(())
+    }
+
+    /// N-leg basket order. Place K orders across K distinct markets in
+    /// one transaction with a SINGLE cross-market stress-lattice gate.
+    /// Generalises `place_basket_order` (which is hard-coded for K=2).
+    ///
+    /// `legs.len()` must equal the number of (market, order_buffer,
+    /// position) triples in `remaining_accounts` (so 3 × K accounts).
+    /// All markets must be distinct. Position PDAs MUST already exist —
+    /// callers init them via a no-op place_limit_order on each market
+    /// first (init_if_needed isn't safe with remaining_accounts).
+    ///
+    /// Hard caps: legs.len() ≤ MAX_BASKET_LEGS_N (4). Larger baskets
+    /// can land via repeated 2-leg or N-leg calls.
+    ///
+    /// Atomicity: any failure (cap breach, buffer full, distinct-market
+    /// guard, basket margin gate, rate limit) rolls back the whole tx.
+    pub fn place_basket_order_n<'info>(
+        ctx: Context<'_, '_, '_, 'info, PlaceBasketOrderN<'info>>,
+        legs: Vec<BasketLeg>,
+    ) -> Result<()> {
+        require!(!legs.is_empty(), FlashBookError::ZeroSize);
+        require!(
+            legs.len() <= MAX_BASKET_LEGS_N,
+            FlashBookError::OutOfRange
+        );
+        let remaining = ctx.remaining_accounts;
+        require!(
+            remaining.len() == legs.len() * 3,
+            FlashBookError::OutOfRange
+        );
+
+        let trader_key = ctx.accounts.trader.key();
+        let program_id = ctx.program_id;
+
+        // Walk remaining_accounts → deserialize markets + positions.
+        // Validate ownership, identity, market uniqueness inline.
+        let mut markets: Vec<MarketAccount> = Vec::with_capacity(legs.len());
+        let mut market_keys: Vec<Pubkey> = Vec::with_capacity(legs.len());
+        let mut positions: Vec<state::PositionAccount> = Vec::with_capacity(legs.len());
+        for (i, _leg) in legs.iter().enumerate() {
+            let m_ai = &remaining[i * 3];
+            let buf_ai = &remaining[i * 3 + 1];
+            let pos_ai = &remaining[i * 3 + 2];
+
+            // Owner checks (defense vs malicious foreign accounts).
+            require_keys_eq!(*m_ai.owner, *program_id, FlashBookError::Unauthorized);
+            require_keys_eq!(*buf_ai.owner, *program_id, FlashBookError::Unauthorized);
+            require_keys_eq!(*pos_ai.owner, *program_id, FlashBookError::Unauthorized);
+
+            let market: MarketAccount =
+                MarketAccount::try_deserialize(&mut &m_ai.try_borrow_data()?[..])?;
+            let position: state::PositionAccount =
+                state::PositionAccount::try_deserialize(&mut &pos_ai.try_borrow_data()?[..])?;
+
+            // Market uniqueness guard.
+            for prev in &market_keys {
+                require!(*prev != m_ai.key(), FlashBookError::OutOfRange);
+            }
+            market_keys.push(m_ai.key());
+
+            // Per-leg intake validation.
+            validate_leg_intake(&market, &legs[i])?;
+            check_caps_for_leg(&market, &position, &ctx.accounts.flp_exposure, &legs[i])?;
+
+            // Position binding (when non-empty). Empty positions OK
+            // — projected as new positions below.
+            if position.size_lots > 0 {
+                require!(position.trader == trader_key, FlashBookError::WrongTrader);
+                require!(position.market == m_ai.key(), FlashBookError::WrongMarket);
+            }
+
+            markets.push(market);
+            positions.push(position);
+        }
+
+        // Cross-market stress-lattice margin gate. Project post-leg state
+        // for each market, then assess against the joint scenario lattice.
+        let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(legs.len());
+        let mut market_snaps: Vec<RiskMarketSnap> = Vec::with_capacity(legs.len());
+        for (i, leg) in legs.iter().enumerate() {
+            if let Some(snap) = project_post_leg(
+                &positions[i],
+                leg,
+                &markets[i],
+                market_keys[i],
+                trader_key,
+            )? {
+                snaps.push(snap);
+            }
+            market_snaps.push(RiskMarketSnap {
+                market: market_keys[i],
+                mark_price: Ticks(markets[i].mark_price_ticks),
+                cum_funding_index: markets[i].cum_funding_index,
+                maintenance_margin_bps: markets[i].params.maintenance_margin_ratio_bps,
+                tick_size: markets[i].params.tick_size,
+            });
+        }
+        if !snaps.is_empty() {
+            let scenarios = default_scenarios_fn(&market_keys);
+            let assessment = assess_margin_fn(
+                &snaps,
+                &market_snaps,
+                &scenarios,
+                ctx.accounts.trader_state.collateral_quote_lots,
+            )?;
+            require!(assessment.is_healthy, FlashBookError::TraderLiquidatable);
+        }
+
+        // Rate limit: bump by legs.len(). Reset on batch boundary.
+        let trader_state = &mut ctx.accounts.trader_state;
+        if trader_state.last_batch_seen != markets[0].current_batch {
+            trader_state.last_batch_seen = markets[0].current_batch;
+            trader_state.orders_this_batch = 0;
+        }
+        let leg_count_u32 = u32::try_from(legs.len()).unwrap_or(u32::MAX);
+        require!(
+            trader_state.orders_this_batch.saturating_add(leg_count_u32)
+                <= MAX_ORDERS_PER_TRADER_PER_BATCH,
+            FlashBookError::RateLimited
+        );
+        trader_state.orders_this_batch = trader_state
+            .orders_this_batch
+            .saturating_add(leg_count_u32);
+
+        // Insert each leg's order into its buffer. Mutable borrow of
+        // each buffer is short-lived (one insert per leg) so we don't
+        // hold conflicting borrows.
+        for (i, leg) in legs.iter().enumerate() {
+            let buf_ai = &remaining[i * 3 + 1];
+            let mut buf_data = buf_ai.try_borrow_mut_data()?;
+            let mut buffer: OrderBufferAccount =
+                OrderBufferAccount::try_deserialize(&mut &buf_data[..])?;
+            insert_into_buffer(&mut buffer, trader_key, leg)?;
+            // Re-serialize back into the account.
+            let mut serialized: Vec<u8> = Vec::with_capacity(buf_data.len());
+            buffer.try_serialize(&mut serialized)?;
+            require!(
+                serialized.len() <= buf_data.len(),
+                FlashBookError::OutOfRange
+            );
+            buf_data[..serialized.len()].copy_from_slice(&serialized);
+        }
+
+        emit!(BasketOrderNPlacedEvent {
+            trader: trader_key,
+            leg_count: legs.len() as u8,
+            markets: market_keys.clone(),
         });
         Ok(())
     }
@@ -3142,6 +3292,30 @@ pub struct PlaceBasketOrder<'info> {
 }
 
 #[derive(Accounts)]
+pub struct PlaceBasketOrderN<'info> {
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+
+    /// Read for the capital-relative position cap (per-leg) and the
+    /// joint stress-lattice gate.
+    #[account(
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
+    )]
+    pub flp_exposure: Account<'info, FlpExposureAccount>,
+    // Per-leg accounts arrive in remaining_accounts as triples:
+    //   [market_0, order_buffer_0, position_0,
+    //    market_1, order_buffer_1, position_1, ...]
+}
+
+#[derive(Accounts)]
 pub struct CancelOrder<'info> {
     pub trader: Signer<'info>,
 
@@ -3400,6 +3574,13 @@ pub struct FundingSettledEvent {
     /// = trader received.
     pub owed_quote_lots: i64,
     pub new_collateral: u64,
+}
+
+#[event]
+pub struct BasketOrderNPlacedEvent {
+    pub trader: Pubkey,
+    pub leg_count: u8,
+    pub markets: Vec<Pubkey>,
 }
 
 #[event]
