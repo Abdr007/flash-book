@@ -18,6 +18,12 @@ pub const BPS_DENOM: u32 = 10_000;
 /// (e.g. 5 bps base × -0.2 = -1 bps rebate to taker).
 pub const MAX_FEE_DISCOUNT_BPS: u32 = 12_000;
 
+/// HIP-3 bond unbonding delay (seconds). When a depositor requests
+/// unbond on their MarketBondAccount, they cannot claim until this
+/// many seconds have elapsed since the request. Prevents the
+/// withdraw-before-slash race after a market goes bad. 7 days = 604_800.
+pub const BOND_UNBOND_DELAY_SECONDS: u64 = 604_800;
+
 /// Maximum stress scenarios per batch — capped to keep margin compute bounded.
 /// At 60 scenarios × 8 markets × 16 positions = 7680 evaluations per batch.
 pub const MAX_STRESS_SCENARIOS: usize = 64;

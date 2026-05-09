@@ -37,6 +37,7 @@ import {
   twapOrderPda,
   vaultPda,
   vaultPositionPda,
+  marketBondPda,
   FLASH_BOOK_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from './pdas.ts';
@@ -1203,17 +1204,33 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// Deposit quote tokens into a vault and mint shares at current NAV.
-  /// SPL transfer from depositor's quote ATA to the protocol quote
-  /// vault; vault_position.shares is incremented.
+  /// Deposit quote tokens into a vault and mint shares at MARK-TO-MARKET
+  /// NAV. SPL transfer from depositor's quote ATA to the protocol vault.
+  ///
+  /// `openPositions` MUST be the vault's currently-open positions, one
+  /// `{market, position}` pair per open position; the chain rejects if
+  /// the count doesn't match `vault_trader_state.open_positions`.
+  /// Caller queries them off-chain via `getProgramAccounts` filtered on
+  /// `position.trader == vaultPda` (or by tailing FillAppliedEvent).
+  /// Pass `[]` if the vault is flat.
+  ///
+  /// MagicBlock ER compatibility: when the markets are delegated to the
+  /// ER, pass them with the ER's clone — Anchor account derivation works
+  /// transparently. The chain reads `mark_price_ticks` which is updated
+  /// inside ER batch clearing.
   depositToVaultIx(args: {
     depositor: PublicKey;
     vault: PublicKey;
     amountQuoteLots: bigint | number;
+    openPositions?: ReadonlyArray<{ market: PublicKey; position: PublicKey }>;
   }): Promise<TransactionInstruction> {
     const ts = this.traderState(args.vault);
     const pos = vaultPositionPda(args.vault, args.depositor);
     const fund = this.insuranceFund();
+    const remaining = (args.openPositions ?? []).flatMap((p) => [
+      { pubkey: p.market, isWritable: false, isSigner: false },
+      { pubkey: p.position, isWritable: false, isSigner: false },
+    ]);
     return this.methods
       .depositToVault(args.amountQuoteLots)
       .accountsPartial({
@@ -1225,20 +1242,27 @@ export class FlashBookClient {
         systemProgram: SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
+      .remainingAccounts(remaining)
       .instruction();
   }
 
-  /// Withdraw from a vault by burning shares for proportional NAV.
-  /// Vault must be FLAT (no open positions) — strategist closes first
-  /// if needed. SPL transfer from quote vault to depositor's quote ATA.
+  /// Withdraw from a vault by burning shares for proportional MTM NAV.
+  /// Same `openPositions` walk semantics as `depositToVaultIx`. Vault
+  /// collateral must cover the cash payout — strategist must close
+  /// positions first if collateral is fully invested.
   withdrawFromVaultIx(args: {
     depositor: PublicKey;
     vault: PublicKey;
     sharesToBurn: bigint | number;
+    openPositions?: ReadonlyArray<{ market: PublicKey; position: PublicKey }>;
   }): Promise<TransactionInstruction> {
     const ts = this.traderState(args.vault);
     const pos = vaultPositionPda(args.vault, args.depositor);
     const fund = this.insuranceFund();
+    const remaining = (args.openPositions ?? []).flatMap((p) => [
+      { pubkey: p.market, isWritable: false, isSigner: false },
+      { pubkey: p.position, isWritable: false, isSigner: false },
+    ]);
     return this.methods
       .withdrawFromVault(args.sharesToBurn)
       .accountsPartial({
@@ -1248,6 +1272,123 @@ export class FlashBookClient {
         vaultPosition: pos.address,
         insuranceFund: fund.address,
         tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .remainingAccounts(remaining)
+      .instruction();
+  }
+
+  /// AUTO-DELEVERAGE — permissionless safety primitive. When the
+  /// insurance fund falls below `pause_threshold_quote_lots`, ADL
+  /// keepers force-close the highest-ranked profitable counter-trader
+  /// at the BANKRUPTCY price of an unhealthy position to absorb the
+  /// loss. Caller should rank candidates off-chain by
+  /// (unrealized_pnl × leverage) descending and submit the top one.
+  /// Eligibility (counter profitable at bp + insurance below threshold
+  /// + underwater is sick) is enforced on-chain.
+  autoDeleverageIx(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    underwaterTrader: PublicKey;
+    counterTrader: PublicKey;
+    closeSizeLots: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const fund = this.insuranceFund();
+    const uts = this.traderState(args.underwaterTrader);
+    const cts = this.traderState(args.counterTrader);
+    const upos = this.position(args.market, args.underwaterTrader);
+    const cpos = this.position(args.market, args.counterTrader);
+    return this.methods
+      .autoDeleverage(args.closeSizeLots)
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        insuranceFund: fund.address,
+        underwaterTraderState: uts.address,
+        underwaterPosition: upos.address,
+        counterTraderState: cts.address,
+        counterPosition: cpos.address,
+      })
+      .instruction();
+  }
+
+  /// Post a slashable HIP-3 deployer bond. Anyone can post bond on any
+  /// market (per (market, depositor) pair). Bond is held in the protocol
+  /// quote vault; slashable by governance. Adding to an existing bond
+  /// cancels any pending unbond request.
+  postMarketBondIx(args: {
+    depositor: PublicKey;
+    market: PublicKey;
+    amountQuoteLots: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const fund = this.insuranceFund();
+    return this.methods
+      .postMarketBond(args.amountQuoteLots)
+      .accountsPartial({
+        depositor: args.depositor,
+        market: args.market,
+        insuranceFund: fund.address,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
+  /// Request to unbond a market bond. Sets the unbond timestamp; the
+  /// bond becomes claimable after BOND_UNBOND_DELAY_SECONDS (7 days).
+  /// Re-posting bond cancels the request.
+  requestUnbondMarketBondIx(args: {
+    depositor: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const bond = marketBondPda(args.market, args.depositor).address;
+    return this.methods
+      .requestUnbondMarketBond()
+      .accountsPartial({
+        depositor: args.depositor,
+        marketBond: bond,
+      })
+      .instruction();
+  }
+
+  /// Claim unbonded market bond. Requires the unbond delay to have
+  /// elapsed. Transfers the full outstanding amount back to the
+  /// depositor's quote ATA. The MarketBondAccount stays open with
+  /// amount=0 (re-postable).
+  claimUnbondedMarketBondIx(args: {
+    depositor: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const bond = marketBondPda(args.market, args.depositor).address;
+    const fund = this.insuranceFund();
+    return this.methods
+      .claimUnbondedMarketBond()
+      .accountsPartial({
+        depositor: args.depositor,
+        marketBond: bond,
+        insuranceFund: fund.address,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
+  /// Slash a deployer bond. Protocol authority signs (single source of
+  /// truth: insurance_fund.authority). Transfers `amount` from bond
+  /// into insurance balance. Slash conditions are enforced off-chain
+  /// by governance + monitors (oracle staleness, mass insolvency).
+  slashMarketBondIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    bondDepositor: PublicKey;
+    amountQuoteLots: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const fund = this.insuranceFund();
+    const bond = marketBondPda(args.market, args.bondDepositor).address;
+    return this.methods
+      .slashMarketBond(args.amountQuoteLots)
+      .accountsPartial({
+        authority: args.authority,
+        insuranceFund: fund.address,
+        marketBond: bond,
       })
       .instruction();
   }

@@ -80,6 +80,14 @@ pub enum FlashBookError {
     VaultBelowHighWaterMark = 1218,
     #[msg("OCO trigger pair link mismatch")]
     OcoPairMismatch = 1219,
+    #[msg("ADL not eligible: insurance fund above threshold or counter unprofitable at bankruptcy price")]
+    AdlNotEligible = 1220,
+    #[msg("HIP-3 deployer bond is below the slashable minimum")]
+    BondTooSmall = 1221,
+    #[msg("Bond cannot be unbonded yet — unbond delay not elapsed")]
+    BondUnbondingDelay = 1222,
+    #[msg("Vault NAV market mismatch — passed market doesn't match position")]
+    VaultNavMarketMismatch = 1223,
 
     // ── 1300-1399 matcher / clearing ────────────────────────────────
     #[msg("Order book buffer at capacity")]

@@ -661,8 +661,8 @@ pub mod flash_book {
     /// the safest mode and avoids requiring the depositor to pass every
     /// market account. A future v2 can pass markets in remaining_accounts
     /// for full mark-to-market NAV.
-    pub fn deposit_to_vault(
-        ctx: Context<DepositToVault>,
+    pub fn deposit_to_vault<'info>(
+        ctx: Context<'_, '_, 'info, 'info, DepositToVault<'info>>,
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
@@ -673,9 +673,26 @@ pub mod flash_book {
             FlashBookError::VaultDepositTooSmall
         );
 
-        // SPL transfer: depositor → vault's quote vault (insurance vault
-        // is reused as the protocol-wide quote vault here, mirroring the
-        // FLP deposit path).
+        // ── Mark-to-market NAV (vaults v2) ──────────────────────────
+        // Compute true NAV BEFORE the deposit: collateral +
+        // sum(unrealized_pnl on each open position at mark). Caller must
+        // pass [market, position] pairs in remaining_accounts for each
+        // open position; the count must match
+        // vault_trader_state.open_positions exactly so callers cannot
+        // omit underwater positions to inflate NAV (would steal value
+        // from existing depositors).
+        let pre_collateral = ctx.accounts.vault_trader_state.collateral_quote_lots;
+        let open_pos = ctx.accounts.vault_trader_state.open_positions;
+        let nav_signed = compute_vault_mtm_nav(
+            ctx.accounts.vault.key(),
+            pre_collateral,
+            open_pos,
+            ctx.remaining_accounts,
+            ctx.program_id,
+        )?;
+        let nav: u128 = if nav_signed <= 0 { 0 } else { nav_signed as u128 };
+
+        // SPL transfer: depositor → protocol vault.
         let cpi_accounts = Transfer {
             from: ctx.accounts.depositor_quote_ata.to_account_info(),
             to: ctx.accounts.quote_vault.to_account_info(),
@@ -688,10 +705,12 @@ pub mod flash_book {
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
         // Mint shares at NAV.
-        let nav = ctx.accounts.vault_trader_state.collateral_quote_lots as u128;
         let shares_outstanding = ctx.accounts.vault.shares_outstanding as u128;
         let shares_to_mint: u64 = if shares_outstanding == 0 || nav == 0 {
-            // Bootstrap: 1:1.
+            // Bootstrap (no shares yet, or NAV ≤ 0 with shares): 1:1.
+            // The NAV ≤ 0 case is operationally rare (vault is wiped out)
+            // — we let new depositors come in 1:1 to repair the pool
+            // rather than gating recovery.
             amount_quote_lots
         } else {
             let s = (amount_quote_lots as u128)
@@ -741,31 +760,53 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Withdraw from a vault. Burns `shares_to_burn` from the depositor's
-    /// holding and pays out proportional NAV. Requires the vault to be
-    /// FLAT (no open positions) — same safety property as
-    /// `sweep_collateral`. To withdraw with positions open, the
-    /// strategist must close first. Future v2 can lift this with a
-    /// position-walk margin check.
+    /// Withdraw from a vault. Burns `shares_to_burn` and pays out
+    /// proportional MARK-TO-MARKET NAV.
     ///
-    /// Payout = shares_to_burn × collateral / shares_outstanding.
-    pub fn withdraw_from_vault(
-        ctx: Context<WithdrawFromVault>,
+    /// Caller passes `[market, position]` pairs in remaining_accounts
+    /// for each of the vault's open positions (count must match
+    /// vault_trader_state.open_positions exactly). NAV = collateral +
+    /// sum(unrealized_pnl). Payout = shares × NAV / shares_outstanding.
+    ///
+    /// Vault collateral must cover the cash payout (positions can stay
+    /// open after withdraw). If collateral < required payout, the call
+    /// rejects — strategist must close some positions to free
+    /// collateral. This avoids forcing the vault to liquidate at bad
+    /// prices to honour a withdrawal. Future v2 can add an automatic
+    /// proportional position-close (HL pattern).
+    pub fn withdraw_from_vault<'info>(
+        ctx: Context<'_, '_, 'info, 'info, WithdrawFromVault<'info>>,
         shares_to_burn: u64,
     ) -> Result<()> {
         require!(shares_to_burn > 0, FlashBookError::ZeroSize);
         let pos = &ctx.accounts.vault_position;
         require!(pos.shares >= shares_to_burn, FlashBookError::InsufficientCollateral);
-        let ts = &ctx.accounts.vault_trader_state;
-        require!(ts.open_positions == 0, FlashBookError::SweepRequiresFlat);
 
+        let ts = &ctx.accounts.vault_trader_state;
         let vault = &ctx.accounts.vault;
         let shares_outstanding = vault.shares_outstanding as u128;
         require!(shares_outstanding > 0, FlashBookError::VaultNavNonPositive);
-        let nav = ts.collateral_quote_lots as u128;
+
+        // Compute MTM NAV via remaining_accounts walk.
+        let nav_signed = compute_vault_mtm_nav(
+            vault.key(),
+            ts.collateral_quote_lots,
+            ts.open_positions,
+            ctx.remaining_accounts,
+            ctx.program_id,
+        )?;
+        require!(nav_signed > 0, FlashBookError::VaultNavNonPositive);
+        let nav = nav_signed as u128;
+
         let payout_u128 = (shares_to_burn as u128)
             .saturating_mul(nav)
             / shares_outstanding;
+        // Collateral must cover the payout — we don't auto-close
+        // positions to free collateral. Strategist closes if needed.
+        require!(
+            payout_u128 <= ts.collateral_quote_lots as u128,
+            FlashBookError::InsufficientCollateral,
+        );
         let payout = if payout_u128 > u64::MAX as u128 {
             u64::MAX
         } else {
@@ -3753,6 +3794,431 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Post a slashable HIP-3 deployer bond on a market. The bond signals
+    /// the depositor's commitment to the market's solvency; if the
+    /// market goes bad (oracle stale, mass insolvent liqs, etc.),
+    /// protocol governance can `slash_market_bond` to transfer up to
+    /// the full bond into the insurance fund.
+    ///
+    /// Caller signs and is the depositor (each bond is per (market,
+    /// depositor) pair — anyone can post bond on any market). SPL
+    /// transfer from depositor's quote ATA to the protocol vault. The
+    /// MarketBondAccount tracks the depositor's claim.
+    ///
+    /// Posting bond does NOT change creator share or market params; it's
+    /// a purely additive commitment signal. Off-chain UIs can rank
+    /// markets by total bond amount (sum across all bond accounts for
+    /// a market).
+    pub fn post_market_bond(
+        ctx: Context<PostMarketBond>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+
+        // SPL transfer to protocol vault (same vault as collateral / FLP).
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.depositor_quote_ata.to_account_info(),
+            to: ctx.accounts.quote_vault.to_account_info(),
+            authority: ctx.accounts.depositor.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+        );
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+        let bond = &mut ctx.accounts.market_bond;
+        // Lazy init on first post.
+        if bond.depositor == Pubkey::default() {
+            bond.market = ctx.accounts.market.key();
+            bond.depositor = ctx.accounts.depositor.key();
+            bond.bump = ctx.bumps.market_bond;
+            bond._pad0 = [0u8; 7];
+            bond.deposited_at_unix = now_unix;
+            bond.total_slashed_quote_lots = 0;
+        }
+        bond.amount_quote_lots = bond
+            .amount_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        // Adding more bond cancels any pending unbond request — the
+        // depositor is signalling they want to keep the bond live.
+        bond.unbond_request_at_unix = 0;
+
+        emit!(MarketBondPostedEvent {
+            market: bond.market,
+            depositor: bond.depositor,
+            amount_quote_lots,
+            new_total_quote_lots: bond.amount_quote_lots,
+        });
+        Ok(())
+    }
+
+    /// Request to unbond. Sets the unbond timestamp; bond cannot be
+    /// claimed until BOND_UNBOND_DELAY_SECONDS elapses. The delay
+    /// prevents withdraw-before-slash races. Re-posting bond cancels
+    /// the request (signals continued commitment).
+    pub fn request_unbond_market_bond(
+        ctx: Context<UnbondMarketBondAuth>,
+    ) -> Result<()> {
+        let bond = &mut ctx.accounts.market_bond;
+        require!(bond.amount_quote_lots > 0, FlashBookError::BondTooSmall);
+        let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+        bond.unbond_request_at_unix = now_unix;
+        emit!(MarketBondUnbondRequestedEvent {
+            market: bond.market,
+            depositor: bond.depositor,
+            requested_at_unix: now_unix,
+            claimable_at_unix: now_unix.saturating_add(constants::BOND_UNBOND_DELAY_SECONDS),
+        });
+        Ok(())
+    }
+
+    /// Claim unbonded bond. Requires `unbond_request_at_unix > 0` AND
+    /// `now ≥ unbond_request_at_unix + BOND_UNBOND_DELAY_SECONDS`.
+    /// Transfers the FULL outstanding amount back to depositor's ATA;
+    /// MarketBondAccount stays open with amount = 0 (re-postable).
+    pub fn claim_unbonded_market_bond(
+        ctx: Context<ClaimUnbondedMarketBond>,
+    ) -> Result<()> {
+        let bond = &ctx.accounts.market_bond;
+        require!(bond.amount_quote_lots > 0, FlashBookError::BondTooSmall);
+        require!(
+            bond.unbond_request_at_unix > 0,
+            FlashBookError::BondUnbondingDelay
+        );
+        let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+        let claimable_at = bond
+            .unbond_request_at_unix
+            .saturating_add(constants::BOND_UNBOND_DELAY_SECONDS);
+        require!(now_unix >= claimable_at, FlashBookError::BondUnbondingDelay);
+
+        let amount = bond.amount_quote_lots;
+
+        // SPL transfer back: insurance_fund PDA signs.
+        let bump = ctx.accounts.insurance_fund.bump;
+        let seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
+        let signer = &[seeds];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.quote_vault.to_account_info(),
+            to: ctx.accounts.depositor_quote_ata.to_account_info(),
+            authority: ctx.accounts.insurance_fund.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+        token::transfer(cpi_ctx, amount)?;
+
+        let bond = &mut ctx.accounts.market_bond;
+        bond.amount_quote_lots = 0;
+        bond.unbond_request_at_unix = 0;
+
+        emit!(MarketBondClaimedEvent {
+            market: bond.market,
+            depositor: bond.depositor,
+            amount_quote_lots: amount,
+        });
+        Ok(())
+    }
+
+    /// Slash a deployer bond. Protocol authority signs (single source of
+    /// truth: insurance_fund.authority). Transfers `amount` quote-lots
+    /// from the bond into the insurance fund's balance.
+    /// Funds physically stay in the same vault — only the accounting
+    /// changes (decrement bond, increment insurance balance).
+    ///
+    /// Slash conditions are enforced off-chain by governance + monitors
+    /// (oracle staleness, insolvency events). On-chain we trust the
+    /// authority — same trust model as `withdraw_insurance_fund`.
+    pub fn slash_market_bond(
+        ctx: Context<SlashMarketBond>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        let bond = &mut ctx.accounts.market_bond;
+        require!(
+            amount_quote_lots <= bond.amount_quote_lots,
+            FlashBookError::BondTooSmall
+        );
+        bond.amount_quote_lots = bond.amount_quote_lots.saturating_sub(amount_quote_lots);
+        bond.total_slashed_quote_lots = bond
+            .total_slashed_quote_lots
+            .saturating_add(amount_quote_lots);
+        // Cancel any pending unbond — slashing is a state change that
+        // resets the unbond clock.
+        bond.unbond_request_at_unix = 0;
+
+        let fund = &mut ctx.accounts.insurance_fund;
+        fund.balance_quote_lots = fund
+            .balance_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        fund.total_contributions = fund
+            .total_contributions
+            .saturating_add(amount_quote_lots);
+
+        emit!(MarketBondSlashedEvent {
+            market: bond.market,
+            depositor: bond.depositor,
+            amount_quote_lots,
+            remaining_bond_quote_lots: bond.amount_quote_lots,
+        });
+        Ok(())
+    }
+
+    /// AUTO-DELEVERAGE — the safety primitive of last resort. When the
+    /// insurance fund falls below `pause_threshold_quote_lots`, a sick
+    /// position cannot be safely liquidated through the normal flow
+    /// (the bankruptcy gap exceeds insurance buffer). ADL force-closes
+    /// the highest-ranked profitable counter-trader at the BANKRUPTCY
+    /// PRICE of the underwater position — they realize their PnL up to
+    /// the bankruptcy price (less than market would give them) and the
+    /// gap between bp and mark is what would have come from insurance.
+    ///
+    /// Permissionless. Caller passes:
+    ///   • underwater (position + trader_state)
+    ///   • counter_position + counter_trader_state (chosen off-chain by
+    ///     ranking unrealized_pnl × leverage, highest first)
+    ///   • close_size_lots (≤ min(underwater.size, counter.size))
+    ///
+    /// Eligibility checks (all enforced on-chain):
+    ///   1. insurance_fund.balance < pause_threshold (ADL trigger)
+    ///   2. underwater is actually unhealthy (margin assessment)
+    ///   3. counter.side != underwater.side
+    ///   4. counter has positive PnL at the BANKRUPTCY price (fair: we
+    ///      never force a counter-trader into a loss they wouldn't have
+    ///      had anyway)
+    ///
+    /// Action:
+    ///   • close `close_size` lots from BOTH at the bankruptcy price
+    ///   • underwater realizes loss (collateral debited pro-rata)
+    ///   • counter realizes profit at bp (less than mark — that's the
+    ///     "give up", which absorbs the loss insurance would have eaten)
+    ///   • update OI counters
+    ///   • emit AutoDeleveragedEvent
+    ///
+    /// Off-chain ranking is incentivised separately (operators run a
+    /// sorted-by-pnl-leverage queue keeper). On-chain we trust the
+    /// caller's ranking but enforce eligibility — invalid ranking just
+    /// rejects.
+    pub fn auto_deleverage(
+        ctx: Context<AutoDeleverage>,
+        close_size_lots: u64,
+    ) -> Result<()> {
+        require!(close_size_lots > 0, FlashBookError::ZeroSize);
+
+        let market = &ctx.accounts.market;
+        let underwater = &ctx.accounts.underwater_position;
+        let counter = &ctx.accounts.counter_position;
+
+        // Sanity: positions on this market, opposite sides, both have size.
+        require!(underwater.market == market.key(), FlashBookError::WrongMarket);
+        require!(counter.market == market.key(), FlashBookError::WrongMarket);
+        require!(underwater.size_lots > 0, FlashBookError::LiquidationStale);
+        require!(counter.size_lots > 0, FlashBookError::LiquidationStale);
+        require!(underwater.side != counter.side, FlashBookError::OutOfRange);
+        require!(
+            close_size_lots <= underwater.size_lots,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            close_size_lots <= counter.size_lots,
+            FlashBookError::OutOfRange
+        );
+
+        // Trader-state alignment.
+        require!(
+            ctx.accounts.underwater_trader_state.trader == underwater.trader,
+            FlashBookError::WrongTrader
+        );
+        require!(
+            ctx.accounts.counter_trader_state.trader == counter.trader,
+            FlashBookError::WrongTrader
+        );
+        // Cannot ADL yourself.
+        require!(
+            underwater.trader != counter.trader,
+            FlashBookError::OutOfRange
+        );
+
+        // Trigger gate: insurance fund must be below the pause threshold
+        // for ADL to be admissible. Above the threshold, normal
+        // liquidation is the right path (insurance can absorb the gap).
+        let fund = &ctx.accounts.insurance_fund;
+        require!(
+            fund.balance_quote_lots < fund.pause_threshold_quote_lots,
+            FlashBookError::AdlNotEligible
+        );
+
+        // Underwater health check — same stress lattice as liquidate_position.
+        let pos_snap = RiskPosSnap {
+            market: underwater.market,
+            side: if underwater.side == 0 { Side::Long } else { Side::Short },
+            size_lots: underwater.size_lots,
+            entry_price: Ticks(underwater.entry_price_ticks),
+            cum_funding_index_at_entry: underwater.cum_funding_index_at_entry,
+        };
+        let market_snap = RiskMarketSnap {
+            market: market.key(),
+            mark_price: Ticks(market.mark_price_ticks),
+            cum_funding_index: market.cum_funding_index,
+            maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+            tick_size: market.params.tick_size,
+        };
+        let scenarios = default_scenarios_fn(&[market.key()]);
+        let assessment = assess_margin_fn(
+            &[pos_snap],
+            &[market_snap],
+            &scenarios,
+            ctx.accounts.underwater_trader_state.collateral_quote_lots,
+        )?;
+        require!(!assessment.is_healthy, FlashBookError::NotLiquidatable);
+
+        // Compute bankruptcy price: the mark at which underwater equity
+        // is exactly zero. For long: bp = entry - C / (S × tick).
+        //                  short: bp = entry + C / (S × tick).
+        // We compute in u128 ticks to avoid overflow at large notional.
+        let tick_size = market.params.tick_size as u128;
+        require!(tick_size > 0, FlashBookError::ZeroPrice);
+        let collateral = ctx.accounts.underwater_trader_state.collateral_quote_lots as u128;
+        let entry = underwater.entry_price_ticks as u128;
+        let size = underwater.size_lots as u128;
+        let denom = size.checked_mul(tick_size)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(denom > 0, FlashBookError::ZeroPrice);
+        let collateral_per_lot_ticks = collateral / denom;
+        let bp_u128: u128 = if underwater.side == 0 {
+            // long: bp = entry - C/(S*tick); clamp to 1 if collateral overshoots
+            entry.saturating_sub(collateral_per_lot_ticks).max(1)
+        } else {
+            // short: bp = entry + C/(S*tick)
+            entry.checked_add(collateral_per_lot_ticks)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+        };
+        let bp_ticks = if bp_u128 > u64::MAX as u128 { u64::MAX } else { bp_u128 as u64 };
+
+        // Counter-eligibility: counter must have POSITIVE PnL at bp.
+        //   Long counter:  pnl = (bp - entry_c) × close × tick > 0  → bp > entry_c
+        //   Short counter: pnl = (entry_c - bp) × close × tick > 0  → bp < entry_c
+        let counter_entry = counter.entry_price_ticks;
+        if counter.side == 0 {
+            require!(bp_ticks > counter_entry, FlashBookError::AdlNotEligible);
+        } else {
+            require!(bp_ticks < counter_entry, FlashBookError::AdlNotEligible);
+        }
+
+        // ── Settle PnL ──
+        // Underwater realizes loss = collateral × close/size (proportional
+        // collateral wiped). Equivalent to: (bp - entry) × close × tick × sign.
+        // We compute via collateral fraction to avoid floating drift.
+        let loss_quote_lots_u128 = collateral.saturating_mul(close_size_lots as u128) / size;
+        let loss_quote_lots = if loss_quote_lots_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            loss_quote_lots_u128 as u64
+        };
+
+        // Counter realizes positive PnL at bp.
+        // |pnl| = |bp - entry_c| × close × tick
+        let counter_gain_per_lot = if counter.side == 0 {
+            (bp_ticks as u128).saturating_sub(counter_entry as u128)
+        } else {
+            (counter_entry as u128).saturating_sub(bp_ticks as u128)
+        };
+        let counter_gain_u128 = counter_gain_per_lot
+            .saturating_mul(close_size_lots as u128)
+            .saturating_mul(tick_size);
+        let counter_gain = if counter_gain_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            counter_gain_u128 as u64
+        };
+
+        // Apply to TraderStates.
+        let market_key = market.key();
+        let uw_trader = underwater.trader;
+        let ct_trader = counter.trader;
+        {
+            let uts = &mut ctx.accounts.underwater_trader_state;
+            uts.collateral_quote_lots = uts.collateral_quote_lots.saturating_sub(loss_quote_lots);
+            uts.realized_pnl_quote_lots = uts
+                .realized_pnl_quote_lots
+                .saturating_sub(loss_quote_lots as i64);
+        }
+        {
+            let cts = &mut ctx.accounts.counter_trader_state;
+            cts.collateral_quote_lots = cts
+                .collateral_quote_lots
+                .checked_add(counter_gain)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            cts.realized_pnl_quote_lots = cts
+                .realized_pnl_quote_lots
+                .saturating_add(counter_gain as i64);
+        }
+
+        // Reduce both positions by close_size. If a side closes to zero,
+        // decrement open_positions on that trader_state.
+        let uw_was_open = underwater.size_lots > 0;
+        let ct_was_open = counter.size_lots > 0;
+        let uw_pre_side = underwater.side;
+        let ct_pre_side = counter.side;
+        let uw_pre_size = underwater.size_lots;
+        let ct_pre_size = counter.size_lots;
+
+        {
+            let uw = &mut ctx.accounts.underwater_position;
+            uw.size_lots = uw.size_lots.saturating_sub(close_size_lots);
+            if uw.size_lots == 0 {
+                // Reset settlement anchors on close.
+                uw.entry_price_ticks = 0;
+                uw.unhealthy_since_slot = 0;
+                uw.last_liquidated_at_slot = 0;
+            }
+        }
+        {
+            let ct = &mut ctx.accounts.counter_position;
+            ct.size_lots = ct.size_lots.saturating_sub(close_size_lots);
+            if ct.size_lots == 0 {
+                ct.entry_price_ticks = 0;
+            }
+        }
+
+        // OI updates: walk pre→post for each side.
+        let uw_post_side = ctx.accounts.underwater_position.side;
+        let uw_post_size = ctx.accounts.underwater_position.size_lots;
+        let ct_post_side = ctx.accounts.counter_position.side;
+        let ct_post_size = ctx.accounts.counter_position.size_lots;
+        let market = &mut ctx.accounts.market;
+        update_oi(market, uw_pre_side, uw_pre_size, uw_post_side, uw_post_size)?;
+        update_oi(market, ct_pre_side, ct_pre_size, ct_post_side, ct_post_size)?;
+
+        // open_positions transitions on TraderStates.
+        if uw_was_open && uw_post_size == 0 {
+            let uts = &mut ctx.accounts.underwater_trader_state;
+            uts.open_positions = uts.open_positions.saturating_sub(1);
+        }
+        if ct_was_open && ct_post_size == 0 {
+            let cts = &mut ctx.accounts.counter_trader_state;
+            cts.open_positions = cts.open_positions.saturating_sub(1);
+        }
+        // Bookkeeping for monitoring.
+        market.total_liquidations = market.total_liquidations.saturating_add(1);
+
+        emit!(AutoDeleveragedEvent {
+            market: market_key,
+            underwater_trader: uw_trader,
+            counter_trader: ct_trader,
+            close_size_lots,
+            bankruptcy_price_ticks: bp_ticks,
+            counter_gain_quote_lots: counter_gain,
+            executor: ctx.accounts.caller.key(),
+        });
+        Ok(())
+    }
+
     /// Cross-market portfolio liquidation. Walks the trader's positions
     /// across multiple markets via `remaining_accounts`, runs the matcher's
     /// cross-margin `assess_margin` against the joint stress lattice, and
@@ -5561,6 +6027,191 @@ pub struct LiquidatePosition<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct PostMarketBond<'info> {
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = depositor,
+        space = state::MarketBondAccount::space(),
+        seeds = [
+            state::MarketBondAccount::SEED,
+            market.key().as_ref(),
+            depositor.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub market_bond: Box<Account<'info, state::MarketBondAccount>>,
+
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = depositor,
+    )]
+    pub depositor_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(mut, address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UnbondMarketBondAuth<'info> {
+    /// Depositor signs — only the bond owner can request unbond.
+    pub depositor: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::MarketBondAccount::SEED,
+            market_bond.market.as_ref(),
+            depositor.key().as_ref(),
+        ],
+        bump = market_bond.bump,
+        constraint = market_bond.depositor == depositor.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market_bond: Account<'info, state::MarketBondAccount>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimUnbondedMarketBond<'info> {
+    pub depositor: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::MarketBondAccount::SEED,
+            market_bond.market.as_ref(),
+            depositor.key().as_ref(),
+        ],
+        bump = market_bond.bump,
+        constraint = market_bond.depositor == depositor.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market_bond: Account<'info, state::MarketBondAccount>,
+
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = depositor,
+    )]
+    pub depositor_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(mut, address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct SlashMarketBond<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+        constraint = insurance_fund.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::MarketBondAccount::SEED,
+            market_bond.market.as_ref(),
+            market_bond.depositor.as_ref(),
+        ],
+        bump = market_bond.bump,
+    )]
+    pub market_bond: Account<'info, state::MarketBondAccount>,
+}
+
+#[derive(Accounts)]
+pub struct AutoDeleverage<'info> {
+    /// Anyone may call. ADL keepers compete off-chain on the (pnl ×
+    /// leverage) ranking; first valid call wins.
+    pub caller: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// Insurance fund — read-only here, used to verify ADL trigger gate
+    /// (balance < pause threshold).
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, underwater_trader_state.trader.as_ref()],
+        bump = underwater_trader_state.bump,
+    )]
+    pub underwater_trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::PositionAccount::SEED,
+            market.key().as_ref(),
+            underwater_trader_state.trader.as_ref(),
+        ],
+        bump = underwater_position.bump,
+    )]
+    pub underwater_position: Account<'info, state::PositionAccount>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, counter_trader_state.trader.as_ref()],
+        bump = counter_trader_state.bump,
+    )]
+    pub counter_trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::PositionAccount::SEED,
+            market.key().as_ref(),
+            counter_trader_state.trader.as_ref(),
+        ],
+        bump = counter_position.bump,
+    )]
+    pub counter_position: Account<'info, state::PositionAccount>,
+}
+
 // ─── Events ─────────────────────────────────────────────────────────────
 
 #[event]
@@ -5911,6 +6562,48 @@ pub struct TwapOrderCancelledEvent {
     pub trader: Pubkey,
     pub twap_id: u8,
     pub unfilled_lots: u64,
+}
+
+#[event]
+pub struct MarketBondPostedEvent {
+    pub market: Pubkey,
+    pub depositor: Pubkey,
+    pub amount_quote_lots: u64,
+    pub new_total_quote_lots: u64,
+}
+
+#[event]
+pub struct MarketBondUnbondRequestedEvent {
+    pub market: Pubkey,
+    pub depositor: Pubkey,
+    pub requested_at_unix: u64,
+    pub claimable_at_unix: u64,
+}
+
+#[event]
+pub struct MarketBondClaimedEvent {
+    pub market: Pubkey,
+    pub depositor: Pubkey,
+    pub amount_quote_lots: u64,
+}
+
+#[event]
+pub struct MarketBondSlashedEvent {
+    pub market: Pubkey,
+    pub depositor: Pubkey,
+    pub amount_quote_lots: u64,
+    pub remaining_bond_quote_lots: u64,
+}
+
+#[event]
+pub struct AutoDeleveragedEvent {
+    pub market: Pubkey,
+    pub underwater_trader: Pubkey,
+    pub counter_trader: Pubkey,
+    pub close_size_lots: u64,
+    pub bankruptcy_price_ticks: u64,
+    pub counter_gain_quote_lots: u64,
+    pub executor: Pubkey,
 }
 
 #[event]
@@ -6345,6 +7038,72 @@ fn update_oi(
 ///   - Opposite side, size ≤ existing: reduce; realize PnL on closed portion.
 ///   - Opposite side, size > existing: flip side; realize PnL on existing
 ///     fully closed; remaining size opens at `price`.
+/// Mark-to-market vault NAV — collateral plus the sum of unrealized
+/// PnL across all the vault's open positions, evaluated at each
+/// market's current `mark_price_ticks`.
+///
+/// `remaining` is interpreted as pairs:
+///   [market_0, position_0, market_1, position_1, …]
+/// Length MUST equal `expected_open_positions × 2`. Each market and
+/// position must be owned by this program; each position.trader must
+/// equal `vault_pda` and position.market must match its paired market.
+/// This prevents a malicious caller from omitting an underwater
+/// position to inflate NAV (during deposit, would steal from existing
+/// depositors) or from omitting a profitable position (during
+/// withdraw, would let the depositor take more than their share).
+///
+/// MagicBlock ER compatibility: this helper only deserialises Market /
+/// Position via Anchor's standard accessors — works identically whether
+/// the market account is delegated to the ER or not.
+fn compute_vault_mtm_nav<'info>(
+    vault_pda: Pubkey,
+    collateral_quote_lots: u64,
+    expected_open_positions: u8,
+    remaining: &[anchor_lang::prelude::AccountInfo<'info>],
+    program_id: &Pubkey,
+) -> Result<i128> {
+    let expected = expected_open_positions as usize;
+    if expected == 0 {
+        require!(remaining.is_empty(), FlashBookError::OutOfRange);
+        return Ok(collateral_quote_lots as i128);
+    }
+    require!(remaining.len() == expected * 2, FlashBookError::OutOfRange);
+
+    let mut nav: i128 = collateral_quote_lots as i128;
+    for i in 0..expected {
+        let market_ai = &remaining[i * 2];
+        let position_ai = &remaining[i * 2 + 1];
+        require!(market_ai.owner == program_id, FlashBookError::OutOfRange);
+        require!(position_ai.owner == program_id, FlashBookError::OutOfRange);
+
+        let market_data = market_ai.try_borrow_data()?;
+        let market_acct: MarketAccount =
+            MarketAccount::try_deserialize(&mut &market_data[..])?;
+        let position_data = position_ai.try_borrow_data()?;
+        let position: state::PositionAccount =
+            state::PositionAccount::try_deserialize(&mut &position_data[..])?;
+
+        require!(position.trader == vault_pda, FlashBookError::WrongTrader);
+        require!(
+            position.market == market_ai.key(),
+            FlashBookError::VaultNavMarketMismatch
+        );
+
+        if position.size_lots == 0 || market_acct.mark_price_ticks == 0 {
+            continue;
+        }
+        let pnl_per_lot_ticks =
+            (market_acct.mark_price_ticks as i128) - (position.entry_price_ticks as i128);
+        let sign: i128 = if position.side == 0 { 1 } else { -1 };
+        let unrealized = sign
+            .saturating_mul(position.size_lots as i128)
+            .saturating_mul(pnl_per_lot_ticks)
+            .saturating_mul(market_acct.params.tick_size as i128);
+        nav = nav.saturating_add(unrealized);
+    }
+    Ok(nav)
+}
+
 /// Single-position margin-threshold check. Cheap (no portfolio walk):
 /// computes equity = collateral + unrealized_pnl(pos, mark) and required
 /// = pos_notional × mmr_bps / 10_000, then emits a

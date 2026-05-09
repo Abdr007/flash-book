@@ -599,6 +599,44 @@ impl TraderStateAccount {
     }
 }
 
+/// HIP-3 deployer bond. Optional slashable stake posted by a market's
+/// creator (or by anyone, on the creator's behalf — bond is per
+/// (market, depositor) pair). Posting bond signals commitment; the
+/// bond is slashable by protocol governance if the market goes bad
+/// (oracle gone stale, insolvent liquidations, etc.). Bond unbonds
+/// after a configurable delay (default 7 days) to prevent immediate
+/// withdrawal in response to slash threats.
+///
+/// PDA seeds: [b"market_bond", market, depositor]. Funds live in the
+/// protocol's quote vault (same vault as collateral / FLP capital);
+/// this account just tracks the depositor's claim.
+#[account]
+#[derive(Debug)]
+pub struct MarketBondAccount {
+    pub market: Pubkey,
+    pub depositor: Pubkey,
+    pub bump: u8,
+    /// Reserved padding for future flag bits / alignment.
+    pub _pad0: [u8; 7],
+    pub amount_quote_lots: u64,
+    pub deposited_at_unix: u64,
+    /// 0 = no unbond request pending; otherwise the unix timestamp of
+    /// the request. Bond is claimable after `unbond_request_at_unix +
+    /// BOND_UNBOND_DELAY_SECONDS`.
+    pub unbond_request_at_unix: u64,
+    /// Cumulative amount slashed by governance over this bond's lifetime
+    /// (informational, used for off-chain reputation tracking).
+    pub total_slashed_quote_lots: u64,
+}
+
+impl MarketBondAccount {
+    pub const SEED: &'static [u8] = b"market_bond";
+    pub fn space() -> usize {
+        // 8 disc + 32 + 32 + 1 + 7 + 8 + 8 + 8 + 8 = 112
+        8 + 112
+    }
+}
+
 /// User-managed trading vault. A strategist deploys a vault and gets
 /// trading authority over its collateral pool via the standard
 /// TraderStateAccount.delegate mechanism. Depositors mint shares at the

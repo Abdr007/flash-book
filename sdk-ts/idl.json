@@ -428,6 +428,251 @@
       ]
     },
     {
+      "name": "auto_deleverage",
+      "docs": [
+        "AUTO-DELEVERAGE — the safety primitive of last resort. When the",
+        "insurance fund falls below `pause_threshold_quote_lots`, a sick",
+        "position cannot be safely liquidated through the normal flow",
+        "(the bankruptcy gap exceeds insurance buffer). ADL force-closes",
+        "the highest-ranked profitable counter-trader at the BANKRUPTCY",
+        "PRICE of the underwater position — they realize their PnL up to",
+        "the bankruptcy price (less than market would give them) and the",
+        "gap between bp and mark is what would have come from insurance.",
+        "",
+        "Permissionless. Caller passes:",
+        "• underwater (position + trader_state)",
+        "• counter_position + counter_trader_state (chosen off-chain by",
+        "ranking unrealized_pnl × leverage, highest first)",
+        "• close_size_lots (≤ min(underwater.size, counter.size))",
+        "",
+        "Eligibility checks (all enforced on-chain):",
+        "1. insurance_fund.balance < pause_threshold (ADL trigger)",
+        "2. underwater is actually unhealthy (margin assessment)",
+        "3. counter.side != underwater.side",
+        "4. counter has positive PnL at the BANKRUPTCY price (fair: we",
+        "never force a counter-trader into a loss they wouldn't have",
+        "had anyway)",
+        "",
+        "Action:",
+        "• close `close_size` lots from BOTH at the bankruptcy price",
+        "• underwater realizes loss (collateral debited pro-rata)",
+        "• counter realizes profit at bp (less than mark — that's the",
+        "\"give up\", which absorbs the loss insurance would have eaten)",
+        "• update OI counters",
+        "• emit AutoDeleveragedEvent",
+        "",
+        "Off-chain ranking is incentivised separately (operators run a",
+        "sorted-by-pnl-leverage queue keeper). On-chain we trust the",
+        "caller's ranking but enforce eligibility — invalid ranking just",
+        "rejects."
+      ],
+      "discriminator": [
+        210,
+        69,
+        163,
+        148,
+        44,
+        245,
+        226,
+        170
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Anyone may call. ADL keepers compete off-chain on the (pnl ×",
+            "leverage) ranking; first valid call wins."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "docs": [
+            "Insurance fund — read-only here, used to verify ADL trigger gate",
+            "(balance < pause threshold)."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "underwater_trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "underwater_trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "underwater_position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "underwater_trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "counter_trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "counter_trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "counter_position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "counter_trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "close_size_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "cancel_order",
       "docs": [
         "Cancel a pending order from the buffer. Only the original trader can",
@@ -574,6 +819,192 @@
         {
           "name": "twap_order",
           "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "claim_unbonded_market_bond",
+      "docs": [
+        "Claim unbonded bond. Requires `unbond_request_at_unix > 0` AND",
+        "`now ≥ unbond_request_at_unix + BOND_UNBOND_DELAY_SECONDS`.",
+        "Transfers the FULL outstanding amount back to depositor's ATA;",
+        "MarketBondAccount stays open with amount = 0 (re-postable)."
+      ],
+      "discriminator": [
+        119,
+        1,
+        204,
+        86,
+        151,
+        112,
+        243,
+        211
+      ],
+      "accounts": [
+        {
+          "name": "depositor",
+          "signer": true
+        },
+        {
+          "name": "market_bond",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  110,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_bond.market",
+                "account": "MarketBondAccount"
+              },
+              {
+                "kind": "account",
+                "path": "depositor"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "depositor_quote_ata",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "depositor"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "quote_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "quote_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": []
@@ -3900,6 +4331,302 @@
       ]
     },
     {
+      "name": "post_market_bond",
+      "docs": [
+        "Post a slashable HIP-3 deployer bond on a market. The bond signals",
+        "the depositor's commitment to the market's solvency; if the",
+        "market goes bad (oracle stale, mass insolvent liqs, etc.),",
+        "protocol governance can `slash_market_bond` to transfer up to",
+        "the full bond into the insurance fund.",
+        "",
+        "Caller signs and is the depositor (each bond is per (market,",
+        "depositor) pair — anyone can post bond on any market). SPL",
+        "transfer from depositor's quote ATA to the protocol vault. The",
+        "MarketBondAccount tracks the depositor's claim.",
+        "",
+        "Posting bond does NOT change creator share or market params; it's",
+        "a purely additive commitment signal. Off-chain UIs can rank",
+        "markets by total bond amount (sum across all bond accounts for",
+        "a market)."
+      ],
+      "discriminator": [
+        247,
+        206,
+        68,
+        160,
+        68,
+        252,
+        1,
+        183
+      ],
+      "accounts": [
+        {
+          "name": "depositor",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_bond",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  110,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "depositor"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "depositor_quote_ata",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "depositor"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "quote_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "quote_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "request_unbond_market_bond",
+      "docs": [
+        "Request to unbond. Sets the unbond timestamp; bond cannot be",
+        "claimed until BOND_UNBOND_DELAY_SECONDS elapses. The delay",
+        "prevents withdraw-before-slash races. Re-posting bond cancels",
+        "the request (signals continued commitment)."
+      ],
+      "discriminator": [
+        93,
+        121,
+        149,
+        182,
+        164,
+        131,
+        143,
+        187
+      ],
+      "accounts": [
+        {
+          "name": "depositor",
+          "docs": [
+            "Depositor signs — only the bond owner can request unbond."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market_bond",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  110,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_bond.market",
+                "account": "MarketBondAccount"
+              },
+              {
+                "kind": "account",
+                "path": "depositor"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "run_batch",
       "docs": [
         "Run one batch: advance funding, generate FLP quotes, clear FBA,",
@@ -4820,6 +5547,103 @@
         }
       ],
       "args": []
+    },
+    {
+      "name": "slash_market_bond",
+      "docs": [
+        "Slash a deployer bond. Protocol authority signs (single source of",
+        "truth: insurance_fund.authority). Transfers `amount` quote-lots",
+        "from the bond into the insurance fund's balance.",
+        "Funds physically stay in the same vault — only the accounting",
+        "changes (decrement bond, increment insurance balance).",
+        "",
+        "Slash conditions are enforced off-chain by governance + monitors",
+        "(oracle staleness, insolvency events). On-chain we trust the",
+        "authority — same trust model as `withdraw_insurance_fund`."
+      ],
+      "discriminator": [
+        245,
+        59,
+        146,
+        3,
+        237,
+        77,
+        68,
+        38
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "insurance_fund",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_bond",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  110,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_bond.market",
+                "account": "MarketBondAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market_bond.depositor",
+                "account": "MarketBondAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
     },
     {
       "name": "submit_commit",
@@ -5954,14 +6778,20 @@
     {
       "name": "withdraw_from_vault",
       "docs": [
-        "Withdraw from a vault. Burns `shares_to_burn` from the depositor's",
-        "holding and pays out proportional NAV. Requires the vault to be",
-        "FLAT (no open positions) — same safety property as",
-        "`sweep_collateral`. To withdraw with positions open, the",
-        "strategist must close first. Future v2 can lift this with a",
-        "position-walk margin check.",
+        "Withdraw from a vault. Burns `shares_to_burn` and pays out",
+        "proportional MARK-TO-MARKET NAV.",
         "",
-        "Payout = shares_to_burn × collateral / shares_outstanding."
+        "Caller passes `[market, position]` pairs in remaining_accounts",
+        "for each of the vault's open positions (count must match",
+        "vault_trader_state.open_positions exactly). NAV = collateral +",
+        "sum(unrealized_pnl). Payout = shares × NAV / shares_outstanding.",
+        "",
+        "Vault collateral must cover the cash payout (positions can stay",
+        "open after withdraw). If collateral < required payout, the call",
+        "rejects — strategist must close some positions to free",
+        "collateral. This avoids forcing the vault to liquidate at bad",
+        "prices to honour a withdrawal. Future v2 can add an automatic",
+        "proportional position-close (HL pattern)."
       ],
       "discriminator": [
         180,
@@ -6416,6 +7246,19 @@
       ]
     },
     {
+      "name": "MarketBondAccount",
+      "discriminator": [
+        234,
+        198,
+        86,
+        91,
+        166,
+        70,
+        41,
+        220
+      ]
+    },
+    {
       "name": "OrderBufferAccount",
       "discriminator": [
         57,
@@ -6508,6 +7351,19 @@
     }
   ],
   "events": [
+    {
+      "name": "AutoDeleveragedEvent",
+      "discriminator": [
+        246,
+        58,
+        136,
+        158,
+        169,
+        2,
+        124,
+        155
+      ]
+    },
     {
       "name": "BasketOrderNPlacedEvent",
       "discriminator": [
@@ -6753,6 +7609,58 @@
         67,
         82,
         66
+      ]
+    },
+    {
+      "name": "MarketBondClaimedEvent",
+      "discriminator": [
+        203,
+        149,
+        24,
+        242,
+        248,
+        246,
+        130,
+        101
+      ]
+    },
+    {
+      "name": "MarketBondPostedEvent",
+      "discriminator": [
+        73,
+        247,
+        214,
+        244,
+        148,
+        113,
+        86,
+        22
+      ]
+    },
+    {
+      "name": "MarketBondSlashedEvent",
+      "discriminator": [
+        12,
+        38,
+        215,
+        186,
+        11,
+        118,
+        222,
+        250
+      ]
+    },
+    {
+      "name": "MarketBondUnbondRequestedEvent",
+      "discriminator": [
+        58,
+        210,
+        243,
+        136,
+        222,
+        184,
+        217,
+        145
       ]
     },
     {
@@ -7225,6 +8133,26 @@
       "msg": "OCO trigger pair link mismatch"
     },
     {
+      "code": 7220,
+      "name": "AdlNotEligible",
+      "msg": "ADL not eligible: insurance fund above threshold or counter unprofitable at bankruptcy price"
+    },
+    {
+      "code": 7221,
+      "name": "BondTooSmall",
+      "msg": "HIP-3 deployer bond is below the slashable minimum"
+    },
+    {
+      "code": 7222,
+      "name": "BondUnbondingDelay",
+      "msg": "Bond cannot be unbonded yet — unbond delay not elapsed"
+    },
+    {
+      "code": 7223,
+      "name": "VaultNavMarketMismatch",
+      "msg": "Vault NAV market mismatch — passed market doesn't match position"
+    },
+    {
       "code": 7300,
       "name": "BufferFull",
       "msg": "Order book buffer at capacity"
@@ -7336,6 +8264,42 @@
     }
   ],
   "types": [
+    {
+      "name": "AutoDeleveragedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "underwater_trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "counter_trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "close_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "bankruptcy_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "counter_gain_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "executor",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
     {
       "name": "BasketLeg",
       "docs": [
@@ -8310,6 +9274,168 @@
           {
             "name": "new_authority",
             "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketBondAccount",
+      "docs": [
+        "HIP-3 deployer bond. Optional slashable stake posted by a market's",
+        "creator (or by anyone, on the creator's behalf — bond is per",
+        "(market, depositor) pair). Posting bond signals commitment; the",
+        "bond is slashable by protocol governance if the market goes bad",
+        "(oracle gone stale, insolvent liquidations, etc.). Bond unbonds",
+        "after a configurable delay (default 7 days) to prevent immediate",
+        "withdrawal in response to slash threats.",
+        "",
+        "PDA seeds: [b\"market_bond\", market, depositor]. Funds live in the",
+        "protocol's quote vault (same vault as collateral / FLP capital);",
+        "this account just tracks the depositor's claim."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "_pad0",
+            "docs": [
+              "Reserved padding for future flag bits / alignment."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "deposited_at_unix",
+            "type": "u64"
+          },
+          {
+            "name": "unbond_request_at_unix",
+            "docs": [
+              "0 = no unbond request pending; otherwise the unix timestamp of",
+              "the request. Bond is claimable after `unbond_request_at_unix +",
+              "BOND_UNBOND_DELAY_SECONDS`."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_slashed_quote_lots",
+            "docs": [
+              "Cumulative amount slashed by governance over this bond's lifetime",
+              "(informational, used for off-chain reputation tracking)."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketBondClaimedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketBondPostedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "new_total_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketBondSlashedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "remaining_bond_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketBondUnbondRequestedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "requested_at_unix",
+            "type": "u64"
+          },
+          {
+            "name": "claimable_at_unix",
+            "type": "u64"
           }
         ]
       }

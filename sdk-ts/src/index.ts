@@ -18,6 +18,7 @@ export {
   twapOrderPda,
   vaultPda,
   vaultPositionPda,
+  marketBondPda,
   type DerivedPda,
 } from './pdas.ts';
 
