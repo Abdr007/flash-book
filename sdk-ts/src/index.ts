@@ -110,6 +110,24 @@ export {
   type MarketMakerStats,
 } from './market-maker.ts';
 
+export {
+  FlashV2Venue,
+  V2_SIDE_LONG,
+  V2_SIDE_SHORT,
+  type FlashV2VenueConfig,
+  type MagicTradeClient,
+  type V2Side,
+  type V2OraclePrice,
+  type V2PoolConfig,
+  type V2PlaceLimitOrderParams,
+  type V2EditLimitOrderParams,
+  type V2InstructionResult,
+  type V2BasketAccount,
+  type V2MarketAccount,
+  type V2PositionMeta,
+  type V2OrderMeta,
+} from './flash-v2-venue.ts';
+
 export type {
   MarketInitializedEvent,
   BatchClearedEvent,

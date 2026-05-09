@@ -23,6 +23,7 @@
     "@solana/web3.js": "^1.95.0"
   },
   "devDependencies": {
+    "@flash_trade/magic-trade-client": "^1.0.25",
     "@types/bn.js": "^5.1.6",
     "typescript": "^5.7.3"
   }
