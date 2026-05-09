@@ -276,6 +276,25 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Permissionlessly check market solvency invariants. Currently
+  /// verifies open-interest balance (S5: oi_long == oi_short). On
+  /// breach, the tx fails and an InvariantBreachDetectedEvent is
+  /// emitted. Off-chain monitors should call this periodically and on
+  /// breach trigger an explicit set_market_status(Paused) via the
+  /// authority.
+  verifyMarketInvariantsIx(args: {
+    caller: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    return this.methods
+      .verifyMarketInvariants()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+      })
+      .instruction();
+  }
+
   /// Authority withdraws excess insurance fund balance. Cannot push the
   /// fund below `pause_threshold_quote_lots`. Authority signs.
   withdrawInsuranceFundIx(args: {
@@ -411,6 +430,7 @@ export class FlashBookClient {
     const buffer = this.orderBuffer(args.market);
     const state = this.traderState(args.trader);
     const position = this.position(args.market, args.trader);
+    const flp = this.flpExposure();
     return this.methods
       .placeLimitOrder(
         args.side === 'long' ? 0 : 1,
@@ -424,6 +444,7 @@ export class FlashBookClient {
         orderBuffer: buffer.address,
         traderState: state.address,
         position: position.address,
+        flpExposure: flp.address,
         systemProgram: SystemProgram.programId,
       })
       .instruction();

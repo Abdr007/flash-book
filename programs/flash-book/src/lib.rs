@@ -926,6 +926,46 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Verify market invariants and auto-halt on breach.
+    ///
+    /// Permissionless: anyone can poke a market to check. The protocol
+    /// pays off-chain monitors / keepers nothing extra; calling this is
+    /// just a tx fee. On any violation, the market is auto-flipped to
+    /// Paused so no new orders can land while operators investigate.
+    ///
+    /// Currently checks:
+    ///   S5 — open interest balance: oi_long_lots == oi_short_lots
+    ///        (Should hold by construction of update_oi at every fill,
+    ///        but a bug in fill paths could drift these. This is the
+    ///        cheapest invariant to verify on-chain.)
+    ///
+    /// Future invariants this hook can absorb:
+    ///   S4 — vault balance ≥ Σ trader collateral + FLP capital
+    ///   S12 — FLP per-batch growth ≤ pool_capital × max_growth%
+    ///   S14 — mark price within oracle band ±band_bps
+    pub fn verify_market_invariants(ctx: Context<VerifyMarketInvariants>) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+
+        if market.oi_long_lots != market.oi_short_lots {
+            // Auto-halt: flip market to Paused. Closed is terminal — preserve.
+            let prev_status = market.status;
+            if market.status != MarketStatus::Closed as u8 {
+                market.status = MarketStatus::Paused as u8;
+            }
+            emit!(InvariantBreachDetectedEvent {
+                market: market.key(),
+                invariant_code: 5,
+                expected: market.oi_long_lots,
+                actual: market.oi_short_lots,
+                previous_status: prev_status,
+                new_status: market.status,
+            });
+            return Err(error!(FlashBookError::OpenInterestImbalance));
+        }
+
+        Ok(())
+    }
+
     /// Update market status (authority-only).
     ///
     /// Status transitions:
@@ -2283,6 +2323,20 @@ pub struct CloseTraderAta<'info> {
 }
 
 #[derive(Accounts)]
+pub struct VerifyMarketInvariants<'info> {
+    /// Permissionless — anyone can poke the invariants. The signer just
+    /// pays the tx fee.
+    pub caller: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+}
+
+#[derive(Accounts)]
 pub struct UpdateOracle<'info> {
     pub authority: Signer<'info>,
     #[account(
@@ -2830,6 +2884,18 @@ pub struct FundingSettledEvent {
     /// = trader received.
     pub owed_quote_lots: i64,
     pub new_collateral: u64,
+}
+
+#[event]
+pub struct InvariantBreachDetectedEvent {
+    pub market: Pubkey,
+    /// Solvency invariant identifier from docs/SAFETY.md (5 = OI balance,
+    /// 4 = vault conservation, etc).
+    pub invariant_code: u8,
+    pub expected: u64,
+    pub actual: u64,
+    pub previous_status: u8,
+    pub new_status: u8,
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────

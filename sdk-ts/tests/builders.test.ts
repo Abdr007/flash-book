@@ -108,6 +108,15 @@ describe('Instruction builders', () => {
     expect(ix.keys[4].pubkey.toBase58()).toBe(expectedAta.toBase58());
   });
 
+  test('verifyMarketInvariantsIx', async () => {
+    const client = makeClient();
+    const ix = await client.verifyMarketInvariantsIx({
+      caller: Keypair.generate().publicKey,
+      market: Keypair.generate().publicKey,
+    });
+    expect(ix.keys.length).toBe(2); // caller, market
+  });
+
   test('withdrawInsuranceFundIx', async () => {
     const client = makeClient();
     const ix = await client.withdrawInsuranceFundIx({
@@ -232,8 +241,8 @@ describe('Instruction builders', () => {
       limitTicks: new BN(99_950),
       postOnly: false,
     });
-    // trader, market, order_buffer, trader_state, position, sysprog
-    expect(ix.keys.length).toBe(6);
+    // trader, market, order_buffer, trader_state, position, flp_exposure, sysprog
+    expect(ix.keys.length).toBe(7);
   });
 
   test('submitCommitIx', async () => {

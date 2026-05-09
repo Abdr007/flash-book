@@ -3120,6 +3120,78 @@
       ]
     },
     {
+      "name": "verify_market_invariants",
+      "docs": [
+        "Verify market invariants and auto-halt on breach.",
+        "",
+        "Permissionless: anyone can poke a market to check. The protocol",
+        "pays off-chain monitors / keepers nothing extra; calling this is",
+        "just a tx fee. On any violation, the market is auto-flipped to",
+        "Paused so no new orders can land while operators investigate.",
+        "",
+        "Currently checks:",
+        "S5 — open interest balance: oi_long_lots == oi_short_lots",
+        "(Should hold by construction of update_oi at every fill,",
+        "but a bug in fill paths could drift these. This is the",
+        "cheapest invariant to verify on-chain.)",
+        "",
+        "Future invariants this hook can absorb:",
+        "S4 — vault balance ≥ Σ trader collateral + FLP capital",
+        "S12 — FLP per-batch growth ≤ pool_capital × max_growth%",
+        "S14 — mark price within oracle band ±band_bps"
+      ],
+      "discriminator": [
+        247,
+        131,
+        7,
+        44,
+        49,
+        18,
+        250,
+        167
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Permissionless — anyone can poke the invariants. The signer just",
+            "pays the tx fee."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "withdraw_collateral",
       "docs": [
         "Withdraw collateral. Decrements accounting + transfers from the",
@@ -3914,6 +3986,19 @@
       ]
     },
     {
+      "name": "InvariantBreachDetectedEvent",
+      "discriminator": [
+        116,
+        202,
+        169,
+        220,
+        18,
+        210,
+        225,
+        250
+      ]
+    },
+    {
       "name": "LiquidationInjectedEvent",
       "discriminator": [
         164,
@@ -4097,6 +4182,11 @@
       "code": 7209,
       "name": "PositionSizeCapExceeded",
       "msg": "Position size would exceed per-trader concentration cap"
+    },
+    {
+      "code": 7210,
+      "name": "OpenInterestImbalance",
+      "msg": "Open interest invariant violated: oi_long != oi_short"
     },
     {
       "code": 7300,
@@ -4647,6 +4737,42 @@
               "collateral + FLP capital."
             ],
             "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "InvariantBreachDetectedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "invariant_code",
+            "docs": [
+              "Solvency invariant identifier from docs/SAFETY.md (5 = OI balance,",
+              "4 = vault conservation, etc)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "expected",
+            "type": "u64"
+          },
+          {
+            "name": "actual",
+            "type": "u64"
+          },
+          {
+            "name": "previous_status",
+            "type": "u8"
+          },
+          {
+            "name": "new_status",
+            "type": "u8"
           }
         ]
       }

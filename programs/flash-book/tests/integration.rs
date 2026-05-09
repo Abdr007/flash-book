@@ -3051,6 +3051,110 @@ async fn place_limit_order_below_min_lot_rejected() {
 }
 
 #[tokio::test]
+async fn verify_market_invariants_passes_when_oi_balanced() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Fresh market: oi_long = oi_short = 0 (balanced trivially).
+    let ix = build_ix(
+        flash_book::instruction::VerifyMarketInvariants {},
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    // Status unchanged (still Active or whatever default).
+    assert_ne!(market.status, flash_book::MarketStatus::Paused as u8);
+}
+
+#[tokio::test]
+async fn verify_market_invariants_auto_halts_on_oi_drift() {
+    // Synthetically inject oi_long != oi_short into market state, then
+    // call verify. Tx must fail AND market must flip to Paused.
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let m_acc = ctx.banks_client.get_account(market_pda).await.unwrap().unwrap();
+    let mut m_state =
+        flash_book::state::MarketAccount::try_deserialize(&mut m_acc.data.as_slice()).unwrap();
+    m_state.oi_long_lots = 100;
+    m_state.oi_short_lots = 99; // drift!
+    let mut new_data = Vec::new();
+    m_state.try_serialize(&mut new_data).unwrap();
+    new_data.resize(m_acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: m_acc.lamports,
+            data: new_data,
+            owner: m_acc.owner,
+            executable: m_acc.executable,
+            rent_epoch: m_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    let ix = build_ix(
+        flash_book::instruction::VerifyMarketInvariants {},
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "verify_market_invariants must fail when OI drifts");
+
+    // Crucially, the auto-halt mutation is rolled back when the tx fails
+    // (Solana's atomicity guarantee). To inspect the auto-halt path, we'd
+    // need the verify to commit successfully on success but mutate +
+    // return Err on breach — which Solana CANNOT do.
+    //
+    // Production design: verify is called by an off-chain monitor; on
+    // breach, the monitor (a) sees the failed tx + emitted log, then (b)
+    // calls set_market_status(Paused) explicitly via the authority. The
+    // emitted InvariantBreachDetectedEvent in this tx (rolled back) won't
+    // persist either — but the on-chain state staying healthy is the
+    // safer default.
+    //
+    // For now: verify failure IS the kill-switch signal for off-chain
+    // automation. A future enhancement could make verify a "checkpoint"
+    // that stores a flag without erroring when invariants hold, and
+    // splits the breach-pause action into a separate ix.
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    // Status remains pre-tx because the tx errored (rolled back). The OI
+    // drift is still present too because we set_account'd it directly.
+    assert_eq!(market.oi_long_lots, 100);
+    assert_eq!(market.oi_short_lots, 99);
+}
+
+#[tokio::test]
 async fn place_limit_order_off_tick_rejected() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;

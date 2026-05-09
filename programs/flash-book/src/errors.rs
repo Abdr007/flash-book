@@ -60,6 +60,8 @@ pub enum FlashBookError {
     RateLimited = 1208,
     #[msg("Position size would exceed per-trader concentration cap")]
     PositionSizeCapExceeded = 1209,
+    #[msg("Open interest invariant violated: oi_long != oi_short")]
+    OpenInterestImbalance = 1210,
 
     // ── 1300-1399 matcher / clearing ────────────────────────────────
     #[msg("Order book buffer at capacity")]
