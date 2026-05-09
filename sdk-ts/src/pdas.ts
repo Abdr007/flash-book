@@ -53,6 +53,7 @@ const TRADER_STATE_SEED = Buffer.from('trader_state');
 const POSITION_SEED = Buffer.from('position');
 const LP_POSITION_SEED = Buffer.from('lp_position');
 const TRIGGER_ORDER_SEED = Buffer.from('trigger');
+const TWAP_ORDER_SEED = Buffer.from('twap');
 
 export interface DerivedPda {
   readonly address: PublicKey;
@@ -124,6 +125,18 @@ export function triggerOrderPda(
 ): DerivedPda {
   return derive(
     [TRIGGER_ORDER_SEED, market.toBuffer(), trader.toBuffer(), Buffer.from([triggerId & 0xff])],
+    programId,
+  );
+}
+
+export function twapOrderPda(
+  market: PublicKey,
+  trader: PublicKey,
+  twapId: number,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
+): DerivedPda {
+  return derive(
+    [TWAP_ORDER_SEED, market.toBuffer(), trader.toBuffer(), Buffer.from([twapId & 0xff])],
     programId,
   );
 }

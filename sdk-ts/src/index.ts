@@ -15,6 +15,7 @@ export {
   positionPda,
   traderStatePda,
   triggerOrderPda,
+  twapOrderPda,
   type DerivedPda,
 } from './pdas.ts';
 

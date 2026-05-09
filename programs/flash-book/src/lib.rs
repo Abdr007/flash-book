@@ -1998,6 +1998,186 @@ pub mod flash_book {
         // Account closure is handled by Anchor's `close = trader` constraint.
     }
 
+    /// Place a NATIVE on-chain TWAP order — Hyperliquid pattern. Splits a
+    /// large order into N slices of `slice_size_lots` (last slice may be
+    /// smaller), released no faster than `slot_interval` apart. Each slice
+    /// is a regular limit order at `limit_price_ticks` (max for buys, min
+    /// for sells — slice ROUTES like any other limit and respects the cap).
+    /// Reduces market impact + survives bot downtime.
+    pub fn place_twap_order(
+        ctx: Context<PlaceTwapOrder>,
+        twap_id: u8,
+        side: u8,
+        total_size_lots: u64,
+        slice_size_lots: u64,
+        limit_price_ticks: u64,
+        slot_interval: u64,
+        end_slot: u64,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(total_size_lots > 0, FlashBookError::ZeroSize);
+        require!(slice_size_lots > 0, FlashBookError::ZeroSize);
+        require!(slice_size_lots <= total_size_lots, FlashBookError::OutOfRange);
+        require!(limit_price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(slot_interval > 0, FlashBookError::OutOfRange);
+
+        let market = &ctx.accounts.market;
+        require!(
+            slice_size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            limit_price_ticks.is_multiple_of(market.params.tick_size),
+            FlashBookError::PriceNotOnTick
+        );
+
+        let now = Clock::get()?.slot;
+        if end_slot > 0 {
+            require!(end_slot > now, FlashBookError::OutOfRange);
+        }
+
+        let t = &mut ctx.accounts.twap_order;
+        t.trader = ctx.accounts.trader.key();
+        t.market = ctx.accounts.market.key();
+        t.bump = ctx.bumps.twap_order;
+        t.twap_id = twap_id;
+        t.side = side;
+        t.flags = state::TwapOrderAccount::FLAG_ACTIVE;
+        t.slice_size_lots = slice_size_lots;
+        t.total_size_lots = total_size_lots;
+        t.size_executed_lots = 0;
+        t.limit_price_ticks = limit_price_ticks;
+        t.start_slot = now;
+        t.slot_interval = slot_interval;
+        t.end_slot = end_slot;
+        // Allow the first slice to fire immediately (last_slice + interval
+        // ≤ now), so set last_slice such that the gate is open at `now`.
+        t.last_slice_at_slot = now.saturating_sub(slot_interval);
+
+        emit!(TwapOrderPlacedEvent {
+            market: t.market,
+            trader: t.trader,
+            twap_id,
+            side,
+            total_size_lots,
+            slice_size_lots,
+            limit_price_ticks,
+            slot_interval,
+            end_slot,
+        });
+        Ok(())
+    }
+
+    /// Execute the next TWAP slice — permissionless. Re-checks the
+    /// interval gate, computes the slice size (min of slice_size_lots,
+    /// remaining), inserts a limit order into the buffer, advances the
+    /// TWAP's executed counter + last_slice timestamp. When fully
+    /// executed (or end_slot crossed) the trader can `cancel_twap_order`.
+    pub fn execute_twap_slice(ctx: Context<ExecuteTwapSlice>) -> Result<()> {
+        let twap = &ctx.accounts.twap_order;
+        let market = &ctx.accounts.market;
+        require!(
+            twap.flags & state::TwapOrderAccount::FLAG_ACTIVE != 0,
+            FlashBookError::OutOfRange
+        );
+
+        let now = Clock::get()?.slot;
+        if twap.end_slot > 0 {
+            require!(twap.end_slot >= now, FlashBookError::OutOfRange);
+        }
+        require!(
+            now >= twap.last_slice_at_slot.saturating_add(twap.slot_interval),
+            FlashBookError::OutOfRange
+        );
+
+        let remaining = twap
+            .total_size_lots
+            .checked_sub(twap.size_executed_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(remaining > 0, FlashBookError::OutOfRange);
+        let slice_size = core::cmp::min(twap.slice_size_lots, remaining);
+        require!(
+            slice_size >= market.params.min_base_lots || slice_size == remaining,
+            FlashBookError::SizeBelowMinLot
+        );
+
+        let buffer = &mut ctx.accounts.order_buffer;
+        require!(
+            (buffer.head as usize) < ORDER_BUFFER_CAP,
+            FlashBookError::BufferFull
+        );
+        let next_seq = buffer
+            .seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+        let mut inserted = false;
+        for slot in buffer.slots.iter_mut() {
+            if slot.valid == 0 {
+                *slot = OrderSlot {
+                    valid: 1,
+                    side: twap.side,
+                    order_type: OrderType::Limit as u8,
+                    post_only: 0,
+                    seq: next_seq,
+                    id: next_seq,
+                    trader: twap.trader,
+                    size_lots: slice_size,
+                    limit_ticks: twap.limit_price_ticks,
+                };
+                inserted = true;
+                break;
+            }
+        }
+        require!(inserted, FlashBookError::BufferFull);
+        buffer.seq_counter = next_seq;
+        buffer.head = buffer
+            .head
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        let twap = &mut ctx.accounts.twap_order;
+        twap.size_executed_lots = twap
+            .size_executed_lots
+            .checked_add(slice_size)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        twap.last_slice_at_slot = now;
+        if twap.size_executed_lots >= twap.total_size_lots {
+            twap.flags &= !state::TwapOrderAccount::FLAG_ACTIVE;
+        }
+
+        emit!(TwapSliceExecutedEvent {
+            market: market.key(),
+            trader: twap.trader,
+            twap_id: twap.twap_id,
+            executor: ctx.accounts.caller.key(),
+            slice_size_lots: slice_size,
+            cumulative_executed_lots: twap.size_executed_lots,
+        });
+        Ok(())
+    }
+
+    /// Cancel a TWAP order — trader signs, account is closed, rent
+    /// returned. Works whether fully executed or partial.
+    pub fn cancel_twap_order(ctx: Context<CancelTwapOrder>) -> Result<()> {
+        let trader = ctx.accounts.trader.key();
+        require!(
+            ctx.accounts.twap_order.trader == trader,
+            FlashBookError::WrongTrader
+        );
+        emit!(TwapOrderCancelledEvent {
+            market: ctx.accounts.twap_order.market,
+            trader,
+            twap_id: ctx.accounts.twap_order.twap_id,
+            unfilled_lots: ctx
+                .accounts
+                .twap_order
+                .total_size_lots
+                .saturating_sub(ctx.accounts.twap_order.size_executed_lots),
+        });
+        Ok(())
+    }
+
     /// Cancel a pending order from the buffer. Only the original trader can
     /// cancel; other callers (or stale order_seq values) are rejected. The
     /// order must still be in the buffer (not yet processed by run_batch).
@@ -3814,6 +3994,84 @@ pub struct CancelTriggerOrder<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(twap_id: u8)]
+pub struct PlaceTwapOrder<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state::TwapOrderAccount::space(),
+        seeds = [
+            state::TwapOrderAccount::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[twap_id],
+        ],
+        bump,
+    )]
+    pub twap_order: Account<'info, state::TwapOrderAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteTwapSlice<'info> {
+    pub caller: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
+        bump = order_buffer.bump,
+    )]
+    pub order_buffer: Account<'info, OrderBufferAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::TwapOrderAccount::SEED,
+            market.key().as_ref(),
+            twap_order.trader.as_ref(),
+            &[twap_order.twap_id],
+        ],
+        bump = twap_order.bump,
+    )]
+    pub twap_order: Account<'info, state::TwapOrderAccount>,
+}
+
+#[derive(Accounts)]
+pub struct CancelTwapOrder<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        close = trader,
+        seeds = [
+            state::TwapOrderAccount::SEED,
+            twap_order.market.as_ref(),
+            twap_order.trader.as_ref(),
+            &[twap_order.twap_id],
+        ],
+        bump = twap_order.bump,
+    )]
+    pub twap_order: Account<'info, state::TwapOrderAccount>,
+}
+
+#[derive(Accounts)]
 pub struct CancelOrder<'info> {
     pub trader: Signer<'info>,
 
@@ -4151,6 +4409,37 @@ pub struct TriggerOrderCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub trigger_id: u8,
+}
+
+#[event]
+pub struct TwapOrderPlacedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub twap_id: u8,
+    pub side: u8,
+    pub total_size_lots: u64,
+    pub slice_size_lots: u64,
+    pub limit_price_ticks: u64,
+    pub slot_interval: u64,
+    pub end_slot: u64,
+}
+
+#[event]
+pub struct TwapSliceExecutedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub twap_id: u8,
+    pub executor: Pubkey,
+    pub slice_size_lots: u64,
+    pub cumulative_executed_lots: u64,
+}
+
+#[event]
+pub struct TwapOrderCancelledEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub twap_id: u8,
+    pub unfilled_lots: u64,
 }
 
 #[event]

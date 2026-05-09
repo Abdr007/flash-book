@@ -959,6 +959,81 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Place a NATIVE on-chain TWAP order. Splits `totalSizeLots` into
+  /// slices of `sliceSizeLots`, released no faster than `slotInterval`
+  /// apart at `limitPriceTicks` (cap for buys, floor for sells). A keeper
+  /// (or anyone) calls `executeTwapSliceIx` once per interval. Reduces
+  /// market impact for large orders + survives bot downtime.
+  placeTwapOrderIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    twapId: number;
+    side: 'long' | 'short';
+    totalSizeLots: bigint | number;
+    sliceSizeLots: bigint | number;
+    limitPriceTicks: bigint | number;
+    slotInterval: bigint | number;
+    endSlot?: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const twap = twapOrderPda(args.market, args.trader, args.twapId);
+    return this.methods
+      .placeTwapOrder(
+        args.twapId,
+        args.side === 'long' ? 0 : 1,
+        args.totalSizeLots,
+        args.sliceSizeLots,
+        args.limitPriceTicks,
+        args.slotInterval,
+        args.endSlot ?? 0,
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        twapOrder: twap.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Permissionless: keeper executes the next TWAP slice when the
+  /// interval gate is open. Re-checks interval + end_slot. Inserts a
+  /// limit order into the buffer and advances the cumulative counter.
+  /// When the total fills, the TWAP marks itself inactive.
+  executeTwapSliceIx(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+    twapId: number;
+  }): Promise<TransactionInstruction> {
+    const twap = twapOrderPda(args.market, args.trader, args.twapId);
+    const buffer = this.orderBuffer(args.market);
+    return this.methods
+      .executeTwapSlice()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        orderBuffer: buffer.address,
+        twapOrder: twap.address,
+      })
+      .instruction();
+  }
+
+  /// Cancel a TWAP order — trader signs, account closes, rent returned.
+  cancelTwapOrderIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    twapId: number;
+  }): Promise<TransactionInstruction> {
+    const twap = twapOrderPda(args.market, args.trader, args.twapId);
+    return this.methods
+      .cancelTwapOrder()
+      .accountsPartial({
+        trader: args.trader,
+        twapOrder: twap.address,
+      })
+      .instruction();
+  }
+
   /// One-time-write referrer. Hyperliquid affiliate model: while the
   /// taker has a referrer set, every fill emits a ReferralOwedEvent
   /// off-chain integrators credit. Cannot be rotated — anti-grief.

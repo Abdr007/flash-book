@@ -346,6 +346,48 @@ impl TriggerOrderAccount {
     }
 }
 
+/// Native on-chain TWAP order — Hyperliquid pattern. The trader specifies
+/// total size + slice size + interval; anyone (typically a keeper) calls
+/// `execute_twap_slice` once per interval to insert one slice into the
+/// market's order buffer. Slices stop firing when total filled OR end_slot
+/// reached.
+///
+/// PDA seeds: [b"twap", market, trader, twap_id]. twap_id is u8 → up to
+/// 256 active TWAPs per (trader, market) pair.
+#[account]
+#[derive(Debug)]
+pub struct TwapOrderAccount {
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub bump: u8,
+    pub twap_id: u8,
+    pub side: u8,
+    pub flags: u8, // bit 0: active
+    pub slice_size_lots: u64,
+    /// Total size to execute across slices.
+    pub total_size_lots: u64,
+    /// Cumulative size successfully sliced into the buffer so far.
+    pub size_executed_lots: u64,
+    /// Limit price applied to every slice (max price for buys, min for
+    /// sells). Slice rejects placement if exceeded.
+    pub limit_price_ticks: u64,
+    pub start_slot: u64,
+    /// Minimum slots between successive slices.
+    pub slot_interval: u64,
+    /// 0 = no end. Otherwise last slot a slice may be placed in.
+    pub end_slot: u64,
+    pub last_slice_at_slot: u64,
+}
+
+impl TwapOrderAccount {
+    pub const SEED: &'static [u8] = b"twap";
+    pub const FLAG_ACTIVE: u8 = 1 << 0;
+    pub fn space() -> usize {
+        // 8 disc + 32+32+1+1+1+1 + 8+8+8+8+8+8+8+8 = 140. Round up.
+        8 + 144
+    }
+}
+
 /// Per-LP share holding. PDA seeded `[b"lp_position", lp.key()]`. Created
 /// lazily on first deposit via `init_if_needed`.
 #[account]

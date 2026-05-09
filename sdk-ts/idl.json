@@ -548,6 +548,35 @@
       "args": []
     },
     {
+      "name": "cancel_twap_order",
+      "docs": [
+        "Cancel a TWAP order — trader signs, account is closed, rent",
+        "returned. Works whether fully executed or partial."
+      ],
+      "discriminator": [
+        23,
+        154,
+        156,
+        168,
+        217,
+        164,
+        158,
+        170
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "twap_order",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "close_trader_ata",
       "docs": [
         "Close the trader's quote ATA and refund the rent lamports to",
@@ -1262,6 +1291,94 @@
               }
             ]
           }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "execute_twap_slice",
+      "docs": [
+        "Execute the next TWAP slice — permissionless. Re-checks the",
+        "interval gate, computes the slice size (min of slice_size_lots,",
+        "remaining), inserts a limit order into the buffer, advances the",
+        "TWAP's executed counter + last_slice timestamp. When fully",
+        "executed (or end_slot crossed) the trader can `cancel_twap_order`."
+      ],
+      "discriminator": [
+        95,
+        48,
+        177,
+        5,
+        24,
+        40,
+        20,
+        71
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "twap_order",
+          "writable": true
         }
       ],
       "args": []
@@ -2966,6 +3083,100 @@
         },
         {
           "name": "expires_at_slot",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "place_twap_order",
+      "docs": [
+        "Place a NATIVE on-chain TWAP order — Hyperliquid pattern. Splits a",
+        "large order into N slices of `slice_size_lots` (last slice may be",
+        "smaller), released no faster than `slot_interval` apart. Each slice",
+        "is a regular limit order at `limit_price_ticks` (max for buys, min",
+        "for sells — slice ROUTES like any other limit and respects the cap).",
+        "Reduces market impact + survives bot downtime."
+      ],
+      "discriminator": [
+        0,
+        140,
+        86,
+        197,
+        70,
+        38,
+        229,
+        173
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "twap_order",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "twap_id",
+          "type": "u8"
+        },
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "total_size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "slice_size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "limit_price_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "slot_interval",
+          "type": "u64"
+        },
+        {
+          "name": "end_slot",
           "type": "u64"
         }
       ]
@@ -4880,6 +5091,19 @@
         158,
         33
       ]
+    },
+    {
+      "name": "TwapOrderAccount",
+      "discriminator": [
+        241,
+        49,
+        158,
+        208,
+        194,
+        175,
+        12,
+        171
+      ]
     }
   ],
   "events": [
@@ -5232,6 +5456,45 @@
         249,
         23,
         17
+      ]
+    },
+    {
+      "name": "TwapOrderCancelledEvent",
+      "discriminator": [
+        34,
+        20,
+        3,
+        218,
+        212,
+        61,
+        148,
+        240
+      ]
+    },
+    {
+      "name": "TwapOrderPlacedEvent",
+      "discriminator": [
+        245,
+        35,
+        133,
+        15,
+        25,
+        19,
+        85,
+        201
+      ]
+    },
+    {
+      "name": "TwapSliceExecutedEvent",
+      "discriminator": [
+        184,
+        166,
+        2,
+        249,
+        98,
+        139,
+        176,
+        147
       ]
     }
   ],
@@ -7168,6 +7431,196 @@
           },
           {
             "name": "limit_price_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TwapOrderAccount",
+      "docs": [
+        "Native on-chain TWAP order — Hyperliquid pattern. The trader specifies",
+        "total size + slice size + interval; anyone (typically a keeper) calls",
+        "`execute_twap_slice` once per interval to insert one slice into the",
+        "market's order buffer. Slices stop firing when total filled OR end_slot",
+        "reached.",
+        "",
+        "PDA seeds: [b\"twap\", market, trader, twap_id]. twap_id is u8 → up to",
+        "256 active TWAPs per (trader, market) pair."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "twap_id",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "flags",
+            "type": "u8"
+          },
+          {
+            "name": "slice_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "total_size_lots",
+            "docs": [
+              "Total size to execute across slices."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "size_executed_lots",
+            "docs": [
+              "Cumulative size successfully sliced into the buffer so far."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "limit_price_ticks",
+            "docs": [
+              "Limit price applied to every slice (max price for buys, min for",
+              "sells). Slice rejects placement if exceeded."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "start_slot",
+            "type": "u64"
+          },
+          {
+            "name": "slot_interval",
+            "docs": [
+              "Minimum slots between successive slices."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "end_slot",
+            "docs": [
+              "0 = no end. Otherwise last slot a slice may be placed in."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_slice_at_slot",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TwapOrderCancelledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "twap_id",
+            "type": "u8"
+          },
+          {
+            "name": "unfilled_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TwapOrderPlacedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "twap_id",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "total_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "slice_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "limit_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "slot_interval",
+            "type": "u64"
+          },
+          {
+            "name": "end_slot",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TwapSliceExecutedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "twap_id",
+            "type": "u8"
+          },
+          {
+            "name": "executor",
+            "type": "pubkey"
+          },
+          {
+            "name": "slice_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "cumulative_executed_lots",
             "type": "u64"
           }
         ]
