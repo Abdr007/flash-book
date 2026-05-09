@@ -33,6 +33,7 @@ import {
   orderBufferPda,
   positionPda,
   traderStatePda,
+  triggerOrderPda,
   FLASH_BOOK_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from './pdas.ts';
@@ -874,6 +875,86 @@ export class FlashBookClient {
         takerPosition: takerPos.address,
         makerPosition: makerPos.address,
         systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Place a NATIVE on-chain trigger order — Hyperliquid pattern.
+  /// `kind` is 0 (fire when oracle ≤ trigger) or 1 (fire when ≥). For a
+  /// long position's stop-loss, set side=1 (short to close), kind=0
+  /// (fire when oracle drops below trigger). Limit price is the resulting
+  /// limit order's price (must be on tick + non-zero).
+  placeTriggerOrderIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    triggerId: number;
+    side: 'long' | 'short';
+    kind: 'below' | 'above';
+    sizeLots: bigint | number;
+    triggerPriceTicks: bigint | number;
+    limitPriceTicks: bigint | number;
+    reduceOnly?: boolean;
+    expiresAtSlot?: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const trigger = triggerOrderPda(args.market, args.trader, args.triggerId);
+    return this.methods
+      .placeTriggerOrder(
+        args.triggerId,
+        args.side === 'long' ? 0 : 1,
+        args.kind === 'below' ? 0 : 1,
+        args.sizeLots,
+        args.triggerPriceTicks,
+        args.limitPriceTicks,
+        args.reduceOnly ?? false,
+        args.expiresAtSlot ?? 0,
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        triggerOrder: trigger.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Permissionless: keeper executes a trigger order when its condition
+  /// is met. The chain re-checks oracle vs trigger price and the
+  /// reduce_only/expiry flags. On success, inserts a regular limit order
+  /// into the market's buffer (matches via run_batch like any other).
+  executeTriggerOrderIx(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+    triggerId: number;
+  }): Promise<TransactionInstruction> {
+    const trigger = triggerOrderPda(args.market, args.trader, args.triggerId);
+    const buffer = this.orderBuffer(args.market);
+    const position = this.position(args.market, args.trader);
+    return this.methods
+      .executeTriggerOrder()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        orderBuffer: buffer.address,
+        triggerOrder: trigger.address,
+        position: position.address,
+      })
+      .instruction();
+  }
+
+  /// Cancel a trigger order — trader signs, account closes, rent
+  /// returned. Works whether the trigger has fired (active=0) or not.
+  cancelTriggerOrderIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    triggerId: number;
+  }): Promise<TransactionInstruction> {
+    const trigger = triggerOrderPda(args.market, args.trader, args.triggerId);
+    return this.methods
+      .cancelTriggerOrder()
+      .accountsPartial({
+        trader: args.trader,
+        triggerOrder: trigger.address,
       })
       .instruction();
   }

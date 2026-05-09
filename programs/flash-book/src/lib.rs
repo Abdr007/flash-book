@@ -1815,6 +1815,189 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Place a NATIVE on-chain trigger order — Hyperliquid pattern. Trader
+    /// pre-funds rent on a TriggerOrderAccount PDA. Once the oracle
+    /// crosses `trigger_price_ticks` in the configured direction, ANY
+    /// signer can call `execute_trigger_order` to insert the resulting
+    /// limit order into the market's buffer. Survives bot downtime —
+    /// your stop-loss fires even if your MM bot is offline.
+    pub fn place_trigger_order(
+        ctx: Context<PlaceTriggerOrder>,
+        trigger_id: u8,
+        side: u8,
+        kind: u8,
+        size_lots: u64,
+        trigger_price_ticks: u64,
+        limit_price_ticks: u64,
+        reduce_only: bool,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(kind <= 1, FlashBookError::OutOfRange);
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(trigger_price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(limit_price_ticks > 0, FlashBookError::ZeroPrice);
+
+        let market = &ctx.accounts.market;
+        require!(
+            size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            limit_price_ticks.is_multiple_of(market.params.tick_size),
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            trigger_price_ticks.is_multiple_of(market.params.tick_size),
+            FlashBookError::PriceNotOnTick
+        );
+
+        let now = Clock::get()?.slot;
+        if expires_at_slot > 0 {
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
+
+        let t = &mut ctx.accounts.trigger_order;
+        t.trader = ctx.accounts.trader.key();
+        t.market = ctx.accounts.market.key();
+        t.bump = ctx.bumps.trigger_order;
+        t.trigger_id = trigger_id;
+        t.side = side;
+        t.kind = kind;
+        t.size_lots = size_lots;
+        t.trigger_price_ticks = trigger_price_ticks;
+        t.limit_price_ticks = limit_price_ticks;
+        t.created_at_slot = now;
+        t.expires_at_slot = expires_at_slot;
+        let mut flags = state::TriggerOrderAccount::FLAG_ACTIVE;
+        if reduce_only {
+            flags |= state::TriggerOrderAccount::FLAG_REDUCE_ONLY;
+        }
+        t.flags = flags;
+
+        emit!(TriggerOrderPlacedEvent {
+            market: t.market,
+            trader: t.trader,
+            trigger_id,
+            side,
+            kind,
+            size_lots,
+            trigger_price_ticks,
+            limit_price_ticks,
+        });
+        Ok(())
+    }
+
+    /// Execute a trigger order — permissionless. Reads the oracle and the
+    /// trigger; if the condition is met, inserts a limit order into the
+    /// market's order buffer (just like `place_limit_order` would for the
+    /// trader). Marks the trigger inactive so it cannot double-fire.
+    /// Caller pays tx fee; future iteration could reward keepers like
+    /// `liquidate_position` does.
+    pub fn execute_trigger_order(ctx: Context<ExecuteTriggerOrder>) -> Result<()> {
+        let trigger = &ctx.accounts.trigger_order;
+        let market = &ctx.accounts.market;
+        require!(
+            trigger.flags & state::TriggerOrderAccount::FLAG_ACTIVE != 0,
+            FlashBookError::OutOfRange
+        );
+
+        let now = Clock::get()?.slot;
+        if trigger.expires_at_slot > 0 {
+            require!(trigger.expires_at_slot >= now, FlashBookError::OutOfRange);
+        }
+
+        // Trigger condition: kind=0 → fire when oracle ≤ trigger;
+        //                    kind=1 → fire when oracle ≥ trigger.
+        let oracle = market.oracle_price_ticks;
+        let fired = if trigger.kind == 0 {
+            oracle <= trigger.trigger_price_ticks
+        } else {
+            oracle >= trigger.trigger_price_ticks
+        };
+        require!(fired, FlashBookError::OutOfRange);
+
+        // Reduce-only check (if flag set).
+        if trigger.flags & state::TriggerOrderAccount::FLAG_REDUCE_ONLY != 0 {
+            let position = &ctx.accounts.position;
+            require!(position.size_lots > 0, FlashBookError::OutOfRange);
+            require!(position.side != trigger.side, FlashBookError::OutOfRange);
+            require!(
+                trigger.size_lots <= position.size_lots,
+                FlashBookError::OutOfRange
+            );
+        }
+
+        // Insert into the market's order buffer (mirrors place_limit_order
+        // body — same uniformity invariants, same matcher behaviour).
+        let buffer = &mut ctx.accounts.order_buffer;
+        require!(
+            (buffer.head as usize) < ORDER_BUFFER_CAP,
+            FlashBookError::BufferFull
+        );
+        let next_seq = buffer
+            .seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+        let mut inserted = false;
+        for slot in buffer.slots.iter_mut() {
+            if slot.valid == 0 {
+                *slot = OrderSlot {
+                    valid: 1,
+                    side: trigger.side,
+                    order_type: OrderType::Limit as u8,
+                    post_only: 0,
+                    seq: next_seq,
+                    id: next_seq,
+                    trader: trigger.trader,
+                    size_lots: trigger.size_lots,
+                    limit_ticks: trigger.limit_price_ticks,
+                };
+                inserted = true;
+                break;
+            }
+        }
+        require!(inserted, FlashBookError::BufferFull);
+        buffer.seq_counter = next_seq;
+        buffer.head = buffer
+            .head
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // Mark trigger inactive so it can't double-fire on subsequent
+        // calls. Trader can `cancel_trigger_order` to reclaim rent.
+        let trigger = &mut ctx.accounts.trigger_order;
+        trigger.flags &= !state::TriggerOrderAccount::FLAG_ACTIVE;
+
+        emit!(TriggerOrderExecutedEvent {
+            market: market.key(),
+            trader: trigger.trader,
+            trigger_id: trigger.trigger_id,
+            executor: ctx.accounts.caller.key(),
+            oracle_price_ticks: oracle,
+        });
+        Ok(())
+    }
+
+    /// Cancel a trigger order. Trader signs; account is closed and rent
+    /// returned to the trader. Works whether the trigger has already fired
+    /// (active=0) or not (active=1).
+    pub fn cancel_trigger_order(ctx: Context<CancelTriggerOrder>) -> Result<()> {
+        let trader = ctx.accounts.trader.key();
+        require!(
+            ctx.accounts.trigger_order.trader == trader,
+            FlashBookError::WrongTrader
+        );
+        emit!(TriggerOrderCancelledEvent {
+            market: ctx.accounts.trigger_order.market,
+            trader,
+            trigger_id: ctx.accounts.trigger_order.trigger_id,
+        });
+        Ok(())
+        // Account closure is handled by Anchor's `close = trader` constraint.
+    }
+
     /// Cancel a pending order from the buffer. Only the original trader can
     /// cancel; other callers (or stale order_seq values) are rejected. The
     /// order must still be in the buffer (not yet processed by run_batch).
@@ -3542,6 +3725,95 @@ pub struct PlaceBasketOrderN<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(trigger_id: u8)]
+pub struct PlaceTriggerOrder<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state::TriggerOrderAccount::space(),
+        seeds = [
+            state::TriggerOrderAccount::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[trigger_id],
+        ],
+        bump,
+    )]
+    pub trigger_order: Account<'info, state::TriggerOrderAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteTriggerOrder<'info> {
+    /// Permissionless caller pays tx fee.
+    pub caller: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
+        bump = order_buffer.bump,
+    )]
+    pub order_buffer: Account<'info, OrderBufferAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::TriggerOrderAccount::SEED,
+            market.key().as_ref(),
+            trigger_order.trader.as_ref(),
+            &[trigger_order.trigger_id],
+        ],
+        bump = trigger_order.bump,
+    )]
+    pub trigger_order: Account<'info, state::TriggerOrderAccount>,
+
+    /// Trader's position — required when reduce_only flag is set.
+    /// When the flag is clear we don't read it, but we always pass it
+    /// for layout uniformity. (Anchor lazy-loads via the seed; the cost
+    /// is one PDA derivation, no allocation if it doesn't exist.)
+    #[account(
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trigger_order.trader.as_ref()],
+        bump,
+    )]
+    pub position: Account<'info, state::PositionAccount>,
+}
+
+#[derive(Accounts)]
+pub struct CancelTriggerOrder<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        close = trader,
+        seeds = [
+            state::TriggerOrderAccount::SEED,
+            trigger_order.market.as_ref(),
+            trigger_order.trader.as_ref(),
+            &[trigger_order.trigger_id],
+        ],
+        bump = trigger_order.bump,
+    )]
+    pub trigger_order: Account<'info, state::TriggerOrderAccount>,
+}
+
+#[derive(Accounts)]
 pub struct CancelOrder<'info> {
     pub trader: Signer<'info>,
 
@@ -3851,6 +4123,34 @@ pub struct ReferralOwedEvent {
     pub taker: Pubkey,
     pub referrer: Pubkey,
     pub amount_quote_lots: u64,
+}
+
+#[event]
+pub struct TriggerOrderPlacedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub trigger_id: u8,
+    pub side: u8,
+    pub kind: u8,
+    pub size_lots: u64,
+    pub trigger_price_ticks: u64,
+    pub limit_price_ticks: u64,
+}
+
+#[event]
+pub struct TriggerOrderExecutedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub trigger_id: u8,
+    pub executor: Pubkey,
+    pub oracle_price_ticks: u64,
+}
+
+#[event]
+pub struct TriggerOrderCancelledEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub trigger_id: u8,
 }
 
 #[event]

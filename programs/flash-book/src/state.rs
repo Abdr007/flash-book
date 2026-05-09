@@ -292,6 +292,60 @@ impl FlpExposureAccount {
     }
 }
 
+/// Native on-chain trigger order — Hyperliquid pattern. The trader pre-funds
+/// rent on a `TriggerOrderAccount` PDA. Anyone (typically a keeper) can
+/// `execute_trigger_order` once the oracle crosses `trigger_price_ticks` in
+/// the configured direction; the chain inserts a regular limit order into
+/// the market's buffer. Survives bot downtime — your stop fires even if
+/// your MM bot is offline.
+///
+/// PDA seeds: [b"trigger", market, trader, trigger_id]. trigger_id is u8
+/// (0..255) so each trader gets up to 256 active triggers per market.
+#[account]
+#[derive(Debug)]
+pub struct TriggerOrderAccount {
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub bump: u8,
+    pub trigger_id: u8,
+    /// Side of the resulting order when triggered (0 = long, 1 = short).
+    /// For closing a long position: side = 1 (short to close). For closing
+    /// a short: side = 0 (long to close).
+    pub side: u8,
+    /// `kind` encodes the comparison direction:
+    ///   0 = trigger when oracle ≤ trigger_price  (stop-loss for longs,
+    ///       take-profit for shorts)
+    ///   1 = trigger when oracle ≥ trigger_price  (take-profit for longs,
+    ///       stop-loss for shorts)
+    pub kind: u8,
+    /// Bit 0: reduce_only — execute only if the resulting order would
+    ///        shrink the trader's position (no flip).
+    /// Bit 1: active — set by `place_trigger_order`, cleared by
+    ///        `execute_trigger_order` (no double-fire).
+    pub flags: u8,
+    pub size_lots: u64,
+    /// Oracle price (in ticks) at which to fire.
+    pub trigger_price_ticks: u64,
+    /// Limit price for the resulting order. 0 = market-style (uses the
+    /// current oracle ± slippage_bps configured at execute time, but for
+    /// v1 we require an explicit non-zero limit to keep the matcher
+    /// deterministic).
+    pub limit_price_ticks: u64,
+    pub created_at_slot: u64,
+    /// 0 = never expires.
+    pub expires_at_slot: u64,
+}
+
+impl TriggerOrderAccount {
+    pub const SEED: &'static [u8] = b"trigger";
+    pub const FLAG_REDUCE_ONLY: u8 = 1 << 0;
+    pub const FLAG_ACTIVE: u8 = 1 << 1;
+    pub fn space() -> usize {
+        // 8 disc + 32+32+1+1+1+1+1 + 8+8+8 + 8+8 = 117. Round up.
+        8 + 128
+    }
+}
+
 /// Per-LP share holding. PDA seeded `[b"lp_position", lp.key()]`. Created
 /// lazily on first deposit via `init_if_needed`.
 #[account]

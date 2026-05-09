@@ -518,6 +518,36 @@
       ]
     },
     {
+      "name": "cancel_trigger_order",
+      "docs": [
+        "Cancel a trigger order. Trader signs; account is closed and rent",
+        "returned to the trader. Works whether the trigger has already fired",
+        "(active=0) or not (active=1)."
+      ],
+      "discriminator": [
+        144,
+        84,
+        67,
+        39,
+        27,
+        25,
+        202,
+        141
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "trigger_order",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "close_trader_ata",
       "docs": [
         "Close the trader's quote ATA and refund the rent lamports to",
@@ -1108,6 +1138,133 @@
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "execute_trigger_order",
+      "docs": [
+        "Execute a trigger order — permissionless. Reads the oracle and the",
+        "trigger; if the condition is met, inserts a limit order into the",
+        "market's order buffer (just like `place_limit_order` would for the",
+        "trader). Marks the trigger inactive so it cannot double-fire.",
+        "Caller pays tx fee; future iteration could reward keepers like",
+        "`liquidate_position` does."
+      ],
+      "discriminator": [
+        105,
+        10,
+        104,
+        136,
+        215,
+        134,
+        84,
+        171
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Permissionless caller pays tx fee."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trigger_order",
+          "writable": true
+        },
+        {
+          "name": "position",
+          "docs": [
+            "Trader's position — required when reduce_only flag is set.",
+            "When the flag is clear we don't read it, but we always pass it",
+            "for layout uniformity. (Anchor lazy-loads via the seed; the cost",
+            "is one PDA derivation, no allocation if it doesn't exist.)"
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "trigger_order.trader",
+                "account": "TriggerOrderAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
     },
     {
       "name": "init_trader_ata",
@@ -2712,6 +2869,104 @@
         {
           "name": "flags",
           "type": "u8"
+        }
+      ]
+    },
+    {
+      "name": "place_trigger_order",
+      "docs": [
+        "Place a NATIVE on-chain trigger order — Hyperliquid pattern. Trader",
+        "pre-funds rent on a TriggerOrderAccount PDA. Once the oracle",
+        "crosses `trigger_price_ticks` in the configured direction, ANY",
+        "signer can call `execute_trigger_order` to insert the resulting",
+        "limit order into the market's buffer. Survives bot downtime —",
+        "your stop-loss fires even if your MM bot is offline."
+      ],
+      "discriminator": [
+        32,
+        156,
+        50,
+        188,
+        232,
+        159,
+        112,
+        236
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trigger_order",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "trigger_id",
+          "type": "u8"
+        },
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "kind",
+          "type": "u8"
+        },
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "trigger_price_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "limit_price_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "reduce_only",
+          "type": "bool"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
         }
       ]
     },
@@ -4612,6 +4867,19 @@
         243,
         127
       ]
+    },
+    {
+      "name": "TriggerOrderAccount",
+      "discriminator": [
+        122,
+        209,
+        140,
+        217,
+        187,
+        38,
+        158,
+        33
+      ]
     }
   ],
   "events": [
@@ -4925,6 +5193,45 @@
         244,
         43,
         49
+      ]
+    },
+    {
+      "name": "TriggerOrderCancelledEvent",
+      "discriminator": [
+        178,
+        127,
+        39,
+        234,
+        87,
+        193,
+        7,
+        119
+      ]
+    },
+    {
+      "name": "TriggerOrderExecutedEvent",
+      "discriminator": [
+        91,
+        152,
+        148,
+        83,
+        160,
+        39,
+        39,
+        70
+      ]
+    },
+    {
+      "name": "TriggerOrderPlacedEvent",
+      "discriminator": [
+        199,
+        125,
+        44,
+        128,
+        6,
+        249,
+        23,
+        17
       ]
     }
   ],
@@ -6677,6 +6984,191 @@
               "griefing)."
             ],
             "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TriggerOrderAccount",
+      "docs": [
+        "Native on-chain trigger order — Hyperliquid pattern. The trader pre-funds",
+        "rent on a `TriggerOrderAccount` PDA. Anyone (typically a keeper) can",
+        "`execute_trigger_order` once the oracle crosses `trigger_price_ticks` in",
+        "the configured direction; the chain inserts a regular limit order into",
+        "the market's buffer. Survives bot downtime — your stop fires even if",
+        "your MM bot is offline.",
+        "",
+        "PDA seeds: [b\"trigger\", market, trader, trigger_id]. trigger_id is u8",
+        "(0..255) so each trader gets up to 256 active triggers per market."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "trigger_id",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "docs": [
+              "Side of the resulting order when triggered (0 = long, 1 = short).",
+              "For closing a long position: side = 1 (short to close). For closing",
+              "a short: side = 0 (long to close)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "kind",
+            "docs": [
+              "`kind` encodes the comparison direction:",
+              "0 = trigger when oracle ≤ trigger_price  (stop-loss for longs,",
+              "take-profit for shorts)",
+              "1 = trigger when oracle ≥ trigger_price  (take-profit for longs,",
+              "stop-loss for shorts)"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "flags",
+            "docs": [
+              "Bit 0: reduce_only — execute only if the resulting order would",
+              "shrink the trader's position (no flip).",
+              "Bit 1: active — set by `place_trigger_order`, cleared by",
+              "`execute_trigger_order` (no double-fire)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "trigger_price_ticks",
+            "docs": [
+              "Oracle price (in ticks) at which to fire."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "limit_price_ticks",
+            "docs": [
+              "Limit price for the resulting order. 0 = market-style (uses the",
+              "current oracle ± slippage_bps configured at execute time, but for",
+              "v1 we require an explicit non-zero limit to keep the matcher",
+              "deterministic)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "created_at_slot",
+            "type": "u64"
+          },
+          {
+            "name": "expires_at_slot",
+            "docs": [
+              "0 = never expires."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TriggerOrderCancelledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "trigger_id",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TriggerOrderExecutedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "trigger_id",
+            "type": "u8"
+          },
+          {
+            "name": "executor",
+            "type": "pubkey"
+          },
+          {
+            "name": "oracle_price_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TriggerOrderPlacedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "trigger_id",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "kind",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "trigger_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "limit_price_ticks",
+            "type": "u64"
           }
         ]
       }
