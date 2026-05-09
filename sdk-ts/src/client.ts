@@ -1251,6 +1251,32 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// View ix: cross-market portfolio risk for a trader. Pass
+  /// `[market, position]` pairs in `openPositions` — count must equal
+  /// trader_state.open_positions. Pass `[]` if flat. SDK callers
+  /// `simulateTransaction` and read the PortfolioRiskEvent from logs:
+  /// (collateral, unrealized_pnl, equity, required_margin,
+  /// health_ratio_bps, largest_position_market, largest_position_notional,
+  /// open_positions, worst_scenario_idx). Authoritative — uses the
+  /// same on-chain stress-lattice that liquidations do.
+  viewPortfolioRiskIx(args: {
+    trader: PublicKey;
+    openPositions?: ReadonlyArray<{ market: PublicKey; position: PublicKey }>;
+  }): Promise<TransactionInstruction> {
+    const ts = this.traderState(args.trader);
+    const remaining = (args.openPositions ?? []).flatMap((p) => [
+      { pubkey: p.market, isWritable: false, isSigner: false },
+      { pubkey: p.position, isWritable: false, isSigner: false },
+    ]);
+    return this.methods
+      .viewPortfolioRisk()
+      .accountsPartial({
+        traderState: ts.address,
+      })
+      .remainingAccounts(remaining)
+      .instruction();
+  }
+
   /// Place a BRACKET order (Hyperliquid pattern): atomic parent limit +
   /// reduce-only TP + reduce-only SL, with the two triggers wired OCO
   /// (one fires, the other auto-deactivates). For long parent: TP must

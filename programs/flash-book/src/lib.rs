@@ -3639,6 +3639,143 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// View ix: cross-market portfolio risk for a trader. Walks the
+    /// trader's open positions via remaining_accounts ([market, position]
+    /// pairs, count must match `trader_state.open_positions`), runs the
+    /// stress-lattice assess, and emits `PortfolioRiskEvent` with
+    /// (collateral, unrealized_pnl, equity, required_margin, health_ratio_bps,
+    /// largest_position_market, largest_position_notional, worst_scenario_idx).
+    ///
+    /// SDK callers simulate the tx and read the event from logs without
+    /// paying for a state mutation. Single-call portfolio risk for UIs
+    /// that previously had to fetch every position + market separately
+    /// and run `previewPortfolioRisk` client-side.
+    ///
+    /// Pass `[]` for remaining_accounts if the trader has no open
+    /// positions (returns equity == collateral, required == 0,
+    /// health_ratio_bps == u32::MAX).
+    pub fn view_portfolio_risk<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ViewPortfolioRisk<'info>>,
+    ) -> Result<()> {
+        let trader_state = &ctx.accounts.trader_state;
+        let open = trader_state.open_positions as usize;
+        require!(
+            ctx.remaining_accounts.len() == open * 2,
+            FlashBookError::OutOfRange
+        );
+
+        let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(open);
+        let mut market_snaps: Vec<RiskMarketSnap> = Vec::with_capacity(open);
+        let mut market_keys: Vec<Pubkey> = Vec::with_capacity(open);
+        let mut largest_notional: u128 = 0;
+        let mut largest_market = Pubkey::default();
+        let mut unrealized_total: i128 = 0;
+
+        for i in 0..open {
+            let market_ai = &ctx.remaining_accounts[i * 2];
+            let position_ai = &ctx.remaining_accounts[i * 2 + 1];
+            require!(market_ai.owner == ctx.program_id, FlashBookError::OutOfRange);
+            require!(position_ai.owner == ctx.program_id, FlashBookError::OutOfRange);
+
+            let market_data = market_ai.try_borrow_data()?;
+            let market_acct: MarketAccount =
+                MarketAccount::try_deserialize(&mut &market_data[..])?;
+            let position_data = position_ai.try_borrow_data()?;
+            let position: state::PositionAccount =
+                state::PositionAccount::try_deserialize(&mut &position_data[..])?;
+            require!(
+                position.trader == trader_state.trader,
+                FlashBookError::WrongTrader
+            );
+            require!(
+                position.market == market_ai.key(),
+                FlashBookError::WrongMarket
+            );
+
+            // Track largest by notional at mark.
+            let notional = (position.size_lots as u128)
+                .saturating_mul(market_acct.mark_price_ticks as u128)
+                .saturating_mul(market_acct.params.tick_size as u128);
+            if notional > largest_notional {
+                largest_notional = notional;
+                largest_market = market_ai.key();
+            }
+
+            // Unrealized PnL at mark.
+            if position.size_lots > 0 && market_acct.mark_price_ticks > 0 {
+                let pnl_per_lot_ticks =
+                    (market_acct.mark_price_ticks as i128) - (position.entry_price_ticks as i128);
+                let sign: i128 = if position.side == 0 { 1 } else { -1 };
+                let upnl = sign
+                    .saturating_mul(position.size_lots as i128)
+                    .saturating_mul(pnl_per_lot_ticks)
+                    .saturating_mul(market_acct.params.tick_size as i128);
+                unrealized_total = unrealized_total.saturating_add(upnl);
+            }
+
+            snaps.push(RiskPosSnap {
+                market: position.market,
+                side: if position.side == 0 { Side::Long } else { Side::Short },
+                size_lots: position.size_lots,
+                entry_price: Ticks(position.entry_price_ticks),
+                cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+            });
+            market_snaps.push(RiskMarketSnap {
+                market: market_ai.key(),
+                mark_price: Ticks(market_acct.mark_price_ticks),
+                cum_funding_index: market_acct.cum_funding_index,
+                maintenance_margin_bps: market_acct.params.maintenance_margin_ratio_bps,
+                tick_size: market_acct.params.tick_size,
+                concentration_threshold_lots: market_acct.params.concentration_threshold_lots,
+                concentration_extra_mmr_bps: market_acct.params.concentration_extra_mmr_bps,
+            });
+            market_keys.push(market_ai.key());
+        }
+
+        let (required, equity_signed, worst_idx) = if open == 0 {
+            (0u64, trader_state.collateral_quote_lots as i128, 0u32)
+        } else {
+            let scenarios = default_scenarios_fn(&market_keys);
+            let assessment = assess_margin_fn(
+                &snaps,
+                &market_snaps,
+                &scenarios,
+                trader_state.collateral_quote_lots,
+            )?;
+            (assessment.required_quote_lots, assessment.equity_quote_lots_signed, assessment.worst_scenario_idx)
+        };
+
+        // Health ratio = equity / required, clamped to u32. u32::MAX = no required (healthy).
+        let health_ratio_bps: u32 = if required == 0 {
+            u32::MAX
+        } else if equity_signed <= 0 {
+            0
+        } else {
+            let ratio = (equity_signed as u128).saturating_mul(constants::BPS_DENOM as u128)
+                / (required as u128);
+            if ratio > u32::MAX as u128 { u32::MAX } else { ratio as u32 }
+        };
+        let largest_notional_u64 = if largest_notional > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            largest_notional as u64
+        };
+
+        emit!(PortfolioRiskEvent {
+            trader: trader_state.trader,
+            collateral_quote_lots: trader_state.collateral_quote_lots,
+            unrealized_pnl_quote_lots: clamp_i128_to_i64(unrealized_total),
+            equity_quote_lots: clamp_i128_to_i64(equity_signed),
+            required_margin_quote_lots: required,
+            health_ratio_bps,
+            largest_position_market: largest_market,
+            largest_position_notional_quote_lots: largest_notional_u64,
+            open_positions: trader_state.open_positions,
+            worst_scenario_idx: worst_idx,
+        });
+        Ok(())
+    }
+
     /// Cancel a pending order from the buffer. Only the original trader can
     /// cancel; other callers (or stale order_seq values) are rejected. The
     /// order must still be in the buffer (not yet processed by run_batch).
@@ -6740,6 +6877,15 @@ pub struct CancelIceberg<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ViewPortfolioRisk<'info> {
+    #[account(
+        seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
+        bump = trader_state.bump,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+}
+
+#[derive(Accounts)]
 pub struct ViewMarket<'info> {
     #[account(
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
@@ -7440,6 +7586,25 @@ pub struct TriggerOrderCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub trigger_id: u8,
+}
+
+/// View ix output: cross-market portfolio risk for a trader.
+/// Emitted by `view_portfolio_risk` so SDK callers can fetch a
+/// trader's full risk snapshot in one tx-simulate. Equivalent to
+/// running `previewPortfolioRisk` client-side but authoritative
+/// (uses the same on-chain stress-lattice as liquidations do).
+#[event]
+pub struct PortfolioRiskEvent {
+    pub trader: Pubkey,
+    pub collateral_quote_lots: u64,
+    pub unrealized_pnl_quote_lots: i64,
+    pub equity_quote_lots: i64,
+    pub required_margin_quote_lots: u64,
+    pub health_ratio_bps: u32,
+    pub largest_position_market: Pubkey,
+    pub largest_position_notional_quote_lots: u64,
+    pub open_positions: u8,
+    pub worst_scenario_idx: u32,
 }
 
 /// View ix output: predicted next-batch funding rate. Emitted by

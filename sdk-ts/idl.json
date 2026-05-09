@@ -6774,6 +6774,68 @@
       "args": []
     },
     {
+      "name": "view_portfolio_risk",
+      "docs": [
+        "View ix: cross-market portfolio risk for a trader. Walks the",
+        "trader's open positions via remaining_accounts ([market, position]",
+        "pairs, count must match `trader_state.open_positions`), runs the",
+        "stress-lattice assess, and emits `PortfolioRiskEvent` with",
+        "(collateral, unrealized_pnl, equity, required_margin, health_ratio_bps,",
+        "largest_position_market, largest_position_notional, worst_scenario_idx).",
+        "",
+        "SDK callers simulate the tx and read the event from logs without",
+        "paying for a state mutation. Single-call portfolio risk for UIs",
+        "that previously had to fetch every position + market separately",
+        "and run `previewPortfolioRisk` client-side.",
+        "",
+        "Pass `[]` for remaining_accounts if the trader has no open",
+        "positions (returns equity == collateral, required == 0,",
+        "health_ratio_bps == u32::MAX)."
+      ],
+      "discriminator": [
+        159,
+        215,
+        124,
+        216,
+        236,
+        106,
+        208,
+        19
+      ],
+      "accounts": [
+        {
+          "name": "trader_state",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "view_predicted_funding",
       "docs": [
         "View ix: compute the predicted funding rate (no state change).",
@@ -8381,6 +8443,19 @@
         74,
         34,
         200
+      ]
+    },
+    {
+      "name": "PortfolioRiskEvent",
+      "discriminator": [
+        239,
+        223,
+        178,
+        1,
+        117,
+        184,
+        188,
+        149
       ]
     },
     {
@@ -10945,6 +11020,61 @@
           {
             "name": "is_pre_launch",
             "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PortfolioRiskEvent",
+      "docs": [
+        "View ix output: cross-market portfolio risk for a trader.",
+        "Emitted by `view_portfolio_risk` so SDK callers can fetch a",
+        "trader's full risk snapshot in one tx-simulate. Equivalent to",
+        "running `previewPortfolioRisk` client-side but authoritative",
+        "(uses the same on-chain stress-lattice as liquidations do)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "collateral_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "unrealized_pnl_quote_lots",
+            "type": "i64"
+          },
+          {
+            "name": "equity_quote_lots",
+            "type": "i64"
+          },
+          {
+            "name": "required_margin_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "health_ratio_bps",
+            "type": "u32"
+          },
+          {
+            "name": "largest_position_market",
+            "type": "pubkey"
+          },
+          {
+            "name": "largest_position_notional_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "open_positions",
+            "type": "u8"
+          },
+          {
+            "name": "worst_scenario_idx",
+            "type": "u32"
           }
         ]
       }
