@@ -108,6 +108,25 @@ describe('Instruction builders', () => {
     expect(ix.keys[4].pubkey.toBase58()).toBe(expectedAta.toBase58());
   });
 
+  test('placeBasketOrderIx', async () => {
+    const client = makeClient();
+    const trader = Keypair.generate().publicKey;
+    const marketA = client.market(SOL, USDC).address;
+    const marketB = client.market(USDC, SOL).address; // distinct market via swap
+    const ix = await client.placeBasketOrderIx({
+      trader,
+      marketA,
+      marketB,
+      legA: { side: 'long', sizeLots: new BN(1), limitTicks: new BN(100_000) },
+      legB: { side: 'short', sizeLots: new BN(1), limitTicks: new BN(200_000) },
+    });
+    // trader, trader_state, flp_exposure,
+    // market_a, order_buffer_a, position_a,
+    // market_b, order_buffer_b, position_b,
+    // system_program
+    expect(ix.keys.length).toBe(10);
+  });
+
   test('verifyMarketInvariantsIx', async () => {
     const client = makeClient();
     const ix = await client.verifyMarketInvariantsIx({

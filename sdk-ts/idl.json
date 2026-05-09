@@ -2028,6 +2028,293 @@
       "args": []
     },
     {
+      "name": "place_basket_order",
+      "docs": [
+        "Place two orders across two distinct markets atomically, with a",
+        "single cross-market stress-lattice gate. The headline use case is",
+        "pair trades / hedges where the trader wants to net long market A",
+        "and net short market B simultaneously, with the engine recognizing",
+        "the hedge so required margin collapses for offsetting positions.",
+        "",
+        "Without basket orders, two separate place_limit_order calls would",
+        "each run a per-market margin check that doesn't see the offsetting",
+        "leg — the first leg might be rejected even though the post-state",
+        "is healthy. Basket orders fix this by projecting the post-state",
+        "across both markets and running assess_margin once.",
+        "",
+        "Atomicity comes from Solana: if any leg fails (cap breach, buffer",
+        "full, margin gate, etc.), the whole tx rolls back. Rate limit",
+        "counts each leg toward orders_this_batch (basket = 2 units).",
+        "",
+        "V1 supports exactly two legs on two distinct markets. N-leg",
+        "(basket > 2) is a follow-up that uses remaining_accounts walking."
+      ],
+      "discriminator": [
+        16,
+        47,
+        182,
+        105,
+        183,
+        154,
+        168,
+        182
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_a",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_a.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market_a.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer_a",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_a"
+              }
+            ]
+          }
+        },
+        {
+          "name": "position_a",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_a"
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_b",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_b.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market_b.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer_b",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_b"
+              }
+            ]
+          }
+        },
+        {
+          "name": "position_b",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_b"
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "leg_a",
+          "type": {
+            "defined": {
+              "name": "BasketLeg"
+            }
+          }
+        },
+        {
+          "name": "leg_b",
+          "type": {
+            "defined": {
+              "name": "BasketLeg"
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "place_limit_order",
       "docs": [
         "Submit a resting limit order. Routed to the order buffer for the",
@@ -3888,6 +4175,19 @@
   ],
   "events": [
     {
+      "name": "BasketOrderPlacedEvent",
+      "discriminator": [
+        118,
+        31,
+        155,
+        161,
+        181,
+        196,
+        176,
+        249
+      ]
+    },
+    {
       "name": "BatchClearedEvent",
       "discriminator": [
         194,
@@ -4080,6 +4380,19 @@
         176,
         10,
         101
+      ]
+    },
+    {
+      "name": "ToxicityTaxAppliedEvent",
+      "discriminator": [
+        72,
+        112,
+        205,
+        30,
+        93,
+        52,
+        219,
+        190
       ]
     }
   ],
@@ -4316,6 +4629,70 @@
     }
   ],
   "types": [
+    {
+      "name": "BasketLeg",
+      "docs": [
+        "One leg of a basket order. Mirrors place_limit_order's args minus",
+        "market identity (which is bound by the account context per leg)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "limit_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "post_only",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BasketOrderPlacedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "market_a",
+            "type": "pubkey"
+          },
+          {
+            "name": "market_b",
+            "type": "pubkey"
+          },
+          {
+            "name": "side_a",
+            "type": "u8"
+          },
+          {
+            "name": "side_b",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots_a",
+            "type": "u64"
+          },
+          {
+            "name": "size_lots_b",
+            "type": "u64"
+          }
+        ]
+      }
+    },
     {
       "name": "BatchClearedEvent",
       "type": {
@@ -5407,6 +5784,46 @@
           },
           {
             "name": "last_settlement_batch",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ToxicityTaxAppliedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "maker",
+            "docs": [
+              "The maker who absorbed the toxic flow (or the FLP pool PDA on",
+              "apply_flp_fill)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "vpin_bps",
+            "type": "u32"
+          },
+          {
+            "name": "tax_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "insurance_share",
+            "type": "u64"
+          },
+          {
+            "name": "maker_share",
             "type": "u64"
           }
         ]

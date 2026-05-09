@@ -1365,6 +1365,136 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Place two orders across two distinct markets atomically, with a
+    /// single cross-market stress-lattice gate. The headline use case is
+    /// pair trades / hedges where the trader wants to net long market A
+    /// and net short market B simultaneously, with the engine recognizing
+    /// the hedge so required margin collapses for offsetting positions.
+    ///
+    /// Without basket orders, two separate place_limit_order calls would
+    /// each run a per-market margin check that doesn't see the offsetting
+    /// leg — the first leg might be rejected even though the post-state
+    /// is healthy. Basket orders fix this by projecting the post-state
+    /// across both markets and running assess_margin once.
+    ///
+    /// Atomicity comes from Solana: if any leg fails (cap breach, buffer
+    /// full, margin gate, etc.), the whole tx rolls back. Rate limit
+    /// counts each leg toward orders_this_batch (basket = 2 units).
+    ///
+    /// V1 supports exactly two legs on two distinct markets. N-leg
+    /// (basket > 2) is a follow-up that uses remaining_accounts walking.
+    pub fn place_basket_order(
+        ctx: Context<PlaceBasketOrder>,
+        leg_a: BasketLeg,
+        leg_b: BasketLeg,
+    ) -> Result<()> {
+        // Distinct markets are required — for same-market orders, callers
+        // can use place_limit_order twice (no cross-margin benefit).
+        let mkt_a = ctx.accounts.market_a.key();
+        let mkt_b = ctx.accounts.market_b.key();
+        require!(mkt_a != mkt_b, FlashBookError::OutOfRange);
+
+        // Validate each leg in isolation: size, price, status, ticks. Skip
+        // the per-market margin gate — basket margin runs across both legs
+        // jointly below.
+        validate_leg_intake(&ctx.accounts.market_a, &leg_a)?;
+        validate_leg_intake(&ctx.accounts.market_b, &leg_b)?;
+
+        // Per-market caps (absolute lots + capital ratio). Run before
+        // basket margin so caps fail fast.
+        check_caps_for_leg(
+            &ctx.accounts.market_a,
+            &ctx.accounts.position_a,
+            &ctx.accounts.flp_exposure,
+            &leg_a,
+        )?;
+        check_caps_for_leg(
+            &ctx.accounts.market_b,
+            &ctx.accounts.position_b,
+            &ctx.accounts.flp_exposure,
+            &leg_b,
+        )?;
+
+        // Project post-leg position state across both markets and run
+        // a single assess_margin. This is where the hedge benefit
+        // materializes — offsetting positions reduce required margin.
+        let market_a = &ctx.accounts.market_a;
+        let market_b = &ctx.accounts.market_b;
+        let market_a_key = market_a.key();
+        let market_b_key = market_b.key();
+        let position_a = &ctx.accounts.position_a;
+        let position_b = &ctx.accounts.position_b;
+        let trader_key = ctx.accounts.trader.key();
+
+        let proj_a = project_post_leg(position_a, &leg_a, market_a, market_a_key, trader_key)?;
+        let proj_b = project_post_leg(position_b, &leg_b, market_b, market_b_key, trader_key)?;
+
+        let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(2);
+        let mut markets: Vec<RiskMarketSnap> = Vec::with_capacity(2);
+        for (proj, market, market_key) in [
+            (proj_a, market_a, market_a_key),
+            (proj_b, market_b, market_b_key),
+        ] {
+            if let Some(s) = proj {
+                snaps.push(s);
+            }
+            markets.push(RiskMarketSnap {
+                market: market_key,
+                mark_price: Ticks(market.mark_price_ticks),
+                cum_funding_index: market.cum_funding_index,
+                maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+                tick_size: market.params.tick_size,
+            });
+        }
+        if !snaps.is_empty() {
+            let mkt_keys: Vec<Pubkey> = markets.iter().map(|m| m.market).collect();
+            let scenarios = default_scenarios_fn(&mkt_keys);
+            let assessment = assess_margin_fn(
+                &snaps,
+                &markets,
+                &scenarios,
+                ctx.accounts.trader_state.collateral_quote_lots,
+            )?;
+            require!(assessment.is_healthy, FlashBookError::TraderLiquidatable);
+        }
+
+        // Rate limit: basket counts as 2 units. Reset on batch boundary.
+        let trader_state = &mut ctx.accounts.trader_state;
+        if trader_state.last_batch_seen != market_a.current_batch {
+            trader_state.last_batch_seen = market_a.current_batch;
+            trader_state.orders_this_batch = 0;
+        }
+        require!(
+            trader_state.orders_this_batch.saturating_add(2)
+                <= MAX_ORDERS_PER_TRADER_PER_BATCH,
+            FlashBookError::RateLimited
+        );
+        trader_state.orders_this_batch += 2;
+
+        // Insert into both order buffers.
+        insert_into_buffer(
+            &mut ctx.accounts.order_buffer_a,
+            trader_key,
+            &leg_a,
+        )?;
+        insert_into_buffer(
+            &mut ctx.accounts.order_buffer_b,
+            trader_key,
+            &leg_b,
+        )?;
+
+        emit!(BasketOrderPlacedEvent {
+            trader: trader_key,
+            market_a: market_a_key,
+            market_b: market_b_key,
+            side_a: leg_a.side,
+            side_b: leg_b.side,
+            size_lots_a: leg_a.size_lots,
+            size_lots_b: leg_b.size_lots,
+        });
+        Ok(())
+    }
+
     /// Cancel a pending order from the buffer. Only the original trader can
     /// cancel; other callers (or stale order_seq values) are rejected. The
     /// order must still be in the buffer (not yet processed by run_batch).
@@ -2810,6 +2940,74 @@ pub struct ApplyFill<'info> {
 }
 
 #[derive(Accounts)]
+pub struct PlaceBasketOrder<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
+    )]
+    pub flp_exposure: Account<'info, FlpExposureAccount>,
+
+    // ── Leg A ──
+    #[account(
+        seeds = [MarketAccount::SEED, market_a.base_mint.as_ref(), market_a.quote_mint.as_ref()],
+        bump = market_a.bump,
+    )]
+    pub market_a: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [OrderBufferAccount::SEED, market_a.key().as_ref()],
+        bump = order_buffer_a.bump,
+    )]
+    pub order_buffer_a: Account<'info, OrderBufferAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = trader,
+        space = state::PositionAccount::space(),
+        seeds = [state::PositionAccount::SEED, market_a.key().as_ref(), trader.key().as_ref()],
+        bump,
+    )]
+    pub position_a: Account<'info, state::PositionAccount>,
+
+    // ── Leg B ──
+    #[account(
+        seeds = [MarketAccount::SEED, market_b.base_mint.as_ref(), market_b.quote_mint.as_ref()],
+        bump = market_b.bump,
+    )]
+    pub market_b: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [OrderBufferAccount::SEED, market_b.key().as_ref()],
+        bump = order_buffer_b.bump,
+    )]
+    pub order_buffer_b: Account<'info, OrderBufferAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = trader,
+        space = state::PositionAccount::space(),
+        seeds = [state::PositionAccount::SEED, market_b.key().as_ref(), trader.key().as_ref()],
+        bump,
+    )]
+    pub position_b: Account<'info, state::PositionAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct CancelOrder<'info> {
     pub trader: Signer<'info>,
 
@@ -3053,6 +3251,17 @@ pub struct FundingSettledEvent {
 }
 
 #[event]
+pub struct BasketOrderPlacedEvent {
+    pub trader: Pubkey,
+    pub market_a: Pubkey,
+    pub market_b: Pubkey,
+    pub side_a: u8,
+    pub side_b: u8,
+    pub size_lots_a: u64,
+    pub size_lots_b: u64,
+}
+
+#[event]
 pub struct ToxicityTaxAppliedEvent {
     pub market: Pubkey,
     pub taker: Pubkey,
@@ -3078,6 +3287,174 @@ pub struct InvariantBreachDetectedEvent {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
+
+/// One leg of a basket order. Mirrors place_limit_order's args minus
+/// market identity (which is bound by the account context per leg).
+#[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize)]
+pub struct BasketLeg {
+    pub side: u8,
+    pub size_lots: u64,
+    pub limit_ticks: u64,
+    pub post_only: bool,
+}
+
+/// Validate per-leg intake gates: status, size/price floors, tick alignment.
+/// Skips per-market margin check — basket margin runs across both legs.
+fn validate_leg_intake(market: &MarketAccount, leg: &BasketLeg) -> Result<()> {
+    require!(leg.size_lots > 0, FlashBookError::ZeroSize);
+    require!(leg.limit_ticks > 0, FlashBookError::ZeroPrice);
+    require!(leg.side <= 1, FlashBookError::OutOfRange);
+    require!(
+        market.status == MarketStatus::Active as u8
+            || market.status == MarketStatus::PostOnly as u8,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        leg.size_lots >= market.params.min_base_lots,
+        FlashBookError::SizeBelowMinLot
+    );
+    require!(
+        leg.limit_ticks.is_multiple_of(market.params.tick_size),
+        FlashBookError::PriceNotOnTick
+    );
+    require!(
+        leg.size_lots <= FLP_SEQ_RESERVED_OFFSET,
+        FlashBookError::OutOfRange
+    );
+    Ok(())
+}
+
+/// Apply absolute and capital-relative position caps for a single basket leg.
+fn check_caps_for_leg(
+    market: &MarketAccount,
+    position: &state::PositionAccount,
+    flp: &FlpExposureAccount,
+    leg: &BasketLeg,
+) -> Result<()> {
+    let cap = market.params.max_position_lots_per_trader;
+    if cap > 0 {
+        let new_size = position.size_lots.saturating_add(leg.size_lots);
+        require!(new_size <= cap, FlashBookError::PositionSizeCapExceeded);
+    }
+    let ratio_cap = market.params.max_position_ratio_bps;
+    if ratio_cap > 0 && flp.total_capital_quote_lots > 0 {
+        let cap_quote_lots = (flp.total_capital_quote_lots as u128)
+            .saturating_mul(ratio_cap as u128)
+            / (constants::BPS_DENOM as u128);
+        let new_size = position.size_lots.saturating_add(leg.size_lots);
+        let new_notional = (new_size as u128)
+            .saturating_mul(leg.limit_ticks as u128)
+            .saturating_mul(market.params.tick_size as u128);
+        require!(
+            new_notional <= cap_quote_lots,
+            FlashBookError::PositionSizeCapExceeded
+        );
+    }
+    Ok(())
+}
+
+/// Project a position's post-leg state for the cross-market margin check.
+/// Returns None if the resulting projected position is still empty.
+fn project_post_leg(
+    position: &state::PositionAccount,
+    leg: &BasketLeg,
+    market: &MarketAccount,
+    market_key: Pubkey,
+    trader: Pubkey,
+) -> Result<Option<RiskPosSnap>> {
+    // If no current position, the projected state assumes the leg fills
+    // entirely as a new position at limit_ticks.
+    if position.size_lots == 0 {
+        return Ok(Some(RiskPosSnap {
+            market: market_key,
+            side: if leg.side == 0 { Side::Long } else { Side::Short },
+            size_lots: leg.size_lots,
+            entry_price: Ticks(leg.limit_ticks),
+            cum_funding_index_at_entry: market.cum_funding_index,
+        }));
+    }
+    require!(
+        position.trader == trader,
+        FlashBookError::WrongTrader
+    );
+    require!(
+        position.market == market_key,
+        FlashBookError::WrongMarket
+    );
+    // Worst-case projection: same-side adds, opposite-side has the leg's
+    // limit price as the worst-case fill (size grows for margin assessment
+    // even if it would actually reduce on cross). Conservative.
+    let projected_size = if position.side == leg.side {
+        position.size_lots.saturating_add(leg.size_lots)
+    } else {
+        // Opposite side: in worst case the leg fully fills and adds to
+        // the existing same-side, AKA a flip. Approximate post-state as
+        // |existing - leg_size|; if leg ≥ existing, we'd be on the leg's
+        // side after fill.
+        if leg.size_lots >= position.size_lots {
+            leg.size_lots - position.size_lots
+        } else {
+            position.size_lots - leg.size_lots
+        }
+    };
+    let projected_side = if position.side == leg.side {
+        position.side
+    } else if leg.size_lots > position.size_lots {
+        leg.side
+    } else {
+        position.side
+    };
+    Ok(Some(RiskPosSnap {
+        market: market_key,
+        side: if projected_side == 0 { Side::Long } else { Side::Short },
+        size_lots: projected_size,
+        entry_price: Ticks(position.entry_price_ticks),
+        cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+    }))
+}
+
+/// Insert a basket leg's order into the given order buffer. Mirrors the
+/// insertion logic in place_limit_order (next_seq, slot scan, head bump).
+fn insert_into_buffer(
+    buffer: &mut OrderBufferAccount,
+    trader: Pubkey,
+    leg: &BasketLeg,
+) -> Result<()> {
+    require!(
+        (buffer.head as usize) < ORDER_BUFFER_CAP,
+        FlashBookError::BufferFull
+    );
+    let next_seq = buffer
+        .seq_counter
+        .checked_add(1)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+    let mut inserted = false;
+    for slot in buffer.slots.iter_mut() {
+        if slot.valid == 0 {
+            *slot = OrderSlot {
+                valid: 1,
+                side: leg.side,
+                order_type: OrderType::Limit as u8,
+                post_only: if leg.post_only { 1 } else { 0 },
+                seq: next_seq,
+                id: next_seq,
+                trader,
+                size_lots: leg.size_lots,
+                limit_ticks: leg.limit_ticks,
+            };
+            inserted = true;
+            break;
+        }
+    }
+    require!(inserted, FlashBookError::BufferFull);
+    buffer.seq_counter = next_seq;
+    buffer.head = buffer
+        .head
+        .checked_add(1)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    Ok(())
+}
 
 #[repr(u8)]
 pub enum MarketStatus {

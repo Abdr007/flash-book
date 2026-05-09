@@ -276,6 +276,46 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Place two orders across two distinct markets atomically with a single
+  /// cross-market stress-lattice gate. Hedged positions get correctly
+  /// reduced required margin (the engine sees both legs' projected
+  /// post-state at once). Atomic: any leg failure rolls back the whole tx.
+  placeBasketOrderIx(args: {
+    trader: PublicKey;
+    marketA: PublicKey;
+    marketB: PublicKey;
+    legA: { side: 'long' | 'short'; sizeLots: bigint | number; limitTicks: bigint | number; postOnly?: boolean };
+    legB: { side: 'long' | 'short'; sizeLots: bigint | number; limitTicks: bigint | number; postOnly?: boolean };
+  }): Promise<TransactionInstruction> {
+    const flp = this.flpExposure();
+    const state = this.traderState(args.trader);
+    const orderBufA = this.orderBuffer(args.marketA);
+    const orderBufB = this.orderBuffer(args.marketB);
+    const posA = this.position(args.marketA, args.trader);
+    const posB = this.position(args.marketB, args.trader);
+    const toLeg = (l: typeof args.legA) => ({
+      side: l.side === 'long' ? 0 : 1,
+      sizeLots: l.sizeLots,
+      limitTicks: l.limitTicks,
+      postOnly: l.postOnly ?? false,
+    });
+    return this.methods
+      .placeBasketOrder(toLeg(args.legA), toLeg(args.legB))
+      .accountsPartial({
+        trader: args.trader,
+        traderState: state.address,
+        flpExposure: flp.address,
+        marketA: args.marketA,
+        orderBufferA: orderBufA.address,
+        positionA: posA.address,
+        marketB: args.marketB,
+        orderBufferB: orderBufB.address,
+        positionB: posB.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
   /// Permissionlessly check market solvency invariants. Currently
   /// verifies open-interest balance (S5: oi_long == oi_short). On
   /// breach, the tx fails and an InvariantBreachDetectedEvent is

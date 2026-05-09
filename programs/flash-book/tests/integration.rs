@@ -2932,6 +2932,139 @@ async fn liquidate_portfolio_with_two_markets_and_no_positions() {
 }
 
 #[tokio::test]
+async fn place_basket_order_lands_both_legs_in_respective_buffers() {
+    // Cross-market basket: long on market 1, short on market 2. Verifies
+    // both legs reach their order buffers atomically and orders_this_batch
+    // increments by 2.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (protocol, m1, ob1, _, _) = setup_market(&mut ctx, &payer).await;
+    let (m2, ob2, _, _) = setup_additional_market(&mut ctx, &payer, 200_000).await;
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (pos1, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        m1.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+    let (pos2, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        m2.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    let leg_a = flash_book::BasketLeg {
+        side: 0, // long
+        size_lots: 1,
+        limit_ticks: 100_500,
+        post_only: false,
+    };
+    let leg_b = flash_book::BasketLeg {
+        side: 1, // short — hedge on the other market
+        size_lots: 1,
+        limit_ticks: 199_500,
+        post_only: false,
+    };
+
+    let basket_ix = build_ix(
+        flash_book::instruction::PlaceBasketOrder { leg_a, leg_b },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(m1, false),
+            AccountMeta::new(ob1, false),
+            AccountMeta::new(pos1, false),
+            AccountMeta::new_readonly(m2, false),
+            AccountMeta::new(ob2, false),
+            AccountMeta::new(pos2, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[basket_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Both order buffers must have head = 1 with the leg's slot active.
+    let buf1: OrderBufferAccount = fetch(&mut ctx.banks_client, ob1).await;
+    let buf2: OrderBufferAccount = fetch(&mut ctx.banks_client, ob2).await;
+    assert_eq!(buf1.head, 1);
+    assert_eq!(buf2.head, 1);
+    assert_eq!(buf1.slots[0].valid, 1);
+    assert_eq!(buf1.slots[0].side, 0);
+    assert_eq!(buf1.slots[0].limit_ticks, 100_500);
+    assert_eq!(buf2.slots[0].valid, 1);
+    assert_eq!(buf2.slots[0].side, 1);
+    assert_eq!(buf2.slots[0].limit_ticks, 199_500);
+
+    // Rate counter incremented by 2.
+    let st: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(st.orders_this_batch, 2);
+}
+
+#[tokio::test]
+async fn place_basket_order_rejects_same_market_for_both_legs() {
+    // Basket requires distinct markets; same-market would be just two
+    // place_limit_order calls.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (protocol, m1, ob1, _, _) = setup_market(&mut ctx, &payer).await;
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (pos1, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        m1.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+
+    let leg = flash_book::BasketLeg {
+        side: 0,
+        size_lots: 1,
+        limit_ticks: 100_500,
+        post_only: false,
+    };
+    // Same market for both legs → reject.
+    let basket_ix = build_ix(
+        flash_book::instruction::PlaceBasketOrder { leg_a: leg, leg_b: leg },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(m1, false),
+            AccountMeta::new(ob1, false),
+            AccountMeta::new(pos1, false),
+            AccountMeta::new_readonly(m1, false),
+            AccountMeta::new(ob1, false),
+            AccountMeta::new(pos1, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[basket_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(result.is_err(), "basket with same market for both legs must reject");
+}
+
+#[tokio::test]
 async fn second_market_initializes_at_different_oracle_price() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
