@@ -2,11 +2,12 @@
 
 > Pool-backed CLOB matched by frequent batch auction on MagicBlock Ephemeral Rollups. Reference design and simulator for Flash Trade's announced Orderbook V3.
 
-[![tests](https://img.shields.io/badge/tests-308%20passing-brightgreen)]()
+[![tests](https://img.shields.io/badge/tests-465%20passing-brightgreen)]()
 [![parity](https://img.shields.io/badge/Rust%E2%86%94TS-byte--equivalent-brightgreen)]()
-[![fuzz](https://img.shields.io/badge/fuzz-72K%20cases-brightgreen)]()
-[![e2e](https://img.shields.io/badge/e2e-49%20on--chain-brightgreen)]()
-[![ix](https://img.shields.io/badge/instructions-29%2F29%20covered-blue)]()
+[![fuzz](https://img.shields.io/badge/fuzz-32K%20properties-brightgreen)]()
+[![e2e](https://img.shields.io/badge/e2e-58%20on--chain-brightgreen)]()
+[![ix](https://img.shields.io/badge/instructions-32%2F32%20covered-blue)]()
+[![bot](https://img.shields.io/badge/bot-multi--market%20%2B%20V2%2BV3-blueviolet)]()
 [![typescript](https://img.shields.io/badge/typescript-strict-blue)]()
 [![rust](https://img.shields.io/badge/rust-stable-orange)]()
 [![license](https://img.shields.io/badge/license-MIT-green)]()
@@ -66,13 +67,26 @@ a Solana program in Rust, deployed to MagicBlock ER and settling to mainnet.
 | **ATA management** (init/close, idempotent) | ✅ `init_trader_ata`, `close_trader_ata` |
 | Synthetic flow simulator | ✅ runs at 42K batches/sec |
 | Rust matcher core (integer arithmetic, checked overflow) | ✅ 31 unit tests |
-| Rust property-based safety tests | ✅ 6 properties × 2K cases = 12K fuzz |
-| Rust integration tests (E2E on-chain) | ✅ 49 tests |
+| Rust property-based safety tests | ✅ 16 properties × 2K cases = 32K fuzz |
+| Rust integration tests (E2E on-chain) | ✅ 58 tests |
 | Rust risk + liquidation + insurance + commit-reveal modules | ✅ ported |
-| Anchor program — 29 instructions | ✅ all implemented + tested |
-| Maker rebate distribution from toxicity tax | 🔲 design ready, deferred |
-| Cross-market basket orders | 🔲 design ready, deferred |
-| MagicBlock ER delegation CPI integration | 🔲 blocked: ephemeral-rollups-sdk Solana 2.x mismatch |
+| Anchor program — 32 instructions | ✅ all implemented + tested |
+| **Maker rebate distribution from toxicity tax** | ✅ apply_fill routes tax → maker + insurance |
+| **2-leg cross-market basket orders** | ✅ `place_basket_order` with joint margin gate |
+| **N-leg cross-market basket orders** | ✅ `place_basket_order_n` (≤4 legs via remaining_accounts) |
+| **Liquidation hardening** (partial + reward + race-safe) | ✅ Hyperliquid + Drift patterns folded in |
+| **Phoenix-grade order semantics** (reduce_only / IOC / flag bitfield) | ✅ `flags` arg on place_limit_order |
+| **Tiered fees** (per-trader discount, off-chain volume tracker) | ✅ `set_trader_fee_tier` ix + apply_fill discount |
+| **MagicBlock ER delegation CPI** (in-house, version-agnostic) | ✅ `programs/flash-book/src/er.rs` |
+| **MM bot — multi-market, quote diffing, V2+V3 venues** | ✅ `bot/` top-level package |
+| **Backtester — replay tape through Strategy** | ✅ `bot/src/backtester.ts` |
+| **Keeper suite** (liquidation, funding, invariant, ATA cleanup) | ✅ `bot/src/keepers.ts` |
+| **Keeper auto-discovery** (`getProgramAccounts` scanner) | ✅ `bot/src/discovery.ts` |
+| **Smart router** (V2 + V3 in one strategy) | ✅ `bot/src/smart-router.ts` |
+| **WebSocket subscriptions** (push-based bot + keeper updates) | ✅ `bot/src/subscriptions.ts` |
+| **Advanced order types** (OCO / Iceberg / Trailing stop) | ✅ `bot/src/order-types.ts` |
+| **Telemetry** (Prometheus push, Counter+Gauge) | ✅ `bot/src/telemetry.ts` |
+| **Hot config reload** (no-restart param tuning) | ✅ `bot/src/hot-config.ts` |
 | BPF compilation | 🔲 blocked: Solana platform-tools v1.48 |
 | Devnet deployment | 🔲 blocked on the above |
 | Mainnet shadow mode (replay Flash V2 trades) | 🔲 phase 2 |
@@ -166,11 +180,14 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the long-form design.
 ## Documentation
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system design, lifecycle, accounts
-- [`docs/INSTRUCTIONS.md`](docs/INSTRUCTIONS.md) — full reference for the 19 Anchor instructions
+- [`docs/INSTRUCTIONS.md`](docs/INSTRUCTIONS.md) — full reference for all Anchor instructions
 - [`docs/MATH.md`](docs/MATH.md) — formal math: clearing, funding, margin, FLP spread
-- [`docs/SAFETY.md`](docs/SAFETY.md) — 14 solvency invariants, threat model, audit checklist
+- [`docs/SAFETY.md`](docs/SAFETY.md) — solvency invariants, threat model, audit checklist
 - [`docs/COMPARISON.md`](docs/COMPARISON.md) — vs every modern perp DEX
 - [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — runbook from `cargo test` to devnet
+- [`docs/MM_TUNING.md`](docs/MM_TUNING.md) — market-maker bot parameter tuning guide
+- [`docs/LP_GUIDE.md`](docs/LP_GUIDE.md) — LP onboarding: deposit, NAV, withdraw flow
+- [`docs/KEEPER_RUNBOOK.md`](docs/KEEPER_RUNBOOK.md) — deploying and operating the keeper suite
 - [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md) — single-source-of-truth status
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — staged path to mainnet
 
