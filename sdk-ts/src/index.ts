@@ -93,6 +93,23 @@ export {
   errorName,
 } from './errors.ts';
 
+export {
+  computeQuote,
+  checkRiskGates,
+  MarketMaker,
+  FlashBookVenue,
+  type Venue,
+  type MarketSnapshot,
+  type TraderSnapshot,
+  type PositionSnapshot,
+  type QuoteParams,
+  type QuoteOutput,
+  type RiskLimits,
+  type RiskGateOutput,
+  type MarketMakerConfig,
+  type MarketMakerStats,
+} from './market-maker.ts';
+
 export type {
   MarketInitializedEvent,
   BatchClearedEvent,
