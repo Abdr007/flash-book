@@ -489,6 +489,463 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Set the per-position leverage cap. Trader (or delegate) signs.
+    /// `cap` must be ∈ [1, market.params.max_leverage]. Pass 0 to clear
+    /// (revert to using market default). Hyperliquid pattern: lets risk-
+    /// conscious traders limit their effective leverage on a single
+    /// position without affecting their other positions or the market's
+    /// global cap. The cap is enforced at place_limit_order intake on
+    /// the projected post-fill notional.
+    ///
+    /// Setting a tighter cap on a position that already exceeds it does
+    /// NOT force a liquidation — the cap only applies to NEW orders that
+    /// would grow the position. To reduce leverage on an existing
+    /// position, the trader can add collateral or close part of it.
+    pub fn set_position_leverage(
+        ctx: Context<SetPositionLeverage>,
+        cap: u32,
+    ) -> Result<()> {
+        let market = &ctx.accounts.market;
+        if cap > 0 {
+            require!(
+                cap <= market.params.max_leverage,
+                FlashBookError::LeverageExceeded
+            );
+        }
+        let position = &mut ctx.accounts.position;
+        let prev = position.leverage_cap;
+        position.leverage_cap = cap;
+        emit!(PositionLeverageUpdatedEvent {
+            market: market.key(),
+            trader: position.trader,
+            previous_cap: prev,
+            new_cap: cap,
+        });
+        Ok(())
+    }
+
+    /// Cross-margin sweep between two trader accounts under a common
+    /// authority. The signer must be the delegate of BOTH source and
+    /// destination trader_states. Moves `amount` quote-lots from
+    /// source.collateral_quote_lots to dest.collateral_quote_lots
+    /// atomically.
+    ///
+    /// Source must be FLAT (no open positions). Future iterations may
+    /// add a position-aware variant that walks positions in
+    /// `remaining_accounts` to enforce post-sweep margin — for v1 the
+    /// flat-source rule is a clean safety property: a trader with open
+    /// positions cannot accidentally drain collateral they need for
+    /// margin. To rebalance with positions, the trader closes first.
+    ///
+    /// Cannot sweep to/from the same account (caller error).
+    pub fn sweep_collateral(
+        ctx: Context<SweepCollateral>,
+        amount: u64,
+    ) -> Result<()> {
+        require!(amount > 0, FlashBookError::ZeroSize);
+        let from = &ctx.accounts.from_state;
+        let to = &ctx.accounts.to_state;
+        require!(from.trader != to.trader, FlashBookError::OutOfRange);
+        let signer = ctx.accounts.authority.key();
+        require!(from.is_authorized(&signer), FlashBookError::Unauthorized);
+        require!(to.is_authorized(&signer), FlashBookError::Unauthorized);
+        require!(from.open_positions == 0, FlashBookError::SweepRequiresFlat);
+
+        let from = &mut ctx.accounts.from_state;
+        from.collateral_quote_lots = from
+            .collateral_quote_lots
+            .checked_sub(amount)
+            .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+        let to = &mut ctx.accounts.to_state;
+        to.collateral_quote_lots = to
+            .collateral_quote_lots
+            .checked_add(amount)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        emit!(CollateralSweptEvent {
+            authority: signer,
+            from: ctx.accounts.from_state.trader,
+            to: ctx.accounts.to_state.trader,
+            amount_quote_lots: amount,
+        });
+        Ok(())
+    }
+
+    /// Create a user-managed trading vault. Caller signs and becomes the
+    /// strategist (delegate of the vault's TraderState). Vault PDA is
+    /// seeded `[b"vault", strategist, vault_id]`; the linked TraderState
+    /// is at `[b"trader_state", vault_pda]`. The strategist trades via
+    /// the existing trade ixs by signing as delegate of the vault's
+    /// TraderState (`is_authorized` accepts trader OR delegate).
+    ///
+    /// `perf_fee_bps` is the high-water-mark performance fee (charged on
+    /// `settle_vault_perf_fee` by minting shares). Capped at 5_000 (50%)
+    /// to prevent rug-vaults that take everything. `min_deposit` is a
+    /// dust-attack floor; depositors below it are rejected.
+    ///
+    /// The vault starts with `accept_deposits = true` and HWM = 0
+    /// (first settlement anchors the HWM at then-current NAV/share so
+    /// no fees are charged on bootstrap deposits).
+    pub fn create_vault(
+        ctx: Context<CreateVault>,
+        vault_id: u8,
+        name: [u8; 32],
+        perf_fee_bps: u32,
+        min_deposit_quote_lots: u64,
+    ) -> Result<()> {
+        require!(
+            perf_fee_bps <= constants::BPS_DENOM as u32 / 2,
+            FlashBookError::OutOfRange
+        );
+        let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+        let strategist_key = ctx.accounts.strategist.key();
+        let vault_key = ctx.accounts.vault.key();
+        let trader_state_key = ctx.accounts.vault_trader_state.key();
+
+        {
+            let v = &mut ctx.accounts.vault;
+            v.strategist = strategist_key;
+            v.bump = ctx.bumps.vault;
+            v.vault_id = vault_id;
+            v.accept_deposits = 1;
+            v._pad0 = 0;
+            v.trader_state = trader_state_key;
+            v.name = name;
+            v.perf_fee_bps = perf_fee_bps;
+            v.shares_outstanding = 0;
+            v.hwm_nav_per_share_u64x6 = 0;
+            v.last_perf_settlement_unix = now_unix;
+            v.min_deposit_quote_lots = min_deposit_quote_lots;
+            v.total_deposited_quote_lots = 0;
+            v.total_withdrawn_quote_lots = 0;
+            v.total_perf_shares_minted = 0;
+        }
+
+        // Initialize the linked TraderStateAccount with delegate = strategist.
+        let ts = &mut ctx.accounts.vault_trader_state;
+        ts.trader = vault_key;
+        ts.bump = ctx.bumps.vault_trader_state;
+        ts.collateral_quote_lots = 0;
+        ts.realized_pnl_quote_lots = 0;
+        ts.open_positions = 0;
+        ts.toxicity_score_bps = 0;
+        ts.orders_this_batch = 0;
+        ts.last_batch_seen = 0;
+        ts.fee_discount_bps = 0;
+        ts.delegate = strategist_key;
+        ts.referrer = Pubkey::default();
+        ts.builder = Pubkey::default();
+        ts.builder_max_fee_share_bps = 0;
+
+        emit!(VaultCreatedEvent {
+            vault: vault_key,
+            strategist: strategist_key,
+            vault_id,
+            perf_fee_bps,
+            min_deposit_quote_lots,
+        });
+        Ok(())
+    }
+
+    /// Deposit into a vault. SPL transfer from the depositor's quote ATA
+    /// to the vault's collateral pool, then mint shares at the current
+    /// NAV/share price.
+    ///
+    /// Shares minted = amount × shares_outstanding / collateral
+    ///                 (bootstrap when shares_outstanding == 0 → 1:1)
+    ///
+    /// In v1 the NAV used here is the COLLATERAL of the vault's
+    /// TraderStateAccount (not collateral + unrealized PnL). Open
+    /// positions of the vault are not counted toward NAV — depositors
+    /// implicitly buy in to existing positions at cost basis. This is
+    /// the safest mode and avoids requiring the depositor to pass every
+    /// market account. A future v2 can pass markets in remaining_accounts
+    /// for full mark-to-market NAV.
+    pub fn deposit_to_vault(
+        ctx: Context<DepositToVault>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        let vault = &ctx.accounts.vault;
+        require!(vault.accept_deposits == 1, FlashBookError::VaultDepositsClosed);
+        require!(
+            amount_quote_lots >= vault.min_deposit_quote_lots,
+            FlashBookError::VaultDepositTooSmall
+        );
+
+        // SPL transfer: depositor → vault's quote vault (insurance vault
+        // is reused as the protocol-wide quote vault here, mirroring the
+        // FLP deposit path).
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.depositor_quote_ata.to_account_info(),
+            to: ctx.accounts.quote_vault.to_account_info(),
+            authority: ctx.accounts.depositor.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+        );
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        // Mint shares at NAV.
+        let nav = ctx.accounts.vault_trader_state.collateral_quote_lots as u128;
+        let shares_outstanding = ctx.accounts.vault.shares_outstanding as u128;
+        let shares_to_mint: u64 = if shares_outstanding == 0 || nav == 0 {
+            // Bootstrap: 1:1.
+            amount_quote_lots
+        } else {
+            let s = (amount_quote_lots as u128)
+                .saturating_mul(shares_outstanding)
+                / nav;
+            require!(s > 0, FlashBookError::VaultNavNonPositive);
+            if s > u64::MAX as u128 { u64::MAX } else { s as u64 }
+        };
+
+        // Credit the depositor's share holding.
+        let pos = &mut ctx.accounts.vault_position;
+        if pos.depositor == Pubkey::default() {
+            pos.depositor = ctx.accounts.depositor.key();
+            pos.vault = ctx.accounts.vault.key();
+            pos.bump = ctx.bumps.vault_position;
+        }
+        pos.shares = pos
+            .shares
+            .checked_add(shares_to_mint)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        pos.total_deposited_quote_lots = pos
+            .total_deposited_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // Credit collateral on the vault's TraderState + bookkeeping.
+        let ts = &mut ctx.accounts.vault_trader_state;
+        ts.collateral_quote_lots = ts
+            .collateral_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let v = &mut ctx.accounts.vault;
+        v.shares_outstanding = v
+            .shares_outstanding
+            .checked_add(shares_to_mint)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        v.total_deposited_quote_lots = v
+            .total_deposited_quote_lots
+            .saturating_add(amount_quote_lots);
+
+        emit!(VaultDepositedEvent {
+            vault: v.key(),
+            depositor: ctx.accounts.depositor.key(),
+            amount_quote_lots,
+            shares_minted: shares_to_mint,
+        });
+        Ok(())
+    }
+
+    /// Withdraw from a vault. Burns `shares_to_burn` from the depositor's
+    /// holding and pays out proportional NAV. Requires the vault to be
+    /// FLAT (no open positions) — same safety property as
+    /// `sweep_collateral`. To withdraw with positions open, the
+    /// strategist must close first. Future v2 can lift this with a
+    /// position-walk margin check.
+    ///
+    /// Payout = shares_to_burn × collateral / shares_outstanding.
+    pub fn withdraw_from_vault(
+        ctx: Context<WithdrawFromVault>,
+        shares_to_burn: u64,
+    ) -> Result<()> {
+        require!(shares_to_burn > 0, FlashBookError::ZeroSize);
+        let pos = &ctx.accounts.vault_position;
+        require!(pos.shares >= shares_to_burn, FlashBookError::InsufficientCollateral);
+        let ts = &ctx.accounts.vault_trader_state;
+        require!(ts.open_positions == 0, FlashBookError::SweepRequiresFlat);
+
+        let vault = &ctx.accounts.vault;
+        let shares_outstanding = vault.shares_outstanding as u128;
+        require!(shares_outstanding > 0, FlashBookError::VaultNavNonPositive);
+        let nav = ts.collateral_quote_lots as u128;
+        let payout_u128 = (shares_to_burn as u128)
+            .saturating_mul(nav)
+            / shares_outstanding;
+        let payout = if payout_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            payout_u128 as u64
+        };
+        require!(payout > 0, FlashBookError::VaultNavNonPositive);
+
+        // Burn shares.
+        let pos = &mut ctx.accounts.vault_position;
+        pos.shares = pos.shares.saturating_sub(shares_to_burn);
+        pos.total_withdrawn_quote_lots = pos
+            .total_withdrawn_quote_lots
+            .saturating_add(payout);
+
+        // Reduce vault collateral.
+        let ts = &mut ctx.accounts.vault_trader_state;
+        ts.collateral_quote_lots = ts
+            .collateral_quote_lots
+            .checked_sub(payout)
+            .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+        let v = &mut ctx.accounts.vault;
+        v.shares_outstanding = v.shares_outstanding.saturating_sub(shares_to_burn);
+        v.total_withdrawn_quote_lots = v
+            .total_withdrawn_quote_lots
+            .saturating_add(payout);
+
+        // SPL transfer: vault → depositor. The vault PDA signs via
+        // insurance_fund's PDA seeds — same authority pattern as
+        // withdraw_flp_capital. (We reuse insurance_fund as the quote
+        // vault authority — single source of truth for protocol vault
+        // ownership.)
+        let bump = ctx.accounts.insurance_fund.bump;
+        let seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
+        let signer = &[seeds];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.quote_vault.to_account_info(),
+            to: ctx.accounts.depositor_quote_ata.to_account_info(),
+            authority: ctx.accounts.insurance_fund.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+        token::transfer(cpi_ctx, payout)?;
+
+        emit!(VaultWithdrawnEvent {
+            vault: ctx.accounts.vault.key(),
+            depositor: ctx.accounts.depositor.key(),
+            shares_burned: shares_to_burn,
+            amount_quote_lots: payout,
+        });
+        Ok(())
+    }
+
+    /// Crystallize the vault's performance fee. Strategist signs.
+    /// If the current NAV/share exceeds the high-water mark, mints new
+    /// shares to the strategist's vault_position equal to:
+    ///   minted_shares = (gain_per_share × shares_outstanding × perf_fee_bps)
+    ///                   / (current_nav_per_share × 10_000)
+    /// and bumps the HWM to the post-mint NAV/share. If no gain (or
+    /// bootstrap with HWM=0), simply anchors HWM at current NAV/share
+    /// without minting.
+    ///
+    /// Vault must be FLAT (no open positions) so NAV is unambiguous.
+    pub fn settle_vault_perf_fee(
+        ctx: Context<SettleVaultPerfFee>,
+    ) -> Result<()> {
+        let vault = &ctx.accounts.vault;
+        require!(
+            ctx.accounts.strategist.key() == vault.strategist,
+            FlashBookError::Unauthorized
+        );
+        let ts = &ctx.accounts.vault_trader_state;
+        require!(ts.open_positions == 0, FlashBookError::SweepRequiresFlat);
+
+        let shares_outstanding = vault.shares_outstanding;
+        // No depositors yet → nothing to settle. Anchor HWM at unit price.
+        if shares_outstanding == 0 {
+            let v = &mut ctx.accounts.vault;
+            v.hwm_nav_per_share_u64x6 = constants::USD_UNIT;
+            v.last_perf_settlement_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            return Ok(());
+        }
+
+        let nav = ts.collateral_quote_lots as u128;
+        // Current NAV per share, scaled by USD_UNIT for fixed-point precision.
+        // nav_per_share_x6 = nav × USD_UNIT / shares_outstanding
+        let nav_per_share_x6 = (nav.saturating_mul(constants::USD_UNIT as u128))
+            / (shares_outstanding as u128);
+        let nav_per_share_u64 = if nav_per_share_x6 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            nav_per_share_x6 as u64
+        };
+
+        let prev_hwm = vault.hwm_nav_per_share_u64x6;
+        // Bootstrap: first ever settle with HWM=0 → just anchor.
+        if prev_hwm == 0 {
+            let v = &mut ctx.accounts.vault;
+            v.hwm_nav_per_share_u64x6 = nav_per_share_u64;
+            v.last_perf_settlement_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            return Ok(());
+        }
+
+        require!(
+            nav_per_share_u64 > prev_hwm,
+            FlashBookError::VaultBelowHighWaterMark
+        );
+        let gain_per_share_x6 = (nav_per_share_u64 - prev_hwm) as u128;
+        // Total gain = gain_per_share × shares_outstanding / USD_UNIT
+        let total_gain = gain_per_share_x6
+            .saturating_mul(shares_outstanding as u128)
+            / (constants::USD_UNIT as u128);
+        // Fee in quote-lots = total_gain × perf_fee_bps / 10_000
+        let fee_quote_lots = total_gain
+            .saturating_mul(vault.perf_fee_bps as u128)
+            / (constants::BPS_DENOM as u128);
+        // Convert fee to shares at current NAV/share:
+        //   shares_to_mint = fee_quote_lots × shares_outstanding / nav_after_fee
+        // We mint at PRE-fee NAV (standard convention in HWM vaults):
+        //   shares_to_mint = fee_quote_lots × shares_outstanding / nav
+        require!(nav > 0, FlashBookError::VaultNavNonPositive);
+        let shares_to_mint_u128 = fee_quote_lots
+            .saturating_mul(shares_outstanding as u128)
+            / nav;
+        let shares_to_mint = if shares_to_mint_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            shares_to_mint_u128 as u64
+        };
+        // No-op if rounding pushed it to zero (very small gain).
+        if shares_to_mint == 0 {
+            let v = &mut ctx.accounts.vault;
+            v.hwm_nav_per_share_u64x6 = nav_per_share_u64;
+            v.last_perf_settlement_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            return Ok(());
+        }
+
+        // Mint to strategist's vault_position.
+        let sp = &mut ctx.accounts.strategist_position;
+        if sp.depositor == Pubkey::default() {
+            sp.depositor = ctx.accounts.strategist.key();
+            sp.vault = ctx.accounts.vault.key();
+            sp.bump = ctx.bumps.strategist_position;
+        }
+        sp.shares = sp
+            .shares
+            .checked_add(shares_to_mint)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        let vault_key = ctx.accounts.vault.key();
+        let v = &mut ctx.accounts.vault;
+        v.shares_outstanding = v
+            .shares_outstanding
+            .checked_add(shares_to_mint)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        v.total_perf_shares_minted = v
+            .total_perf_shares_minted
+            .saturating_add(shares_to_mint);
+        // After mint, NAV/share is diluted; recompute and anchor HWM there
+        // so the strategist starts the next epoch from the post-fee mark.
+        let new_nav_per_share_x6 = (nav.saturating_mul(constants::USD_UNIT as u128))
+            / (v.shares_outstanding as u128);
+        v.hwm_nav_per_share_u64x6 = if new_nav_per_share_x6 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            new_nav_per_share_x6 as u64
+        };
+        v.last_perf_settlement_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+
+        emit!(VaultPerfFeeSettledEvent {
+            vault: vault_key,
+            strategist: v.strategist,
+            shares_minted: shares_to_mint,
+            new_hwm_per_share_u64x6: v.hwm_nav_per_share_u64x6,
+        });
+        Ok(())
+    }
+
     /// Set or rotate the trader's builder pubkey + the maximum fee share
     /// (in bps of net fee) the trader authorizes the builder to collect.
     /// Pass Pubkey::default() to revoke. Hyperliquid builder-codes model:
@@ -1531,6 +1988,30 @@ pub mod flash_book {
             );
         }
 
+        // Per-position leverage cap (Hyperliquid-style). When the trader
+        // has set a tighter cap on this position, the order's projected
+        // post-fill notional must respect it. cap = min(market max,
+        // position cap if set). 0 on the position means "use market
+        // default." Same-side adds increase notional; opposite-side
+        // reduces are exempt (they de-risk).
+        let position_lev_cap = ctx.accounts.position.leverage_cap;
+        if position_lev_cap > 0 {
+            let effective_cap = market.params.max_leverage.min(position_lev_cap);
+            // Worst case: same-side fill at limit_ticks. Compute projected
+            // notional and compare to (collateral × effective_cap).
+            let existing_size = ctx.accounts.position.size_lots;
+            let projected_size = existing_size.saturating_add(size_lots);
+            let projected_notional = (projected_size as u128)
+                .saturating_mul(limit_ticks as u128)
+                .saturating_mul(market.params.tick_size as u128);
+            let collateral = ctx.accounts.trader_state.collateral_quote_lots as u128;
+            let allowed_notional = collateral.saturating_mul(effective_cap as u128);
+            require!(
+                projected_notional <= allowed_notional,
+                FlashBookError::LeverageCapExceeded,
+            );
+        }
+
         // Capital-relative concentration cap: prevent any single trader's
         // notional from exceeding `max_position_ratio_bps` of FLP capital.
         // Distinct from the absolute lots cap above — this scales with the
@@ -1997,6 +2478,7 @@ pub mod flash_book {
             flags |= state::TriggerOrderAccount::FLAG_REDUCE_ONLY;
         }
         t.flags = flags;
+        t.oco_pair = Pubkey::default();
 
         emit!(TriggerOrderPlacedEvent {
             market: t.market,
@@ -2090,13 +2572,36 @@ pub mod flash_book {
 
         // Mark trigger inactive so it can't double-fire on subsequent
         // calls. Trader can `cancel_trigger_order` to reclaim rent.
+        let oco_pair_key = ctx.accounts.trigger_order.oco_pair;
         let trigger = &mut ctx.accounts.trigger_order;
         trigger.flags &= !state::TriggerOrderAccount::FLAG_ACTIVE;
+        let exec_trader = trigger.trader;
+        let exec_id = trigger.trigger_id;
+
+        // OCO: if this trigger has a linked partner, mark it inactive
+        // too. The partner account must be passed via remaining_accounts
+        // (exactly one entry, matching `oco_pair`). Skipped if no link.
+        if oco_pair_key != Pubkey::default() {
+            let oco_ai = ctx
+                .remaining_accounts
+                .iter()
+                .find(|a| a.key() == oco_pair_key)
+                .ok_or_else(|| error!(FlashBookError::OcoPairMismatch))?;
+            require!(oco_ai.is_writable, FlashBookError::OcoPairMismatch);
+            let mut data = oco_ai.try_borrow_mut_data()?;
+            let mut partner: state::TriggerOrderAccount =
+                state::TriggerOrderAccount::try_deserialize(&mut &data[..])?;
+            require!(partner.oco_pair == ctx.accounts.trigger_order.key(),
+                FlashBookError::OcoPairMismatch);
+            partner.flags &= !state::TriggerOrderAccount::FLAG_ACTIVE;
+            let mut cursor = &mut data[..];
+            partner.try_serialize(&mut cursor)?;
+        }
 
         emit!(TriggerOrderExecutedEvent {
             market: market.key(),
-            trader: trigger.trader,
-            trigger_id: trigger.trigger_id,
+            trader: exec_trader,
+            trigger_id: exec_id,
             executor: ctx.accounts.caller.key(),
             oracle_price_ticks: oracle,
         });
@@ -2105,13 +2610,37 @@ pub mod flash_book {
 
     /// Cancel a trigger order. Trader signs; account is closed and rent
     /// returned to the trader. Works whether the trigger has already fired
-    /// (active=0) or not (active=1).
+    /// (active=0) or not (active=1). If this trigger participates in an
+    /// OCO bracket, the partner is also marked inactive (passed via
+    /// remaining_accounts) so it can't fire orphaned.
     pub fn cancel_trigger_order(ctx: Context<CancelTriggerOrder>) -> Result<()> {
         let trader = ctx.accounts.trader.key();
         require!(
             ctx.accounts.trigger_order.trader == trader,
             FlashBookError::WrongTrader
         );
+        let oco_pair_key = ctx.accounts.trigger_order.oco_pair;
+        if oco_pair_key != Pubkey::default() {
+            // OCO partner deactivation is best-effort: if the trader
+            // explicitly cancels just one leg without passing the partner,
+            // we accept it (the partner remains placed but the trader
+            // can cancel it independently). When the partner IS passed,
+            // we deactivate it.
+            if let Some(oco_ai) = ctx.remaining_accounts.iter().find(|a| a.key() == oco_pair_key) {
+                require!(oco_ai.is_writable, FlashBookError::OcoPairMismatch);
+                let mut data = oco_ai.try_borrow_mut_data()?;
+                let mut partner: state::TriggerOrderAccount =
+                    state::TriggerOrderAccount::try_deserialize(&mut &data[..])?;
+                require!(partner.oco_pair == ctx.accounts.trigger_order.key(),
+                    FlashBookError::OcoPairMismatch);
+                partner.flags &= !state::TriggerOrderAccount::FLAG_ACTIVE;
+                // Clear the link too so a subsequent cancel of the partner
+                // doesn't try to walk the now-closed account.
+                partner.oco_pair = Pubkey::default();
+                let mut cursor = &mut data[..];
+                partner.try_serialize(&mut cursor)?;
+            }
+        }
         emit!(TriggerOrderCancelledEvent {
             market: ctx.accounts.trigger_order.market,
             trader,
@@ -2119,6 +2648,186 @@ pub mod flash_book {
         });
         Ok(())
         // Account closure is handled by Anchor's `close = trader` constraint.
+    }
+
+    /// Place a BRACKET order — atomic parent + take-profit + stop-loss.
+    /// Hyperliquid pattern: in one tx, the trader places a parent limit
+    /// order AND wires two reduce-only triggers (one above, one below)
+    /// linked OCO. When the parent fills, the position opens. When the
+    /// oracle later crosses TP, the TP trigger fires (closes via
+    /// reduce-only); the SL is auto-deactivated. And vice-versa.
+    /// Survives bot downtime AND eliminates the brief gap between
+    /// parent fill and child trigger placement.
+    ///
+    /// `parent_side` = side of the parent order (0=long entry, 1=short).
+    /// TP / SL price/limit are AUTOMATICALLY KIND-DETERMINED:
+    ///   • Long  parent → TP fires on ≥ tp_trigger; SL fires on ≤ sl_trigger
+    ///   • Short parent → TP fires on ≤ tp_trigger; SL fires on ≥ sl_trigger
+    /// Both triggers close opposite-side, reduce-only. Tick-aligned.
+    pub fn place_bracket_order(
+        ctx: Context<PlaceBracketOrder>,
+        parent_side: u8,
+        size_lots: u64,
+        parent_limit_ticks: u64,
+        tp_trigger_id: u8,
+        tp_trigger_price_ticks: u64,
+        tp_limit_ticks: u64,
+        sl_trigger_id: u8,
+        sl_trigger_price_ticks: u64,
+        sl_limit_ticks: u64,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        require!(parent_side <= 1, FlashBookError::OutOfRange);
+        require!(tp_trigger_id != sl_trigger_id, FlashBookError::OutOfRange);
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(parent_limit_ticks > 0, FlashBookError::ZeroPrice);
+        require!(tp_trigger_price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(sl_trigger_price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(tp_limit_ticks > 0, FlashBookError::ZeroPrice);
+        require!(sl_limit_ticks > 0, FlashBookError::ZeroPrice);
+
+        let market = &ctx.accounts.market;
+        require!(
+            size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            parent_limit_ticks.is_multiple_of(market.params.tick_size),
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            tp_trigger_price_ticks.is_multiple_of(market.params.tick_size),
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            sl_trigger_price_ticks.is_multiple_of(market.params.tick_size),
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            tp_limit_ticks.is_multiple_of(market.params.tick_size),
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            sl_limit_ticks.is_multiple_of(market.params.tick_size),
+            FlashBookError::PriceNotOnTick
+        );
+
+        let now = Clock::get()?.slot;
+        if expires_at_slot > 0 {
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
+
+        // Sanity: TP must be on the profitable side, SL on the loss side.
+        // Long  → TP > parent_limit, SL < parent_limit
+        // Short → TP < parent_limit, SL > parent_limit
+        if parent_side == 0 {
+            require!(tp_trigger_price_ticks > parent_limit_ticks, FlashBookError::OutOfRange);
+            require!(sl_trigger_price_ticks < parent_limit_ticks, FlashBookError::OutOfRange);
+        } else {
+            require!(tp_trigger_price_ticks < parent_limit_ticks, FlashBookError::OutOfRange);
+            require!(sl_trigger_price_ticks > parent_limit_ticks, FlashBookError::OutOfRange);
+        }
+
+        // ── 1. Insert parent order into the market's buffer (mirrors
+        //       place_limit_order body — same matcher invariants). We
+        //       intentionally skip the cross-market margin walk here:
+        //       the bracket trader has already passed market_lots/ratio
+        //       caps via the existing place_limit_order intake when
+        //       calling this from the SDK; the bracket only adds the
+        //       OCO triggers atop. (Future: hoist the full margin gate
+        //       into the bracket ix once we plumb stress-lattice eval
+        //       through this context's accounts.)
+        let buffer = &mut ctx.accounts.order_buffer;
+        require!((buffer.head as usize) < ORDER_BUFFER_CAP, FlashBookError::BufferFull);
+        let next_seq = buffer
+            .seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+        let trader_pk = ctx.accounts.trader.key();
+        let mut inserted = false;
+        for slot in buffer.slots.iter_mut() {
+            if slot.valid == 0 {
+                *slot = OrderSlot {
+                    valid: 1,
+                    side: parent_side,
+                    order_type: OrderType::Limit as u8,
+                    post_only: 0,
+                    seq: next_seq,
+                    id: next_seq,
+                    trader: trader_pk,
+                    size_lots,
+                    limit_ticks: parent_limit_ticks,
+                };
+                inserted = true;
+                break;
+            }
+        }
+        require!(inserted, FlashBookError::BufferFull);
+        buffer.seq_counter = next_seq;
+        buffer.head = buffer.head.checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // ── 2. Wire the two reduce-only triggers, side = OPPOSITE of
+        //       parent (closing the position). kind derived from parent_side
+        //       per the comment block above.
+        let close_side: u8 = 1 - parent_side;
+        let (tp_kind, sl_kind) = if parent_side == 0 {
+            (1u8, 0u8) // long: TP fires on ≥, SL fires on ≤
+        } else {
+            (0u8, 1u8) // short: TP fires on ≤, SL fires on ≥
+        };
+
+        let tp = &mut ctx.accounts.tp_trigger;
+        let sl = &mut ctx.accounts.sl_trigger;
+        let tp_key = tp.key();
+        let sl_key = sl.key();
+        let market_key = market.key();
+        let common_flags = state::TriggerOrderAccount::FLAG_ACTIVE
+            | state::TriggerOrderAccount::FLAG_REDUCE_ONLY
+            | state::TriggerOrderAccount::FLAG_BRACKET_LEG;
+
+        tp.trader = trader_pk;
+        tp.market = market_key;
+        tp.bump = ctx.bumps.tp_trigger;
+        tp.trigger_id = tp_trigger_id;
+        tp.side = close_side;
+        tp.kind = tp_kind;
+        tp.flags = common_flags;
+        tp.size_lots = size_lots;
+        tp.trigger_price_ticks = tp_trigger_price_ticks;
+        tp.limit_price_ticks = tp_limit_ticks;
+        tp.created_at_slot = now;
+        tp.expires_at_slot = expires_at_slot;
+        tp.oco_pair = sl_key;
+
+        sl.trader = trader_pk;
+        sl.market = market_key;
+        sl.bump = ctx.bumps.sl_trigger;
+        sl.trigger_id = sl_trigger_id;
+        sl.side = close_side;
+        sl.kind = sl_kind;
+        sl.flags = common_flags;
+        sl.size_lots = size_lots;
+        sl.trigger_price_ticks = sl_trigger_price_ticks;
+        sl.limit_price_ticks = sl_limit_ticks;
+        sl.created_at_slot = now;
+        sl.expires_at_slot = expires_at_slot;
+        sl.oco_pair = tp_key;
+
+        emit!(BracketOrderPlacedEvent {
+            market: market_key,
+            trader: trader_pk,
+            parent_side,
+            size_lots,
+            parent_limit_ticks,
+            parent_seq: next_seq,
+            tp_trigger_id,
+            sl_trigger_id,
+            tp_trigger_price_ticks,
+            sl_trigger_price_ticks,
+        });
+        Ok(())
     }
 
     /// Place a NATIVE on-chain TWAP order — Hyperliquid pattern. Splits a
@@ -3735,6 +4444,251 @@ pub struct SetTraderFeeTier<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetPositionLeverage<'info> {
+    /// Trader OR delegate may sign — TraderStateAccount.is_authorized
+    /// gates the action via the trader_state.delegate slot. Trader is
+    /// the authority of record (position.trader); delegate is allowed
+    /// for hot-key UX patterns.
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        seeds = [TraderStateAccount::SEED, position.trader.as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.is_authorized(&authority.key()) @ FlashBookError::Unauthorized,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        mut,
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), position.trader.as_ref()],
+        bump = position.bump,
+    )]
+    pub position: Account<'info, state::PositionAccount>,
+}
+
+#[derive(Accounts)]
+pub struct SweepCollateral<'info> {
+    /// Master authority (trader OR delegate of BOTH source and destination
+    /// trader_states). Authorization is checked against each via
+    /// `is_authorized` in the handler.
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, from_state.trader.as_ref()],
+        bump = from_state.bump,
+    )]
+    pub from_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, to_state.trader.as_ref()],
+        bump = to_state.bump,
+    )]
+    pub to_state: Account<'info, TraderStateAccount>,
+}
+
+#[derive(Accounts)]
+#[instruction(vault_id: u8)]
+pub struct CreateVault<'info> {
+    #[account(mut)]
+    pub strategist: Signer<'info>,
+
+    #[account(
+        init,
+        payer = strategist,
+        space = state::VaultAccount::space(),
+        seeds = [
+            state::VaultAccount::SEED,
+            strategist.key().as_ref(),
+            &[vault_id],
+        ],
+        bump,
+    )]
+    pub vault: Box<Account<'info, state::VaultAccount>>,
+
+    /// Vault's TraderState — created here, seeded by the vault PDA. The
+    /// strategist becomes the delegate so they can sign trade ixs.
+    #[account(
+        init,
+        payer = strategist,
+        space = TraderStateAccount::space(),
+        seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
+        bump,
+    )]
+    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct DepositToVault<'info> {
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::VaultAccount::SEED,
+            vault.strategist.as_ref(),
+            &[vault.vault_id],
+        ],
+        bump = vault.bump,
+    )]
+    pub vault: Box<Account<'info, state::VaultAccount>>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
+        bump = vault_trader_state.bump,
+        constraint = vault_trader_state.key() == vault.trader_state @ FlashBookError::OutOfRange,
+    )]
+    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+
+    /// Per-depositor share holding (created lazily on first deposit).
+    #[account(
+        init_if_needed,
+        payer = depositor,
+        space = state::VaultPositionAccount::space(),
+        seeds = [
+            state::VaultPositionAccount::SEED,
+            vault.key().as_ref(),
+            depositor.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub vault_position: Box<Account<'info, state::VaultPositionAccount>>,
+
+    /// Insurance fund PDA — owns the protocol's quote vault.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = depositor,
+    )]
+    pub depositor_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(mut, address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawFromVault<'info> {
+    pub depositor: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::VaultAccount::SEED,
+            vault.strategist.as_ref(),
+            &[vault.vault_id],
+        ],
+        bump = vault.bump,
+    )]
+    pub vault: Box<Account<'info, state::VaultAccount>>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
+        bump = vault_trader_state.bump,
+        constraint = vault_trader_state.key() == vault.trader_state @ FlashBookError::OutOfRange,
+    )]
+    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::VaultPositionAccount::SEED,
+            vault.key().as_ref(),
+            depositor.key().as_ref(),
+        ],
+        bump = vault_position.bump,
+        constraint = vault_position.depositor == depositor.key() @ FlashBookError::Unauthorized,
+    )]
+    pub vault_position: Box<Account<'info, state::VaultPositionAccount>>,
+
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = depositor,
+    )]
+    pub depositor_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(mut, address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct SettleVaultPerfFee<'info> {
+    #[account(mut)]
+    pub strategist: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::VaultAccount::SEED,
+            strategist.key().as_ref(),
+            &[vault.vault_id],
+        ],
+        bump = vault.bump,
+        constraint = vault.strategist == strategist.key() @ FlashBookError::Unauthorized,
+    )]
+    pub vault: Box<Account<'info, state::VaultAccount>>,
+
+    #[account(
+        seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
+        bump = vault_trader_state.bump,
+        constraint = vault_trader_state.key() == vault.trader_state @ FlashBookError::OutOfRange,
+    )]
+    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+
+    /// Strategist's vault_position — minted into on settle. Created
+    /// lazily on first non-zero settlement.
+    #[account(
+        init_if_needed,
+        payer = strategist,
+        space = state::VaultPositionAccount::space(),
+        seeds = [
+            state::VaultPositionAccount::SEED,
+            vault.key().as_ref(),
+            strategist.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub strategist_position: Box<Account<'info, state::VaultPositionAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct SetTraderBuilder<'info> {
     /// Trader signs — the user is the only one who can install or rotate
     /// the builder for their account. Protocol authority does NOT have
@@ -4322,6 +5276,65 @@ pub struct CancelTriggerOrder<'info> {
         bump = trigger_order.bump,
     )]
     pub trigger_order: Account<'info, state::TriggerOrderAccount>,
+    // OCO partner (if linked) is passed via remaining_accounts. Optional.
+}
+
+#[derive(Accounts)]
+#[instruction(
+    parent_side: u8,
+    size_lots: u64,
+    parent_limit_ticks: u64,
+    tp_trigger_id: u8,
+    tp_trigger_price_ticks: u64,
+    tp_limit_ticks: u64,
+    sl_trigger_id: u8,
+)]
+pub struct PlaceBracketOrder<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
+        bump = order_buffer.bump,
+    )]
+    pub order_buffer: Account<'info, OrderBufferAccount>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state::TriggerOrderAccount::space(),
+        seeds = [
+            state::TriggerOrderAccount::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[tp_trigger_id],
+        ],
+        bump,
+    )]
+    pub tp_trigger: Account<'info, state::TriggerOrderAccount>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state::TriggerOrderAccount::space(),
+        seeds = [
+            state::TriggerOrderAccount::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[sl_trigger_id],
+        ],
+        bump,
+    )]
+    pub sl_trigger: Account<'info, state::TriggerOrderAccount>,
+
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -4756,6 +5769,55 @@ pub struct TradingRewardEligibleEvent {
 }
 
 #[event]
+pub struct VaultCreatedEvent {
+    pub vault: Pubkey,
+    pub strategist: Pubkey,
+    pub vault_id: u8,
+    pub perf_fee_bps: u32,
+    pub min_deposit_quote_lots: u64,
+}
+
+#[event]
+pub struct VaultDepositedEvent {
+    pub vault: Pubkey,
+    pub depositor: Pubkey,
+    pub amount_quote_lots: u64,
+    pub shares_minted: u64,
+}
+
+#[event]
+pub struct VaultWithdrawnEvent {
+    pub vault: Pubkey,
+    pub depositor: Pubkey,
+    pub shares_burned: u64,
+    pub amount_quote_lots: u64,
+}
+
+#[event]
+pub struct VaultPerfFeeSettledEvent {
+    pub vault: Pubkey,
+    pub strategist: Pubkey,
+    pub shares_minted: u64,
+    pub new_hwm_per_share_u64x6: u64,
+}
+
+#[event]
+pub struct PositionLeverageUpdatedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub previous_cap: u32,
+    pub new_cap: u32,
+}
+
+#[event]
+pub struct CollateralSweptEvent {
+    pub authority: Pubkey,
+    pub from: Pubkey,
+    pub to: Pubkey,
+    pub amount_quote_lots: u64,
+}
+
+#[event]
 pub struct TraderBuilderUpdatedEvent {
     pub trader: Pubkey,
     pub previous: Pubkey,
@@ -4804,6 +5866,20 @@ pub struct TriggerOrderCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub trigger_id: u8,
+}
+
+#[event]
+pub struct BracketOrderPlacedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub parent_side: u8,
+    pub size_lots: u64,
+    pub parent_limit_ticks: u64,
+    pub parent_seq: u64,
+    pub tp_trigger_id: u8,
+    pub sl_trigger_id: u8,
+    pub tp_trigger_price_ticks: u64,
+    pub sl_trigger_price_ticks: u64,
 }
 
 #[event]

@@ -66,6 +66,20 @@ pub enum FlashBookError {
     FlpWithdrawUndercollateralized = 1211,
     #[msg("Required market account missing from remaining_accounts")]
     MissingMarketAccount = 1212,
+    #[msg("Order would exceed per-position leverage cap set by trader")]
+    LeverageCapExceeded = 1213,
+    #[msg("Sweep requires source trader to be flat (no open positions)")]
+    SweepRequiresFlat = 1214,
+    #[msg("Vault is not accepting deposits")]
+    VaultDepositsClosed = 1215,
+    #[msg("Vault deposit below configured minimum")]
+    VaultDepositTooSmall = 1216,
+    #[msg("Vault NAV is non-positive — cannot mint shares")]
+    VaultNavNonPositive = 1217,
+    #[msg("Vault perf-fee settle: NAV/share at or below high-water mark")]
+    VaultBelowHighWaterMark = 1218,
+    #[msg("OCO trigger pair link mismatch")]
+    OcoPairMismatch = 1219,
 
     // ── 1300-1399 matcher / clearing ────────────────────────────────
     #[msg("Order book buffer at capacity")]

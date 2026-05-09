@@ -54,6 +54,8 @@ const POSITION_SEED = Buffer.from('position');
 const LP_POSITION_SEED = Buffer.from('lp_position');
 const TRIGGER_ORDER_SEED = Buffer.from('trigger');
 const TWAP_ORDER_SEED = Buffer.from('twap');
+const VAULT_SEED = Buffer.from('vault');
+const VAULT_POSITION_SEED = Buffer.from('vault_position');
 
 export interface DerivedPda {
   readonly address: PublicKey;
@@ -137,6 +139,28 @@ export function twapOrderPda(
 ): DerivedPda {
   return derive(
     [TWAP_ORDER_SEED, market.toBuffer(), trader.toBuffer(), Buffer.from([twapId & 0xff])],
+    programId,
+  );
+}
+
+export function vaultPda(
+  strategist: PublicKey,
+  vaultId: number,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
+): DerivedPda {
+  return derive(
+    [VAULT_SEED, strategist.toBuffer(), Buffer.from([vaultId & 0xff])],
+    programId,
+  );
+}
+
+export function vaultPositionPda(
+  vault: PublicKey,
+  depositor: PublicKey,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
+): DerivedPda {
+  return derive(
+    [VAULT_POSITION_SEED, vault.toBuffer(), depositor.toBuffer()],
     programId,
   );
 }

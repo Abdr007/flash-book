@@ -522,7 +522,9 @@
       "docs": [
         "Cancel a trigger order. Trader signs; account is closed and rent",
         "returned to the trader. Works whether the trigger has already fired",
-        "(active=0) or not (active=1)."
+        "(active=0) or not (active=1). If this trigger participates in an",
+        "OCO bracket, the partner is also marked inactive (passed via",
+        "remaining_accounts) so it can't fire orphaned."
       ],
       "discriminator": [
         144,
@@ -745,6 +747,107 @@
         }
       ],
       "args": []
+    },
+    {
+      "name": "create_vault",
+      "docs": [
+        "Create a user-managed trading vault. Caller signs and becomes the",
+        "strategist (delegate of the vault's TraderState). Vault PDA is",
+        "seeded `[b\"vault\", strategist, vault_id]`; the linked TraderState",
+        "is at `[b\"trader_state\", vault_pda]`. The strategist trades via",
+        "the existing trade ixs by signing as delegate of the vault's",
+        "TraderState (`is_authorized` accepts trader OR delegate).",
+        "",
+        "`perf_fee_bps` is the high-water-mark performance fee (charged on",
+        "`settle_vault_perf_fee` by minting shares). Capped at 5_000 (50%)",
+        "to prevent rug-vaults that take everything. `min_deposit` is a",
+        "dust-attack floor; depositors below it are rejected.",
+        "",
+        "The vault starts with `accept_deposits = true` and HWM = 0",
+        "(first settlement anchors the HWM at then-current NAV/share so",
+        "no fees are charged on bootstrap deposits)."
+      ],
+      "discriminator": [
+        29,
+        237,
+        247,
+        208,
+        193,
+        82,
+        54,
+        135
+      ],
+      "accounts": [
+        {
+          "name": "strategist",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "vault_trader_state",
+          "docs": [
+            "Vault's TraderState — created here, seeded by the vault PDA. The",
+            "strategist becomes the delegate so they can sign trade ixs."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "vault_id",
+          "type": "u8"
+        },
+        {
+          "name": "name",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "perf_fee_bps",
+          "type": "u32"
+        },
+        {
+          "name": "min_deposit_quote_lots",
+          "type": "u64"
+        }
+      ]
     },
     {
       "name": "deposit_collateral",
@@ -1066,6 +1169,253 @@
               {
                 "kind": "account",
                 "path": "authority"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "quote_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "quote_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "deposit_to_vault",
+      "docs": [
+        "Deposit into a vault. SPL transfer from the depositor's quote ATA",
+        "to the vault's collateral pool, then mint shares at the current",
+        "NAV/share price.",
+        "",
+        "Shares minted = amount × shares_outstanding / collateral",
+        "(bootstrap when shares_outstanding == 0 → 1:1)",
+        "",
+        "In v1 the NAV used here is the COLLATERAL of the vault's",
+        "TraderStateAccount (not collateral + unrealized PnL). Open",
+        "positions of the vault are not counted toward NAV — depositors",
+        "implicitly buy in to existing positions at cost basis. This is",
+        "the safest mode and avoids requiring the depositor to pass every",
+        "market account. A future v2 can pass markets in remaining_accounts",
+        "for full mark-to-market NAV."
+      ],
+      "discriminator": [
+        18,
+        62,
+        110,
+        8,
+        26,
+        106,
+        248,
+        151
+      ],
+      "accounts": [
+        {
+          "name": "depositor",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "vault_trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_position",
+          "docs": [
+            "Per-depositor share holding (created lazily on first deposit)."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "depositor"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "docs": [
+            "Insurance fund PDA — owns the protocol's quote vault."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "depositor_quote_ata",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "depositor"
               },
               {
                 "kind": "const",
@@ -2993,6 +3343,153 @@
       ]
     },
     {
+      "name": "place_bracket_order",
+      "docs": [
+        "Place a BRACKET order — atomic parent + take-profit + stop-loss.",
+        "Hyperliquid pattern: in one tx, the trader places a parent limit",
+        "order AND wires two reduce-only triggers (one above, one below)",
+        "linked OCO. When the parent fills, the position opens. When the",
+        "oracle later crosses TP, the TP trigger fires (closes via",
+        "reduce-only); the SL is auto-deactivated. And vice-versa.",
+        "Survives bot downtime AND eliminates the brief gap between",
+        "parent fill and child trigger placement.",
+        "",
+        "`parent_side` = side of the parent order (0=long entry, 1=short).",
+        "TP / SL price/limit are AUTOMATICALLY KIND-DETERMINED:",
+        "• Long  parent → TP fires on ≥ tp_trigger; SL fires on ≤ sl_trigger",
+        "• Short parent → TP fires on ≤ tp_trigger; SL fires on ≥ sl_trigger",
+        "Both triggers close opposite-side, reduce-only. Tick-aligned."
+      ],
+      "discriminator": [
+        107,
+        18,
+        96,
+        108,
+        210,
+        18,
+        108,
+        50
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "order_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  100,
+                  101,
+                  114,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "tp_trigger",
+          "writable": true
+        },
+        {
+          "name": "sl_trigger",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "parent_side",
+          "type": "u8"
+        },
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "parent_limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "tp_trigger_id",
+          "type": "u8"
+        },
+        {
+          "name": "tp_trigger_price_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "tp_limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "sl_trigger_id",
+          "type": "u8"
+        },
+        {
+          "name": "sl_trigger_price_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "sl_limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "place_limit_order",
       "docs": [
         "Submit a resting limit order. Routed to the order buffer for the",
@@ -3634,6 +4131,138 @@
       ]
     },
     {
+      "name": "set_position_leverage",
+      "docs": [
+        "Set the per-position leverage cap. Trader (or delegate) signs.",
+        "`cap` must be ∈ [1, market.params.max_leverage]. Pass 0 to clear",
+        "(revert to using market default). Hyperliquid pattern: lets risk-",
+        "conscious traders limit their effective leverage on a single",
+        "position without affecting their other positions or the market's",
+        "global cap. The cap is enforced at place_limit_order intake on",
+        "the projected post-fill notional.",
+        "",
+        "Setting a tighter cap on a position that already exceeds it does",
+        "NOT force a liquidation — the cap only applies to NEW orders that",
+        "would grow the position. To reduce leverage on an existing",
+        "position, the trader can add collateral or close part of it."
+      ],
+      "discriminator": [
+        245,
+        164,
+        43,
+        156,
+        185,
+        100,
+        114,
+        178
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "Trader OR delegate may sign — TraderStateAccount.is_authorized",
+            "gates the action via the trader_state.delegate slot. Trader is",
+            "the authority of record (position.trader); delegate is allowed",
+            "for hot-key UX patterns."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_state",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "position.trader",
+                "account": "PositionAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "position.trader",
+                "account": "PositionAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "cap",
+          "type": "u32"
+        }
+      ]
+    },
+    {
       "name": "set_trader_builder",
       "docs": [
         "Set or rotate the trader's builder pubkey + the maximum fee share",
@@ -4085,6 +4714,114 @@
       "args": []
     },
     {
+      "name": "settle_vault_perf_fee",
+      "docs": [
+        "Crystallize the vault's performance fee. Strategist signs.",
+        "If the current NAV/share exceeds the high-water mark, mints new",
+        "shares to the strategist's vault_position equal to:",
+        "minted_shares = (gain_per_share × shares_outstanding × perf_fee_bps)",
+        "/ (current_nav_per_share × 10_000)",
+        "and bumps the HWM to the post-mint NAV/share. If no gain (or",
+        "bootstrap with HWM=0), simply anchors HWM at current NAV/share",
+        "without minting.",
+        "",
+        "Vault must be FLAT (no open positions) so NAV is unambiguous."
+      ],
+      "discriminator": [
+        19,
+        120,
+        121,
+        201,
+        96,
+        250,
+        198,
+        160
+      ],
+      "accounts": [
+        {
+          "name": "strategist",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "vault_trader_state",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "strategist_position",
+          "docs": [
+            "Strategist's vault_position — minted into on settle. Created",
+            "lazily on first non-zero settlement."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "strategist"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "submit_commit",
       "docs": [
         "Submit a commit hash for a future taker reveal."
@@ -4309,6 +5046,112 @@
               32
             ]
           }
+        }
+      ]
+    },
+    {
+      "name": "sweep_collateral",
+      "docs": [
+        "Cross-margin sweep between two trader accounts under a common",
+        "authority. The signer must be the delegate of BOTH source and",
+        "destination trader_states. Moves `amount` quote-lots from",
+        "source.collateral_quote_lots to dest.collateral_quote_lots",
+        "atomically.",
+        "",
+        "Source must be FLAT (no open positions). Future iterations may",
+        "add a position-aware variant that walks positions in",
+        "`remaining_accounts` to enforce post-sweep margin — for v1 the",
+        "flat-source rule is a clean safety property: a trader with open",
+        "positions cannot accidentally drain collateral they need for",
+        "margin. To rebalance with positions, the trader closes first.",
+        "",
+        "Cannot sweep to/from the same account (caller error)."
+      ],
+      "discriminator": [
+        175,
+        101,
+        104,
+        209,
+        138,
+        219,
+        62,
+        209
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "Master authority (trader OR delegate of BOTH source and destination",
+            "trader_states). Authorization is checked against each via",
+            "`is_authorized` in the handler."
+          ],
+          "signer": true
+        },
+        {
+          "name": "from_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "from_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "to_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "to_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
         }
       ]
     },
@@ -5109,6 +5952,236 @@
       ]
     },
     {
+      "name": "withdraw_from_vault",
+      "docs": [
+        "Withdraw from a vault. Burns `shares_to_burn` from the depositor's",
+        "holding and pays out proportional NAV. Requires the vault to be",
+        "FLAT (no open positions) — same safety property as",
+        "`sweep_collateral`. To withdraw with positions open, the",
+        "strategist must close first. Future v2 can lift this with a",
+        "position-walk margin check.",
+        "",
+        "Payout = shares_to_burn × collateral / shares_outstanding."
+      ],
+      "discriminator": [
+        180,
+        34,
+        37,
+        46,
+        156,
+        0,
+        211,
+        238
+      ],
+      "accounts": [
+        {
+          "name": "depositor",
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "vault_trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "depositor"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "depositor_quote_ata",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "depositor"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "quote_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "quote_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "shares_to_burn",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "withdraw_insurance_fund",
       "docs": [
         "Authority withdraws excess insurance fund balance. Cannot push the",
@@ -5406,6 +6479,32 @@
         12,
         171
       ]
+    },
+    {
+      "name": "VaultAccount",
+      "discriminator": [
+        230,
+        251,
+        241,
+        83,
+        139,
+        202,
+        93,
+        28
+      ]
+    },
+    {
+      "name": "VaultPositionAccount",
+      "discriminator": [
+        108,
+        192,
+        130,
+        141,
+        127,
+        95,
+        58,
+        211
+      ]
     }
   ],
   "events": [
@@ -5449,6 +6548,19 @@
       ]
     },
     {
+      "name": "BracketOrderPlacedEvent",
+      "discriminator": [
+        232,
+        177,
+        78,
+        57,
+        80,
+        82,
+        178,
+        217
+      ]
+    },
+    {
       "name": "BuilderFeeOwedEvent",
       "discriminator": [
         15,
@@ -5472,6 +6584,19 @@
         143,
         196,
         5
+      ]
+    },
+    {
+      "name": "CollateralSweptEvent",
+      "discriminator": [
+        224,
+        194,
+        242,
+        5,
+        83,
+        101,
+        165,
+        222
       ]
     },
     {
@@ -5696,6 +6821,19 @@
       ]
     },
     {
+      "name": "PositionLeverageUpdatedEvent",
+      "discriminator": [
+        3,
+        105,
+        226,
+        119,
+        49,
+        24,
+        194,
+        177
+      ]
+    },
+    {
       "name": "ReferralOwedEvent",
       "discriminator": [
         132,
@@ -5876,6 +7014,58 @@
         176,
         147
       ]
+    },
+    {
+      "name": "VaultCreatedEvent",
+      "discriminator": [
+        81,
+        80,
+        244,
+        58,
+        136,
+        54,
+        236,
+        111
+      ]
+    },
+    {
+      "name": "VaultDepositedEvent",
+      "discriminator": [
+        127,
+        54,
+        183,
+        51,
+        131,
+        82,
+        85,
+        52
+      ]
+    },
+    {
+      "name": "VaultPerfFeeSettledEvent",
+      "discriminator": [
+        50,
+        102,
+        162,
+        253,
+        245,
+        94,
+        227,
+        169
+      ]
+    },
+    {
+      "name": "VaultWithdrawnEvent",
+      "discriminator": [
+        191,
+        75,
+        78,
+        193,
+        228,
+        82,
+        111,
+        17
+      ]
     }
   ],
   "errors": [
@@ -5998,6 +7188,41 @@
       "code": 7212,
       "name": "MissingMarketAccount",
       "msg": "Required market account missing from remaining_accounts"
+    },
+    {
+      "code": 7213,
+      "name": "LeverageCapExceeded",
+      "msg": "Order would exceed per-position leverage cap set by trader"
+    },
+    {
+      "code": 7214,
+      "name": "SweepRequiresFlat",
+      "msg": "Sweep requires source trader to be flat (no open positions)"
+    },
+    {
+      "code": 7215,
+      "name": "VaultDepositsClosed",
+      "msg": "Vault is not accepting deposits"
+    },
+    {
+      "code": 7216,
+      "name": "VaultDepositTooSmall",
+      "msg": "Vault deposit below configured minimum"
+    },
+    {
+      "code": 7217,
+      "name": "VaultNavNonPositive",
+      "msg": "Vault NAV is non-positive — cannot mint shares"
+    },
+    {
+      "code": 7218,
+      "name": "VaultBelowHighWaterMark",
+      "msg": "Vault perf-fee settle: NAV/share at or below high-water mark"
+    },
+    {
+      "code": 7219,
+      "name": "OcoPairMismatch",
+      "msg": "OCO trigger pair link mismatch"
     },
     {
       "code": 7300,
@@ -6234,6 +7459,54 @@
       }
     },
     {
+      "name": "BracketOrderPlacedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "parent_side",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "parent_limit_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "parent_seq",
+            "type": "u64"
+          },
+          {
+            "name": "tp_trigger_id",
+            "type": "u8"
+          },
+          {
+            "name": "sl_trigger_id",
+            "type": "u8"
+          },
+          {
+            "name": "tp_trigger_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "sl_trigger_price_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "BuilderFeeOwedEvent",
       "type": {
         "kind": "struct",
@@ -6268,6 +7541,30 @@
           },
           {
             "name": "new_balance",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CollateralSweptEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "from",
+            "type": "pubkey"
+          },
+          {
+            "name": "to",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
             "type": "u64"
           }
         ]
@@ -7547,6 +8844,42 @@
               "gate."
             ],
             "type": "u64"
+          },
+          {
+            "name": "leverage_cap",
+            "docs": [
+              "Per-position leverage cap (set by trader via `set_position_leverage`).",
+              "0 = use the market's `params.max_leverage`. Otherwise capped at",
+              "`min(params.max_leverage, leverage_cap)` during margin checks.",
+              "Hyperliquid pattern: lets risk-conscious traders limit their",
+              "exposure on a per-position basis without affecting other positions.",
+              "Validated at set time: cap ∈ [1, market.max_leverage]."
+            ],
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PositionLeverageUpdatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_cap",
+            "type": "u32"
+          },
+          {
+            "name": "new_cap",
+            "type": "u32"
           }
         ]
       }
@@ -7955,6 +9288,18 @@
               "0 = never expires."
             ],
             "type": "u64"
+          },
+          {
+            "name": "oco_pair",
+            "docs": [
+              "OCO (One-Cancels-the-Other) partner trigger PDA. Default = no",
+              "link. When non-default, executing OR cancelling THIS trigger",
+              "also marks the partner inactive (one fires, the other dies).",
+              "Set by `place_bracket_order` to wire a TP+SL pair atomically.",
+              "The partner account is passed via the optional `oco_pair`",
+              "account on `execute_trigger_order` / `cancel_trigger_order`."
+            ],
+            "type": "pubkey"
           }
         ]
       }
@@ -8232,6 +9577,272 @@
           },
           {
             "name": "cumulative_executed_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultAccount",
+      "docs": [
+        "User-managed trading vault. A strategist deploys a vault and gets",
+        "trading authority over its collateral pool via the standard",
+        "TraderStateAccount.delegate mechanism. Depositors mint shares at the",
+        "current NAV; withdrawals burn shares for proportional NAV. The",
+        "strategist earns a high-water-mark performance fee, paid in newly",
+        "minted shares.",
+        "",
+        "PDA seeds: [b\"vault\", strategist, vault_id]. vault_id is u8 → up to",
+        "256 vaults per strategist. The vault's TraderStateAccount lives at",
+        "[b\"trader_state\", vault_pda] (i.e. the vault PDA is the \"trader\").",
+        "The strategist is set as `delegate` on that TraderState so they can",
+        "trade with their own keypair."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "strategist",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "vault_id",
+            "type": "u8"
+          },
+          {
+            "name": "accept_deposits",
+            "docs": [
+              "1 if accepting deposits, 0 if closed (withdrawals always allowed)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "_pad0",
+            "docs": [
+              "Reserved padding for alignment."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "trader_state",
+            "docs": [
+              "The vault PDA's TraderStateAccount (where collateral lives)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "name",
+            "docs": [
+              "Display name (UTF-8, null-padded)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "perf_fee_bps",
+            "docs": [
+              "Performance fee in bps of NAV growth above the high-water mark.",
+              "Charged on `settle_vault_perf_fee` by minting shares to the",
+              "strategist. Typical: 1000–2000 (10–20%). Capped at BPS_DENOM/2."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "shares_outstanding",
+            "docs": [
+              "Total shares outstanding (sum of all VaultPositionAccount.shares)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "hwm_nav_per_share_u64x6",
+            "docs": [
+              "Q64.0 NAV-per-share at the last performance crystallization.",
+              "Stored × USD_UNIT for precision; 0 = bootstrap (perf fee not yet",
+              "settled — first settle anchors the HWM at then-current NAV/share)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_perf_settlement_unix",
+            "docs": [
+              "Unix timestamp of the last performance settlement."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "min_deposit_quote_lots",
+            "docs": [
+              "Minimum deposit in quote-lots to prevent dust attacks. 0 = none."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_deposited_quote_lots",
+            "docs": [
+              "Cumulative quote-lots deposited across the vault's lifetime",
+              "(informational, used for ROI display)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_withdrawn_quote_lots",
+            "docs": [
+              "Cumulative quote-lots withdrawn (gross, before perf fee)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_perf_shares_minted",
+            "docs": [
+              "Cumulative shares minted to the strategist as perf fee."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultCreatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "strategist",
+            "type": "pubkey"
+          },
+          {
+            "name": "vault_id",
+            "type": "u8"
+          },
+          {
+            "name": "perf_fee_bps",
+            "type": "u32"
+          },
+          {
+            "name": "min_deposit_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultDepositedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "shares_minted",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultPerfFeeSettledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "strategist",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares_minted",
+            "type": "u64"
+          },
+          {
+            "name": "new_hwm_per_share_u64x6",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultPositionAccount",
+      "docs": [
+        "Per-depositor share holding in a vault. Created lazily on first",
+        "deposit via init_if_needed.",
+        "",
+        "PDA seeds: [b\"vault_position\", vault, depositor]."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "shares",
+            "type": "u64"
+          },
+          {
+            "name": "total_deposited_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "total_withdrawn_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultWithdrawnEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares_burned",
+            "type": "u64"
+          },
+          {
+            "name": "amount_quote_lots",
             "type": "u64"
           }
         ]

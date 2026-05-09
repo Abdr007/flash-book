@@ -221,6 +221,13 @@ pub struct PositionAccount {
     /// this position landed. 0 = never liquidated. Used by the cooldown
     /// gate.
     pub last_liquidated_at_slot: u64,
+    /// Per-position leverage cap (set by trader via `set_position_leverage`).
+    /// 0 = use the market's `params.max_leverage`. Otherwise capped at
+    /// `min(params.max_leverage, leverage_cap)` during margin checks.
+    /// Hyperliquid pattern: lets risk-conscious traders limit their
+    /// exposure on a per-position basis without affecting other positions.
+    /// Validated at set time: cap ∈ [1, market.max_leverage].
+    pub leverage_cap: u32,
 }
 
 impl PositionAccount {
@@ -357,15 +364,25 @@ pub struct TriggerOrderAccount {
     pub created_at_slot: u64,
     /// 0 = never expires.
     pub expires_at_slot: u64,
+    /// OCO (One-Cancels-the-Other) partner trigger PDA. Default = no
+    /// link. When non-default, executing OR cancelling THIS trigger
+    /// also marks the partner inactive (one fires, the other dies).
+    /// Set by `place_bracket_order` to wire a TP+SL pair atomically.
+    /// The partner account is passed via the optional `oco_pair`
+    /// account on `execute_trigger_order` / `cancel_trigger_order`.
+    pub oco_pair: Pubkey,
 }
 
 impl TriggerOrderAccount {
     pub const SEED: &'static [u8] = b"trigger";
     pub const FLAG_REDUCE_ONLY: u8 = 1 << 0;
     pub const FLAG_ACTIVE: u8 = 1 << 1;
+    /// Bracket leg flag — set by `place_bracket_order`. Informational;
+    /// OCO behaviour keys off `oco_pair != Pubkey::default()`.
+    pub const FLAG_BRACKET_LEG: u8 = 1 << 2;
     pub fn space() -> usize {
-        // 8 disc + 32+32+1+1+1+1+1 + 8+8+8 + 8+8 = 117. Round up.
-        8 + 128
+        // 8 disc + 32+32+1+1+1+1+1 + 8+8+8 + 8+8 + 32 (oco) = 149. Round up.
+        8 + 168
     }
 }
 
@@ -579,6 +596,86 @@ impl TraderStateAccount {
     /// behalf — either the trader themselves or a non-default delegate.
     pub fn is_authorized(&self, signer: &Pubkey) -> bool {
         signer == &self.trader || (self.delegate != Pubkey::default() && signer == &self.delegate)
+    }
+}
+
+/// User-managed trading vault. A strategist deploys a vault and gets
+/// trading authority over its collateral pool via the standard
+/// TraderStateAccount.delegate mechanism. Depositors mint shares at the
+/// current NAV; withdrawals burn shares for proportional NAV. The
+/// strategist earns a high-water-mark performance fee, paid in newly
+/// minted shares.
+///
+/// PDA seeds: [b"vault", strategist, vault_id]. vault_id is u8 → up to
+/// 256 vaults per strategist. The vault's TraderStateAccount lives at
+/// [b"trader_state", vault_pda] (i.e. the vault PDA is the "trader").
+/// The strategist is set as `delegate` on that TraderState so they can
+/// trade with their own keypair.
+#[account]
+#[derive(Debug)]
+pub struct VaultAccount {
+    pub strategist: Pubkey,
+    pub bump: u8,
+    pub vault_id: u8,
+    /// 1 if accepting deposits, 0 if closed (withdrawals always allowed).
+    pub accept_deposits: u8,
+    /// Reserved padding for alignment.
+    pub _pad0: u8,
+    /// The vault PDA's TraderStateAccount (where collateral lives).
+    pub trader_state: Pubkey,
+    /// Display name (UTF-8, null-padded).
+    pub name: [u8; 32],
+    /// Performance fee in bps of NAV growth above the high-water mark.
+    /// Charged on `settle_vault_perf_fee` by minting shares to the
+    /// strategist. Typical: 1000–2000 (10–20%). Capped at BPS_DENOM/2.
+    pub perf_fee_bps: u32,
+    /// Total shares outstanding (sum of all VaultPositionAccount.shares).
+    pub shares_outstanding: u64,
+    /// Q64.0 NAV-per-share at the last performance crystallization.
+    /// Stored × USD_UNIT for precision; 0 = bootstrap (perf fee not yet
+    /// settled — first settle anchors the HWM at then-current NAV/share).
+    pub hwm_nav_per_share_u64x6: u64,
+    /// Unix timestamp of the last performance settlement.
+    pub last_perf_settlement_unix: u64,
+    /// Minimum deposit in quote-lots to prevent dust attacks. 0 = none.
+    pub min_deposit_quote_lots: u64,
+    /// Cumulative quote-lots deposited across the vault's lifetime
+    /// (informational, used for ROI display).
+    pub total_deposited_quote_lots: u64,
+    /// Cumulative quote-lots withdrawn (gross, before perf fee).
+    pub total_withdrawn_quote_lots: u64,
+    /// Cumulative shares minted to the strategist as perf fee.
+    pub total_perf_shares_minted: u64,
+}
+
+impl VaultAccount {
+    pub const SEED: &'static [u8] = b"vault";
+    pub fn space() -> usize {
+        // 8 disc + 32 + 1 + 1 + 1 + 1 + 32 + 32 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 = 168
+        8 + 168
+    }
+}
+
+/// Per-depositor share holding in a vault. Created lazily on first
+/// deposit via init_if_needed.
+///
+/// PDA seeds: [b"vault_position", vault, depositor].
+#[account]
+#[derive(Debug)]
+pub struct VaultPositionAccount {
+    pub vault: Pubkey,
+    pub depositor: Pubkey,
+    pub bump: u8,
+    pub shares: u64,
+    pub total_deposited_quote_lots: u64,
+    pub total_withdrawn_quote_lots: u64,
+}
+
+impl VaultPositionAccount {
+    pub const SEED: &'static [u8] = b"vault_position";
+    pub fn space() -> usize {
+        // 8 disc + 32 + 32 + 1 + 8 + 8 + 8 = 97; round to 112.
+        8 + 112
     }
 }
 

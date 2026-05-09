@@ -35,6 +35,8 @@ import {
   traderStatePda,
   triggerOrderPda,
   twapOrderPda,
+  vaultPda,
+  vaultPositionPda,
   FLASH_BOOK_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from './pdas.ts';
@@ -1074,6 +1076,201 @@ export class FlashBookClient {
       .accountsPartial({
         trader: args.trader,
         twapOrder: twap.address,
+      })
+      .instruction();
+  }
+
+  /// Place a BRACKET order (Hyperliquid pattern): atomic parent limit +
+  /// reduce-only TP + reduce-only SL, with the two triggers wired OCO
+  /// (one fires, the other auto-deactivates). For long parent: TP must
+  /// be ABOVE parent_limit, SL BELOW. For short: TP BELOW, SL ABOVE.
+  /// Both triggers execute opposite-side, reduce-only — they cannot
+  /// fire before the parent fills (reduce_only enforces position exists).
+  ///
+  /// All four prices must be tick-aligned. Trigger IDs must differ.
+  /// `expiresAtSlot = 0` = both triggers never expire (otherwise both
+  /// share the same expiry).
+  placeBracketOrderIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    parentSide: 'long' | 'short';
+    sizeLots: bigint | number;
+    parentLimitTicks: bigint | number;
+    tpTriggerId: number;
+    tpTriggerPriceTicks: bigint | number;
+    tpLimitTicks: bigint | number;
+    slTriggerId: number;
+    slTriggerPriceTicks: bigint | number;
+    slLimitTicks: bigint | number;
+    expiresAtSlot?: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const buffer = this.orderBuffer(args.market);
+    const tp = triggerOrderPda(args.market, args.trader, args.tpTriggerId);
+    const sl = triggerOrderPda(args.market, args.trader, args.slTriggerId);
+    return this.methods
+      .placeBracketOrder(
+        args.parentSide === 'long' ? 0 : 1,
+        args.sizeLots,
+        args.parentLimitTicks,
+        args.tpTriggerId,
+        args.tpTriggerPriceTicks,
+        args.tpLimitTicks,
+        args.slTriggerId,
+        args.slTriggerPriceTicks,
+        args.slLimitTicks,
+        args.expiresAtSlot ?? 0,
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        orderBuffer: buffer.address,
+        tpTrigger: tp.address,
+        slTrigger: sl.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Set the per-position leverage cap (Hyperliquid pattern). `cap` ∈
+  /// [1, market.maxLeverage]; 0 to clear. Trader OR delegate signs.
+  /// Enforced on `placeLimitOrder` intake against projected post-fill
+  /// notional. Existing oversize positions are NOT force-liquidated.
+  setPositionLeverageIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+    cap: number;
+  }): Promise<TransactionInstruction> {
+    const state = this.traderState(args.trader);
+    const position = this.position(args.market, args.trader);
+    return this.methods
+      .setPositionLeverage(args.cap)
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        traderState: state.address,
+        position: position.address,
+      })
+      .instruction();
+  }
+
+  /// Cross-margin sweep between two trader accounts under a common
+  /// authority (master signs as delegate of both). Source must be FLAT
+  /// (no open positions). Useful for prop traders rebalancing capital
+  /// between subaccount-style trader_states.
+  sweepCollateralIx(args: {
+    authority: PublicKey;
+    fromTrader: PublicKey;
+    toTrader: PublicKey;
+    amountQuoteLots: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const from = this.traderState(args.fromTrader);
+    const to = this.traderState(args.toTrader);
+    return this.methods
+      .sweepCollateral(args.amountQuoteLots)
+      .accountsPartial({
+        authority: args.authority,
+        fromState: from.address,
+        toState: to.address,
+      })
+      .instruction();
+  }
+
+  /// Create a user-managed trading vault. Caller becomes the strategist
+  /// (delegate of the vault's TraderState). Vault PDA seeded by
+  /// (strategist, vaultId). The strategist can then trade by signing
+  /// with their normal keypair — `is_authorized` checks delegate.
+  createVaultIx(args: {
+    strategist: PublicKey;
+    vaultId: number;
+    name: Uint8Array; // 32 bytes
+    perfFeeBps: number;
+    minDepositQuoteLots: bigint | number;
+  }): Promise<TransactionInstruction> {
+    if (args.name.length !== 32) {
+      throw new Error('vault name must be exactly 32 bytes (UTF-8, null-padded)');
+    }
+    const vault = vaultPda(args.strategist, args.vaultId);
+    const ts = this.traderState(vault.address);
+    return this.methods
+      .createVault(args.vaultId, Array.from(args.name), args.perfFeeBps, args.minDepositQuoteLots)
+      .accountsPartial({
+        strategist: args.strategist,
+        vault: vault.address,
+        vaultTraderState: ts.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Deposit quote tokens into a vault and mint shares at current NAV.
+  /// SPL transfer from depositor's quote ATA to the protocol quote
+  /// vault; vault_position.shares is incremented.
+  depositToVaultIx(args: {
+    depositor: PublicKey;
+    vault: PublicKey;
+    amountQuoteLots: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const ts = this.traderState(args.vault);
+    const pos = vaultPositionPda(args.vault, args.depositor);
+    const fund = this.insuranceFund();
+    return this.methods
+      .depositToVault(args.amountQuoteLots)
+      .accountsPartial({
+        depositor: args.depositor,
+        vault: args.vault,
+        vaultTraderState: ts.address,
+        vaultPosition: pos.address,
+        insuranceFund: fund.address,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
+  /// Withdraw from a vault by burning shares for proportional NAV.
+  /// Vault must be FLAT (no open positions) — strategist closes first
+  /// if needed. SPL transfer from quote vault to depositor's quote ATA.
+  withdrawFromVaultIx(args: {
+    depositor: PublicKey;
+    vault: PublicKey;
+    sharesToBurn: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const ts = this.traderState(args.vault);
+    const pos = vaultPositionPda(args.vault, args.depositor);
+    const fund = this.insuranceFund();
+    return this.methods
+      .withdrawFromVault(args.sharesToBurn)
+      .accountsPartial({
+        depositor: args.depositor,
+        vault: args.vault,
+        vaultTraderState: ts.address,
+        vaultPosition: pos.address,
+        insuranceFund: fund.address,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
+  /// Crystallize the vault's high-water-mark performance fee. Strategist
+  /// signs. Vault must be flat. If NAV/share has grown above the HWM,
+  /// shares are minted to the strategist proportional to the gain ×
+  /// perf_fee_bps; otherwise the call rejects.
+  settleVaultPerfFeeIx(args: {
+    strategist: PublicKey;
+    vaultId: number;
+  }): Promise<TransactionInstruction> {
+    const vault = vaultPda(args.strategist, args.vaultId);
+    const ts = this.traderState(vault.address);
+    const sp = vaultPositionPda(vault.address, args.strategist);
+    return this.methods
+      .settleVaultPerfFee()
+      .accountsPartial({
+        strategist: args.strategist,
+        vault: vault.address,
+        vaultTraderState: ts.address,
+        strategistPosition: sp.address,
+        systemProgram: SystemProgram.programId,
       })
       .instruction();
   }
