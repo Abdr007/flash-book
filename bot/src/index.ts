@@ -63,6 +63,13 @@ export { diffQuotes, type DiffDecision, type DiffInput } from './diff.ts';
 // ─── Multi-market bot (recommended) ──────────────────────────────────
 export { Strategy, type StrategyConfig, type StrategyInput, type StrategyOutput } from './strategy.ts';
 export { MultiMarketBot, type MultiMarketBotConfig } from './multi-market.ts';
+export {
+  Backtester,
+  type FillEvent,
+  type MarketTape,
+  type BacktestConfig,
+  type BacktestResult,
+} from './backtester.ts';
 
 // ─── Single-market MM bot (legacy single-bot path) ───────────────────
 export {
@@ -90,6 +97,18 @@ export {
   type V2PositionMeta,
   type V2OrderMeta,
 } from './flash-v2-venue.ts';
+
+// ─── Smart router (multi-venue) ──────────────────────────────────────
+export { SmartRouter, type SmartRouterConfig, type RoutingPolicy } from './smart-router.ts';
+
+// ─── Keeper auto-discovery ───────────────────────────────────────────
+export {
+  discoverActivePositions,
+  discoverEmptyTraderStates,
+  type DiscoveryConfig,
+  type DiscoveredPosition,
+  type DiscoveredTraderState,
+} from './discovery.ts';
 
 // ─── Keeper suite ────────────────────────────────────────────────────
 export {
