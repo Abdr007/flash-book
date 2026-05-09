@@ -20,6 +20,7 @@ export {
 export {
   defaultMajorMarketParams,
   defaultInsuranceFundParams,
+  defaultSpotMarketParams,
   type MarketParamsRaw,
   type InsuranceFundInitParams,
 } from './params.ts';

@@ -3,7 +3,32 @@ import BN from 'bn.js';
 import {
   defaultInsuranceFundParams,
   defaultMajorMarketParams,
+  defaultSpotMarketParams,
 } from '../src/params.ts';
+
+describe('defaultSpotMarketParams', () => {
+  const p = defaultSpotMarketParams();
+
+  test('no leverage (1x max, full IM)', () => {
+    expect(p.maxLeverage).toBe(1);
+    expect(p.initialMarginRatioBps).toBe(10_000);
+  });
+
+  test('no funding accrual (k = 0)', () => {
+    expect(p.fundingRateKBps).toBe(0);
+    expect(p.fundingRateMaxBpsPerSec).toBe(0);
+  });
+
+  test('no liquidation penalty (positions fully collateralized)', () => {
+    expect(p.liqPenaltyBps).toBe(0);
+  });
+
+  test('inherits sensible matcher fields from major-market default', () => {
+    const major = defaultMajorMarketParams();
+    expect(p.tickSize.eq(major.tickSize)).toBe(true);
+    expect(p.takerFeeBps).toBe(major.takerFeeBps);
+  });
+});
 
 describe('defaultMajorMarketParams', () => {
   const p = defaultMajorMarketParams();

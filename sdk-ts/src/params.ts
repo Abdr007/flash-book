@@ -50,6 +50,8 @@ export interface MarketParamsRaw {
   maxPositionLotsPerTrader: BN;
   /** Multi-oracle quorum max dispersion (bps of median); 0 = no check. */
   oracleQuorumMaxDispersionBps: number;
+  /** Per-trader max notional as bps of FLP capital; 0 = unlimited. */
+  maxPositionRatioBps: number;
 }
 
 /** Sensible default parameter set for SOL/BTC/ETH-style major markets. */
@@ -101,6 +103,36 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
     // Quorum dispersion: 50 bps = 0.5%. If 3 oracles disagree by more
     // than this, reject the update (sources are seeing different markets).
     oracleQuorumMaxDispersionBps: 50,
+    // Capital-relative cap: 0 = unlimited. Set per market based on the
+    // FLP's tolerable concentration risk (e.g. 100 = 1% of pool).
+    maxPositionRatioBps: 0,
+  };
+}
+
+/**
+ * Spot-market parameter recipe. Spot markets use the same matcher as
+ * perps but configured to disable funding (k=0), force 1x leverage, and
+ * widen the FLP spread modestly. No code-level "spot mode" exists —
+ * spot is just a parameter shape that makes the perp engine behave
+ * like a spot market. This is by design: the FBA matcher, FLP quoter,
+ * commit-reveal, VPIN, and risk modules are all inherently
+ * leverage-agnostic.
+ */
+export function defaultSpotMarketParams(): MarketParamsRaw {
+  return {
+    ...defaultMajorMarketParams(),
+    // No leverage — spot positions are 1:1 collateral-backed.
+    maxLeverage: 1,
+    // Higher initial margin requirement = no leverage.
+    initialMarginRatioBps: 10_000, // 100% — full collateralization
+    maintenanceMarginRatioBps: 9_500, // 95% — small buffer for fees
+    // No funding (spot has no perpetual funding mechanism).
+    fundingRateKBps: 0,
+    fundingRateMaxBpsPerSec: 0,
+    // No liquidation penalty (positions are fully collateralized).
+    liqPenaltyBps: 0,
+    // Slightly tighter FLP spread for spot — less variance to hedge.
+    flpSpreadBaseBps: 3,
   };
 }
 
