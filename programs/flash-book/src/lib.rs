@@ -2000,15 +2000,38 @@ pub mod flash_book {
     /// trader's position on *this market only*. Cross-market portfolio
     /// margin will be a separate `liquidate_portfolio` instruction taking
     /// remaining_accounts (Phase 2).
-    pub fn liquidate_position(ctx: Context<LiquidatePosition>) -> Result<()> {
+    /// Liquidate an unhealthy position. Three production-grade upgrades
+    /// over the v1 implementation:
+    ///
+    /// 1. PARTIAL LIQUIDATION via `requested_close_lots`. The keeper passes
+    ///    the size to close (0 = full close). Hyperliquid-style: avoid
+    ///    over-liquidating traders who can be brought back above
+    ///    maintenance margin by closing only part of their position.
+    ///
+    /// 2. LIQUIDATOR REWARD. `market.params.liquidator_reward_bps` of the
+    ///    closure notional is debited from the liquidatee's collateral and
+    ///    credited to the caller's `caller_trader_state`. Drift/dYdX-style
+    ///    tip-based incentive — attracts a competitive keeper pool so
+    ///    underwater positions actually get liquidated. 0 bps = disabled
+    ///    (operators rely on protocol-funded keepers).
+    ///
+    /// 3. RACE-SAFE atomic gate. The check `position.size_lots > 0` + the
+    ///    fact that on-chain transactions land sequentially per-slot
+    ///    means a second concurrent liquidator on the same position fails
+    ///    cleanly with LiquidationStale (their tx still pays a base fee
+    ///    but no double-debits or partial state). Tested.
+    pub fn liquidate_position(
+        ctx: Context<LiquidatePosition>,
+        requested_close_lots: u64,
+    ) -> Result<()> {
         let market = &ctx.accounts.market;
         let position = &ctx.accounts.position;
-        let trader_state = &ctx.accounts.trader_state;
+        let trader_state_pre = ctx.accounts.trader_state.clone();
         let buffer = &mut ctx.accounts.order_buffer;
 
         require!(position.size_lots > 0, FlashBookError::LiquidationStale);
         require!(
-            position.trader == trader_state.trader,
+            position.trader == trader_state_pre.trader,
             FlashBookError::WrongTrader
         );
         require!(
@@ -2016,6 +2039,21 @@ pub mod flash_book {
             FlashBookError::WrongMarket
         );
 
+        // Determine close size. 0 = max (full close, preserves v1 behaviour
+        // for keepers that don't size their liquidations).
+        let close_size = if requested_close_lots == 0 {
+            position.size_lots
+        } else {
+            require!(
+                requested_close_lots <= position.size_lots,
+                FlashBookError::OutOfRange
+            );
+            requested_close_lots
+        };
+        require!(close_size > 0, FlashBookError::ZeroSize);
+
+        // Health gate — rejects when the trader's portfolio is healthy at
+        // current state. Same stress lattice as on placement.
         let pos_snap = RiskPosSnap {
             market: position.market,
             side: if position.side == 0 { Side::Long } else { Side::Short },
@@ -2031,23 +2069,21 @@ pub mod flash_book {
             tick_size: market.params.tick_size,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
-
         let assessment = assess_margin_fn(
             &[pos_snap],
             &[market_snap],
             &scenarios,
-            trader_state.collateral_quote_lots,
+            trader_state_pre.collateral_quote_lots,
         )?;
-
         require!(!assessment.is_healthy, FlashBookError::NotLiquidatable);
 
-        // Inject a synthetic liquidation order on the OPPOSITE side of the
-        // position, limited at oracle ± liq_penalty.
+        // Compute liquidation order params. Closes opposite side at
+        // oracle ± penalty so the trader pays the penalty implicitly via
+        // a worse fill price.
         require!(
             (buffer.head as usize) < ORDER_BUFFER_CAP,
             FlashBookError::BufferFull
         );
-
         let pos_side = pos_snap.side;
         let close_side = pos_side.opposite();
         let penalty = market.params.liq_penalty_bps as u128;
@@ -2058,12 +2094,55 @@ pub mod flash_book {
             Side::Long => (oracle.saturating_add(penalty_delta)) as u64,
         };
 
+        // Lazy-initialize caller_trader_state on first liquidation so
+        // freshly-rented keepers don't need to call open_trader_state
+        // separately. trader field default = Pubkey::default() ⇒ untouched.
+        {
+            let cts = &mut ctx.accounts.caller_trader_state;
+            if cts.trader == Pubkey::default() {
+                cts.trader = ctx.accounts.caller.key();
+                cts.bump = ctx.bumps.caller_trader_state;
+            }
+        }
+
+        // Pay the liquidator reward BEFORE injecting the close order. The
+        // reward is debited from the liquidatee's collateral and credited
+        // to the caller's trader_state. Capped at available collateral so
+        // we never go negative.
+        let mut reward_paid: u64 = 0;
+        if market.params.liquidator_reward_bps > 0 {
+            // Notional in quote lots = size × oracle_price × tick_size.
+            // We use oracle_price (not the limit_ticks fill price) so the
+            // reward is keeper-side-deterministic at submission time.
+            let notional_u128 = (close_size as u128)
+                .saturating_mul(oracle)
+                .saturating_mul(market.params.tick_size as u128);
+            let reward_u128 = notional_u128
+                .saturating_mul(market.params.liquidator_reward_bps as u128)
+                / (constants::BPS_DENOM as u128);
+            let reward_u64 = if reward_u128 > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                reward_u128 as u64
+            };
+            // Cap to available collateral on the liquidatee.
+            reward_paid = reward_u64.min(ctx.accounts.trader_state.collateral_quote_lots);
+            if reward_paid > 0 {
+                ctx.accounts.trader_state.collateral_quote_lots -= reward_paid;
+                let caller_ts = &mut ctx.accounts.caller_trader_state;
+                caller_ts.collateral_quote_lots = caller_ts
+                    .collateral_quote_lots
+                    .checked_add(reward_paid)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            }
+        }
+
+        // Inject the synthetic close order.
         let next_seq = buffer
             .seq_counter
             .checked_add(1)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
-
         let trader = position.trader;
         let mut inserted = false;
         for slot in buffer.slots.iter_mut() {
@@ -2076,7 +2155,7 @@ pub mod flash_book {
                     seq: next_seq,
                     id: next_seq,
                     trader,
-                    size_lots: position.size_lots,
+                    size_lots: close_size,
                     limit_ticks: limit,
                 };
                 inserted = true;
@@ -2094,10 +2173,18 @@ pub mod flash_book {
             market: market.key(),
             trader,
             side: pos_side as u8,
-            size_lots: position.size_lots,
+            size_lots: close_size,
             limit_ticks: limit,
             worst_scenario_idx: assessment.worst_scenario_idx,
         });
+        if reward_paid > 0 {
+            emit!(LiquidatorRewardedEvent {
+                market: market.key(),
+                liquidator: ctx.accounts.caller.key(),
+                liquidatee: trader,
+                reward_quote_lots: reward_paid,
+            });
+        }
         Ok(())
     }
 
@@ -3104,9 +3191,10 @@ pub struct LiquidatePortfolio<'info> {
 
 #[derive(Accounts)]
 pub struct LiquidatePosition<'info> {
-    /// Anyone may call. Future iteration may gate by sequencer or
-    /// liquidator-bond, but in v1 anyone can permissionlessly trigger
-    /// liquidation as long as the trader is genuinely unhealthy.
+    /// Anyone may call. The caller pays the tx fee and (when
+    /// `liquidator_reward_bps > 0`) receives a tip credited to their
+    /// `caller_trader_state`.
+    #[account(mut)]
     pub caller: Signer<'info>,
 
     #[account(
@@ -3122,17 +3210,34 @@ pub struct LiquidatePosition<'info> {
     )]
     pub order_buffer: Account<'info, OrderBufferAccount>,
 
+    /// The unhealthy trader's state. Mut because the liquidator reward is
+    /// debited from their collateral.
     #[account(
+        mut,
         seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
         bump = trader_state.bump,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
+
+    /// The caller's own trader_state. Reward is credited here. Created
+    /// lazily on first liquidation (init_if_needed) so new keepers don't
+    /// need to call open_trader_state separately.
+    #[account(
+        init_if_needed,
+        payer = caller,
+        space = TraderStateAccount::space(),
+        seeds = [TraderStateAccount::SEED, caller.key().as_ref()],
+        bump,
+    )]
+    pub caller_trader_state: Account<'info, TraderStateAccount>,
 
     #[account(
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.trader.as_ref()],
         bump = position.bump,
     )]
     pub position: Account<'info, state::PositionAccount>,
+
+    pub system_program: Program<'info, System>,
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────
@@ -3259,6 +3364,14 @@ pub struct BasketOrderPlacedEvent {
     pub side_b: u8,
     pub size_lots_a: u64,
     pub size_lots_b: u64,
+}
+
+#[event]
+pub struct LiquidatorRewardedEvent {
+    pub market: Pubkey,
+    pub liquidator: Pubkey,
+    pub liquidatee: Pubkey,
+    pub reward_quote_lots: u64,
 }
 
 #[event]

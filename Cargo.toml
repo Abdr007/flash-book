@@ -11,11 +11,14 @@ repository = "https://github.com/Abdr007/flash-book"
 [workspace.dependencies]
 anchor-lang = "0.31.1"
 anchor-spl = "0.31.1"
-# ephemeral-rollups-sdk: tried 0.2 (Solana 1.x compat issues) and 0.13
-# (current Solana 2.x type mismatches in invoke_signed). Both blocked
-# upstream. Tracked. Integration is purely additive — when the SDK
-# stabilizes against Solana 2.x, it slots in here without semantic
-# changes to existing instructions.
+# ephemeral-rollups-sdk Rust crate: 0.13.0 declares loose Solana version
+# bounds (≥1.16, <3) that resolve to 2.2.x via the magicblock-magic-program-api
+# 0.8.x dep, conflicting with our spl-token v6 + solana-program-test 2.1.x
+# stack (which can't bump to 2.2 without breaking the SPL chain). The
+# off-chain TypeScript SDK has no such conflict — we wire delegation
+# THERE (sdk-ts/src/er.ts) instead. The Rust on-chain CPI route can
+# re-attempt once spl-token + solana-program-test publish 2.2-compatible
+# releases. This is purely a dep-tree limitation, not a design one.
 # borsh is re-exported via anchor_lang::prelude — do NOT add it as a
 # top-level dep; it triggers a derive-macro ambiguity error.
 bytemuck = { version = "1.21", features = ["derive"] }

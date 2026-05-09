@@ -358,8 +358,22 @@ describe('Instruction builders', () => {
       market,
       trader: Keypair.generate().publicKey,
     });
-    // caller, market, order_buffer, trader_state, position
-    expect(ix.keys.length).toBe(5);
+    // caller, market, order_buffer, trader_state, caller_trader_state,
+    // position, system_program
+    expect(ix.keys.length).toBe(7);
+  });
+
+  test('liquidatePositionIx supports partial close via requestedCloseLots', async () => {
+    const client = makeClient();
+    const ix = await client.liquidatePositionIx({
+      caller: Keypair.generate().publicKey,
+      market: client.market(SOL, USDC).address,
+      trader: Keypair.generate().publicKey,
+      requestedCloseLots: new BN(50),
+    });
+    // Same shape — only the data argument changes.
+    expect(ix.keys.length).toBe(7);
+    expect(ix.data.length).toBeGreaterThan(0);
   });
 
   test('liquidatePortfolioIx without cross-margin args', async () => {

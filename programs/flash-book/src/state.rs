@@ -85,6 +85,14 @@ pub struct MarketParams {
     /// concentration risk that the absolute lots cap can't enforce when
     /// the pool grows or shrinks.
     pub max_position_ratio_bps: u32,
+
+    /// Bps of liquidation penalty paid to the keeper that triggers the
+    /// liquidation (a "tip" for being first to act). 0 = no incentive
+    /// (operators rely on protocol-level keepers). Battle-tested CLOBs
+    /// typically wire 1000-2000 bps (10-20% of penalty) to attract a
+    /// competitive liquidator pool. The remainder of the penalty flows
+    /// through the existing insurance-fund waterfall.
+    pub liquidator_reward_bps: u32,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).

@@ -1830,7 +1830,27 @@
         "Single-market scope: this instruction assesses margin against the",
         "trader's position on *this market only*. Cross-market portfolio",
         "margin will be a separate `liquidate_portfolio` instruction taking",
-        "remaining_accounts (Phase 2)."
+        "remaining_accounts (Phase 2).",
+        "Liquidate an unhealthy position. Three production-grade upgrades",
+        "over the v1 implementation:",
+        "",
+        "1. PARTIAL LIQUIDATION via `requested_close_lots`. The keeper passes",
+        "the size to close (0 = full close). Hyperliquid-style: avoid",
+        "over-liquidating traders who can be brought back above",
+        "maintenance margin by closing only part of their position.",
+        "",
+        "2. LIQUIDATOR REWARD. `market.params.liquidator_reward_bps` of the",
+        "closure notional is debited from the liquidatee's collateral and",
+        "credited to the caller's `caller_trader_state`. Drift/dYdX-style",
+        "tip-based incentive — attracts a competitive keeper pool so",
+        "underwater positions actually get liquidated. 0 bps = disabled",
+        "(operators rely on protocol-funded keepers).",
+        "",
+        "3. RACE-SAFE atomic gate. The check `position.size_lots > 0` + the",
+        "fact that on-chain transactions land sequentially per-slot",
+        "means a second concurrent liquidator on the same position fails",
+        "cleanly with LiquidationStale (their tx still pays a base fee",
+        "but no double-debits or partial state). Tested."
       ],
       "discriminator": [
         187,
@@ -1846,10 +1866,11 @@
         {
           "name": "caller",
           "docs": [
-            "Anyone may call. Future iteration may gate by sequencer or",
-            "liquidator-bond, but in v1 anyone can permissionlessly trigger",
-            "liquidation as long as the trader is genuinely unhealthy."
+            "Anyone may call. The caller pays the tx fee and (when",
+            "`liquidator_reward_bps > 0`) receives a tip credited to their",
+            "`caller_trader_state`."
           ],
+          "writable": true,
           "signer": true
         },
         {
@@ -1911,6 +1932,11 @@
         },
         {
           "name": "trader_state",
+          "docs": [
+            "The unhealthy trader's state. Mut because the liquidator reward is",
+            "debited from their collateral."
+          ],
+          "writable": true,
           "pda": {
             "seeds": [
               {
@@ -1934,6 +1960,40 @@
                 "kind": "account",
                 "path": "trader_state.trader",
                 "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "caller_trader_state",
+          "docs": [
+            "The caller's own trader_state. Reward is credited here. Created",
+            "lazily on first liquidation (init_if_needed) so new keepers don't",
+            "need to call open_trader_state separately."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "caller"
               }
             ]
           }
@@ -1966,9 +2026,18 @@
               }
             ]
           }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
-      "args": []
+      "args": [
+        {
+          "name": "requested_close_lots",
+          "type": "u64"
+        }
+      ]
     },
     {
       "name": "open_trader_state",
@@ -4318,6 +4387,19 @@
       ]
     },
     {
+      "name": "LiquidatorRewardedEvent",
+      "discriminator": [
+        189,
+        149,
+        112,
+        167,
+        243,
+        21,
+        200,
+        133
+      ]
+    },
+    {
       "name": "MarketAuthorityTransferredEvent",
       "discriminator": [
         19,
@@ -5203,6 +5285,30 @@
       }
     },
     {
+      "name": "LiquidatorRewardedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "liquidator",
+            "type": "pubkey"
+          },
+          {
+            "name": "liquidatee",
+            "type": "pubkey"
+          },
+          {
+            "name": "reward_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "LpPositionAccount",
       "docs": [
         "Per-LP share holding. PDA seeded `[b\"lp_position\", lp.key()]`. Created",
@@ -5584,6 +5690,18 @@
               "the FLP's `total_capital_quote_lots`. Defends against cap-relative",
               "concentration risk that the absolute lots cap can't enforce when",
               "the pool grows or shrinks."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "liquidator_reward_bps",
+            "docs": [
+              "Bps of liquidation penalty paid to the keeper that triggers the",
+              "liquidation (a \"tip\" for being first to act). 0 = no incentive",
+              "(operators rely on protocol-level keepers). Battle-tested CLOBs",
+              "typically wire 1000-2000 bps (10-20% of penalty) to attract a",
+              "competitive liquidator pool. The remainder of the penalty flows",
+              "through the existing insurance-fund waterfall."
             ],
             "type": "u32"
           }

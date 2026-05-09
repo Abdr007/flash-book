@@ -123,6 +123,7 @@ fn default_params() -> MarketParams {
         max_position_lots_per_trader: 0,
         oracle_quorum_max_dispersion_bps: 0,
         max_position_ratio_bps: 0,
+        liquidator_reward_bps: 0,
     }
 }
 
@@ -1897,14 +1898,21 @@ async fn liquidate_position_rejects_healthy_trader() {
         .await
         .unwrap();
 
+    // Caller's TraderState is now part of the LiquidatePosition context
+    // (init_if_needed + receives the optional liquidator reward).
+    let (caller_state, _) = pda(&[TraderStateAccount::SEED, caller.pubkey().as_ref()]);
     let liq_ix = build_ix(
-        flash_book::instruction::LiquidatePosition {},
+        flash_book::instruction::LiquidatePosition {
+            requested_close_lots: 0, // 0 = full close
+        },
         vec![
-            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(caller.pubkey(), true),
             AccountMeta::new_readonly(market_pda, false),
             AccountMeta::new(order_buf, false),
-            AccountMeta::new_readonly(trader_state, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(caller_state, false),
             AccountMeta::new_readonly(position, false),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();

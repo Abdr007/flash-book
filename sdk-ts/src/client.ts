@@ -8,6 +8,7 @@
 
 import {
   AnchorProvider,
+  BN,
   BorshAccountsCoder,
   Program,
   type Idl,
@@ -687,22 +688,39 @@ export class FlashBookClient {
     return builder.instruction();
   }
 
+  /// Liquidate an unhealthy position. Three production-grade behaviours:
+  ///
+  /// - `requestedCloseLots` = 0 → close the full position (legacy behaviour).
+  ///   > 0 → partial liquidation (Hyperliquid-style); the chain validates
+  ///   the size is ≤ position.size_lots.
+  /// - When `market.params.liquidatorRewardBps > 0`, the caller receives
+  ///   the reward credited to their own TraderState (auto-created on first
+  ///   call via init_if_needed).
+  /// - Race-safe: a second concurrent liquidator on the same position
+  ///   gets LiquidationStale (position.size_lots == 0 after the first
+  ///   tx commits).
   liquidatePositionIx(args: {
     caller: PublicKey;
     market: PublicKey;
     trader: PublicKey;
+    /// 0 = max (full close). Otherwise the on-chain handler closes
+    /// exactly this many lots.
+    requestedCloseLots?: bigint | number;
   }): Promise<TransactionInstruction> {
     const buffer = this.orderBuffer(args.market);
     const traderState = this.traderState(args.trader);
+    const callerState = this.traderState(args.caller);
     const position = this.position(args.market, args.trader);
     return this.methods
-      .liquidatePosition()
+      .liquidatePosition(args.requestedCloseLots ?? new BN(0))
       .accountsPartial({
         caller: args.caller,
         market: args.market,
         orderBuffer: buffer.address,
         traderState: traderState.address,
+        callerTraderState: callerState.address,
         position: position.address,
+        systemProgram: SystemProgram.programId,
       })
       .instruction();
   }
