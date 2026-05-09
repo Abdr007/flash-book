@@ -762,6 +762,72 @@ pub mod flash_book {
             .checked_add(net_fee)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
 
+        // ── Toxicity tax (VPIN-scaled) ────────────────────────────────
+        // Charges the taker an extra fee proportional to the market's
+        // current VPIN signal. Compensates the maker — who was on the
+        // wrong side of toxic flow — and tops up the insurance fund.
+        // tax = notional × max_bps × vpin_bps / (10_000 × 10_000)
+        // Skipped silently when vpin_bps == 0 (no observed toxicity) or
+        // when toxicity_tax_max_bps == 0 (feature disabled per market).
+        let tax_max_bps = market.params.toxicity_tax_max_bps;
+        let vpin_bps = market.vpin.as_bps();
+        if tax_max_bps > 0 && vpin_bps > 0 {
+            let tax_u128 = notional_u128
+                .saturating_mul(tax_max_bps as u128)
+                .saturating_mul(vpin_bps as u128)
+                / (constants::BPS_DENOM as u128)
+                / (constants::BPS_DENOM as u128);
+            let tax_uncapped: u64 = if tax_u128 > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                tax_u128 as u64
+            };
+            // Cap to taker's available collateral — never fail the fill.
+            let tax = tax_uncapped.min(ctx.accounts.taker_trader_state.collateral_quote_lots);
+            if tax > 0 {
+                // Deduct from taker.
+                ctx.accounts.taker_trader_state.collateral_quote_lots -= tax;
+                // Split: insurance fund gets `tox_contribution_bps`, maker
+                // receives the remainder as a toxic-flow rebate.
+                let to_insurance = (tax as u128)
+                    .saturating_mul(ctx.accounts.insurance_fund.toxicity_tax_contribution_bps as u128)
+                    .checked_div(constants::BPS_DENOM as u128)
+                    .ok_or_else(|| error!(FlashBookError::DivisionByZero))?
+                    as u64;
+                let to_maker = tax.saturating_sub(to_insurance);
+                {
+                    let fund = &mut ctx.accounts.insurance_fund;
+                    fund.balance_quote_lots = fund
+                        .balance_quote_lots
+                        .checked_add(to_insurance)
+                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                    fund.total_contributions = fund
+                        .total_contributions
+                        .saturating_add(to_insurance);
+                }
+                {
+                    let maker_state = &mut ctx.accounts.maker_trader_state;
+                    maker_state.collateral_quote_lots = maker_state
+                        .collateral_quote_lots
+                        .checked_add(to_maker)
+                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                }
+                market.total_toxicity_tax_collected = market
+                    .total_toxicity_tax_collected
+                    .checked_add(tax)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                emit!(ToxicityTaxAppliedEvent {
+                    market: market_key,
+                    taker: taker_trader_pk,
+                    maker: maker_trader_pk,
+                    vpin_bps,
+                    tax_quote_lots: tax,
+                    insurance_share: to_insurance,
+                    maker_share: to_maker,
+                });
+            }
+        }
+
         let taker_pos = &mut ctx.accounts.taker_position;
         let maker_pos = &mut ctx.accounts.maker_position;
 
@@ -1681,6 +1747,68 @@ pub mod flash_book {
             .total_fees_collected
             .checked_add(net_fee)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // ── Toxicity tax (FLP-fill variant) ───────────────────────────
+        // Same VPIN-scaled tax as apply_fill, but the maker is the FLP
+        // pool — so the maker share flows into flp.total_capital, lifting
+        // NAV/share for all LPs pro-rata. This is the LP equivalent of a
+        // toxic-flow rebate.
+        let tax_max_bps = market.params.toxicity_tax_max_bps;
+        let vpin_bps = market.vpin.as_bps();
+        if tax_max_bps > 0 && vpin_bps > 0 {
+            let tax_u128 = notional_u128
+                .saturating_mul(tax_max_bps as u128)
+                .saturating_mul(vpin_bps as u128)
+                / (constants::BPS_DENOM as u128)
+                / (constants::BPS_DENOM as u128);
+            let tax_uncapped: u64 = if tax_u128 > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                tax_u128 as u64
+            };
+            let tax = tax_uncapped.min(ctx.accounts.taker_trader_state.collateral_quote_lots);
+            if tax > 0 {
+                ctx.accounts.taker_trader_state.collateral_quote_lots -= tax;
+                let to_insurance = (tax as u128)
+                    .saturating_mul(ctx.accounts.insurance_fund.toxicity_tax_contribution_bps as u128)
+                    .checked_div(constants::BPS_DENOM as u128)
+                    .ok_or_else(|| error!(FlashBookError::DivisionByZero))?
+                    as u64;
+                let to_flp = tax.saturating_sub(to_insurance);
+                {
+                    let fund = &mut ctx.accounts.insurance_fund;
+                    fund.balance_quote_lots = fund
+                        .balance_quote_lots
+                        .checked_add(to_insurance)
+                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                    fund.total_contributions = fund
+                        .total_contributions
+                        .saturating_add(to_insurance);
+                }
+                {
+                    let flp = &mut ctx.accounts.flp_exposure;
+                    flp.total_capital_quote_lots = flp
+                        .total_capital_quote_lots
+                        .checked_add(to_flp)
+                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                }
+                market.total_toxicity_tax_collected = market
+                    .total_toxicity_tax_collected
+                    .checked_add(tax)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                emit!(ToxicityTaxAppliedEvent {
+                    market: market_key,
+                    taker: taker_trader_pk,
+                    // For FLP fills the "maker" is the pool itself. Use the
+                    // flp_exposure PDA address as the maker identity.
+                    maker: ctx.accounts.flp_exposure.key(),
+                    vpin_bps,
+                    tax_quote_lots: tax,
+                    insurance_share: to_insurance,
+                    maker_share: to_flp,
+                });
+            }
+        }
 
         let taker_pos = &mut ctx.accounts.taker_position;
         if taker_pos.market == Pubkey::default() {
@@ -2922,6 +3050,19 @@ pub struct FundingSettledEvent {
     /// = trader received.
     pub owed_quote_lots: i64,
     pub new_collateral: u64,
+}
+
+#[event]
+pub struct ToxicityTaxAppliedEvent {
+    pub market: Pubkey,
+    pub taker: Pubkey,
+    /// The maker who absorbed the toxic flow (or the FLP pool PDA on
+    /// apply_flp_fill).
+    pub maker: Pubkey,
+    pub vpin_bps: u32,
+    pub tax_quote_lots: u64,
+    pub insurance_share: u64,
+    pub maker_share: u64,
 }
 
 #[event]

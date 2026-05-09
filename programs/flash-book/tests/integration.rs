@@ -3507,6 +3507,197 @@ async fn apply_fill_settles_two_trader_positions() {
 }
 
 #[tokio::test]
+async fn apply_fill_charges_toxicity_tax_when_vpin_positive() {
+    // End-to-end: inject vpin > 0 into the market, place crossing orders,
+    // run_batch, apply_fill, verify the taker pays an extra toxicity tax
+    // and the maker receives a portion as a toxic-flow rebate.
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
+    let (commit_buf, _) = pda(&[
+        flash_book::state::CommitBufferAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    let alice_state = setup_trader(&mut ctx, &payer, &alice, 50_000, &protocol).await;
+    let bob_state = setup_trader(&mut ctx, &payer, &bob, 50_000, &protocol).await;
+
+    let (alice_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        alice.pubkey().as_ref(),
+    ]);
+    let (bob_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        bob.pubkey().as_ref(),
+    ]);
+
+    for (signer, state, pos, side, limit) in [
+        (&alice, alice_state, alice_pos, 0u8, 100_500u64),
+        (&bob, bob_state, bob_pos, 1u8, 99_500u64),
+    ] {
+        let ix = build_ix(
+            flash_book::instruction::PlaceLimitOrder {
+                side,
+                size_lots: 1,
+                limit_ticks: limit,
+                post_only: false,
+            },
+            vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(order_buf, false),
+                AccountMeta::new(state, false),
+                AccountMeta::new(pos, false),
+                AccountMeta::new_readonly(protocol.flp_exposure, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        );
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signer.pubkey()),
+                &[signer],
+                bh,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let run_ix = build_ix(
+        flash_book::instruction::RunBatch { now_ms: 1_000_000 },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(order_buf, false),
+            AccountMeta::new(commit_buf, false),
+            AccountMeta::new(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[run_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let market_after_batch: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    let clearing_price = market_after_batch.recent_clearing_prices[0];
+
+    // Inject a synthetic vpin value. on-chain as_bps() = (value × 10_000) >> 32,
+    // truncated. We compute the resulting vpin_bps below for assertion math.
+    let injected_value: u64 = 429_496_730;
+    let m_acc = ctx.banks_client.get_account(market_pda).await.unwrap().unwrap();
+    let mut m_state =
+        flash_book::state::MarketAccount::try_deserialize(&mut m_acc.data.as_slice()).unwrap();
+    m_state.vpin.value_q32_32 = injected_value;
+    let mut nd = Vec::new();
+    m_state.try_serialize(&mut nd).unwrap();
+    nd.resize(m_acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: m_acc.lamports,
+            data: nd,
+            owner: m_acc.owner,
+            executable: m_acc.executable,
+            rent_epoch: m_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    // Snapshot pre-apply balances.
+    let alice_pre: TraderStateAccount = fetch(&mut ctx.banks_client, alice_state).await;
+    let bob_pre: TraderStateAccount = fetch(&mut ctx.banks_client, bob_state).await;
+    let fund_pre: flash_book::state::InsuranceFundAccount =
+        fetch(&mut ctx.banks_client, insurance_fund).await;
+
+    let apply_ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: clearing_price,
+            taker_side: 0,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund, false),
+            AccountMeta::new(alice_state, false),
+            AccountMeta::new(bob_state, false),
+            AccountMeta::new(alice_pos, false),
+            AccountMeta::new(bob_pos, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[apply_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Compute expected fees + tax. From default_params:
+    //   taker_fee_bps = 5, maker_rebate_bps = 1, fee_contribution_bps = 1_000
+    //   toxicity_tax_max_bps = 5, toxicity_tax_contribution_bps = 5_000
+    // notional = 1 × clearing_price × tick_size(1)
+    let notional: u128 = clearing_price as u128;
+    let taker_fee = (notional * 5 / 10_000) as u64;
+    let maker_rebate = (notional * 1 / 10_000) as u64;
+    let net_fee = taker_fee.saturating_sub(maker_rebate);
+    let fee_to_insurance = (net_fee as u128 * 1_000 / 10_000) as u64;
+    // Mirror on-chain VpinState::as_bps math exactly.
+    let vpin_bps: u128 =
+        (((injected_value as u128) * 10_000) >> 32).min(10_000);
+    let expected_tax = (notional * 5 * vpin_bps / 10_000 / 10_000) as u64;
+    let tax_to_insurance = (expected_tax as u128 * 5_000 / 10_000) as u64;
+    let tax_to_maker = expected_tax.saturating_sub(tax_to_insurance);
+
+    let alice_post: TraderStateAccount = fetch(&mut ctx.banks_client, alice_state).await;
+    let bob_post: TraderStateAccount = fetch(&mut ctx.banks_client, bob_state).await;
+    let fund_post: flash_book::state::InsuranceFundAccount =
+        fetch(&mut ctx.banks_client, insurance_fund).await;
+    let market_post: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+
+    assert_eq!(
+        alice_pre.collateral_quote_lots - alice_post.collateral_quote_lots,
+        taker_fee + expected_tax,
+        "taker pays fee + tax"
+    );
+    assert_eq!(
+        bob_post.collateral_quote_lots - bob_pre.collateral_quote_lots,
+        maker_rebate + tax_to_maker,
+        "maker receives rebate + tax_share"
+    );
+    assert_eq!(
+        fund_post.balance_quote_lots - fund_pre.balance_quote_lots,
+        fee_to_insurance + tax_to_insurance,
+        "insurance receives fee + tax shares"
+    );
+    assert_eq!(market_post.total_toxicity_tax_collected, expected_tax);
+    // Sanity: tax actually charged something.
+    assert!(expected_tax > 0);
+}
+
+#[tokio::test]
 async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
     // Settlement path where FLP is the maker. Apply_flp_fill mutates the
     // taker's position + the FlpExposureAccount.per_market entry on the
