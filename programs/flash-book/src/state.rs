@@ -186,6 +186,19 @@ pub struct MarketParams {
     /// HL uses single-tick premium; this is mathematically smarter.
     /// Capped at MARK_HISTORY_LEN (16). Typical: 4-8 batches.
     pub funding_premium_twap_window: u8,
+
+    /// Symmetric-OI funding dampener. When true, the funding rate is
+    /// scaled by the OI imbalance:
+    ///   skew_bps = |oi_long − oi_short| × 10_000 / (oi_long + oi_short)
+    ///   dampened_rate = rate × skew_bps / 10_000
+    /// When the book is balanced (skew = 0), funding is fully dampened
+    /// (zero) — no reason to drain anyone since no side dominates.
+    /// When the book is one-sided (skew = 10_000 = 100%), funding is
+    /// at full strength to incentivise correction. HL charges full
+    /// premium-driven funding even with balanced OI; this is a
+    /// genuinely smarter signal of "actual incentive needed."
+    /// Default false = HL-equivalent.
+    pub funding_oi_dampening: bool,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).

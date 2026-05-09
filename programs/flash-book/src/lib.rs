@@ -3848,7 +3848,7 @@ pub mod flash_book {
         } else {
             Ticks(market.mark_price_ticks)
         };
-        let (new_index, ftick) = advance(
+        let (raw_new_index, ftick) = advance(
             market.cum_funding_index,
             mark_for_funding,
             Ticks(market.oracle_price_ticks),
@@ -3856,8 +3856,40 @@ pub mod flash_book {
             market.params.funding_rate_k_bps,
             market.params.funding_rate_max_bps_per_sec,
         )?;
+
+        // Symmetric-OI funding dampener (Flash-Book-specific). When the
+        // book is balanced (no side dominates), funding has no
+        // economic reason to push traders one way — dampen toward 0.
+        // When the book is heavily one-sided, funding is at full
+        // strength. Smarter than HL's flat premium-driven model.
+        let (new_index, dampened_rate) = if market.params.funding_oi_dampening {
+            let total = (market.oi_long_lots as u128)
+                .saturating_add(market.oi_short_lots as u128);
+            let skew_bps: u128 = if total == 0 {
+                0
+            } else {
+                let imbalance = if market.oi_long_lots >= market.oi_short_lots {
+                    (market.oi_long_lots - market.oi_short_lots) as u128
+                } else {
+                    (market.oi_short_lots - market.oi_long_lots) as u128
+                };
+                ((imbalance.saturating_mul(constants::BPS_DENOM as u128)) / total)
+                    .min(constants::BPS_DENOM as u128)
+            };
+            // Scale BOTH the index delta AND the rate by skew/BPS_DENOM.
+            let index_delta = raw_new_index.saturating_sub(market.cum_funding_index);
+            let scaled_delta = ((index_delta as i128).saturating_mul(skew_bps as i128))
+                / (constants::BPS_DENOM as i128);
+            let scaled_index = market.cum_funding_index.saturating_add(scaled_delta);
+            let scaled_rate = ((ftick.rate_bps_per_sec as i128)
+                .saturating_mul(skew_bps as i128))
+                / (constants::BPS_DENOM as i128);
+            (scaled_index, clamp_i128_to_i64(scaled_rate))
+        } else {
+            (raw_new_index, ftick.rate_bps_per_sec)
+        };
         market.cum_funding_index = new_index;
-        market.last_funding_rate_bps_per_sec = ftick.rate_bps_per_sec;
+        market.last_funding_rate_bps_per_sec = dampened_rate;
 
         // 2. Load buffered orders. SKIP GTT-expired orders — the slot
         //    stays valid (cleanup keepers reclaim rent later via

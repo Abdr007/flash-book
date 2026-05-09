@@ -259,3 +259,156 @@ proptest! {
         prop_assert_eq!(discounted_fee(base, 0), base);
     }
 }
+
+// ─── Symmetric-OI funding dampener (wave 13) ─────────────────────────
+//
+// Mirrors the run_batch dampener:
+//   skew_bps = |oi_long - oi_short| × 10_000 / (oi_long + oi_short)
+//   dampened_rate = rate × skew_bps / 10_000
+//
+// Properties:
+//   • balanced book → dampened_rate == 0
+//   • fully one-sided → dampened_rate == raw rate
+//   • |dampened_rate| ≤ |raw rate| always (dampening can't amplify)
+//   • dampened sign == raw sign (or both zero) — never flips direction
+
+fn skew_bps(oi_long: u64, oi_short: u64) -> u64 {
+    let total = (oi_long as u128) + (oi_short as u128);
+    if total == 0 {
+        return 0;
+    }
+    let imb = if oi_long >= oi_short {
+        (oi_long - oi_short) as u128
+    } else {
+        (oi_short - oi_long) as u128
+    };
+    ((imb * BPS_DENOM) / total).min(BPS_DENOM) as u64
+}
+
+fn dampened_rate(raw_rate_bps: i64, oi_long: u64, oi_short: u64) -> i64 {
+    let skew = skew_bps(oi_long, oi_short);
+    ((raw_rate_bps as i128) * (skew as i128) / (BPS_DENOM as i128)) as i64
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 2_000, .. ProptestConfig::default() })]
+
+    /// Balanced book (oi_long == oi_short, both > 0) ⇒ dampened == 0.
+    #[test]
+    fn oi_dampener_balanced_book_zeros_funding(
+        oi in 1u64..=1_000_000_000u64,
+        raw in -1_000i64..=1_000i64,
+    ) {
+        prop_assert_eq!(dampened_rate(raw, oi, oi), 0);
+    }
+
+    /// Fully one-sided (oi_short == 0, oi_long > 0) ⇒ dampened == raw.
+    /// And vice versa.
+    #[test]
+    fn oi_dampener_one_sided_passes_through(
+        oi in 1u64..=1_000_000_000u64,
+        raw in -1_000i64..=1_000i64,
+    ) {
+        // Long-only.
+        prop_assert_eq!(dampened_rate(raw, oi, 0), raw);
+        // Short-only.
+        prop_assert_eq!(dampened_rate(raw, 0, oi), raw);
+    }
+
+    /// |dampened| ≤ |raw| — dampening can never amplify.
+    #[test]
+    fn oi_dampener_never_amplifies(
+        oi_long in 0u64..=1_000_000_000u64,
+        oi_short in 0u64..=1_000_000_000u64,
+        raw in -10_000i64..=10_000i64,
+    ) {
+        let damp = dampened_rate(raw, oi_long, oi_short);
+        prop_assert!(damp.unsigned_abs() <= raw.unsigned_abs());
+    }
+
+    /// Sign of dampened matches sign of raw (or both zero) — never flips.
+    #[test]
+    fn oi_dampener_preserves_sign(
+        oi_long in 0u64..=1_000_000_000u64,
+        oi_short in 0u64..=1_000_000_000u64,
+        raw in -10_000i64..=10_000i64,
+    ) {
+        let damp = dampened_rate(raw, oi_long, oi_short);
+        if raw == 0 {
+            prop_assert_eq!(damp, 0);
+        } else if damp != 0 {
+            prop_assert_eq!(raw.signum(), damp.signum());
+        }
+    }
+
+    /// Empty book (no OI either side) ⇒ dampened == 0 (no positions to charge).
+    #[test]
+    fn oi_dampener_empty_book_zeros(raw in -10_000i64..=10_000i64) {
+        prop_assert_eq!(dampened_rate(raw, 0, 0), 0);
+    }
+}
+
+// ─── Concentration margin tier (wave 12) ─────────────────────────────
+//
+// Mirrors MarketSnapshot::effective_mmr_bps:
+//   if size >= threshold > 0 → base + extra (saturating_add)
+//   else                     → base
+//
+// Properties:
+//   • threshold = 0 ⇒ identity (always returns base)
+//   • size below threshold ⇒ identity
+//   • size at-or-above threshold ⇒ base + extra (or u32::MAX on saturate)
+//   • effective is monotone in size (larger position never gets cheaper margin)
+
+fn effective_mmr(size_lots: u64, base_bps: u32, threshold: u64, extra_bps: u32) -> u32 {
+    if threshold > 0 && size_lots >= threshold {
+        base_bps.saturating_add(extra_bps)
+    } else {
+        base_bps
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 2_000, .. ProptestConfig::default() })]
+
+    #[test]
+    fn concentration_zero_threshold_is_identity(
+        size in 0u64..=1_000_000_000u64,
+        base in 0u32..=10_000u32,
+        extra in 0u32..=10_000u32,
+    ) {
+        prop_assert_eq!(effective_mmr(size, base, 0, extra), base);
+    }
+
+    #[test]
+    fn concentration_below_threshold_is_identity(
+        size in 0u64..=999u64,
+        base in 0u32..=10_000u32,
+        extra in 0u32..=10_000u32,
+    ) {
+        prop_assert_eq!(effective_mmr(size, base, 1_000, extra), base);
+    }
+
+    #[test]
+    fn concentration_at_or_above_threshold_adds_extra(
+        size in 1_000u64..=1_000_000_000u64,
+        base in 0u32..=10_000u32,
+        extra in 0u32..=10_000u32,
+    ) {
+        let eff = effective_mmr(size, base, 1_000, extra);
+        prop_assert_eq!(eff, base.saturating_add(extra));
+    }
+
+    #[test]
+    fn concentration_monotone_in_size(
+        size_a in 0u64..=500_000u64,
+        size_b in 500_001u64..=1_000_000u64,
+        base in 0u32..=10_000u32,
+        extra in 0u32..=10_000u32,
+    ) {
+        let threshold = 750_000u64;
+        let a = effective_mmr(size_a, base, threshold, extra);
+        let b = effective_mmr(size_b, base, threshold, extra);
+        prop_assert!(b >= a);
+    }
+}

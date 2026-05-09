@@ -205,3 +205,102 @@ trade (close or reduce only).
 
 See [`docs/MATH.md`](MATH.md) for the formal math and
 [`docs/SAFETY.md`](SAFETY.md) for the threat model and invariants.
+
+## Recent additions (waves 6-13)
+
+The base architecture is unchanged; the additions slot into existing
+seams. Every new feature is **additive** — no instruction's signature
+breaks, no account layout migrates (existing accounts default the new
+fields to zero/equivalent). The matcher's hot path doesn't grow.
+
+### Native order types beyond limit/taker
+- **Trigger orders** (`TriggerOrderAccount`) — permissionless `execute_*`
+  reads oracle, inserts the resulting order into the regular buffer.
+  Optional OCO link, reduce-only, GTT expiry, trailing offset.
+- **TWAP orders** (`TwapOrderAccount`) — permissionless `execute_twap_slice`
+  inserts one slice per interval.
+- **Bracket orders** (`place_bracket_order`) — atomic parent + 2 OCO
+  triggers (TP + SL) in one tx. Parent fill → triggers become
+  reduce-only-eligible; one fires → other auto-deactivates.
+- **Iceberg orders** (`IcebergOrderAccount`) — hidden reservoir;
+  permissionless `replenish_iceberg` inserts the next chunk when the
+  visible child fills.
+- **Trailing stops** — `trailing_offset_bps` on TriggerOrderAccount;
+  permissionless `update_trailing_stop` ratchets in the favorable
+  direction with conservative tick rounding.
+
+### Risk + safety
+- **Per-position leverage cap** (`set_position_leverage`) — enforced at
+  intake against projected post-fill notional.
+- **Concentration margin tier** (FLP-keyed; smarter than HL's flat MMR)
+  — `MarketSnapshot::effective_mmr_bps(size_lots)` used in stress
+  lattice.
+- **Symmetric-OI funding dampener** (smarter than HL's premium-only
+  funding) — when `funding_oi_dampening`, rate × |skew| / total scales
+  funding. Balanced book → 0 funding.
+- **Funding-premium TWAP** — last-N-batch clearing-price TWAP as the
+  premium input; kills 1-batch microbursts at our 50ms cadence.
+- **Mark sanity cap** — per-batch ±X bps clamp on post-clearing mark.
+- **Per-market OI cap** — whole-market hard ceiling at intake.
+- **STP modes** — CancelNewest / CancelOldest / CancelBoth via flag bits
+  4-5 on the OrderSlot; matcher applies the newer-order's mode.
+- **GTT order expiry** — `expires_at_slot` on every order; matcher
+  silently skips expired slots; cleanup-keeper reclaims rent.
+
+### Permissionless markets (HIP-3 + bond)
+- **`permissionless_initialize_market`** — anyone deploys a market;
+  envelope-clamped params; caller is creator + earns
+  `creator_share_bps`.
+- **HIP-3 deployer bond** (`MarketBondAccount`) — slashable stake with
+  7-day unbond delay. `slash_market_bond` is authority-gated.
+
+### Capital primitives
+- **Multi-LP NAV vault** (`LpPositionAccount`) — already present; share
+  math now also covers per-deposit + per-withdraw bookkeeping.
+- **User-managed trading vaults** (`VaultAccount` +
+  `VaultPositionAccount`) — strategist trades via the existing
+  delegate path; deposit + withdraw use mark-to-market NAV via market
+  walk in `remaining_accounts`. HWM perf-fee in shares.
+- **Cross-margin sweep** (`sweep_collateral`) — position-aware via
+  joint stress-lattice gate; same MTM walk pattern as vaults.
+
+### Liquidation + ADL
+- **Auto-Deleverage** (`auto_deleverage`) — when insurance is below
+  pause_threshold, force-close highest-ranked profitable counter at
+  the bankruptcy price. Permissionless; eligibility re-checked on chain.
+- **Multi-threshold margin alerts** — per-fill emit at 250%/200%/125%
+  of MMR for off-chain pre-liq pushes.
+- **Mass cancel** (`cancel_all_orders_in_market`) — single-tx flatten.
+
+### Fee + reward primitives
+- **Builder codes** (`set_trader_builder`) — frontend earns up to user-
+  approved cap.
+- **Referral program** (`set_trader_referrer`) — one-time-write,
+  anti-rotation.
+- **Negative-fee top tier** — `discount_bps` up to 12_000 (120%) →
+  taker is paid for routing flow; sourced from insurance contribution.
+- **Trading-rewards eligibility** — per-fill emit for off-chain HYPE-
+  style accrual.
+
+### View ixs (UI primitives via tx simulation)
+- `view_predicted_funding` — emits `PredictedFundingEvent` with
+  rate + premium + cum_index; SDK simulates the tx.
+- `view_quote_ladder` — re-runs `generate_quotes` with current state;
+  emits `QuoteLadderSnapshotEvent` (top-level summary; full ladder is
+  deterministically recoverable off-chain).
+
+### Bot suite (`@flash-book/bot`)
+8 keepers ship: liquidation, funding, invariant, ATA cleanup, ADL,
+trailing-stop, iceberg, bond-monitor. Each shares the `Keeper` base
+class (start/stop/stats); discovery is operator-supplied (no
+`getProgramAccounts` scans by default — keeps RPC load predictable).
+
+### MagicBlock ER compatibility
+Every new ix and view operates through Anchor's standard PDA
+derivation + Borsh accessors that work transparently when the market
+account is delegated to an ER. The in-house `cpi_delegate` /
+`cpi_undelegate` ixs (`programs/flash-book/src/er.rs`) bypass the
+upstream SDK's Solana version conflict by re-implementing the
+delegation discriminators directly. New state (vault, iceberg,
+trigger, twap, bond) participates in the same delegation lifecycle —
+no special-casing needed.

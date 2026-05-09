@@ -79,6 +79,8 @@ export interface MarketParamsRaw {
   concentrationExtraMmrBps: number;
   /** TWAP window (batches) for funding-premium dampening. 0 = single-tick (legacy). */
   fundingPremiumTwapWindow: number;
+  /** Symmetric-OI funding dampener (smarter than HL — balanced book → 0 funding). */
+  fundingOiDampening: boolean;
 }
 
 /** Sensible default parameter set for SOL/BTC/ETH-style major markets. */
@@ -162,6 +164,10 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
     // 4-8 batches at our 50ms FBA cadence. Smarter than HL's
     // single-tick premium — kills funding spikes from microbursts.
     fundingPremiumTwapWindow: 0,
+    // Symmetric-OI funding dampener (off by default). Production: enable
+    // for non-HIP-3 markets where balanced flow is the norm. Smarter
+    // than HL — funding only kicks in when the book actually leans.
+    fundingOiDampening: false,
   };
 }
 

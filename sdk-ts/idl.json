@@ -10684,6 +10684,54 @@
               "Typical: 200-1000 bps (2%-10% per batch ≈ per 50ms)."
             ],
             "type": "u32"
+          },
+          {
+            "name": "concentration_threshold_lots",
+            "docs": [
+              "CME-style concentration margin tier. When a position's size_lots",
+              "crosses `concentration_threshold_lots`, its effective maintenance",
+              "margin becomes `maintenance_margin_ratio_bps +",
+              "concentration_extra_mmr_bps`. Penalises whales whose size is",
+              "harder to liquidate without market impact. 0 threshold = tier",
+              "disabled (single-MMR for the whole market). Smarter than HL's",
+              "flat per-market MMR.",
+              "Typical: threshold sized to 1-5% of FLP capital; extra 100-500 bps."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "concentration_extra_mmr_bps",
+            "type": "u32"
+          },
+          {
+            "name": "funding_premium_twap_window",
+            "docs": [
+              "TWAP window length (in batches) for the funding-premium dampener.",
+              "0 = disabled (legacy single-tick premium). When > 0, the funding",
+              "rate uses the average of the last N batches' (mark - oracle)",
+              "premium instead of the instantaneous one — kills funding spikes",
+              "from microbursts of toxic flow that move the mark for one batch.",
+              "HL uses single-tick premium; this is mathematically smarter.",
+              "Capped at MARK_HISTORY_LEN (16). Typical: 4-8 batches."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "funding_oi_dampening",
+            "docs": [
+              "Symmetric-OI funding dampener. When true, the funding rate is",
+              "scaled by the OI imbalance:",
+              "skew_bps = |oi_long − oi_short| × 10_000 / (oi_long + oi_short)",
+              "dampened_rate = rate × skew_bps / 10_000",
+              "When the book is balanced (skew = 0), funding is fully dampened",
+              "(zero) — no reason to drain anyone since no side dominates.",
+              "When the book is one-sided (skew = 10_000 = 100%), funding is",
+              "at full strength to incentivise correction. HL charges full",
+              "premium-driven funding even with balanced OI; this is a",
+              "genuinely smarter signal of \"actual incentive needed.\"",
+              "Default false = HL-equivalent."
+            ],
+            "type": "bool"
           }
         ]
       }
