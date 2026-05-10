@@ -77,6 +77,40 @@ export const ORDER_FLAG_JIT = 1 << 3;
 export const ORDER_FLAG_STP_CANCEL_OLDEST = 1 << 4;
 export const ORDER_FLAG_STP_CANCEL_BOTH = 2 << 4;
 
+/// Wave 18h signal: which orderbook the protocol prefers as of this
+/// SDK version. New integrations should target v2 (hypertree, resting
+/// orders, smarter matcher); v1 (flat array, single-batch) is being
+/// deprecated. Wave 19 will delete v1 entirely once trigger / TWAP /
+/// iceberg / liquidation flows have v2 equivalents.
+export const PREFERRED_ORDERBOOK_VERSION: 'v2' = 'v2';
+
+/// Runtime helper: given a Solana connection + market PDA, ask the
+/// chain which orderbook(s) exist for that market. Off-chain
+/// sequencers / MMs / dashboards use this to pick the right ix path
+/// during the v1→v2 transition. Returns:
+///   • 'v2'      — only v2 hypertree exists (use *_v2 ixs)
+///   • 'v1'      — only v1 flat buffer exists (use legacy ixs)
+///   • 'both'    — both exist (use v2; v1 was likely an earlier init)
+///   • 'neither' — market is fresh; init one of the books first
+export async function detectOrderbookVersion(
+  connection: import('@solana/web3.js').Connection,
+  market: import('@solana/web3.js').PublicKey,
+  programId?: import('@solana/web3.js').PublicKey,
+): Promise<'v1' | 'v2' | 'both' | 'neither'> {
+  const v1Pda = (await import('./pdas.ts')).orderBufferPda(market, programId);
+  const v2Pda = (await import('./pdas.ts')).marketBookPda(market, programId);
+  const [v1Info, v2Info] = await Promise.all([
+    connection.getAccountInfo(v1Pda.address),
+    connection.getAccountInfo(v2Pda.address),
+  ]);
+  const v1Live = v1Info !== null && v1Info.data.length > 0;
+  const v2Live = v2Info !== null && v2Info.data.length > 0;
+  if (v1Live && v2Live) return 'both';
+  if (v2Live) return 'v2';
+  if (v1Live) return 'v1';
+  return 'neither';
+}
+
 export { subscribeToProgramEvents } from './event-stream.ts';
 
 export {

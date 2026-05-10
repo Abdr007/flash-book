@@ -10,6 +10,15 @@
 //! position state moved by separate `apply_fill` instruction).
 
 #![allow(unexpected_cfgs)]
+// The v1 ixs (initialize_order_buffer, place_limit_order, cancel_order,
+// cancel_all_orders_in_market, run_batch) are marked `#[deprecated]` in
+// wave 18h. Anchor's `#[program]` macro generates synthetic dispatch
+// call-sites inside this crate, which would surface the warning on
+// every program rebuild. The `#[deprecated]` attribute remains useful
+// for EXTERNAL Rust callers (other crates, integration test crates,
+// CPI consumers) — it surfaces there normally. Internal dispatcher
+// noise is suppressed crate-wide here only.
+#![allow(deprecated)]
 
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
@@ -71,6 +80,10 @@ pub mod flash_book {
     /// `initialize_commit_buffer` to avoid Anchor 0.31's BPF
     /// "Overlapping copy" invariant when two large (~5KB) boxed
     /// accounts init in one ix.
+    #[deprecated(
+        note = "v1 flat-array orderbook. Use init_market_book + place_limit_order_v2 + run_batch_v2. \
+                Wave 19 will delete this ix once trigger/TWAP/iceberg/liquidation flows have v2 equivalents."
+    )]
     pub fn initialize_order_buffer(
         ctx: Context<InitializeOrderBuffer>,
     ) -> Result<()> {
@@ -2745,6 +2758,9 @@ pub mod flash_book {
     /// Pass 0 for a vanilla GTC limit. The legacy boolean `post_only`
     /// argument continues to work transparently — it is mapped to
     /// `flags = (post_only as u8) << 0`.
+    #[deprecated(
+        note = "v1 single-batch FBA. Use place_limit_order_v2 for resting orders on the hypertree book."
+    )]
     pub fn place_limit_order(
         ctx: Context<PlaceOrder>,
         side: u8,
@@ -4530,6 +4546,9 @@ pub mod flash_book {
     ///
     /// On success: the slot is cleared (`valid = 0`), `head` decrements,
     /// and an `OrderCancelledEvent` is emitted.
+    #[deprecated(
+        note = "v1 cancel — only valid for orders in the legacy flat buffer. Use cancel_order_v2."
+    )]
     pub fn cancel_order(
         ctx: Context<CancelOrder>,
         order_seq: u64,
@@ -4571,6 +4590,9 @@ pub mod flash_book {
     /// submitted orders are eligible). Reduces failed-cancel UX
     /// thrash for active traders / MMs that need to flatten quotes
     /// before a reconfig.
+    #[deprecated(
+        note = "v1 mass-cancel. Wave 19 ships cancel_all_orders_in_market_v2 walking the hypertree."
+    )]
     pub fn cancel_all_orders_in_market(
         ctx: Context<CancelAllOrders>,
     ) -> Result<()> {
@@ -4685,6 +4707,10 @@ pub mod flash_book {
     /// Run one batch: advance funding, generate FLP quotes, clear FBA,
     /// update mark, sweep expired commits. Position updates are emitted as
     /// an event for the off-chain bookkeeper or for `apply_fill` to consume.
+    #[deprecated(
+        note = "v1 single-batch matcher. Use run_batch_v2 — same FBA, hypertree-backed, EMA funding, \
+                vol-adaptive band, VPIN-gated FLP. Wave 19 deletes this ix."
+    )]
     pub fn run_batch(ctx: Context<RunBatch>, now_ms: u64) -> Result<()> {
         let market = &mut ctx.accounts.market;
         let buffer = &mut ctx.accounts.order_buffer;

@@ -253,9 +253,12 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// MUST be called after `initializeMarketIx` (and before any
-  /// `placeLimitOrderIx` / `runBatchIx`). Initializes the order_buffer
-  /// for the market.
+  /// @deprecated Wave 18h — use `initMarketBookIx` (v2 hypertree). The
+  /// v1 flat-array order_buffer is capped at CAP=16 nodes and runs the
+  /// legacy single-batch matcher. v2 carries 100 nodes (~50/side) on
+  /// the hypertree, supports resting orders across batches, and runs
+  /// the smarter matcher (EMA-blended funding, vol-adaptive band,
+  /// VPIN-gated FLP). Wave 19 will delete this builder.
   initializeOrderBufferIx(args: {
     authority: PublicKey;
     market: PublicKey;
@@ -755,6 +758,9 @@ export class FlashBookClient {
   /// `expiresAtSlot` enables Good-Till-Time (GTT). 0 = GTC. Otherwise
   /// the matcher skips the order once `current_slot > expiresAtSlot`
   /// (cleanup keepers can sweep them via cancelOrder for rent reclaim).
+  ///
+  /// @deprecated Wave 18h — use `placeLimitOrderV2Ix` (hypertree-backed,
+  /// resting orders, larger book, smarter matcher). Wave 19 will delete.
   placeLimitOrderIx(args: {
     trader: PublicKey;
     market: PublicKey;
@@ -796,6 +802,11 @@ export class FlashBookClient {
   /// caller in this market. Single signer, single tx. Single O(n) walk
   /// over the order_buffer (n ≤ 64). FLP-virtual / liq / ADL system
   /// orders are skipped.
+  ///
+  /// @deprecated Wave 18h — use the v2 walking variant once wave 19
+  /// ships `cancelAllOrdersInMarketV2Ix`. Until then, callers on the
+  /// v2 hypertree must enumerate orders via `viewBookDepthV2Ix` (or
+  /// the off-chain event log) and call `cancelOrderV2Ix` per order.
   cancelAllOrdersInMarketIx(args: {
     trader: PublicKey;
     market: PublicKey;
@@ -853,6 +864,10 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// @deprecated Wave 18h — use `runBatchV2Ix`. v2 has economic parity
+  /// (funding/FLP/VPIN/mark TWAP/oracle band/commit sweep) PLUS
+  /// EMA-blended funding, vol-adaptive band, and VPIN-gated FLP pause
+  /// (improvements over HL/Phoenix/Manifest). Wave 19 will delete this.
   runBatchIx(args: {
     sequencer: PublicKey;
     market: PublicKey;
@@ -1838,6 +1853,9 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// @deprecated Wave 18h — use `cancelOrderV2Ix` (looks up by encoded
+  /// order_id; supports the resting-order semantics of the hypertree).
+  /// Wave 19 will delete this builder.
   cancelOrderIx(args: {
     trader: PublicKey;
     market: PublicKey;
