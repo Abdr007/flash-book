@@ -4653,6 +4653,122 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// V2: replenish an iceberg's visible chunk against the hypertree-
+    /// backed book. Same iceberg semantics as v1 (FLAG_ACTIVE, expiry,
+    /// "still_resting" probe to avoid double-displaying, displayed-size
+    /// chunking, residual-tail allowance below min_base_lots,
+    /// auto-deactivate at zero remaining); only the order injection
+    /// target differs (hypertree, not v1 buffer).
+    ///
+    /// Lookup mechanics: the v1 buffer scan is replaced by an O(log n)
+    /// `lookup_bid/ask_by_order_id` against the hypertree using the
+    /// child's encoded order_id (recomputed from iceberg.limit_ticks +
+    /// iceberg.child_order_seq + side). NIL = fully consumed → replenish.
+    pub fn replenish_iceberg_v2(ctx: Context<ReplenishIcebergV2>) -> Result<()> {
+        let iceberg = &ctx.accounts.iceberg_order;
+        let market = &ctx.accounts.market;
+        require!(
+            iceberg.flags & state::IcebergOrderAccount::FLAG_ACTIVE != 0,
+            FlashBookError::OutOfRange
+        );
+
+        let now = Clock::get()?.slot;
+        if iceberg.expires_at_slot > 0 {
+            require!(iceberg.expires_at_slot >= now, FlashBookError::OutOfRange);
+        }
+        require!(iceberg.remaining_lots > 0, FlashBookError::OutOfRange);
+
+        let market_key = market.key();
+        let side_is_bid = iceberg.side == 0;
+        let chunk = iceberg.displayed_size_lots.min(iceberg.remaining_lots);
+        let trader_pk = iceberg.trader;
+        let limit_ticks = iceberg.limit_ticks;
+        let expires_at_slot = iceberg.expires_at_slot;
+        let prior_child_seq = iceberg.child_order_seq;
+        let iceberg_side = iceberg.side;
+
+        let inserted_idx;
+        let next_seq;
+        {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let mut handle =
+                state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            require!(
+                handle.header.market_pubkey == market_key,
+                FlashBookError::WrongMarket
+            );
+
+            // Probe: is the prior child still resting? If so, no-op
+            // (lazy poll-friendly; same UX as v1). prior_child_seq == 0
+            // means "no prior child yet" (first replenish on a fresh
+            // iceberg) — skip probe.
+            if prior_child_seq != 0 {
+                let prior_id = state_v2::encode_order_id(
+                    limit_ticks,
+                    prior_child_seq,
+                    side_is_bid,
+                );
+                let prior_idx = if side_is_bid {
+                    handle.lookup_bid_by_order_id(prior_id)
+                } else {
+                    handle.lookup_ask_by_order_id(prior_id)
+                };
+                if prior_idx != crate::hypertree::NIL {
+                    return Ok(());
+                }
+            }
+
+            next_seq = handle
+                .header
+                .order_seq_counter
+                .checked_add(1)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            require!(
+                next_seq < FLP_SEQ_RESERVED_OFFSET,
+                FlashBookError::OutOfRange
+            );
+            handle.header.order_seq_counter = next_seq;
+
+            let order = state_v2::RestingOrderV2 {
+                order_id: state_v2::encode_order_id(limit_ticks, next_seq, side_is_bid),
+                seq: next_seq,
+                price_ticks: limit_ticks,
+                size_lots: chunk,
+                expires_at_slot,
+                trader: trader_pk,
+                last_valid_slot: now as u32,
+                side: iceberg_side,
+                order_type: 0, // limit
+                flags: 0,
+                _pad: 0,
+            };
+            inserted_idx = if side_is_bid {
+                handle.insert_bid(order)?
+            } else {
+                handle.insert_ask(order)?
+            };
+        }
+
+        let iceberg = &mut ctx.accounts.iceberg_order;
+        iceberg.remaining_lots = iceberg.remaining_lots.saturating_sub(chunk);
+        iceberg.child_order_seq = next_seq;
+        if iceberg.remaining_lots == 0 {
+            iceberg.flags &= !state::IcebergOrderAccount::FLAG_ACTIVE;
+        }
+
+        emit!(IcebergReplenishedV2Event {
+            market: market_key,
+            trader: trader_pk,
+            iceberg_id: iceberg.iceberg_id,
+            executor: ctx.accounts.caller.key(),
+            chunk_size_lots: chunk,
+            remaining_lots: iceberg.remaining_lots,
+            new_child_seq: next_seq,
+            node_index: inserted_idx,
+        });
+        Ok(())
+    }
+
     /// Cancel an iceberg order. Trader signs. Removes any active child
     /// from the OrderBuffer and closes the IcebergOrderAccount.
     pub fn cancel_iceberg(ctx: Context<CancelIceberg>) -> Result<()> {
@@ -8523,6 +8639,40 @@ pub struct ReplenishIceberg<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ReplenishIcebergV2<'info> {
+    pub caller: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at the market_book seed; disc validated inside handler
+    /// via `MarketBookHandle::from_account_data`. Mut because we both
+    /// READ (probe by order_id for "still resting" check) and WRITE
+    /// (insert next chunk).
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::IcebergOrderAccount::SEED,
+            market.key().as_ref(),
+            iceberg_order.trader.as_ref(),
+            &[iceberg_order.iceberg_id],
+        ],
+        bump = iceberg_order.bump,
+    )]
+    pub iceberg_order: Account<'info, state::IcebergOrderAccount>,
+}
+
+#[derive(Accounts)]
 pub struct CancelIceberg<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
@@ -9117,6 +9267,19 @@ pub struct IcebergReplenishedEvent {
     pub chunk_size_lots: u64,
     pub remaining_lots: u64,
     pub new_child_seq: u64,
+}
+
+#[event]
+pub struct IcebergReplenishedV2Event {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub iceberg_id: u8,
+    pub executor: Pubkey,
+    pub chunk_size_lots: u64,
+    pub remaining_lots: u64,
+    pub new_child_seq: u64,
+    /// Hypertree node index of the inserted child RestingOrderV2.
+    pub node_index: u32,
 }
 
 #[event]

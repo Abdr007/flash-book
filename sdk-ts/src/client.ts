@@ -1539,6 +1539,30 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// V2 iceberg replenish — fires the next visible chunk against the
+  /// hypertree-backed book. Same iceberg semantics as v1 (still-resting
+  /// probe via order_id lookup → no-op if prior chunk hasn't fully
+  /// filled; auto-deactivate at zero remaining); only the order
+  /// injection target differs (hypertree, not v1 buffer).
+  replenishIcebergV2Ix(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+    icebergId: number;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    const ice = icebergOrderPda(args.market, args.trader, args.icebergId);
+    return this.methods
+      .replenishIcebergV2()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        marketBook: book.address,
+        icebergOrder: ice.address,
+      })
+      .instruction();
+  }
+
   /// Cancel an iceberg order — trader signs. Removes any active child
   /// from the OrderBuffer and closes the IcebergOrderAccount, refunding
   /// rent.
