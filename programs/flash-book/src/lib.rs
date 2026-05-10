@@ -4763,6 +4763,119 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// V2: create an iceberg order and seed the first visible chunk into
+    /// the hypertree-backed book. Pure parity port of v1 (same validation,
+    /// same IcebergOrderAccount field set, same first_chunk sizing).
+    /// Only the injection target differs (hypertree, not v1 buffer).
+    pub fn place_iceberg_order_v2(
+        ctx: Context<PlaceIcebergOrderV2>,
+        iceberg_id: u8,
+        side: u8,
+        total_size_lots: u64,
+        displayed_size_lots: u64,
+        limit_ticks: u64,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(total_size_lots > 0, FlashBookError::ZeroSize);
+        require!(displayed_size_lots > 0, FlashBookError::ZeroSize);
+        require!(
+            displayed_size_lots <= total_size_lots,
+            FlashBookError::OutOfRange
+        );
+        require!(limit_ticks > 0, FlashBookError::ZeroPrice);
+
+        let market = &ctx.accounts.market;
+        require!(
+            displayed_size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            (limit_ticks % market.params.tick_size == 0),
+            FlashBookError::PriceNotOnTick
+        );
+
+        let now = Clock::get()?.slot;
+        if expires_at_slot > 0 {
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
+
+        let trader_pk = ctx.accounts.trader.key();
+        let market_key = market.key();
+        let first_chunk = displayed_size_lots.min(total_size_lots);
+
+        let next_seq;
+        let first_child_idx;
+        {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let mut handle =
+                state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            require!(
+                handle.header.market_pubkey == market_key,
+                FlashBookError::WrongMarket
+            );
+            next_seq = handle
+                .header
+                .order_seq_counter
+                .checked_add(1)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            require!(
+                next_seq < FLP_SEQ_RESERVED_OFFSET,
+                FlashBookError::OutOfRange
+            );
+            handle.header.order_seq_counter = next_seq;
+
+            let side_is_bid = side == 0;
+            let order = state_v2::RestingOrderV2 {
+                order_id: state_v2::encode_order_id(limit_ticks, next_seq, side_is_bid),
+                seq: next_seq,
+                price_ticks: limit_ticks,
+                size_lots: first_chunk,
+                expires_at_slot,
+                trader: trader_pk,
+                last_valid_slot: now as u32,
+                side,
+                order_type: 0, // limit
+                flags: 0,
+                _pad: 0,
+            };
+            first_child_idx = if side_is_bid {
+                handle.insert_bid(order)?
+            } else {
+                handle.insert_ask(order)?
+            };
+        }
+
+        let iceberg = &mut ctx.accounts.iceberg_order;
+        iceberg.trader = trader_pk;
+        iceberg.market = market_key;
+        iceberg.bump = ctx.bumps.iceberg_order;
+        iceberg.iceberg_id = iceberg_id;
+        iceberg.side = side;
+        iceberg.flags = state::IcebergOrderAccount::FLAG_ACTIVE;
+        iceberg._pad0 = [0u8; 5];
+        iceberg.limit_ticks = limit_ticks;
+        iceberg.total_size_lots = total_size_lots;
+        iceberg.remaining_lots = total_size_lots.saturating_sub(first_chunk);
+        iceberg.displayed_size_lots = displayed_size_lots;
+        iceberg.child_order_seq = next_seq;
+        iceberg.created_at_slot = now;
+        iceberg.expires_at_slot = expires_at_slot;
+
+        emit!(IcebergOrderPlacedV2Event {
+            market: market_key,
+            trader: trader_pk,
+            iceberg_id,
+            side,
+            total_size_lots,
+            displayed_size_lots,
+            limit_ticks,
+            first_child_seq: next_seq,
+            first_child_node_index: first_child_idx,
+        });
+        Ok(())
+    }
+
     /// Replenish an iceberg's visible chunk — PERMISSIONLESS keeper.
     /// Reads the IcebergOrderAccount and the OrderBuffer; if the current
     /// child is no longer in the buffer (filled or matcher-cleared) AND
@@ -4999,6 +5112,69 @@ pub mod flash_book {
             .saturating_add(ctx.accounts.iceberg_order.displayed_size_lots);
         emit!(IcebergCancelledEvent {
             market: ctx.accounts.iceberg_order.market,
+            trader,
+            iceberg_id: ctx.accounts.iceberg_order.iceberg_id,
+            unfilled_lots: unfilled.min(ctx.accounts.iceberg_order.total_size_lots),
+        });
+        Ok(())
+    }
+
+    /// V2: cancel an iceberg order against the hypertree-backed book.
+    /// Best-effort child removal: if the current child is still resting,
+    /// look it up via O(log n) RBT search (vs v1's O(n) buffer scan)
+    /// and remove via handle.remove_*_node. If already filled, no-op.
+    /// Closes the iceberg account (rent returned via Anchor's `close`
+    /// constraint).
+    pub fn cancel_iceberg_v2(ctx: Context<CancelIcebergV2>) -> Result<()> {
+        let trader = ctx.accounts.trader.key();
+        require!(
+            ctx.accounts.iceberg_order.trader == trader,
+            FlashBookError::WrongTrader
+        );
+
+        let iceberg = &ctx.accounts.iceberg_order;
+        let child_seq = iceberg.child_order_seq;
+        let limit_ticks = iceberg.limit_ticks;
+        let side_is_bid = iceberg.side == 0;
+        let market_key = iceberg.market;
+
+        if child_seq != 0 {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let mut handle =
+                state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            require!(
+                handle.header.market_pubkey == market_key,
+                FlashBookError::WrongMarket
+            );
+            let child_id =
+                state_v2::encode_order_id(limit_ticks, child_seq, side_is_bid);
+            let child_idx = if side_is_bid {
+                handle.lookup_bid_by_order_id(child_id)
+            } else {
+                handle.lookup_ask_by_order_id(child_id)
+            };
+            if child_idx != crate::hypertree::NIL {
+                // Belt-and-suspenders: ensure the resting node really is
+                // this trader's (defends against the unlikely case that
+                // an attacker happened to land at the same encoded id).
+                let resting = handle.order_at(child_idx);
+                if resting.trader == trader {
+                    if side_is_bid {
+                        handle.remove_bid_node(child_idx);
+                    } else {
+                        handle.remove_ask_node(child_idx);
+                    }
+                }
+            }
+        }
+
+        let unfilled = ctx
+            .accounts
+            .iceberg_order
+            .remaining_lots
+            .saturating_add(ctx.accounts.iceberg_order.displayed_size_lots);
+        emit!(IcebergCancelledEvent {
+            market: market_key,
             trader,
             iceberg_id: ctx.accounts.iceberg_order.iceberg_id,
             unfilled_lots: unfilled.min(ctx.accounts.iceberg_order.total_size_lots),
@@ -7071,6 +7247,272 @@ pub mod flash_book {
             size_lots: exec_position.size_lots,
             limit_ticks: limit,
             worst_scenario_idx: assessment.worst_scenario_idx,
+        });
+        Ok(())
+    }
+
+    /// V2: cross-market portfolio liquidation against the hypertree-backed
+    /// book. Pure parity port of v1's `liquidate_portfolio`:
+    ///   • Walks remaining_accounts in (market, position) pairs
+    ///   • Verifies owner program + trader/market binding for each pair
+    ///   • Builds the joint cross-market scenario lattice
+    ///   • Stress-checks via assess_margin_fn
+    ///   • Injects synthetic close on EXECUTION market only
+    ///
+    /// Only the injection target differs (hypertree, not v1 buffer). The
+    /// order_type byte is set to 3 (Liquidation) so wave 19e's matcher
+    /// mapping promotes it to FIFO liquidation priority.
+    pub fn liquidate_portfolio_v2<'info>(
+        ctx: Context<'_, '_, '_, 'info, LiquidatePortfolioV2<'info>>,
+    ) -> Result<()> {
+        let exec_market = &ctx.accounts.execution_market;
+        let exec_position = &ctx.accounts.execution_position;
+        let trader_state = &ctx.accounts.trader_state;
+
+        require!(
+            exec_position.size_lots > 0,
+            FlashBookError::LiquidationStale
+        );
+        require!(
+            exec_position.trader == trader_state.trader,
+            FlashBookError::WrongTrader
+        );
+        require!(
+            exec_position.market == exec_market.key(),
+            FlashBookError::WrongMarket
+        );
+
+        // Build snapshot vectors with the execution market+position first.
+        let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
+        let mut position_snaps: Vec<RiskPosSnap> = Vec::new();
+        market_snaps.push(RiskMarketSnap {
+            market: exec_market.key(),
+            mark_price: Ticks(exec_market.mark_price_ticks),
+            cum_funding_index: exec_market.cum_funding_index,
+            maintenance_margin_bps: exec_market.params.maintenance_margin_ratio_bps,
+            tick_size: exec_market.params.tick_size,
+            concentration_threshold_lots: exec_market.params.concentration_threshold_lots,
+            concentration_extra_mmr_bps: exec_market.params.concentration_extra_mmr_bps,
+        });
+        position_snaps.push(RiskPosSnap {
+            market: exec_position.market,
+            side: if exec_position.side == 0 { Side::Long } else { Side::Short },
+            size_lots: exec_position.size_lots,
+            entry_price: Ticks(exec_position.entry_price_ticks),
+            cum_funding_index_at_entry: exec_position.cum_funding_index_at_entry,
+        });
+
+        let remaining = ctx.remaining_accounts;
+        require!(remaining.len() % 2 == 0, FlashBookError::OutOfRange);
+        let program_id = ctx.program_id;
+        let mut i = 0usize;
+        while i + 1 < remaining.len() {
+            let market_ai = &remaining[i];
+            let position_ai = &remaining[i + 1];
+            require_keys_eq!(*market_ai.owner, *program_id, FlashBookError::Unauthorized);
+            require_keys_eq!(*position_ai.owner, *program_id, FlashBookError::Unauthorized);
+
+            let m_data = market_ai.try_borrow_data()?;
+            let market: MarketAccount =
+                MarketAccount::try_deserialize(&mut &m_data[..])?;
+            let p_data = position_ai.try_borrow_data()?;
+            let position: state::PositionAccount =
+                state::PositionAccount::try_deserialize(&mut &p_data[..])?;
+            require!(
+                position.trader == trader_state.trader,
+                FlashBookError::WrongTrader
+            );
+            require!(
+                position.market == market_ai.key(),
+                FlashBookError::WrongMarket
+            );
+
+            if position.size_lots > 0 {
+                market_snaps.push(RiskMarketSnap {
+                    market: market_ai.key(),
+                    mark_price: Ticks(market.mark_price_ticks),
+                    cum_funding_index: market.cum_funding_index,
+                    maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+                    tick_size: market.params.tick_size,
+                    concentration_threshold_lots: market.params.concentration_threshold_lots,
+                    concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                });
+                position_snaps.push(RiskPosSnap {
+                    market: position.market,
+                    side: if position.side == 0 { Side::Long } else { Side::Short },
+                    size_lots: position.size_lots,
+                    entry_price: Ticks(position.entry_price_ticks),
+                    cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                });
+            }
+            i += 2;
+        }
+
+        let market_keys: Vec<Pubkey> = market_snaps.iter().map(|m| m.market).collect();
+        let scenarios = default_scenarios_fn(&market_keys);
+        let assessment = assess_margin_fn(
+            &position_snaps,
+            &market_snaps,
+            &scenarios,
+            trader_state.collateral_quote_lots,
+        )?;
+        require!(!assessment.is_healthy, FlashBookError::NotLiquidatable);
+
+        // Inject liquidation order on the EXECUTION market's hypertree.
+        let pos_side = if exec_position.side == 0 { Side::Long } else { Side::Short };
+        let close_side = pos_side.opposite();
+        let penalty = exec_market.params.liq_penalty_bps as u128;
+        let oracle = exec_market.oracle_price_ticks as u128;
+        let penalty_delta = (oracle * penalty) / constants::BPS_DENOM as u128;
+        let limit = match close_side {
+            Side::Short => oracle.saturating_sub(penalty_delta) as u64,
+            Side::Long => oracle.saturating_add(penalty_delta) as u64,
+        };
+
+        let trader = exec_position.trader;
+        let close_size = exec_position.size_lots;
+        let close_side_u8 = close_side as u8;
+        let market_key = exec_market.key();
+        let now_slot = Clock::get()?.slot;
+        let inserted_idx;
+        let next_seq;
+        {
+            let mut book_data = ctx.accounts.execution_market_book.try_borrow_mut_data()?;
+            let mut handle =
+                state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            require!(
+                handle.header.market_pubkey == market_key,
+                FlashBookError::WrongMarket
+            );
+            next_seq = handle
+                .header
+                .order_seq_counter
+                .checked_add(1)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            require!(
+                next_seq < FLP_SEQ_RESERVED_OFFSET,
+                FlashBookError::OutOfRange
+            );
+            handle.header.order_seq_counter = next_seq;
+
+            let side_is_bid = close_side_u8 == 0;
+            let order = state_v2::RestingOrderV2 {
+                order_id: state_v2::encode_order_id(limit, next_seq, side_is_bid),
+                seq: next_seq,
+                price_ticks: limit,
+                size_lots: close_size,
+                expires_at_slot: 0,
+                trader,
+                last_valid_slot: now_slot as u32,
+                side: close_side_u8,
+                order_type: 3, // Liquidation
+                flags: 0,
+                _pad: 0,
+            };
+            inserted_idx = if side_is_bid {
+                handle.insert_bid(order)?
+            } else {
+                handle.insert_ask(order)?
+            };
+        }
+
+        emit!(LiquidationInjectedV2Event {
+            market: market_key,
+            trader,
+            side: pos_side as u8,
+            size_lots: close_size,
+            limit_ticks: limit,
+            worst_scenario_idx: assessment.worst_scenario_idx,
+            order_seq: next_seq,
+            node_index: inserted_idx,
+        });
+        Ok(())
+    }
+
+    /// Delegate the commit_buffer PDA to the MagicBlock ER. Required for
+    /// run_batch_v2 on the ER to call sweep_expired() against the commit
+    /// buffer (which mutates expired bonds). Pair with delegate_market_book
+    /// + delegate_market — all three must be live for full ER tick.
+    pub fn delegate_commit_buffer(
+        ctx: Context<DelegateCommitBuffer>,
+        commit_frequency_ms: u32,
+        validator: Option<Pubkey>,
+    ) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.accounts.commit_buffer.bump;
+
+        require_keys_eq!(
+            *ctx.accounts.commit_buffer.to_account_info().owner,
+            *ctx.program_id,
+            FlashBookError::Unauthorized
+        );
+
+        let seeds_for_args: Vec<Vec<u8>> = vec![
+            CommitBufferAccount::SEED.to_vec(),
+            market_key.as_ref().to_vec(),
+            vec![bump],
+        ];
+        let signer_seeds: &[&[u8]] = &[
+            CommitBufferAccount::SEED,
+            market_key.as_ref(),
+            &[bump],
+        ];
+
+        er::cpi_delegate(
+            er::DelegateAccounts {
+                payer: ctx.accounts.authority.to_account_info(),
+                delegated_account: ctx.accounts.commit_buffer.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                delegate_buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                delegation_record: ctx.accounts.delegation_record.to_account_info(),
+                delegation_metadata: ctx.accounts.delegation_metadata.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            er::DelegateArgs {
+                commit_frequency_ms,
+                seeds: seeds_for_args,
+                validator,
+            },
+            signer_seeds,
+        )?;
+
+        emit!(CommitBufferDelegatedEvent {
+            market: market_key,
+            commit_buffer: ctx.accounts.commit_buffer.key(),
+            commit_frequency_ms,
+            validator: validator.unwrap_or_default(),
+        });
+        Ok(())
+    }
+
+    /// Undelegate the commit_buffer PDA from the ER back to mainnet.
+    pub fn undelegate_commit_buffer(
+        ctx: Context<UndelegateCommitBuffer>,
+    ) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.accounts.commit_buffer.bump;
+        let signer_seeds: &[&[u8]] = &[
+            CommitBufferAccount::SEED,
+            market_key.as_ref(),
+            &[bump],
+        ];
+
+        er::cpi_undelegate(
+            er::UndelegateAccounts {
+                payer: ctx.accounts.authority.to_account_info(),
+                delegated_account: ctx.accounts.commit_buffer.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            signer_seeds,
+        )?;
+
+        emit!(CommitBufferUndelegatedEvent {
+            market: market_key,
+            commit_buffer: ctx.accounts.commit_buffer.key(),
         });
         Ok(())
     }
@@ -9163,6 +9605,72 @@ pub struct CancelIceberg<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(iceberg_id: u8)]
+pub struct PlaceIcebergOrderV2<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at market_book seed; disc validated inside handler.
+    /// Mut because the first iceberg child is inserted into the hypertree.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state::IcebergOrderAccount::space(),
+        seeds = [
+            state::IcebergOrderAccount::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[iceberg_id],
+        ],
+        bump,
+    )]
+    pub iceberg_order: Account<'info, state::IcebergOrderAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CancelIcebergV2<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    /// CHECK: PDA at market_book seed; disc validated inside handler.
+    /// Mut because the active child (if still resting) is removed.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, iceberg_order.market.as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        close = trader,
+        seeds = [
+            state::IcebergOrderAccount::SEED,
+            iceberg_order.market.as_ref(),
+            iceberg_order.trader.as_ref(),
+            &[iceberg_order.iceberg_id],
+        ],
+        bump = iceberg_order.bump,
+    )]
+    pub iceberg_order: Account<'info, state::IcebergOrderAccount>,
+}
+
+#[derive(Accounts)]
 pub struct ViewPortfolioRisk<'info> {
     #[account(
         seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
@@ -9291,6 +9799,113 @@ pub struct LiquidatePortfolio<'info> {
     pub execution_position: Account<'info, state::PositionAccount>,
     // remaining_accounts: alternating [Market, Position] pairs for the
     // trader's other markets (cross-margin assessment).
+}
+
+#[derive(Accounts)]
+pub struct LiquidatePortfolioV2<'info> {
+    pub caller: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, execution_market.base_mint.as_ref(), execution_market.quote_mint.as_ref()],
+        bump = execution_market.bump,
+    )]
+    pub execution_market: Account<'info, MarketAccount>,
+
+    /// CHECK: hypertree PDA for the execution market; disc validated inside.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, execution_market.key().as_ref()],
+        bump,
+    )]
+    pub execution_market_book: UncheckedAccount<'info>,
+
+    #[account(
+        seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
+        bump = trader_state.bump,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        seeds = [state::PositionAccount::SEED, execution_market.key().as_ref(), trader_state.trader.as_ref()],
+        bump = execution_position.bump,
+    )]
+    pub execution_position: Account<'info, state::PositionAccount>,
+    // remaining_accounts: alternating [Market, Position] pairs for the
+    // trader's other markets (cross-margin assessment).
+}
+
+#[derive(Accounts)]
+pub struct DelegateCommitBuffer<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    #[account(
+        mut,
+        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
+        bump = commit_buffer.bump,
+    )]
+    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
+
+    /// CHECK: this program's account info.
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under owner_program at [b"buffer", commit_buffer].
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID.
+    #[account(mut)]
+    pub delegation_record: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID.
+    #[account(mut)]
+    pub delegation_metadata: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UndelegateCommitBuffer<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    #[account(
+        mut,
+        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
+        bump = commit_buffer.bump,
+    )]
+    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
+
+    /// CHECK: this program's account info.
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: same buffer PDA from delegate.
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -9597,6 +10212,34 @@ pub struct MarketBookDelegatedEvent {
     pub commit_frequency_ms: u32,
     /// Pinned ER validator pubkey, or default Pubkey if permissionless.
     pub validator: Pubkey,
+}
+
+#[event]
+pub struct CommitBufferDelegatedEvent {
+    pub market: Pubkey,
+    pub commit_buffer: Pubkey,
+    pub commit_frequency_ms: u32,
+    pub validator: Pubkey,
+}
+
+#[event]
+pub struct CommitBufferUndelegatedEvent {
+    pub market: Pubkey,
+    pub commit_buffer: Pubkey,
+}
+
+#[event]
+pub struct IcebergOrderPlacedV2Event {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub iceberg_id: u8,
+    pub side: u8,
+    pub total_size_lots: u64,
+    pub displayed_size_lots: u64,
+    pub limit_ticks: u64,
+    pub first_child_seq: u64,
+    /// Hypertree node index of the first inserted child RestingOrderV2.
+    pub first_child_node_index: u32,
 }
 
 #[event]

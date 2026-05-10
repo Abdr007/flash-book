@@ -791,6 +791,71 @@
       "args": []
     },
     {
+      "name": "cancel_iceberg_v2",
+      "docs": [
+        "V2: cancel an iceberg order against the hypertree-backed book.",
+        "Best-effort child removal: if the current child is still resting,",
+        "look it up via O(log n) RBT search (vs v1's O(n) buffer scan)",
+        "and remove via handle.remove_*_node. If already filled, no-op.",
+        "Closes the iceberg account (rent returned via Anchor's `close`",
+        "constraint)."
+      ],
+      "discriminator": [
+        184,
+        246,
+        16,
+        15,
+        37,
+        114,
+        54,
+        197
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "Mut because the active child (if still resting) is removed."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "iceberg_order.market",
+                "account": "IcebergOrderAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "iceberg_order",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "cancel_order",
       "docs": [
         "Cancel a pending order from the buffer. Only the original trader can",
@@ -1494,6 +1559,126 @@
         {
           "name": "min_deposit_quote_lots",
           "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "delegate_commit_buffer",
+      "docs": [
+        "Delegate the commit_buffer PDA to the MagicBlock ER. Required for",
+        "run_batch_v2 on the ER to call sweep_expired() against the commit",
+        "buffer (which mutates expired bonds). Pair with delegate_market_book",
+        "+ delegate_market — all three must be live for full ER tick."
+      ],
+      "discriminator": [
+        147,
+        4,
+        16,
+        124,
+        111,
+        122,
+        160,
+        31
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "commit_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner_program",
+          "address": "FBookV1111111111111111111111111111111111111"
+        },
+        {
+          "name": "delegate_buffer",
+          "writable": true
+        },
+        {
+          "name": "delegation_record",
+          "writable": true
+        },
+        {
+          "name": "delegation_metadata",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "delegation_program",
+          "address": "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
+        }
+      ],
+      "args": [
+        {
+          "name": "commit_frequency_ms",
+          "type": "u32"
+        },
+        {
+          "name": "validator",
+          "type": {
+            "option": "pubkey"
+          }
         }
       ]
     },
@@ -3858,6 +4043,153 @@
       "args": []
     },
     {
+      "name": "liquidate_portfolio_v2",
+      "docs": [
+        "V2: cross-market portfolio liquidation against the hypertree-backed",
+        "book. Pure parity port of v1's `liquidate_portfolio`:",
+        "• Walks remaining_accounts in (market, position) pairs",
+        "• Verifies owner program + trader/market binding for each pair",
+        "• Builds the joint cross-market scenario lattice",
+        "• Stress-checks via assess_margin_fn",
+        "• Injects synthetic close on EXECUTION market only",
+        "",
+        "Only the injection target differs (hypertree, not v1 buffer). The",
+        "order_type byte is set to 3 (Liquidation) so wave 19e's matcher",
+        "mapping promotes it to FIFO liquidation priority."
+      ],
+      "discriminator": [
+        183,
+        176,
+        153,
+        237,
+        164,
+        209,
+        229,
+        147
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "signer": true
+        },
+        {
+          "name": "execution_market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "execution_market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "execution_market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "execution_market_book",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "execution_market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_state",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "execution_position",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "execution_market"
+              },
+              {
+                "kind": "account",
+                "path": "trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "liquidate_position",
       "docs": [
         "Liquidate a specific position. Anyone may call this for any position;",
@@ -5326,6 +5658,125 @@
                   102,
                   101,
                   114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "iceberg_order",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "iceberg_id",
+          "type": "u8"
+        },
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "total_size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "displayed_size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "place_iceberg_order_v2",
+      "docs": [
+        "V2: create an iceberg order and seed the first visible chunk into",
+        "the hypertree-backed book. Pure parity port of v1 (same validation,",
+        "same IcebergOrderAccount field set, same first_chunk sizing).",
+        "Only the injection target differs (hypertree, not v1 buffer)."
+      ],
+      "discriminator": [
+        210,
+        2,
+        238,
+        78,
+        49,
+        9,
+        102,
+        6
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "Mut because the first iceberg child is inserted into the hypertree."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
                 ]
               },
               {
@@ -7976,6 +8427,104 @@
       ]
     },
     {
+      "name": "undelegate_commit_buffer",
+      "docs": [
+        "Undelegate the commit_buffer PDA from the ER back to mainnet."
+      ],
+      "discriminator": [
+        203,
+        142,
+        82,
+        32,
+        31,
+        10,
+        90,
+        66
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "commit_buffer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner_program",
+          "address": "FBookV1111111111111111111111111111111111111"
+        },
+        {
+          "name": "delegate_buffer",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "delegation_program",
+          "address": "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "undelegate_market",
       "docs": [
         "Undelegate the MarketAccount from the ER back to mainnet."
@@ -10001,6 +10550,32 @@
       ]
     },
     {
+      "name": "CommitBufferDelegatedEvent",
+      "discriminator": [
+        98,
+        10,
+        63,
+        203,
+        10,
+        219,
+        120,
+        0
+      ]
+    },
+    {
+      "name": "CommitBufferUndelegatedEvent",
+      "discriminator": [
+        192,
+        85,
+        6,
+        128,
+        189,
+        43,
+        107,
+        211
+      ]
+    },
+    {
       "name": "CreatorFeeOwedEvent",
       "discriminator": [
         213,
@@ -10115,6 +10690,19 @@
         83,
         30,
         73
+      ]
+    },
+    {
+      "name": "IcebergOrderPlacedV2Event",
+      "discriminator": [
+        0,
+        10,
+        237,
+        90,
+        58,
+        55,
+        117,
+        94
       ]
     },
     {
@@ -11518,6 +12106,46 @@
       }
     },
     {
+      "name": "CommitBufferDelegatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "commit_buffer",
+            "type": "pubkey"
+          },
+          {
+            "name": "commit_frequency_ms",
+            "type": "u32"
+          },
+          {
+            "name": "validator",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CommitBufferUndelegatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "commit_buffer",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
       "name": "CommitRow",
       "docs": [
         "Commit-reveal entry. Stored as a row in a per-market commit table."
@@ -11998,6 +12626,53 @@
           {
             "name": "first_child_seq",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "IcebergOrderPlacedV2Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "iceberg_id",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "total_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "displayed_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "limit_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "first_child_seq",
+            "type": "u64"
+          },
+          {
+            "name": "first_child_node_index",
+            "docs": [
+              "Hypertree node index of the first inserted child RestingOrderV2."
+            ],
+            "type": "u32"
           }
         ]
       }

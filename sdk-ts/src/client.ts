@@ -1168,6 +1168,91 @@ export class FlashBookClient {
     return builder.instruction();
   }
 
+  /// V2 cross-margin portfolio liquidation against the hypertree-backed
+  /// book. Pure parity port of v1; only injection target differs.
+  liquidatePortfolioV2Ix(args: {
+    caller: PublicKey;
+    executionMarket: PublicKey;
+    trader: PublicKey;
+    crossMargin?: ReadonlyArray<{ market: PublicKey }>;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.executionMarket);
+    const traderState = this.traderState(args.trader);
+    const position = this.position(args.executionMarket, args.trader);
+    const builder = this.methods.liquidatePortfolioV2().accountsPartial({
+      caller: args.caller,
+      executionMarket: args.executionMarket,
+      executionMarketBook: book.address,
+      traderState: traderState.address,
+      executionPosition: position.address,
+    });
+    const remaining: Array<{ pubkey: PublicKey; isWritable: boolean; isSigner: boolean }> = [];
+    for (const m of args.crossMargin ?? []) {
+      remaining.push({ pubkey: m.market, isWritable: false, isSigner: false });
+      remaining.push({
+        pubkey: this.position(m.market, args.trader).address,
+        isWritable: false,
+        isSigner: false,
+      });
+    }
+    if (remaining.length > 0) {
+      const withRemaining = (builder as unknown as {
+        remainingAccounts: (a: typeof remaining) => typeof builder;
+      }).remainingAccounts(remaining);
+      return withRemaining.instruction();
+    }
+    return builder.instruction();
+  }
+
+  /// Delegate the commit_buffer to the MagicBlock ER. Required for ER
+  /// ticks (run_batch_v2 sweeps expired bonds via this account).
+  delegateCommitBufferIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    commitFrequencyMs: number;
+    validator?: PublicKey | null;
+  }): Promise<TransactionInstruction> {
+    const commit = this.commitBuffer(args.market);
+    const buffer = delegateBufferPda(commit.address, this.programId);
+    const record = delegationRecordPda(commit.address);
+    const metadata = delegationMetadataPda(commit.address);
+    return this.methods
+      .delegateCommitBuffer(args.commitFrequencyMs, args.validator ?? null)
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        commitBuffer: commit.address,
+        ownerProgram: this.programId,
+        delegateBuffer: buffer.address,
+        delegationRecord: record.address,
+        delegationMetadata: metadata.address,
+        systemProgram: SystemProgram.programId,
+        delegationProgram: MAGICBLOCK_DELEGATION_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
+  /// Undelegate the commit_buffer from the ER back to mainnet.
+  undelegateCommitBufferIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const commit = this.commitBuffer(args.market);
+    const buffer = delegateBufferPda(commit.address, this.programId);
+    return this.methods
+      .undelegateCommitBuffer()
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        commitBuffer: commit.address,
+        ownerProgram: this.programId,
+        delegateBuffer: buffer.address,
+        systemProgram: SystemProgram.programId,
+        delegationProgram: MAGICBLOCK_DELEGATION_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
   /// Liquidate an unhealthy position. Three production-grade behaviours:
   ///
   /// - `requestedCloseLots` = 0 → close the full position (legacy behaviour).
@@ -1546,6 +1631,39 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// V2: create an iceberg + seed first child into the hypertree-backed
+  /// book. Pure parity port of v1; only injection target differs.
+  placeIcebergOrderV2Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    icebergId: number;
+    side: 'long' | 'short';
+    totalSizeLots: bigint | number;
+    displayedSizeLots: bigint | number;
+    limitTicks: bigint | number;
+    expiresAtSlot?: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    const ice = icebergOrderPda(args.market, args.trader, args.icebergId);
+    return this.methods
+      .placeIcebergOrderV2(
+        args.icebergId,
+        args.side === 'long' ? 0 : 1,
+        args.totalSizeLots,
+        args.displayedSizeLots,
+        args.limitTicks,
+        args.expiresAtSlot ?? new BN(0),
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        marketBook: book.address,
+        icebergOrder: ice.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
   /// Replenish an iceberg's visible chunk — permissionless keeper.
   /// No-op when the current child is still resting (cheap to poll).
   /// Keepers can call on every batch boundary; the chain only does
@@ -1608,6 +1726,25 @@ export class FlashBookClient {
       .accountsPartial({
         trader: args.trader,
         orderBuffer: buffer.address,
+        icebergOrder: ice.address,
+      })
+      .instruction();
+  }
+
+  /// V2 cancel iceberg — O(log n) hypertree probe + remove (vs v1's O(n)
+  /// buffer scan). Closes the iceberg account, refunds rent.
+  cancelIcebergV2Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    icebergId: number;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    const ice = icebergOrderPda(args.market, args.trader, args.icebergId);
+    return this.methods
+      .cancelIcebergV2()
+      .accountsPartial({
+        trader: args.trader,
+        marketBook: book.address,
         icebergOrder: ice.address,
       })
       .instruction();
