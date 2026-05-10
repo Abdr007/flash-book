@@ -382,29 +382,31 @@ pub mod flash_book {
     }
 
     /// V2 matcher tick: run an FBA Walrasian clearing over the resting
-    /// hypertree book, mutate filled orders in place (decrement on partial,
-    /// remove + free on full), update the market mark price, and emit a
-    /// `BatchClearedEvent`.
+    /// hypertree book, plus the full v1 bookkeeping suite, plus three
+    /// improvements over Hyperliquid / Manifest / Phoenix:
     ///
-    /// Wave 18f scope: pure book mechanics + FBA clearing. The complex
-    /// bookkeeping that lives in v1's `run_batch` (funding advance, VPIN,
-    /// insurance fund, FLP virtual-quote generation, oracle band, mark-
-    /// change clamp, commit sweep) intentionally does NOT run here yet —
-    /// those layer on in waves 18g+ once the matcher migration is proven
-    /// correct against integration tests. v1's `run_batch` continues to
-    /// exist for markets still on the legacy buffer.
+    ///   1. **Vol-adaptive oracle band** — the `oracle_band_bps` cap on
+    ///      the new mark widens proportionally with realized volatility,
+    ///      so legitimate vol moves aren't clamped (HL uses fixed pct →
+    ///      over-clamps during real moves; Phoenix has no band).
+    ///   2. **VPIN-gated FLP pause** — when toxicity (VPIN) exceeds
+    ///      `FLP_VPIN_PAUSE_THRESHOLD_BPS`, FLP virtual quotes are
+    ///      skipped this batch. Manifest has no LP, Phoenix has no auto-
+    ///      pause, HL has no LP-protection signal — this protects LP
+    ///      capital from toxic flow at the matcher level (not just at
+    ///      the per-fill toxicity-tax level).
+    ///   3. **EMA-blended funding rate** — the per-batch dampened rate is
+    ///      blended 50/50 with the prior `last_funding_rate_bps_per_sec`
+    ///      via EMA, smoothing the funding curve (HL recomputes from
+    ///      scratch each block — high microstructure noise).
     ///
-    /// Off-chain settlement: identical to v1 — fills are applied to
-    /// Position PDAs via per-fill `apply_fill` / `apply_flp_fill` ixs the
-    /// sequencer dispatches after this batch tick, reading the
-    /// `FillAppliedEvent`s emitted in this ix.
+    /// Off-chain settlement is identical to v1 — fills emit
+    /// `FillAppliedEvent`-shaped `BatchClearedEvent`, the sequencer
+    /// dispatches per-fill `apply_fill` / `apply_flp_fill` ixs.
     pub fn run_batch_v2(ctx: Context<RunBatchV2>, now_ms: u64) -> Result<()> {
         let market_key = ctx.accounts.market.key();
 
-        // Phase 1: walk the hypertree to harvest live orders (read-only
-        // borrow on market_book). We also drop GTT-expired orders from
-        // the matcher input — lazy expiry, the keeper reclaims rent later
-        // via cancel_order_v2.
+        // ─── Phase 0: walk the hypertree to harvest live orders ──────────
         let now_slot = Clock::get()?.slot;
         let max_per_side = MAX_BATCH_ORDERS_PER_SIDE_V2;
         let mut orders: Vec<matcher::order::Order> = Vec::with_capacity(2 * max_per_side);
@@ -462,16 +464,217 @@ pub mod flash_book {
             });
         }
 
-        // Phase 2: FBA clearing.
-        let market_acct = &mut ctx.accounts.market;
-        let prior_mark = matcher::lot::Ticks(market_acct.mark_price_ticks);
+        let market = &mut ctx.accounts.market;
+        let commit_buffer = &mut ctx.accounts.commit_buffer;
+        let flp = &ctx.accounts.flp_exposure;
+
+        // ─── Phase 1: advance funding (parity-port from v1 run_batch) ────
+        let block_delta_ms = if market.last_batch_ms == 0 {
+            0
+        } else {
+            now_ms.saturating_sub(market.last_batch_ms)
+        };
+        let mark_for_funding = if market.params.funding_premium_twap_window > 0 {
+            let win = (market.params.funding_premium_twap_window as usize)
+                .min(MARK_HISTORY_LEN)
+                .min(market.recent_clearing_count as usize);
+            if win == 0 {
+                matcher::lot::Ticks(market.mark_price_ticks)
+            } else {
+                let mut sum: u128 = 0;
+                let len = MARK_HISTORY_LEN;
+                let newest_idx = if market.current_batch == 0 {
+                    0
+                } else {
+                    (market.current_batch as usize - 1) % len
+                };
+                for k in 0..win {
+                    let idx = (newest_idx + len - k) % len;
+                    sum = sum.saturating_add(market.recent_clearing_prices[idx] as u128);
+                }
+                let avg = (sum / win as u128).min(u64::MAX as u128) as u64;
+                if avg == 0 {
+                    matcher::lot::Ticks(market.mark_price_ticks)
+                } else {
+                    matcher::lot::Ticks(avg)
+                }
+            }
+        } else {
+            matcher::lot::Ticks(market.mark_price_ticks)
+        };
+        let (raw_new_index, ftick) = matcher::funding::advance(
+            market.cum_funding_index,
+            mark_for_funding,
+            matcher::lot::Ticks(market.oracle_price_ticks),
+            block_delta_ms,
+            market.params.funding_rate_k_bps,
+            market.params.funding_rate_max_bps_per_sec,
+        )?;
+
+        // OI dampener (parity-port).
+        let (new_index, dampened_rate) = if market.params.funding_oi_dampening {
+            let total = (market.oi_long_lots as u128)
+                .saturating_add(market.oi_short_lots as u128);
+            let skew_bps: u128 = if total == 0 {
+                0
+            } else {
+                let imbalance = if market.oi_long_lots >= market.oi_short_lots {
+                    (market.oi_long_lots - market.oi_short_lots) as u128
+                } else {
+                    (market.oi_short_lots - market.oi_long_lots) as u128
+                };
+                ((imbalance.saturating_mul(constants::BPS_DENOM as u128)) / total)
+                    .min(constants::BPS_DENOM as u128)
+            };
+            let index_delta = raw_new_index.saturating_sub(market.cum_funding_index);
+            let scaled_delta = ((index_delta as i128).saturating_mul(skew_bps as i128))
+                / (constants::BPS_DENOM as i128);
+            let scaled_index = market.cum_funding_index.saturating_add(scaled_delta);
+            let scaled_rate = ((ftick.rate_bps_per_sec as i128)
+                .saturating_mul(skew_bps as i128))
+                / (constants::BPS_DENOM as i128);
+            (scaled_index, clamp_i128_to_i64(scaled_rate))
+        } else {
+            (raw_new_index, ftick.rate_bps_per_sec)
+        };
+        market.cum_funding_index = new_index;
+
+        // SMARTER-THAN-HL #1: EMA-blend the dampened rate with the prior
+        // posted rate. See `matcher::v2_bookkeeping::ema_blend_funding_rate`
+        // for the why + math + edge cases.
+        let blended_rate = matcher::v2_bookkeeping::ema_blend_funding_rate(
+            market.last_funding_rate_bps_per_sec,
+            dampened_rate,
+            market.current_batch == 0,
+        );
+        market.last_funding_rate_bps_per_sec = blended_rate;
+
+        // Per-period funding cap (parity-port).
+        if market.params.funding_per_period_max_bps > 0
+            && market.params.funding_period_seconds > 0
+        {
+            let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            if market.period_started_at_unix == 0
+                || now_unix.saturating_sub(market.period_started_at_unix)
+                    >= market.params.funding_period_seconds as u64
+            {
+                market.period_started_at_unix = now_unix;
+                market.period_funding_paid_abs_bps = 0;
+            }
+            let raw_delta = new_index.saturating_sub(market.cum_funding_index);
+            let abs_delta = raw_delta.unsigned_abs();
+            let abs_bps_u128 = abs_delta
+                .saturating_mul(constants::BPS_DENOM as u128)
+                >> constants::FUNDING_INDEX_FRACTIONAL_BITS;
+            let abs_bps = if abs_bps_u128 > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                abs_bps_u128 as u64
+            };
+            let cap = market.params.funding_per_period_max_bps as u64;
+            let prior = market.period_funding_paid_abs_bps;
+            let projected = prior.saturating_add(abs_bps);
+            if projected > cap {
+                let allowed = cap.saturating_sub(prior) as u128;
+                let scale_den = abs_bps as u128;
+                if scale_den != 0 {
+                    let scaled_delta =
+                        (raw_delta as i128).saturating_mul(allowed as i128) / scale_den as i128;
+                    market.cum_funding_index =
+                        market.cum_funding_index.saturating_add(scaled_delta);
+                    market.period_funding_paid_abs_bps = cap;
+                    let rate_scale = ((blended_rate as i128).saturating_mul(allowed as i128))
+                        / scale_den.max(1) as i128;
+                    market.last_funding_rate_bps_per_sec = clamp_i128_to_i64(rate_scale);
+                    emit!(FundingPeriodCapHitEvent {
+                        market: market_key,
+                        period_started_at_unix: market.period_started_at_unix,
+                        cap_bps: cap,
+                        attenuated_rate_bps_per_sec: market.last_funding_rate_bps_per_sec,
+                    });
+                }
+            } else {
+                market.period_funding_paid_abs_bps = projected;
+            }
+        }
+
+        // ─── Phase 2: SMARTER-THAN-MANIFEST #2 — VPIN-gated FLP ──────────
+        // Skip FLP virtual quoting when current toxicity (VPIN) exceeds
+        // the pause threshold. Protects LP capital from informed flow.
+        let realized_vol_bps = realized_vol_bps_from_window(
+            &market.recent_clearing_prices,
+            market.recent_clearing_count,
+        );
+        let vpin_bps_now = market.vpin.as_bps();
+        let flp_paused = vpin_bps_now >= FLP_VPIN_PAUSE_THRESHOLD_BPS;
+
+        if !flp_paused {
+            let flp_pool_capital = flp.total_capital_quote_lots;
+            let flp_net_signed: i64 = {
+                let entry = flp
+                    .per_market
+                    .iter()
+                    .find(|e| e.market == market_key && e.side != 255);
+                match entry {
+                    Some(e) => {
+                        let notional_u128 = (e.size_lots as u128)
+                            .saturating_mul(e.entry_price_ticks as u128)
+                            .saturating_mul(market.params.tick_size as u128);
+                        let notional = notional_u128.min(i64::MAX as u128) as i64;
+                        if e.side == 0 { notional } else { -notional }
+                    }
+                    None => 0,
+                }
+            };
+            let utilization_bps = if flp_pool_capital > 0 {
+                let oi_total =
+                    market.oi_long_lots.saturating_add(market.oi_short_lots) as u128;
+                let notional = oi_total
+                    .saturating_mul(market.mark_price_ticks as u128)
+                    .saturating_mul(market.params.tick_size as u128);
+                ((notional / (flp_pool_capital as u128)).min(constants::BPS_DENOM as u128))
+                    as u32
+            } else {
+                0
+            };
+            let flp_params = FlpQuoterParams {
+                base_spread_bps: market.params.flp_spread_base_bps,
+                alpha_bps: market.params.flp_spread_alpha_bps,
+                beta_bps: market.params.flp_spread_beta_bps,
+                gamma_bps: market.params.flp_spread_gamma_bps,
+                kappa_bps: market.params.flp_spread_kappa_bps,
+                delta_bps: market.params.flp_spread_delta_bps,
+                inventory_lambda_bps: market.params.flp_inventory_lambda_bps,
+                depth_floor_lots: market.params.flp_depth_floor_lots,
+                max_growth_per_batch_bps: market.params.flp_max_growth_per_batch_bps,
+                levels: market.params.flp_quote_levels,
+                tick_size: market.params.tick_size,
+            };
+            let flp_inputs = FlpQuoterInputs {
+                oracle_ticks: matcher::lot::Ticks(market.oracle_price_ticks),
+                vpin_bps: vpin_bps_now,
+                realized_vol_bps,
+                pool_capital_quote_lots: flp_pool_capital,
+                pool_net_quote_lots_signed: flp_net_signed,
+                pool_gross_utilization_bps: utilization_bps,
+                oi_long_lots: market.oi_long_lots,
+                oi_short_lots: market.oi_short_lots,
+            };
+            let flp_trader = flp.key();
+            let flp_seq_base =
+                FLP_SEQ_RESERVED_OFFSET.saturating_add(market.current_batch.saturating_mul(1024));
+            let (_flp_out, flp_orders) =
+                generate_quotes(flp_params, flp_inputs, flp_trader, flp_seq_base)?;
+            for o in flp_orders {
+                orders.push(o);
+            }
+        }
+
+        // ─── Phase 3: FBA Walrasian clearing ─────────────────────────────
+        let prior_mark = matcher::lot::Ticks(market.mark_price_ticks);
         let result = matcher::fba::clear_batch(&orders, prior_mark)?;
 
-        // Phase 3: apply fills back to the hypertree. Aggregate per source
-        // order (multiple fills can reference the same maker), so we mutate
-        // each node exactly once — cheaper than per-fill RBT lookups and
-        // avoids the "remove first, then partial fill from the second fill
-        // hits NIL" hazard.
+        // ─── Phase 4: apply fills back to the hypertree ──────────────────
         let mut consumed: Vec<(u64, hypertree::DataIndex, bool, u64)> =
             Vec::with_capacity(sources.len());
         for fill in &result.fills {
@@ -490,7 +693,6 @@ pub mod flash_book {
                 }
             }
         }
-
         if !consumed.is_empty() {
             let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
             let mut handle =
@@ -507,27 +709,94 @@ pub mod flash_book {
             }
         }
 
-        // Phase 4: update mark price (raw clearing price — wave 18g layers
-        // back the TWAP / oracle band / mark-change clamp from v1).
+        // ─── Phase 5: update mark price (TWAP + VOL-ADAPTIVE band + clamp)
         if result.clearing_volume.0 > 0 {
-            market_acct.mark_price_ticks = result.clearing_price.0;
+            let len = MARK_HISTORY_LEN;
+            let idx = (market.current_batch as usize) % len;
+            market.recent_clearing_prices[idx] = result.clearing_price.0;
+            if (market.recent_clearing_count as usize) < len {
+                market.recent_clearing_count =
+                    market.recent_clearing_count.saturating_add(1);
+            }
+            let count = market.recent_clearing_count as usize;
+            let sum: u128 = market
+                .recent_clearing_prices
+                .iter()
+                .take(count)
+                .fold(0u128, |acc, p| acc.saturating_add(*p as u128));
+            let twap = sum
+                .checked_div(count as u128)
+                .unwrap_or(result.clearing_price.0 as u128) as u64;
+
+            // SMARTER-THAN-HL #3: vol-adaptive oracle band. See
+            // `matcher::v2_bookkeeping::vol_adaptive_band_bps` for the
+            // multiplier curve, the 4× cap rationale, and unit tests.
+            let adaptive_band_bps = matcher::v2_bookkeeping::vol_adaptive_band_bps(
+                market.params.oracle_band_bps,
+                realized_vol_bps,
+            ) as u128;
+            let band = (market.oracle_price_ticks as u128)
+                .saturating_mul(adaptive_band_bps)
+                / constants::BPS_DENOM as u128;
+            let lo = (market.oracle_price_ticks as u128).saturating_sub(band) as u64;
+            let hi = (market.oracle_price_ticks as u128)
+                .saturating_add(band)
+                .min(u64::MAX as u128) as u64;
+            let banded = twap.max(lo).min(hi);
+
+            // Mark-change sanity cap (parity-port).
+            let prior = market.mark_price_ticks as u128;
+            let cap_bps = market.params.mark_change_max_bps as u128;
+            let new_mark = if cap_bps > 0 && prior > 0 {
+                let cap_delta = prior.saturating_mul(cap_bps) / constants::BPS_DENOM as u128;
+                let cap_lo = prior.saturating_sub(cap_delta) as u64;
+                let cap_hi = prior
+                    .saturating_add(cap_delta)
+                    .min(u64::MAX as u128) as u64;
+                let clamped = banded.max(cap_lo).min(cap_hi);
+                if clamped != banded {
+                    emit!(MarkChangeClampedEvent {
+                        market: market_key,
+                        batch_num: market.current_batch,
+                        unclamped_mark_ticks: banded,
+                        clamped_mark_ticks: clamped,
+                        prior_mark_ticks: prior as u64,
+                    });
+                }
+                clamped
+            } else {
+                banded
+            };
+            market.mark_price_ticks = new_mark;
         }
 
-        // Phase 5: bookkeeping.
-        market_acct.current_batch = market_acct
+        // ─── Phase 6: update VPIN (parity-port) ──────────────────────────
+        let vpin_bucket = market.params.vpin_bucket_size_lots;
+        let vpin_window = market.params.vpin_ema_window;
+        for fill in &result.fills {
+            market
+                .vpin
+                .record_fill(fill.taker_side, fill.size.0, vpin_bucket, vpin_window)?;
+        }
+
+        // ─── Phase 7: sweep expired commit-bonds (parity-port) ───────────
+        let seized = sweep_expired(&mut commit_buffer.commits, market.current_batch);
+
+        // ─── Phase 8: bookkeeping + event ────────────────────────────────
+        market.current_batch = market
             .current_batch
             .checked_add(1)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        market_acct.last_batch_ms = now_ms;
+        market.last_batch_ms = now_ms;
 
         emit!(BatchClearedEvent {
             market: market_key,
-            batch_num: market_acct.current_batch,
+            batch_num: market.current_batch,
             clearing_price: result.clearing_price.0,
             clearing_volume: result.clearing_volume.0,
             fill_count: result.fills.len() as u32,
-            funding_rate_bps_per_sec: 0,
-            seized_bonds: 0,
+            funding_rate_bps_per_sec: market.last_funding_rate_bps_per_sec,
+            seized_bonds: seized,
         });
         Ok(())
     }
@@ -6178,6 +6447,22 @@ pub struct RunBatchV2<'info> {
         bump,
     )]
     pub market_book: UncheckedAccount<'info>,
+
+    /// Mut so commit-buffer expired-bond sweep can clear stale entries.
+    #[account(
+        mut,
+        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
+        bump = commit_buffer.bump,
+    )]
+    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
+
+    /// Read-only — feeds FLP virtual quote generation. The pool's NAV
+    /// is mutated by `apply_flp_fill` (separate ix), not by run_batch.
+    #[account(
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
+    )]
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
 }
 
 #[derive(Accounts)]
@@ -7985,6 +8270,15 @@ pub const BOOK_DEPTH_LEVELS: usize = 4;
 /// CU usage bounded. Wave 18g lifts this when the matcher is refactored
 /// to a streaming O(N log N) walk over the price ladder.
 pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 64;
+
+/// VPIN level (bps of toxicity probability) at or above which `run_batch_v2`
+/// SKIPS FLP virtual-quote generation for the current batch. Protects LP
+/// capital from informed flow at the matcher level (the per-fill toxicity
+/// tax is a downstream defence; this is upstream — don't even quote).
+/// 7000 bps = 70%: a high-confidence "this batch is being adversarially
+/// selected" signal. Below 70% LP keeps quoting normally; the spread
+/// widens via the existing VPIN-scaled `kappa_bps` term in the FLP quoter.
+pub const FLP_VPIN_PAUSE_THRESHOLD_BPS: u32 = 7000;
 
 #[event]
 pub struct OrderCancelledV2Event {

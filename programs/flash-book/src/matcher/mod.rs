@@ -10,6 +10,7 @@ pub mod liquidation;
 pub mod lot;
 pub mod order;
 pub mod risk;
+pub mod v2_bookkeeping;
 pub mod vpin;
 
 #[cfg(test)]

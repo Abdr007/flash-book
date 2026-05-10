@@ -368,9 +368,9 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// V2 matcher tick: run an FBA Walrasian clearing over the resting
-  /// hypertree book. Mutates filled-order sizes / removes fully-filled
-  /// nodes, updates the market mark price, emits BatchClearedEvent.
+  /// V2 matcher tick: full pipeline — funding advance + EMA-blended rate +
+  /// VPIN-gated FLP virtuals + FBA Walrasian clearing + node mutation +
+  /// vol-adaptive mark band + commit-bond sweep + BatchClearedEvent emit.
   /// Permissionless — any signer can call it (sequencer in production).
   runBatchV2Ix(args: {
     sequencer: PublicKey;
@@ -378,12 +378,16 @@ export class FlashBookClient {
     nowMs: bigint | number;
   }): Promise<TransactionInstruction> {
     const book = marketBookPda(args.market);
+    const commitBuffer = this.commitBuffer(args.market);
+    const flpExposure = this.flpExposure();
     return this.methods
       .runBatchV2(args.nowMs)
       .accountsPartial({
         sequencer: args.sequencer,
         market: args.market,
         marketBook: book.address,
+        commitBuffer: commitBuffer.address,
+        flpExposure: flpExposure.address,
       })
       .instruction();
   }

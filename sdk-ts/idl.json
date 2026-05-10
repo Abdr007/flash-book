@@ -5650,22 +5650,27 @@
       "name": "run_batch_v2",
       "docs": [
         "V2 matcher tick: run an FBA Walrasian clearing over the resting",
-        "hypertree book, mutate filled orders in place (decrement on partial,",
-        "remove + free on full), update the market mark price, and emit a",
-        "`BatchClearedEvent`.",
+        "hypertree book, plus the full v1 bookkeeping suite, plus three",
+        "improvements over Hyperliquid / Manifest / Phoenix:",
         "",
-        "Wave 18f scope: pure book mechanics + FBA clearing. The complex",
-        "bookkeeping that lives in v1's `run_batch` (funding advance, VPIN,",
-        "insurance fund, FLP virtual-quote generation, oracle band, mark-",
-        "change clamp, commit sweep) intentionally does NOT run here yet —",
-        "those layer on in waves 18g+ once the matcher migration is proven",
-        "correct against integration tests. v1's `run_batch` continues to",
-        "exist for markets still on the legacy buffer.",
+        "1. **Vol-adaptive oracle band** — the `oracle_band_bps` cap on",
+        "the new mark widens proportionally with realized volatility,",
+        "so legitimate vol moves aren't clamped (HL uses fixed pct →",
+        "over-clamps during real moves; Phoenix has no band).",
+        "2. **VPIN-gated FLP pause** — when toxicity (VPIN) exceeds",
+        "`FLP_VPIN_PAUSE_THRESHOLD_BPS`, FLP virtual quotes are",
+        "skipped this batch. Manifest has no LP, Phoenix has no auto-",
+        "pause, HL has no LP-protection signal — this protects LP",
+        "capital from toxic flow at the matcher level (not just at",
+        "the per-fill toxicity-tax level).",
+        "3. **EMA-blended funding rate** — the per-batch dampened rate is",
+        "blended 50/50 with the prior `last_funding_rate_bps_per_sec`",
+        "via EMA, smoothing the funding curve (HL recomputes from",
+        "scratch each block — high microstructure noise).",
         "",
-        "Off-chain settlement: identical to v1 — fills are applied to",
-        "Position PDAs via per-fill `apply_fill` / `apply_flp_fill` ixs the",
-        "sequencer dispatches after this batch tick, reading the",
-        "`FillAppliedEvent`s emitted in this ix."
+        "Off-chain settlement is identical to v1 — fills emit",
+        "`FillAppliedEvent`-shaped `BatchClearedEvent`, the sequencer",
+        "dispatches per-fill `apply_fill` / `apply_flp_fill` ixs."
       ],
       "discriminator": [
         153,
@@ -5739,6 +5744,67 @@
               {
                 "kind": "account",
                 "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "commit_buffer",
+          "docs": [
+            "Mut so commit-buffer expired-bond sweep can clear stale entries."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  95,
+                  98,
+                  117,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "docs": [
+            "Read-only — feeds FLP virtual quote generation. The pool's NAV",
+            "is mutated by `apply_flp_fill` (separate ix), not by run_batch."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
               }
             ]
           }
