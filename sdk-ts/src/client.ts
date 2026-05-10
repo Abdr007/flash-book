@@ -1726,6 +1726,52 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// V2 atomic bracket — parent limit + TP + SL OCO triggers, parent
+  /// inserted into the hypertree-backed book. Pure parity port of v1
+  /// (same validation, same TP/SL kind logic, same FLAG_BRACKET_LEG
+  /// marking, same OCO linking). Pair with executeTriggerOrderV2Ix on
+  /// the trigger keepers — those fire into the same hypertree.
+  placeBracketOrderV2Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    parentSide: 'long' | 'short';
+    sizeLots: bigint | number;
+    parentLimitTicks: bigint | number;
+    tpTriggerId: number;
+    tpTriggerPriceTicks: bigint | number;
+    tpLimitTicks: bigint | number;
+    slTriggerId: number;
+    slTriggerPriceTicks: bigint | number;
+    slLimitTicks: bigint | number;
+    expiresAtSlot?: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    const tp = triggerOrderPda(args.market, args.trader, args.tpTriggerId);
+    const sl = triggerOrderPda(args.market, args.trader, args.slTriggerId);
+    return this.methods
+      .placeBracketOrderV2(
+        args.parentSide === 'long' ? 0 : 1,
+        args.sizeLots,
+        args.parentLimitTicks,
+        args.tpTriggerId,
+        args.tpTriggerPriceTicks,
+        args.tpLimitTicks,
+        args.slTriggerId,
+        args.slTriggerPriceTicks,
+        args.slLimitTicks,
+        args.expiresAtSlot ?? new BN(0),
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        marketBook: book.address,
+        tpTrigger: tp.address,
+        slTrigger: sl.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
   /// Set the per-position leverage cap (Hyperliquid pattern). `cap` ∈
   /// [1, market.maxLeverage]; 0 to clear. Trader OR delegate signs.
   /// Enforced on `placeLimitOrder` intake against projected post-fill

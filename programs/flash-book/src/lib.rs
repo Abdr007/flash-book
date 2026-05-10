@@ -4062,6 +4062,208 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// V2 bracket order — atomic parent + take-profit + stop-loss against
+    /// the hypertree-backed book. Pure parity port of v1's
+    /// `place_bracket_order` (same validation, same TP/SL kind logic for
+    /// long-vs-short, same FLAG_BRACKET_LEG marking, same
+    /// reduce-only/active flag set). Only the parent's order injection
+    /// target differs (hypertree, not v1 buffer).
+    ///
+    /// Hyperliquid pattern: trader places parent + 2 reduce-only OCO
+    /// triggers in one tx. When parent fills, position opens. When the
+    /// oracle later crosses TP, TP trigger fires (closes via reduce-only)
+    /// and the SL is auto-deactivated by `execute_trigger_order_v2`'s OCO
+    /// partner walk. Survives bot downtime AND eliminates the gap between
+    /// parent fill and child trigger placement.
+    pub fn place_bracket_order_v2(
+        ctx: Context<PlaceBracketOrderV2>,
+        parent_side: u8,
+        size_lots: u64,
+        parent_limit_ticks: u64,
+        tp_trigger_id: u8,
+        tp_trigger_price_ticks: u64,
+        tp_limit_ticks: u64,
+        sl_trigger_id: u8,
+        sl_trigger_price_ticks: u64,
+        sl_limit_ticks: u64,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        require!(parent_side <= 1, FlashBookError::OutOfRange);
+        require!(tp_trigger_id != sl_trigger_id, FlashBookError::OutOfRange);
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(parent_limit_ticks > 0, FlashBookError::ZeroPrice);
+        require!(tp_trigger_price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(sl_trigger_price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(tp_limit_ticks > 0, FlashBookError::ZeroPrice);
+        require!(sl_limit_ticks > 0, FlashBookError::ZeroPrice);
+
+        let market = &ctx.accounts.market;
+        require!(
+            size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            (parent_limit_ticks % market.params.tick_size == 0),
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            (tp_trigger_price_ticks % market.params.tick_size == 0),
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            (sl_trigger_price_ticks % market.params.tick_size == 0),
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            (tp_limit_ticks % market.params.tick_size == 0),
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            (sl_limit_ticks % market.params.tick_size == 0),
+            FlashBookError::PriceNotOnTick
+        );
+
+        let now = Clock::get()?.slot;
+        if expires_at_slot > 0 {
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
+
+        // TP must be on the profitable side, SL on the loss side
+        // (parity with v1).
+        if parent_side == 0 {
+            require!(
+                tp_trigger_price_ticks > parent_limit_ticks,
+                FlashBookError::OutOfRange
+            );
+            require!(
+                sl_trigger_price_ticks < parent_limit_ticks,
+                FlashBookError::OutOfRange
+            );
+        } else {
+            require!(
+                tp_trigger_price_ticks < parent_limit_ticks,
+                FlashBookError::OutOfRange
+            );
+            require!(
+                sl_trigger_price_ticks > parent_limit_ticks,
+                FlashBookError::OutOfRange
+            );
+        }
+
+        let trader_pk = ctx.accounts.trader.key();
+        let market_key = market.key();
+
+        // ── 1. Insert parent order into the hypertree.
+        let next_seq;
+        let parent_node_idx;
+        {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let mut handle =
+                state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            require!(
+                handle.header.market_pubkey == market_key,
+                FlashBookError::WrongMarket
+            );
+            next_seq = handle
+                .header
+                .order_seq_counter
+                .checked_add(1)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            require!(
+                next_seq < FLP_SEQ_RESERVED_OFFSET,
+                FlashBookError::OutOfRange
+            );
+            handle.header.order_seq_counter = next_seq;
+
+            let side_is_bid = parent_side == 0;
+            let parent = state_v2::RestingOrderV2 {
+                order_id: state_v2::encode_order_id(
+                    parent_limit_ticks,
+                    next_seq,
+                    side_is_bid,
+                ),
+                seq: next_seq,
+                price_ticks: parent_limit_ticks,
+                size_lots,
+                expires_at_slot: 0,
+                trader: trader_pk,
+                last_valid_slot: now as u32,
+                side: parent_side,
+                order_type: 0, // limit
+                flags: 0,
+                _pad: 0,
+            };
+            parent_node_idx = if side_is_bid {
+                handle.insert_bid(parent)?
+            } else {
+                handle.insert_ask(parent)?
+            };
+        }
+
+        // ── 2. Wire the two reduce-only triggers (parity with v1).
+        let close_side: u8 = 1 - parent_side;
+        let (tp_kind, sl_kind) = if parent_side == 0 {
+            (1u8, 0u8) // long: TP fires on ≥, SL fires on ≤
+        } else {
+            (0u8, 1u8) // short: TP fires on ≤, SL fires on ≥
+        };
+
+        let tp = &mut ctx.accounts.tp_trigger;
+        let sl = &mut ctx.accounts.sl_trigger;
+        let tp_key = tp.key();
+        let sl_key = sl.key();
+        let common_flags = state::TriggerOrderAccount::FLAG_ACTIVE
+            | state::TriggerOrderAccount::FLAG_REDUCE_ONLY
+            | state::TriggerOrderAccount::FLAG_BRACKET_LEG;
+
+        tp.trader = trader_pk;
+        tp.market = market_key;
+        tp.bump = ctx.bumps.tp_trigger;
+        tp.trigger_id = tp_trigger_id;
+        tp.side = close_side;
+        tp.kind = tp_kind;
+        tp.flags = common_flags;
+        tp.size_lots = size_lots;
+        tp.trigger_price_ticks = tp_trigger_price_ticks;
+        tp.limit_price_ticks = tp_limit_ticks;
+        tp.created_at_slot = now;
+        tp.expires_at_slot = expires_at_slot;
+        tp.oco_pair = sl_key;
+        tp.trailing_offset_bps = 0;
+        tp.trailing_anchor_ticks = 0;
+
+        sl.trader = trader_pk;
+        sl.market = market_key;
+        sl.bump = ctx.bumps.sl_trigger;
+        sl.trigger_id = sl_trigger_id;
+        sl.side = close_side;
+        sl.kind = sl_kind;
+        sl.flags = common_flags;
+        sl.size_lots = size_lots;
+        sl.trigger_price_ticks = sl_trigger_price_ticks;
+        sl.limit_price_ticks = sl_limit_ticks;
+        sl.created_at_slot = now;
+        sl.expires_at_slot = expires_at_slot;
+        sl.oco_pair = tp_key;
+        sl.trailing_offset_bps = 0;
+        sl.trailing_anchor_ticks = 0;
+
+        emit!(BracketOrderPlacedV2Event {
+            market: market_key,
+            trader: trader_pk,
+            parent_side,
+            size_lots,
+            parent_limit_ticks,
+            parent_seq: next_seq,
+            parent_node_index: parent_node_idx,
+            tp_trigger_id,
+            sl_trigger_id,
+            tp_trigger_price_ticks,
+            sl_trigger_price_ticks,
+        });
+        Ok(())
+    }
+
     /// Ratchet a trailing-stop trigger order — permissionless. Reads the
     /// current oracle and updates the trigger's anchor + price if the
     /// oracle has moved in the trader's favour. Hyperliquid trailing-stop
@@ -8663,6 +8865,66 @@ pub struct PlaceBracketOrder<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(
+    parent_side: u8,
+    size_lots: u64,
+    parent_limit_ticks: u64,
+    tp_trigger_id: u8,
+    tp_trigger_price_ticks: u64,
+    tp_limit_ticks: u64,
+    sl_trigger_id: u8,
+)]
+pub struct PlaceBracketOrderV2<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at market_book seed; disc validated inside handler.
+    /// Mut because the parent limit order is inserted into the hypertree.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state::TriggerOrderAccount::space(),
+        seeds = [
+            state::TriggerOrderAccount::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[tp_trigger_id],
+        ],
+        bump,
+    )]
+    pub tp_trigger: Account<'info, state::TriggerOrderAccount>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state::TriggerOrderAccount::space(),
+        seeds = [
+            state::TriggerOrderAccount::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[sl_trigger_id],
+        ],
+        bump,
+    )]
+    pub sl_trigger: Account<'info, state::TriggerOrderAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 #[instruction(twap_id: u8)]
 pub struct PlaceTwapOrder<'info> {
     #[account(mut)]
@@ -9891,6 +10153,22 @@ pub struct BracketOrderPlacedEvent {
     pub size_lots: u64,
     pub parent_limit_ticks: u64,
     pub parent_seq: u64,
+    pub tp_trigger_id: u8,
+    pub sl_trigger_id: u8,
+    pub tp_trigger_price_ticks: u64,
+    pub sl_trigger_price_ticks: u64,
+}
+
+#[event]
+pub struct BracketOrderPlacedV2Event {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub parent_side: u8,
+    pub size_lots: u64,
+    pub parent_limit_ticks: u64,
+    pub parent_seq: u64,
+    /// Hypertree node index of the inserted parent RestingOrderV2.
+    pub parent_node_index: u32,
     pub tp_trigger_id: u8,
     pub sl_trigger_id: u8,
     pub tp_trigger_price_ticks: u64,
