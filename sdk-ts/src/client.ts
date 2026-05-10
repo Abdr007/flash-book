@@ -347,6 +347,40 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// V2 trigger execute — fires a stop-loss / take-profit / OCO trigger
+  /// against the hypertree-backed book. Same trigger semantics as v1
+  /// (kind, oracle compare, reduce-only, OCO partner deactivation); only
+  /// the order injection target differs (v2 hypertree, not v1 buffer).
+  /// Permissionless caller — pre-authorized by trader at trigger creation.
+  ///
+  /// Pass the OCO partner trigger PDA as the first remaining_account if
+  /// this trigger participates in an OCO bracket.
+  executeTriggerOrderV2Ix(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    triggerOrder: PublicKey;
+    triggerOwner: PublicKey;
+    ocoPartner?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    const position = positionPda(args.market, args.triggerOwner);
+    const builder = this.methods
+      .executeTriggerOrderV2()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        marketBook: book.address,
+        triggerOrder: args.triggerOrder,
+        position: position.address,
+      });
+    if (args.ocoPartner) {
+      builder.remainingAccounts([
+        { pubkey: args.ocoPartner, isWritable: true, isSigner: false },
+      ]);
+    }
+    return builder.instruction();
+  }
+
   /// V2 cancel: remove a resting order from the hypertree-backed book.
   /// `orderId` is the encoded Phoenix-style id from `OrderPlacedV2Event`
   /// (= `(price << 16) | (seq & 0xffff)`, inverted for bids). The SDK

@@ -3518,6 +3518,128 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// V2: execute a trigger order against the hypertree-backed book.
+    /// Same trigger semantics as v1 (kind, oracle compare, reduce-only,
+    /// expiry, OCO partner deactivation) — only the order injection
+    /// target differs: insert as a `RestingOrderV2` node in the bid or
+    /// ask RBT instead of writing into the legacy flat buffer.
+    ///
+    /// Permissionless executor (any signer can fire a triggered trigger
+    /// — trader pre-authorized by creating the trigger).
+    pub fn execute_trigger_order_v2(
+        ctx: Context<ExecuteTriggerOrderV2>,
+    ) -> Result<()> {
+        let trigger = &ctx.accounts.trigger_order;
+        let market = &ctx.accounts.market;
+        require!(
+            trigger.flags & state::TriggerOrderAccount::FLAG_ACTIVE != 0,
+            FlashBookError::OutOfRange
+        );
+
+        let now = Clock::get()?.slot;
+        if trigger.expires_at_slot > 0 {
+            require!(trigger.expires_at_slot >= now, FlashBookError::OutOfRange);
+        }
+
+        let oracle = market.oracle_price_ticks;
+        let fired = if trigger.kind == 0 {
+            oracle <= trigger.trigger_price_ticks
+        } else {
+            oracle >= trigger.trigger_price_ticks
+        };
+        require!(fired, FlashBookError::OutOfRange);
+
+        if trigger.flags & state::TriggerOrderAccount::FLAG_REDUCE_ONLY != 0 {
+            let position = &ctx.accounts.position;
+            require!(position.size_lots > 0, FlashBookError::OutOfRange);
+            require!(position.side != trigger.side, FlashBookError::OutOfRange);
+            require!(
+                trigger.size_lots <= position.size_lots,
+                FlashBookError::OutOfRange
+            );
+        }
+
+        // V2 inject — into the hypertree.
+        let market_key = market.key();
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle =
+            state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        require!(
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+        let next_seq = handle
+            .header
+            .order_seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+        handle.header.order_seq_counter = next_seq;
+
+        let side_is_bid = trigger.side == 0;
+        let order = state_v2::RestingOrderV2 {
+            order_id: state_v2::encode_order_id(
+                trigger.limit_price_ticks,
+                next_seq,
+                side_is_bid,
+            ),
+            seq: next_seq,
+            price_ticks: trigger.limit_price_ticks,
+            size_lots: trigger.size_lots,
+            expires_at_slot: 0,
+            trader: trigger.trader,
+            last_valid_slot: now as u32,
+            side: trigger.side,
+            order_type: 0, // limit
+            flags: 0,
+            _pad: 0,
+        };
+        let inserted_idx = if side_is_bid {
+            handle.insert_bid(order)?
+        } else {
+            handle.insert_ask(order)?
+        };
+        // Drop the borrow before re-borrowing for OCO partner read below.
+        drop(book_data);
+
+        // Mark trigger inactive (mirror of v1).
+        let oco_pair_key = ctx.accounts.trigger_order.oco_pair;
+        let trigger = &mut ctx.accounts.trigger_order;
+        trigger.flags &= !state::TriggerOrderAccount::FLAG_ACTIVE;
+        let exec_trader = trigger.trader;
+        let exec_id = trigger.trigger_id;
+
+        if oco_pair_key != Pubkey::default() {
+            let oco_ai = ctx
+                .remaining_accounts
+                .iter()
+                .find(|a| a.key() == oco_pair_key)
+                .ok_or_else(|| error!(FlashBookError::OcoPairMismatch))?;
+            require!(oco_ai.is_writable, FlashBookError::OcoPairMismatch);
+            let mut data = oco_ai.try_borrow_mut_data()?;
+            let mut partner: state::TriggerOrderAccount =
+                state::TriggerOrderAccount::try_deserialize(&mut &data[..])?;
+            require!(
+                partner.oco_pair == ctx.accounts.trigger_order.key(),
+                FlashBookError::OcoPairMismatch
+            );
+            partner.flags &= !state::TriggerOrderAccount::FLAG_ACTIVE;
+            let mut cursor = &mut data[..];
+            partner.try_serialize(&mut cursor)?;
+        }
+
+        emit!(TriggerOrderExecutedV2Event {
+            market: market_key,
+            trader: exec_trader,
+            trigger_id: exec_id,
+            executor: ctx.accounts.caller.key(),
+            oracle_price_ticks: oracle,
+            order_seq: next_seq,
+            node_index: inserted_idx,
+        });
+        Ok(())
+    }
+
     /// Cancel a trigger order. Trader signs; account is closed and rent
     /// returned to the trader. Works whether the trigger has already fired
     /// (active=0) or not (active=1). If this trigger participates in an
@@ -7623,6 +7745,48 @@ pub struct ExecuteTriggerOrder<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ExecuteTriggerOrderV2<'info> {
+    /// Permissionless caller pays tx fee.
+    pub caller: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at the market_book seed; disc validated inside handler
+    /// via `MarketBookHandle::from_account_data`. Mut because the trigger
+    /// inserts a new resting order.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::TriggerOrderAccount::SEED,
+            market.key().as_ref(),
+            trigger_order.trader.as_ref(),
+            &[trigger_order.trigger_id],
+        ],
+        bump = trigger_order.bump,
+    )]
+    pub trigger_order: Account<'info, state::TriggerOrderAccount>,
+
+    /// Trader's position — required when reduce_only flag is set.
+    /// Same lazy-load pattern as v1.
+    #[account(
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trigger_order.trader.as_ref()],
+        bump,
+    )]
+    pub position: Account<'info, state::PositionAccount>,
+}
+
+#[derive(Accounts)]
 pub struct UpdateTrailingStop<'info> {
     /// Permissionless. Caller pays tx fee. Production deployments wire
     /// this to a per-market keeper that reads oracle ticks and calls
@@ -8673,6 +8837,19 @@ pub struct TriggerOrderCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub trigger_id: u8,
+}
+
+#[event]
+pub struct TriggerOrderExecutedV2Event {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub trigger_id: u8,
+    pub executor: Pubkey,
+    pub oracle_price_ticks: u64,
+    /// Sequence assigned to the synthesized resting order.
+    pub order_seq: u64,
+    /// Hypertree node index of the inserted RestingOrderV2.
+    pub node_index: u32,
 }
 
 /// View ix output: cross-market portfolio risk for a trader.

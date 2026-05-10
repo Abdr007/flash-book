@@ -2294,6 +2294,136 @@
       "args": []
     },
     {
+      "name": "execute_trigger_order_v2",
+      "docs": [
+        "V2: execute a trigger order against the hypertree-backed book.",
+        "Same trigger semantics as v1 (kind, oracle compare, reduce-only,",
+        "expiry, OCO partner deactivation) — only the order injection",
+        "target differs: insert as a `RestingOrderV2` node in the bid or",
+        "ask RBT instead of writing into the legacy flat buffer.",
+        "",
+        "Permissionless executor (any signer can fire a triggered trigger",
+        "— trader pre-authorized by creating the trigger)."
+      ],
+      "discriminator": [
+        5,
+        228,
+        48,
+        119,
+        8,
+        214,
+        183,
+        150
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Permissionless caller pays tx fee."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "via `MarketBookHandle::from_account_data`. Mut because the trigger",
+            "inserts a new resting order."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trigger_order",
+          "writable": true
+        },
+        {
+          "name": "position",
+          "docs": [
+            "Trader's position — required when reduce_only flag is set.",
+            "Same lazy-load pattern as v1."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "trigger_order.trader",
+                "account": "TriggerOrderAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "execute_twap_slice",
       "docs": [
         "Execute the next TWAP slice — permissionless. Re-checks the",
@@ -9472,6 +9602,19 @@
       ]
     },
     {
+      "name": "TriggerOrderExecutedV2Event",
+      "discriminator": [
+        76,
+        72,
+        33,
+        79,
+        69,
+        227,
+        152,
+        21
+      ]
+    },
+    {
       "name": "TriggerOrderPlacedEvent",
       "discriminator": [
         199,
@@ -12860,6 +13003,48 @@
           {
             "name": "oracle_price_ticks",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TriggerOrderExecutedV2Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "trigger_id",
+            "type": "u8"
+          },
+          {
+            "name": "executor",
+            "type": "pubkey"
+          },
+          {
+            "name": "oracle_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "order_seq",
+            "docs": [
+              "Sequence assigned to the synthesized resting order."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "node_index",
+            "docs": [
+              "Hypertree node index of the inserted RestingOrderV2."
+            ],
+            "type": "u32"
           }
         ]
       }
