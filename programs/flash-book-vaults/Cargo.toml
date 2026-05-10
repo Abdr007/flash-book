@@ -1,0 +1,21 @@
+[package]
+name = "flash-book-vaults"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Flash Book Vaults — strategist vaults, depositor shares, withdraw queueing. CPIs into flash-book-core."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "flash_book_vaults"
+
+[features]
+default = []
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true }

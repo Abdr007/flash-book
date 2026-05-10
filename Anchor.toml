@@ -4,6 +4,9 @@ skip-lint = false
 
 [programs.localnet]
 flash_book = "FBookV1111111111111111111111111111111111111"
+flash_book_orders = "2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5"
+flash_book_flp = "eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M"
+flash_book_vaults = "GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt"
 
 [provider]
 cluster = "localnet"
@@ -13,4 +16,9 @@ wallet = "~/.config/solana/id.json"
 test = "bun test programs/flash-book/tests"
 
 [workspace]
-members = ["programs/flash-book"]
+members = [
+    "programs/flash-book",
+    "programs/flash-book-orders",
+    "programs/flash-book-flp",
+    "programs/flash-book-vaults",
+]

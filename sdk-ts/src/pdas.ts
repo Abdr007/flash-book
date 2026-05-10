@@ -16,6 +16,21 @@ export const FLASH_BOOK_PROGRAM_ID = new PublicKey(
   'FBookV1111111111111111111111111111111111111',
 );
 
+/// Wave 21 program-split sister IDs. SKELETONS as of wave 21 phase 1
+/// (deployable; no functional ixs beyond `ping`). See
+/// `docs/V3_WAVE21_MODULAR.md` for the migration plan.
+export const FLASH_BOOK_ORDERS_PROGRAM_ID = new PublicKey(
+  '2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5',
+);
+
+export const FLASH_BOOK_FLP_PROGRAM_ID = new PublicKey(
+  'eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M',
+);
+
+export const FLASH_BOOK_VAULTS_PROGRAM_ID = new PublicKey(
+  'GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt',
+);
+
 export const TOKEN_PROGRAM_ID = new PublicKey(
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
 );

@@ -101,13 +101,23 @@ This means:
 This is a hard migration because account ownership changes mid-flight.
 Cannot be done with a simple program upgrade.
 
-### Phase 1 — Deploy the 3 new programs (zero traffic)
+### Phase 1 — Deploy the 3 new programs (zero traffic) ✅ SHIPPED
 
-  1. Deploy `flash-book-orders` to a fresh program ID.
-  2. Deploy `flash-book-flp` to a fresh program ID.
-  3. Deploy `flash-book-vaults` to a fresh program ID.
-  4. Each program ships as `pub mod flash_book_orders` etc. with empty
-     account types — no functionality yet.
+  1. ✅ `flash-book-orders` — program ID
+     `2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5`
+  2. ✅ `flash-book-flp` — program ID
+     `eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M`
+  3. ✅ `flash-book-vaults` — program ID
+     `GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt`
+  4. ✅ Each program ships as `pub mod flash_book_orders` etc. with
+     a single liveness ix `ping` that emits a `Pong` event. Lets
+     operators verify the program is deployed + callable on a target
+     cluster before wiring any state. `target/deploy/*.so` ready to
+     ship via `solana program deploy`.
+
+  All 4 programs build clean. IDLs generated in `target/idl/`.
+  Workspace + `Anchor.toml` updated. SDK exports the 3 new program
+  IDs (`FLASH_BOOK_ORDERS_PROGRAM_ID`, `_FLP_`, `_VAULTS_`).
 
 ### Phase 2 — Add CPI surface in core
 
