@@ -82,26 +82,6 @@ export interface MarketParamsAccount {
   batchIntervalMs: number;
 }
 
-export interface OrderBufferAccount {
-  market: PublicKey;
-  bump: number;
-  head: number;
-  seqCounter: BN;
-  slots: OrderSlot[];
-}
-
-export interface OrderSlot {
-  valid: number;
-  side: number;
-  orderType: number;
-  postOnly: number;
-  seq: BN;
-  id: BN;
-  trader: PublicKey;
-  sizeLots: BN;
-  limitTicks: BN;
-}
-
 export interface CommitBufferAccount {
   market: PublicKey;
   bump: number;
@@ -187,13 +167,6 @@ export async function fetchMarket(client: FlashBookClient, address: PublicKey): 
   return (await ns(client).marketAccount.fetchNullable(address)) as MarketAccount | null;
 }
 
-export async function fetchOrderBuffer(
-  client: FlashBookClient,
-  address: PublicKey,
-): Promise<OrderBufferAccount | null> {
-  return (await ns(client).orderBufferAccount.fetchNullable(address)) as OrderBufferAccount | null;
-}
-
 export async function fetchCommitBuffer(
   client: FlashBookClient,
   address: PublicKey,
@@ -239,7 +212,6 @@ export async function fetchPosition(
 export function decodeAccount<T>(
   accountName:
     | 'marketAccount'
-    | 'orderBufferAccount'
     | 'commitBufferAccount'
     | 'insuranceFundAccount'
     | 'flpExposureAccount'

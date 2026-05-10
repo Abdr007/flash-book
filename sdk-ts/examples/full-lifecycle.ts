@@ -88,7 +88,6 @@ line('base mint', baseMint);
 line('quote mint', quoteMint);
 
 const market = client.market(baseMint, quoteMint);
-const orderBuffer = client.orderBuffer(market.address);
 const commitBuffer = client.commitBuffer(market.address);
 const insuranceFund = client.insuranceFund();
 const flpExposure = client.flpExposure();
@@ -97,7 +96,6 @@ const counterpartyState = client.traderState(counterparty.publicKey);
 const traderPosition = client.position(market.address, trader.publicKey);
 
 line('market PDA', market.address);
-line('order_buffer PDA', orderBuffer.address);
 line('commit_buffer PDA', commitBuffer.address);
 line('insurance_fund PDA', insuranceFund.address);
 line('flp_exposure PDA', flpExposure.address);
@@ -138,7 +136,6 @@ describeIx(
   [
     authority.publicKey.toBase58(),
     market.address.toBase58(),
-    orderBuffer.address.toBase58(),
     commitBuffer.address.toBase58(),
     insuranceFund.address.toBase58(),
     flpExposure.address.toBase58(),
@@ -166,43 +163,34 @@ describeIx('deposit_collateral', [trader.publicKey.toBase58(), traderState.addre
 
 header('Phase 3 — Order intake');
 
-const ix6 = await client.placeLimitOrderIx({
+const ix6 = await client.placeLimitOrderV2Ix({
   trader: trader.publicKey,
   market: market.address,
   side: 'long',
   sizeLots: new BN(10),
   limitTicks: new BN(99_950),
-  postOnly: false,
 });
 describeIx(
-  'place_limit_order',
-  [
-    trader.publicKey.toBase58(),
-    market.address.toBase58(),
-    orderBuffer.address.toBase58(),
-    traderState.address.toBase58(),
-    traderPosition.address.toBase58(),
-  ],
-  { side: 'long', size_lots: 10, limit_ticks: 99_950, post_only: false },
+  'place_limit_order_v2',
+  [trader.publicKey.toBase58(), market.address.toBase58()],
+  { side: 'long', size_lots: 10, limit_ticks: 99_950 },
 );
 
 // ─── Phase 4: sequencer runs the batch ────────────────────────────────
 
 header('Phase 4 — Batch execution (sequencer signs)');
 
-const ix7 = await client.runBatchIx({
+const ix7 = await client.runBatchV2Ix({
   sequencer: sequencer.publicKey,
   market: market.address,
   nowMs: new BN(Date.now()),
 });
 describeIx(
-  'run_batch',
+  'run_batch_v2',
   [
     sequencer.publicKey.toBase58(),
     market.address.toBase58(),
-    orderBuffer.address.toBase58(),
     commitBuffer.address.toBase58(),
-    insuranceFund.address.toBase58(),
     flpExposure.address.toBase58(),
   ],
   { now_ms: Date.now() },

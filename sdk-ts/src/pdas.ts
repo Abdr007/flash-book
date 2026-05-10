@@ -45,7 +45,6 @@ export function associatedTokenAddress(
 }
 
 const MARKET_SEED = Buffer.from('market');
-const ORDER_BUFFER_SEED = Buffer.from('order_buffer');
 const COMMIT_BUFFER_SEED = Buffer.from('commit_buffer');
 const INSURANCE_FUND_SEED = Buffer.from('insurance_fund');
 const FLP_EXPOSURE_SEED = Buffer.from('flp_exposure');
@@ -76,13 +75,6 @@ export function marketPda(
   programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
 ): DerivedPda {
   return derive([MARKET_SEED, baseMint.toBuffer(), quoteMint.toBuffer()], programId);
-}
-
-export function orderBufferPda(
-  market: PublicKey,
-  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
-): DerivedPda {
-  return derive([ORDER_BUFFER_SEED, market.toBuffer()], programId);
 }
 
 export function commitBufferPda(

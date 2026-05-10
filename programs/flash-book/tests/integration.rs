@@ -13,7 +13,7 @@
 use anchor_lang::{prelude::*, InstructionData};
 use flash_book::state::{
     FlpExposureAccount, InsuranceFundAccount, MarketAccount, MarketParams,
-    OrderBufferAccount, TraderStateAccount,
+    TraderStateAccount,
 };
 use solana_program_test::{processor, BanksClient, ProgramTest};
 use solana_sdk::{
@@ -392,7 +392,9 @@ async fn setup_market(
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let (order_buffer, _) = pda(&[OrderBufferAccount::SEED, market.as_ref()]);
+    // (v1 order_buffer PDA — no longer derived; markets use the v2 hypertree
+    // PDA via state_v2::MARKET_BOOK_SEED.)
+    let order_buffer = Pubkey::default();
     let (commit_buffer, _) = pda(&[
         flash_book::state::CommitBufferAccount::SEED,
         market.as_ref(),
@@ -411,7 +413,6 @@ async fn setup_market(
             AccountMeta::new_readonly(quote_vault, false),
             AccountMeta::new_readonly(oracle_account, false),
             AccountMeta::new(market, false),
-            AccountMeta::new(order_buffer, false),
             AccountMeta::new(commit_buffer, false),
             AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(flp_exposure, false),
@@ -454,7 +455,9 @@ async fn setup_additional_market(
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let (order_buffer, _) = pda(&[OrderBufferAccount::SEED, market.as_ref()]);
+    // (v1 order_buffer PDA — no longer derived; markets use the v2 hypertree
+    // PDA via state_v2::MARKET_BOOK_SEED.)
+    let order_buffer = Pubkey::default();
     let (commit_buffer, _) = pda(&[
         flash_book::state::CommitBufferAccount::SEED,
         market.as_ref(),
@@ -473,7 +476,6 @@ async fn setup_additional_market(
             AccountMeta::new_readonly(quote_vault, false),
             AccountMeta::new_readonly(oracle_account, false),
             AccountMeta::new(market, false),
-            AccountMeta::new(order_buffer, false),
             AccountMeta::new(commit_buffer, false),
             AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(flp_exposure, false),
@@ -1355,7 +1357,7 @@ async fn initialize_market_writes_state() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (_protocol, market_pda, order_buf, base_mint, quote_mint) = setup_market(&mut ctx, &payer).await;
+    let (_protocol, market_pda, _order_buf, base_mint, quote_mint) = setup_market(&mut ctx, &payer).await;
 
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(market.authority, payer.pubkey());
@@ -1371,12 +1373,8 @@ async fn initialize_market_writes_state() {
     assert_eq!(market.status, 1);
     assert_eq!(market.params.tick_size, 1);
     assert_eq!(market.params.flp_quote_levels, 5);
-
-    // OrderBuffer should be initialized empty.
-    let buf: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
-    assert_eq!(buf.head, 0);
-    assert_eq!(buf.seq_counter, 0);
-    assert_eq!(buf.market, market_pda);
+    // v1 order_buffer no longer init'd; v2 markets use the hypertree-backed
+    // market_book PDA initialized separately via init_market_book.
 }
 
 #[tokio::test]
@@ -1958,183 +1956,6 @@ async fn lp_units_withdraw_rejects_other_lps_shares() {
 }
 
 #[tokio::test]
-async fn submit_commit_and_reveal_full_flow() {
-    let pt = make_program_test();
-    let mut ctx = pt.start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let (protocol, market_pda, order_buf, _base, _quote) = setup_market(&mut ctx, &payer).await;
-    let (commit_buf, _) = pda(&[
-        flash_book::state::CommitBufferAccount::SEED,
-        market_pda.as_ref(),
-    ]);
-
-    let trader = Keypair::new();
-    let _trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
-
-    // Build a reveal payload + its hash matching the program's keccak rule.
-    let nonce = [7u8; 32];
-    let side: u8 = 0; // long
-    let size_lots: u64 = 5;
-    let limit_ticks: u64 = 99_950;
-
-    use anchor_lang::solana_program::keccak::hashv;
-    let hash = hashv(&[
-        trader.pubkey().as_ref(),
-        &[side],
-        &size_lots.to_le_bytes(),
-        &limit_ticks.to_le_bytes(),
-        &nonce,
-    ])
-    .0;
-
-    let commit_ix = build_ix(
-        flash_book::instruction::SubmitCommit { hash, bond: 1_000 },
-        vec![
-            AccountMeta::new_readonly(trader.pubkey(), true),
-            AccountMeta::new_readonly(market_pda, false),
-            AccountMeta::new(commit_buf, false),
-        ],
-    );
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[commit_ix],
-            Some(&trader.pubkey()),
-            &[&trader],
-            bh,
-        ))
-        .await
-        .unwrap();
-
-    // Verify the commit landed in the buffer.
-    let cb: flash_book::state::CommitBufferAccount =
-        fetch(&mut ctx.banks_client, commit_buf).await;
-    let active = cb.commits.iter().filter(|r| r.valid == 1).count();
-    assert_eq!(active, 1, "commit should be in buffer");
-
-    // Now reveal.
-    let reveal_ix = build_ix(
-        flash_book::instruction::SubmitReveal {
-            side,
-            size_lots,
-            limit_ticks,
-            nonce,
-        },
-        vec![
-            AccountMeta::new_readonly(trader.pubkey(), true),
-            AccountMeta::new_readonly(market_pda, false),
-            AccountMeta::new(commit_buf, false),
-            AccountMeta::new(order_buf, false),
-        ],
-    );
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[reveal_ix],
-            Some(&trader.pubkey()),
-            &[&trader],
-            bh,
-        ))
-        .await
-        .unwrap();
-
-    // After reveal: commit slot cleared, order in buffer.
-    let cb_after: flash_book::state::CommitBufferAccount =
-        fetch(&mut ctx.banks_client, commit_buf).await;
-    let active_after = cb_after.commits.iter().filter(|r| r.valid == 1).count();
-    assert_eq!(active_after, 0, "commit should be consumed");
-
-    let ob: OrderBufferAccount = fetch(&mut ctx.banks_client, order_buf).await;
-    assert_eq!(ob.head, 1, "reveal should produce a taker order");
-    let slot = ob.slots[0];
-    assert_eq!(slot.valid, 1);
-    assert_eq!(slot.side, 0);
-    assert_eq!(slot.size_lots, 5);
-    assert_eq!(slot.limit_ticks, 99_950);
-    assert_eq!(slot.order_type, 1); // OrderType::Taker = 1
-    assert_eq!(slot.trader, trader.pubkey());
-}
-
-#[tokio::test]
-async fn submit_reveal_with_wrong_payload_fails() {
-    let pt = make_program_test();
-    let mut ctx = pt.start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let (protocol, market_pda, order_buf, _, _) = setup_market(&mut ctx, &payer).await;
-    let (commit_buf, _) = pda(&[
-        flash_book::state::CommitBufferAccount::SEED,
-        market_pda.as_ref(),
-    ]);
-
-    let trader = Keypair::new();
-    let _trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
-
-    let nonce = [7u8; 32];
-    let side: u8 = 0;
-    let size_lots: u64 = 5;
-    let limit_ticks: u64 = 99_950;
-
-    use anchor_lang::solana_program::keccak::hashv;
-    let hash = hashv(&[
-        trader.pubkey().as_ref(),
-        &[side],
-        &size_lots.to_le_bytes(),
-        &limit_ticks.to_le_bytes(),
-        &nonce,
-    ])
-    .0;
-
-    // Submit a valid commit.
-    let commit_ix = build_ix(
-        flash_book::instruction::SubmitCommit { hash, bond: 1_000 },
-        vec![
-            AccountMeta::new_readonly(trader.pubkey(), true),
-            AccountMeta::new_readonly(market_pda, false),
-            AccountMeta::new(commit_buf, false),
-        ],
-    );
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[commit_ix],
-            Some(&trader.pubkey()),
-            &[&trader],
-            bh,
-        ))
-        .await
-        .unwrap();
-
-    // Reveal with TAMPERED size — should fail.
-    let reveal_ix = build_ix(
-        flash_book::instruction::SubmitReveal {
-            side,
-            size_lots: 6, // tampered
-            limit_ticks,
-            nonce,
-        },
-        vec![
-            AccountMeta::new_readonly(trader.pubkey(), true),
-            AccountMeta::new_readonly(market_pda, false),
-            AccountMeta::new(commit_buf, false),
-            AccountMeta::new(order_buf, false),
-        ],
-    );
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let result = ctx
-        .banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[reveal_ix],
-            Some(&trader.pubkey()),
-            &[&trader],
-            bh,
-        ))
-        .await;
-    assert!(result.is_err(), "reveal with wrong payload should fail");
-}
-
-#[tokio::test]
 async fn update_oracle_authority_only() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
@@ -2269,139 +2090,6 @@ async fn transfer_market_authority_rotates_keys() {
         ))
         .await;
     assert!(result.is_err(), "old authority should be revoked");
-}
-
-#[tokio::test]
-async fn place_basket_order_lands_both_legs_in_respective_buffers() {
-    // Cross-market basket: long on market 1, short on market 2. Verifies
-    // both legs reach their order buffers atomically and orders_this_batch
-    // increments by 2.
-    let pt = make_program_test();
-    let mut ctx = pt.start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let (protocol, m1, ob1, _, _) = setup_market(&mut ctx, &payer).await;
-    let (m2, ob2, _, _) = setup_additional_market(&mut ctx, &payer, 200_000).await;
-
-    let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
-    let (pos1, _) = pda(&[
-        flash_book::state::PositionAccount::SEED,
-        m1.as_ref(),
-        trader.pubkey().as_ref(),
-    ]);
-    let (pos2, _) = pda(&[
-        flash_book::state::PositionAccount::SEED,
-        m2.as_ref(),
-        trader.pubkey().as_ref(),
-    ]);
-
-    let leg_a = flash_book::BasketLeg {
-        side: 0, // long
-        size_lots: 1,
-        limit_ticks: 100_500,
-        post_only: false,
-    };
-    let leg_b = flash_book::BasketLeg {
-        side: 1, // short — hedge on the other market
-        size_lots: 1,
-        limit_ticks: 199_500,
-        post_only: false,
-    };
-
-    let basket_ix = build_ix(
-        flash_book::instruction::PlaceBasketOrder { leg_a, leg_b },
-        vec![
-            AccountMeta::new(trader.pubkey(), true),
-            AccountMeta::new(trader_state, false),
-            AccountMeta::new_readonly(protocol.flp_exposure, false),
-            AccountMeta::new_readonly(m1, false),
-            AccountMeta::new(ob1, false),
-            AccountMeta::new(pos1, false),
-            AccountMeta::new_readonly(m2, false),
-            AccountMeta::new(ob2, false),
-            AccountMeta::new(pos2, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-    );
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[basket_ix],
-            Some(&trader.pubkey()),
-            &[&trader],
-            bh,
-        ))
-        .await
-        .unwrap();
-
-    // Both order buffers must have head = 1 with the leg's slot active.
-    let buf1: OrderBufferAccount = fetch(&mut ctx.banks_client, ob1).await;
-    let buf2: OrderBufferAccount = fetch(&mut ctx.banks_client, ob2).await;
-    assert_eq!(buf1.head, 1);
-    assert_eq!(buf2.head, 1);
-    assert_eq!(buf1.slots[0].valid, 1);
-    assert_eq!(buf1.slots[0].side, 0);
-    assert_eq!(buf1.slots[0].limit_ticks, 100_500);
-    assert_eq!(buf2.slots[0].valid, 1);
-    assert_eq!(buf2.slots[0].side, 1);
-    assert_eq!(buf2.slots[0].limit_ticks, 199_500);
-
-    // Rate counter incremented by 2.
-    let st: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
-    assert_eq!(st.orders_this_batch, 2);
-}
-
-#[tokio::test]
-async fn place_basket_order_rejects_same_market_for_both_legs() {
-    // Basket requires distinct markets; same-market would be just two
-    // place_limit_order calls.
-    let pt = make_program_test();
-    let mut ctx = pt.start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let (protocol, m1, ob1, _, _) = setup_market(&mut ctx, &payer).await;
-    let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
-    let (pos1, _) = pda(&[
-        flash_book::state::PositionAccount::SEED,
-        m1.as_ref(),
-        trader.pubkey().as_ref(),
-    ]);
-
-    let leg = flash_book::BasketLeg {
-        side: 0,
-        size_lots: 1,
-        limit_ticks: 100_500,
-        post_only: false,
-    };
-    // Same market for both legs → reject.
-    let basket_ix = build_ix(
-        flash_book::instruction::PlaceBasketOrder { leg_a: leg, leg_b: leg },
-        vec![
-            AccountMeta::new(trader.pubkey(), true),
-            AccountMeta::new(trader_state, false),
-            AccountMeta::new_readonly(protocol.flp_exposure, false),
-            AccountMeta::new_readonly(m1, false),
-            AccountMeta::new(ob1, false),
-            AccountMeta::new(pos1, false),
-            AccountMeta::new_readonly(m1, false),
-            AccountMeta::new(ob1, false),
-            AccountMeta::new(pos1, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-    );
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let result = ctx
-        .banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[basket_ix],
-            Some(&trader.pubkey()),
-            &[&trader],
-            bh,
-        ))
-        .await;
-    assert!(result.is_err(), "basket with same market for both legs must reject");
 }
 
 #[tokio::test]
@@ -2621,7 +2309,7 @@ async fn update_oracle_rejects_stale_price() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let (order_buf, _) = pda(&[OrderBufferAccount::SEED, market_pda.as_ref()]);
+    let order_buf = Pubkey::default();
     let (cb, _) = pda(&[
         flash_book::state::CommitBufferAccount::SEED,
         market_pda.as_ref(),
@@ -2643,7 +2331,6 @@ async fn update_oracle_rejects_stale_price() {
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new(order_buf, false),
             AccountMeta::new(cb, false),
             AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(flp_exposure, false),
@@ -2703,7 +2390,7 @@ async fn update_oracle_rejects_wide_confidence() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let (order_buf, _) = pda(&[OrderBufferAccount::SEED, market_pda.as_ref()]);
+    let order_buf = Pubkey::default();
     let (cb, _) = pda(&[
         flash_book::state::CommitBufferAccount::SEED,
         market_pda.as_ref(),
@@ -2725,7 +2412,6 @@ async fn update_oracle_rejects_wide_confidence() {
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new(order_buf, false),
             AccountMeta::new(cb, false),
             AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(flp_exposure, false),
@@ -2830,7 +2516,7 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let (order_buf, _) = pda(&[OrderBufferAccount::SEED, market_pda.as_ref()]);
+    let order_buf = Pubkey::default();
     let (cb, _) = pda(&[
         flash_book::state::CommitBufferAccount::SEED,
         market_pda.as_ref(),
@@ -2851,7 +2537,6 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new(order_buf, false),
             AccountMeta::new(cb, false),
             AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(flp_exposure, false),

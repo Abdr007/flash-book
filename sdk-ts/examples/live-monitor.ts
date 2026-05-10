@@ -18,7 +18,6 @@ import {
   fetchFlpExposure,
   fetchInsuranceFund,
   fetchMarket,
-  fetchOrderBuffer,
   fetchPosition,
   fetchTraderState,
   previewPortfolioRisk,
@@ -104,13 +103,9 @@ if (LIVE) {
       field('Total fees', market.totalFeesCollected.toString());
       field('Total liquidations', market.totalLiquidations.toString());
 
-      const buf = await fetchOrderBuffer(client, client.orderBuffer(marketPda).address);
-      if (buf) {
-        field('Order buffer head', buf.head);
-        field('Buffer seq counter', buf.seqCounter.toString());
-        const active = buf.slots.filter((s) => s.valid === 1);
-        field('Active orders', active.length);
-      }
+      // (v3 hypertree-backed orderbook depth: subscribe to OrderPlacedV2Event
+      // / OrderCancelledV2Event for live state, or call view_book_depth_v2
+      // for top-N levels per side.)
 
       // Risk preview if a trader was provided.
       if (traderArg) {

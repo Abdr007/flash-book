@@ -31,7 +31,6 @@ export {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   FLASH_BOOK_PROGRAM_ID,
   marketPda,
-  orderBufferPda,
   insuranceFundPda,
   flpExposurePda,
   traderStatePda,

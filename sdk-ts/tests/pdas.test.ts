@@ -9,7 +9,6 @@ import {
   flpExposurePda,
   insuranceFundPda,
   marketPda,
-  orderBufferPda,
   positionPda,
   traderStatePda,
 } from '../src/pdas.ts';
@@ -33,12 +32,6 @@ describe('PDA derivation', () => {
     const a = marketPda(SOL, USDC);
     const b = marketPda(USDC, SOL); // swap
     expect(a.address.toBase58()).not.toBe(b.address.toBase58());
-  });
-
-  test('orderBufferPda derives from market', () => {
-    const market = marketPda(SOL, USDC).address;
-    const buf = orderBufferPda(market);
-    expect(buf.address.toBytes()).toHaveLength(32);
   });
 
   test('commitBufferPda derives from market', () => {
@@ -129,13 +122,12 @@ describe('PDA derivation', () => {
 
   test('all derived addresses have valid bumps', () => {
     const market = marketPda(SOL, USDC);
-    const buf = orderBufferPda(market.address);
     const cbuf = commitBufferPda(market.address);
     const trader = Keypair.generate().publicKey;
     const ts = traderStatePda(trader);
     const pos = positionPda(market.address, trader);
 
-    for (const d of [market, buf, cbuf, ts, pos]) {
+    for (const d of [market, cbuf, ts, pos]) {
       expect(d.bump).toBeGreaterThanOrEqual(0);
       expect(d.bump).toBeLessThan(256);
     }

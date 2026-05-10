@@ -10,19 +10,6 @@
 //! position state moved by separate `apply_fill` instruction).
 
 #![allow(unexpected_cfgs)]
-// V1 ixs (the original flat-buffer orderbook surface — initialize_order_buffer,
-// place_limit_order, cancel_order, cancel_all_orders_in_market, run_batch)
-// are marked `#[deprecated]` since wave 18h. v2 hypertree replacements ship
-// in waves 18d–19g and cover all original injection paths.
-//
-// Anchor's `#[program]` macro generates synthetic dispatch call-sites that
-// would otherwise surface the deprecation warning on every program rebuild.
-// The `#[deprecated]` attribute still surfaces normally for EXTERNAL Rust
-// callers (other crates, integration tests, CPI consumers); only the
-// internal dispatcher noise is suppressed crate-wide here.
-//
-// Final v1 deletion is gated on bot/MM migration (wave 19h-future).
-#![allow(deprecated)]
 
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
@@ -40,23 +27,22 @@ pub use errors::FlashBookError;
 
 use constants::{
     FLP_SEQ_RESERVED_OFFSET, MARK_HISTORY_LEN, MAX_BASKET_LEGS_N,
-    MAX_ORDERS_PER_TRADER_PER_BATCH, ORDER_BUFFER_CAP,
+    MAX_ORDERS_PER_TRADER_PER_BATCH,
 };
 use matcher::commit_reveal::{
     register_commit, redeem_reveal, sweep_expired, RevealPayload,
 };
-use matcher::fba::clear_batch;
 use matcher::flp_quoter::{generate_quotes, FlpQuoterInputs, FlpQuoterParams};
-use matcher::funding::{advance, funding_owed};
+use matcher::funding::funding_owed;
 use matcher::lot::{BaseLots, Ticks};
-use matcher::order::{Order, OrderType, Side};
+use matcher::order::Side;
 use matcher::risk::{
     assess_margin as assess_margin_fn, default_scenarios as default_scenarios_fn,
     MarketSnapshot as RiskMarketSnap, PositionSnapshot as RiskPosSnap,
 };
 use state::{
     CommitBufferAccount, FlpExposureAccount, InsuranceFundAccount, MarketAccount,
-    MarketParams, OrderBufferAccount, OrderSlot, TraderStateAccount,
+    MarketParams, TraderStateAccount,
 };
 
 declare_id!("FBookV1111111111111111111111111111111111111");
@@ -77,28 +63,6 @@ pub mod flash_book {
         initial_oracle_ticks: u64,
     ) -> Result<()> {
         initialize_market_inner(ctx, params, initial_oracle_ticks, false)
-    }
-
-    /// Initialize the order_buffer for an existing market. MUST be
-    /// called after `initialize_market`. Separate from
-    /// `initialize_commit_buffer` to avoid Anchor 0.31's BPF
-    /// "Overlapping copy" invariant when two large (~5KB) boxed
-    /// accounts init in one ix.
-    #[deprecated(
-        note = "v1 flat-array orderbook. Use init_market_book + place_limit_order_v2 + run_batch_v2. \
-                Wave 19 will delete this ix once trigger/TWAP/iceberg/liquidation flows have v2 equivalents."
-    )]
-    pub fn initialize_order_buffer(
-        ctx: Context<InitializeOrderBuffer>,
-    ) -> Result<()> {
-        let market_key = ctx.accounts.market.key();
-        let buffer = &mut ctx.accounts.order_buffer;
-        buffer.market = market_key;
-        buffer.bump = ctx.bumps.order_buffer;
-        buffer.head = 0;
-        buffer.seq_counter = 0;
-        buffer.slots = [OrderSlot::default(); ORDER_BUFFER_CAP];
-        Ok(())
     }
 
     /// Initialize the commit_buffer for an existing market. MUST be
@@ -2935,43 +2899,23 @@ pub mod flash_book {
 
     // ─── Order intake ───────────────────────────────────────────────
 
-    /// Place two orders across two distinct markets atomically, with a
-    /// single cross-market stress-lattice gate. The headline use case is
-    /// pair trades / hedges where the trader wants to net long market A
-    /// and net short market B simultaneously, with the engine recognizing
-    /// the hedge so required margin collapses for offsetting positions.
-    ///
-    /// Without basket orders, two separate place_limit_order calls would
-    /// each run a per-market margin check that doesn't see the offsetting
-    /// leg — the first leg might be rejected even though the post-state
-    /// is healthy. Basket orders fix this by projecting the post-state
-    /// across both markets and running assess_margin once.
-    ///
-    /// Atomicity comes from Solana: if any leg fails (cap breach, buffer
-    /// full, margin gate, etc.), the whole tx rolls back. Rate limit
-    /// counts each leg toward orders_this_batch (basket = 2 units).
-    ///
-    /// V1 supports exactly two legs on two distinct markets. N-leg
-    /// (basket > 2) is a follow-up that uses remaining_accounts walking.
-    pub fn place_basket_order(
-        ctx: Context<PlaceBasketOrder>,
+    /// V2 2-leg basket order against the hypertree-backed book. Pure
+    /// parity port of `place_basket_order` — same distinct-market guard,
+    /// same per-leg intake validation, same per-market caps, same joint
+    /// stress-lattice margin gate, same rate limit. Only the injection
+    /// target differs (per-market market_book PDA, not per-market
+    /// order_buffer).
+    pub fn place_basket_order_v2(
+        ctx: Context<PlaceBasketOrderV2>,
         leg_a: BasketLeg,
         leg_b: BasketLeg,
     ) -> Result<()> {
-        // Distinct markets are required — for same-market orders, callers
-        // can use place_limit_order twice (no cross-margin benefit).
         let mkt_a = ctx.accounts.market_a.key();
         let mkt_b = ctx.accounts.market_b.key();
         require!(mkt_a != mkt_b, FlashBookError::OutOfRange);
 
-        // Validate each leg in isolation: size, price, status, ticks. Skip
-        // the per-market margin gate — basket margin runs across both legs
-        // jointly below.
         validate_leg_intake(&ctx.accounts.market_a, &leg_a)?;
         validate_leg_intake(&ctx.accounts.market_b, &leg_b)?;
-
-        // Per-market caps (absolute lots + capital ratio). Run before
-        // basket margin so caps fail fast.
         check_caps_for_leg(
             &ctx.accounts.market_a,
             &ctx.accounts.position_a,
@@ -2985,13 +2929,10 @@ pub mod flash_book {
             &leg_b,
         )?;
 
-        // Project post-leg position state across both markets and run
-        // a single assess_margin. This is where the hedge benefit
-        // materializes — offsetting positions reduce required margin.
         let market_a = &ctx.accounts.market_a;
         let market_b = &ctx.accounts.market_b;
-        let market_a_key = market_a.key();
-        let market_b_key = market_b.key();
+        let market_a_key = mkt_a;
+        let market_b_key = mkt_b;
         let position_a = &ctx.accounts.position_a;
         let position_b = &ctx.accounts.position_b;
         let trader_key = ctx.accounts.trader.key();
@@ -3030,7 +2971,7 @@ pub mod flash_book {
             require!(assessment.is_healthy, FlashBookError::TraderLiquidatable);
         }
 
-        // Rate limit: basket counts as 2 units. Reset on batch boundary.
+        // Rate limit (parity).
         let trader_state = &mut ctx.accounts.trader_state;
         if trader_state.last_batch_seen != market_a.current_batch {
             trader_state.last_batch_seen = market_a.current_batch;
@@ -3043,19 +2984,24 @@ pub mod flash_book {
         );
         trader_state.orders_this_batch += 2;
 
-        // Insert into both order buffers.
-        insert_into_buffer(
-            &mut ctx.accounts.order_buffer_a,
+        // V2 inject — into BOTH market_book PDAs.
+        let now_slot = Clock::get()?.slot;
+        let (seq_a, idx_a) = inject_leg_into_hypertree(
+            &ctx.accounts.market_book_a,
+            market_a_key,
             trader_key,
             &leg_a,
+            now_slot,
         )?;
-        insert_into_buffer(
-            &mut ctx.accounts.order_buffer_b,
+        let (seq_b, idx_b) = inject_leg_into_hypertree(
+            &ctx.accounts.market_book_b,
+            market_b_key,
             trader_key,
             &leg_b,
+            now_slot,
         )?;
 
-        emit!(BasketOrderPlacedEvent {
+        emit!(BasketOrderPlacedV2Event {
             trader: trader_key,
             market_a: market_a_key,
             market_b: market_b_key,
@@ -3063,56 +3009,43 @@ pub mod flash_book {
             side_b: leg_b.side,
             size_lots_a: leg_a.size_lots,
             size_lots_b: leg_b.size_lots,
+            seq_a,
+            seq_b,
+            node_index_a: idx_a,
+            node_index_b: idx_b,
         });
         Ok(())
     }
 
-    /// N-leg basket order. Place K orders across K distinct markets in
-    /// one transaction with a SINGLE cross-market stress-lattice gate.
-    /// Generalises `place_basket_order` (which is hard-coded for K=2).
-    ///
-    /// `legs.len()` must equal the number of (market, order_buffer,
-    /// position) triples in `remaining_accounts` (so 3 × K accounts).
-    /// All markets must be distinct. Position PDAs MUST already exist —
-    /// callers init them via a no-op place_limit_order on each market
-    /// first (init_if_needed isn't safe with remaining_accounts).
-    ///
-    /// Hard caps: legs.len() ≤ MAX_BASKET_LEGS_N (4). Larger baskets
-    /// can land via repeated 2-leg or N-leg calls.
-    ///
-    /// Atomicity: any failure (cap breach, buffer full, distinct-market
-    /// guard, basket margin gate, rate limit) rolls back the whole tx.
-    pub fn place_basket_order_n<'info>(
-        ctx: Context<'_, '_, '_, 'info, PlaceBasketOrderN<'info>>,
+    /// V2 N-leg basket order. Pure parity port of `place_basket_order_n`
+    /// — same K-distinct-markets guard, per-leg intake, caps, joint
+    /// stress lattice, rate limit. remaining_accounts layout: triples
+    /// of (market, market_book, position) per leg, so 3 × K accounts.
+    pub fn place_basket_order_n_v2<'info>(
+        ctx: Context<'_, '_, '_, 'info, PlaceBasketOrderNV2<'info>>,
         legs: Vec<BasketLeg>,
     ) -> Result<()> {
         require!(!legs.is_empty(), FlashBookError::ZeroSize);
-        require!(
-            legs.len() <= MAX_BASKET_LEGS_N,
-            FlashBookError::OutOfRange
-        );
+        require!(legs.len() <= MAX_BASKET_LEGS_N, FlashBookError::OutOfRange);
         let remaining = ctx.remaining_accounts;
-        require!(
-            remaining.len() == legs.len() * 3,
-            FlashBookError::OutOfRange
-        );
+        require!(remaining.len() == legs.len() * 3, FlashBookError::OutOfRange);
 
         let trader_key = ctx.accounts.trader.key();
         let program_id = ctx.program_id;
 
-        // Walk remaining_accounts → deserialize markets + positions.
-        // Validate ownership, identity, market uniqueness inline.
+        // Walk remaining_accounts in (market, market_book, position) triples.
         let mut markets: Vec<MarketAccount> = Vec::with_capacity(legs.len());
         let mut market_keys: Vec<Pubkey> = Vec::with_capacity(legs.len());
         let mut positions: Vec<state::PositionAccount> = Vec::with_capacity(legs.len());
         for (i, _leg) in legs.iter().enumerate() {
             let m_ai = &remaining[i * 3];
-            let buf_ai = &remaining[i * 3 + 1];
+            let book_ai = &remaining[i * 3 + 1];
             let pos_ai = &remaining[i * 3 + 2];
 
-            // Owner checks (defense vs malicious foreign accounts).
             require_keys_eq!(*m_ai.owner, *program_id, FlashBookError::Unauthorized);
-            require_keys_eq!(*buf_ai.owner, *program_id, FlashBookError::Unauthorized);
+            // book_ai owner is also this program (PDA we own). Disc check
+            // happens inside MarketBookHandle::from_account_data on inject.
+            require_keys_eq!(*book_ai.owner, *program_id, FlashBookError::Unauthorized);
             require_keys_eq!(*pos_ai.owner, *program_id, FlashBookError::Unauthorized);
 
             let market: MarketAccount =
@@ -3120,18 +3053,14 @@ pub mod flash_book {
             let position: state::PositionAccount =
                 state::PositionAccount::try_deserialize(&mut &pos_ai.try_borrow_data()?[..])?;
 
-            // Market uniqueness guard.
             for prev in &market_keys {
                 require!(*prev != m_ai.key(), FlashBookError::OutOfRange);
             }
             market_keys.push(m_ai.key());
 
-            // Per-leg intake validation.
             validate_leg_intake(&market, &legs[i])?;
             check_caps_for_leg(&market, &position, &ctx.accounts.flp_exposure, &legs[i])?;
 
-            // Position binding (when non-empty). Empty positions OK
-            // — projected as new positions below.
             if position.size_lots > 0 {
                 require!(position.trader == trader_key, FlashBookError::WrongTrader);
                 require!(position.market == m_ai.key(), FlashBookError::WrongMarket);
@@ -3141,8 +3070,7 @@ pub mod flash_book {
             positions.push(position);
         }
 
-        // Cross-market stress-lattice margin gate. Project post-leg state
-        // for each market, then assess against the joint scenario lattice.
+        // Cross-market stress lattice (parity).
         let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(legs.len());
         let mut market_snaps: Vec<RiskMarketSnap> = Vec::with_capacity(legs.len());
         for (i, leg) in legs.iter().enumerate() {
@@ -3176,7 +3104,7 @@ pub mod flash_book {
             require!(assessment.is_healthy, FlashBookError::TraderLiquidatable);
         }
 
-        // Rate limit: bump by legs.len(). Reset on batch boundary.
+        // Rate limit (parity).
         let trader_state = &mut ctx.accounts.trader_state;
         if trader_state.last_batch_seen != markets[0].current_batch {
             trader_state.last_batch_seen = markets[0].current_batch;
@@ -3192,26 +3120,20 @@ pub mod flash_book {
             .orders_this_batch
             .saturating_add(leg_count_u32);
 
-        // Insert each leg's order into its buffer. Mutable borrow of
-        // each buffer is short-lived (one insert per leg) so we don't
-        // hold conflicting borrows.
+        // Inject each leg into its market_book.
+        let now_slot = Clock::get()?.slot;
         for (i, leg) in legs.iter().enumerate() {
-            let buf_ai = &remaining[i * 3 + 1];
-            let mut buf_data = buf_ai.try_borrow_mut_data()?;
-            let mut buffer: OrderBufferAccount =
-                OrderBufferAccount::try_deserialize(&mut &buf_data[..])?;
-            insert_into_buffer(&mut buffer, trader_key, leg)?;
-            // Re-serialize back into the account.
-            let mut serialized: Vec<u8> = Vec::with_capacity(buf_data.len());
-            buffer.try_serialize(&mut serialized)?;
-            require!(
-                serialized.len() <= buf_data.len(),
-                FlashBookError::OutOfRange
-            );
-            buf_data[..serialized.len()].copy_from_slice(&serialized);
+            let book_ai = &remaining[i * 3 + 1];
+            inject_leg_into_hypertree_unchecked(
+                book_ai,
+                market_keys[i],
+                trader_key,
+                leg,
+                now_slot,
+            )?;
         }
 
-        emit!(BasketOrderNPlacedEvent {
+        emit!(BasketOrderNPlacedV2Event {
             trader: trader_key,
             leg_count: legs.len() as u8,
             markets: market_keys.clone(),
@@ -4546,49 +4468,6 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Mass-cancel: clears EVERY pending limit/taker order belonging to
-    /// the caller in this market's buffer. Single tx, single signer.
-    /// O(n) over the buffer (n ≤ ORDER_BUFFER_CAP = 64). FLP-virtual,
-    /// liquidation, and ADL system orders are skipped (only user-
-    /// submitted orders are eligible). Reduces failed-cancel UX
-    /// thrash for active traders / MMs that need to flatten quotes
-    /// before a reconfig.
-    #[deprecated(
-        note = "v1 mass-cancel. Wave 19 ships cancel_all_orders_in_market_v2 walking the hypertree."
-    )]
-    pub fn cancel_all_orders_in_market(
-        ctx: Context<CancelAllOrders>,
-    ) -> Result<()> {
-        let buffer = &mut ctx.accounts.order_buffer;
-        let trader_key = ctx.accounts.trader.key();
-        let mut cancelled: u32 = 0;
-        for slot in buffer.slots.iter_mut() {
-            if slot.valid == 1
-                && slot.trader == trader_key
-                && (slot.order_type == OrderType::Limit as u8
-                    || slot.order_type == OrderType::Taker as u8)
-            {
-                *slot = OrderSlot::default();
-                cancelled = cancelled.saturating_add(1);
-            }
-        }
-        // head = number of valid slots; recompute by walking. Cheaper +
-        // safer than maintaining a delta when bursts of cancels happen.
-        let mut head: u32 = 0;
-        for slot in buffer.slots.iter() {
-            if slot.valid == 1 {
-                head = head.saturating_add(1);
-            }
-        }
-        buffer.head = head;
-        emit!(OrdersMassCancelledEvent {
-            market: buffer.market,
-            trader: trader_key,
-            cancelled_count: cancelled,
-        });
-        Ok(())
-    }
-
     /// Submit a commit hash for a future taker reveal.
     pub fn submit_commit(
         ctx: Context<SubmitCommit>,
@@ -4607,10 +4486,17 @@ pub mod flash_book {
         )
     }
 
-    /// Reveal a previously committed taker order. The matcher checks the
-    /// hash and synthesizes a taker order in the next batch.
-    pub fn submit_reveal(
-        ctx: Context<SubmitReveal>,
+    /// V2 reveal: redeem a previously-submitted commit and inject the
+    /// revealed taker order into the hypertree-backed book. Same
+    /// commit-reveal cryptography as v1 (`redeem_reveal` validates the
+    /// hash + bond against the commit_buffer); only the inject target
+    /// differs (hypertree, not v1 buffer).
+    ///
+    /// The revealed order is inserted with order_type byte = 1 (Taker)
+    /// so the matcher's FIFO mapping promotes it AHEAD of resting limits
+    /// at the same price tier — same priority semantics as v1.
+    pub fn submit_reveal_v2(
+        ctx: Context<SubmitRevealV2>,
         side: u8,
         size_lots: u64,
         limit_ticks: u64,
@@ -4628,393 +4514,69 @@ pub mod flash_book {
             nonce,
         };
 
-        let market = &ctx.accounts.market;
+        let market_key = ctx.accounts.market.key();
+        let current_batch = ctx.accounts.market.current_batch;
         let commit_buffer = &mut ctx.accounts.commit_buffer;
-        let buffer = &mut ctx.accounts.order_buffer;
+        let trader_pk = ctx.accounts.trader.key();
+        let now_slot = Clock::get()?.slot;
 
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle =
+            state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
         require!(
-            (buffer.head as usize) < ORDER_BUFFER_CAP,
-            FlashBookError::BufferFull
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
         );
 
-        let next_seq = buffer
-            .seq_counter
+        // Bump seq + redeem the reveal (validates the hash + clears the commit).
+        let next_seq = handle
+            .header
+            .order_seq_counter
             .checked_add(1)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        let order = redeem_reveal(
+        require!(
+            next_seq < FLP_SEQ_RESERVED_OFFSET,
+            FlashBookError::OutOfRange
+        );
+        let _matcher_order = redeem_reveal(
             &mut commit_buffer.commits,
             &payload,
-            market.current_batch,
+            current_batch,
             next_seq,
         )?;
+        handle.header.order_seq_counter = next_seq;
 
-        let mut inserted = false;
-        for slot in buffer.slots.iter_mut() {
-            if slot.valid == 0 {
-                *slot = order_to_slot(&order);
-                inserted = true;
-                break;
-            }
-        }
-        require!(inserted, FlashBookError::BufferFull);
-        buffer.seq_counter = next_seq;
-        buffer.head = buffer
-            .head
-            .checked_add(1)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        Ok(())
-    }
-
-    // ─── Batch execution ────────────────────────────────────────────
-
-    /// Run one batch: advance funding, generate FLP quotes, clear FBA,
-    /// update mark, sweep expired commits. Position updates are emitted as
-    /// an event for the off-chain bookkeeper or for `apply_fill` to consume.
-    #[deprecated(
-        note = "v1 single-batch matcher. Use run_batch_v2 — same FBA, hypertree-backed, EMA funding, \
-                vol-adaptive band, VPIN-gated FLP. Wave 19 deletes this ix."
-    )]
-    pub fn run_batch(ctx: Context<RunBatch>, now_ms: u64) -> Result<()> {
-        let market = &mut ctx.accounts.market;
-        let buffer = &mut ctx.accounts.order_buffer;
-        let commit_buffer = &mut ctx.accounts.commit_buffer;
-        let _insurance = &mut ctx.accounts.insurance_fund;
-        let flp = &ctx.accounts.flp_exposure;
-
-        // 1. Advance funding index.
-        //
-        // Smarter than HL: when params.funding_premium_twap_window > 0, we
-        // use a TWAP of the last N batches' clearing prices as the "mark"
-        // input to the premium calculation, instead of the instantaneous
-        // mark. This kills funding spikes from microbursts of toxic flow
-        // that move the mark for one batch — at our 50ms FBA cadence,
-        // single-tick premium is too noisy to be a fair funding signal.
-        // 0 window = legacy single-tick (HL-equivalent).
-        let block_delta_ms = if market.last_batch_ms == 0 {
-            0
+        // Build + insert the resting order. order_type = 1 (Taker) so
+        // the matcher's mapping (`order_type_byte_to_matcher`) promotes
+        // it to OrderType::Taker FIFO priority.
+        let side_is_bid = side == 0;
+        let order = state_v2::RestingOrderV2 {
+            order_id: state_v2::encode_order_id(limit_ticks, next_seq, side_is_bid),
+            seq: next_seq,
+            price_ticks: limit_ticks,
+            size_lots,
+            expires_at_slot: 0,
+            trader: trader_pk,
+            last_valid_slot: now_slot as u32,
+            side,
+            order_type: 1, // Taker
+            flags: 0,
+            _pad: 0,
+        };
+        let inserted_idx = if side_is_bid {
+            handle.insert_bid(order)?
         } else {
-            now_ms.saturating_sub(market.last_batch_ms)
-        };
-        let mark_for_funding = if market.params.funding_premium_twap_window > 0 {
-            let win = (market.params.funding_premium_twap_window as usize)
-                .min(MARK_HISTORY_LEN)
-                .min(market.recent_clearing_count as usize);
-            if win == 0 {
-                Ticks(market.mark_price_ticks)
-            } else {
-                // Walk the last `win` entries from `recent_clearing_prices`,
-                // wrapping. The newest entry is at
-                // (current_batch - 1) % MARK_HISTORY_LEN.
-                let mut sum: u128 = 0;
-                let len = MARK_HISTORY_LEN;
-                let newest_idx = if market.current_batch == 0 {
-                    0
-                } else {
-                    ((market.current_batch as usize - 1) % len) as usize
-                };
-                for k in 0..win {
-                    let idx = (newest_idx + len - k) % len;
-                    sum = sum.saturating_add(market.recent_clearing_prices[idx] as u128);
-                }
-                let avg = (sum / win as u128).min(u64::MAX as u128) as u64;
-                if avg == 0 { Ticks(market.mark_price_ticks) } else { Ticks(avg) }
-            }
-        } else {
-            Ticks(market.mark_price_ticks)
-        };
-        let (raw_new_index, ftick) = advance(
-            market.cum_funding_index,
-            mark_for_funding,
-            Ticks(market.oracle_price_ticks),
-            block_delta_ms,
-            market.params.funding_rate_k_bps,
-            market.params.funding_rate_max_bps_per_sec,
-        )?;
-
-        // Symmetric-OI funding dampener (Flash-Book-specific). When the
-        // book is balanced (no side dominates), funding has no
-        // economic reason to push traders one way — dampen toward 0.
-        // When the book is heavily one-sided, funding is at full
-        // strength. Smarter than HL's flat premium-driven model.
-        let (new_index, dampened_rate) = if market.params.funding_oi_dampening {
-            let total = (market.oi_long_lots as u128)
-                .saturating_add(market.oi_short_lots as u128);
-            let skew_bps: u128 = if total == 0 {
-                0
-            } else {
-                let imbalance = if market.oi_long_lots >= market.oi_short_lots {
-                    (market.oi_long_lots - market.oi_short_lots) as u128
-                } else {
-                    (market.oi_short_lots - market.oi_long_lots) as u128
-                };
-                ((imbalance.saturating_mul(constants::BPS_DENOM as u128)) / total)
-                    .min(constants::BPS_DENOM as u128)
-            };
-            // Scale BOTH the index delta AND the rate by skew/BPS_DENOM.
-            let index_delta = raw_new_index.saturating_sub(market.cum_funding_index);
-            let scaled_delta = ((index_delta as i128).saturating_mul(skew_bps as i128))
-                / (constants::BPS_DENOM as i128);
-            let scaled_index = market.cum_funding_index.saturating_add(scaled_delta);
-            let scaled_rate = ((ftick.rate_bps_per_sec as i128)
-                .saturating_mul(skew_bps as i128))
-                / (constants::BPS_DENOM as i128);
-            (scaled_index, clamp_i128_to_i64(scaled_rate))
-        } else {
-            (raw_new_index, ftick.rate_bps_per_sec)
-        };
-        market.cum_funding_index = new_index;
-        market.last_funding_rate_bps_per_sec = dampened_rate;
-
-        // Funding-per-period cap (anti-gouge). When set, the absolute
-        // cumulative funding paid over a rolling `funding_period_seconds`
-        // window cannot exceed `funding_per_period_max_bps` of position
-        // notional. Once hit, the index advance for the rest of the
-        // window is scaled to fit. Smarter than HL — extended one-way
-        // funding can't drain a position past the daily ceiling.
-        if market.params.funding_per_period_max_bps > 0
-            && market.params.funding_period_seconds > 0
-        {
-            let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
-            // Period rollover: reset accumulator when window elapsed.
-            if market.period_started_at_unix == 0 {
-                market.period_started_at_unix = now_unix;
-                market.period_funding_paid_abs_bps = 0;
-            } else if now_unix.saturating_sub(market.period_started_at_unix)
-                >= market.params.funding_period_seconds as u64
-            {
-                market.period_started_at_unix = now_unix;
-                market.period_funding_paid_abs_bps = 0;
-            }
-            // Convert this batch's index_delta into a bps-of-notional
-            // contribution. ΔI is Q64.64 of (rate_bps_per_sec × Δt /
-            // 10_000); the bps contribution per unit notional is
-            // |ΔI| / 2^64 × 10_000.
-            let raw_delta = new_index.saturating_sub(market.cum_funding_index);
-            let abs_delta = raw_delta.unsigned_abs();
-            let abs_bps_u128 = abs_delta
-                .saturating_mul(constants::BPS_DENOM as u128)
-                >> constants::FUNDING_INDEX_FRACTIONAL_BITS;
-            let abs_bps = if abs_bps_u128 > u64::MAX as u128 {
-                u64::MAX
-            } else {
-                abs_bps_u128 as u64
-            };
-            let cap = market.params.funding_per_period_max_bps as u64;
-            let prior = market.period_funding_paid_abs_bps;
-            let projected = prior.saturating_add(abs_bps);
-            if projected > cap {
-                // Scale index advance so we land exactly at the cap.
-                let allowed = cap.saturating_sub(prior) as u128;
-                let scale_num = allowed;
-                let scale_den = abs_bps as u128;
-                if scale_den == 0 {
-                    // Already at cap; nothing to do (index unchanged).
-                } else {
-                    let scaled_delta = (raw_delta as i128)
-                        .saturating_mul(scale_num as i128)
-                        / scale_den as i128;
-                    market.cum_funding_index = market
-                        .cum_funding_index
-                        .saturating_add(scaled_delta);
-                    market.period_funding_paid_abs_bps = cap;
-                    // Rate also scales (off-chain monitors see the
-                    // attenuated rate, not the unattenuated one).
-                    let rate_scale = ((dampened_rate as i128)
-                        .saturating_mul(scale_num as i128))
-                        / scale_den.max(1) as i128;
-                    market.last_funding_rate_bps_per_sec = clamp_i128_to_i64(rate_scale);
-                    emit!(FundingPeriodCapHitEvent {
-                        market: market.key(),
-                        period_started_at_unix: market.period_started_at_unix,
-                        cap_bps: cap,
-                        attenuated_rate_bps_per_sec: market.last_funding_rate_bps_per_sec,
-                    });
-                }
-            } else {
-                market.period_funding_paid_abs_bps = projected;
-            }
-        }
-
-        // 2. Load buffered orders. SKIP GTT-expired orders — the slot
-        //    stays valid (cleanup keepers reclaim rent later via
-        //    cancel_order) but the matcher pretends the order isn't
-        //    there. Lazy expiry: no per-slot tx cost for the trader.
-        let now_slot = Clock::get()?.slot;
-        let mut orders: Vec<Order> = Vec::with_capacity(buffer.head as usize);
-        for slot in buffer.slots.iter().take(ORDER_BUFFER_CAP) {
-            if slot.valid != 1 {
-                continue;
-            }
-            if slot.expires_at_slot > 0 && now_slot > slot.expires_at_slot {
-                continue;
-            }
-            orders.push(slot_to_order(slot)?);
-        }
-
-        // 3. Generate FLP virtual quotes — synthesized; consumed in this match.
-        // Compute real signed exposure for *this* market from the per-market
-        // entry on FlpExposureAccount, plus gross utilization across all
-        // markets the pool is exposed to.
-        let flp_pool_capital = flp.total_capital_quote_lots;
-        let market_key = market.key();
-        let flp_net_signed: i64 = {
-            let entry = flp
-                .per_market
-                .iter()
-                .find(|e| e.market == market_key && e.side != 255);
-            match entry {
-                Some(e) => {
-                    let notional_u128 = (e.size_lots as u128)
-                        .saturating_mul(e.entry_price_ticks as u128)
-                        .saturating_mul(market.params.tick_size as u128);
-                    let notional = notional_u128.min(i64::MAX as u128) as i64;
-                    if e.side == 0 { notional } else { -notional }
-                }
-                None => 0,
-            }
-        };
-        let utilization_bps = if flp_pool_capital > 0 {
-            let oi_total = market
-                .oi_long_lots
-                .saturating_add(market.oi_short_lots) as u128;
-            let notional = oi_total
-                .saturating_mul(market.mark_price_ticks as u128)
-                .saturating_mul(market.params.tick_size as u128);
-            let bps = (notional / (flp_pool_capital as u128)).min(constants::BPS_DENOM as u128);
-            bps as u32
-        } else {
-            0
+            handle.insert_ask(order)?
         };
 
-        // Realized volatility from the recent clearing-price window.
-        let realized_vol_bps = realized_vol_bps_from_window(
-            &market.recent_clearing_prices,
-            market.recent_clearing_count,
-        );
-
-        let flp_params = FlpQuoterParams {
-            base_spread_bps: market.params.flp_spread_base_bps,
-            alpha_bps: market.params.flp_spread_alpha_bps,
-            beta_bps: market.params.flp_spread_beta_bps,
-            gamma_bps: market.params.flp_spread_gamma_bps,
-            kappa_bps: market.params.flp_spread_kappa_bps,
-            delta_bps: market.params.flp_spread_delta_bps,
-            inventory_lambda_bps: market.params.flp_inventory_lambda_bps,
-            depth_floor_lots: market.params.flp_depth_floor_lots,
-            max_growth_per_batch_bps: market.params.flp_max_growth_per_batch_bps,
-            levels: market.params.flp_quote_levels,
-            tick_size: market.params.tick_size,
-        };
-        let flp_inputs = FlpQuoterInputs {
-            oracle_ticks: Ticks(market.oracle_price_ticks),
-            vpin_bps: market.vpin.as_bps(),
-            realized_vol_bps,
-            pool_capital_quote_lots: flp_pool_capital,
-            pool_net_quote_lots_signed: flp_net_signed,
-            pool_gross_utilization_bps: utilization_bps,
-            oi_long_lots: market.oi_long_lots,
-            oi_short_lots: market.oi_short_lots,
-        };
-        let flp_trader = flp.key();
-        let flp_seq_base = FLP_SEQ_RESERVED_OFFSET
-            .saturating_add(market.current_batch.saturating_mul(1024));
-        let (_flp_out, flp_orders) =
-            generate_quotes(flp_params, flp_inputs, flp_trader, flp_seq_base)?;
-        for o in flp_orders {
-            orders.push(o);
-        }
-
-        // 4. Run FBA Walrasian clearing.
-        let prior_mark = Ticks(market.mark_price_ticks);
-        let result = clear_batch(&orders, prior_mark)?;
-
-        // 5. Update mark price (TWAP, oracle-banded).
-        if result.clearing_volume.0 > 0 {
-            let len = MARK_HISTORY_LEN;
-            let idx = (market.current_batch as usize) % len;
-            market.recent_clearing_prices[idx] = result.clearing_price.0;
-            if (market.recent_clearing_count as usize) < len {
-                market.recent_clearing_count =
-                    market.recent_clearing_count.saturating_add(1);
-            }
-            // TWAP.
-            let count = market.recent_clearing_count as usize;
-            let sum: u128 = market
-                .recent_clearing_prices
-                .iter()
-                .take(count)
-                .fold(0u128, |acc, p| acc.saturating_add(*p as u128));
-            let twap = (sum.checked_div(count as u128)).unwrap_or(result.clearing_price.0 as u128) as u64;
-            // Oracle band.
-            let band = (market.oracle_price_ticks as u128)
-                .saturating_mul(market.params.oracle_band_bps as u128)
-                / constants::BPS_DENOM as u128;
-            let lo = (market.oracle_price_ticks as u128).saturating_sub(band) as u64;
-            let hi = (market.oracle_price_ticks as u128).saturating_add(band) as u64;
-            let banded = twap.max(lo).min(hi);
-
-            // Mark-change sanity cap (anti-flash-crash). When set, clamp
-            // the new mark to within `mark_change_max_bps` of the prior
-            // mark. Defends against a single thin-liquidity batch (or a
-            // band-passing oracle spike) producing an outlier mark that
-            // would liquidate a swathe of healthy positions on the next
-            // assess. 0 = unlimited (legacy / pre-launch).
-            let prior = market.mark_price_ticks as u128;
-            let cap_bps = market.params.mark_change_max_bps as u128;
-            let new_mark = if cap_bps > 0 && prior > 0 {
-                let cap_delta = prior.saturating_mul(cap_bps) / constants::BPS_DENOM as u128;
-                let cap_lo = prior.saturating_sub(cap_delta) as u64;
-                let cap_hi = prior.saturating_add(cap_delta).min(u64::MAX as u128) as u64;
-                let clamped = banded.max(cap_lo).min(cap_hi);
-                if clamped != banded {
-                    emit!(MarkChangeClampedEvent {
-                        market: market.key(),
-                        batch_num: market.current_batch,
-                        unclamped_mark_ticks: banded,
-                        clamped_mark_ticks: clamped,
-                        prior_mark_ticks: prior as u64,
-                    });
-                }
-                clamped
-            } else {
-                banded
-            };
-            market.mark_price_ticks = new_mark;
-        }
-
-        // 6. Update VPIN. Snapshot params before mutable borrow on vpin.
-        let vpin_bucket = market.params.vpin_bucket_size_lots;
-        let vpin_window = market.params.vpin_ema_window;
-        for fill in &result.fills {
-            market
-                .vpin
-                .record_fill(fill.taker_side, fill.size.0, vpin_bucket, vpin_window)?;
-        }
-
-        // 7. Sweep expired commits (bond seizure logged).
-        let seized = sweep_expired(&mut commit_buffer.commits, market.current_batch);
-
-        // 8. Clear order buffer.
-        for slot in buffer.slots.iter_mut() {
-            *slot = OrderSlot::default();
-        }
-        buffer.head = 0;
-
-        // 9. Bookkeeping.
-        market.current_batch = market
-            .current_batch
-            .checked_add(1)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        market.last_batch_ms = now_ms;
-
-        emit!(BatchClearedEvent {
-            market: market.key(),
-            batch_num: market.current_batch,
-            clearing_price: result.clearing_price.0,
-            clearing_volume: result.clearing_volume.0,
-            fill_count: result.fills.len() as u32,
-            funding_rate_bps_per_sec: ftick.rate_bps_per_sec,
-            seized_bonds: seized,
+        emit!(RevealAppliedV2Event {
+            market: market_key,
+            trader: trader_pk,
+            side,
+            size_lots,
+            limit_ticks,
+            order_seq: next_seq,
+            node_index: inserted_idx,
         });
         Ok(())
     }
@@ -6289,13 +5851,6 @@ fn initialize_market_inner(
     market.period_funding_paid_abs_bps = 0;
     market.params = params;
 
-    let buffer = &mut ctx.accounts.order_buffer;
-    buffer.market = market.key();
-    buffer.bump = ctx.bumps.order_buffer;
-    buffer.head = 0;
-    buffer.seq_counter = 0;
-    buffer.slots = [OrderSlot::default(); ORDER_BUFFER_CAP];
-
     let commit_buf = &mut ctx.accounts.commit_buffer;
     commit_buf.market = market.key();
     commit_buf.bump = ctx.bumps.commit_buffer;
@@ -6345,19 +5900,9 @@ pub struct InitializeMarket<'info> {
     )]
     pub market: Box<Account<'info, MarketAccount>>,
 
-    /// Buffers init in the same ix again — works because we shrunk
-    /// ORDER_BUFFER_CAP / COMMIT_BUFFER_CAP from 64 to 16. At CAP=16
-    /// each buffer is ~1.5KB instead of ~5KB, comfortably under BPF's
-    /// 4KB stack frame on Anchor's auto-deserialize.
-    #[account(
-        init,
-        payer = authority,
-        space = OrderBufferAccount::space(),
-        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub order_buffer: Box<Account<'info, OrderBufferAccount>>,
-
+    /// commit_buffer init alongside the market; commit-reveal needs it.
+    /// (v1 also init'd order_buffer here; deleted in wave 19i since the
+    /// hypertree-backed market_book PDA is initialized via init_market_book.)
     #[account(
         init,
         payer = authority,
@@ -6651,29 +6196,6 @@ pub struct InitMarketBook<'info> {
         bump,
     )]
     pub market_book: UncheckedAccount<'info>,
-
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct InitializeOrderBuffer<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    #[account(
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-
-    #[account(
-        init,
-        payer = authority,
-        space = OrderBufferAccount::space(),
-        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub order_buffer: Box<Account<'info, OrderBufferAccount>>,
 
     pub system_program: Program<'info, System>,
 }
@@ -7330,7 +6852,7 @@ pub struct SubmitCommit<'info> {
 }
 
 #[derive(Accounts)]
-pub struct SubmitReveal<'info> {
+pub struct SubmitRevealV2<'info> {
     pub trader: Signer<'info>,
     #[account(
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
@@ -7343,46 +6865,13 @@ pub struct SubmitReveal<'info> {
         bump = commit_buffer.bump,
     )]
     pub commit_buffer: Account<'info, CommitBufferAccount>,
+    /// CHECK: hypertree PDA; disc validated inside handler.
     #[account(
         mut,
-        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
-        bump = order_buffer.bump,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
     )]
-    pub order_buffer: Account<'info, OrderBufferAccount>,
-}
-
-#[derive(Accounts)]
-pub struct RunBatch<'info> {
-    pub sequencer: Signer<'info>,
-    #[account(
-        mut,
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-    #[account(
-        mut,
-        seeds = [OrderBufferAccount::SEED, market.key().as_ref()],
-        bump = order_buffer.bump,
-    )]
-    pub order_buffer: Box<Account<'info, OrderBufferAccount>>,
-    #[account(
-        mut,
-        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
-        bump = commit_buffer.bump,
-    )]
-    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
-    #[account(
-        mut,
-        seeds = [InsuranceFundAccount::SEED],
-        bump = insurance_fund.bump,
-    )]
-    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
-    #[account(
-        seeds = [FlpExposureAccount::SEED],
-        bump = flp_exposure.bump,
-    )]
-    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+    pub market_book: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -7554,7 +7043,7 @@ pub struct ApplyFill<'info> {
 }
 
 #[derive(Accounts)]
-pub struct PlaceBasketOrder<'info> {
+pub struct PlaceBasketOrderV2<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
 
@@ -7579,12 +7068,13 @@ pub struct PlaceBasketOrder<'info> {
     )]
     pub market_a: Account<'info, MarketAccount>,
 
+    /// CHECK: hypertree PDA for leg A; disc validated inside handler.
     #[account(
         mut,
-        seeds = [OrderBufferAccount::SEED, market_a.key().as_ref()],
-        bump = order_buffer_a.bump,
+        seeds = [state_v2::MARKET_BOOK_SEED, market_a.key().as_ref()],
+        bump,
     )]
-    pub order_buffer_a: Account<'info, OrderBufferAccount>,
+    pub market_book_a: UncheckedAccount<'info>,
 
     #[account(
         init_if_needed,
@@ -7602,12 +7092,13 @@ pub struct PlaceBasketOrder<'info> {
     )]
     pub market_b: Account<'info, MarketAccount>,
 
+    /// CHECK: hypertree PDA for leg B; disc validated inside handler.
     #[account(
         mut,
-        seeds = [OrderBufferAccount::SEED, market_b.key().as_ref()],
-        bump = order_buffer_b.bump,
+        seeds = [state_v2::MARKET_BOOK_SEED, market_b.key().as_ref()],
+        bump,
     )]
-    pub order_buffer_b: Account<'info, OrderBufferAccount>,
+    pub market_book_b: UncheckedAccount<'info>,
 
     #[account(
         init_if_needed,
@@ -7622,7 +7113,7 @@ pub struct PlaceBasketOrder<'info> {
 }
 
 #[derive(Accounts)]
-pub struct PlaceBasketOrderN<'info> {
+pub struct PlaceBasketOrderNV2<'info> {
     pub trader: Signer<'info>,
 
     #[account(
@@ -7633,16 +7124,14 @@ pub struct PlaceBasketOrderN<'info> {
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
 
-    /// Read for the capital-relative position cap (per-leg) and the
-    /// joint stress-lattice gate.
     #[account(
         seeds = [FlpExposureAccount::SEED],
         bump = flp_exposure.bump,
     )]
     pub flp_exposure: Account<'info, FlpExposureAccount>,
     // Per-leg accounts arrive in remaining_accounts as triples:
-    //   [market_0, order_buffer_0, position_0,
-    //    market_1, order_buffer_1, position_1, ...]
+    //   [market_0, market_book_0, position_0,
+    //    market_1, market_book_1, position_1, ...]
 }
 
 #[derive(Accounts)]
@@ -8026,18 +7515,6 @@ pub struct ViewMarket<'info> {
         bump = flp_exposure.bump,
     )]
     pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
-}
-
-#[derive(Accounts)]
-pub struct CancelAllOrders<'info> {
-    pub trader: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [OrderBufferAccount::SEED, order_buffer.market.as_ref()],
-        bump = order_buffer.bump,
-    )]
-    pub order_buffer: Account<'info, OrderBufferAccount>,
 }
 
 #[derive(Accounts)]
@@ -8663,13 +8140,6 @@ pub struct IcebergCancelledEvent {
 }
 
 #[event]
-pub struct OrdersMassCancelledEvent {
-    pub market: Pubkey,
-    pub trader: Pubkey,
-    pub cancelled_count: u32,
-}
-
-#[event]
 pub struct FillAppliedEvent {
     pub market: Pubkey,
     pub taker: Pubkey,
@@ -8691,14 +8161,7 @@ pub struct FundingSettledEvent {
 }
 
 #[event]
-pub struct BasketOrderNPlacedEvent {
-    pub trader: Pubkey,
-    pub leg_count: u8,
-    pub markets: Vec<Pubkey>,
-}
-
-#[event]
-pub struct BasketOrderPlacedEvent {
+pub struct BasketOrderPlacedV2Event {
     pub trader: Pubkey,
     pub market_a: Pubkey,
     pub market_b: Pubkey,
@@ -8706,6 +8169,28 @@ pub struct BasketOrderPlacedEvent {
     pub side_b: u8,
     pub size_lots_a: u64,
     pub size_lots_b: u64,
+    pub seq_a: u64,
+    pub seq_b: u64,
+    pub node_index_a: u32,
+    pub node_index_b: u32,
+}
+
+#[event]
+pub struct BasketOrderNPlacedV2Event {
+    pub trader: Pubkey,
+    pub leg_count: u8,
+    pub markets: Vec<Pubkey>,
+}
+
+#[event]
+pub struct RevealAppliedV2Event {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub side: u8,
+    pub size_lots: u64,
+    pub limit_ticks: u64,
+    pub order_seq: u64,
+    pub node_index: u32,
 }
 
 #[event]
@@ -9225,50 +8710,6 @@ fn project_post_leg(
     }))
 }
 
-/// Insert a basket leg's order into the given order buffer. Mirrors the
-/// insertion logic in place_limit_order (next_seq, slot scan, head bump).
-fn insert_into_buffer(
-    buffer: &mut OrderBufferAccount,
-    trader: Pubkey,
-    leg: &BasketLeg,
-) -> Result<()> {
-    require!(
-        (buffer.head as usize) < ORDER_BUFFER_CAP,
-        FlashBookError::BufferFull
-    );
-    let next_seq = buffer
-        .seq_counter
-        .checked_add(1)
-        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-    require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
-    let mut inserted = false;
-    for slot in buffer.slots.iter_mut() {
-        if slot.valid == 0 {
-            *slot = OrderSlot {
-                valid: 1,
-                side: leg.side,
-                order_type: OrderType::Limit as u8,
-                post_only: if leg.post_only { 1 } else { 0 },
-                seq: next_seq,
-                id: next_seq,
-                trader,
-                size_lots: leg.size_lots,
-                limit_ticks: leg.limit_ticks,
-                expires_at_slot: 0,
-            };
-            inserted = true;
-            break;
-        }
-    }
-    require!(inserted, FlashBookError::BufferFull);
-    buffer.seq_counter = next_seq;
-    buffer.head = buffer
-        .head
-        .checked_add(1)
-        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-    Ok(())
-}
-
 #[repr(u8)]
 pub enum MarketStatus {
     Inactive = 0,
@@ -9276,6 +8717,101 @@ pub enum MarketStatus {
     PostOnly = 2,
     Paused = 3,
     Closed = 4,
+}
+
+/// Inject one basket leg into a hypertree-backed market_book PDA.
+/// Used by `place_basket_order_v2`. Returns (assigned_seq, node_index)
+/// for the inserted RestingOrderV2.
+///
+/// The market_book account is passed as `UncheckedAccount` (typed in the
+/// caller's ctx). This helper takes a borrow of its data, writes the
+/// new RestingOrderV2 via the hypertree handle, and returns.
+fn inject_leg_into_hypertree(
+    market_book: &UncheckedAccount<'_>,
+    market_key: Pubkey,
+    trader_key: Pubkey,
+    leg: &BasketLeg,
+    now_slot: u64,
+) -> Result<(u64, hypertree::DataIndex)> {
+    let mut book_data = market_book.try_borrow_mut_data()?;
+    let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+    require!(
+        handle.header.market_pubkey == market_key,
+        FlashBookError::WrongMarket
+    );
+    let next_seq = handle
+        .header
+        .order_seq_counter
+        .checked_add(1)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+    handle.header.order_seq_counter = next_seq;
+
+    let side_is_bid = leg.side == 0;
+    let order = state_v2::RestingOrderV2 {
+        order_id: state_v2::encode_order_id(leg.limit_ticks, next_seq, side_is_bid),
+        seq: next_seq,
+        price_ticks: leg.limit_ticks,
+        size_lots: leg.size_lots,
+        expires_at_slot: 0,
+        trader: trader_key,
+        last_valid_slot: now_slot as u32,
+        side: leg.side,
+        order_type: 0, // limit
+        flags: if leg.post_only { 0b0000_0001 } else { 0 },
+        _pad: 0,
+    };
+    let idx = if side_is_bid {
+        handle.insert_bid(order)?
+    } else {
+        handle.insert_ask(order)?
+    };
+    Ok((next_seq, idx))
+}
+
+/// AccountInfo variant for `place_basket_order_n_v2`, where leg market_books
+/// arrive via `remaining_accounts` (untyped). Same insertion contract.
+fn inject_leg_into_hypertree_unchecked(
+    market_book_ai: &AccountInfo<'_>,
+    market_key: Pubkey,
+    trader_key: Pubkey,
+    leg: &BasketLeg,
+    now_slot: u64,
+) -> Result<()> {
+    let mut book_data = market_book_ai.try_borrow_mut_data()?;
+    let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+    require!(
+        handle.header.market_pubkey == market_key,
+        FlashBookError::WrongMarket
+    );
+    let next_seq = handle
+        .header
+        .order_seq_counter
+        .checked_add(1)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    require!(next_seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+    handle.header.order_seq_counter = next_seq;
+
+    let side_is_bid = leg.side == 0;
+    let order = state_v2::RestingOrderV2 {
+        order_id: state_v2::encode_order_id(leg.limit_ticks, next_seq, side_is_bid),
+        seq: next_seq,
+        price_ticks: leg.limit_ticks,
+        size_lots: leg.size_lots,
+        expires_at_slot: 0,
+        trader: trader_key,
+        last_valid_slot: now_slot as u32,
+        side: leg.side,
+        order_type: 0,
+        flags: if leg.post_only { 0b0000_0001 } else { 0 },
+        _pad: 0,
+    };
+    if side_is_bid {
+        handle.insert_bid(order)?;
+    } else {
+        handle.insert_ask(order)?;
+    }
+    Ok(())
 }
 
 /// Map a `RestingOrderV2.order_type` byte to the matcher's OrderType.
@@ -9295,34 +8831,6 @@ pub fn order_type_byte_to_matcher(b: u8) -> matcher::order::OrderType {
         4 => OrderType::Adl,
         _ => OrderType::Limit,
     }
-}
-
-fn slot_to_order(slot: &OrderSlot) -> Result<Order> {
-    let side = if slot.side == 0 { Side::Long } else { Side::Short };
-    let order_type = match slot.order_type {
-        0 => OrderType::Limit,
-        1 => OrderType::Taker,
-        2 => OrderType::FlpVirtual,
-        3 => OrderType::Liquidation,
-        4 => OrderType::Adl,
-        _ => return Err(error!(FlashBookError::OutOfRange)),
-    };
-    // Decode STP mode from flags bits 4-5 of the OrderSlot.post_only
-    // bitfield. 0..2 are valid; 3 is reserved/invalid → fall back to
-    // CancelNewest defensively.
-    let stp_bits = (slot.post_only >> 4) & 0b11;
-    let stp_mode = matcher::order::StpMode::from_u8(stp_bits);
-    Ok(Order {
-        id: slot.id,
-        trader: slot.trader,
-        side,
-        order_type,
-        size: BaseLots(slot.size_lots),
-        limit_price: Ticks(slot.limit_ticks),
-        seq: slot.seq,
-        post_only: (slot.post_only & 1) == 1,
-        stp_mode,
-    })
 }
 
 /// Realized volatility (stdev of relative returns) over a clearing-price
@@ -9747,17 +9255,3 @@ fn clamp_i128_to_i64(v: i128) -> i64 {
     else { v as i64 }
 }
 
-fn order_to_slot(o: &Order) -> OrderSlot {
-    OrderSlot {
-        valid: 1,
-        side: o.side as u8,
-        order_type: o.order_type as u8,
-        post_only: if o.post_only { 1 } else { 0 },
-        seq: o.seq,
-        id: o.id,
-        trader: o.trader,
-        size_lots: o.size.0,
-        limit_ticks: o.limit_price.0,
-        expires_at_slot: 0,
-    }
-}

@@ -30,7 +30,6 @@ import {
   insuranceFundPda,
   lpPositionPda,
   marketPda,
-  orderBufferPda,
   positionPda,
   traderStatePda,
   triggerOrderPda,
@@ -94,9 +93,6 @@ export class FlashBookClient {
 
   market(baseMint: PublicKey, quoteMint: PublicKey) {
     return marketPda(baseMint, quoteMint, this.programId);
-  }
-  orderBuffer(market: PublicKey) {
-    return orderBufferPda(market, this.programId);
   }
   commitBuffer(market: PublicKey) {
     return commitBufferPda(market, this.programId);
@@ -233,7 +229,6 @@ export class FlashBookClient {
     initialOracleTicks: bigint | number;
   }): Promise<TransactionInstruction> {
     const market = this.market(args.baseMint, args.quoteMint);
-    const orderBuffer = this.orderBuffer(market.address);
     const commitBuffer = this.commitBuffer(market.address);
     const fund = this.insuranceFund();
     const flp = this.flpExposure();
@@ -248,32 +243,9 @@ export class FlashBookClient {
         quoteVault: args.quoteVault,
         oracleAccount: args.oracleAccount,
         market: market.address,
-        orderBuffer: orderBuffer.address,
         commitBuffer: commitBuffer.address,
         insuranceFund: fund.address,
         flpExposure: flp.address,
-        systemProgram: SystemProgram.programId,
-      })
-      .instruction();
-  }
-
-  /// @deprecated Wave 18h — use `initMarketBookIx` (v2 hypertree). The
-  /// v1 flat-array order_buffer is capped at CAP=16 nodes and runs the
-  /// legacy single-batch matcher. v2 carries 100 nodes (~50/side) on
-  /// the hypertree, supports resting orders across batches, and runs
-  /// the smarter matcher (EMA-blended funding, vol-adaptive band,
-  /// VPIN-gated FLP). Wave 19 will delete this builder.
-  initializeOrderBufferIx(args: {
-    authority: PublicKey;
-    market: PublicKey;
-  }): Promise<TransactionInstruction> {
-    const orderBuffer = this.orderBuffer(args.market);
-    return this.methods
-      .initializeOrderBuffer()
-      .accountsPartial({
-        authority: args.authority,
-        market: args.market,
-        orderBuffer: orderBuffer.address,
         systemProgram: SystemProgram.programId,
       })
       .instruction();
@@ -580,7 +552,6 @@ export class FlashBookClient {
     initialOracleTicks: bigint | number;
   }): Promise<TransactionInstruction> {
     const market = this.market(args.baseMint, args.quoteMint);
-    const orderBuffer = this.orderBuffer(market.address);
     const commitBuffer = this.commitBuffer(market.address);
     const fund = this.insuranceFund();
     const flp = this.flpExposure();
@@ -595,7 +566,6 @@ export class FlashBookClient {
         quoteVault: args.quoteVault,
         oracleAccount: args.oracleAccount,
         market: market.address,
-        orderBuffer: orderBuffer.address,
         commitBuffer: commitBuffer.address,
         insuranceFund: fund.address,
         flpExposure: flp.address,
@@ -666,11 +636,9 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// Place two orders across two distinct markets atomically with a single
-  /// cross-market stress-lattice gate. Hedged positions get correctly
-  /// reduced required margin (the engine sees both legs' projected
-  /// post-state at once). Atomic: any leg failure rolls back the whole tx.
-  placeBasketOrderIx(args: {
+  /// V2 2-leg basket order against the hypertree-backed book. Same
+  /// validation + cross-market margin gate as v1 (place_basket_order).
+  placeBasketOrderV2Ix(args: {
     trader: PublicKey;
     marketA: PublicKey;
     marketB: PublicKey;
@@ -679,8 +647,8 @@ export class FlashBookClient {
   }): Promise<TransactionInstruction> {
     const flp = this.flpExposure();
     const state = this.traderState(args.trader);
-    const orderBufA = this.orderBuffer(args.marketA);
-    const orderBufB = this.orderBuffer(args.marketB);
+    const bookA = marketBookPda(args.marketA);
+    const bookB = marketBookPda(args.marketB);
     const posA = this.position(args.marketA, args.trader);
     const posB = this.position(args.marketB, args.trader);
     const toLeg = (l: typeof args.legA) => ({
@@ -690,27 +658,25 @@ export class FlashBookClient {
       postOnly: l.postOnly ?? false,
     });
     return this.methods
-      .placeBasketOrder(toLeg(args.legA), toLeg(args.legB))
+      .placeBasketOrderV2(toLeg(args.legA), toLeg(args.legB))
       .accountsPartial({
         trader: args.trader,
         traderState: state.address,
         flpExposure: flp.address,
         marketA: args.marketA,
-        orderBufferA: orderBufA.address,
+        marketBookA: bookA.address,
         positionA: posA.address,
         marketB: args.marketB,
-        orderBufferB: orderBufB.address,
+        marketBookB: bookB.address,
         positionB: posB.address,
         systemProgram: SystemProgram.programId,
       })
       .instruction();
   }
 
-  /// N-leg basket order (≤ MAX_BASKET_LEGS_N = 4). Generalises the
-  /// fixed 2-leg `placeBasketOrderIx` via remaining_accounts walking.
-  /// Position PDAs MUST already exist on each market — call a no-op
-  /// place_limit_order first to init.
-  placeBasketOrderNIx(args: {
+  /// V2 N-leg basket order. remaining_accounts triples per leg are
+  /// (market, market_book, position). Position PDAs must pre-exist.
+  placeBasketOrderNV2Ix(args: {
     trader: PublicKey;
     legs: ReadonlyArray<{
       market: PublicKey;
@@ -728,20 +694,18 @@ export class FlashBookClient {
       limitTicks: l.limitTicks,
       postOnly: l.postOnly ?? false,
     }));
-    // Build remaining_accounts as triples [market, order_buffer, position]
-    // per leg. Caller delivers the same array order as legs.
     const remaining: { pubkey: PublicKey; isWritable: boolean; isSigner: boolean }[] = [];
     for (const leg of args.legs) {
-      const buf = this.orderBuffer(leg.market);
+      const book = marketBookPda(leg.market);
       const pos = this.position(leg.market, args.trader);
       remaining.push(
         { pubkey: leg.market, isWritable: false, isSigner: false },
-        { pubkey: buf.address, isWritable: true, isSigner: false },
+        { pubkey: book.address, isWritable: true, isSigner: false },
         { pubkey: pos.address, isWritable: true, isSigner: false },
       );
     }
     return this.methods
-      .placeBasketOrderN(ixLegs)
+      .placeBasketOrderNV2(ixLegs)
       .accountsPartial({
         trader: args.trader,
         traderState: state.address,
@@ -894,29 +858,6 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// Mass-cancel: drop EVERY pending limit/taker order belonging to the
-  /// caller in this market. Single signer, single tx. Single O(n) walk
-  /// over the order_buffer (n ≤ 64). FLP-virtual / liq / ADL system
-  /// orders are skipped.
-  ///
-  /// @deprecated Wave 18h — use the v2 walking variant once wave 19
-  /// ships `cancelAllOrdersInMarketV2Ix`. Until then, callers on the
-  /// v2 hypertree must enumerate orders via `viewBookDepthV2Ix` (or
-  /// the off-chain event log) and call `cancelOrderV2Ix` per order.
-  cancelAllOrdersInMarketIx(args: {
-    trader: PublicKey;
-    market: PublicKey;
-  }): Promise<TransactionInstruction> {
-    const buffer = this.orderBuffer(args.market);
-    return this.methods
-      .cancelAllOrdersInMarket()
-      .accountsPartial({
-        trader: args.trader,
-        orderBuffer: buffer.address,
-      })
-      .instruction();
-  }
-
   submitCommitIx(args: {
     trader: PublicKey;
     market: PublicKey;
@@ -934,7 +875,12 @@ export class FlashBookClient {
       .instruction();
   }
 
-  submitRevealIx(args: {
+  /// V2 commit-reveal: redeem a previously-submitted commit and inject
+  /// the revealed taker order into the hypertree-backed book. Same hash
+  /// validation as v1; only the inject target differs (hypertree, not
+  /// v1 buffer). order_type byte = 1 (Taker) → matcher promotes to
+  /// Taker FIFO priority above resting limits at the same price tier.
+  submitRevealV2Ix(args: {
     trader: PublicKey;
     market: PublicKey;
     side: 'long' | 'short';
@@ -942,10 +888,10 @@ export class FlashBookClient {
     limitTicks: bigint | number;
     nonce: Uint8Array;
   }): Promise<TransactionInstruction> {
-    const orderBuffer = this.orderBuffer(args.market);
+    const book = marketBookPda(args.market);
     const commitBuffer = this.commitBuffer(args.market);
     return this.methods
-      .submitReveal(
+      .submitRevealV2(
         args.side === 'long' ? 0 : 1,
         args.sizeLots,
         args.limitTicks,
@@ -954,37 +900,12 @@ export class FlashBookClient {
       .accountsPartial({
         trader: args.trader,
         market: args.market,
-        orderBuffer: orderBuffer.address,
         commitBuffer: commitBuffer.address,
+        marketBook: book.address,
       })
       .instruction();
   }
 
-  /// @deprecated Wave 18h — use `runBatchV2Ix`. v2 has economic parity
-  /// (funding/FLP/VPIN/mark TWAP/oracle band/commit sweep) PLUS
-  /// EMA-blended funding, vol-adaptive band, and VPIN-gated FLP pause
-  /// (improvements over HL/Phoenix/Manifest). Wave 19 will delete this.
-  runBatchIx(args: {
-    sequencer: PublicKey;
-    market: PublicKey;
-    nowMs: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const buffer = this.orderBuffer(args.market);
-    const commitBuffer = this.commitBuffer(args.market);
-    const fund = this.insuranceFund();
-    const flp = this.flpExposure();
-    return this.methods
-      .runBatch(args.nowMs)
-      .accountsPartial({
-        sequencer: args.sequencer,
-        market: args.market,
-        orderBuffer: buffer.address,
-        commitBuffer: commitBuffer.address,
-        insuranceFund: fund.address,
-        flpExposure: flp.address,
-      })
-      .instruction();
-  }
 
   setMarketStatusIx(args: {
     authority: PublicKey;

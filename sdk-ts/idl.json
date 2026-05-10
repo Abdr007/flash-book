@@ -673,65 +673,6 @@
       ]
     },
     {
-      "name": "cancel_all_orders_in_market",
-      "docs": [
-        "Mass-cancel: clears EVERY pending limit/taker order belonging to",
-        "the caller in this market's buffer. Single tx, single signer.",
-        "O(n) over the buffer (n ≤ ORDER_BUFFER_CAP = 64). FLP-virtual,",
-        "liquidation, and ADL system orders are skipped (only user-",
-        "submitted orders are eligible). Reduces failed-cancel UX",
-        "thrash for active traders / MMs that need to flatten quotes",
-        "before a reconfig."
-      ],
-      "discriminator": [
-        61,
-        148,
-        114,
-        57,
-        201,
-        35,
-        8,
-        39
-      ],
-      "accounts": [
-        {
-          "name": "trader",
-          "signer": true
-        },
-        {
-          "name": "order_buffer",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  111,
-                  114,
-                  100,
-                  101,
-                  114,
-                  95,
-                  98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "order_buffer.market",
-                "account": "OrderBufferAccount"
-              }
-            ]
-          }
-        }
-      ],
-      "args": []
-    },
-    {
       "name": "cancel_iceberg_v2",
       "docs": [
         "V2: cancel an iceberg order against the hypertree-backed book.",
@@ -3301,42 +3242,12 @@
           }
         },
         {
-          "name": "order_buffer",
-          "docs": [
-            "Buffers init in the same ix again — works because we shrunk",
-            "ORDER_BUFFER_CAP / COMMIT_BUFFER_CAP from 64 to 16. At CAP=16",
-            "each buffer is ~1.5KB instead of ~5KB, comfortably under BPF's",
-            "4KB stack frame on Anchor's auto-deserialize."
-          ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  111,
-                  114,
-                  100,
-                  101,
-                  114,
-                  95,
-                  98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
           "name": "commit_buffer",
+          "docs": [
+            "commit_buffer init alongside the market; commit-reveal needs it.",
+            "(v1 also init'd order_buffer here; deleted in wave 19i since the",
+            "hypertree-backed market_book PDA is initialized via init_market_book.)"
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -3434,95 +3345,6 @@
           "type": "u64"
         }
       ]
-    },
-    {
-      "name": "initialize_order_buffer",
-      "docs": [
-        "Initialize the order_buffer for an existing market. MUST be",
-        "called after `initialize_market`. Separate from",
-        "`initialize_commit_buffer` to avoid Anchor 0.31's BPF",
-        "\"Overlapping copy\" invariant when two large (~5KB) boxed",
-        "accounts init in one ix."
-      ],
-      "discriminator": [
-        216,
-        7,
-        68,
-        242,
-        102,
-        120,
-        129,
-        36
-      ],
-      "accounts": [
-        {
-          "name": "authority",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "market",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  109,
-                  97,
-                  114,
-                  107,
-                  101,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market.base_mint",
-                "account": "MarketAccount"
-              },
-              {
-                "kind": "account",
-                "path": "market.quote_mint",
-                "account": "MarketAccount"
-              }
-            ]
-          }
-        },
-        {
-          "name": "order_buffer",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  111,
-                  114,
-                  100,
-                  101,
-                  114,
-                  95,
-                  98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": []
     },
     {
       "name": "liquidate_portfolio_v2",
@@ -4016,42 +3838,12 @@
           }
         },
         {
-          "name": "order_buffer",
-          "docs": [
-            "Buffers init in the same ix again — works because we shrunk",
-            "ORDER_BUFFER_CAP / COMMIT_BUFFER_CAP from 64 to 16. At CAP=16",
-            "each buffer is ~1.5KB instead of ~5KB, comfortably under BPF's",
-            "4KB stack frame on Anchor's auto-deserialize."
-          ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  111,
-                  114,
-                  100,
-                  101,
-                  114,
-                  95,
-                  98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
           "name": "commit_buffer",
+          "docs": [
+            "commit_buffer init alongside the market; commit-reveal needs it.",
+            "(v1 also init'd order_buffer here; deleted in wave 19i since the",
+            "hypertree-backed market_book PDA is initialized via init_market_book.)"
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -4151,36 +3943,114 @@
       ]
     },
     {
-      "name": "place_basket_order",
+      "name": "place_basket_order_n_v2",
       "docs": [
-        "Place two orders across two distinct markets atomically, with a",
-        "single cross-market stress-lattice gate. The headline use case is",
-        "pair trades / hedges where the trader wants to net long market A",
-        "and net short market B simultaneously, with the engine recognizing",
-        "the hedge so required margin collapses for offsetting positions.",
-        "",
-        "Without basket orders, two separate place_limit_order calls would",
-        "each run a per-market margin check that doesn't see the offsetting",
-        "leg — the first leg might be rejected even though the post-state",
-        "is healthy. Basket orders fix this by projecting the post-state",
-        "across both markets and running assess_margin once.",
-        "",
-        "Atomicity comes from Solana: if any leg fails (cap breach, buffer",
-        "full, margin gate, etc.), the whole tx rolls back. Rate limit",
-        "counts each leg toward orders_this_batch (basket = 2 units).",
-        "",
-        "V1 supports exactly two legs on two distinct markets. N-leg",
-        "(basket > 2) is a follow-up that uses remaining_accounts walking."
+        "V2 N-leg basket order. Pure parity port of `place_basket_order_n`",
+        "— same K-distinct-markets guard, per-leg intake, caps, joint",
+        "stress lattice, rate limit. remaining_accounts layout: triples",
+        "of (market, market_book, position) per leg, so 3 × K accounts."
       ],
       "discriminator": [
-        16,
-        47,
-        182,
-        105,
-        183,
-        154,
-        168,
-        182
+        215,
+        27,
+        56,
+        117,
+        215,
+        9,
+        119,
+        31
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "legs",
+          "type": {
+            "vec": {
+              "defined": {
+                "name": "BasketLeg"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "place_basket_order_v2",
+      "docs": [
+        "V2 2-leg basket order against the hypertree-backed book. Pure",
+        "parity port of `place_basket_order` — same distinct-market guard,",
+        "same per-leg intake validation, same per-market caps, same joint",
+        "stress-lattice margin gate, same rate limit. Only the injection",
+        "target differs (per-market market_book PDA, not per-market",
+        "order_buffer)."
+      ],
+      "discriminator": [
+        139,
+        48,
+        44,
+        27,
+        106,
+        215,
+        238,
+        123
       ],
       "accounts": [
         {
@@ -4270,25 +4140,24 @@
           }
         },
         {
-          "name": "order_buffer_a",
+          "name": "market_book_a",
           "writable": true,
           "pda": {
             "seeds": [
               {
                 "kind": "const",
                 "value": [
-                  111,
+                  109,
+                  97,
                   114,
-                  100,
+                  107,
                   101,
-                  114,
+                  116,
                   95,
                   98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
+                  111,
+                  111,
+                  107
                 ]
               },
               {
@@ -4356,25 +4225,24 @@
           }
         },
         {
-          "name": "order_buffer_b",
+          "name": "market_book_b",
           "writable": true,
           "pda": {
             "seeds": [
               {
                 "kind": "const",
                 "value": [
-                  111,
+                  109,
+                  97,
                   114,
-                  100,
+                  107,
                   101,
-                  114,
+                  116,
                   95,
                   98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
+                  111,
+                  111,
+                  107
                 ]
               },
               {
@@ -4432,111 +4300,6 @@
           "type": {
             "defined": {
               "name": "BasketLeg"
-            }
-          }
-        }
-      ]
-    },
-    {
-      "name": "place_basket_order_n",
-      "docs": [
-        "N-leg basket order. Place K orders across K distinct markets in",
-        "one transaction with a SINGLE cross-market stress-lattice gate.",
-        "Generalises `place_basket_order` (which is hard-coded for K=2).",
-        "",
-        "`legs.len()` must equal the number of (market, order_buffer,",
-        "position) triples in `remaining_accounts` (so 3 × K accounts).",
-        "All markets must be distinct. Position PDAs MUST already exist —",
-        "callers init them via a no-op place_limit_order on each market",
-        "first (init_if_needed isn't safe with remaining_accounts).",
-        "",
-        "Hard caps: legs.len() ≤ MAX_BASKET_LEGS_N (4). Larger baskets",
-        "can land via repeated 2-leg or N-leg calls.",
-        "",
-        "Atomicity: any failure (cap breach, buffer full, distinct-market",
-        "guard, basket margin gate, rate limit) rolls back the whole tx."
-      ],
-      "discriminator": [
-        31,
-        154,
-        234,
-        152,
-        222,
-        154,
-        50,
-        156
-      ],
-      "accounts": [
-        {
-          "name": "trader",
-          "signer": true
-        },
-        {
-          "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
-        },
-        {
-          "name": "flp_exposure",
-          "docs": [
-            "Read for the capital-relative position cap (per-leg) and the",
-            "joint stress-lattice gate."
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  102,
-                  108,
-                  112,
-                  95,
-                  101,
-                  120,
-                  112,
-                  111,
-                  115,
-                  117,
-                  114,
-                  101
-                ]
-              }
-            ]
-          }
-        }
-      ],
-      "args": [
-        {
-          "name": "legs",
-          "type": {
-            "vec": {
-              "defined": {
-                "name": "BasketLeg"
-              }
             }
           }
         }
@@ -5516,175 +5279,6 @@
         }
       ],
       "args": []
-    },
-    {
-      "name": "run_batch",
-      "docs": [
-        "Run one batch: advance funding, generate FLP quotes, clear FBA,",
-        "update mark, sweep expired commits. Position updates are emitted as",
-        "an event for the off-chain bookkeeper or for `apply_fill` to consume."
-      ],
-      "discriminator": [
-        252,
-        221,
-        85,
-        107,
-        31,
-        61,
-        26,
-        213
-      ],
-      "accounts": [
-        {
-          "name": "sequencer",
-          "signer": true
-        },
-        {
-          "name": "market",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  109,
-                  97,
-                  114,
-                  107,
-                  101,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market.base_mint",
-                "account": "MarketAccount"
-              },
-              {
-                "kind": "account",
-                "path": "market.quote_mint",
-                "account": "MarketAccount"
-              }
-            ]
-          }
-        },
-        {
-          "name": "order_buffer",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  111,
-                  114,
-                  100,
-                  101,
-                  114,
-                  95,
-                  98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "commit_buffer",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  109,
-                  109,
-                  105,
-                  116,
-                  95,
-                  98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "insurance_fund",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  105,
-                  110,
-                  115,
-                  117,
-                  114,
-                  97,
-                  110,
-                  99,
-                  101,
-                  95,
-                  102,
-                  117,
-                  110,
-                  100
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "flp_exposure",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  102,
-                  108,
-                  112,
-                  95,
-                  101,
-                  120,
-                  112,
-                  111,
-                  115,
-                  117,
-                  114,
-                  101
-                ]
-              }
-            ]
-          }
-        }
-      ],
-      "args": [
-        {
-          "name": "now_ms",
-          "type": "u64"
-        }
-      ]
     },
     {
       "name": "run_batch_v2",
@@ -6803,20 +6397,27 @@
       ]
     },
     {
-      "name": "submit_reveal",
+      "name": "submit_reveal_v2",
       "docs": [
-        "Reveal a previously committed taker order. The matcher checks the",
-        "hash and synthesizes a taker order in the next batch."
+        "V2 reveal: redeem a previously-submitted commit and inject the",
+        "revealed taker order into the hypertree-backed book. Same",
+        "commit-reveal cryptography as v1 (`redeem_reveal` validates the",
+        "hash + bond against the commit_buffer); only the inject target",
+        "differs (hypertree, not v1 buffer).",
+        "",
+        "The revealed order is inserted with order_type byte = 1 (Taker)",
+        "so the matcher's FIFO mapping promotes it AHEAD of resting limits",
+        "at the same price tier — same priority semantics as v1."
       ],
       "discriminator": [
-        255,
-        153,
-        68,
-        56,
-        227,
-        55,
-        19,
-        157
+        201,
+        26,
+        38,
+        149,
+        248,
+        104,
+        142,
+        7
       ],
       "accounts": [
         {
@@ -6882,25 +6483,24 @@
           }
         },
         {
-          "name": "order_buffer",
+          "name": "market_book",
           "writable": true,
           "pda": {
             "seeds": [
               {
                 "kind": "const",
                 "value": [
-                  111,
+                  109,
+                  97,
                   114,
-                  100,
+                  107,
                   101,
-                  114,
+                  116,
                   95,
                   98,
-                  117,
-                  102,
-                  102,
-                  101,
-                  114
+                  111,
+                  111,
+                  107
                 ]
               },
               {
@@ -8986,19 +8586,6 @@
       ]
     },
     {
-      "name": "OrderBufferAccount",
-      "discriminator": [
-        57,
-        46,
-        2,
-        49,
-        10,
-        168,
-        125,
-        100
-      ]
-    },
-    {
       "name": "PositionAccount",
       "discriminator": [
         60,
@@ -9092,29 +8679,29 @@
       ]
     },
     {
-      "name": "BasketOrderNPlacedEvent",
+      "name": "BasketOrderNPlacedV2Event",
       "discriminator": [
-        19,
-        153,
-        141,
-        135,
-        48,
-        6,
-        0,
-        31
+        157,
+        20,
+        152,
+        178,
+        42,
+        205,
+        112,
+        236
       ]
     },
     {
-      "name": "BasketOrderPlacedEvent",
+      "name": "BasketOrderPlacedV2Event",
       "discriminator": [
-        118,
-        31,
-        155,
-        161,
-        181,
-        196,
-        176,
-        249
+        123,
+        236,
+        203,
+        13,
+        56,
+        1,
+        128,
+        118
       ]
     },
     {
@@ -9625,19 +9212,6 @@
       ]
     },
     {
-      "name": "OrdersMassCancelledEvent",
-      "discriminator": [
-        79,
-        0,
-        7,
-        214,
-        112,
-        87,
-        209,
-        216
-      ]
-    },
-    {
       "name": "PermissionlessMarketDeployedEvent",
       "discriminator": [
         30,
@@ -9726,6 +9300,19 @@
         224,
         41,
         32
+      ]
+    },
+    {
+      "name": "RevealAppliedV2Event",
+      "discriminator": [
+        120,
+        26,
+        191,
+        47,
+        92,
+        219,
+        106,
+        245
       ]
     },
     {
@@ -10313,7 +9900,7 @@
       }
     },
     {
-      "name": "BasketOrderNPlacedEvent",
+      "name": "BasketOrderNPlacedV2Event",
       "type": {
         "kind": "struct",
         "fields": [
@@ -10335,7 +9922,7 @@
       }
     },
     {
-      "name": "BasketOrderPlacedEvent",
+      "name": "BasketOrderPlacedV2Event",
       "type": {
         "kind": "struct",
         "fields": [
@@ -10366,6 +9953,22 @@
           {
             "name": "size_lots_b",
             "type": "u64"
+          },
+          {
+            "name": "seq_a",
+            "type": "u64"
+          },
+          {
+            "name": "seq_b",
+            "type": "u64"
+          },
+          {
+            "name": "node_index_a",
+            "type": "u32"
+          },
+          {
+            "name": "node_index_b",
+            "type": "u32"
           }
         ]
       }
@@ -12363,53 +11966,6 @@
       }
     },
     {
-      "name": "OrderBufferAccount",
-      "docs": [
-        "Per-market order buffer: pending limit + revealed-taker orders for the",
-        "next `run_batch`. Cleared after each batch."
-      ],
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "bump",
-            "type": "u8"
-          },
-          {
-            "name": "head",
-            "docs": [
-              "Number of valid orders in `slots[..head]`."
-            ],
-            "type": "u32"
-          },
-          {
-            "name": "seq_counter",
-            "docs": [
-              "Monotonic sequence counter for FIFO ordering within a batch."
-            ],
-            "type": "u64"
-          },
-          {
-            "name": "slots",
-            "type": {
-              "array": [
-                {
-                  "defined": {
-                    "name": "OrderSlot"
-                  }
-                },
-                16
-              ]
-            }
-          }
-        ]
-      }
-    },
-    {
       "name": "OrderCancelledV2Event",
       "type": {
         "kind": "struct",
@@ -12476,92 +12032,6 @@
           },
           {
             "name": "total_orders_after",
-            "type": "u32"
-          }
-        ]
-      }
-    },
-    {
-      "name": "OrderSlot",
-      "docs": [
-        "Compact on-chain order representation. Mirrors `matcher::order::Order`",
-        "in the same fields but stored as a flat struct for Borsh serialization.",
-        "",
-        "The `post_only` field is now a flag bitfield (bit 0 = post_only, bit",
-        "1 = reduce_only, bit 2 = ioc, bit 3 = jit). The name is kept for",
-        "account-layout compatibility — values 0 or 1 are forward-compatible",
-        "with the legacy boolean reading. Higher bits (4-7) reserved.",
-        "",
-        "`expires_at_slot` enables Good-Till-Time (GTT) limit orders. 0 means",
-        "the order rests until cancelled or filled (legacy / GTC behavior);",
-        "otherwise the matcher skips the order once `current_slot >",
-        "expires_at_slot` and `cancel_order` will accept the cancellation",
-        "without further checks (cleanup keepers can sweep them)."
-      ],
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "valid",
-            "type": "u8"
-          },
-          {
-            "name": "side",
-            "type": "u8"
-          },
-          {
-            "name": "order_type",
-            "type": "u8"
-          },
-          {
-            "name": "post_only",
-            "type": "u8"
-          },
-          {
-            "name": "seq",
-            "type": "u64"
-          },
-          {
-            "name": "id",
-            "type": "u64"
-          },
-          {
-            "name": "trader",
-            "type": "pubkey"
-          },
-          {
-            "name": "size_lots",
-            "type": "u64"
-          },
-          {
-            "name": "limit_ticks",
-            "type": "u64"
-          },
-          {
-            "name": "expires_at_slot",
-            "docs": [
-              "Good-Till-Time expiry slot. 0 = GTC (no expiry)."
-            ],
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "OrdersMassCancelledEvent",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "trader",
-            "type": "pubkey"
-          },
-          {
-            "name": "cancelled_count",
             "type": "u32"
           }
         ]
@@ -12880,6 +12350,42 @@
           {
             "name": "amount_quote_lots",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RevealAppliedV2Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "limit_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "order_seq",
+            "type": "u64"
+          },
+          {
+            "name": "node_index",
+            "type": "u32"
           }
         ]
       }

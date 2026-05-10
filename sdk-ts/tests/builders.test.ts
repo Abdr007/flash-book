@@ -70,8 +70,9 @@ describe('Instruction builders', () => {
     });
     expect(ix.programId.equals(FLASH_BOOK_PROGRAM_ID)).toBe(true);
     // authority, base_mint, quote_mint, base_vault, quote_vault, oracle,
-    // market, order_buffer, commit_buffer, insurance, flp, sysprog
-    expect(ix.keys.length).toBe(12);
+    // market, commit_buffer, insurance, flp, sysprog (v1 order_buffer
+    // removed in wave 19i — markets use the v2 hypertree market_book PDA)
+    expect(ix.keys.length).toBe(11);
   });
 
   test('openTraderStateIx', async () => {
@@ -108,12 +109,12 @@ describe('Instruction builders', () => {
     expect(ix.keys[4].pubkey.toBase58()).toBe(expectedAta.toBase58());
   });
 
-  test('placeBasketOrderIx', async () => {
+  test('placeBasketOrderV2Ix', async () => {
     const client = makeClient();
     const trader = Keypair.generate().publicKey;
     const marketA = client.market(SOL, USDC).address;
-    const marketB = client.market(USDC, SOL).address; // distinct market via swap
-    const ix = await client.placeBasketOrderIx({
+    const marketB = client.market(USDC, SOL).address;
+    const ix = await client.placeBasketOrderV2Ix({
       trader,
       marketA,
       marketB,
@@ -121,21 +122,19 @@ describe('Instruction builders', () => {
       legB: { side: 'short', sizeLots: new BN(1), limitTicks: new BN(200_000) },
     });
     // trader, trader_state, flp_exposure,
-    // market_a, order_buffer_a, position_a,
-    // market_b, order_buffer_b, position_b,
+    // market_a, market_book_a, position_a,
+    // market_b, market_book_b, position_b,
     // system_program
     expect(ix.keys.length).toBe(10);
   });
 
-  test('placeBasketOrderNIx with 3 legs has correct account count', async () => {
+  test('placeBasketOrderNV2Ix with 3 legs has correct account count', async () => {
     const client = makeClient();
     const trader = Keypair.generate().publicKey;
     const m1 = client.market(SOL, USDC).address;
-    // Distinct second + third markets (use SOL/SOL and USDC/USDC pairings to
-    // avoid colliding with m1).
     const m2 = client.market(USDC, SOL).address;
     const m3 = client.market(SOL, SOL).address;
-    const ix = await client.placeBasketOrderNIx({
+    const ix = await client.placeBasketOrderNV2Ix({
       trader,
       legs: [
         { market: m1, side: 'long', sizeLots: new BN(1), limitTicks: new BN(100_000) },
@@ -143,7 +142,7 @@ describe('Instruction builders', () => {
         { market: m3, side: 'long', sizeLots: new BN(1), limitTicks: new BN(50_000) },
       ],
     });
-    // trader, trader_state, flp_exposure + (market, order_buffer, position) × 3
+    // trader, trader_state, flp_exposure + (market, market_book, position) × 3
     expect(ix.keys.length).toBe(3 + 3 * 3);
   });
 
@@ -295,10 +294,10 @@ describe('Instruction builders', () => {
     expect(ix.keys.length).toBe(3); // trader, market, commit_buffer
   });
 
-  test('submitRevealIx', async () => {
+  test('submitRevealV2Ix', async () => {
     const client = makeClient();
     const market = client.market(SOL, USDC).address;
-    const ix = await client.submitRevealIx({
+    const ix = await client.submitRevealV2Ix({
       trader: Keypair.generate().publicKey,
       market,
       side: 'short',
@@ -306,7 +305,7 @@ describe('Instruction builders', () => {
       limitTicks: new BN(100_050),
       nonce: new Uint8Array(32),
     });
-    expect(ix.keys.length).toBe(4); // trader, market, order_buffer, commit_buffer
+    expect(ix.keys.length).toBe(4); // trader, market, commit_buffer, market_book
   });
 
   // ─── Batch + settlement (3) ────────────────────────────────────────
@@ -496,8 +495,7 @@ describe('Instruction builders', () => {
     // This test serves as a tripwire: if a new instruction is added to
     // the program, this list will fall out of sync with the test count
     // above. v1 ix builders deleted in wave 19h; only v2 builders for
-    // injection paths remain. Cancel-all + basket + commit-reveal
-    // remain on v1 (no v2 equivalent yet — see V3_STATUS.md).
+    // injection paths shipped. v1 ix surface fully removed in wave 19i.
     const expected = [
       'initializeInsuranceFundIx',
       'initializeFlpExposureIx',
@@ -508,8 +506,10 @@ describe('Instruction builders', () => {
       'depositFlpCapitalIx',
       'withdrawFlpCapitalIx',
       'placeLimitOrderV2Ix',
+      'placeBasketOrderV2Ix',
+      'placeBasketOrderNV2Ix',
       'submitCommitIx',
-      'submitRevealIx',
+      'submitRevealV2Ix',
       'runBatchV2Ix',
       'applyFillIx',
       'applyFlpFillIx',
@@ -522,7 +522,7 @@ describe('Instruction builders', () => {
       'updateMarketParamsIx',
       'transferMarketAuthorityIx',
     ];
-    expect(expected.length).toBe(22);
+    expect(expected.length).toBe(24);
     const client = makeClient();
     for (const name of expected) {
       expect(typeof (client as unknown as Record<string, unknown>)[name]).toBe('function');

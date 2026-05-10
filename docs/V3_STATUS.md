@@ -112,12 +112,12 @@ production pattern from the listed exchange:
 | Suite | Count |
 |-------|-------|
 | Rust unit (lib + matcher) | 93 |
-| Rust integration | 35 (was 58 pre-19h; 23 v1-touching tests deleted) |
+| Rust integration | 31 (was 58; 27 v1-touching tests deleted across 19h + 19i) |
 | Rust parity | 1 |
 | Rust proptests (5 modules) | 55 |
-| TS (sdk-ts) | 135 |
+| TS (sdk-ts) | 128 (was 135; 7 v1 builder + orderbook-version tests deleted) |
 | TS (root) | 141 |
-| **Total** | **460** |
+| **Total** | **449** |
 
 Zero failures, zero warnings.
 
@@ -125,7 +125,7 @@ Zero failures, zero warnings.
 
 | Wave | Description | Status / design doc |
 |------|-------------|---------------------|
-| 19h  | Mass v1 deletion | **Largely done** (commits `04445a4` bot migration + `81b6c55` mass rip-out: -7613 lines, 10 v1 ixs + 17 ctxs/events + 10 SDK builders + 23 tests deleted). Residual v1 surface (basket / commit-reveal / cancel-all + supporting state) deferred to a follow-up wave that ships their v2 equivalents first. |
+| 19h  | Mass v1 deletion | **Done** (commits `04445a4` bot migration + `81b6c55` first rip-out + this wave 19i: basket+reveal+v1-residue full deletion). Total: 16 v1 ixs + all ctxs/events/state/helpers/SDK gone. v3 program is single-orderbook (hypertree only). |
 | 20a  | Multi-tier MMR (HL has up to 6 tiers per asset) | Single-tier already covers ~80% of cases via `concentration_threshold_lots` + `concentration_extra_mmr_bps`; multi-tier needs additive `MarketLeverageTiers` PDA + RiskMarketSnap plumbing through 10+ files |
 | 20b  | Withdrawal floor `max(IM, 0.1 × notional)` | Current is **stricter** (`open_positions == 0`); HL floor is a UX upgrade (allows partial withdrawal with positions), not a security fix. Implement as additive `partial_withdraw_collateral` ix when needed |
 | 21   | Modular wrapper programs | Full spec in [`V3_WAVE21_MODULAR.md`](./V3_WAVE21_MODULAR.md): 4-program topology (core / orders / flp / vaults), per-market FLP, 4-phase migration plan, 4-week effort estimate |
