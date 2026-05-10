@@ -119,15 +119,26 @@ Cannot be done with a simple program upgrade.
   Workspace + `Anchor.toml` updated. SDK exports the 3 new program
   IDs (`FLASH_BOOK_ORDERS_PROGRAM_ID`, `_FLP_`, `_VAULTS_`).
 
-### Phase 2 — Add CPI surface in core
+### Phase 2 — Add CPI surface in core ✅ SHIPPED (limit-order path)
 
-  5. `flash-book-core` adds: `place_limit_order_v2` accepts an
-     authorized-program signer in addition to the trader signer.
-     The whitelist of accepted programs is hardcoded (`FBOrd...`,
-     `FBflp...`, `FBVault...`).
-  6. Core ships: `apply_flp_fill_per_market` ix that takes the
-     per-market FLP exposure account from `flash-book-flp` instead
-     of the singleton.
+  5. ✅ `flash-book-core` ships `place_limit_order_v2_cpi` —
+     authorized-program signer variant of `place_limit_order_v2`.
+     Whitelist hardcoded as `WAVE21_ORDERS_PROGRAM_ID`,
+     `WAVE21_FLP_PROGRAM_ID`, `WAVE21_VAULTS_PROGRAM_ID` constants.
+     Each wrapper signs over its own `[CPI_AUTHORITY_SEED]` PDA;
+     core derives all 3 expected PDAs and verifies the signer
+     matches one. Trader pubkey passed as a regular account (not
+     signer) — wrapper authorized at trigger / vault-deposit time
+     via its OWN state.
+  6. ✅ `flash-book-orders` ships `place_order_via_core` — full CPI
+     wiring proof: derives this program's PDA via
+     `find_program_address(&[CPI_AUTHORITY_SEED], &orders_program_id)`,
+     calls `flash_book::cpi::place_limit_order_v2_cpi` with the PDA
+     as `invoke_signed` authority. End-to-end build clean: anchor
+     build produces 4 .so files + 4 IDLs.
+  7. ⬜ `apply_flp_fill_per_market` (per-market FLP variant) — pending
+     Phase 3 since FLP-account migration depends on the new account
+     type living in `flash-book-flp` first.
 
 ### Phase 3 — Migrate per-market data
 

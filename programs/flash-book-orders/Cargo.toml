@@ -15,7 +15,15 @@ no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
-idl-build = ["anchor-lang/idl-build"]
+# Propagating idl-build to flash-book is required: when anchor builds
+# this program's IDL it pulls in flash-book as a build dep (for the
+# CPI-accounts struct definitions), which in turn requires
+# anchor-spl/idl-build to be enabled to satisfy the Anchor derive
+# macros for SPL Mint / TokenAccount accessors.
+idl-build = ["anchor-lang/idl-build", "flash-book/idl-build"]
 
 [dependencies]
 anchor-lang = { workspace = true }
+# Core CPI client (cpi feature exposes anchor-generated builders without
+# pulling the entrypoint).
+flash-book = { path = "../flash-book", features = ["cpi"] }

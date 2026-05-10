@@ -5007,6 +5007,138 @@
       ]
     },
     {
+      "name": "place_limit_order_v2_cpi",
+      "docs": [
+        "Wave 21 phase 2 — CPI variant of `place_limit_order_v2`. Called",
+        "by wrapper programs (`flash-book-orders`, `-flp`, `-vaults`) via",
+        "`invoke_signed` to place orders on behalf of traders WITHOUT",
+        "the trader directly signing the core ix. The wrapper signs over",
+        "its `[CPI_AUTHORITY_SEED]` PDA; core verifies the signer is one",
+        "of the 3 expected derivations (anything else fails).",
+        "",
+        "Trust model: the wrapper has full authority over the trader's",
+        "order placement decision via its OWN state (trigger account,",
+        "vault deposit, etc.) — it already authenticated the trader's",
+        "intent at trigger / deposit time. Core trusts the wrapper to",
+        "inject an order with the trader's pubkey stamped on it.",
+        "",
+        "Pure parity with the trader-signed `place_limit_order_v2` for",
+        "every validation gate (status, min lots, tick alignment, OI cap,",
+        "expiry, flag-bit mask). Different ix entry, identical economic",
+        "behavior."
+      ],
+      "discriminator": [
+        241,
+        238,
+        36,
+        95,
+        89,
+        207,
+        89,
+        255
+      ],
+      "accounts": [
+        {
+          "name": "cpi_authority",
+          "docs": [
+            "CPI authority — must be the `[CPI_AUTHORITY_SEED]` PDA of one",
+            "of the 3 whitelisted wrapper programs (orders / flp / vaults).",
+            "Wrapper signs over this PDA via `invoke_signed`. Core's handler",
+            "computes the 3 expected derivations and verifies the signer",
+            "matches one of them."
+          ],
+          "signer": true
+        },
+        {
+          "name": "trader",
+          "docs": [
+            "NOT a signer — the wrapper authorized the trader at trigger /",
+            "vault-deposit time via its own state. Core trusts the wrapper",
+            "to inject the right trader pubkey here."
+          ]
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "flags",
+          "type": "u8"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "place_trigger_order",
       "docs": [
         "Place a NATIVE on-chain trigger order — Hyperliquid pattern. Trader",
@@ -9648,6 +9780,19 @@
       ]
     },
     {
+      "name": "OrderPlacedV2CpiEvent",
+      "discriminator": [
+        121,
+        6,
+        20,
+        199,
+        5,
+        234,
+        4,
+        80
+      ]
+    },
+    {
       "name": "OrderPlacedV2Event",
       "discriminator": [
         45,
@@ -12580,6 +12725,56 @@
           {
             "name": "total_orders_after",
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderPlacedV2CpiEvent",
+      "docs": [
+        "Wave 21 phase 2: emitted when a wrapper program's CPI lands an order",
+        "via `place_limit_order_v2_cpi`. Same payload as OrderPlacedV2Event",
+        "PLUS the cpi_authority that signed (so off-chain reconciliation can",
+        "attribute the order to a specific wrapper program)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "node_index",
+            "type": "u32"
+          },
+          {
+            "name": "total_orders_after",
+            "type": "u32"
+          },
+          {
+            "name": "cpi_authority",
+            "type": "pubkey"
           }
         ]
       }

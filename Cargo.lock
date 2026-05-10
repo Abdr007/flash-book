@@ -1605,6 +1605,7 @@ name = "flash-book-orders"
 version = "0.1.0"
 dependencies = [
  "anchor-lang",
+ "flash-book",
 ]
 
 [[package]]

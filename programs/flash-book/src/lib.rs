@@ -445,6 +445,138 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Wave 21 phase 2 — CPI variant of `place_limit_order_v2`. Called
+    /// by wrapper programs (`flash-book-orders`, `-flp`, `-vaults`) via
+    /// `invoke_signed` to place orders on behalf of traders WITHOUT
+    /// the trader directly signing the core ix. The wrapper signs over
+    /// its `[CPI_AUTHORITY_SEED]` PDA; core verifies the signer is one
+    /// of the 3 expected derivations (anything else fails).
+    ///
+    /// Trust model: the wrapper has full authority over the trader's
+    /// order placement decision via its OWN state (trigger account,
+    /// vault deposit, etc.) — it already authenticated the trader's
+    /// intent at trigger / deposit time. Core trusts the wrapper to
+    /// inject an order with the trader's pubkey stamped on it.
+    ///
+    /// Pure parity with the trader-signed `place_limit_order_v2` for
+    /// every validation gate (status, min lots, tick alignment, OI cap,
+    /// expiry, flag-bit mask). Different ix entry, identical economic
+    /// behavior.
+    pub fn place_limit_order_v2_cpi(
+        ctx: Context<PlaceLimitOrderV2Cpi>,
+        side: u8,
+        size_lots: u64,
+        limit_ticks: u64,
+        flags: u8,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        // Wrapper-program signer check. cpi_authority must match one
+        // of the 3 expected PDAs. Computing the derivations costs
+        // ~18K CU vs ~5K for a single address comparison — acceptable
+        // given the security gain.
+        let cpi_signer = ctx.accounts.cpi_authority.key();
+        let (orders_authority, _) = Pubkey::find_program_address(
+            &[CPI_AUTHORITY_SEED],
+            &WAVE21_ORDERS_PROGRAM_ID,
+        );
+        let (flp_authority, _) = Pubkey::find_program_address(
+            &[CPI_AUTHORITY_SEED],
+            &WAVE21_FLP_PROGRAM_ID,
+        );
+        let (vaults_authority, _) = Pubkey::find_program_address(
+            &[CPI_AUTHORITY_SEED],
+            &WAVE21_VAULTS_PROGRAM_ID,
+        );
+        require!(
+            cpi_signer == orders_authority
+                || cpi_signer == flp_authority
+                || cpi_signer == vaults_authority,
+            FlashBookError::Unauthorized
+        );
+
+        // Mirror place_limit_order_v2 intake validation.
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(limit_ticks > 0, FlashBookError::ZeroPrice);
+        require!(flags & !0b0011_1111 == 0, FlashBookError::OutOfRange);
+        let now_slot = Clock::get()?.slot;
+        if expires_at_slot > 0 {
+            require!(expires_at_slot > now_slot, FlashBookError::OutOfRange);
+        }
+
+        let market = &ctx.accounts.market;
+        require!(
+            market.status == MarketStatus::Active as u8
+                || market.status == MarketStatus::PostOnly as u8,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            limit_ticks % market.params.tick_size == 0,
+            FlashBookError::PriceNotOnTick
+        );
+
+        let oi_cap = market.params.max_oi_base_lots;
+        if oi_cap > 0 {
+            let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
+            let projected = cur.saturating_add(size_lots);
+            require!(projected <= oi_cap, FlashBookError::OpenInterestCapExceeded);
+        }
+
+        let trader_pk = ctx.accounts.trader.key();
+        let market_key = market.key();
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        require!(
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+
+        let seq = handle
+            .header
+            .order_seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        handle.header.order_seq_counter = seq;
+
+        let side_is_bid = side == 0;
+        let order = state_v2::RestingOrderV2 {
+            order_id: state_v2::encode_order_id(limit_ticks, seq, side_is_bid),
+            seq,
+            price_ticks: limit_ticks,
+            size_lots,
+            expires_at_slot,
+            trader: trader_pk,
+            last_valid_slot: now_slot as u32,
+            side,
+            order_type: 0,
+            flags,
+            _pad: 0,
+        };
+        let inserted_idx = if side_is_bid {
+            handle.insert_bid(order)?
+        } else {
+            handle.insert_ask(order)?
+        };
+
+        emit!(OrderPlacedV2CpiEvent {
+            market: market_key,
+            trader: trader_pk,
+            seq,
+            side,
+            price_ticks: limit_ticks,
+            size_lots,
+            node_index: inserted_idx,
+            total_orders_after: handle.header.total_orders_active,
+            cpi_authority: cpi_signer,
+        });
+        Ok(())
+    }
+
     /// V2 cancel: remove a resting order from the hypertree. Validates
     /// that the caller is the original trader (orders carry trader pubkey
     /// inline in wave 18 — wave 19 indirects through a seat). Refunds no
@@ -6184,6 +6316,37 @@ pub struct PlaceLimitOrderV2<'info> {
 }
 
 #[derive(Accounts)]
+pub struct PlaceLimitOrderV2Cpi<'info> {
+    /// CPI authority — must be the `[CPI_AUTHORITY_SEED]` PDA of one
+    /// of the 3 whitelisted wrapper programs (orders / flp / vaults).
+    /// Wrapper signs over this PDA via `invoke_signed`. Core's handler
+    /// computes the 3 expected derivations and verifies the signer
+    /// matches one of them.
+    pub cpi_authority: Signer<'info>,
+
+    /// CHECK: trader pubkey to stamp on the resulting RestingOrderV2.
+    /// NOT a signer — the wrapper authorized the trader at trigger /
+    /// vault-deposit time via its own state. Core trusts the wrapper
+    /// to inject the right trader pubkey here.
+    pub trader: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at the market_book seed; disc validated inside handler.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct ViewBookDepthV2<'info> {
     #[account(
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
@@ -8297,6 +8460,23 @@ pub struct OrderPlacedV2Event {
     pub total_orders_after: u32,
 }
 
+/// Wave 21 phase 2: emitted when a wrapper program's CPI lands an order
+/// via `place_limit_order_v2_cpi`. Same payload as OrderPlacedV2Event
+/// PLUS the cpi_authority that signed (so off-chain reconciliation can
+/// attribute the order to a specific wrapper program).
+#[event]
+pub struct OrderPlacedV2CpiEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub seq: u64,
+    pub side: u8,
+    pub price_ticks: u64,
+    pub size_lots: u64,
+    pub node_index: u32,
+    pub total_orders_after: u32,
+    pub cpi_authority: Pubkey,
+}
+
 /// How many price levels per side `view_book_depth_v2` returns.
 /// Capped to keep the event log payload bounded; off-chain depth
 /// reconstruction watches `OrderPlacedV2Event` + `OrderCancelledV2Event`
@@ -8308,6 +8488,24 @@ pub const BOOK_DEPTH_LEVELS: usize = 4;
 /// CU usage bounded. Wave 18g lifts this when the matcher is refactored
 /// to a streaming O(N log N) walk over the price ladder.
 pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 64;
+
+/// Wave 21 phase 2 — sister-program IDs that core trusts as CPI callers.
+/// Matches `programs/flash-book-orders/src/lib.rs::declare_id!`,
+/// `flash-book-flp::declare_id!`, `flash-book-vaults::declare_id!`.
+/// Reading this list = reading the trust boundary; if a wrapper isn't
+/// listed here, its CPI into core's `*_cpi` ixs will be rejected.
+pub const WAVE21_ORDERS_PROGRAM_ID: Pubkey =
+    anchor_lang::solana_program::pubkey!("2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5");
+pub const WAVE21_FLP_PROGRAM_ID: Pubkey =
+    anchor_lang::solana_program::pubkey!("eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M");
+pub const WAVE21_VAULTS_PROGRAM_ID: Pubkey =
+    anchor_lang::solana_program::pubkey!("GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt");
+
+/// PDA seed each wrapper program uses to sign CPI calls into core.
+/// Wrapper signs over `[CPI_AUTHORITY_SEED]` with its own program ID,
+/// producing a unique authority pubkey per wrapper. Core's `*_cpi`
+/// ixs check `cpi_authority.key()` against the 3 derived addresses.
+pub const CPI_AUTHORITY_SEED: &[u8] = b"cpi_authority";
 
 /// HL withdrawal floor — wave 20b. When a trader pulls collateral from
 /// `partial_withdraw_collateral` with positions still open, the remaining
