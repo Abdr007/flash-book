@@ -220,12 +220,14 @@ describe('FlashV2Venue', () => {
       ],
     };
     const v = new FlashV2Venue(makeMockClient({ basket }), dummyConn, baseConfig);
-    const seqs = await v.fetchOpenOrderSeqs(targetCustody, trader);
-    expect(seqs.length).toBe(2);
-    // Long seq has bit 63 = 0 → equals orderId.
-    expect(seqs).toContain(5n);
-    // Short seq has bit 63 = 1 → orderId | (1<<63).
-    expect(seqs).toContain(7n | (1n << 63n));
+    const orders = await v.fetchOpenOrders(targetCustody, trader);
+    expect(orders.length).toBe(2);
+    // Long order: orderId = 5, side = 'long'.
+    const longOrder = orders.find((o) => o.side === 'long');
+    expect(longOrder?.orderId).toBe(5n);
+    // Short order: orderId = 7, side = 'short'.
+    const shortOrder = orders.find((o) => o.side === 'short');
+    expect(shortOrder?.orderId).toBe(7n);
   });
 
   test('buildQuoteInstructions calls placeLimitOrder for each non-zero side', async () => {
@@ -266,12 +268,14 @@ describe('FlashV2Venue', () => {
     const ixs = await v.buildCancelInstructions({
       trader: Keypair.generate().publicKey,
       market: targetCustody,
-      seqs: [3n, 9n | (1n << 63n)],
+      orders: [
+        { orderId: 3n, side: 'long', priceTicks: 0n, seq: 3n },
+        { orderId: 9n, side: 'short', priceTicks: 0n, seq: 9n },
+      ],
     });
     expect(ixs.length).toBe(2);
     expect(client.editCalls.length).toBe(2);
     expect(client.editCalls.every((c) => c.sizeAmount.isZero() && c.limitPrice.price.isZero())).toBe(true);
-    // Verify orderId decoding strips the side bit.
     expect(client.editCalls.find((c) => c.orderId === 3)).toBeDefined();
     expect(client.editCalls.find((c) => c.orderId === 9)).toBeDefined();
   });

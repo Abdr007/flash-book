@@ -34,6 +34,7 @@ import type {
   MarketSnapshot,
   TraderSnapshot,
   PositionSnapshot,
+  OpenOrder,
 } from './market-maker.ts';
 
 // ─── Types we mirror from @flash_trade/magic-trade-client ─────────────
@@ -249,18 +250,26 @@ export class FlashV2Venue implements Venue {
     }
   }
 
-  async fetchOpenOrderSeqs(_market: PublicKey, trader: PublicKey): Promise<bigint[]> {
+  async fetchOpenOrders(_market: PublicKey, trader: PublicKey): Promise<OpenOrder[]> {
     try {
       const basket = await this.client.accounts.fetchBasket(trader);
-      const seqs: bigint[] = [];
+      const out: OpenOrder[] = [];
       for (const o of basket.orders) {
         if (!o.isActive) continue;
-        // Pack side into bit 63 so cancel knows which side to address.
-        // bit 63 = 1 → short, 0 → long.
-        const sideBit = 'short' in o.side ? 1n << 63n : 0n;
-        seqs.push(BigInt(o.orderId) | sideBit);
+        const isShort = 'short' in o.side;
+        // For Flash V2, the matcher addresses orders by orderId + side.
+        // Bot's local OpenOrder.orderId field carries the V2 orderId
+        // directly (no Phoenix-style encoding); the v2-Flash-Book
+        // counterpart uses the encoded form. Each adapter decodes
+        // appropriately at cancel time.
+        out.push({
+          orderId: BigInt(o.orderId),
+          side: isShort ? 'short' : 'long',
+          priceTicks: 0n, // Flash V2 doesn't expose ticks here; informational only
+          seq: BigInt(o.orderId),
+        });
       }
-      return seqs;
+      return out;
     } catch {
       return [];
     }
@@ -320,15 +329,14 @@ export class FlashV2Venue implements Venue {
   async buildCancelInstructions(args: {
     trader: PublicKey;
     market: PublicKey;
-    seqs: bigint[];
+    orders: OpenOrder[];
   }): Promise<TransactionInstruction[]> {
     // Per IDL: editLimitOrder with limitPrice=0 AND sizeAmount=0 cancels.
     const out: TransactionInstruction[] = [];
     const ZERO_PRICE: V2OraclePrice = { price: new BN(0), exponent: this.cfg.priceExponent };
-    const SIDE_MASK = (1n << 63n) - 1n;
-    for (const seq of args.seqs) {
-      const isShort = (seq >> 63n) === 1n;
-      const orderId = Number(seq & SIDE_MASK);
+    for (const o of args.orders) {
+      const isShort = o.side === 'short';
+      const orderId = Number(o.orderId);
       const params: V2EditLimitOrderParams = {
         orderId,
         limitPrice: ZERO_PRICE,

@@ -268,20 +268,19 @@ describe('Instruction builders', () => {
 
   // ─── Order intake (3) ──────────────────────────────────────────────
 
-  test('placeLimitOrderIx', async () => {
+  test('placeLimitOrderV2Ix', async () => {
     const client = makeClient();
     const trader = Keypair.generate().publicKey;
     const market = client.market(SOL, USDC).address;
-    const ix = await client.placeLimitOrderIx({
+    const ix = await client.placeLimitOrderV2Ix({
       trader,
       market,
       side: 'long',
       sizeLots: new BN(1),
       limitTicks: new BN(99_950),
-      postOnly: false,
     });
-    // trader, market, order_buffer, trader_state, position, flp_exposure, sysprog
-    expect(ix.keys.length).toBe(7);
+    // trader, market, market_book
+    expect(ix.keys.length).toBe(3);
   });
 
   test('submitCommitIx', async () => {
@@ -312,16 +311,16 @@ describe('Instruction builders', () => {
 
   // ─── Batch + settlement (3) ────────────────────────────────────────
 
-  test('runBatchIx', async () => {
+  test('runBatchV2Ix', async () => {
     const client = makeClient();
     const market = client.market(SOL, USDC).address;
-    const ix = await client.runBatchIx({
+    const ix = await client.runBatchV2Ix({
       sequencer: Keypair.generate().publicKey,
       market,
       nowMs: new BN(1_000_000),
     });
-    // sequencer, market, order_buffer, commit_buffer, insurance, flp
-    expect(ix.keys.length).toBe(6);
+    // sequencer, market, market_book, commit_buffer, flp_exposure
+    expect(ix.keys.length).toBe(5);
   });
 
   test('applyFillIx', async () => {
@@ -341,15 +340,16 @@ describe('Instruction builders', () => {
     expect(ix.keys.length).toBe(8);
   });
 
-  test('cancelOrderIx', async () => {
+  test('cancelOrderV2Ix', async () => {
     const client = makeClient();
     const market = client.market(SOL, USDC).address;
-    const ix = await client.cancelOrderIx({
+    const ix = await client.cancelOrderV2Ix({
       trader: Keypair.generate().publicKey,
       market,
-      orderSeq: new BN(42),
+      side: 'long',
+      orderId: 0xdead_beefn,
     });
-    // trader, market, order_buffer
+    // trader, market, market_book
     expect(ix.keys.length).toBe(3);
   });
 
@@ -370,22 +370,22 @@ describe('Instruction builders', () => {
 
   // ─── Liquidation (2) ───────────────────────────────────────────────
 
-  test('liquidatePositionIx', async () => {
+  test('liquidatePositionV2Ix', async () => {
     const client = makeClient();
     const market = client.market(SOL, USDC).address;
-    const ix = await client.liquidatePositionIx({
+    const ix = await client.liquidatePositionV2Ix({
       caller: Keypair.generate().publicKey,
       market,
       trader: Keypair.generate().publicKey,
     });
-    // caller, market, order_buffer, trader_state, caller_trader_state,
+    // caller, market, market_book, trader_state, caller_trader_state,
     // position, system_program
     expect(ix.keys.length).toBe(7);
   });
 
-  test('liquidatePositionIx supports partial close via requestedCloseLots', async () => {
+  test('liquidatePositionV2Ix supports partial close via requestedCloseLots', async () => {
     const client = makeClient();
-    const ix = await client.liquidatePositionIx({
+    const ix = await client.liquidatePositionV2Ix({
       caller: Keypair.generate().publicKey,
       market: client.market(SOL, USDC).address,
       trader: Keypair.generate().publicKey,
@@ -396,22 +396,22 @@ describe('Instruction builders', () => {
     expect(ix.data.length).toBeGreaterThan(0);
   });
 
-  test('liquidatePortfolioIx without cross-margin args', async () => {
+  test('liquidatePortfolioV2Ix without cross-margin args', async () => {
     const client = makeClient();
-    const ix = await client.liquidatePortfolioIx({
+    const ix = await client.liquidatePortfolioV2Ix({
       caller: Keypair.generate().publicKey,
       executionMarket: client.market(SOL, USDC).address,
       trader: Keypair.generate().publicKey,
     });
-    // caller, exec_market, exec_order_buffer, trader_state, exec_position
+    // caller, exec_market, exec_market_book, trader_state, exec_position
     expect(ix.keys.length).toBe(5);
   });
 
-  test('liquidatePortfolioIx with cross-margin remaining_accounts', async () => {
+  test('liquidatePortfolioV2Ix with cross-margin remaining_accounts', async () => {
     const client = makeClient();
     const otherMint1 = Keypair.generate().publicKey;
     const otherMint2 = Keypair.generate().publicKey;
-    const ix = await client.liquidatePortfolioIx({
+    const ix = await client.liquidatePortfolioV2Ix({
       caller: Keypair.generate().publicKey,
       executionMarket: client.market(SOL, USDC).address,
       trader: Keypair.generate().publicKey,

@@ -159,7 +159,7 @@ export class LiquidationKeeper extends Keeper {
     for (const { market, trader } of this.cfg.watchlist) {
       const decision = await this.evaluate(market, trader);
       if (!decision.shouldLiquidate) continue;
-      const ix = await this.client.liquidatePositionIx({
+      const ix = await this.client.liquidatePositionV2Ix({
         caller: this.base.signer.publicKey,
         market,
         trader,
@@ -603,7 +603,7 @@ export class IcebergKeeper extends Keeper {
 
   protected async iterate(): Promise<void> {
     for (const w of this.cfg.watchlist) {
-      const ix = await this.client.replenishIcebergIx({
+      const ix = await this.client.replenishIcebergV2Ix({
         caller: this.base.signer.publicKey,
         market: w.market,
         trader: w.trader,

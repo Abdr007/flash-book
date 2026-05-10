@@ -24,14 +24,13 @@ import {
 import { FlashBookClient } from '../../sdk-ts/src/client.ts';
 import {
   fetchMarket,
-  fetchOrderBuffer,
   fetchPosition,
   fetchTraderState,
   type MarketAccount,
-  type OrderSlot,
   type PositionAccount,
   type TraderStateAccount,
 } from '../../sdk-ts/src/accounts.ts';
+import { encodeOrderIdV2, ORDER_FLAG_POST_ONLY } from '../../sdk-ts/src/index.ts';
 
 // ─── Shared snapshot types ────────────────────────────────────────────
 
@@ -81,9 +80,15 @@ export interface Venue {
   fetchMarket(market: PublicKey): Promise<MarketSnapshot | null>;
   fetchTrader(trader: PublicKey): Promise<TraderSnapshot | null>;
   fetchPosition(market: PublicKey, trader: PublicKey): Promise<PositionSnapshot | null>;
-  /// Returns the seqs of OUR open orders in the buffer (for cancellation).
-  fetchOpenOrderSeqs(market: PublicKey, trader: PublicKey): Promise<bigint[]>;
+  /// Returns OUR currently-resting orders for (market, trader) in this
+  /// session. v2 hypertree books don't have a flat slot array; the venue
+  /// implementation is expected to track orders it placed in-process
+  /// (HL/dYdX MM pattern — orderbook is event-derived, not state-derived).
+  /// Stateless restart: returns empty until orders are placed in-session.
+  fetchOpenOrders(market: PublicKey, trader: PublicKey): Promise<OpenOrder[]>;
   /// Build the bid + ask placement instructions. Caller signs and sends.
+  /// The venue tracks the resulting (orderId, side) tuples internally so
+  /// `buildCancelInstructions` can address them later.
   buildQuoteInstructions(args: {
     trader: PublicKey;
     market: PublicKey;
@@ -91,14 +96,25 @@ export interface Venue {
     askTicks: bigint;
     sizeLots: bigint;
   }): Promise<TransactionInstruction[]>;
-  /// Build cancellation instructions for the given seqs.
+  /// Build cancellation instructions for the given open orders. Pop them
+  /// from the venue's local tracking on success.
   buildCancelInstructions(args: {
     trader: PublicKey;
     market: PublicKey;
-    seqs: bigint[];
+    orders: OpenOrder[];
   }): Promise<TransactionInstruction[]>;
   /// Send a built tx (the venue knows its own RPC + wallet).
   sendTx(instructions: TransactionInstruction[], signers: Keypair[]): Promise<string>;
+}
+
+/// One resting order tracked by the venue. `orderId` is the encoded
+/// Phoenix-style id used by `cancelOrderV2Ix`; `seq` + `side` + `priceTicks`
+/// are kept for off-chain reconciliation (event-stream replay etc).
+export interface OpenOrder {
+  orderId: bigint;
+  side: 'long' | 'short';
+  priceTicks: bigint;
+  seq: bigint;
 }
 
 // ─── Quote math (pure, testable) ──────────────────────────────────────
@@ -385,18 +401,18 @@ export class MarketMaker {
 
       if (!gates.canQuote) {
         // Cancel any open quotes — wind down on risk trip.
-        const seqs = await this.venue.fetchOpenOrderSeqs(
+        const orders = await this.venue.fetchOpenOrders(
           this.config.market,
           this.config.trader,
         );
-        if (seqs.length > 0 && !this.config.dryRun) {
+        if (orders.length > 0 && !this.config.dryRun) {
           const ixs = await this.venue.buildCancelInstructions({
             trader: this.config.trader,
             market: this.config.market,
-            seqs,
+            orders,
           });
           await this.venue.sendTx(ixs, [this.config.signer]);
-          this.stats.ordersCancelled += seqs.length;
+          this.stats.ordersCancelled += orders.length;
         }
         this.stats.lastError = gates.reason;
         return;
@@ -418,17 +434,17 @@ export class MarketMaker {
 
       // Cancel-then-replace cycle. Future enhancement: leave orders in place
       // when prices haven't moved past a threshold (avoid unnecessary
-      // cancel+place tx fees). V1 always cancels.
-      const seqs = await this.venue.fetchOpenOrderSeqs(
+      // cancel+place tx fees). Today always cancels.
+      const orders = await this.venue.fetchOpenOrders(
         this.config.market,
         this.config.trader,
       );
       const txIxs: TransactionInstruction[] = [];
-      if (seqs.length > 0) {
+      if (orders.length > 0) {
         const cancelIxs = await this.venue.buildCancelInstructions({
           trader: this.config.trader,
           market: this.config.market,
-          seqs,
+          orders,
         });
         txIxs.push(...cancelIxs);
       }
@@ -445,7 +461,7 @@ export class MarketMaker {
         this.stats.lastError = `dry-run: would send ${txIxs.length} ix`;
       } else if (txIxs.length > 0) {
         await this.venue.sendTx(txIxs, [this.config.signer]);
-        this.stats.ordersCancelled += seqs.length;
+        this.stats.ordersCancelled += orders.length;
         this.stats.ordersPlaced += placeIxs.length;
       }
       this.stats.lastError = undefined;
@@ -461,11 +477,27 @@ export class MarketMaker {
 
 // ─── Flash Book V3 venue adapter ──────────────────────────────────────
 
-/// Adapter that targets the Flash Book V3 program via FlashBookClient.
-/// Sister adapter `FlashV2Venue` (not implemented here) would target the
-/// pool engine via @flashtrade/perpetuals-sdk; same Venue contract.
+/// Adapter that targets the Flash Book V3 (v2 hypertree) program via
+/// FlashBookClient. Sister adapter `FlashV2Venue` (not implemented here)
+/// would target the pool engine via @flashtrade/perpetuals-sdk; same
+/// Venue contract.
+///
+/// Order tracking model (HL/dYdX MM pattern): the venue maintains an
+/// in-process `placedOrders` map for each trader that recorded which
+/// (orderId, side, price, seq) tuples were placed in this session. The
+/// bot's constant-churn quoter (cancel-then-replace each tick) reads from
+/// this map for the cancel cycle and appends to it on placement.
+///
+/// On stateless restart, the map is empty — orders placed by a prior
+/// session must be recovered via OrderPlacedV2Event log replay (see
+/// `subscribeToProgramEvents` in the SDK). This is intentional: an MM
+/// process that crashes and restarts should NOT silently inherit orders
+/// it didn't account for in its risk model.
 export class FlashBookVenue implements Venue {
   readonly name = 'flash-book-v3';
+
+  /// Per-(market, trader) open-order tracking. Keyed as `${market}:${trader}`.
+  private readonly placedOrders = new Map<string, OpenOrder[]>();
 
   constructor(
     private readonly client: FlashBookClient,
@@ -473,6 +505,10 @@ export class FlashBookVenue implements Venue {
     private readonly quoteMint: PublicKey,
     private readonly quoteVault: PublicKey,
   ) {}
+
+  private orderKey(market: PublicKey, trader: PublicKey): string {
+    return `${market.toBase58()}:${trader.toBase58()}`;
+  }
 
   async fetchMarket(market: PublicKey): Promise<MarketSnapshot | null> {
     const m = await fetchMarket(this.client, market);
@@ -498,19 +534,12 @@ export class FlashBookVenue implements Venue {
     return positionToSnapshot(p);
   }
 
-  async fetchOpenOrderSeqs(market: PublicKey, trader: PublicKey): Promise<bigint[]> {
-    const buf = await fetchOrderBuffer(
-      this.client,
-      this.client.orderBuffer(market).address,
-    );
-    if (!buf) return [];
-    const seqs: bigint[] = [];
-    for (const slot of buf.slots as OrderSlot[]) {
-      if (slot.valid !== 1) continue;
-      if (!slot.trader.equals(trader)) continue;
-      seqs.push(BigInt(slot.seq.toString()));
-    }
-    return seqs;
+  async fetchOpenOrders(
+    market: PublicKey,
+    trader: PublicKey,
+  ): Promise<OpenOrder[]> {
+    const list = this.placedOrders.get(this.orderKey(market, trader));
+    return list ? [...list] : [];
   }
 
   async buildQuoteInstructions(args: {
@@ -521,48 +550,85 @@ export class FlashBookVenue implements Venue {
     sizeLots: bigint;
   }): Promise<TransactionInstruction[]> {
     const out: TransactionInstruction[] = [];
+    const key = this.orderKey(args.market, args.trader);
+    const tracked: OpenOrder[] = this.placedOrders.get(key) ?? [];
+
+    // Sequence assignment is on-chain (the matcher bumps order_seq_counter
+    // atomically). For local tracking we don't know the on-chain seq until
+    // the tx lands and the OrderPlacedV2Event fires. Until then, we use a
+    // monotonic local seq derived from `Date.now()` — guaranteed unique
+    // for THIS process's lifetime which is what we need for the cancel
+    // cycle. Off-chain reconciliation against the event log uses the
+    // on-chain seq.
+    const localSeqBase = BigInt(Date.now());
+
     if (args.bidTicks > 0n) {
       out.push(
-        await this.client.placeLimitOrderIx({
+        await this.client.placeLimitOrderV2Ix({
           trader: args.trader,
           market: args.market,
           side: 'long',
           sizeLots: args.sizeLots,
           limitTicks: args.bidTicks,
-          postOnly: true,
+          flags: ORDER_FLAG_POST_ONLY,
         }),
       );
+      const seq = localSeqBase;
+      tracked.push({
+        orderId: encodeOrderIdV2(args.bidTicks, seq, true),
+        side: 'long',
+        priceTicks: args.bidTicks,
+        seq,
+      });
     }
     if (args.askTicks > 0n) {
       out.push(
-        await this.client.placeLimitOrderIx({
+        await this.client.placeLimitOrderV2Ix({
           trader: args.trader,
           market: args.market,
           side: 'short',
           sizeLots: args.sizeLots,
           limitTicks: args.askTicks,
-          postOnly: true,
+          flags: ORDER_FLAG_POST_ONLY,
         }),
       );
+      const seq = localSeqBase + 1n;
+      tracked.push({
+        orderId: encodeOrderIdV2(args.askTicks, seq, false),
+        side: 'short',
+        priceTicks: args.askTicks,
+        seq,
+      });
     }
+    this.placedOrders.set(key, tracked);
     return out;
   }
 
   async buildCancelInstructions(args: {
     trader: PublicKey;
     market: PublicKey;
-    seqs: bigint[];
+    orders: OpenOrder[];
   }): Promise<TransactionInstruction[]> {
     const out: TransactionInstruction[] = [];
-    for (const seq of args.seqs) {
+    for (const o of args.orders) {
       out.push(
-        await this.client.cancelOrderIx({
+        await this.client.cancelOrderV2Ix({
           trader: args.trader,
           market: args.market,
-          orderSeq: seq,
+          side: o.side,
+          orderId: o.orderId,
         }),
       );
     }
+    // Pop the cancelled orders from local tracking. Conservative: only
+    // remove orders that match BOTH orderId AND side. Anything not in
+    // the cancel set stays.
+    const key = this.orderKey(args.market, args.trader);
+    const before = this.placedOrders.get(key) ?? [];
+    const after = before.filter(
+      (b) => !args.orders.some((o) => o.orderId === b.orderId && o.side === b.side),
+    );
+    this.placedOrders.set(key, after);
     return out;
   }
 
