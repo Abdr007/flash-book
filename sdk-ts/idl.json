@@ -2759,6 +2759,102 @@
       "args": []
     },
     {
+      "name": "execute_twap_slice_v2",
+      "docs": [
+        "V2: execute one TWAP slice against the hypertree-backed book.",
+        "Same scheduling semantics as v1 (FLAG_ACTIVE check, end_slot",
+        "expiry, slot_interval gating, slice sizing with min_base_lots",
+        "floor, parent depletion deactivation); only the order injection",
+        "target differs (hypertree, not v1 buffer).",
+        "",
+        "Permissionless caller — pre-authorized by trader at TWAP creation."
+      ],
+      "discriminator": [
+        13,
+        233,
+        204,
+        68,
+        44,
+        65,
+        163,
+        51
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Permissionless caller pays tx fee."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "via `MarketBookHandle::from_account_data`. Mut because the slice",
+            "inserts a new resting order."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "twap_order",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "init_market_book",
       "docs": [
         "Initialize the v2 hypertree-backed orderbook for a market.",
@@ -10137,6 +10233,19 @@
       ]
     },
     {
+      "name": "TwapSliceExecutedV2Event",
+      "discriminator": [
+        48,
+        239,
+        115,
+        65,
+        85,
+        38,
+        223,
+        127
+      ]
+    },
+    {
       "name": "VaultCreatedEvent",
       "discriminator": [
         81,
@@ -13820,6 +13929,52 @@
           {
             "name": "cumulative_executed_lots",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TwapSliceExecutedV2Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "twap_id",
+            "type": "u8"
+          },
+          {
+            "name": "executor",
+            "type": "pubkey"
+          },
+          {
+            "name": "slice_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "cumulative_executed_lots",
+            "type": "u64"
+          },
+          {
+            "name": "order_seq",
+            "docs": [
+              "Sequence assigned to the synthesized resting slice."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "node_index",
+            "docs": [
+              "Hypertree node index of the inserted RestingOrderV2."
+            ],
+            "type": "u32"
           }
         ]
       }

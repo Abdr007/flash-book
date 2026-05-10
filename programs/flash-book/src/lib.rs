@@ -4325,6 +4325,116 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// V2: execute one TWAP slice against the hypertree-backed book.
+    /// Same scheduling semantics as v1 (FLAG_ACTIVE check, end_slot
+    /// expiry, slot_interval gating, slice sizing with min_base_lots
+    /// floor, parent depletion deactivation); only the order injection
+    /// target differs (hypertree, not v1 buffer).
+    ///
+    /// Permissionless caller — pre-authorized by trader at TWAP creation.
+    pub fn execute_twap_slice_v2(ctx: Context<ExecuteTwapSliceV2>) -> Result<()> {
+        let twap = &ctx.accounts.twap_order;
+        let market = &ctx.accounts.market;
+        require!(
+            twap.flags & state::TwapOrderAccount::FLAG_ACTIVE != 0,
+            FlashBookError::OutOfRange
+        );
+
+        let now = Clock::get()?.slot;
+        if twap.end_slot > 0 {
+            require!(twap.end_slot >= now, FlashBookError::OutOfRange);
+        }
+        require!(
+            now >= twap.last_slice_at_slot.saturating_add(twap.slot_interval),
+            FlashBookError::OutOfRange
+        );
+
+        let remaining = twap
+            .total_size_lots
+            .checked_sub(twap.size_executed_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(remaining > 0, FlashBookError::OutOfRange);
+        let slice_size = core::cmp::min(twap.slice_size_lots, remaining);
+        require!(
+            slice_size >= market.params.min_base_lots || slice_size == remaining,
+            FlashBookError::SizeBelowMinLot
+        );
+
+        // V2 inject — into the hypertree.
+        let market_key = market.key();
+        let twap_trader = twap.trader;
+        let twap_side = twap.side;
+        let twap_limit_ticks = twap.limit_price_ticks;
+        let inserted_idx;
+        let next_seq;
+        {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let mut handle =
+                state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            require!(
+                handle.header.market_pubkey == market_key,
+                FlashBookError::WrongMarket
+            );
+            next_seq = handle
+                .header
+                .order_seq_counter
+                .checked_add(1)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            require!(
+                next_seq < FLP_SEQ_RESERVED_OFFSET,
+                FlashBookError::OutOfRange
+            );
+            handle.header.order_seq_counter = next_seq;
+
+            let side_is_bid = twap_side == 0;
+            let order = state_v2::RestingOrderV2 {
+                order_id: state_v2::encode_order_id(
+                    twap_limit_ticks,
+                    next_seq,
+                    side_is_bid,
+                ),
+                seq: next_seq,
+                price_ticks: twap_limit_ticks,
+                size_lots: slice_size,
+                expires_at_slot: 0,
+                trader: twap_trader,
+                last_valid_slot: now as u32,
+                side: twap_side,
+                order_type: 0, // limit
+                flags: 0,
+                _pad: 0,
+            };
+            inserted_idx = if side_is_bid {
+                handle.insert_bid(order)?
+            } else {
+                handle.insert_ask(order)?
+            };
+        }
+
+        // Update TWAP scheduling state (mirror v1).
+        let twap = &mut ctx.accounts.twap_order;
+        twap.size_executed_lots = twap
+            .size_executed_lots
+            .checked_add(slice_size)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        twap.last_slice_at_slot = now;
+        if twap.size_executed_lots >= twap.total_size_lots {
+            twap.flags &= !state::TwapOrderAccount::FLAG_ACTIVE;
+        }
+
+        emit!(TwapSliceExecutedV2Event {
+            market: market_key,
+            trader: twap_trader,
+            twap_id: twap.twap_id,
+            executor: ctx.accounts.caller.key(),
+            slice_size_lots: slice_size,
+            cumulative_executed_lots: twap.size_executed_lots,
+            order_seq: next_seq,
+            node_index: inserted_idx,
+        });
+        Ok(())
+    }
+
     /// Cancel a TWAP order — trader signs, account is closed, rent
     /// returned. Works whether fully executed or partial.
     pub fn cancel_twap_order(ctx: Context<CancelTwapOrder>) -> Result<()> {
@@ -8294,6 +8404,40 @@ pub struct ExecuteTwapSlice<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ExecuteTwapSliceV2<'info> {
+    /// Permissionless caller pays tx fee.
+    pub caller: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at the market_book seed; disc validated inside handler
+    /// via `MarketBookHandle::from_account_data`. Mut because the slice
+    /// inserts a new resting order.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::TwapOrderAccount::SEED,
+            market.key().as_ref(),
+            twap_order.trader.as_ref(),
+            &[twap_order.twap_id],
+        ],
+        bump = twap_order.bump,
+    )]
+    pub twap_order: Account<'info, state::TwapOrderAccount>,
+}
+
+#[derive(Accounts)]
 pub struct CancelTwapOrder<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
@@ -9352,6 +9496,20 @@ pub struct TwapOrderCancelledEvent {
     pub trader: Pubkey,
     pub twap_id: u8,
     pub unfilled_lots: u64,
+}
+
+#[event]
+pub struct TwapSliceExecutedV2Event {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub twap_id: u8,
+    pub executor: Pubkey,
+    pub slice_size_lots: u64,
+    pub cumulative_executed_lots: u64,
+    /// Sequence assigned to the synthesized resting slice.
+    pub order_seq: u64,
+    /// Hypertree node index of the inserted RestingOrderV2.
+    pub node_index: u32,
 }
 
 #[event]

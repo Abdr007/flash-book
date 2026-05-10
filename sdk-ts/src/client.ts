@@ -1441,6 +1441,29 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// V2 TWAP slice — fires one slice against the hypertree-backed book.
+  /// Same scheduling semantics as v1 (FLAG_ACTIVE / end_slot / slot_interval
+  /// / slice sizing); only the order injection target differs (hypertree,
+  /// not v1 buffer). Permissionless caller pays tx fee.
+  executeTwapSliceV2Ix(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+    twapId: number;
+  }): Promise<TransactionInstruction> {
+    const twap = twapOrderPda(args.market, args.trader, args.twapId);
+    const book = marketBookPda(args.market);
+    return this.methods
+      .executeTwapSliceV2()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        marketBook: book.address,
+        twapOrder: twap.address,
+      })
+      .instruction();
+  }
+
   /// Cancel a TWAP order — trader signs, account closes, rent returned.
   cancelTwapOrderIx(args: {
     trader: PublicKey;
