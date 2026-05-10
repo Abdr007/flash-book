@@ -20,6 +20,7 @@ export {
   vaultPositionPda,
   marketBondPda,
   marketBookPda,
+  marketLeverageTiersPda,
   MAGICBLOCK_DELEGATION_PROGRAM_ID,
   delegateBufferPda,
   delegationRecordPda,

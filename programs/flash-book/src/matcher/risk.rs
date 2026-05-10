@@ -75,6 +75,105 @@ impl MarketSnapshot {
     }
 }
 
+/// Hyperliquid-style multi-tier MMR. Each tier is a
+/// `(min_notional_quote_lots, mmr_bps)` pair sorted ascending by notional.
+/// A position's effective MMR = `mmr_bps` of the largest tier whose
+/// `min_notional` is ≤ the position's notional, OR `base_mmr_bps` if no
+/// tier matches (notional below the first tier's threshold).
+///
+/// Example tier table (typical HL BTC market):
+///   [(0,        100),    // tier 1: ≤  ~$1M  → 1.0% MMR
+///    (1_000_000, 200),   // tier 2:  ~$5M    → 2.0% MMR
+///    (5_000_000, 300),   // tier 3: ~$25M    → 3.0% MMR
+///    (25_000_000, 500)]  // tier 4: > $25M   → 5.0% MMR
+///
+/// `tiers` MUST be sorted ascending by `min_notional`. The caller is
+/// responsible for sort order; helpers in `lib.rs:init_market_leverage_tiers`
+/// enforce this at write time.
+///
+/// Pure function — no Solana types beyond u64/u32. Unit-tested directly.
+pub fn tiered_mmr_bps(
+    base_mmr_bps: u32,
+    tiers: &[(u64, u32)],
+    position_notional_quote_lots: u128,
+) -> u32 {
+    let mut effective = base_mmr_bps;
+    for (min_notional, tier_mmr) in tiers {
+        if position_notional_quote_lots >= *min_notional as u128 {
+            effective = *tier_mmr;
+        } else {
+            break;
+        }
+    }
+    effective
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    #[test]
+    fn empty_tiers_returns_base() {
+        assert_eq!(tiered_mmr_bps(100, &[], 0), 100);
+        assert_eq!(tiered_mmr_bps(100, &[], 1_000_000_000), 100);
+    }
+
+    #[test]
+    fn below_first_tier_returns_base() {
+        let tiers = [(1_000_000u64, 200u32), (5_000_000, 300)];
+        assert_eq!(tiered_mmr_bps(100, &tiers, 0), 100);
+        assert_eq!(tiered_mmr_bps(100, &tiers, 999_999), 100);
+    }
+
+    #[test]
+    fn at_or_above_tier_returns_tier_mmr() {
+        let tiers = [(1_000_000u64, 200u32), (5_000_000, 300), (25_000_000, 500)];
+        assert_eq!(tiered_mmr_bps(100, &tiers, 1_000_000), 200);
+        assert_eq!(tiered_mmr_bps(100, &tiers, 4_999_999), 200);
+        assert_eq!(tiered_mmr_bps(100, &tiers, 5_000_000), 300);
+        assert_eq!(tiered_mmr_bps(100, &tiers, 24_999_999), 300);
+        assert_eq!(tiered_mmr_bps(100, &tiers, 25_000_000), 500);
+        assert_eq!(tiered_mmr_bps(100, &tiers, u128::MAX), 500);
+    }
+
+    #[test]
+    fn monotone_in_notional() {
+        let tiers = [(100u64, 150u32), (1_000, 250), (10_000, 400)];
+        let mut prev = tiered_mmr_bps(100, &tiers, 0);
+        for n in [99u128, 100, 999, 1_000, 9_999, 10_000, 1_000_000] {
+            let now = tiered_mmr_bps(100, &tiers, n);
+            assert!(now >= prev, "non-monotone at {}: prev={} now={}", n, prev, now);
+            prev = now;
+        }
+    }
+
+    #[test]
+    fn hl_btc_table() {
+        // HL's typical BTC tier table:
+        //   <$1M  → base 0.5% MMR (retail tier — uses caller's base_mmr)
+        //   $1M+  → 1.0% MMR
+        //   $5M+  → 2.0%
+        //   $25M+ → 3.0%
+        //   $100M+→ 5.0% (whale tier)
+        let tiers = [
+            (1_000_000u64, 100u32),
+            (5_000_000, 200),
+            (25_000_000, 300),
+            (100_000_000, 500),
+        ];
+        // Tiny retail position (< $1M) → base MMR (50 bps from caller).
+        assert_eq!(tiered_mmr_bps(50, &tiers, 500_000), 50);
+        // $3M position → first tier matches (≥$1M), second doesn't (<$5M).
+        assert_eq!(tiered_mmr_bps(50, &tiers, 3_000_000), 100);
+        // $7M position → second tier active.
+        assert_eq!(tiered_mmr_bps(50, &tiers, 7_000_000), 200);
+        // $30M position → third tier.
+        assert_eq!(tiered_mmr_bps(50, &tiers, 30_000_000), 300);
+        // $200M whale → top tier (5% MMR).
+        assert_eq!(tiered_mmr_bps(50, &tiers, 200_000_000), 500);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MarginAssessment {
     /// Required margin in quote-lots, ≥ 0.

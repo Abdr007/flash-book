@@ -39,6 +39,7 @@ import {
   vaultPositionPda,
   marketBondPda,
   marketBookPda,
+  marketLeverageTiersPda,
   MAGICBLOCK_DELEGATION_PROGRAM_ID,
   delegateBufferPda,
   delegationRecordPda,
@@ -977,6 +978,61 @@ export class FlashBookClient {
       .accountsPartial({
         authority: args.authority,
         market: args.market,
+      })
+      .instruction();
+  }
+
+  /// Initialize the per-market leverage-tier table (wave 20a, HL pattern).
+  /// Authority-only. Tiers must be sorted ascending by minNotionalQuoteLots
+  /// and each `mmrBps` must be ≥ market's baseline maintenance_margin_bps.
+  initMarketLeverageTiersIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    tiers: ReadonlyArray<{ minNotionalQuoteLots: bigint | BN; mmrBps: number }>;
+  }): Promise<TransactionInstruction> {
+    const ZERO_PAD = [0, 0, 0, 0];
+    const ixTiers = args.tiers.map((t) => ({
+      minNotionalQuoteLots:
+        t.minNotionalQuoteLots instanceof BN
+          ? t.minNotionalQuoteLots
+          : new BN(t.minNotionalQuoteLots.toString()),
+      mmrBps: t.mmrBps,
+      _pad: ZERO_PAD,
+    }));
+    const tiersPda = marketLeverageTiersPda(args.market, this.programId);
+    return this.methods
+      .initMarketLeverageTiers(ixTiers)
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        leverageTiers: tiersPda.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Update an existing per-market leverage-tier table.
+  updateMarketLeverageTiersIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    tiers: ReadonlyArray<{ minNotionalQuoteLots: bigint | BN; mmrBps: number }>;
+  }): Promise<TransactionInstruction> {
+    const ZERO_PAD = [0, 0, 0, 0];
+    const ixTiers = args.tiers.map((t) => ({
+      minNotionalQuoteLots:
+        t.minNotionalQuoteLots instanceof BN
+          ? t.minNotionalQuoteLots
+          : new BN(t.minNotionalQuoteLots.toString()),
+      mmrBps: t.mmrBps,
+      _pad: ZERO_PAD,
+    }));
+    const tiersPda = marketLeverageTiersPda(args.market, this.programId);
+    return this.methods
+      .updateMarketLeverageTiers(ixTiers)
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        leverageTiers: tiersPda.address,
       })
       .instruction();
   }

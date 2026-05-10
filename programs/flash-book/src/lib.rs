@@ -41,8 +41,9 @@ use matcher::risk::{
     MarketSnapshot as RiskMarketSnap, PositionSnapshot as RiskPosSnap,
 };
 use state::{
-    CommitBufferAccount, FlpExposureAccount, InsuranceFundAccount, MarketAccount,
-    MarketParams, TraderStateAccount,
+    CommitBufferAccount, FlpExposureAccount, InsuranceFundAccount, LeverageTier,
+    MarketAccount, MarketLeverageTiersAccount, MarketParams, TraderStateAccount,
+    MAX_LEVERAGE_TIERS,
 };
 
 declare_id!("FBookV1111111111111111111111111111111111111");
@@ -3037,6 +3038,72 @@ pub mod flash_book {
         market.params = new_params;
         emit!(MarketParamsUpdatedEvent {
             market: market.key(),
+        });
+        Ok(())
+    }
+
+    /// Initialize the per-market leverage-tier table — wave 20a.
+    /// Hyperliquid pattern: per-asset MMR scales with notional. A trader
+    /// holding $25M of BTC pays a higher MMR rate than one holding
+    /// $100K of BTC.
+    ///
+    /// Authority-gated: only the market authority can init / update.
+    /// `tiers` MUST be sorted ascending by `min_notional_quote_lots`,
+    /// non-empty, length ≤ MAX_LEVERAGE_TIERS = 8. Each tier's
+    /// `mmr_bps` MUST be ≥ market.params.maintenance_margin_bps
+    /// (tiers can only INCREASE MMR vs the baseline).
+    ///
+    /// A market with no tiers PDA falls back to the existing 2-tier
+    /// model (baseline + concentration_extra_mmr_bps).
+    pub fn init_market_leverage_tiers(
+        ctx: Context<InitMarketLeverageTiers>,
+        tiers: Vec<LeverageTier>,
+    ) -> Result<()> {
+        validate_leverage_tiers(&ctx.accounts.market, &tiers)?;
+
+        let acct = &mut ctx.accounts.leverage_tiers;
+        acct.market = ctx.accounts.market.key();
+        acct.bump = ctx.bumps.leverage_tiers;
+        acct.tier_count = tiers.len() as u8;
+        acct._pad0 = [0u8; 6];
+        acct.tiers = [LeverageTier::default(); MAX_LEVERAGE_TIERS];
+        for (i, t) in tiers.iter().enumerate() {
+            acct.tiers[i] = LeverageTier {
+                min_notional_quote_lots: t.min_notional_quote_lots,
+                mmr_bps: t.mmr_bps,
+                _pad: [0u8; 4],
+            };
+        }
+
+        emit!(MarketLeverageTiersInitializedEvent {
+            market: acct.market,
+            tier_count: acct.tier_count,
+        });
+        Ok(())
+    }
+
+    /// Update an existing per-market leverage-tier table. Same
+    /// validation as init. Authority-only.
+    pub fn update_market_leverage_tiers(
+        ctx: Context<UpdateMarketLeverageTiers>,
+        tiers: Vec<LeverageTier>,
+    ) -> Result<()> {
+        validate_leverage_tiers(&ctx.accounts.market, &tiers)?;
+
+        let acct = &mut ctx.accounts.leverage_tiers;
+        acct.tier_count = tiers.len() as u8;
+        acct.tiers = [LeverageTier::default(); MAX_LEVERAGE_TIERS];
+        for (i, t) in tiers.iter().enumerate() {
+            acct.tiers[i] = LeverageTier {
+                min_notional_quote_lots: t.min_notional_quote_lots,
+                mmr_bps: t.mmr_bps,
+                _pad: [0u8; 4],
+            };
+        }
+
+        emit!(MarketLeverageTiersUpdatedEvent {
+            market: acct.market,
+            tier_count: acct.tier_count,
         });
         Ok(())
     }
@@ -7002,6 +7069,48 @@ pub struct UpdateMarketAuthority<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitMarketLeverageTiers<'info> {
+    #[account(mut, address = market.authority)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = MarketLeverageTiersAccount::space(),
+        seeds = [MarketLeverageTiersAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub leverage_tiers: Account<'info, MarketLeverageTiersAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateMarketLeverageTiers<'info> {
+    #[account(address = market.authority)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [MarketLeverageTiersAccount::SEED, market.key().as_ref()],
+        bump = leverage_tiers.bump,
+    )]
+    pub leverage_tiers: Account<'info, MarketLeverageTiersAccount>,
+}
+
+#[derive(Accounts)]
 pub struct SubmitCommit<'info> {
     pub trader: Signer<'info>,
     #[account(
@@ -8315,6 +8424,18 @@ pub struct MarketParamsUpdatedEvent {
 }
 
 #[event]
+pub struct MarketLeverageTiersInitializedEvent {
+    pub market: Pubkey,
+    pub tier_count: u8,
+}
+
+#[event]
+pub struct MarketLeverageTiersUpdatedEvent {
+    pub market: Pubkey,
+    pub tier_count: u8,
+}
+
+#[event]
 pub struct MarketAuthorityTransferredEvent {
     pub market: Pubkey,
     pub previous_authority: Pubkey,
@@ -9050,6 +9171,43 @@ fn inject_leg_into_hypertree_unchecked(
 ///
 /// Unknown bytes default to Limit — defensive; an attacker writing a
 /// junk value in the order_type byte gets the lowest-priority bucket.
+/// Validate a leverage-tier table for `init_market_leverage_tiers` /
+/// `update_market_leverage_tiers`. Tiers must be:
+///   • non-empty and length ≤ MAX_LEVERAGE_TIERS
+///   • sorted ascending by min_notional_quote_lots (with strict increase)
+///   • each tier mmr_bps ≥ market.params.maintenance_margin_ratio_bps
+///     (tiers can only INCREASE MMR vs the baseline)
+///   • mmr_bps ≤ BPS_DENOM (sanity)
+///
+/// First tier may have min_notional = 0 (becomes the new baseline).
+fn validate_leverage_tiers(market: &MarketAccount, tiers: &[LeverageTier]) -> Result<()> {
+    require!(!tiers.is_empty(), FlashBookError::ZeroSize);
+    require!(
+        tiers.len() <= MAX_LEVERAGE_TIERS,
+        FlashBookError::OutOfRange
+    );
+    let base_mmr = market.params.maintenance_margin_ratio_bps;
+    let mut prev_min: Option<u64> = None;
+    for t in tiers {
+        require!(
+            t.mmr_bps >= base_mmr,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            t.mmr_bps <= constants::BPS_DENOM as u32,
+            FlashBookError::OutOfRange
+        );
+        if let Some(prev) = prev_min {
+            require!(
+                t.min_notional_quote_lots > prev,
+                FlashBookError::OutOfRange
+            );
+        }
+        prev_min = Some(t.min_notional_quote_lots);
+    }
+    Ok(())
+}
+
 pub fn order_type_byte_to_matcher(b: u8) -> matcher::order::OrderType {
     use matcher::order::OrderType;
     match b {

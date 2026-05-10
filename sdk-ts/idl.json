@@ -2720,6 +2720,116 @@
       "args": []
     },
     {
+      "name": "init_market_leverage_tiers",
+      "docs": [
+        "Initialize the per-market leverage-tier table — wave 20a.",
+        "Hyperliquid pattern: per-asset MMR scales with notional. A trader",
+        "holding $25M of BTC pays a higher MMR rate than one holding",
+        "$100K of BTC.",
+        "",
+        "Authority-gated: only the market authority can init / update.",
+        "`tiers` MUST be sorted ascending by `min_notional_quote_lots`,",
+        "non-empty, length ≤ MAX_LEVERAGE_TIERS = 8. Each tier's",
+        "`mmr_bps` MUST be ≥ market.params.maintenance_margin_bps",
+        "(tiers can only INCREASE MMR vs the baseline).",
+        "",
+        "A market with no tiers PDA falls back to the existing 2-tier",
+        "model (baseline + concentration_extra_mmr_bps)."
+      ],
+      "discriminator": [
+        239,
+        107,
+        242,
+        109,
+        142,
+        185,
+        7,
+        218
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "leverage_tiers",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  101,
+                  118,
+                  101,
+                  114,
+                  97,
+                  103,
+                  101,
+                  95,
+                  116,
+                  105,
+                  101,
+                  114,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "tiers",
+          "type": {
+            "vec": {
+              "defined": {
+                "name": "LeverageTier"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "init_trader_ata",
       "docs": [
         "Idempotently create the trader's quote ATA. Anchor's `init_if_needed`",
@@ -3754,9 +3864,7 @@
         "Partial withdrawal that allows traders with open positions to",
         "pull out collateral above the safety floor. Hyperliquid pattern:",
         "post-withdrawal collateral must satisfy",
-        "",
-        "remaining ≥ max(IM_required, WITHDRAWAL_FLOOR_BPS × notional)",
-        "",
+        "`remaining >= max(IM_required, WITHDRAWAL_FLOOR_BPS * notional)`",
         "where:",
         "• IM_required is the standard initial-margin requirement under",
         "the joint stress lattice (same engine as place_limit_order_v2",
@@ -7176,6 +7284,100 @@
       "args": []
     },
     {
+      "name": "update_market_leverage_tiers",
+      "docs": [
+        "Update an existing per-market leverage-tier table. Same",
+        "validation as init. Authority-only."
+      ],
+      "discriminator": [
+        172,
+        24,
+        160,
+        41,
+        83,
+        105,
+        224,
+        99
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "leverage_tiers",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  101,
+                  118,
+                  101,
+                  114,
+                  97,
+                  103,
+                  101,
+                  95,
+                  116,
+                  105,
+                  101,
+                  114,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "tiers",
+          "type": {
+            "vec": {
+              "defined": {
+                "name": "LeverageTier"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "update_market_params",
       "docs": [
         "Update mutable market parameters (authority-only).",
@@ -8794,6 +8996,19 @@
       ]
     },
     {
+      "name": "MarketLeverageTiersAccount",
+      "discriminator": [
+        144,
+        105,
+        152,
+        82,
+        251,
+        69,
+        54,
+        155
+      ]
+    },
+    {
       "name": "PositionAccount",
       "discriminator": [
         60,
@@ -9352,6 +9567,32 @@
         143,
         45,
         25
+      ]
+    },
+    {
+      "name": "MarketLeverageTiersInitializedEvent",
+      "discriminator": [
+        227,
+        125,
+        210,
+        22,
+        100,
+        218,
+        33,
+        32
+      ]
+    },
+    {
+      "name": "MarketLeverageTiersUpdatedEvent",
+      "discriminator": [
+        0,
+        121,
+        68,
+        26,
+        136,
+        229,
+        59,
+        33
       ]
     },
     {
@@ -11135,6 +11376,34 @@
       }
     },
     {
+      "name": "LeverageTier",
+      "docs": [
+        "One rung of the leverage tier table."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "min_notional_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "mmr_bps",
+            "type": "u32"
+          },
+          {
+            "name": "_pad",
+            "type": {
+              "array": [
+                "u8",
+                4
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
       "name": "LiquidationInjectedV2Event",
       "type": {
         "kind": "struct",
@@ -11760,6 +12029,103 @@
           {
             "name": "initial_oracle_ticks",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketLeverageTiersAccount",
+      "docs": [
+        "Hyperliquid-style multi-tier MMR table — wave 20a.",
+        "",
+        "Per-market account that holds up to MAX_LEVERAGE_TIERS rungs of",
+        "`(min_notional_quote_lots, mmr_bps)`. A position's effective MMR is",
+        "resolved via `matcher::risk::tiered_mmr_bps(market.maintenance_margin_bps,",
+        "tiers, position_notional)`.",
+        "",
+        "OPTIONAL: a market without this PDA falls back to the existing 2-tier",
+        "model (baseline + concentration_extra_mmr). Markets that need the full",
+        "HL leverage curve (BTC, ETH, ALT majors) can opt in via",
+        "`init_market_leverage_tiers`.",
+        "",
+        "Authority-gated: only the market authority can init / update."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "tier_count",
+            "docs": [
+              "Number of valid tiers in `tiers[..tier_count]`. Slots beyond",
+              "`tier_count` are zero-init padding."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "_pad0",
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            }
+          },
+          {
+            "name": "tiers",
+            "docs": [
+              "Sorted ascending by `min_notional_quote_lots`. Validated at",
+              "init/update — see `lib.rs:init_market_leverage_tiers`."
+            ],
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "LeverageTier"
+                  }
+                },
+                8
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketLeverageTiersInitializedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "tier_count",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketLeverageTiersUpdatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "tier_count",
+            "type": "u8"
           }
         ]
       }

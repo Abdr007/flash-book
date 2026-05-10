@@ -188,6 +188,18 @@ export function marketBookPda(
   return derive([MARKET_BOOK_SEED, market.toBuffer()], programId);
 }
 
+/// Per-market leverage-tier table — wave 20a (HL pattern).
+/// PDA seeds [b"leverage_tiers", market]. OPTIONAL — markets without
+/// this account fall back to the 2-tier (baseline + concentration_extra)
+/// model already on `MarketAccount.params`.
+const LEVERAGE_TIERS_SEED = Buffer.from('leverage_tiers');
+export function marketLeverageTiersPda(
+  market: PublicKey,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
+): DerivedPda {
+  return derive([LEVERAGE_TIERS_SEED, market.toBuffer()], programId);
+}
+
 // ─── MagicBlock ER delegation PDAs ────────────────────────────────────
 //
 // Mirrors `programs/flash-book/src/er.rs`:

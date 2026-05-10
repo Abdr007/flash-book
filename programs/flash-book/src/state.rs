@@ -278,6 +278,55 @@ impl MarketAccount {
     }
 }
 
+/// Hyperliquid-style multi-tier MMR table — wave 20a.
+///
+/// Per-market account that holds up to MAX_LEVERAGE_TIERS rungs of
+/// `(min_notional_quote_lots, mmr_bps)`. A position's effective MMR is
+/// resolved via `matcher::risk::tiered_mmr_bps(market.maintenance_margin_bps,
+/// tiers, position_notional)`.
+///
+/// OPTIONAL: a market without this PDA falls back to the existing 2-tier
+/// model (baseline + concentration_extra_mmr). Markets that need the full
+/// HL leverage curve (BTC, ETH, ALT majors) can opt in via
+/// `init_market_leverage_tiers`.
+///
+/// Authority-gated: only the market authority can init / update.
+#[account]
+#[derive(Debug, Default)]
+pub struct MarketLeverageTiersAccount {
+    pub market: Pubkey,
+    pub bump: u8,
+    /// Number of valid tiers in `tiers[..tier_count]`. Slots beyond
+    /// `tier_count` are zero-init padding.
+    pub tier_count: u8,
+    pub _pad0: [u8; 6],
+    /// Sorted ascending by `min_notional_quote_lots`. Validated at
+    /// init/update — see `lib.rs:init_market_leverage_tiers`.
+    pub tiers: [LeverageTier; MAX_LEVERAGE_TIERS],
+}
+
+/// One rung of the leverage tier table.
+#[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize, Default)]
+pub struct LeverageTier {
+    pub min_notional_quote_lots: u64,
+    pub mmr_bps: u32,
+    pub _pad: [u8; 4],
+}
+
+/// HL uses up to 6 tiers per asset; 8 gives us headroom for very large
+/// markets (e.g. BTC could justify 10-20 tiers in extreme cases, but 8
+/// covers the practical envelope).
+pub const MAX_LEVERAGE_TIERS: usize = 8;
+
+impl MarketLeverageTiersAccount {
+    pub const SEED: &'static [u8] = b"leverage_tiers";
+    pub fn space() -> usize {
+        // 8 disc + 32 market + 1 bump + 1 count + 6 pad +
+        //   MAX × (8 + 4 + 4) = 8 × 16 = 128
+        8 + 32 + 1 + 1 + 6 + (MAX_LEVERAGE_TIERS * 16)
+    }
+}
+
 #[account]
 #[derive(Debug)]
 pub struct PositionAccount {
