@@ -203,6 +203,38 @@ export function marketBookPda(
   return derive([MARKET_BOOK_SEED, market.toBuffer()], programId);
 }
 
+/// Wave 21 phase 3a: TriggerOrderAccountV3 PDA owned by `flash-book-orders`.
+/// Distinct from core's `triggerOrderPda` (core seed `b"trigger"`,
+/// orders seed `b"trigger_v3"`) so a trader can hold both legacy and
+/// v3 triggers during the migration window.
+const TRIGGER_V3_SEED = Buffer.from('trigger_v3');
+export function triggerOrderV3Pda(
+  market: PublicKey,
+  trader: PublicKey,
+  triggerId: number,
+  ordersProgramId: PublicKey = FLASH_BOOK_ORDERS_PROGRAM_ID,
+): DerivedPda {
+  return derive(
+    [
+      TRIGGER_V3_SEED,
+      market.toBuffer(),
+      trader.toBuffer(),
+      Buffer.from([triggerId & 0xff]),
+    ],
+    ordersProgramId,
+  );
+}
+
+/// Wave 21 phase 2: per-wrapper-program CPI signer PDA. Each wrapper
+/// (orders / flp / vaults) signs core CPI calls with this PDA. Core
+/// validates the signer matches one of the 3 expected derivations.
+const CPI_AUTHORITY_SEED = Buffer.from('cpi_authority');
+export function wrapperCpiAuthorityPda(
+  wrapperProgramId: PublicKey,
+): DerivedPda {
+  return derive([CPI_AUTHORITY_SEED], wrapperProgramId);
+}
+
 /// Per-market leverage-tier table — wave 20a (HL pattern).
 /// PDA seeds [b"leverage_tiers", market]. OPTIONAL — markets without
 /// this account fall back to the 2-tier (baseline + concentration_extra)

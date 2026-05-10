@@ -24,6 +24,8 @@ export {
   marketBondPda,
   marketBookPda,
   marketLeverageTiersPda,
+  triggerOrderV3Pda,
+  wrapperCpiAuthorityPda,
   MAGICBLOCK_DELEGATION_PROGRAM_ID,
   delegateBufferPda,
   delegationRecordPda,

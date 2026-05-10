@@ -142,16 +142,44 @@ Cannot be done with a simple program upgrade.
 
 ### Phase 3 — Migrate per-market data
 
-For each market in production:
+  7a. ✅ **Trigger orders v3** (this commit). New `TriggerOrderAccountV3`
+      account in `flash-book-orders` (seed `b"trigger_v3"`, distinct
+      from core's `b"trigger"` so legacy + v3 coexist). Three new
+      ixs in orders:
+        • `place_trigger_order_v3` — create v3 trigger PDA
+        • `execute_trigger_order_v3` — validate fire condition (oracle
+          / expiry / reduce-only) + CPI into core's
+          `place_limit_order_v2_cpi` to inject the order
+        • `cancel_trigger_order_v3` — close + refund rent
+      SDK: `triggerOrderV3Pda` + `wrapperCpiAuthorityPda` helpers.
 
-  7. Pause the market (`change_market_status` to Paused).
-  8. Snapshot trigger / TWAP / iceberg accounts. Re-create them under
-     `flash-book-orders` ownership.
-  9. Snapshot the singleton FLP exposure's per-market entry. Initialize
-     a `FlpExposurePerMarketAccount` under `flash-book-flp` with the
-     same state.
-  10. Snapshot vault accounts. Re-create them under `flash-book-vaults`.
-  11. Resume the market.
+  7b. ⬜ **TWAP orders v3** — `TwapOrderAccountV3` in orders, same
+      template. Add `place_twap_order_v3` / `execute_twap_slice_v3` /
+      `cancel_twap_order_v3`. Execute path CPIs into core via the
+      same authority PDA already wired in 7a.
+
+  7c. ⬜ **Iceberg orders v3** — `IcebergOrderAccountV3` in orders,
+      `place_iceberg_order_v3` / `replenish_iceberg_v3` /
+      `cancel_iceberg_v3`. Same CPI plumbing.
+
+  7d. ⬜ **Bracket orders v3** — uses TriggerOrderAccountV3 from 7a
+      under the hood (TP + SL OCO pair). New `place_bracket_order_v3`
+      ix that creates two TriggerOrderAccountV3 PDAs atomically and
+      OCO-links them.
+
+  8.  ⬜ **Per-market FLP exposure** — singleton `FlpExposureAccount`
+      in core split into `FlpExposurePerMarketAccount` PDAs in
+      `flash-book-flp` (seed `[b"flp", market]`). One per market,
+      independently ER-delegatable. Migration ix copies the singleton's
+      `per_market[i]` slot into a new account.
+
+  9.  ⬜ **Vault accounts** — `VaultAccount` + `VaultPositionAccount`
+      move from core to `flash-book-vaults`. Vault execute paths CPI
+      into core via the wrapper's authority PDA.
+
+  10. ⬜ **One-shot per-market migration** — for each existing market:
+      pause via `change_market_status(Paused)` → migration ixs above
+      → resume.
 
 ### Phase 4 — Sunset the legacy ixs in core
 
