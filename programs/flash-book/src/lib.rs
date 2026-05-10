@@ -10,14 +10,18 @@
 //! position state moved by separate `apply_fill` instruction).
 
 #![allow(unexpected_cfgs)]
-// The v1 ixs (initialize_order_buffer, place_limit_order, cancel_order,
-// cancel_all_orders_in_market, run_batch) are marked `#[deprecated]` in
-// wave 18h. Anchor's `#[program]` macro generates synthetic dispatch
-// call-sites inside this crate, which would surface the warning on
-// every program rebuild. The `#[deprecated]` attribute remains useful
-// for EXTERNAL Rust callers (other crates, integration test crates,
-// CPI consumers) — it surfaces there normally. Internal dispatcher
-// noise is suppressed crate-wide here only.
+// V1 ixs (the original flat-buffer orderbook surface — initialize_order_buffer,
+// place_limit_order, cancel_order, cancel_all_orders_in_market, run_batch)
+// are marked `#[deprecated]` since wave 18h. v2 hypertree replacements ship
+// in waves 18d–19g and cover all original injection paths.
+//
+// Anchor's `#[program]` macro generates synthetic dispatch call-sites that
+// would otherwise surface the deprecation warning on every program rebuild.
+// The `#[deprecated]` attribute still surfaces normally for EXTERNAL Rust
+// callers (other crates, integration tests, CPI consumers); only the
+// internal dispatcher noise is suppressed crate-wide here.
+//
+// Final v1 deletion is gated on bot/MM migration (wave 19h-future).
 #![allow(deprecated)]
 
 use anchor_lang::prelude::*;
@@ -7517,12 +7521,18 @@ pub mod flash_book {
         Ok(())
     }
 
-    // ER delegation (delegate_market / undelegate_market) is intentionally
-    // omitted in this build. The upstream `ephemeral-rollups-sdk` is not yet
-    // compatible with Solana 2.x; introducing a stub here would create a
-    // misleading instruction surface. The integration is purely additive —
-    // when the SDK ships compat, two new instructions slot in here without
-    // changing any existing semantics.
+    // ER delegation lifecycle ixs (delegate_market_book, undelegate_market_book,
+    // delegate_market, undelegate_market, delegate_commit_buffer,
+    // undelegate_commit_buffer) ship in waves 19b + 19g via in-house CPI
+    // wrappers in `src/er.rs`. flp_exposure is intentionally NOT
+    // ER-delegatable: it's a singleton, so delegating it would bottleneck
+    // ALL markets to a single ER instance. Per-market FLP exposure is
+    // queued for wave 21 (modular wrapper programs).
+    //
+    // Historical note: in-house CPI sidesteps the upstream
+    // `ephemeral-rollups-sdk` Solana 2.x compat issue. When upstream lands
+    // 2.1-compatible release we can swap to it drop-in via the Delegate /
+    // Undelegate ix builders in `src/er.rs`.
 
     /// HIP-3 / permissionless market deployment. ANY signer can call this
     /// to deploy a new market — no protocol authority gating. The caller
