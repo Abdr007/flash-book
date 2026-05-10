@@ -225,6 +225,80 @@ export function triggerOrderV3Pda(
   );
 }
 
+/// Wave 21 phase 3b: TwapOrderAccountV3 PDA under flash-book-orders.
+const TWAP_V3_SEED = Buffer.from('twap_v3');
+export function twapOrderV3Pda(
+  market: PublicKey,
+  trader: PublicKey,
+  twapId: number,
+  ordersProgramId: PublicKey = FLASH_BOOK_ORDERS_PROGRAM_ID,
+): DerivedPda {
+  return derive(
+    [
+      TWAP_V3_SEED,
+      market.toBuffer(),
+      trader.toBuffer(),
+      Buffer.from([twapId & 0xff]),
+    ],
+    ordersProgramId,
+  );
+}
+
+/// Wave 21 phase 3c: IcebergOrderAccountV3 PDA under flash-book-orders.
+const ICEBERG_V3_SEED = Buffer.from('iceberg_v3');
+export function icebergOrderV3Pda(
+  market: PublicKey,
+  trader: PublicKey,
+  icebergId: number,
+  ordersProgramId: PublicKey = FLASH_BOOK_ORDERS_PROGRAM_ID,
+): DerivedPda {
+  return derive(
+    [
+      ICEBERG_V3_SEED,
+      market.toBuffer(),
+      trader.toBuffer(),
+      Buffer.from([icebergId & 0xff]),
+    ],
+    ordersProgramId,
+  );
+}
+
+/// Wave 21 phase 8: per-market FLP exposure under flash-book-flp.
+/// One per market — independently ER-delegatable.
+const FLP_PER_MARKET_SEED = Buffer.from('flp_per_market');
+export function flpExposurePerMarketV3Pda(
+  market: PublicKey,
+  flpProgramId: PublicKey = FLASH_BOOK_FLP_PROGRAM_ID,
+): DerivedPda {
+  return derive([FLP_PER_MARKET_SEED, market.toBuffer()], flpProgramId);
+}
+
+/// Wave 21 phase 9: vault account under flash-book-vaults.
+const VAULT_V3_SEED = Buffer.from('vault_v3');
+export function vaultV3Pda(
+  strategist: PublicKey,
+  vaultId: number,
+  vaultsProgramId: PublicKey = FLASH_BOOK_VAULTS_PROGRAM_ID,
+): DerivedPda {
+  return derive(
+    [VAULT_V3_SEED, strategist.toBuffer(), Buffer.from([vaultId & 0xff])],
+    vaultsProgramId,
+  );
+}
+
+/// Wave 21 phase 9: vault depositor share account under flash-book-vaults.
+const VAULT_POSITION_V3_SEED = Buffer.from('vault_position_v3');
+export function vaultPositionV3Pda(
+  vault: PublicKey,
+  depositor: PublicKey,
+  vaultsProgramId: PublicKey = FLASH_BOOK_VAULTS_PROGRAM_ID,
+): DerivedPda {
+  return derive(
+    [VAULT_POSITION_V3_SEED, vault.toBuffer(), depositor.toBuffer()],
+    vaultsProgramId,
+  );
+}
+
 /// Wave 21 phase 2: per-wrapper-program CPI signer PDA. Each wrapper
 /// (orders / flp / vaults) signs core CPI calls with this PDA. Core
 /// validates the signer matches one of the 3 expected derivations.

@@ -153,33 +153,42 @@ Cannot be done with a simple program upgrade.
         • `cancel_trigger_order_v3` — close + refund rent
       SDK: `triggerOrderV3Pda` + `wrapperCpiAuthorityPda` helpers.
 
-  7b. ⬜ **TWAP orders v3** — `TwapOrderAccountV3` in orders, same
-      template. Add `place_twap_order_v3` / `execute_twap_slice_v3` /
-      `cancel_twap_order_v3`. Execute path CPIs into core via the
-      same authority PDA already wired in 7a.
+  7b. ✅ **TWAP orders v3** — `TwapOrderAccountV3` in orders.
+      `place_twap_order_v3` / `execute_twap_slice_v3` (CPI into core) /
+      `cancel_twap_order_v3` shipped.
 
-  7c. ⬜ **Iceberg orders v3** — `IcebergOrderAccountV3` in orders,
-      `place_iceberg_order_v3` / `replenish_iceberg_v3` /
-      `cancel_iceberg_v3`. Same CPI plumbing.
+  7c. ✅ **Iceberg orders v3** — `IcebergOrderAccountV3` in orders.
+      `place_iceberg_order_v3` (creates account + CPIs first chunk) /
+      `replenish_iceberg_v3` (CPIs next chunk) / `cancel_iceberg_v3`.
 
-  7d. ⬜ **Bracket orders v3** — uses TriggerOrderAccountV3 from 7a
-      under the hood (TP + SL OCO pair). New `place_bracket_order_v3`
-      ix that creates two TriggerOrderAccountV3 PDAs atomically and
-      OCO-links them.
+  7d. ✅ **Bracket orders v3** — `place_bracket_order_v3` atomically
+      creates 2 TriggerOrderAccountV3 PDAs (TP+SL) AND CPIs the parent
+      limit into core in one ix. Reuses TriggerOrderAccountV3 from 7a
+      so the existing `execute_trigger_order_v3` path fires brackets.
 
-  8.  ⬜ **Per-market FLP exposure** — singleton `FlpExposureAccount`
-      in core split into `FlpExposurePerMarketAccount` PDAs in
-      `flash-book-flp` (seed `[b"flp", market]`). One per market,
-      independently ER-delegatable. Migration ix copies the singleton's
-      `per_market[i]` slot into a new account.
+  8.  ✅ **Per-market FLP exposure** — `FlpExposurePerMarketAccountV3`
+      in `flash-book-flp` (seed `[b"flp_per_market", market]`). One
+      per market, independently ER-delegatable.
+      `init_flp_per_market_v3` + `record_flp_fill_v3` (authority-
+      gated, mirrors core's volume-weighted-avg + flip semantics) shipped.
+      ⚠ SPL deposit/withdraw paths deferred to phase 8b — they need
+      to inverse-CPI back into core's InsuranceFundAccount-owned vault
+      (auth model needs careful design + signoff).
 
-  9.  ⬜ **Vault accounts** — `VaultAccount` + `VaultPositionAccount`
-      move from core to `flash-book-vaults`. Vault execute paths CPI
-      into core via the wrapper's authority PDA.
+  9.  ✅ **Vault accounts** — `VaultAccountV3` + `VaultPositionAccountV3`
+      in `flash-book-vaults`. `create_vault_v3` / `vault_deposit_v3` /
+      `vault_withdraw_v3` shipped with full pro-rata share-mint /
+      share-burn math (bootstrap 1:1, NAV-aware otherwise).
+      ⚠ SPL transfer between depositor's ATA and vault collateral PDA
+      stays in core — phase 9b wires the inverse CPI for the actual
+      token movement. Local share accounting works today.
 
   10. ⬜ **One-shot per-market migration** — for each existing market:
-      pause via `change_market_status(Paused)` → migration ixs above
-      → resume.
+      pause via `change_market_status(Paused)` → state-copy ixs that
+      read core's legacy account and seed the matching v3 account
+      with the same data → resume. Per-account-type migration ixs
+      are the next focused work; the receiving account types now all
+      exist.
 
 ### Phase 4 — Sunset the legacy ixs in core
 
