@@ -121,16 +121,16 @@ production pattern from the listed exchange:
 
 Zero failures, zero warnings.
 
-## What's intentionally deferred
+## What's intentionally deferred (with full design docs)
 
-| Wave | Description | Reason for deferral |
+| Wave | Description | Status / design doc |
 |------|-------------|---------------------|
-| 19h  | Mass v1 deletion (~14 files, 187 references) | Bot uses v1 SDK builders; needs offchain migration first |
-| 20a  | Multi-tier MMR (HL has up to 6 tiers per asset) | Single-tier already covers ~80% of cases via existing `concentration_threshold_lots` + `concentration_extra_mmr_bps`; multi-tier requires schema change |
-| 20b  | Withdrawal floor `max(IM, 0.1 × notional)` | Current is **stricter** (`open_positions == 0`); HL floor is a UX upgrade, not a security fix |
-| 21   | Modular wrapper programs (split triggers / vaults / HIP-3 into separate Anchor programs that CPI into core) | Design-heavy; needs governance + program-ID coordination |
+| 19h  | Mass v1 deletion | **Bot pt1 done** (commit `04445a4`); checklist for the rest in [`V3_WAVE19H_DELETION_CHECKLIST.md`](./V3_WAVE19H_DELETION_CHECKLIST.md) — 13 phases A-N, ~16-20 focused hours, single dedicated session |
+| 20a  | Multi-tier MMR (HL has up to 6 tiers per asset) | Single-tier already covers ~80% of cases via `concentration_threshold_lots` + `concentration_extra_mmr_bps`; multi-tier needs additive `MarketLeverageTiers` PDA + RiskMarketSnap plumbing through 10+ files |
+| 20b  | Withdrawal floor `max(IM, 0.1 × notional)` | Current is **stricter** (`open_positions == 0`); HL floor is a UX upgrade (allows partial withdrawal with positions), not a security fix. Implement as additive `partial_withdraw_collateral` ix when needed |
+| 21   | Modular wrapper programs | Full spec in [`V3_WAVE21_MODULAR.md`](./V3_WAVE21_MODULAR.md): 4-program topology (core / orders / flp / vaults), per-market FLP, 4-phase migration plan, 4-week effort estimate |
 | 22   | Fee tier table | Already exists: `TraderStateAccount.fee_discount_bps` + `set_trader_fee_tier` ix |
-| 23   | Certora formal spec | External coordination + paid audit slot |
+| 23   | Certora formal spec | Full prep doc in [`V3_WAVE23_CERTORA.md`](./V3_WAVE23_CERTORA.md): 13 critical invariants formalized (matcher 5, risk 5, hypertree 4, funding 3), engagement scope $80-120K, 8-10 weeks |
 
 ## Latent items spotted along the way
 
