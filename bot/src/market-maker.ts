@@ -30,7 +30,12 @@ import {
   type PositionAccount,
   type TraderStateAccount,
 } from '../../sdk-ts/src/accounts.ts';
-import { encodeOrderIdV2, ORDER_FLAG_POST_ONLY } from '../../sdk-ts/src/index.ts';
+import {
+  encodeOrderIdV2,
+  ORDER_FLAG_POST_ONLY,
+  subscribeToTraderOrders,
+} from '../../sdk-ts/src/index.ts';
+import type { EventSubscription } from '../../sdk-ts/src/event-decoder.ts';
 
 // ─── Shared snapshot types ────────────────────────────────────────────
 
@@ -499,6 +504,11 @@ export class FlashBookVenue implements Venue {
   /// Per-(market, trader) open-order tracking. Keyed as `${market}:${trader}`.
   private readonly placedOrders = new Map<string, OpenOrder[]>();
 
+  /// Active event subscriptions per (market, trader). Keyed identically
+  /// to placedOrders. Each entry is the unsubscribe handle from
+  /// `subscribeToTraderOrders`.
+  private readonly subscriptions = new Map<string, EventSubscription>();
+
   constructor(
     private readonly client: FlashBookClient,
     private readonly connection: Connection,
@@ -508,6 +518,82 @@ export class FlashBookVenue implements Venue {
 
   private orderKey(market: PublicKey, trader: PublicKey): string {
     return `${market.toBase58()}:${trader.toBase58()}`;
+  }
+
+  /// Start a logsSubscribe-driven order-tracking subscription for
+  /// (market, trader). Production-grade pattern: the local
+  /// `placedOrders` map is hydrated from on-chain events, so a
+  /// stateless restart that re-runs `enableOrderTracking` and waits
+  /// one slot will see the chain's view. Local optimistic writes from
+  /// `buildQuoteInstructions` provide immediate feedback before the
+  /// event lands; the event then confirms (idempotent dedupe by
+  /// orderId).
+  ///
+  /// Idempotent — calling twice for the same (market, trader) tears
+  /// down the prior subscription and starts a fresh one.
+  enableOrderTracking(
+    market: PublicKey,
+    trader: PublicKey,
+    options: {
+      commitment?: 'processed' | 'confirmed' | 'finalized';
+    } = {},
+  ): void {
+    const key = this.orderKey(market, trader);
+    this.subscriptions.get(key)?.unsubscribe();
+    const sub = subscribeToTraderOrders(
+      this.connection,
+      {
+        traderFilterBase58: trader.toBase58(),
+        marketFilterBase58: market.toBase58(),
+        onPlaced: (order) => {
+          const list = this.placedOrders.get(key) ?? [];
+          // Dedupe: if local optimistic write already added this orderId,
+          // keep the existing entry (its priceTicks may already be set).
+          if (!list.some((o) => o.orderId === order.orderId)) {
+            list.push({
+              orderId: order.orderId,
+              side: order.side,
+              priceTicks: order.priceTicks,
+              seq: order.seq,
+            });
+            this.placedOrders.set(key, list);
+          }
+        },
+        onCancelled: (orderSeq, side) => {
+          const list = this.placedOrders.get(key);
+          if (!list) return;
+          const filtered = list.filter(
+            (o) => !(o.seq === orderSeq && o.side === side),
+          );
+          if (filtered.length !== list.length) {
+            this.placedOrders.set(key, filtered);
+          }
+        },
+      },
+      {
+        programId: this.client.programId,
+        commitment: options.commitment ?? 'confirmed',
+      },
+    );
+    this.subscriptions.set(key, sub);
+  }
+
+  /// Stop the order-tracking subscription for (market, trader).
+  /// No-op if none was started.
+  disableOrderTracking(market: PublicKey, trader: PublicKey): void {
+    const key = this.orderKey(market, trader);
+    const sub = this.subscriptions.get(key);
+    if (sub) {
+      sub.unsubscribe();
+      this.subscriptions.delete(key);
+    }
+  }
+
+  /// Tear down all active order-tracking subscriptions. Call on shutdown
+  /// to release the WS handles cleanly.
+  shutdown(): void {
+    for (const sub of this.subscriptions.values()) sub.unsubscribe();
+    this.subscriptions.clear();
   }
 
   async fetchMarket(market: PublicKey): Promise<MarketSnapshot | null> {
