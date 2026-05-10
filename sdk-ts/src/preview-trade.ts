@@ -14,11 +14,9 @@ import BN from 'bn.js';
 import type { FlashBookClient } from './client.ts';
 import {
   fetchMarket,
-  fetchOrderBuffer,
   fetchPosition,
   fetchTraderState,
   type MarketAccount,
-  type OrderSlot,
   type PositionAccount,
 } from './accounts.ts';
 import {
@@ -73,27 +71,6 @@ export interface PreviewTradeResult {
 const STATUS_ACTIVE = 1;
 const STATUS_POST_ONLY = 2;
 const RATE_LIMIT_PER_BATCH = 16;
-
-function slotToSim(slot: OrderSlot): SimOrder {
-  return {
-    id: `slot_${slot.id.toString()}`,
-    trader: slot.trader.toBase58(),
-    side: slot.side === 0 ? 'long' : 'short',
-    orderType:
-      slot.orderType === 0
-        ? 'limit'
-        : slot.orderType === 1
-          ? 'taker'
-          : slot.orderType === 2
-            ? 'flp_virtual'
-            : slot.orderType === 3
-              ? 'liquidation'
-              : 'adl',
-    sizeLots: slot.sizeLots.toNumber(),
-    limitTicks: slot.limitTicks.toNumber(),
-    seq: slot.seq.toNumber(),
-  };
-}
 
 /**
  * Project the post-fill PositionAccount given the current position and
@@ -175,10 +152,14 @@ export async function previewTrade(
   client: FlashBookClient,
   req: PreviewTradeRequest,
 ): Promise<PreviewTradeResult> {
-  // Fetch all the pieces in parallel.
-  const [marketAcct, bufferAcct, traderState, currentPos] = await Promise.all([
+  // Fetch market + trader + position state. v3 hypertree orderbook is
+  // not enumerated in the preview path — preview projects the post-trade
+  // position + margin against the current mark. For cross-against-current-
+  // book preview, callers should fetch top levels via `view_book_depth_v2`
+  // (returns top 4 per side) or replay OrderPlacedV2/CancelledV2 events
+  // and feed a richer sim themselves.
+  const [marketAcct, traderState, currentPos] = await Promise.all([
     fetchMarket(client, req.market),
-    fetchOrderBuffer(client, client.orderBuffer(req.market).address),
     fetchTraderState(client, client.traderState(req.trader).address),
     fetchPosition(client, client.position(req.market, req.trader).address),
   ]);
@@ -207,14 +188,10 @@ export async function previewTrade(
     return earlyExit('rate-limit-exceeded', marketAcct, currentPos, req);
   }
 
-  // Build sim input.
+  // Build sim input. v3 preview sims only the prospective order
+  // against an empty book — the matcher will treat it as a clearing-
+  // price floor (no immediate fill unless other batched orders cross).
   const orders: SimOrder[] = [];
-  if (bufferAcct) {
-    for (const slot of bufferAcct.slots) {
-      if (slot.valid === 1) orders.push(slotToSim(slot));
-    }
-  }
-  // Append our prospective order.
   const myId = `preview_${req.trader.toBase58()}_${Date.now()}`;
   orders.push({
     id: myId,
@@ -223,7 +200,7 @@ export async function previewTrade(
     orderType: req.orderType ?? 'taker',
     sizeLots: req.sizeLots,
     limitTicks: req.limitTicks,
-    seq: bufferAcct ? bufferAcct.seqCounter.toNumber() + 1 : 1,
+    seq: 1,
   });
 
   // Simulate.
