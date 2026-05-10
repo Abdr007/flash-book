@@ -894,56 +894,6 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// Place a limit order. Phoenix-grade order semantics via `flags`:
-  ///   bit 0 — post_only (also via the explicit `postOnly` arg)
-  ///   bit 1 — reduce_only: order can only shrink the trader's position
-  ///   bit 2 — ioc: immediate-or-cancel; don't rest after batch
-  ///   bit 3 — jit (drift JIT auction tag)
-  ///   higher bits — reserved (chain rejects)
-  ///
-  /// `expiresAtSlot` enables Good-Till-Time (GTT). 0 = GTC. Otherwise
-  /// the matcher skips the order once `current_slot > expiresAtSlot`
-  /// (cleanup keepers can sweep them via cancelOrder for rent reclaim).
-  ///
-  /// @deprecated Wave 18h — use `placeLimitOrderV2Ix` (hypertree-backed,
-  /// resting orders, larger book, smarter matcher). Wave 19 will delete.
-  placeLimitOrderIx(args: {
-    trader: PublicKey;
-    market: PublicKey;
-    side: 'long' | 'short';
-    sizeLots: bigint | number;
-    limitTicks: bigint | number;
-    postOnly?: boolean;
-    /// Bitfield of flags. Use {ORDER_FLAG_*} constants.
-    flags?: number;
-    /// 0 = GTC; otherwise the slot at which the order auto-expires.
-    expiresAtSlot?: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const buffer = this.orderBuffer(args.market);
-    const state = this.traderState(args.trader);
-    const position = this.position(args.market, args.trader);
-    const flp = this.flpExposure();
-    return this.methods
-      .placeLimitOrder(
-        args.side === 'long' ? 0 : 1,
-        args.sizeLots,
-        args.limitTicks,
-        args.postOnly ?? false,
-        args.flags ?? 0,
-        args.expiresAtSlot ?? new BN(0),
-      )
-      .accountsPartial({
-        trader: args.trader,
-        market: args.market,
-        orderBuffer: buffer.address,
-        traderState: state.address,
-        position: position.address,
-        flpExposure: flp.address,
-        systemProgram: SystemProgram.programId,
-      })
-      .instruction();
-  }
-
   /// Mass-cancel: drop EVERY pending limit/taker order belonging to the
   /// caller in this market. Single signer, single tx. Single O(n) walk
   /// over the order_buffer (n ≤ 64). FLP-virtual / liq / ADL system
@@ -1133,41 +1083,6 @@ export class FlashBookClient {
    * market's position. Each entry contributes one Market account
    * followed by one Position account to remaining_accounts.
    */
-  liquidatePortfolioIx(args: {
-    caller: PublicKey;
-    executionMarket: PublicKey;
-    trader: PublicKey;
-    crossMargin?: ReadonlyArray<{ market: PublicKey }>;
-  }): Promise<TransactionInstruction> {
-    const buffer = this.orderBuffer(args.executionMarket);
-    const traderState = this.traderState(args.trader);
-    const position = this.position(args.executionMarket, args.trader);
-    const builder = this.methods.liquidatePortfolio().accountsPartial({
-      caller: args.caller,
-      executionMarket: args.executionMarket,
-      executionOrderBuffer: buffer.address,
-      traderState: traderState.address,
-      executionPosition: position.address,
-    });
-    const remaining: Array<{ pubkey: PublicKey; isWritable: boolean; isSigner: boolean }> = [];
-    for (const m of args.crossMargin ?? []) {
-      remaining.push({ pubkey: m.market, isWritable: false, isSigner: false });
-      remaining.push({
-        pubkey: this.position(m.market, args.trader).address,
-        isWritable: false,
-        isSigner: false,
-      });
-    }
-    if (remaining.length > 0) {
-      // anchor's MethodsBuilder shape is loose — cast and call .remainingAccounts.
-      const withRemaining = (builder as unknown as {
-        remainingAccounts: (a: typeof remaining) => typeof builder;
-      }).remainingAccounts(remaining);
-      return withRemaining.instruction();
-    }
-    return builder.instruction();
-  }
-
   /// V2 cross-margin portfolio liquidation against the hypertree-backed
   /// book. Pure parity port of v1; only injection target differs.
   liquidatePortfolioV2Ix(args: {
@@ -1249,43 +1164,6 @@ export class FlashBookClient {
         delegateBuffer: buffer.address,
         systemProgram: SystemProgram.programId,
         delegationProgram: MAGICBLOCK_DELEGATION_PROGRAM_ID,
-      })
-      .instruction();
-  }
-
-  /// Liquidate an unhealthy position. Three production-grade behaviours:
-  ///
-  /// - `requestedCloseLots` = 0 → close the full position (legacy behaviour).
-  ///   > 0 → partial liquidation (Hyperliquid-style); the chain validates
-  ///   the size is ≤ position.size_lots.
-  /// - When `market.params.liquidatorRewardBps > 0`, the caller receives
-  ///   the reward credited to their own TraderState (auto-created on first
-  ///   call via init_if_needed).
-  /// - Race-safe: a second concurrent liquidator on the same position
-  ///   gets LiquidationStale (position.size_lots == 0 after the first
-  ///   tx commits).
-  liquidatePositionIx(args: {
-    caller: PublicKey;
-    market: PublicKey;
-    trader: PublicKey;
-    /// 0 = max (full close). Otherwise the on-chain handler closes
-    /// exactly this many lots.
-    requestedCloseLots?: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const buffer = this.orderBuffer(args.market);
-    const traderState = this.traderState(args.trader);
-    const callerState = this.traderState(args.caller);
-    const position = this.position(args.market, args.trader);
-    return this.methods
-      .liquidatePosition(args.requestedCloseLots ?? new BN(0))
-      .accountsPartial({
-        caller: args.caller,
-        market: args.market,
-        orderBuffer: buffer.address,
-        traderState: traderState.address,
-        callerTraderState: callerState.address,
-        position: position.address,
-        systemProgram: SystemProgram.programId,
       })
       .instruction();
   }
@@ -1455,31 +1333,6 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// Permissionless: keeper executes a trigger order when its condition
-  /// is met. The chain re-checks oracle vs trigger price and the
-  /// reduce_only/expiry flags. On success, inserts a regular limit order
-  /// into the market's buffer (matches via run_batch like any other).
-  executeTriggerOrderIx(args: {
-    caller: PublicKey;
-    market: PublicKey;
-    trader: PublicKey;
-    triggerId: number;
-  }): Promise<TransactionInstruction> {
-    const trigger = triggerOrderPda(args.market, args.trader, args.triggerId);
-    const buffer = this.orderBuffer(args.market);
-    const position = this.position(args.market, args.trader);
-    return this.methods
-      .executeTriggerOrder()
-      .accountsPartial({
-        caller: args.caller,
-        market: args.market,
-        orderBuffer: buffer.address,
-        triggerOrder: trigger.address,
-        position: position.address,
-      })
-      .instruction();
-  }
-
   /// Cancel a trigger order — trader signs, account closes, rent
   /// returned. Works whether the trigger has fired (active=0) or not.
   cancelTriggerOrderIx(args: {
@@ -1533,29 +1386,6 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// Permissionless: keeper executes the next TWAP slice when the
-  /// interval gate is open. Re-checks interval + end_slot. Inserts a
-  /// limit order into the buffer and advances the cumulative counter.
-  /// When the total fills, the TWAP marks itself inactive.
-  executeTwapSliceIx(args: {
-    caller: PublicKey;
-    market: PublicKey;
-    trader: PublicKey;
-    twapId: number;
-  }): Promise<TransactionInstruction> {
-    const twap = twapOrderPda(args.market, args.trader, args.twapId);
-    const buffer = this.orderBuffer(args.market);
-    return this.methods
-      .executeTwapSlice()
-      .accountsPartial({
-        caller: args.caller,
-        market: args.market,
-        orderBuffer: buffer.address,
-        twapOrder: twap.address,
-      })
-      .instruction();
-  }
-
   /// V2 TWAP slice — fires one slice against the hypertree-backed book.
   /// Same scheduling semantics as v1 (FLAG_ACTIVE / end_slot / slot_interval
   /// / slice sizing); only the order injection target differs (hypertree,
@@ -1595,42 +1425,6 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// Place an ICEBERG order (Hyperliquid pattern). Hides total size by
-  /// displaying `displayedSizeLots` at a time at `limitTicks`. When the
-  /// visible chunk fills, a permissionless `replenishIcebergIx` keeper
-  /// inserts the next chunk from the hidden reservoir. Tick-aligned;
-  /// displayed must be ≥ market.minBaseLots and ≤ totalSizeLots.
-  placeIcebergOrderIx(args: {
-    trader: PublicKey;
-    market: PublicKey;
-    icebergId: number;
-    side: 'long' | 'short';
-    totalSizeLots: bigint | number;
-    displayedSizeLots: bigint | number;
-    limitTicks: bigint | number;
-    expiresAtSlot?: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const buffer = this.orderBuffer(args.market);
-    const ice = icebergOrderPda(args.market, args.trader, args.icebergId);
-    return this.methods
-      .placeIcebergOrder(
-        args.icebergId,
-        args.side === 'long' ? 0 : 1,
-        args.totalSizeLots,
-        args.displayedSizeLots,
-        args.limitTicks,
-        args.expiresAtSlot ?? new BN(0),
-      )
-      .accountsPartial({
-        trader: args.trader,
-        market: args.market,
-        orderBuffer: buffer.address,
-        icebergOrder: ice.address,
-        systemProgram: SystemProgram.programId,
-      })
-      .instruction();
-  }
-
   /// V2: create an iceberg + seed first child into the hypertree-backed
   /// book. Pure parity port of v1; only injection target differs.
   placeIcebergOrderV2Ix(args: {
@@ -1664,29 +1458,6 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// Replenish an iceberg's visible chunk — permissionless keeper.
-  /// No-op when the current child is still resting (cheap to poll).
-  /// Keepers can call on every batch boundary; the chain only does
-  /// real work when the previous chunk has filled.
-  replenishIcebergIx(args: {
-    caller: PublicKey;
-    market: PublicKey;
-    trader: PublicKey;
-    icebergId: number;
-  }): Promise<TransactionInstruction> {
-    const buffer = this.orderBuffer(args.market);
-    const ice = icebergOrderPda(args.market, args.trader, args.icebergId);
-    return this.methods
-      .replenishIceberg()
-      .accountsPartial({
-        caller: args.caller,
-        market: args.market,
-        orderBuffer: buffer.address,
-        icebergOrder: ice.address,
-      })
-      .instruction();
-  }
-
   /// V2 iceberg replenish — fires the next visible chunk against the
   /// hypertree-backed book. Same iceberg semantics as v1 (still-resting
   /// probe via order_id lookup → no-op if prior chunk hasn't fully
@@ -1706,26 +1477,6 @@ export class FlashBookClient {
         caller: args.caller,
         market: args.market,
         marketBook: book.address,
-        icebergOrder: ice.address,
-      })
-      .instruction();
-  }
-
-  /// Cancel an iceberg order — trader signs. Removes any active child
-  /// from the OrderBuffer and closes the IcebergOrderAccount, refunding
-  /// rent.
-  cancelIcebergIx(args: {
-    trader: PublicKey;
-    market: PublicKey;
-    icebergId: number;
-  }): Promise<TransactionInstruction> {
-    const buffer = this.orderBuffer(args.market);
-    const ice = icebergOrderPda(args.market, args.trader, args.icebergId);
-    return this.methods
-      .cancelIceberg()
-      .accountsPartial({
-        trader: args.trader,
-        orderBuffer: buffer.address,
         icebergOrder: ice.address,
       })
       .instruction();
@@ -1809,57 +1560,6 @@ export class FlashBookClient {
         traderState: ts.address,
       })
       .remainingAccounts(remaining)
-      .instruction();
-  }
-
-  /// Place a BRACKET order (Hyperliquid pattern): atomic parent limit +
-  /// reduce-only TP + reduce-only SL, with the two triggers wired OCO
-  /// (one fires, the other auto-deactivates). For long parent: TP must
-  /// be ABOVE parent_limit, SL BELOW. For short: TP BELOW, SL ABOVE.
-  /// Both triggers execute opposite-side, reduce-only — they cannot
-  /// fire before the parent fills (reduce_only enforces position exists).
-  ///
-  /// All four prices must be tick-aligned. Trigger IDs must differ.
-  /// `expiresAtSlot = 0` = both triggers never expire (otherwise both
-  /// share the same expiry).
-  placeBracketOrderIx(args: {
-    trader: PublicKey;
-    market: PublicKey;
-    parentSide: 'long' | 'short';
-    sizeLots: bigint | number;
-    parentLimitTicks: bigint | number;
-    tpTriggerId: number;
-    tpTriggerPriceTicks: bigint | number;
-    tpLimitTicks: bigint | number;
-    slTriggerId: number;
-    slTriggerPriceTicks: bigint | number;
-    slLimitTicks: bigint | number;
-    expiresAtSlot?: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const buffer = this.orderBuffer(args.market);
-    const tp = triggerOrderPda(args.market, args.trader, args.tpTriggerId);
-    const sl = triggerOrderPda(args.market, args.trader, args.slTriggerId);
-    return this.methods
-      .placeBracketOrder(
-        args.parentSide === 'long' ? 0 : 1,
-        args.sizeLots,
-        args.parentLimitTicks,
-        args.tpTriggerId,
-        args.tpTriggerPriceTicks,
-        args.tpLimitTicks,
-        args.slTriggerId,
-        args.slTriggerPriceTicks,
-        args.slLimitTicks,
-        args.expiresAtSlot ?? new BN(0),
-      )
-      .accountsPartial({
-        trader: args.trader,
-        market: args.market,
-        orderBuffer: buffer.address,
-        tpTrigger: tp.address,
-        slTrigger: sl.address,
-        systemProgram: SystemProgram.programId,
-      })
       .instruction();
   }
 
@@ -2255,25 +1955,6 @@ export class FlashBookClient {
       .accountsPartial({
         trader: args.trader,
         traderState: state.address,
-      })
-      .instruction();
-  }
-
-  /// @deprecated Wave 18h — use `cancelOrderV2Ix` (looks up by encoded
-  /// order_id; supports the resting-order semantics of the hypertree).
-  /// Wave 19 will delete this builder.
-  cancelOrderIx(args: {
-    trader: PublicKey;
-    market: PublicKey;
-    orderSeq: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const buffer = this.orderBuffer(args.market);
-    return this.methods
-      .cancelOrder(args.orderSeq)
-      .accountsPartial({
-        trader: args.trader,
-        market: args.market,
-        orderBuffer: buffer.address,
       })
       .instruction();
   }

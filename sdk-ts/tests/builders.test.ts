@@ -495,7 +495,9 @@ describe('Instruction builders', () => {
   test('all 22 instruction builders covered', () => {
     // This test serves as a tripwire: if a new instruction is added to
     // the program, this list will fall out of sync with the test count
-    // above.
+    // above. v1 ix builders deleted in wave 19h; only v2 builders for
+    // injection paths remain. Cancel-all + basket + commit-reveal
+    // remain on v1 (no v2 equivalent yet — see V3_STATUS.md).
     const expected = [
       'initializeInsuranceFundIx',
       'initializeFlpExposureIx',
@@ -505,15 +507,15 @@ describe('Instruction builders', () => {
       'withdrawCollateralIx',
       'depositFlpCapitalIx',
       'withdrawFlpCapitalIx',
-      'placeLimitOrderIx',
+      'placeLimitOrderV2Ix',
       'submitCommitIx',
       'submitRevealIx',
-      'runBatchIx',
+      'runBatchV2Ix',
       'applyFillIx',
       'applyFlpFillIx',
-      'cancelOrderIx',
-      'liquidatePositionIx',
-      'liquidatePortfolioIx',
+      'cancelOrderV2Ix',
+      'liquidatePositionV2Ix',
+      'liquidatePortfolioV2Ix',
       'updateOracleIx',
       'updateOracleQuorumIx',
       'setMarketStatusIx',

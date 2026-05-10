@@ -32,12 +32,6 @@ export interface CollateralWithdrawnEvent {
   newBalance: BN;
 }
 
-export interface OrderCancelledEvent {
-  market: PublicKey;
-  trader: PublicKey;
-  orderSeq: BN;
-}
-
 export interface FillAppliedEvent {
   market: PublicKey;
   taker: PublicKey;
@@ -46,15 +40,6 @@ export interface FillAppliedEvent {
   sizeLots: BN;
   priceTicks: BN;
   batchNum: BN;
-}
-
-export interface LiquidationInjectedEvent {
-  market: PublicKey;
-  trader: PublicKey;
-  side: number;
-  sizeLots: BN;
-  limitTicks: BN;
-  worstScenarioIdx: number;
 }
 
 export interface FlpExposureInitializedEvent {
@@ -153,14 +138,12 @@ export type FlashBookEvent =
   | { name: 'CollateralDepositedEvent'; data: CollateralDepositedEvent }
   | { name: 'CollateralWithdrawnEvent'; data: CollateralWithdrawnEvent }
   | { name: 'FillAppliedEvent'; data: FillAppliedEvent }
-  | { name: 'LiquidationInjectedEvent'; data: LiquidationInjectedEvent }
   | { name: 'FlpFillAppliedEvent'; data: FlpFillAppliedEvent }
   | { name: 'MarketStatusChangedEvent'; data: MarketStatusChangedEvent }
   | { name: 'MarketParamsUpdatedEvent'; data: MarketParamsUpdatedEvent }
   | { name: 'MarketAuthorityTransferredEvent'; data: MarketAuthorityTransferredEvent }
   | { name: 'FlpExposureInitializedEvent'; data: FlpExposureInitializedEvent }
   | { name: 'FlpCapitalUpdatedEvent'; data: FlpCapitalUpdatedEvent }
-  | { name: 'OrderCancelledEvent'; data: OrderCancelledEvent }
   | { name: 'MarketBookInitializedEvent'; data: MarketBookInitializedEvent }
   | { name: 'OrderPlacedV2Event'; data: OrderPlacedV2Event }
   | { name: 'BookDepthV2Event'; data: BookDepthV2Event }
