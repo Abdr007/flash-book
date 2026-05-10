@@ -3749,6 +3749,214 @@
       "args": []
     },
     {
+      "name": "partial_withdraw_collateral",
+      "docs": [
+        "Partial withdrawal that allows traders with open positions to",
+        "pull out collateral above the safety floor. Hyperliquid pattern:",
+        "post-withdrawal collateral must satisfy",
+        "",
+        "remaining ≥ max(IM_required, WITHDRAWAL_FLOOR_BPS × notional)",
+        "",
+        "where:",
+        "• IM_required is the standard initial-margin requirement under",
+        "the joint stress lattice (same engine as place_limit_order_v2",
+        "intake — `assess_margin_fn`)",
+        "• WITHDRAWAL_FLOOR_BPS = 1000 (10% of total notional) — HL's",
+        "anti-deposit-then-withdraw guard prevents a trader from",
+        "temporarily topping up to satisfy IM, placing a trade, then",
+        "immediately yanking the temporary collateral leaving only",
+        "enough for maintenance margin (a known footgun in v1",
+        "systems that gate only on IM)",
+        "",
+        "remaining_accounts layout: alternating (market, position) pairs",
+        "for every market the trader has a non-zero position in. Identical",
+        "to liquidate_portfolio_v2's walk pattern.",
+        "",
+        "This ix is ADDITIVE; the existing `withdraw_collateral` (which",
+        "requires `open_positions == 0`) remains as the strict-safety",
+        "path. A trader with no positions should prefer that ix —",
+        "no remaining_accounts walk, smaller fee."
+      ],
+      "discriminator": [
+        220,
+        187,
+        0,
+        153,
+        160,
+        25,
+        94,
+        231
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "trader_quote_ata",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "trader"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "quote_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "quote_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "permissionless_initialize_market",
       "docs": [
         "HIP-3 / permissionless market deployment. ANY signer can call this",
@@ -9212,6 +9420,19 @@
       ]
     },
     {
+      "name": "PartialCollateralWithdrawnEvent",
+      "discriminator": [
+        211,
+        19,
+        175,
+        205,
+        118,
+        8,
+        74,
+        156
+      ]
+    },
+    {
       "name": "PermissionlessMarketDeployedEvent",
       "discriminator": [
         30,
@@ -12033,6 +12254,48 @@
           {
             "name": "total_orders_after",
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PartialCollateralWithdrawnEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "new_balance",
+            "type": "u64"
+          },
+          {
+            "name": "im_required",
+            "docs": [
+              "IM required at post-withdrawal collateral (the IM-floor input)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "notional_floor",
+            "docs": [
+              "10% × total_notional (the notional-floor input)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "applied_floor",
+            "docs": [
+              "The active floor = max(im_required, notional_floor). Post-",
+              "withdrawal collateral must be ≥ this."
+            ],
+            "type": "u64"
           }
         ]
       }

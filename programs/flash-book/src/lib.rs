@@ -2117,6 +2117,172 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Partial withdrawal that allows traders with open positions to
+    /// pull out collateral above the safety floor. Hyperliquid pattern:
+    /// post-withdrawal collateral must satisfy
+    /// `remaining >= max(IM_required, WITHDRAWAL_FLOOR_BPS * notional)`
+    /// where:
+    ///   • IM_required is the standard initial-margin requirement under
+    ///     the joint stress lattice (same engine as place_limit_order_v2
+    ///     intake — `assess_margin_fn`)
+    ///   • WITHDRAWAL_FLOOR_BPS = 1000 (10% of total notional) — HL's
+    ///     anti-deposit-then-withdraw guard prevents a trader from
+    ///     temporarily topping up to satisfy IM, placing a trade, then
+    ///     immediately yanking the temporary collateral leaving only
+    ///     enough for maintenance margin (a known footgun in v1
+    ///     systems that gate only on IM)
+    ///
+    /// remaining_accounts layout: alternating (market, position) pairs
+    /// for every market the trader has a non-zero position in. Identical
+    /// to liquidate_portfolio_v2's walk pattern.
+    ///
+    /// This ix is ADDITIVE; the existing `withdraw_collateral` (which
+    /// requires `open_positions == 0`) remains as the strict-safety
+    /// path. A trader with no positions should prefer that ix —
+    /// no remaining_accounts walk, smaller fee.
+    pub fn partial_withdraw_collateral<'info>(
+        ctx: Context<'_, '_, '_, 'info, PartialWithdrawCollateral<'info>>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+
+        // Pre-flight: amount available.
+        {
+            let s = &ctx.accounts.trader_state;
+            require!(
+                amount_quote_lots <= s.collateral_quote_lots,
+                FlashBookError::InsufficientCollateral,
+            );
+        }
+
+        // Walk remaining_accounts in (market, position) pairs to build
+        // the post-withdrawal margin snapshot.
+        let trader_pk = ctx.accounts.trader_state.trader;
+        let program_id = ctx.program_id;
+        let remaining = ctx.remaining_accounts;
+        require!(remaining.len() % 2 == 0, FlashBookError::OutOfRange);
+
+        let mut snaps: Vec<RiskPosSnap> = Vec::new();
+        let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
+        let mut market_keys: Vec<Pubkey> = Vec::new();
+        let mut total_notional_quote: u128 = 0;
+
+        let mut i = 0usize;
+        while i + 1 < remaining.len() {
+            let m_ai = &remaining[i];
+            let p_ai = &remaining[i + 1];
+            require_keys_eq!(*m_ai.owner, *program_id, FlashBookError::Unauthorized);
+            require_keys_eq!(*p_ai.owner, *program_id, FlashBookError::Unauthorized);
+
+            let market: MarketAccount =
+                MarketAccount::try_deserialize(&mut &m_ai.try_borrow_data()?[..])?;
+            let position: state::PositionAccount =
+                state::PositionAccount::try_deserialize(&mut &p_ai.try_borrow_data()?[..])?;
+            require!(
+                position.trader == trader_pk,
+                FlashBookError::WrongTrader
+            );
+            require!(
+                position.market == m_ai.key(),
+                FlashBookError::WrongMarket
+            );
+
+            if position.size_lots > 0 {
+                let notional = (position.size_lots as u128)
+                    .saturating_mul(market.mark_price_ticks as u128)
+                    .saturating_mul(market.params.tick_size as u128);
+                total_notional_quote = total_notional_quote.saturating_add(notional);
+
+                snaps.push(RiskPosSnap {
+                    market: position.market,
+                    side: if position.side == 0 { Side::Long } else { Side::Short },
+                    size_lots: position.size_lots,
+                    entry_price: Ticks(position.entry_price_ticks),
+                    cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                });
+                market_snaps.push(RiskMarketSnap {
+                    market: m_ai.key(),
+                    mark_price: Ticks(market.mark_price_ticks),
+                    cum_funding_index: market.cum_funding_index,
+                    maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+                    tick_size: market.params.tick_size,
+                    concentration_threshold_lots: market.params.concentration_threshold_lots,
+                    concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                });
+                market_keys.push(m_ai.key());
+            }
+            i += 2;
+        }
+
+        // Pre-mutate snapshot of the post-withdrawal collateral.
+        let post_collateral = ctx
+            .accounts
+            .trader_state
+            .collateral_quote_lots
+            .checked_sub(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+
+        // Compute the safety floor.
+        // (a) IM required under joint stress lattice.
+        let im_required: u64 = if snaps.is_empty() {
+            0
+        } else {
+            let scenarios = default_scenarios_fn(&market_keys);
+            let assessment = assess_margin_fn(
+                &snaps,
+                &market_snaps,
+                &scenarios,
+                post_collateral,
+            )?;
+            assessment.required_quote_lots
+        };
+
+        // (b) HL withdrawal floor: 10% of total notional.
+        let notional_floor_u128 = total_notional_quote
+            .saturating_mul(WITHDRAWAL_FLOOR_BPS as u128)
+            / (constants::BPS_DENOM as u128);
+        let notional_floor = if notional_floor_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            notional_floor_u128 as u64
+        };
+
+        let floor = im_required.max(notional_floor);
+        require!(
+            post_collateral >= floor,
+            FlashBookError::InsufficientCollateral
+        );
+
+        // SPL transfer (identical to withdraw_collateral).
+        let bump = ctx.accounts.insurance_fund.bump;
+        let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
+        let signers = &[signer_seeds];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.quote_vault.to_account_info(),
+            to: ctx.accounts.trader_quote_ata.to_account_info(),
+            authority: ctx.accounts.insurance_fund.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signers,
+        );
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        // Accounting.
+        let s = &mut ctx.accounts.trader_state;
+        s.collateral_quote_lots = post_collateral;
+        emit!(PartialCollateralWithdrawnEvent {
+            trader: s.trader,
+            amount: amount_quote_lots,
+            new_balance: s.collateral_quote_lots,
+            im_required,
+            notional_floor,
+            applied_floor: floor,
+        });
+        Ok(())
+    }
+
     /// Settle accrued funding for a single position. Computes funding owed
     /// since the last settlement using `funding_owed(side, notional, now,
     /// at_entry)`, debits or credits the trader's collateral_quote_lots,
@@ -6956,6 +7122,46 @@ pub struct WithdrawCollateral<'info> {
 }
 
 #[derive(Accounts)]
+pub struct PartialWithdrawCollateral<'info> {
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = trader,
+    )]
+    pub trader_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        address = insurance_fund.quote_vault,
+    )]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    // remaining_accounts: alternating (market, position) pairs for every
+    // market the trader has a non-zero position in. Walked inside the
+    // handler to compute total notional + IM required for the floor check.
+}
+
+#[derive(Accounts)]
 pub struct SettleFunding<'info> {
     /// Permissionless — any signer can settle funding for any position.
     /// The position's owner is determined by the position PDA's seeds,
@@ -7994,6 +8200,15 @@ pub const BOOK_DEPTH_LEVELS: usize = 4;
 /// to a streaming O(N log N) walk over the price ladder.
 pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 64;
 
+/// HL withdrawal floor — wave 20b. When a trader pulls collateral from
+/// `partial_withdraw_collateral` with positions still open, the remaining
+/// collateral must satisfy `>= max(IM_required, WITHDRAWAL_FLOOR_BPS ×
+/// total_notional)`. 1000 bps = 10% — Hyperliquid's exact value. Defends
+/// against deposit-then-withdraw attacks where a trader briefly tops up
+/// to satisfy IM, places a trade, then yanks the temporary collateral
+/// leaving only enough for maintenance margin.
+pub const WITHDRAWAL_FLOOR_BPS: u32 = 1000;
+
 /// VPIN level (bps of toxicity probability) at or above which `run_batch_v2`
 /// SKIPS FLP virtual-quote generation for the current batch. Protects LP
 /// capital from informed flow at the matcher level (the per-fill toxicity
@@ -8059,6 +8274,20 @@ pub struct CollateralWithdrawnEvent {
     pub trader: Pubkey,
     pub amount: u64,
     pub new_balance: u64,
+}
+
+#[event]
+pub struct PartialCollateralWithdrawnEvent {
+    pub trader: Pubkey,
+    pub amount: u64,
+    pub new_balance: u64,
+    /// IM required at post-withdrawal collateral (the IM-floor input).
+    pub im_required: u64,
+    /// 10% × total_notional (the notional-floor input).
+    pub notional_floor: u64,
+    /// The active floor = max(im_required, notional_floor). Post-
+    /// withdrawal collateral must be ≥ this.
+    pub applied_floor: u64,
 }
 
 #[event]

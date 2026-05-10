@@ -858,6 +858,52 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// HL-pattern partial withdrawal — pull collateral while positions
+  /// remain open, gated by the safety floor `max(IM_required,
+  /// 10% × total_notional)`. Pass every market the trader has a non-
+  /// zero position in via `openPositionMarkets`; the on-chain handler
+  /// walks (market, position) pairs in remaining_accounts.
+  ///
+  /// For traders with NO open positions, prefer `withdrawCollateralIx`
+  /// (no remaining_accounts walk, smaller fee).
+  partialWithdrawCollateralIx(args: {
+    trader: PublicKey;
+    amount: bigint | number;
+    quoteMint: PublicKey;
+    quoteVault: PublicKey;
+    openPositionMarkets: ReadonlyArray<PublicKey>;
+    traderQuoteAta?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const state = this.traderState(args.trader);
+    const fund = this.insuranceFund();
+    const ata = args.traderQuoteAta ?? associatedTokenAddress(args.trader, args.quoteMint);
+    const remaining: { pubkey: PublicKey; isWritable: boolean; isSigner: boolean }[] = [];
+    for (const m of args.openPositionMarkets) {
+      remaining.push(
+        { pubkey: m, isWritable: false, isSigner: false },
+        { pubkey: this.position(m, args.trader).address, isWritable: false, isSigner: false },
+      );
+    }
+    const builder = this.methods
+      .partialWithdrawCollateral(args.amount)
+      .accountsPartial({
+        trader: args.trader,
+        traderState: state.address,
+        insuranceFund: fund.address,
+        quoteMint: args.quoteMint,
+        traderQuoteAta: ata,
+        quoteVault: args.quoteVault,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      });
+    if (remaining.length > 0) {
+      const withRemaining = (builder as unknown as {
+        remainingAccounts: (a: typeof remaining) => typeof builder;
+      }).remainingAccounts(remaining);
+      return withRemaining.instruction();
+    }
+    return builder.instruction();
+  }
+
   submitCommitIx(args: {
     trader: PublicKey;
     market: PublicKey;
