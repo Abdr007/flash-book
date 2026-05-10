@@ -1498,6 +1498,253 @@
       ]
     },
     {
+      "name": "delegate_market",
+      "docs": [
+        "Delegate the MarketAccount itself to the ER. Required for",
+        "`run_batch_v2` to mutate `mark_price_ticks`, `cum_funding_index`,",
+        "`last_funding_rate_bps_per_sec`, `vpin`, `current_batch`, and",
+        "`last_batch_ms` on the ER. Pair this with `delegate_market_book`",
+        "— both delegations must be live for the matcher tick to run on",
+        "the ER."
+      ],
+      "discriminator": [
+        223,
+        125,
+        110,
+        148,
+        99,
+        176,
+        143,
+        72
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "docs": [
+            "The market account itself becomes a delegated account; mut so we",
+            "can sign over it via seeds (PDA-as-signer for invoke_signed)."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner_program",
+          "address": "FBookV1111111111111111111111111111111111111"
+        },
+        {
+          "name": "delegate_buffer",
+          "writable": true
+        },
+        {
+          "name": "delegation_record",
+          "writable": true
+        },
+        {
+          "name": "delegation_metadata",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "delegation_program",
+          "address": "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
+        }
+      ],
+      "args": [
+        {
+          "name": "commit_frequency_ms",
+          "type": "u32"
+        },
+        {
+          "name": "validator",
+          "type": {
+            "option": "pubkey"
+          }
+        }
+      ]
+    },
+    {
+      "name": "delegate_market_book",
+      "docs": [
+        "Delegate the v2 hypertree market_book PDA to the MagicBlock ER.",
+        "After this lands, the account state lives on the ER for sub-ms",
+        "matcher access; only this program (via PDA signature) can",
+        "undelegate it back to mainnet. The market account must also be",
+        "delegated (see `delegate_market`) for `run_batch_v2` to mutate",
+        "mark/funding/VPIN on the ER.",
+        "",
+        "`commit_frequency_ms` controls how often the ER auto-commits the",
+        "state back to mainnet when the program isn't doing it explicitly.",
+        "0 disables auto-commit (only manual undelegate flushes state).",
+        "Production target: 50–200 ms (matches the FBA cadence).",
+        "",
+        "`validator` pins the ER validator (None = permissionless selection)."
+      ],
+      "discriminator": [
+        36,
+        70,
+        161,
+        194,
+        200,
+        206,
+        153,
+        43
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "Pays for the delegation buffer + delegation record allocation."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "verifies the seeds + bump match. Inside the handler we additionally",
+            "verify .owner == this program (defence-in-depth — er.rs SECURITY note)."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner_program",
+          "docs": [
+            "MagicBlock delegation program). Verified inside cpi_delegate via",
+            "the program ID match. Constraint pins it to this crate's program ID."
+          ],
+          "address": "FBookV1111111111111111111111111111111111111"
+        },
+        {
+          "name": "delegate_buffer",
+          "docs": [
+            "MagicBlock delegation program initialises this; we don't preallocate."
+          ],
+          "writable": true
+        },
+        {
+          "name": "delegation_record",
+          "docs": [
+            "Initialised by the delegation program."
+          ],
+          "writable": true
+        },
+        {
+          "name": "delegation_metadata",
+          "docs": [
+            "Initialised by the delegation program."
+          ],
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "delegation_program",
+          "docs": [
+            "canonical DELEGATION_PROGRAM_ID; cpi_delegate also rechecks."
+          ],
+          "address": "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
+        }
+      ],
+      "args": [
+        {
+          "name": "commit_frequency_ms",
+          "type": "u32"
+        },
+        {
+          "name": "validator",
+          "type": {
+            "option": "pubkey"
+          }
+        }
+      ]
+    },
+    {
       "name": "deposit_collateral",
       "docs": [
         "Deposit collateral. Performs an SPL transfer from the trader's",
@@ -7189,6 +7436,177 @@
       ]
     },
     {
+      "name": "undelegate_market",
+      "docs": [
+        "Undelegate the MarketAccount from the ER back to mainnet."
+      ],
+      "discriminator": [
+        22,
+        56,
+        12,
+        119,
+        64,
+        238,
+        106,
+        106
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner_program",
+          "address": "FBookV1111111111111111111111111111111111111"
+        },
+        {
+          "name": "delegate_buffer",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "delegation_program",
+          "address": "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "undelegate_market_book",
+      "docs": [
+        "Undelegate the market_book PDA from the ER back to mainnet. After",
+        "this lands the account state is authoritative on mainnet again",
+        "and matcher ticks must run on mainnet (`run_batch_v2` callable",
+        "directly, no ER bridging needed).",
+        "",
+        "Use during planned ER downtime, validator rotation, or to flush",
+        "final state before a permanent shutdown of the ER instance."
+      ],
+      "discriminator": [
+        205,
+        118,
+        12,
+        20,
+        82,
+        161,
+        147,
+        71
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner_program",
+          "address": "FBookV1111111111111111111111111111111111111"
+        },
+        {
+          "name": "delegate_buffer",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "delegation_program",
+          "address": "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "update_market_params",
       "docs": [
         "Update mutable market parameters (authority-only).",
@@ -9290,6 +9708,19 @@
       ]
     },
     {
+      "name": "MarketBookDelegatedEvent",
+      "discriminator": [
+        30,
+        255,
+        125,
+        89,
+        250,
+        96,
+        127,
+        49
+      ]
+    },
+    {
       "name": "MarketBookInitializedEvent",
       "discriminator": [
         23,
@@ -9300,6 +9731,32 @@
         125,
         216,
         242
+      ]
+    },
+    {
+      "name": "MarketBookUndelegatedEvent",
+      "discriminator": [
+        67,
+        73,
+        211,
+        163,
+        44,
+        33,
+        17,
+        134
+      ]
+    },
+    {
+      "name": "MarketDelegatedEvent",
+      "discriminator": [
+        196,
+        127,
+        99,
+        65,
+        72,
+        77,
+        109,
+        221
       ]
     },
     {
@@ -9339,6 +9796,19 @@
         34,
         39,
         53
+      ]
+    },
+    {
+      "name": "MarketUndelegatedEvent",
+      "discriminator": [
+        34,
+        9,
+        162,
+        40,
+        86,
+        4,
+        223,
+        27
       ]
     },
     {
@@ -11528,6 +11998,33 @@
       }
     },
     {
+      "name": "MarketBookDelegatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "market_book",
+            "type": "pubkey"
+          },
+          {
+            "name": "commit_frequency_ms",
+            "type": "u32"
+          },
+          {
+            "name": "validator",
+            "docs": [
+              "Pinned ER validator pubkey, or default Pubkey if permissionless."
+            ],
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
       "name": "MarketBookInitializedEvent",
       "type": {
         "kind": "struct",
@@ -11547,6 +12044,42 @@
           {
             "name": "data_bytes",
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketBookUndelegatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "market_book",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketDelegatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "commit_frequency_ms",
+            "type": "u32"
+          },
+          {
+            "name": "validator",
+            "type": "pubkey"
           }
         ]
       }
@@ -11977,6 +12510,18 @@
           {
             "name": "new_status",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketUndelegatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
           }
         ]
       }

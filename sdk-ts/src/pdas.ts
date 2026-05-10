@@ -195,3 +195,52 @@ export function marketBookPda(
 ): DerivedPda {
   return derive([MARKET_BOOK_SEED, market.toBuffer()], programId);
 }
+
+// ─── MagicBlock ER delegation PDAs ────────────────────────────────────
+//
+// Mirrors `programs/flash-book/src/er.rs`:
+//   - Delegation program: DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh
+//   - Delegate buffer    : [b"buffer",              delegated_account]
+//                          OWNED BY THE OWNER PROGRAM (= our program ID)
+//   - Delegation record  : [b"delegation",          delegated_account]
+//                          OWNED BY THE DELEGATION PROGRAM
+//   - Metadata           : [b"delegation-metadata", delegated_account]
+//                          OWNED BY THE DELEGATION PROGRAM
+//
+// SDK callers use these to compose `delegateMarketBookIx` /
+// `delegateMarketIx` accounts WITHOUT pulling the magicblock SDK as a
+// runtime dependency.
+
+export const MAGICBLOCK_DELEGATION_PROGRAM_ID = new PublicKey(
+  'DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh',
+);
+
+const DELEGATE_BUFFER_TAG = Buffer.from('buffer');
+const DELEGATION_RECORD_TAG = Buffer.from('delegation');
+const DELEGATION_METADATA_TAG = Buffer.from('delegation-metadata');
+
+/// Delegate buffer PDA — lives under THIS program (the account owner),
+/// not under the delegation program. Pass `programId` for non-default
+/// owner programs.
+export function delegateBufferPda(
+  delegatedAccount: PublicKey,
+  ownerProgramId: PublicKey = FLASH_BOOK_PROGRAM_ID,
+): DerivedPda {
+  return derive([DELEGATE_BUFFER_TAG, delegatedAccount.toBuffer()], ownerProgramId);
+}
+
+/// Delegation record PDA — lives under the MagicBlock delegation program.
+export function delegationRecordPda(delegatedAccount: PublicKey): DerivedPda {
+  return derive(
+    [DELEGATION_RECORD_TAG, delegatedAccount.toBuffer()],
+    MAGICBLOCK_DELEGATION_PROGRAM_ID,
+  );
+}
+
+/// Delegation metadata PDA — lives under the MagicBlock delegation program.
+export function delegationMetadataPda(delegatedAccount: PublicKey): DerivedPda {
+  return derive(
+    [DELEGATION_METADATA_TAG, delegatedAccount.toBuffer()],
+    MAGICBLOCK_DELEGATION_PROGRAM_ID,
+  );
+}

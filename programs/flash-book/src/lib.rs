@@ -173,6 +173,201 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Delegate the v2 hypertree market_book PDA to the MagicBlock ER.
+    /// After this lands, the account state lives on the ER for sub-ms
+    /// matcher access; only this program (via PDA signature) can
+    /// undelegate it back to mainnet. The market account must also be
+    /// delegated (see `delegate_market`) for `run_batch_v2` to mutate
+    /// mark/funding/VPIN on the ER.
+    ///
+    /// `commit_frequency_ms` controls how often the ER auto-commits the
+    /// state back to mainnet when the program isn't doing it explicitly.
+    /// 0 disables auto-commit (only manual undelegate flushes state).
+    /// Production target: 50–200 ms (matches the FBA cadence).
+    ///
+    /// `validator` pins the ER validator (None = permissionless selection).
+    pub fn delegate_market_book(
+        ctx: Context<DelegateMarketBook>,
+        commit_frequency_ms: u32,
+        validator: Option<Pubkey>,
+    ) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.market_book;
+
+        // Defence-in-depth (er.rs SECURITY note): the market_book MUST
+        // be owned by us before we sign a delegate over it. The seeds
+        // constraint already implies this, but recheck explicitly.
+        require_keys_eq!(
+            *ctx.accounts.market_book.owner,
+            *ctx.program_id,
+            FlashBookError::Unauthorized
+        );
+
+        let seeds_for_args: Vec<Vec<u8>> = vec![
+            state_v2::MARKET_BOOK_SEED.to_vec(),
+            market_key.as_ref().to_vec(),
+            vec![bump],
+        ];
+        let signer_seeds: &[&[u8]] = &[
+            state_v2::MARKET_BOOK_SEED,
+            market_key.as_ref(),
+            &[bump],
+        ];
+
+        er::cpi_delegate(
+            er::DelegateAccounts {
+                payer: ctx.accounts.authority.to_account_info(),
+                delegated_account: ctx.accounts.market_book.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                delegate_buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                delegation_record: ctx.accounts.delegation_record.to_account_info(),
+                delegation_metadata: ctx.accounts.delegation_metadata.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            er::DelegateArgs {
+                commit_frequency_ms,
+                seeds: seeds_for_args,
+                validator,
+            },
+            signer_seeds,
+        )?;
+
+        emit!(MarketBookDelegatedEvent {
+            market: market_key,
+            market_book: ctx.accounts.market_book.key(),
+            commit_frequency_ms,
+            validator: validator.unwrap_or_default(),
+        });
+        Ok(())
+    }
+
+    /// Undelegate the market_book PDA from the ER back to mainnet. After
+    /// this lands the account state is authoritative on mainnet again
+    /// and matcher ticks must run on mainnet (`run_batch_v2` callable
+    /// directly, no ER bridging needed).
+    ///
+    /// Use during planned ER downtime, validator rotation, or to flush
+    /// final state before a permanent shutdown of the ER instance.
+    pub fn undelegate_market_book(ctx: Context<UndelegateMarketBook>) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.market_book;
+        let signer_seeds: &[&[u8]] = &[
+            state_v2::MARKET_BOOK_SEED,
+            market_key.as_ref(),
+            &[bump],
+        ];
+
+        er::cpi_undelegate(
+            er::UndelegateAccounts {
+                payer: ctx.accounts.authority.to_account_info(),
+                delegated_account: ctx.accounts.market_book.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            signer_seeds,
+        )?;
+
+        emit!(MarketBookUndelegatedEvent {
+            market: market_key,
+            market_book: ctx.accounts.market_book.key(),
+        });
+        Ok(())
+    }
+
+    /// Delegate the MarketAccount itself to the ER. Required for
+    /// `run_batch_v2` to mutate `mark_price_ticks`, `cum_funding_index`,
+    /// `last_funding_rate_bps_per_sec`, `vpin`, `current_batch`, and
+    /// `last_batch_ms` on the ER. Pair this with `delegate_market_book`
+    /// — both delegations must be live for the matcher tick to run on
+    /// the ER.
+    pub fn delegate_market(
+        ctx: Context<DelegateMarket>,
+        commit_frequency_ms: u32,
+        validator: Option<Pubkey>,
+    ) -> Result<()> {
+        let base_mint = ctx.accounts.market.base_mint;
+        let quote_mint = ctx.accounts.market.quote_mint;
+        let bump = ctx.accounts.market.bump;
+
+        require_keys_eq!(
+            *ctx.accounts.market.to_account_info().owner,
+            *ctx.program_id,
+            FlashBookError::Unauthorized
+        );
+
+        let seeds_for_args: Vec<Vec<u8>> = vec![
+            MarketAccount::SEED.to_vec(),
+            base_mint.as_ref().to_vec(),
+            quote_mint.as_ref().to_vec(),
+            vec![bump],
+        ];
+        let signer_seeds: &[&[u8]] = &[
+            MarketAccount::SEED,
+            base_mint.as_ref(),
+            quote_mint.as_ref(),
+            &[bump],
+        ];
+
+        er::cpi_delegate(
+            er::DelegateAccounts {
+                payer: ctx.accounts.authority.to_account_info(),
+                delegated_account: ctx.accounts.market.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                delegate_buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                delegation_record: ctx.accounts.delegation_record.to_account_info(),
+                delegation_metadata: ctx.accounts.delegation_metadata.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            er::DelegateArgs {
+                commit_frequency_ms,
+                seeds: seeds_for_args,
+                validator,
+            },
+            signer_seeds,
+        )?;
+
+        emit!(MarketDelegatedEvent {
+            market: ctx.accounts.market.key(),
+            commit_frequency_ms,
+            validator: validator.unwrap_or_default(),
+        });
+        Ok(())
+    }
+
+    /// Undelegate the MarketAccount from the ER back to mainnet.
+    pub fn undelegate_market(ctx: Context<UndelegateMarket>) -> Result<()> {
+        let base_mint = ctx.accounts.market.base_mint;
+        let quote_mint = ctx.accounts.market.quote_mint;
+        let bump = ctx.accounts.market.bump;
+        let signer_seeds: &[&[u8]] = &[
+            MarketAccount::SEED,
+            base_mint.as_ref(),
+            quote_mint.as_ref(),
+            &[bump],
+        ];
+
+        er::cpi_undelegate(
+            er::UndelegateAccounts {
+                payer: ctx.accounts.authority.to_account_info(),
+                delegated_account: ctx.accounts.market.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            signer_seeds,
+        )?;
+
+        emit!(MarketUndelegatedEvent {
+            market: ctx.accounts.market.key(),
+        });
+        Ok(())
+    }
+
     /// V2 limit-order placement against the hypertree-backed orderbook.
     /// Runs ALONGSIDE the legacy `place_limit_order` for now — operators
     /// pick which book each market uses by calling `init_market_book`
@@ -6614,6 +6809,155 @@ pub struct RunBatchV2<'info> {
 }
 
 #[derive(Accounts)]
+pub struct DelegateMarketBook<'info> {
+    /// Pays for the delegation buffer + delegation record allocation.
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; signed via seeds for the delegate CPI. Anchor
+    /// verifies the seeds + bump match. Inside the handler we additionally
+    /// verify .owner == this program (defence-in-depth — er.rs SECURITY note).
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    /// CHECK: this program's account info (passed as `owner_program` to the
+    /// MagicBlock delegation program). Verified inside cpi_delegate via
+    /// the program ID match. Constraint pins it to this crate's program ID.
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under owner_program at [b"buffer", market_book]. The
+    /// MagicBlock delegation program initialises this; we don't preallocate.
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID at [b"delegation", market_book].
+    /// Initialised by the delegation program.
+    #[account(mut)]
+    pub delegation_record: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID at [b"delegation-metadata", market_book].
+    /// Initialised by the delegation program.
+    #[account(mut)]
+    pub delegation_metadata: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program. Address pinned to the
+    /// canonical DELEGATION_PROGRAM_ID; cpi_delegate also rechecks.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UndelegateMarketBook<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; signed via seeds for undelegate CPI.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    /// CHECK: this program's account info.
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: same buffer PDA from delegate (it carries the committed state).
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct DelegateMarket<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// The market account itself becomes a delegated account; mut so we
+    /// can sign over it via seeds (PDA-as-signer for invoke_signed).
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: this program's account info.
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under owner_program at [b"buffer", market].
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID at [b"delegation", market].
+    #[account(mut)]
+    pub delegation_record: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID at [b"delegation-metadata", market].
+    #[account(mut)]
+    pub delegation_metadata: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UndelegateMarket<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: this program's account info.
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: same buffer PDA from delegate.
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitMarketBook<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -8435,6 +8779,33 @@ pub struct MarketBookInitializedEvent {
     pub market_book: Pubkey,
     pub total_bytes: u32,
     pub data_bytes: u32,
+}
+
+#[event]
+pub struct MarketBookDelegatedEvent {
+    pub market: Pubkey,
+    pub market_book: Pubkey,
+    pub commit_frequency_ms: u32,
+    /// Pinned ER validator pubkey, or default Pubkey if permissionless.
+    pub validator: Pubkey,
+}
+
+#[event]
+pub struct MarketBookUndelegatedEvent {
+    pub market: Pubkey,
+    pub market_book: Pubkey,
+}
+
+#[event]
+pub struct MarketDelegatedEvent {
+    pub market: Pubkey,
+    pub commit_frequency_ms: u32,
+    pub validator: Pubkey,
+}
+
+#[event]
+pub struct MarketUndelegatedEvent {
+    pub market: Pubkey,
 }
 
 #[event]

@@ -21,6 +21,10 @@ export {
   vaultPositionPda,
   marketBondPda,
   marketBookPda,
+  MAGICBLOCK_DELEGATION_PROGRAM_ID,
+  delegateBufferPda,
+  delegationRecordPda,
+  delegationMetadataPda,
   type DerivedPda,
 } from './pdas.ts';
 

@@ -40,6 +40,10 @@ import {
   vaultPositionPda,
   marketBondPda,
   marketBookPda,
+  MAGICBLOCK_DELEGATION_PROGRAM_ID,
+  delegateBufferPda,
+  delegationRecordPda,
+  delegationMetadataPda,
   FLASH_BOOK_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from './pdas.ts';
@@ -293,6 +297,114 @@ export class FlashBookClient {
         market: args.market,
         marketBook: book.address,
         systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  // ─── MagicBlock ER delegation ─────────────────────────────────────────
+  //
+  // Lifecycle: init the v2 book on mainnet (initMarketBookIx), then
+  // delegate BOTH the market_book PDA and the MarketAccount to the ER
+  // (delegateMarketBookIx + delegateMarketIx). The matcher tick
+  // (runBatchV2Ix) then runs on the ER with sub-millisecond latency;
+  // the ER auto-commits state back to mainnet at `commitFrequencyMs`.
+  // Undelegate at the end-of-life of the ER instance.
+
+  /// Delegate the v2 hypertree market_book to the MagicBlock ER.
+  /// Production cadence target: commitFrequencyMs ≈ 50–200 (matches
+  /// the FBA cadence). Pass `validator` to pin a specific ER validator
+  /// or omit for permissionless selection.
+  delegateMarketBookIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    commitFrequencyMs: number;
+    validator?: PublicKey | null;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    const buffer = delegateBufferPda(book.address, this.programId);
+    const record = delegationRecordPda(book.address);
+    const metadata = delegationMetadataPda(book.address);
+    return this.methods
+      .delegateMarketBook(args.commitFrequencyMs, args.validator ?? null)
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        marketBook: book.address,
+        ownerProgram: this.programId,
+        delegateBuffer: buffer.address,
+        delegationRecord: record.address,
+        delegationMetadata: metadata.address,
+        systemProgram: SystemProgram.programId,
+        delegationProgram: MAGICBLOCK_DELEGATION_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
+  /// Undelegate the market_book from the ER back to mainnet. State is
+  /// flushed via the buffer PDA before control returns.
+  undelegateMarketBookIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    const buffer = delegateBufferPda(book.address, this.programId);
+    return this.methods
+      .undelegateMarketBook()
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        marketBook: book.address,
+        ownerProgram: this.programId,
+        delegateBuffer: buffer.address,
+        systemProgram: SystemProgram.programId,
+        delegationProgram: MAGICBLOCK_DELEGATION_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
+  /// Delegate the MarketAccount to the ER. Required for run_batch_v2 to
+  /// mutate mark/funding/VPIN/current_batch on the ER. Pair with
+  /// delegateMarketBookIx — both delegations must be live for the
+  /// matcher tick to run on the ER.
+  delegateMarketIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    commitFrequencyMs: number;
+    validator?: PublicKey | null;
+  }): Promise<TransactionInstruction> {
+    const buffer = delegateBufferPda(args.market, this.programId);
+    const record = delegationRecordPda(args.market);
+    const metadata = delegationMetadataPda(args.market);
+    return this.methods
+      .delegateMarket(args.commitFrequencyMs, args.validator ?? null)
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        ownerProgram: this.programId,
+        delegateBuffer: buffer.address,
+        delegationRecord: record.address,
+        delegationMetadata: metadata.address,
+        systemProgram: SystemProgram.programId,
+        delegationProgram: MAGICBLOCK_DELEGATION_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
+  /// Undelegate the MarketAccount from the ER back to mainnet.
+  undelegateMarketIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const buffer = delegateBufferPda(args.market, this.programId);
+    return this.methods
+      .undelegateMarket()
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        ownerProgram: this.programId,
+        delegateBuffer: buffer.address,
+        systemProgram: SystemProgram.programId,
+        delegationProgram: MAGICBLOCK_DELEGATION_PROGRAM_ID,
       })
       .instruction();
   }
