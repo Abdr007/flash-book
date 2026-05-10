@@ -1205,6 +1205,36 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// V2 liquidation — pure parity port of v1, just retargets the close
+  /// order injection at the hypertree (order_type byte = 3, matcher
+  /// promotes to OrderType::Liquidation FIFO priority). Same v1 maths
+  /// (cooldown, stress lattice, Dutch auction reward, oracle ± penalty).
+  /// Bonus: v2 ctx correctly marks `position` as mut (v1 has a latent
+  /// bug — position writes silently don't persist).
+  liquidatePositionV2Ix(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+    requestedCloseLots?: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    const traderState = this.traderState(args.trader);
+    const callerState = this.traderState(args.caller);
+    const position = this.position(args.market, args.trader);
+    return this.methods
+      .liquidatePositionV2(args.requestedCloseLots ?? new BN(0))
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        marketBook: book.address,
+        traderState: traderState.address,
+        callerTraderState: callerState.address,
+        position: position.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
   applyFlpFillIx(args: {
     sequencer: PublicKey;
     market: PublicKey;

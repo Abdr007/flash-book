@@ -639,7 +639,7 @@ pub mod flash_book {
                     id: o.order_id,
                     trader: o.trader,
                     side: matcher::order::Side::Long,
-                    order_type: matcher::order::OrderType::Limit,
+                    order_type: order_type_byte_to_matcher(o.order_type),
                     size: matcher::lot::BaseLots(o.size_lots),
                     limit_price: matcher::lot::Ticks(o.price_ticks),
                     seq: o.seq,
@@ -660,7 +660,7 @@ pub mod flash_book {
                     id: o.order_id,
                     trader: o.trader,
                     side: matcher::order::Side::Short,
-                    order_type: matcher::order::OrderType::Limit,
+                    order_type: order_type_byte_to_matcher(o.order_type),
                     size: matcher::lot::BaseLots(o.size_lots),
                     limit_price: matcher::lot::Ticks(o.price_ticks),
                     seq: o.seq,
@@ -6051,6 +6051,208 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// V2: liquidate an unhealthy position by injecting a synthetic
+    /// close order into the hypertree-backed book.
+    ///
+    /// PURE PARITY PORT of v1's `liquidate_position` — same cooldown
+    /// gate, same stress-lattice health check, same Dutch-auction
+    /// reward curve, same `oracle ± penalty_bps` limit pricing, same
+    /// position timing updates. Only the order injection target
+    /// differs: hypertree, not v1 buffer. The order_type byte is set
+    /// to 3 (Liquidation) so the matcher's FIFO mapping (mirror of
+    /// v1's `slot_to_order`) places it AHEAD of regular limits at
+    /// the same price tier — same priority semantics as v1.
+    pub fn liquidate_position_v2(
+        ctx: Context<LiquidatePositionV2>,
+        requested_close_lots: u64,
+    ) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let position = &ctx.accounts.position;
+        let trader_state_pre = ctx.accounts.trader_state.clone();
+
+        require!(position.size_lots > 0, FlashBookError::LiquidationStale);
+        require!(
+            position.trader == trader_state_pre.trader,
+            FlashBookError::WrongTrader
+        );
+        require!(
+            position.market == market.key(),
+            FlashBookError::WrongMarket
+        );
+
+        let close_size = if requested_close_lots == 0 {
+            position.size_lots
+        } else {
+            require!(
+                requested_close_lots <= position.size_lots,
+                FlashBookError::OutOfRange
+            );
+            requested_close_lots
+        };
+        require!(close_size > 0, FlashBookError::ZeroSize);
+
+        let current_slot = Clock::get()?.slot;
+        let cooldown = market.params.liquidation_cooldown_slots as u64;
+        if cooldown > 0 && position.last_liquidated_at_slot > 0 {
+            let elapsed = current_slot.saturating_sub(position.last_liquidated_at_slot);
+            require!(elapsed >= cooldown, FlashBookError::RateLimited);
+        }
+
+        // Health gate (parity-port).
+        let pos_snap = RiskPosSnap {
+            market: position.market,
+            side: if position.side == 0 { Side::Long } else { Side::Short },
+            size_lots: position.size_lots,
+            entry_price: Ticks(position.entry_price_ticks),
+            cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+        };
+        let market_snap = RiskMarketSnap {
+            market: market.key(),
+            mark_price: Ticks(market.mark_price_ticks),
+            cum_funding_index: market.cum_funding_index,
+            maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+            tick_size: market.params.tick_size,
+            concentration_threshold_lots: market.params.concentration_threshold_lots,
+            concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+        };
+        let scenarios = default_scenarios_fn(&[market.key()]);
+        let assessment = assess_margin_fn(
+            &[pos_snap],
+            &[market_snap],
+            &scenarios,
+            trader_state_pre.collateral_quote_lots,
+        )?;
+        require!(!assessment.is_healthy, FlashBookError::NotLiquidatable);
+
+        let pos_side = pos_snap.side;
+        let close_side = pos_side.opposite();
+        let penalty = market.params.liq_penalty_bps as u128;
+        let oracle = market.oracle_price_ticks as u128;
+        let penalty_delta = (oracle * penalty) / constants::BPS_DENOM as u128;
+        let limit = match close_side {
+            Side::Short => (oracle.saturating_sub(penalty_delta)) as u64,
+            Side::Long => (oracle.saturating_add(penalty_delta)) as u64,
+        };
+
+        // Lazy-init caller_trader_state (parity-port).
+        {
+            let cts = &mut ctx.accounts.caller_trader_state;
+            if cts.trader == Pubkey::default() {
+                cts.trader = ctx.accounts.caller.key();
+                cts.bump = ctx.bumps.caller_trader_state;
+            }
+        }
+
+        let market_key = market.key();
+
+        // Dutch-auction reward (parity-port from v1).
+        let mut reward_paid: u64 = 0;
+        if market.params.liquidator_reward_bps > 0 {
+            let notional_u128 = (close_size as u128)
+                .saturating_mul(oracle)
+                .saturating_mul(market.params.tick_size as u128);
+            let mut reward_bps_eff = market.params.liquidator_reward_bps as u128;
+            let auction_duration =
+                market.params.liquidation_auction_duration_slots as u64;
+            if auction_duration > 0 && ctx.accounts.position.unhealthy_since_slot > 0 {
+                let elapsed = current_slot
+                    .saturating_sub(ctx.accounts.position.unhealthy_since_slot);
+                let scale = (elapsed.min(auction_duration) as u128)
+                    .saturating_mul(constants::BPS_DENOM as u128)
+                    / (auction_duration as u128);
+                reward_bps_eff = reward_bps_eff
+                    .saturating_mul(scale)
+                    / (constants::BPS_DENOM as u128);
+            } else if auction_duration > 0 {
+                reward_bps_eff = 0;
+            }
+            let reward_u128 = notional_u128
+                .saturating_mul(reward_bps_eff)
+                / (constants::BPS_DENOM as u128);
+            let reward_u64 = if reward_u128 > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                reward_u128 as u64
+            };
+            reward_paid = reward_u64.min(ctx.accounts.trader_state.collateral_quote_lots);
+            if reward_paid > 0 {
+                ctx.accounts.trader_state.collateral_quote_lots -= reward_paid;
+                let caller_ts = &mut ctx.accounts.caller_trader_state;
+                caller_ts.collateral_quote_lots = caller_ts
+                    .collateral_quote_lots
+                    .checked_add(reward_paid)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            }
+        }
+
+        // V2 inject — into the hypertree, with order_type = Liquidation (3).
+        let trader = position.trader;
+        let close_side_u8 = close_side as u8;
+        let inserted_idx;
+        let next_seq;
+        {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let mut handle =
+                state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            next_seq = handle
+                .header
+                .order_seq_counter
+                .checked_add(1)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            require!(
+                next_seq < FLP_SEQ_RESERVED_OFFSET,
+                FlashBookError::OutOfRange
+            );
+            handle.header.order_seq_counter = next_seq;
+
+            let side_is_bid = close_side_u8 == 0;
+            let order = state_v2::RestingOrderV2 {
+                order_id: state_v2::encode_order_id(limit, next_seq, side_is_bid),
+                seq: next_seq,
+                price_ticks: limit,
+                size_lots: close_size,
+                expires_at_slot: 0,
+                trader,
+                last_valid_slot: current_slot as u32,
+                side: close_side_u8,
+                order_type: 3, // 3 = Liquidation (matcher promotes priority)
+                flags: 0,
+                _pad: 0,
+            };
+            inserted_idx = if side_is_bid {
+                handle.insert_bid(order)?
+            } else {
+                handle.insert_ask(order)?
+            };
+        }
+
+        let position = &mut ctx.accounts.position;
+        if position.unhealthy_since_slot == 0 {
+            position.unhealthy_since_slot = current_slot;
+        }
+        position.last_liquidated_at_slot = current_slot;
+
+        emit!(LiquidationInjectedV2Event {
+            market: market_key,
+            trader,
+            side: pos_side as u8,
+            size_lots: close_size,
+            limit_ticks: limit,
+            worst_scenario_idx: assessment.worst_scenario_idx,
+            order_seq: next_seq,
+            node_index: inserted_idx,
+        });
+        if reward_paid > 0 {
+            emit!(LiquidatorRewardedEvent {
+                market: market_key,
+                liquidator: ctx.accounts.caller.key(),
+                liquidatee: trader,
+                reward_quote_lots: reward_paid,
+            });
+        }
+        Ok(())
+    }
+
     /// Post a slashable HIP-3 deployer bond on a market. The bond signals
     /// the depositor's commitment to the market's solvency; if the
     /// market goes bad (oracle stale, mass insolvent liqs, etc.),
@@ -8881,6 +9083,57 @@ pub struct LiquidatePosition<'info> {
 }
 
 #[derive(Accounts)]
+pub struct LiquidatePositionV2<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at market_book seed; disc validated inside handler.
+    /// Mut because the synthetic close order is inserted into the
+    /// hypertree.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
+        bump = trader_state.bump,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = caller,
+        space = TraderStateAccount::space(),
+        seeds = [TraderStateAccount::SEED, caller.key().as_ref()],
+        bump,
+    )]
+    pub caller_trader_state: Account<'info, TraderStateAccount>,
+
+    /// MUT — wave 19e fixes a v1 latent bug: v1's LiquidatePosition has
+    /// this WITHOUT `mut`, so writes to `unhealthy_since_slot` /
+    /// `last_liquidated_at_slot` silently don't persist. Anchor doesn't
+    /// serialize back accounts not declared mut. v2 correctly marks it.
+    #[account(
+        mut,
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.trader.as_ref()],
+        bump = position.bump,
+    )]
+    pub position: Account<'info, state::PositionAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct PostMarketBond<'info> {
     #[account(mut)]
     pub depositor: Signer<'info>,
@@ -9244,6 +9497,20 @@ pub struct LiquidationInjectedEvent {
     pub size_lots: u64,
     pub limit_ticks: u64,
     pub worst_scenario_idx: u32,
+}
+
+#[event]
+pub struct LiquidationInjectedV2Event {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub side: u8,
+    pub size_lots: u64,
+    pub limit_ticks: u64,
+    pub worst_scenario_idx: u32,
+    /// Sequence assigned to the synthesized close order.
+    pub order_seq: u64,
+    /// Hypertree node index of the inserted RestingOrderV2.
+    pub node_index: u32,
 }
 
 #[event]
@@ -9928,6 +10195,25 @@ pub enum MarketStatus {
     PostOnly = 2,
     Paused = 3,
     Closed = 4,
+}
+
+/// Map a `RestingOrderV2.order_type` byte to the matcher's OrderType.
+/// Matches v1's `slot_to_order` mapping so v2 orders fed into the same
+/// FBA clearing logic get the same FIFO priority weighting (limits
+/// behind takers, takers behind liquidations, ADL highest).
+///
+/// Unknown bytes default to Limit — defensive; an attacker writing a
+/// junk value in the order_type byte gets the lowest-priority bucket.
+pub fn order_type_byte_to_matcher(b: u8) -> matcher::order::OrderType {
+    use matcher::order::OrderType;
+    match b {
+        0 => OrderType::Limit,
+        1 => OrderType::Taker,
+        2 => OrderType::FlpVirtual,
+        3 => OrderType::Liquidation,
+        4 => OrderType::Adl,
+        _ => OrderType::Limit,
+    }
 }
 
 fn slot_to_order(slot: &OrderSlot) -> Result<Order> {
