@@ -187,31 +187,27 @@ async function main() {
   const balance = await conn.getBalance(authority.publicKey);
   console.log(`  Authority SOL:    ${balance / 1e9}`);
 
-  // ─── 1. Create quote_vault TokenAccount owned by InsuranceFund PDA
+  // ─── 1. Quote vault TokenAccount keypair
+  // Anchor's `initialize_insurance_fund` uses `init` (not init_if_needed
+  // or ATA) for the quote_vault, so we generate a fresh keypair and
+  // pass it as a signer alongside the authority. The init creates the
+  // TokenAccount with InsuranceFund PDA as token::authority.
   const fund = insuranceFundPda();
   console.log(`\n[1/5] InsuranceFund PDA: ${fund.address.toBase58()}`);
 
-  // ATA for the InsuranceFund PDA holding USDC.
-  const { getAssociatedTokenAddress } = await import('@solana/spl-token');
-  const quoteVault = await getAssociatedTokenAddress(
-    QUOTE_MINT,
-    fund.address,
-    true, // allowOwnerOffCurve — fund is a PDA
-  );
-  if (await exists(conn, quoteVault)) {
-    console.log(`  → quote_vault ATA already exists at ${quoteVault.toBase58()}`);
+  const QUOTE_VAULT_PATH = path.join(os.homedir(), '.flash', 'devnet-quote-vault.json');
+  let quoteVaultKp: Keypair;
+  if (fs.existsSync(QUOTE_VAULT_PATH)) {
+    quoteVaultKp = loadKeypair(QUOTE_VAULT_PATH);
+    console.log(`  → reusing existing quote_vault keypair: ${quoteVaultKp.publicKey.toBase58()}`);
   } else {
-    const createAtaIx = createAssociatedTokenAccountInstruction(
-      authority.publicKey,
-      quoteVault,
-      fund.address,
-      QUOTE_MINT,
-      TOKEN_PROGRAM_ID,
-      ASSOCIATED_TOKEN_PROGRAM_ID,
-    );
-    await send(conn, authority, [createAtaIx], [], 'create quote_vault ATA');
-    console.log(`  → quote_vault: ${quoteVault.toBase58()}`);
+    quoteVaultKp = Keypair.generate();
+    fs.mkdirSync(path.dirname(QUOTE_VAULT_PATH), { recursive: true });
+    fs.writeFileSync(QUOTE_VAULT_PATH, JSON.stringify(Array.from(quoteVaultKp.secretKey)));
+    console.log(`  → generated new quote_vault keypair: ${quoteVaultKp.publicKey.toBase58()}`);
+    console.log(`  → saved to ${QUOTE_VAULT_PATH}`);
   }
+  const quoteVault = quoteVaultKp.publicKey;
 
   // ─── 2. Initialize InsuranceFund
   console.log(`\n[2/5] Initialize InsuranceFund`);
@@ -224,7 +220,7 @@ async function main() {
       quoteVault,
       params: defaultInsuranceFundParams(),
     });
-    await send(conn, authority, [ix], [], 'init InsuranceFund');
+    await send(conn, authority, [ix], [quoteVaultKp], 'init InsuranceFund');
   }
 
   // ─── 3. Initialize FLP exposure singleton
@@ -285,7 +281,7 @@ async function main() {
         quoteVault,
         oracleAccount,
         params: defaultMajorMarketParams(),
-        initialOracleTicks: m.initialPriceTicks,
+        initialOracleTicks: new BN(m.initialPriceTicks.toString()) as unknown as bigint,
       });
       await send(conn, authority, [ix], [], 'initialize_market');
     }
