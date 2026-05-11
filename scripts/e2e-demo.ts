@@ -219,7 +219,7 @@ async function main() {
       authority: authority.publicKey,
       volumeWindowSlots: new BN(3_024_000),
       tiers: [
-        { minVolumeQuoteLots: new BN(0), makerRebateBps: -2, takerFeeBps: 5 },
+        { minVolumeQuoteLots: new BN(0), makerRebateBps: 0, takerFeeBps: 5 },
         { minVolumeQuoteLots: new BN('1000000000000'), makerRebateBps: 0, takerFeeBps: 4 },
         { minVolumeQuoteLots: new BN('5000000000000'), makerRebateBps: 1, takerFeeBps: 3 },
         { minVolumeQuoteLots: new BN('25000000000000'), makerRebateBps: 2, takerFeeBps: 2 },

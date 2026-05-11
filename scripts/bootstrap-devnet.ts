@@ -160,7 +160,7 @@ function hlStyleTiers(): {
   // tier 2:           $5M → maker  +1 (1bp reb), taker  3
   // tier 3:           $25M→ maker  +2 (2bp reb), taker  2
   return [
-    { minVolumeQuoteLots: new BN(0), makerRebateBps: -2, takerFeeBps: 5 },
+    { minVolumeQuoteLots: new BN(0), makerRebateBps: 0, takerFeeBps: 5 },
     { minVolumeQuoteLots: new BN('1000000000000'), makerRebateBps: 0, takerFeeBps: 4 },
     { minVolumeQuoteLots: new BN('5000000000000'), makerRebateBps: 1, takerFeeBps: 3 },
     { minVolumeQuoteLots: new BN('25000000000000'), makerRebateBps: 2, takerFeeBps: 2 },
