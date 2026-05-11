@@ -54,6 +54,11 @@ export {
 } from './client.ts';
 
 export {
+  FlashBookVaultsClient,
+  VAULTS_IDL,
+} from './vaults-client.ts';
+
+export {
   fetchMarket,
   fetchCommitBuffer,
   fetchInsuranceFund,

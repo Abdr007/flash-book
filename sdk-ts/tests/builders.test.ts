@@ -364,8 +364,9 @@ describe('Instruction builders', () => {
       priceTicks: new BN(99_950),
       takerSide: 'long',
     });
-    // sequencer, market, insurance_fund, taker_state, taker_pos, flp, sysprog
-    expect(ix.keys.length).toBe(7);
+    // sequencer, market, insurance_fund, taker_state, taker_pos, flp,
+    // fee_tiers (optional null placeholder), sysprog
+    expect(ix.keys.length).toBe(8);
   });
 
   // ─── Liquidation (2) ───────────────────────────────────────────────

@@ -1324,6 +1324,11 @@ export class FlashBookClient {
     sizeLots: bigint | number;
     priceTicks: bigint | number;
     takerSide: 'long' | 'short';
+    /// WAVE 22 phase 2 (FLP path): when true, the global FeeTiersAccount
+    /// is included so the TAKER's `taker_fee_bps` is resolved from
+    /// their rolling-window volume against the tier table. FLP-side
+    /// rebate stays flat (FLP is the protocol).
+    useFeeTiers?: boolean;
   }): Promise<TransactionInstruction> {
     const takerState = this.traderState(args.takerTrader);
     const takerPos = this.position(args.market, args.takerTrader);
@@ -1342,6 +1347,9 @@ export class FlashBookClient {
         takerTraderState: takerState.address,
         takerPosition: takerPos.address,
         flpExposure: flp.address,
+        feeTiers: (args.useFeeTiers
+          ? feeTiersPda(this.programId).address
+          : null) as unknown as PublicKey,
         systemProgram: SystemProgram.programId,
       })
       .instruction();

@@ -2253,6 +2253,9 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(flp_exposure, false),
+            // Wave 22 phase 2 — Optional<FeeTiersAccount>. Anchor's
+            // convention for "None" is the program ID itself.
+            AccountMeta::new_readonly(flash_book::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );

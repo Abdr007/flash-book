@@ -420,6 +420,18 @@
           }
         },
         {
+          "name": "fee_tiers",
+          "docs": [
+            "WAVE 22 phase 2 (FLP path): optional global fee-tier table.",
+            "When supplied, the TAKER's `taker_fee_bps` is resolved per",
+            "their rolling-window volume. FLP-side maker rebate stays flat",
+            "(FLP IS the protocol — tier-tier semantics don't apply on the",
+            "maker side here). When omitted, falls back to flat",
+            "`market.params.taker_fee_bps`."
+          ],
+          "optional": true
+        },
+        {
           "name": "system_program",
           "address": "11111111111111111111111111111111"
         }
@@ -8870,6 +8882,19 @@
       ]
     },
     {
+      "name": "BatchFillIntentEvent",
+      "discriminator": [
+        242,
+        216,
+        203,
+        153,
+        14,
+        216,
+        130,
+        27
+      ]
+    },
+    {
       "name": "BookDepthV2Event",
       "discriminator": [
         223,
@@ -10221,6 +10246,57 @@
           },
           {
             "name": "seized_bonds",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BatchFillIntentEvent",
+      "docs": [
+        "Sequencer feed — emitted by `run_batch_v2` for every cleared fill.",
+        "The off-chain sequencer subscribes to these and dispatches the",
+        "matching `apply_fill` / `apply_flp_fill` ix on mainnet. Carries",
+        "the full per-fill payload + the order IDs (so the sequencer can",
+        "dedup against its own outbox).",
+        "",
+        "FLP detection: when `maker == FLP_VIRTUAL_TRADER` (= Pubkey::default",
+        "— FLP makers don't carry a real trader pubkey), the sequencer",
+        "dispatches `apply_flp_fill` instead of `apply_fill`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "maker",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker_side",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "taker_id",
+            "type": "u64"
+          },
+          {
+            "name": "maker_id",
             "type": "u64"
           }
         ]

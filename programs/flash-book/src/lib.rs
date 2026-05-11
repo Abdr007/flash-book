@@ -1195,6 +1195,29 @@ pub mod flash_book {
         let prior_mark = matcher::lot::Ticks(market.mark_price_ticks);
         let result = matcher::fba::clear_batch(&orders, prior_mark)?;
 
+        // ─── Sequencer feed — emit one event per fill so the off-chain
+        //    sequencer can dispatch the matching `apply_fill` /
+        //    `apply_flp_fill` ix on mainnet. The matcher itself only
+        //    mutates orderbook state; trader/position state lives in
+        //    core PDAs that the sequencer settles. Events are how we
+        //    bridge the matcher tick (potentially on the ER) to the
+        //    settlement ix (always on mainnet).
+        for fill in &result.fills {
+            emit!(BatchFillIntentEvent {
+                market: market_key,
+                taker: fill.taker_trader,
+                maker: fill.maker_trader,
+                taker_side: match fill.taker_side {
+                    matcher::order::Side::Long => 0,
+                    matcher::order::Side::Short => 1,
+                },
+                size_lots: fill.size.0,
+                price_ticks: fill.price.0,
+                taker_id: fill.taker_id,
+                maker_id: fill.maker_id,
+            });
+        }
+
         // ─── Phase 4: apply fills back to the hypertree ──────────────────
         let mut consumed: Vec<(u64, hypertree::DataIndex, bool, u64)> =
             Vec::with_capacity(sources.len());
@@ -4697,8 +4720,35 @@ pub mod flash_book {
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
             .checked_mul(market.params.tick_size as u128)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // ── Wave 22 phase 2 (FLP path) — tier-resolved taker fee ─────
+        // When the FeeTiersAccount is supplied, use the taker's
+        // tier-resolved taker_fee_bps. Pre-fill volume is used so the
+        // current trade doesn't promote itself.
+        let (taker_taker_fee_bps, fee_tier_pairs): (u32, Vec<(u64, i32, u32)>) =
+            if let Some(ft) = &ctx.accounts.fee_tiers {
+                let pairs: Vec<(u64, i32, u32)> = ft.tiers[..ft.tier_count as usize]
+                    .iter()
+                    .map(|t| (t.min_volume_quote_lots, t.maker_rebate_bps, t.taker_fee_bps))
+                    .collect();
+                let taker_volume = ctx.accounts.taker_trader_state.volume_30d_quote_lots;
+                let (_unused_maker, tt) = matcher::risk::resolve_fee_tier(
+                    market.params.maker_rebate_bps,
+                    market.params.taker_fee_bps,
+                    &pairs,
+                    taker_volume,
+                );
+                (tt, pairs)
+            } else {
+                (market.params.taker_fee_bps, Vec::new())
+            };
+        let pre_taker_tier_index = tier_index_for_volume(
+            &fee_tier_pairs,
+            ctx.accounts.taker_trader_state.volume_30d_quote_lots,
+        );
+
         let taker_fee_u128 =
-            notional_u128.saturating_mul(market.params.taker_fee_bps as u128) / constants::BPS_DENOM as u128;
+            notional_u128.saturating_mul(taker_taker_fee_bps as u128) / constants::BPS_DENOM as u128;
         // FLP-as-maker case: ignore negative maker_rebate_bps (the
         // protocol cannot charge itself a fee). Tier-tier semantics
         // for retail makers don't apply when the maker IS the protocol.
@@ -4862,6 +4912,40 @@ pub mod flash_book {
             flp_size_after: flp_post.1,
             flp_side_after: flp_post.0,
         });
+
+        // ── Wave 22 phase 2 (FLP path) — credit taker's rolling volume
+        //    + emit tier-upgrade event on boundary crossings.
+        // FLP fills only credit the TAKER (no human maker).
+        if market.params.taker_fee_bps > 0 {
+            let notional_quote_lots = if notional_u128 > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                notional_u128 as u64
+            };
+            let now_slot = Clock::get()?.slot;
+            credit_volume_for_tier(
+                &mut ctx.accounts.taker_trader_state,
+                notional_quote_lots,
+                now_slot,
+            );
+            if !fee_tier_pairs.is_empty() {
+                let post_taker_tier_index = tier_index_for_volume(
+                    &fee_tier_pairs,
+                    ctx.accounts.taker_trader_state.volume_30d_quote_lots,
+                );
+                if post_taker_tier_index != pre_taker_tier_index {
+                    emit!(TraderTierUpgradedEvent {
+                        trader: taker_trader_pk,
+                        previous_tier_index: pre_taker_tier_index,
+                        new_tier_index: post_taker_tier_index,
+                        volume_quote_lots: ctx
+                            .accounts
+                            .taker_trader_state
+                            .volume_30d_quote_lots,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -7607,6 +7691,14 @@ pub struct ApplyFlpFill<'info> {
     )]
     pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
 
+    /// WAVE 22 phase 2 (FLP path): optional global fee-tier table.
+    /// When supplied, the TAKER's `taker_fee_bps` is resolved per
+    /// their rolling-window volume. FLP-side maker rebate stays flat
+    /// (FLP IS the protocol — tier-tier semantics don't apply on the
+    /// maker side here). When omitted, falls back to flat
+    /// `market.params.taker_fee_bps`.
+    pub fee_tiers: Option<Box<Account<'info, state::FeeTiersAccount>>>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -8014,6 +8106,27 @@ pub struct OrderPlacedV2Event {
     pub size_lots: u64,
     pub node_index: u32,
     pub total_orders_after: u32,
+}
+
+/// Sequencer feed — emitted by `run_batch_v2` for every cleared fill.
+/// The off-chain sequencer subscribes to these and dispatches the
+/// matching `apply_fill` / `apply_flp_fill` ix on mainnet. Carries
+/// the full per-fill payload + the order IDs (so the sequencer can
+/// dedup against its own outbox).
+///
+/// FLP detection: when `maker == FLP_VIRTUAL_TRADER` (= Pubkey::default
+/// — FLP makers don't carry a real trader pubkey), the sequencer
+/// dispatches `apply_flp_fill` instead of `apply_fill`.
+#[event]
+pub struct BatchFillIntentEvent {
+    pub market: Pubkey,
+    pub taker: Pubkey,
+    pub maker: Pubkey,
+    pub taker_side: u8,
+    pub size_lots: u64,
+    pub price_ticks: u64,
+    pub taker_id: u64,
+    pub maker_id: u64,
 }
 
 /// Wave 21 phase 8b/9b: emitted when a wrapper program's CPI releases

@@ -1,0 +1,1839 @@
+{
+  "address": "GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt",
+  "metadata": {
+    "name": "flash_book_vaults",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Flash Book Vaults — strategist vaults, depositor shares, withdraw queueing. CPIs into flash-book-core."
+  },
+  "instructions": [
+    {
+      "name": "create_vault_v3",
+      "docs": [
+        "Strategist creates a new vault. Vault id is per-strategist",
+        "(0..255), so each strategist can run up to 256 vaults."
+      ],
+      "discriminator": [
+        250,
+        73,
+        117,
+        80,
+        90,
+        245,
+        91,
+        159
+      ],
+      "accounts": [
+        {
+          "name": "strategist",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "vault_id",
+          "type": "u8"
+        },
+        {
+          "name": "name",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "perf_fee_bps",
+          "type": "u32"
+        }
+      ]
+    },
+    {
+      "name": "migrate_vault_position_to_v3",
+      "docs": [
+        "Wave 21 phase 10 — migrate a depositor's legacy VaultPositionAccount",
+        "to VaultPositionAccountV3. Depositor signs."
+      ],
+      "discriminator": [
+        228,
+        34,
+        15,
+        155,
+        237,
+        157,
+        75,
+        179
+      ],
+      "accounts": [
+        {
+          "name": "depositor",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "legacy",
+          "docs": [
+            "Legacy core position — read-only."
+          ]
+        },
+        {
+          "name": "v3_vault",
+          "docs": [
+            "V3 vault that this position belongs to. Must already have been",
+            "migrated via `migrate_vault_to_v3`."
+          ]
+        },
+        {
+          "name": "v3",
+          "docs": [
+            "Destination v3 position."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110,
+                  95,
+                  118,
+                  51
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "v3_vault"
+              },
+              {
+                "kind": "account",
+                "path": "depositor"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "migrate_vault_to_v3",
+      "docs": [
+        "Wave 21 phase 10 — migrate a legacy core vault to VaultAccountV3.",
+        "Strategist signs (only the vault owner can migrate). Drops",
+        "`trader_state` (the v3 NAV bookkeeping is local; trading via",
+        "`place_limit_order_v2_cpi` follows in a later wave)."
+      ],
+      "discriminator": [
+        142,
+        237,
+        210,
+        157,
+        146,
+        138,
+        119,
+        172
+      ],
+      "accounts": [
+        {
+          "name": "strategist",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "legacy",
+          "docs": [
+            "Legacy core vault — read-only."
+          ]
+        },
+        {
+          "name": "v3",
+          "docs": [
+            "Destination v3 vault."
+          ],
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "ping",
+      "docs": [
+        "Liveness check."
+      ],
+      "discriminator": [
+        173,
+        0,
+        94,
+        236,
+        73,
+        133,
+        225,
+        153
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "settle_vault_perf_fee_v3",
+      "docs": [
+        "WAVE 22 / Phase 4 — crystallize the vault's performance fee.",
+        "Strategist signs. If current NAV/share exceeds the high-water",
+        "mark, mints new shares to the strategist's vault_position equal",
+        "to the perf-fee share equivalent. Bumps HWM to post-mint",
+        "NAV/share.",
+        "",
+        "Math (mirrors core's legacy `settle_vault_perf_fee`):",
+        "nav_per_share_x6 = total_capital × USD_UNIT / shares_outstanding",
+        "gain_per_share_x6 = nav_per_share - hwm",
+        "total_gain = gain_per_share_x6 × shares_outstanding / USD_UNIT",
+        "fee_qlots = total_gain × perf_fee_bps / BPS_DENOM",
+        "shares_to_mint = fee_qlots × shares_outstanding / total_capital",
+        "new_hwm = total_capital × USD_UNIT / (shares_outstanding + minted)",
+        "",
+        "Bootstrap: first call when HWM == 0 just anchors the HWM at",
+        "then-current NAV/share without minting (no historical",
+        "performance to crystallize).",
+        "",
+        "NAV source: core's TraderState.collateral_quote_lots (live,",
+        "authoritative). Vault should be FLAT (no open positions) so",
+        "the collateral represents the full vault value; with open",
+        "positions, the mark-to-market component is ignored and only",
+        "the cash collateral counts toward the HWM. Strategists should",
+        "close out before settling for accurate crystallization."
+      ],
+      "discriminator": [
+        122,
+        232,
+        134,
+        209,
+        254,
+        184,
+        146,
+        185
+      ],
+      "accounts": [
+        {
+          "name": "strategist",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "strategist_position",
+          "docs": [
+            "Strategist's own position — created lazily on first perf-fee",
+            "crystallization so the minted shares have somewhere to land."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110,
+                  95,
+                  118,
+                  51
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "strategist"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_trader_state",
+          "docs": [
+            "Vault's TraderState in core — read-only; provides authoritative",
+            "`collateral_quote_lots` for live NAV."
+          ]
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "vault_cancel_order_v3",
+      "docs": [
+        "Strategist cancels a vault-PDA order via core's",
+        "`cancel_order_v2_cpi`. Order ownership (trader == vault PDA)",
+        "is validated inside core."
+      ],
+      "discriminator": [
+        47,
+        2,
+        158,
+        0,
+        140,
+        190,
+        15,
+        135
+      ],
+      "accounts": [
+        {
+          "name": "strategist",
+          "signer": true
+        },
+        {
+          "name": "vault"
+        },
+        {
+          "name": "cpi_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  112,
+                  105,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "market_book",
+          "writable": true
+        },
+        {
+          "name": "flash_book_program",
+          "address": "FBookV1111111111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "order_id",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "vault_deposit_v3",
+      "docs": [
+        "Depositor adds capital, mints shares pro-rata to current NAV.",
+        "Bootstrap (no shares yet) mints 1:1.",
+        "",
+        "Phase 9b: depositor signs an SPL transfer from their ATA → core's",
+        "`quote_vault` (depositor owns their ATA — no PDA signing for the",
+        "IN direction). Wrapper records the deposit + mints shares.",
+        "",
+        "Wave 22 phase 5: ALSO credits the vault PDA's core TraderState",
+        "collateral via inverse CPI so the matcher recognizes the",
+        "capital when the strategist places orders. The strategist must",
+        "have called `vault_open_trader_state_v3` once before the first",
+        "deposit (bootstraps the vault's TraderState)."
+      ],
+      "discriminator": [
+        24,
+        234,
+        203,
+        153,
+        121,
+        239,
+        208,
+        99
+      ],
+      "accounts": [
+        {
+          "name": "depositor",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110,
+                  95,
+                  118,
+                  51
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "depositor"
+              }
+            ]
+          }
+        },
+        {
+          "name": "depositor_quote_ata",
+          "docs": [
+            "Depositor's USDC ATA — debited."
+          ],
+          "writable": true
+        },
+        {
+          "name": "quote_vault",
+          "docs": [
+            "Core's protocol vault — credited."
+          ],
+          "writable": true
+        },
+        {
+          "name": "cpi_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  112,
+                  105,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_trader_state",
+          "docs": [
+            "Vault's TraderState in core. Boxed cross-program account read so",
+            "the wrapper can use core's authoritative `collateral_quote_lots`",
+            "as the NAV source for share-mint math (handles trading PnL drift",
+            "from wrapper-side `total_capital_quote_lots`)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "flash_book_program",
+          "address": "FBookV1111111111111111111111111111111111111"
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "vault_open_trader_state_v3",
+      "docs": [
+        "Bootstrap a core `TraderStateAccount` for this vault (PDA-trader",
+        "pattern). One-time setup before the vault can place orders. The",
+        "vault PDA can't sign for itself (it's a PDA, not a keypair), so",
+        "the wrapper signs as its CPI authority and CPIs into core's",
+        "`cpi_open_trader_state_for_trader` which inits the TraderState",
+        "seeded by the vault PDA. Strategist signs (and pays rent)."
+      ],
+      "discriminator": [
+        60,
+        24,
+        100,
+        190,
+        19,
+        194,
+        19,
+        178
+      ],
+      "accounts": [
+        {
+          "name": "strategist",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault"
+        },
+        {
+          "name": "cpi_authority",
+          "docs": [
+            "`[CPI_AUTHORITY_SEED]` under this program ID."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  112,
+                  105,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_trader_state",
+          "docs": [
+            "the inner CPI, validated against vault PDA via core's",
+            "`cpi_open_trader_state_for_trader` seed constraint."
+          ],
+          "writable": true
+        },
+        {
+          "name": "flash_book_program",
+          "address": "FBookV1111111111111111111111111111111111111"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "vault_place_order_v3",
+      "docs": [
+        "Strategist places a limit order on behalf of vault depositors.",
+        "The vault PDA is the trader; wrapper signs the CPI to core's",
+        "`place_limit_order_v2_cpi`. Core validates the wrapper authority",
+        "+ injects the order into the hypertree with the vault PDA",
+        "stamped as `RestingOrderV2.trader`. When that order fills,",
+        "`apply_fill` settles into the vault's TraderState (already",
+        "bootstrapped by `vault_open_trader_state_v3`) and the vault's",
+        "PositionAccount (init_if_needed in apply_fill)."
+      ],
+      "discriminator": [
+        191,
+        248,
+        123,
+        12,
+        154,
+        172,
+        177,
+        82
+      ],
+      "accounts": [
+        {
+          "name": "strategist",
+          "signer": true
+        },
+        {
+          "name": "vault"
+        },
+        {
+          "name": "cpi_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  112,
+                  105,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "docs": [
+            "which re-validates the PDA derivation against the",
+            "`flash_book_program` ID. We don't deserialize it here (cross-",
+            "program Account<T> can't synthesize Bumps)."
+          ]
+        },
+        {
+          "name": "market_book",
+          "writable": true
+        },
+        {
+          "name": "flash_book_program",
+          "address": "FBookV1111111111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "flags",
+          "type": "u8"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "vault_withdraw_v3",
+      "docs": [
+        "Depositor burns shares to withdraw their pro-rata claim.",
+        "Phase 9b: wrapper computes the payout, burns the shares, then",
+        "CPIs into core's `cpi_release_collateral_to_user` which signs",
+        "the SPL transfer from `quote_vault` → depositor's ATA as the",
+        "InsuranceFund PDA."
+      ],
+      "discriminator": [
+        223,
+        62,
+        4,
+        236,
+        108,
+        44,
+        141,
+        234
+      ],
+      "accounts": [
+        {
+          "name": "depositor",
+          "signer": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110,
+                  95,
+                  118,
+                  51
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "depositor"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cpi_authority",
+          "docs": [
+            "`[CPI_AUTHORITY_SEED]` under this program ID."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  112,
+                  105,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "docs": [
+            "Core's InsuranceFund PDA — signs the SPL transfer out."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ],
+            "program": {
+              "kind": "account",
+              "path": "flash_book_program"
+            }
+          }
+        },
+        {
+          "name": "quote_vault",
+          "docs": [
+            "Core's protocol vault — debited via core CPI."
+          ],
+          "writable": true
+        },
+        {
+          "name": "depositor_quote_ata",
+          "docs": [
+            "Depositor's USDC ATA — credited via core CPI."
+          ],
+          "writable": true
+        },
+        {
+          "name": "vault_trader_state",
+          "docs": [
+            "Vault's TraderState in core — read for authoritative NAV +",
+            "debited by inner CPI before SPL release."
+          ],
+          "writable": true
+        },
+        {
+          "name": "flash_book_program",
+          "address": "FBookV1111111111111111111111111111111111111"
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "shares_to_burn",
+          "type": "u64"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "InsuranceFundAccount",
+      "discriminator": [
+        207,
+        17,
+        68,
+        223,
+        65,
+        72,
+        98,
+        52
+      ]
+    },
+    {
+      "name": "TraderStateAccount",
+      "discriminator": [
+        80,
+        247,
+        115,
+        47,
+        164,
+        154,
+        243,
+        127
+      ]
+    },
+    {
+      "name": "VaultAccount",
+      "discriminator": [
+        230,
+        251,
+        241,
+        83,
+        139,
+        202,
+        93,
+        28
+      ]
+    },
+    {
+      "name": "VaultAccountV3",
+      "discriminator": [
+        235,
+        156,
+        109,
+        254,
+        179,
+        213,
+        23,
+        72
+      ]
+    },
+    {
+      "name": "VaultPositionAccount",
+      "discriminator": [
+        108,
+        192,
+        130,
+        141,
+        127,
+        95,
+        58,
+        211
+      ]
+    },
+    {
+      "name": "VaultPositionAccountV3",
+      "discriminator": [
+        208,
+        237,
+        174,
+        14,
+        69,
+        203,
+        247,
+        22
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "LegacyVaultMigratedV3Event",
+      "discriminator": [
+        63,
+        165,
+        114,
+        78,
+        160,
+        5,
+        153,
+        127
+      ]
+    },
+    {
+      "name": "LegacyVaultPositionMigratedV3Event",
+      "discriminator": [
+        102,
+        235,
+        113,
+        237,
+        244,
+        109,
+        8,
+        105
+      ]
+    },
+    {
+      "name": "Pong",
+      "discriminator": [
+        107,
+        153,
+        141,
+        173,
+        103,
+        56,
+        68,
+        117
+      ]
+    },
+    {
+      "name": "VaultDepositV3Event",
+      "discriminator": [
+        57,
+        56,
+        151,
+        161,
+        197,
+        35,
+        43,
+        173
+      ]
+    },
+    {
+      "name": "VaultOrderCancelledV3Event",
+      "discriminator": [
+        2,
+        1,
+        176,
+        226,
+        157,
+        17,
+        210,
+        141
+      ]
+    },
+    {
+      "name": "VaultOrderPlacedV3Event",
+      "discriminator": [
+        236,
+        74,
+        181,
+        160,
+        227,
+        123,
+        231,
+        25
+      ]
+    },
+    {
+      "name": "VaultPerfFeeSettledV3Event",
+      "discriminator": [
+        20,
+        232,
+        179,
+        37,
+        124,
+        248,
+        108,
+        108
+      ]
+    },
+    {
+      "name": "VaultTraderStateOpenedV3Event",
+      "discriminator": [
+        112,
+        184,
+        118,
+        170,
+        218,
+        69,
+        206,
+        196
+      ]
+    },
+    {
+      "name": "VaultV3CreatedEvent",
+      "discriminator": [
+        41,
+        206,
+        239,
+        88,
+        107,
+        247,
+        27,
+        78
+      ]
+    },
+    {
+      "name": "VaultWithdrawV3Event",
+      "discriminator": [
+        117,
+        176,
+        132,
+        112,
+        181,
+        53,
+        44,
+        79
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "OutOfRange",
+      "msg": "argument out of allowed range"
+    },
+    {
+      "code": 6001,
+      "name": "ZeroSize",
+      "msg": "size cannot be zero"
+    },
+    {
+      "code": 6002,
+      "name": "DepositsClosed",
+      "msg": "vault is closed for deposits"
+    },
+    {
+      "code": 6003,
+      "name": "Unauthorized",
+      "msg": "unauthorized caller"
+    },
+    {
+      "code": 6004,
+      "name": "VaultNavNonPositive",
+      "msg": "vault NAV is non-positive (cannot mint shares)"
+    },
+    {
+      "code": 6005,
+      "name": "VaultBelowHighWaterMark",
+      "msg": "vault NAV/share is below the high-water mark — no perf fee owed"
+    }
+  ],
+  "types": [
+    {
+      "name": "InsuranceFundAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "balance_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "fee_contribution_bps",
+            "type": "u32"
+          },
+          {
+            "name": "toxicity_tax_contribution_bps",
+            "type": "u32"
+          },
+          {
+            "name": "liq_penalty_contribution_bps",
+            "type": "u32"
+          },
+          {
+            "name": "pause_threshold_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "total_contributions",
+            "type": "u64"
+          },
+          {
+            "name": "total_payouts",
+            "type": "u64"
+          },
+          {
+            "name": "quote_mint",
+            "docs": [
+              "SPL mint for the protocol's quote currency (typically USDC). All",
+              "collateral and FLP capital moves through this mint."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "quote_vault",
+            "docs": [
+              "Global protocol vault TokenAccount. Owned by the InsuranceFundAccount",
+              "PDA (which signs transfers out via known seeds). Holds all trader",
+              "collateral + FLP capital."
+            ],
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LegacyVaultMigratedV3Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "strategist",
+            "type": "pubkey"
+          },
+          {
+            "name": "vault_id",
+            "type": "u8"
+          },
+          {
+            "name": "legacy",
+            "type": "pubkey"
+          },
+          {
+            "name": "v3",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares_outstanding",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LegacyVaultPositionMigratedV3Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "legacy",
+            "type": "pubkey"
+          },
+          {
+            "name": "v3",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Pong",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "program",
+            "type": "pubkey"
+          },
+          {
+            "name": "caller",
+            "type": "pubkey"
+          },
+          {
+            "name": "slot",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TraderStateAccount",
+      "docs": [
+        "Per-trader state. Holds collateral, last-settled funding marker, and",
+        "position-list pointers (Position PDAs are separate accounts; this is",
+        "a lightweight index)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "collateral_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "realized_pnl_quote_lots",
+            "type": "i64"
+          },
+          {
+            "name": "open_positions",
+            "docs": [
+              "Number of open positions (each in its own Position PDA)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "toxicity_score_bps",
+            "docs": [
+              "Toxicity score in bps; updated post-fill. Used for taker-fee tier."
+            ],
+            "type": "i32"
+          },
+          {
+            "name": "orders_this_batch",
+            "docs": [
+              "Per-batch order count (rate limit)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "last_batch_seen",
+            "type": "u64"
+          },
+          {
+            "name": "fee_discount_bps",
+            "docs": [
+              "Fee tier discount in bps off the base taker fee. 0 = standard",
+              "fees; e.g. 1000 = 10% discount. Set by `set_trader_fee_tier`",
+              "(authority-only) based on off-chain 30-day rolling volume —",
+              "universal pattern at every CEX (Binance, OKX, Bybit, Hyperliquid)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "delegate",
+            "docs": [
+              "Delegate authority. When non-default, the delegate may sign",
+              "trader-bound instructions (place_limit_order, cancel_order,",
+              "settle_funding, etc.) on the trader's behalf. Foundation for",
+              "subaccount / portfolio-margin patterns:",
+              "• Master keypair holds funds, delegates trading authority to a",
+              "hot key (Hyperliquid / dYdX standard).",
+              "• Multi-sig \"subaccount manager\" can act on behalf of the",
+              "trader without holding their funds.",
+              "Cleared by setting back to Pubkey::default(). The trader pubkey",
+              "itself ALWAYS retains authority — delegate is additive, not",
+              "exclusive (the trader can revoke at any time)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "referrer",
+            "docs": [
+              "Referrer pubkey. When non-default, on every fill where this trader",
+              "is the taker, `market.params.referrer_share_bps` of the protocol's",
+              "net fee revenue is credited to the referrer's TraderState",
+              "collateral. Hyperliquid affiliate model. Pubkey::default() = no",
+              "referrer (default for all new trader_state). Set once via",
+              "`set_trader_referrer` — immutable after first set (anti-rotation",
+              "griefing)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "builder",
+            "docs": [
+              "Approved builder pubkey. When non-default, on every fill where this",
+              "trader is the taker, `min(market.params.builder_share_bps,",
+              "builder_max_fee_share_bps)` of the protocol's net fee revenue is",
+              "credited to the builder via `BuilderFeeOwedEvent` (off-chain",
+              "pull-based). Hyperliquid builder-codes model: a third-party UI/",
+              "wallet/aggregator that routes flow earns a share of the fee from",
+              "the user's trades. Set/rotated/revoked freely via",
+              "`set_trader_builder`; the trader's CAP on the share keeps builders",
+              "from extracting more than the user agreed to."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "builder_max_fee_share_bps",
+            "docs": [
+              "Maximum fee share (in bps of net fee) the trader has authorized",
+              "the builder to take. The on-chain emit clamps the protocol-side",
+              "builder_share_bps by this. 0 = builder set but no share approved",
+              "(functionally the same as no builder). Allows the trader to set a",
+              "conservative cap below whatever the protocol rate is."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "volume_30d_quote_lots",
+            "docs": [
+              "Wave 22: rolling notional traded in the current volume window",
+              "(quote lots, summed across maker + taker fills). Reset when the",
+              "window expires. Used by `resolve_fee_tier` to pick the trader's",
+              "effective maker / taker bps from `FeeTiersAccount`."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "volume_window_start_slot",
+            "docs": [
+              "Wave 22: slot at which the current volume window opened. When",
+              "`Clock::slot - this > FeeTiersAccount.volume_window_slots`, the",
+              "next apply_fill resets `volume_30d_quote_lots` and re-anchors",
+              "this. HL pattern (14-day rolling tier window)."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultAccount",
+      "docs": [
+        "User-managed trading vault. A strategist deploys a vault and gets",
+        "trading authority over its collateral pool via the standard",
+        "TraderStateAccount.delegate mechanism. Depositors mint shares at the",
+        "current NAV; withdrawals burn shares for proportional NAV. The",
+        "strategist earns a high-water-mark performance fee, paid in newly",
+        "minted shares.",
+        "",
+        "PDA seeds: [b\"vault\", strategist, vault_id]. vault_id is u8 → up to",
+        "256 vaults per strategist. The vault's TraderStateAccount lives at",
+        "[b\"trader_state\", vault_pda] (i.e. the vault PDA is the \"trader\").",
+        "The strategist is set as `delegate` on that TraderState so they can",
+        "trade with their own keypair."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "strategist",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "vault_id",
+            "type": "u8"
+          },
+          {
+            "name": "accept_deposits",
+            "docs": [
+              "1 if accepting deposits, 0 if closed (withdrawals always allowed)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "_pad0",
+            "docs": [
+              "Reserved padding for alignment."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "trader_state",
+            "docs": [
+              "The vault PDA's TraderStateAccount (where collateral lives)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "name",
+            "docs": [
+              "Display name (UTF-8, null-padded)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "perf_fee_bps",
+            "docs": [
+              "Performance fee in bps of NAV growth above the high-water mark.",
+              "Charged on `settle_vault_perf_fee` by minting shares to the",
+              "strategist. Typical: 1000–2000 (10–20%). Capped at BPS_DENOM/2."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "shares_outstanding",
+            "docs": [
+              "Total shares outstanding (sum of all VaultPositionAccount.shares)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "hwm_nav_per_share_u64x6",
+            "docs": [
+              "Q64.0 NAV-per-share at the last performance crystallization.",
+              "Stored × USD_UNIT for precision; 0 = bootstrap (perf fee not yet",
+              "settled — first settle anchors the HWM at then-current NAV/share)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_perf_settlement_unix",
+            "docs": [
+              "Unix timestamp of the last performance settlement."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "min_deposit_quote_lots",
+            "docs": [
+              "Minimum deposit in quote-lots to prevent dust attacks. 0 = none."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_deposited_quote_lots",
+            "docs": [
+              "Cumulative quote-lots deposited across the vault's lifetime",
+              "(informational, used for ROI display)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_withdrawn_quote_lots",
+            "docs": [
+              "Cumulative quote-lots withdrawn (gross, before perf fee)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_perf_shares_minted",
+            "docs": [
+              "Cumulative shares minted to the strategist as perf fee."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultAccountV3",
+      "docs": [
+        "V3 vault account. Seeds: `[b\"vault_v3\", strategist, vault_id]`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "strategist",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "vault_id",
+            "type": "u8"
+          },
+          {
+            "name": "accept_deposits",
+            "type": "u8"
+          },
+          {
+            "name": "_pad0",
+            "type": "u8"
+          },
+          {
+            "name": "name",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "perf_fee_bps",
+            "type": "u32"
+          },
+          {
+            "name": "shares_outstanding",
+            "type": "u64"
+          },
+          {
+            "name": "total_capital_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "hwm_nav_per_share_u64x6",
+            "docs": [
+              "HWM of NAV-per-share, scaled by USD_UNIT (1_000_000) for",
+              "fixed-point precision. 0 = bootstrap (first settle anchors at",
+              "then-current NAV/share with no fee charged)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_perf_settlement_unix",
+            "docs": [
+              "Unix timestamp of last `settle_vault_perf_fee_v3` call."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_perf_shares_minted",
+            "docs": [
+              "Cumulative perf-fee shares minted to strategist (informational)."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultDepositV3Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "shares_minted",
+            "type": "u64"
+          },
+          {
+            "name": "shares_outstanding_after",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultOrderCancelledV3Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "order_id",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultOrderPlacedV3Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "limit_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultPerfFeeSettledV3Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "strategist",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares_minted",
+            "type": "u64"
+          },
+          {
+            "name": "new_hwm_per_share_u64x6",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultPositionAccount",
+      "docs": [
+        "Per-depositor share holding in a vault. Created lazily on first",
+        "deposit via init_if_needed.",
+        "",
+        "PDA seeds: [b\"vault_position\", vault, depositor]."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "shares",
+            "type": "u64"
+          },
+          {
+            "name": "total_deposited_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "total_withdrawn_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultPositionAccountV3",
+      "docs": [
+        "V3 vault depositor position. Seeds: `[b\"vault_position_v3\", vault, depositor]`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "shares",
+            "type": "u64"
+          },
+          {
+            "name": "total_deposited_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "total_withdrawn_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultTraderStateOpenedV3Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "vault_trader_state",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultV3CreatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "strategist",
+            "type": "pubkey"
+          },
+          {
+            "name": "vault_id",
+            "type": "u8"
+          },
+          {
+            "name": "perf_fee_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultWithdrawV3Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares_burned",
+            "type": "u64"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "shares_outstanding_after",
+            "type": "u64"
+          }
+        ]
+      }
+    }
+  ]
+}

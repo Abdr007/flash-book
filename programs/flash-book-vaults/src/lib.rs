@@ -34,8 +34,8 @@ use flash_book::cpi::accounts::{
 };
 use flash_book::program::FlashBook;
 use flash_book::state::{
-    InsuranceFundAccount, VaultAccount as CoreVaultAccount,
-    VaultPositionAccount as CoreVaultPositionAccount,
+    InsuranceFundAccount, TraderStateAccount as CoreTraderStateAccount,
+    VaultAccount as CoreVaultAccount, VaultPositionAccount as CoreVaultPositionAccount,
 };
 
 declare_id!("GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt");
@@ -150,23 +150,32 @@ pub mod flash_book_vaults {
         let vault = &mut ctx.accounts.vault;
         require!(vault.accept_deposits == 1, VaultsError::DepositsClosed);
 
-        // Compute shares to mint:
-        //   bootstrap (no shares yet) → 1:1
-        //   else → amount × shares_outstanding / total_capital
-        let shares_to_mint: u64 = if vault.shares_outstanding == 0
-            || vault.total_capital_quote_lots == 0
-        {
+        // ── Wave 22 NAV-source upgrade ───────────────────────────────
+        // Use core's TraderState.collateral_quote_lots as the
+        // AUTHORITATIVE NAV source (subtract the just-credited deposit
+        // to recover pre-deposit NAV). This handles the case where
+        // trading PnL has drifted the wrapper's `total_capital_quote_lots`
+        // away from actual capital.
+        //
+        // Bootstrap: shares_outstanding == 0 → 1:1 mint regardless of
+        // NAV (matches industry convention for the first depositor).
+        let post_deposit_collateral =
+            ctx.accounts.vault_trader_state.collateral_quote_lots;
+        let pre_deposit_nav = post_deposit_collateral.saturating_sub(amount_quote_lots);
+        let shares_to_mint: u64 = if vault.shares_outstanding == 0 || pre_deposit_nav == 0 {
             amount_quote_lots
         } else {
             let prod = (amount_quote_lots as u128)
                 .checked_mul(vault.shares_outstanding as u128)
                 .ok_or_else(|| error!(VaultsError::OutOfRange))?;
-            let s = prod / (vault.total_capital_quote_lots as u128);
+            let s = prod / (pre_deposit_nav as u128);
             require!(s <= u64::MAX as u128, VaultsError::OutOfRange);
             s as u64
         };
         require!(shares_to_mint > 0, VaultsError::ZeroSize);
 
+        // total_capital_quote_lots is now an INFORMATIONAL cumulative
+        // counter (lifetime gross deposits — NOT the live NAV).
         vault.total_capital_quote_lots = vault
             .total_capital_quote_lots
             .checked_add(amount_quote_lots)
@@ -214,16 +223,24 @@ pub mod flash_book_vaults {
 
         let vault_key = ctx.accounts.vault.key();
         let depositor_key = ctx.accounts.depositor.key();
-        let total_capital = ctx.accounts.vault.total_capital_quote_lots;
         let total_shares = ctx.accounts.vault.shares_outstanding;
 
         require!(ctx.accounts.position.shares >= shares_to_burn, VaultsError::OutOfRange);
         require!(total_shares >= shares_to_burn, VaultsError::OutOfRange);
         require!(total_shares > 0, VaultsError::OutOfRange);
 
-        // Pro-rata withdrawal: amount = shares × total_capital / shares_outstanding.
+        // ── Wave 22 NAV-source upgrade ───────────────────────────────
+        // Use core's TraderState.collateral_quote_lots as authoritative
+        // NAV. Withdraw can only release CASH collateral — open trading
+        // positions stay open. If collateral can't cover the pro-rata
+        // payout, withdraw rejects (strategist must close positions
+        // first to free collateral; matches HL pattern).
+        let live_nav = ctx.accounts.vault_trader_state.collateral_quote_lots as u128;
+        require!(live_nav > 0, VaultsError::VaultNavNonPositive);
+
+        // Pro-rata withdrawal: amount = shares × NAV / shares_outstanding.
         let amount_u128 = (shares_to_burn as u128)
-            .checked_mul(total_capital as u128)
+            .checked_mul(live_nav)
             .ok_or_else(|| error!(VaultsError::OutOfRange))?
             / (total_shares as u128);
         let amount: u64 = if amount_u128 > u64::MAX as u128 {
@@ -233,14 +250,14 @@ pub mod flash_book_vaults {
         };
         require!(amount > 0, VaultsError::ZeroSize);
 
-        // Burn shares + decrement capital BEFORE the CPI (defensive — if
-        // the SPL transfer fails the whole tx aborts and state rolls back).
+        // Burn shares BEFORE the CPI (defensive — if the SPL transfer
+        // fails the whole tx aborts and state rolls back).
+        // Note: `total_capital_quote_lots` is the cumulative DEPOSITS
+        // counter (informational); not decremented on withdraw. Live
+        // NAV comes from core's TraderState.collateral.
         {
             let vault = &mut ctx.accounts.vault;
             let pos = &mut ctx.accounts.position;
-            vault.total_capital_quote_lots = vault
-                .total_capital_quote_lots
-                .saturating_sub(amount);
             vault.shares_outstanding = vault
                 .shares_outstanding
                 .saturating_sub(shares_to_burn);
@@ -376,11 +393,12 @@ pub mod flash_book_vaults {
     /// then-current NAV/share without minting (no historical
     /// performance to crystallize).
     ///
-    /// No-position requirement: vault's `total_capital_quote_lots`
-    /// represents quote lots in the protocol vault. Open trading
-    /// positions are not yet tracked in v3 (vault trading lands in
-    /// phase 5). When phase 5 ships, this ix will need to enforce
-    /// "no open positions" so NAV is unambiguous (matches HL pattern).
+    /// NAV source: core's TraderState.collateral_quote_lots (live,
+    /// authoritative). Vault should be FLAT (no open positions) so
+    /// the collateral represents the full vault value; with open
+    /// positions, the mark-to-market component is ignored and only
+    /// the cash collateral counts toward the HWM. Strategists should
+    /// close out before settling for accurate crystallization.
     pub fn settle_vault_perf_fee_v3(
         ctx: Context<SettleVaultPerfFeeV3>,
     ) -> Result<()> {
@@ -399,7 +417,8 @@ pub mod flash_book_vaults {
             return Ok(());
         }
 
-        let nav = vault.total_capital_quote_lots as u128;
+        // Live NAV = core TraderState.collateral (cash portion).
+        let nav = ctx.accounts.vault_trader_state.collateral_quote_lots as u128;
         require!(nav > 0, VaultsError::VaultNavNonPositive);
 
         // Current NAV per share, scaled by USD_UNIT.
@@ -736,11 +755,12 @@ pub struct VaultDepositV3<'info> {
     #[account(seeds = [CPI_AUTHORITY_SEED], bump)]
     pub cpi_authority: UncheckedAccount<'info>,
 
-    /// CHECK: vault's TraderState in core. Inner CPI validates seed
-    /// derivation (must be `[b"trader_state", vault]` under
-    /// flash_book_program).
+    /// Vault's TraderState in core. Boxed cross-program account read so
+    /// the wrapper can use core's authoritative `collateral_quote_lots`
+    /// as the NAV source for share-mint math (handles trading PnL drift
+    /// from wrapper-side `total_capital_quote_lots`).
     #[account(mut)]
-    pub vault_trader_state: UncheckedAccount<'info>,
+    pub vault_trader_state: Box<Account<'info, CoreTraderStateAccount>>,
 
     pub flash_book_program: Program<'info, FlashBook>,
     pub token_program: Program<'info, Token>,
@@ -791,9 +811,10 @@ pub struct VaultWithdrawV3<'info> {
     #[account(mut)]
     pub depositor_quote_ata: Account<'info, TokenAccount>,
 
-    /// CHECK: vault's TraderState in core (debited by inner CPI).
+    /// Vault's TraderState in core — read for authoritative NAV +
+    /// debited by inner CPI before SPL release.
     #[account(mut)]
-    pub vault_trader_state: UncheckedAccount<'info>,
+    pub vault_trader_state: Box<Account<'info, CoreTraderStateAccount>>,
 
     pub flash_book_program: Program<'info, FlashBook>,
     pub token_program: Program<'info, Token>,
@@ -955,6 +976,10 @@ pub struct SettleVaultPerfFeeV3<'info> {
         bump,
     )]
     pub strategist_position: Account<'info, VaultPositionAccountV3>,
+
+    /// Vault's TraderState in core — read-only; provides authoritative
+    /// `collateral_quote_lots` for live NAV.
+    pub vault_trader_state: Box<Account<'info, CoreTraderStateAccount>>,
 
     pub system_program: Program<'info, System>,
 }
