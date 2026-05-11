@@ -371,7 +371,7 @@
         },
         {
           "name": "flash_book_program",
-          "address": "FBookV1111111111111111111111111111111111111"
+          "address": "HGP5GN7BHSt1geH1DxRwVGFg7g7ERU28Q2QEYf6KP24b"
         }
       ],
       "args": [
@@ -510,7 +510,7 @@
         },
         {
           "name": "flash_book_program",
-          "address": "FBookV1111111111111111111111111111111111111"
+          "address": "HGP5GN7BHSt1geH1DxRwVGFg7g7ERU28Q2QEYf6KP24b"
         },
         {
           "name": "token_program",
@@ -595,7 +595,7 @@
         },
         {
           "name": "flash_book_program",
-          "address": "FBookV1111111111111111111111111111111111111"
+          "address": "HGP5GN7BHSt1geH1DxRwVGFg7g7ERU28Q2QEYf6KP24b"
         },
         {
           "name": "system_program",
@@ -673,7 +673,7 @@
         },
         {
           "name": "flash_book_program",
-          "address": "FBookV1111111111111111111111111111111111111"
+          "address": "HGP5GN7BHSt1geH1DxRwVGFg7g7ERU28Q2QEYf6KP24b"
         }
       ],
       "args": [
@@ -850,7 +850,7 @@
         },
         {
           "name": "flash_book_program",
-          "address": "FBookV1111111111111111111111111111111111111"
+          "address": "HGP5GN7BHSt1geH1DxRwVGFg7g7ERU28Q2QEYf6KP24b"
         },
         {
           "name": "token_program",

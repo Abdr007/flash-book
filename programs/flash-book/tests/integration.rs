@@ -24,7 +24,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-const PROGRAM_ID_STR: &str = "FBookV1111111111111111111111111111111111111";
+const PROGRAM_ID_STR: &str = "HGP5GN7BHSt1geH1DxRwVGFg7g7ERU28Q2QEYf6KP24b";
 
 fn program_id() -> Pubkey {
     PROGRAM_ID_STR.parse().unwrap()
