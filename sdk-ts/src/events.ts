@@ -132,11 +132,108 @@ export enum MarketStatus {
   Closed = 4,
 }
 
+// ─── Wave 21 — wrapper-program CPI events ───────────────────────────
+
+export interface OrderPlacedV2CpiEvent extends OrderPlacedV2Event {
+  cpiAuthority: PublicKey;
+}
+
+export interface WrapperCollateralReleasedEvent {
+  cpiAuthority: PublicKey;
+  user: PublicKey;
+  amount: BN;
+}
+
+export interface WrapperTraderStateOpenedEvent {
+  cpiAuthority: PublicKey;
+  trader: PublicKey;
+}
+
+export interface WrapperCollateralCreditedEvent {
+  cpiAuthority: PublicKey;
+  trader: PublicKey;
+  amount: BN;
+  newCollateral: BN;
+}
+
+export interface WrapperCollateralDebitedEvent {
+  cpiAuthority: PublicKey;
+  trader: PublicKey;
+  amount: BN;
+  newCollateral: BN;
+}
+
+// ─── Wave 22 — fee-tier events ──────────────────────────────────────
+
+export interface FeeTiersInitializedEvent {
+  authority: PublicKey;
+  tierCount: number;
+  volumeWindowSlots: BN;
+}
+
+export interface FeeTiersUpdatedEvent {
+  authority: PublicKey;
+  tierCount: number;
+  volumeWindowSlots: BN;
+}
+
+export interface TraderEffectiveTierEvent {
+  trader: PublicKey;
+  tierIndex: number;
+  effectiveVolumeQuoteLots: BN;
+  /// SIGNED — positive = maker rebate, negative = maker fee.
+  makerRebateBps: number;
+  takerFeeBps: number;
+  windowExpired: boolean;
+}
+
+export interface TraderTierUpgradedEvent {
+  trader: PublicKey;
+  previousTierIndex: number;
+  newTierIndex: number;
+  volumeQuoteLots: BN;
+}
+
+/// Sequencer feed — emitted by `run_batch_v2` per cleared fill so the
+/// off-chain sequencer can dispatch apply_fill / apply_flp_fill on
+/// mainnet. FLP detection: `maker == PublicKey.default`.
+export interface BatchFillIntentEvent {
+  market: PublicKey;
+  taker: PublicKey;
+  maker: PublicKey;
+  takerSide: number;
+  sizeLots: BN;
+  priceTicks: BN;
+  takerId: BN;
+  makerId: BN;
+}
+
+// ─── Wave 20a — multi-tier MMR events ───────────────────────────────
+
+export interface MarketLeverageTiersInitializedEvent {
+  market: PublicKey;
+  tierCount: number;
+}
+
+export interface MarketLeverageTiersUpdatedEvent {
+  market: PublicKey;
+  tierCount: number;
+}
+
+// ─── Wave 20b — partial withdraw event ──────────────────────────────
+
+export interface PartialCollateralWithdrawnEvent {
+  trader: PublicKey;
+  amount: BN;
+  newBalance: BN;
+}
+
 export type FlashBookEvent =
   | { name: 'MarketInitializedEvent'; data: MarketInitializedEvent }
   | { name: 'BatchClearedEvent'; data: BatchClearedEvent }
   | { name: 'CollateralDepositedEvent'; data: CollateralDepositedEvent }
   | { name: 'CollateralWithdrawnEvent'; data: CollateralWithdrawnEvent }
+  | { name: 'PartialCollateralWithdrawnEvent'; data: PartialCollateralWithdrawnEvent }
   | { name: 'FillAppliedEvent'; data: FillAppliedEvent }
   | { name: 'FlpFillAppliedEvent'; data: FlpFillAppliedEvent }
   | { name: 'MarketStatusChangedEvent'; data: MarketStatusChangedEvent }
@@ -147,4 +244,16 @@ export type FlashBookEvent =
   | { name: 'MarketBookInitializedEvent'; data: MarketBookInitializedEvent }
   | { name: 'OrderPlacedV2Event'; data: OrderPlacedV2Event }
   | { name: 'BookDepthV2Event'; data: BookDepthV2Event }
-  | { name: 'OrderCancelledV2Event'; data: OrderCancelledV2Event };
+  | { name: 'OrderCancelledV2Event'; data: OrderCancelledV2Event }
+  | { name: 'OrderPlacedV2CpiEvent'; data: OrderPlacedV2CpiEvent }
+  | { name: 'WrapperCollateralReleasedEvent'; data: WrapperCollateralReleasedEvent }
+  | { name: 'WrapperTraderStateOpenedEvent'; data: WrapperTraderStateOpenedEvent }
+  | { name: 'WrapperCollateralCreditedEvent'; data: WrapperCollateralCreditedEvent }
+  | { name: 'WrapperCollateralDebitedEvent'; data: WrapperCollateralDebitedEvent }
+  | { name: 'FeeTiersInitializedEvent'; data: FeeTiersInitializedEvent }
+  | { name: 'FeeTiersUpdatedEvent'; data: FeeTiersUpdatedEvent }
+  | { name: 'TraderEffectiveTierEvent'; data: TraderEffectiveTierEvent }
+  | { name: 'TraderTierUpgradedEvent'; data: TraderTierUpgradedEvent }
+  | { name: 'BatchFillIntentEvent'; data: BatchFillIntentEvent }
+  | { name: 'MarketLeverageTiersInitializedEvent'; data: MarketLeverageTiersInitializedEvent }
+  | { name: 'MarketLeverageTiersUpdatedEvent'; data: MarketLeverageTiersUpdatedEvent };

@@ -49,12 +49,37 @@ import {
 
 const AUTHORITY_KEYPAIR =
   process.env.AUTHORITY_KEYPAIR ?? path.join(os.homedir(), '.config', 'solana', 'id.json');
-// ER endpoints (where matcher ticks happen). Same RPC as mainnet for
-// localnet / devnet test (no ER deployed yet).
-const ER_RPC = process.env.ER_RPC ?? 'http://127.0.0.1:8899';
-const ER_WS = process.env.ER_WS ?? 'ws://127.0.0.1:8900';
-// Mainnet endpoint (where apply_fill settles).
-const MAINNET_RPC = process.env.MAINNET_RPC ?? ER_RPC;
+
+// Known-good Flash production endpoints (used by flash-mobile + the
+// existing Flash V2 deploy):
+//   • ER mainnet:        https://flashtrade.magicblock.app
+//                        wss://flashtrade.magicblock.app  (WS path)
+//   • Solana mainnet:    https://api.mainnet-beta.solana.com
+//                        (replace with a paid RPC for production —
+//                        the public endpoint is heavily rate-limited)
+//
+// CLUSTER env selects which set we default to:
+//   CLUSTER=mainnet  → Flash ER + Solana mainnet
+//   CLUSTER=devnet   → public devnet (safe testing)
+//   CLUSTER=local    → localnet (default, fully offline)
+const CLUSTER = (process.env.CLUSTER ?? 'local').toLowerCase();
+
+let ER_RPC_DEFAULT = 'http://127.0.0.1:8899';
+let ER_WS_DEFAULT = 'ws://127.0.0.1:8900';
+let MAINNET_RPC_DEFAULT = ER_RPC_DEFAULT;
+if (CLUSTER === 'mainnet') {
+  ER_RPC_DEFAULT = 'https://flashtrade.magicblock.app';
+  ER_WS_DEFAULT = 'wss://flashtrade.magicblock.app';
+  MAINNET_RPC_DEFAULT = 'https://api.mainnet-beta.solana.com';
+} else if (CLUSTER === 'devnet') {
+  ER_RPC_DEFAULT = 'https://api.devnet.solana.com';
+  ER_WS_DEFAULT = 'wss://api.devnet.solana.com';
+  MAINNET_RPC_DEFAULT = 'https://api.devnet.solana.com';
+}
+
+const ER_RPC = process.env.ER_RPC ?? ER_RPC_DEFAULT;
+const ER_WS = process.env.ER_WS ?? ER_WS_DEFAULT;
+const MAINNET_RPC = process.env.MAINNET_RPC ?? MAINNET_RPC_DEFAULT;
 
 // FLP marker — FLP fills carry maker == Pubkey::default. The sequencer
 // detects this and routes to apply_flp_fill instead of apply_fill.
@@ -78,6 +103,14 @@ function loadKeypair(p: string): Keypair {
   return Keypair.fromSecretKey(new Uint8Array(raw));
 }
 
+function validateRpcUrl(label: string, url: string) {
+  if (url.includes('mainnet') && url.startsWith('http://')) {
+    throw new Error(
+      `Refusing http:// URL for ${label} on mainnet: ${url}. Use https://`,
+    );
+  }
+}
+
 function fillKey(f: BatchFillIntent): string {
   return `${f.market.toBase58()}:${f.takerId}:${f.makerId}`;
 }
@@ -90,6 +123,9 @@ async function main() {
   console.log(`  ER RPC:      ${ER_RPC}`);
   console.log(`  ER WS:       ${ER_WS}`);
   console.log(`  Mainnet RPC: ${MAINNET_RPC}`);
+
+  validateRpcUrl('ER_RPC', ER_RPC);
+  validateRpcUrl('MAINNET_RPC', MAINNET_RPC);
 
   const sequencer = loadKeypair(AUTHORITY_KEYPAIR);
   console.log(`  Sequencer pubkey: ${sequencer.publicKey.toBase58()}`);

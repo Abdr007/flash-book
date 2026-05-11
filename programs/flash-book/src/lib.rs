@@ -470,29 +470,9 @@ pub mod flash_book {
         flags: u8,
         expires_at_slot: u64,
     ) -> Result<()> {
-        // Wrapper-program signer check. cpi_authority must match one
-        // of the 3 expected PDAs. Computing the derivations costs
-        // ~18K CU vs ~5K for a single address comparison — acceptable
-        // given the security gain.
+        // Wrapper-program signer check (~18K CU for the 3 PDA derivations).
+        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
         let cpi_signer = ctx.accounts.cpi_authority.key();
-        let (orders_authority, _) = Pubkey::find_program_address(
-            &[CPI_AUTHORITY_SEED],
-            &WAVE21_ORDERS_PROGRAM_ID,
-        );
-        let (flp_authority, _) = Pubkey::find_program_address(
-            &[CPI_AUTHORITY_SEED],
-            &WAVE21_FLP_PROGRAM_ID,
-        );
-        let (vaults_authority, _) = Pubkey::find_program_address(
-            &[CPI_AUTHORITY_SEED],
-            &WAVE21_VAULTS_PROGRAM_ID,
-        );
-        require!(
-            cpi_signer == orders_authority
-                || cpi_signer == flp_authority
-                || cpi_signer == vaults_authority,
-            FlashBookError::Unauthorized
-        );
 
         // Mirror place_limit_order_v2 intake validation.
         require!(side <= 1, FlashBookError::OutOfRange);
@@ -604,26 +584,9 @@ pub mod flash_book {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
 
         // Wrapper signer check — same 3-PDA whitelist as
-        // place_limit_order_v2_cpi.
+        // place_limit_order_v2_cpi (helper centralizes the gate).
+        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
         let cpi_signer = ctx.accounts.cpi_authority.key();
-        let (orders_authority, _) = Pubkey::find_program_address(
-            &[CPI_AUTHORITY_SEED],
-            &WAVE21_ORDERS_PROGRAM_ID,
-        );
-        let (flp_authority, _) = Pubkey::find_program_address(
-            &[CPI_AUTHORITY_SEED],
-            &WAVE21_FLP_PROGRAM_ID,
-        );
-        let (vaults_authority, _) = Pubkey::find_program_address(
-            &[CPI_AUTHORITY_SEED],
-            &WAVE21_VAULTS_PROGRAM_ID,
-        );
-        require!(
-            cpi_signer == orders_authority
-                || cpi_signer == flp_authority
-                || cpi_signer == vaults_authority,
-            FlashBookError::Unauthorized
-        );
 
         // SPL transfer signed by InsuranceFund PDA.
         let bump = ctx.accounts.insurance_fund.bump;

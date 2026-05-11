@@ -61,7 +61,22 @@ import {
 
 // ─── Config ──────────────────────────────────────────────────────────
 
-const RPC_URL = process.env.RPC_URL ?? 'http://127.0.0.1:8899';
+// Known-good Flash production endpoints (per flash-mobile project):
+//   • Solana mainnet-beta:  https://api.mainnet-beta.solana.com
+//   • Flash ER (mainnet):   https://flashtrade.magicblock.app
+//
+// CLUSTER env selects defaults safely:
+//   CLUSTER=mainnet  → Solana mainnet-beta (sets up a LIVE deployment)
+//   CLUSTER=devnet   → Solana devnet (safe testing — DEFAULT)
+//   CLUSTER=local    → localnet
+const CLUSTER = (process.env.CLUSTER ?? 'devnet').toLowerCase();
+const RPC_URL =
+  process.env.RPC_URL ??
+  (CLUSTER === 'mainnet'
+    ? 'https://api.mainnet-beta.solana.com'
+    : CLUSTER === 'devnet'
+      ? 'https://api.devnet.solana.com'
+      : 'http://127.0.0.1:8899');
 const AUTHORITY_KEYPAIR =
   process.env.AUTHORITY_KEYPAIR ?? path.join(os.homedir(), '.config', 'solana', 'id.json');
 
@@ -95,6 +110,17 @@ const MARKETS = MARKETS_ENV
 function loadKeypair(p: string): Keypair {
   const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as number[];
   return Keypair.fromSecretKey(new Uint8Array(raw));
+}
+
+/// Reject http:// when targeting mainnet — credentials would
+/// transit cleartext + an MITM could swap pubkeys mid-bootstrap.
+function validateRpcUrl(url: string) {
+  if (url.includes('mainnet') && url.startsWith('http://')) {
+    throw new Error(
+      `Refusing http:// URL targeting mainnet: ${url}. ` +
+        `Use https:// (TLS) for production endpoints.`,
+    );
+  }
 }
 
 async function exists(conn: Connection, pubkey: PublicKey): Promise<boolean> {
@@ -149,6 +175,7 @@ async function main() {
   console.log(`  RPC:        ${RPC_URL}`);
   console.log(`  Authority:  ${AUTHORITY_KEYPAIR}`);
   console.log(`  Quote mint: ${QUOTE_MINT.toBase58()}`);
+  validateRpcUrl(RPC_URL);
 
   const authority = loadKeypair(AUTHORITY_KEYPAIR);
   const conn = new Connection(RPC_URL, 'confirmed');
