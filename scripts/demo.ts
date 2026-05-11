@@ -325,61 +325,10 @@ const limitGttIx = await client.placeLimitOrderIx({
 });
 describeIx('placeLimitOrderIx (reduce-only + GTT)', limitGttIx);
 
-const triggerIx = await client.placeTriggerOrderIx({
-  trader,
-  market,
-  triggerId: 1,
-  side: 'short',
-  kind: 'below',
-  sizeLots: new BN(10),
-  triggerPriceTicks: new BN(95_000),
-  limitPriceTicks: new BN(94_500),
-  reduceOnly: true,
-});
-describeIx('placeTriggerOrderIx (long-position SL @ 95_000)', triggerIx);
-
-const trailingIx = await client.placeTriggerOrderIx({
-  trader,
-  market,
-  triggerId: 2,
-  side: 'short',
-  kind: 'below',
-  sizeLots: new BN(10),
-  triggerPriceTicks: new BN(95_000),
-  limitPriceTicks: new BN(94_500),
-  reduceOnly: true,
-  trailingOffsetBps: 200, // 2% trailing
-});
-describeIx('placeTriggerOrderIx (trailing stop, 2% offset)', trailingIx);
-
-const bracketIx = await client.placeBracketOrderIx({
-  trader,
-  market,
-  parentSide: 'long',
-  sizeLots: new BN(10),
-  parentLimitTicks: new BN(100_000),
-  tpTriggerId: 10,
-  tpTriggerPriceTicks: new BN(105_000),
-  tpLimitTicks: new BN(104_500),
-  slTriggerId: 11,
-  slTriggerPriceTicks: new BN(95_000),
-  slLimitTicks: new BN(94_500),
-});
-describeIx('placeBracketOrderIx (atomic parent + TP + SL with OCO)', bracketIx);
-
-const icebergIx = await client.placeIcebergOrderIx({
-  trader,
-  market,
-  icebergId: 1,
-  side: 'long',
-  totalSizeLots: new BN(1_000),
-  displayedSizeLots: new BN(50),
-  limitTicks: new BN(99_900),
-});
-describeIx('placeIcebergOrderIx (1_000 hidden, 50 visible at a time)', icebergIx);
-
-const massCancelIx = await client.cancelAllOrdersInMarketIx({ trader, market });
-describeIx('cancelAllOrdersInMarketIx (single-tx flatten)', massCancelIx);
+// Trigger / bracket / iceberg / mass-cancel placement moved to the
+// flash-book-orders wrapper program in wave 21 phase 4. See
+// `programs/flash-book-orders/src/lib.rs` (place_trigger_order_v3,
+// place_bracket_order_v3, place_iceberg_order_v3, etc).
 
 // ─── 4. View ixs — live data via simulation ───────────────────────────
 //

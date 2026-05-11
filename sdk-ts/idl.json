@@ -1254,102 +1254,98 @@
       "args": []
     },
     {
-      "name": "create_vault",
+      "name": "cpi_release_collateral_to_user",
       "docs": [
-        "Create a user-managed trading vault. Caller signs and becomes the",
-        "strategist (delegate of the vault's TraderState). Vault PDA is",
-        "seeded `[b\"vault\", strategist, vault_id]`; the linked TraderState",
-        "is at `[b\"trader_state\", vault_pda]`. The strategist trades via",
-        "the existing trade ixs by signing as delegate of the vault's",
-        "TraderState (`is_authorized` accepts trader OR delegate).",
+        "Wave 21 phase 8b/9b — inverse CPI release of quote collateral",
+        "from the protocol's quote_vault to a user's ATA. Only callable",
+        "by the 3 wrapper programs' CPI authority PDAs. Used by:",
         "",
-        "`perf_fee_bps` is the high-water-mark performance fee (charged on",
-        "`settle_vault_perf_fee` by minting shares). Capped at 5_000 (50%)",
-        "to prevent rug-vaults that take everything. `min_deposit` is a",
-        "dust-attack floor; depositors below it are rejected.",
+        "• flash-book-flp's `flp_withdraw_v3` — pays an LP burning",
+        "shares back into their ATA",
+        "• flash-book-vaults' `vault_withdraw_v3` — pays a vault",
+        "depositor burning shares back into their ATA",
         "",
-        "The vault starts with `accept_deposits = true` and HWM = 0",
-        "(first settlement anchors the HWM at then-current NAV/share so",
-        "no fees are charged on bootstrap deposits)."
+        "Core signs the SPL transfer as `InsuranceFundAccount` (the",
+        "vault's authority); the wrapper authenticates the WHO + HOW",
+        "MUCH via its own state.",
+        "",
+        "Trust model: same as `place_limit_order_v2_cpi` — wrapper",
+        "authority PDAs are whitelisted; once accepted, core trusts",
+        "the wrapper's calculation of the release amount. This is",
+        "safe because (a) the wrapper signed for a SPECIFIC trader",
+        "(off-chain reconciliation against the wrapper's burn event",
+        "catches misroutes); (b) total exposure is bounded by the",
+        "wrapper's own balance accounting."
       ],
       "discriminator": [
-        29,
-        237,
-        247,
-        208,
-        193,
-        82,
-        54,
-        135
+        139,
+        137,
+        196,
+        22,
+        155,
+        216,
+        46,
+        174
       ],
       "accounts": [
         {
-          "name": "strategist",
-          "writable": true,
+          "name": "cpi_authority",
+          "docs": [
+            "CPI authority — must be one of the 3 wrapper-program PDAs."
+          ],
           "signer": true
         },
         {
-          "name": "vault",
-          "writable": true
-        },
-        {
-          "name": "vault_trader_state",
+          "name": "insurance_fund",
           "docs": [
-            "Vault's TraderState — created here, seeded by the vault PDA. The",
-            "strategist becomes the delegate so they can sign trade ixs."
+            "InsuranceFund PDA — owns the vault, signs the SPL transfer out."
           ],
-          "writable": true,
           "pda": {
             "seeds": [
               {
                 "kind": "const",
                 "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
+                  105,
+                  110,
                   115,
-                  116,
+                  117,
+                  114,
                   97,
-                  116,
-                  101
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
                 ]
-              },
-              {
-                "kind": "account",
-                "path": "vault"
               }
             ]
           }
         },
         {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
+          "name": "quote_vault",
+          "docs": [
+            "Source vault (program-owned, InsuranceFund authority)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "user_quote_ata",
+          "docs": [
+            "Destination — user's ATA. Mut because we credit it."
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": [
         {
-          "name": "vault_id",
-          "type": "u8"
-        },
-        {
-          "name": "name",
-          "type": {
-            "array": [
-              "u8",
-              32
-            ]
-          }
-        },
-        {
-          "name": "perf_fee_bps",
-          "type": "u32"
-        },
-        {
-          "name": "min_deposit_quote_lots",
+          "name": "amount_quote_lots",
           "type": "u64"
         }
       ]
@@ -2041,253 +2037,6 @@
               {
                 "kind": "account",
                 "path": "authority"
-              },
-              {
-                "kind": "const",
-                "value": [
-                  6,
-                  221,
-                  246,
-                  225,
-                  215,
-                  101,
-                  161,
-                  147,
-                  217,
-                  203,
-                  225,
-                  70,
-                  206,
-                  235,
-                  121,
-                  172,
-                  28,
-                  180,
-                  133,
-                  237,
-                  95,
-                  91,
-                  55,
-                  145,
-                  58,
-                  140,
-                  245,
-                  133,
-                  126,
-                  255,
-                  0,
-                  169
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "quote_mint"
-              }
-            ],
-            "program": {
-              "kind": "const",
-              "value": [
-                140,
-                151,
-                37,
-                143,
-                78,
-                36,
-                137,
-                241,
-                187,
-                61,
-                16,
-                41,
-                20,
-                142,
-                13,
-                131,
-                11,
-                90,
-                19,
-                153,
-                218,
-                255,
-                16,
-                132,
-                4,
-                142,
-                123,
-                216,
-                219,
-                233,
-                248,
-                89
-              ]
-            }
-          }
-        },
-        {
-          "name": "quote_vault",
-          "writable": true
-        },
-        {
-          "name": "token_program",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": [
-        {
-          "name": "amount_quote_lots",
-          "type": "u64"
-        }
-      ]
-    },
-    {
-      "name": "deposit_to_vault",
-      "docs": [
-        "Deposit into a vault. SPL transfer from the depositor's quote ATA",
-        "to the vault's collateral pool, then mint shares at the current",
-        "NAV/share price.",
-        "",
-        "Shares minted = amount × shares_outstanding / collateral",
-        "(bootstrap when shares_outstanding == 0 → 1:1)",
-        "",
-        "In v1 the NAV used here is the COLLATERAL of the vault's",
-        "TraderStateAccount (not collateral + unrealized PnL). Open",
-        "positions of the vault are not counted toward NAV — depositors",
-        "implicitly buy in to existing positions at cost basis. This is",
-        "the safest mode and avoids requiring the depositor to pass every",
-        "market account. A future v2 can pass markets in remaining_accounts",
-        "for full mark-to-market NAV."
-      ],
-      "discriminator": [
-        18,
-        62,
-        110,
-        8,
-        26,
-        106,
-        248,
-        151
-      ],
-      "accounts": [
-        {
-          "name": "depositor",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "vault",
-          "writable": true
-        },
-        {
-          "name": "vault_trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "vault"
-              }
-            ]
-          }
-        },
-        {
-          "name": "vault_position",
-          "docs": [
-            "Per-depositor share holding (created lazily on first deposit)."
-          ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  118,
-                  97,
-                  117,
-                  108,
-                  116,
-                  95,
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "vault"
-              },
-              {
-                "kind": "account",
-                "path": "depositor"
-              }
-            ]
-          }
-        },
-        {
-          "name": "insurance_fund",
-          "docs": [
-            "Insurance fund PDA — owns the protocol's quote vault."
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  105,
-                  110,
-                  115,
-                  117,
-                  114,
-                  97,
-                  110,
-                  99,
-                  101,
-                  95,
-                  102,
-                  117,
-                  110,
-                  100
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "quote_mint"
-        },
-        {
-          "name": "depositor_quote_ata",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "account",
-                "path": "depositor"
               },
               {
                 "kind": "const",
@@ -4622,273 +4371,6 @@
       ]
     },
     {
-      "name": "place_bracket_order_v2",
-      "docs": [
-        "V2 bracket order — atomic parent + take-profit + stop-loss against",
-        "the hypertree-backed book. Pure parity port of v1's",
-        "`place_bracket_order` (same validation, same TP/SL kind logic for",
-        "long-vs-short, same FLAG_BRACKET_LEG marking, same",
-        "reduce-only/active flag set). Only the parent's order injection",
-        "target differs (hypertree, not v1 buffer).",
-        "",
-        "Hyperliquid pattern: trader places parent + 2 reduce-only OCO",
-        "triggers in one tx. When parent fills, position opens. When the",
-        "oracle later crosses TP, TP trigger fires (closes via reduce-only)",
-        "and the SL is auto-deactivated by `execute_trigger_order_v2`'s OCO",
-        "partner walk. Survives bot downtime AND eliminates the gap between",
-        "parent fill and child trigger placement."
-      ],
-      "discriminator": [
-        33,
-        155,
-        24,
-        195,
-        188,
-        66,
-        62,
-        216
-      ],
-      "accounts": [
-        {
-          "name": "trader",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "market",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  109,
-                  97,
-                  114,
-                  107,
-                  101,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market.base_mint",
-                "account": "MarketAccount"
-              },
-              {
-                "kind": "account",
-                "path": "market.quote_mint",
-                "account": "MarketAccount"
-              }
-            ]
-          }
-        },
-        {
-          "name": "market_book",
-          "docs": [
-            "Mut because the parent limit order is inserted into the hypertree."
-          ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  109,
-                  97,
-                  114,
-                  107,
-                  101,
-                  116,
-                  95,
-                  98,
-                  111,
-                  111,
-                  107
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "tp_trigger",
-          "writable": true
-        },
-        {
-          "name": "sl_trigger",
-          "writable": true
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": [
-        {
-          "name": "parent_side",
-          "type": "u8"
-        },
-        {
-          "name": "size_lots",
-          "type": "u64"
-        },
-        {
-          "name": "parent_limit_ticks",
-          "type": "u64"
-        },
-        {
-          "name": "tp_trigger_id",
-          "type": "u8"
-        },
-        {
-          "name": "tp_trigger_price_ticks",
-          "type": "u64"
-        },
-        {
-          "name": "tp_limit_ticks",
-          "type": "u64"
-        },
-        {
-          "name": "sl_trigger_id",
-          "type": "u8"
-        },
-        {
-          "name": "sl_trigger_price_ticks",
-          "type": "u64"
-        },
-        {
-          "name": "sl_limit_ticks",
-          "type": "u64"
-        },
-        {
-          "name": "expires_at_slot",
-          "type": "u64"
-        }
-      ]
-    },
-    {
-      "name": "place_iceberg_order_v2",
-      "docs": [
-        "V2: create an iceberg order and seed the first visible chunk into",
-        "the hypertree-backed book. Pure parity port of v1 (same validation,",
-        "same IcebergOrderAccount field set, same first_chunk sizing).",
-        "Only the injection target differs (hypertree, not v1 buffer)."
-      ],
-      "discriminator": [
-        210,
-        2,
-        238,
-        78,
-        49,
-        9,
-        102,
-        6
-      ],
-      "accounts": [
-        {
-          "name": "trader",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "market",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  109,
-                  97,
-                  114,
-                  107,
-                  101,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market.base_mint",
-                "account": "MarketAccount"
-              },
-              {
-                "kind": "account",
-                "path": "market.quote_mint",
-                "account": "MarketAccount"
-              }
-            ]
-          }
-        },
-        {
-          "name": "market_book",
-          "docs": [
-            "Mut because the first iceberg child is inserted into the hypertree."
-          ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  109,
-                  97,
-                  114,
-                  107,
-                  101,
-                  116,
-                  95,
-                  98,
-                  111,
-                  111,
-                  107
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "iceberg_order",
-          "writable": true
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": [
-        {
-          "name": "iceberg_id",
-          "type": "u8"
-        },
-        {
-          "name": "side",
-          "type": "u8"
-        },
-        {
-          "name": "total_size_lots",
-          "type": "u64"
-        },
-        {
-          "name": "displayed_size_lots",
-          "type": "u64"
-        },
-        {
-          "name": "limit_ticks",
-          "type": "u64"
-        },
-        {
-          "name": "expires_at_slot",
-          "type": "u64"
-        }
-      ]
-    },
-    {
       "name": "place_limit_order_v2",
       "docs": [
         "V2 limit-order placement against the hypertree-backed orderbook.",
@@ -5134,202 +4616,6 @@
         },
         {
           "name": "expires_at_slot",
-          "type": "u64"
-        }
-      ]
-    },
-    {
-      "name": "place_trigger_order",
-      "docs": [
-        "Place a NATIVE on-chain trigger order — Hyperliquid pattern. Trader",
-        "pre-funds rent on a TriggerOrderAccount PDA. Once the oracle",
-        "crosses `trigger_price_ticks` in the configured direction, ANY",
-        "signer can call `execute_trigger_order` to insert the resulting",
-        "limit order into the market's buffer. Survives bot downtime —",
-        "your stop-loss fires even if your MM bot is offline."
-      ],
-      "discriminator": [
-        32,
-        156,
-        50,
-        188,
-        232,
-        159,
-        112,
-        236
-      ],
-      "accounts": [
-        {
-          "name": "trader",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "market",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  109,
-                  97,
-                  114,
-                  107,
-                  101,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market.base_mint",
-                "account": "MarketAccount"
-              },
-              {
-                "kind": "account",
-                "path": "market.quote_mint",
-                "account": "MarketAccount"
-              }
-            ]
-          }
-        },
-        {
-          "name": "trigger_order",
-          "writable": true
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": [
-        {
-          "name": "trigger_id",
-          "type": "u8"
-        },
-        {
-          "name": "side",
-          "type": "u8"
-        },
-        {
-          "name": "kind",
-          "type": "u8"
-        },
-        {
-          "name": "size_lots",
-          "type": "u64"
-        },
-        {
-          "name": "trigger_price_ticks",
-          "type": "u64"
-        },
-        {
-          "name": "limit_price_ticks",
-          "type": "u64"
-        },
-        {
-          "name": "reduce_only",
-          "type": "bool"
-        },
-        {
-          "name": "expires_at_slot",
-          "type": "u64"
-        },
-        {
-          "name": "trailing_offset_bps",
-          "type": "u32"
-        }
-      ]
-    },
-    {
-      "name": "place_twap_order",
-      "docs": [
-        "Place a NATIVE on-chain TWAP order — Hyperliquid pattern. Splits a",
-        "large order into N slices of `slice_size_lots` (last slice may be",
-        "smaller), released no faster than `slot_interval` apart. Each slice",
-        "is a regular limit order at `limit_price_ticks` (max for buys, min",
-        "for sells — slice ROUTES like any other limit and respects the cap).",
-        "Reduces market impact + survives bot downtime."
-      ],
-      "discriminator": [
-        0,
-        140,
-        86,
-        197,
-        70,
-        38,
-        229,
-        173
-      ],
-      "accounts": [
-        {
-          "name": "trader",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "market",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  109,
-                  97,
-                  114,
-                  107,
-                  101,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market.base_mint",
-                "account": "MarketAccount"
-              },
-              {
-                "kind": "account",
-                "path": "market.quote_mint",
-                "account": "MarketAccount"
-              }
-            ]
-          }
-        },
-        {
-          "name": "twap_order",
-          "writable": true
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": [
-        {
-          "name": "twap_id",
-          "type": "u8"
-        },
-        {
-          "name": "side",
-          "type": "u8"
-        },
-        {
-          "name": "total_size_lots",
-          "type": "u64"
-        },
-        {
-          "name": "slice_size_lots",
-          "type": "u64"
-        },
-        {
-          "name": "limit_price_ticks",
-          "type": "u64"
-        },
-        {
-          "name": "slot_interval",
-          "type": "u64"
-        },
-        {
-          "name": "end_slot",
           "type": "u64"
         }
       ]
@@ -8632,242 +7918,6 @@
       ]
     },
     {
-      "name": "withdraw_from_vault",
-      "docs": [
-        "Withdraw from a vault. Burns `shares_to_burn` and pays out",
-        "proportional MARK-TO-MARKET NAV.",
-        "",
-        "Caller passes `[market, position]` pairs in remaining_accounts",
-        "for each of the vault's open positions (count must match",
-        "vault_trader_state.open_positions exactly). NAV = collateral +",
-        "sum(unrealized_pnl). Payout = shares × NAV / shares_outstanding.",
-        "",
-        "Vault collateral must cover the cash payout (positions can stay",
-        "open after withdraw). If collateral < required payout, the call",
-        "rejects — strategist must close some positions to free",
-        "collateral. This avoids forcing the vault to liquidate at bad",
-        "prices to honour a withdrawal. Future v2 can add an automatic",
-        "proportional position-close (HL pattern)."
-      ],
-      "discriminator": [
-        180,
-        34,
-        37,
-        46,
-        156,
-        0,
-        211,
-        238
-      ],
-      "accounts": [
-        {
-          "name": "depositor",
-          "signer": true
-        },
-        {
-          "name": "vault",
-          "writable": true
-        },
-        {
-          "name": "vault_trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "vault"
-              }
-            ]
-          }
-        },
-        {
-          "name": "vault_position",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  118,
-                  97,
-                  117,
-                  108,
-                  116,
-                  95,
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "vault"
-              },
-              {
-                "kind": "account",
-                "path": "depositor"
-              }
-            ]
-          }
-        },
-        {
-          "name": "insurance_fund",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  105,
-                  110,
-                  115,
-                  117,
-                  114,
-                  97,
-                  110,
-                  99,
-                  101,
-                  95,
-                  102,
-                  117,
-                  110,
-                  100
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "quote_mint"
-        },
-        {
-          "name": "depositor_quote_ata",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "account",
-                "path": "depositor"
-              },
-              {
-                "kind": "const",
-                "value": [
-                  6,
-                  221,
-                  246,
-                  225,
-                  215,
-                  101,
-                  161,
-                  147,
-                  217,
-                  203,
-                  225,
-                  70,
-                  206,
-                  235,
-                  121,
-                  172,
-                  28,
-                  180,
-                  133,
-                  237,
-                  95,
-                  91,
-                  55,
-                  145,
-                  58,
-                  140,
-                  245,
-                  133,
-                  126,
-                  255,
-                  0,
-                  169
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "quote_mint"
-              }
-            ],
-            "program": {
-              "kind": "const",
-              "value": [
-                140,
-                151,
-                37,
-                143,
-                78,
-                36,
-                137,
-                241,
-                187,
-                61,
-                16,
-                41,
-                20,
-                142,
-                13,
-                131,
-                11,
-                90,
-                19,
-                153,
-                218,
-                255,
-                16,
-                132,
-                4,
-                142,
-                123,
-                216,
-                219,
-                233,
-                248,
-                89
-              ]
-            }
-          }
-        },
-        {
-          "name": "quote_vault",
-          "writable": true
-        },
-        {
-          "name": "token_program",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        }
-      ],
-      "args": [
-        {
-          "name": "shares_to_burn",
-          "type": "u64"
-        }
-      ]
-    },
-    {
       "name": "withdraw_insurance_fund",
       "docs": [
         "Authority withdraws excess insurance fund balance. Cannot push the",
@@ -9286,19 +8336,6 @@
       ]
     },
     {
-      "name": "BracketOrderPlacedV2Event",
-      "discriminator": [
-        24,
-        154,
-        66,
-        108,
-        155,
-        61,
-        81,
-        133
-      ]
-    },
-    {
       "name": "BuilderFeeOwedEvent",
       "discriminator": [
         15,
@@ -9478,19 +8515,6 @@
         188,
         230,
         62
-      ]
-    },
-    {
-      "name": "IcebergOrderPlacedV2Event",
-      "discriminator": [
-        0,
-        10,
-        237,
-        90,
-        58,
-        55,
-        117,
-        94
       ]
     },
     {
@@ -10040,19 +9064,6 @@
       ]
     },
     {
-      "name": "TriggerOrderPlacedEvent",
-      "discriminator": [
-        199,
-        125,
-        44,
-        128,
-        6,
-        249,
-        23,
-        17
-      ]
-    },
-    {
       "name": "TwapOrderCancelledEvent",
       "discriminator": [
         34,
@@ -10063,19 +9074,6 @@
         61,
         148,
         240
-      ]
-    },
-    {
-      "name": "TwapOrderPlacedEvent",
-      "discriminator": [
-        245,
-        35,
-        133,
-        15,
-        25,
-        19,
-        85,
-        201
       ]
     },
     {
@@ -10092,32 +9090,6 @@
       ]
     },
     {
-      "name": "VaultCreatedEvent",
-      "discriminator": [
-        81,
-        80,
-        244,
-        58,
-        136,
-        54,
-        236,
-        111
-      ]
-    },
-    {
-      "name": "VaultDepositedEvent",
-      "discriminator": [
-        127,
-        54,
-        183,
-        51,
-        131,
-        82,
-        85,
-        52
-      ]
-    },
-    {
       "name": "VaultPerfFeeSettledEvent",
       "discriminator": [
         50,
@@ -10131,16 +9103,16 @@
       ]
     },
     {
-      "name": "VaultWithdrawnEvent",
+      "name": "WrapperCollateralReleasedEvent",
       "discriminator": [
-        191,
-        75,
-        78,
-        193,
-        228,
-        82,
-        111,
-        17
+        135,
+        243,
+        81,
+        35,
+        29,
+        206,
+        220,
+        70
       ]
     }
   ],
@@ -10672,61 +9644,6 @@
           {
             "name": "trader",
             "type": "pubkey"
-          }
-        ]
-      }
-    },
-    {
-      "name": "BracketOrderPlacedV2Event",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "trader",
-            "type": "pubkey"
-          },
-          {
-            "name": "parent_side",
-            "type": "u8"
-          },
-          {
-            "name": "size_lots",
-            "type": "u64"
-          },
-          {
-            "name": "parent_limit_ticks",
-            "type": "u64"
-          },
-          {
-            "name": "parent_seq",
-            "type": "u64"
-          },
-          {
-            "name": "parent_node_index",
-            "docs": [
-              "Hypertree node index of the inserted parent RestingOrderV2."
-            ],
-            "type": "u32"
-          },
-          {
-            "name": "tp_trigger_id",
-            "type": "u8"
-          },
-          {
-            "name": "sl_trigger_id",
-            "type": "u8"
-          },
-          {
-            "name": "tp_trigger_price_ticks",
-            "type": "u64"
-          },
-          {
-            "name": "sl_trigger_price_ticks",
-            "type": "u64"
           }
         ]
       }
@@ -11329,53 +10246,6 @@
               "0 = never expires."
             ],
             "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "IcebergOrderPlacedV2Event",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "trader",
-            "type": "pubkey"
-          },
-          {
-            "name": "iceberg_id",
-            "type": "u8"
-          },
-          {
-            "name": "side",
-            "type": "u8"
-          },
-          {
-            "name": "total_size_lots",
-            "type": "u64"
-          },
-          {
-            "name": "displayed_size_lots",
-            "type": "u64"
-          },
-          {
-            "name": "limit_ticks",
-            "type": "u64"
-          },
-          {
-            "name": "first_child_seq",
-            "type": "u64"
-          },
-          {
-            "name": "first_child_node_index",
-            "docs": [
-              "Hypertree node index of the first inserted child RestingOrderV2."
-            ],
-            "type": "u32"
           }
         ]
       }
@@ -13713,46 +12583,6 @@
       }
     },
     {
-      "name": "TriggerOrderPlacedEvent",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "trader",
-            "type": "pubkey"
-          },
-          {
-            "name": "trigger_id",
-            "type": "u8"
-          },
-          {
-            "name": "side",
-            "type": "u8"
-          },
-          {
-            "name": "kind",
-            "type": "u8"
-          },
-          {
-            "name": "size_lots",
-            "type": "u64"
-          },
-          {
-            "name": "trigger_price_ticks",
-            "type": "u64"
-          },
-          {
-            "name": "limit_price_ticks",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
       "name": "TwapOrderAccount",
       "docs": [
         "Native on-chain TWAP order — Hyperliquid pattern. The trader specifies",
@@ -13861,50 +12691,6 @@
           },
           {
             "name": "unfilled_lots",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "TwapOrderPlacedEvent",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "trader",
-            "type": "pubkey"
-          },
-          {
-            "name": "twap_id",
-            "type": "u8"
-          },
-          {
-            "name": "side",
-            "type": "u8"
-          },
-          {
-            "name": "total_size_lots",
-            "type": "u64"
-          },
-          {
-            "name": "slice_size_lots",
-            "type": "u64"
-          },
-          {
-            "name": "limit_price_ticks",
-            "type": "u64"
-          },
-          {
-            "name": "slot_interval",
-            "type": "u64"
-          },
-          {
-            "name": "end_slot",
             "type": "u64"
           }
         ]
@@ -14085,58 +12871,6 @@
       }
     },
     {
-      "name": "VaultCreatedEvent",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "vault",
-            "type": "pubkey"
-          },
-          {
-            "name": "strategist",
-            "type": "pubkey"
-          },
-          {
-            "name": "vault_id",
-            "type": "u8"
-          },
-          {
-            "name": "perf_fee_bps",
-            "type": "u32"
-          },
-          {
-            "name": "min_deposit_quote_lots",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "VaultDepositedEvent",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "vault",
-            "type": "pubkey"
-          },
-          {
-            "name": "depositor",
-            "type": "pubkey"
-          },
-          {
-            "name": "amount_quote_lots",
-            "type": "u64"
-          },
-          {
-            "name": "shares_minted",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
       "name": "VaultPerfFeeSettledEvent",
       "type": {
         "kind": "struct",
@@ -14199,30 +12933,6 @@
       }
     },
     {
-      "name": "VaultWithdrawnEvent",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "vault",
-            "type": "pubkey"
-          },
-          {
-            "name": "depositor",
-            "type": "pubkey"
-          },
-          {
-            "name": "shares_burned",
-            "type": "u64"
-          },
-          {
-            "name": "amount_quote_lots",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
       "name": "VpinState",
       "type": {
         "kind": "struct",
@@ -14253,6 +12963,32 @@
             "docs": [
               "Q32.32 fixed-point VPIN value (0 = balanced, FIXED_ONE = max imbalance)."
             ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WrapperCollateralReleasedEvent",
+      "docs": [
+        "Wave 21 phase 8b/9b: emitted when a wrapper program's CPI releases",
+        "collateral from the protocol vault to a user. Carries the",
+        "cpi_authority pubkey (so off-chain reconciliation can attribute",
+        "the release to a specific wrapper program)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "cpi_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "user",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
             "type": "u64"
           }
         ]

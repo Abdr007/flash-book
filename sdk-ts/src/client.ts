@@ -1290,49 +1290,6 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// Place a NATIVE on-chain trigger order — Hyperliquid pattern.
-  /// `kind` is 0 (fire when oracle ≤ trigger) or 1 (fire when ≥). For a
-  /// long position's stop-loss, set side=1 (short to close), kind=0
-  /// (fire when oracle drops below trigger). Limit price is the resulting
-  /// limit order's price (must be on tick + non-zero).
-  placeTriggerOrderIx(args: {
-    trader: PublicKey;
-    market: PublicKey;
-    triggerId: number;
-    side: 'long' | 'short';
-    kind: 'below' | 'above';
-    sizeLots: bigint | number;
-    triggerPriceTicks: bigint | number;
-    limitPriceTicks: bigint | number;
-    reduceOnly?: boolean;
-    expiresAtSlot?: bigint | number;
-    /// Trailing-stop offset in bps (0 = static trigger). Capped at 5_000
-    /// (50%). When set, a permissionless `updateTrailingStopIx` keeper
-    /// ratchets the trigger price as the oracle moves favourably.
-    trailingOffsetBps?: number;
-  }): Promise<TransactionInstruction> {
-    const trigger = triggerOrderPda(args.market, args.trader, args.triggerId);
-    return this.methods
-      .placeTriggerOrder(
-        args.triggerId,
-        args.side === 'long' ? 0 : 1,
-        args.kind === 'below' ? 0 : 1,
-        args.sizeLots,
-        args.triggerPriceTicks,
-        args.limitPriceTicks,
-        args.reduceOnly ?? false,
-        args.expiresAtSlot ?? new BN(0),
-        args.trailingOffsetBps ?? 0,
-      )
-      .accountsPartial({
-        trader: args.trader,
-        market: args.market,
-        triggerOrder: trigger.address,
-        systemProgram: SystemProgram.programId,
-      })
-      .instruction();
-  }
-
   /// Ratchet a trailing-stop trigger order. Permissionless keeper ix —
   /// reads the oracle and updates the trigger price + anchor when the
   /// favorable-direction move is enough to change the tick-aligned
@@ -1373,42 +1330,6 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// Place a NATIVE on-chain TWAP order. Splits `totalSizeLots` into
-  /// slices of `sliceSizeLots`, released no faster than `slotInterval`
-  /// apart at `limitPriceTicks` (cap for buys, floor for sells). A keeper
-  /// (or anyone) calls `executeTwapSliceIx` once per interval. Reduces
-  /// market impact for large orders + survives bot downtime.
-  placeTwapOrderIx(args: {
-    trader: PublicKey;
-    market: PublicKey;
-    twapId: number;
-    side: 'long' | 'short';
-    totalSizeLots: bigint | number;
-    sliceSizeLots: bigint | number;
-    limitPriceTicks: bigint | number;
-    slotInterval: bigint | number;
-    endSlot?: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const twap = twapOrderPda(args.market, args.trader, args.twapId);
-    return this.methods
-      .placeTwapOrder(
-        args.twapId,
-        args.side === 'long' ? 0 : 1,
-        args.totalSizeLots,
-        args.sliceSizeLots,
-        args.limitPriceTicks,
-        args.slotInterval,
-        args.endSlot ?? new BN(0),
-      )
-      .accountsPartial({
-        trader: args.trader,
-        market: args.market,
-        twapOrder: twap.address,
-        systemProgram: SystemProgram.programId,
-      })
-      .instruction();
-  }
-
   /// V2 TWAP slice — fires one slice against the hypertree-backed book.
   /// Same scheduling semantics as v1 (FLAG_ACTIVE / end_slot / slot_interval
   /// / slice sizing); only the order injection target differs (hypertree,
@@ -1444,39 +1365,6 @@ export class FlashBookClient {
       .accountsPartial({
         trader: args.trader,
         twapOrder: twap.address,
-      })
-      .instruction();
-  }
-
-  /// V2: create an iceberg + seed first child into the hypertree-backed
-  /// book. Pure parity port of v1; only injection target differs.
-  placeIcebergOrderV2Ix(args: {
-    trader: PublicKey;
-    market: PublicKey;
-    icebergId: number;
-    side: 'long' | 'short';
-    totalSizeLots: bigint | number;
-    displayedSizeLots: bigint | number;
-    limitTicks: bigint | number;
-    expiresAtSlot?: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const book = marketBookPda(args.market);
-    const ice = icebergOrderPda(args.market, args.trader, args.icebergId);
-    return this.methods
-      .placeIcebergOrderV2(
-        args.icebergId,
-        args.side === 'long' ? 0 : 1,
-        args.totalSizeLots,
-        args.displayedSizeLots,
-        args.limitTicks,
-        args.expiresAtSlot ?? new BN(0),
-      )
-      .accountsPartial({
-        trader: args.trader,
-        market: args.market,
-        marketBook: book.address,
-        icebergOrder: ice.address,
-        systemProgram: SystemProgram.programId,
       })
       .instruction();
   }
@@ -1586,52 +1474,6 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// V2 atomic bracket — parent limit + TP + SL OCO triggers, parent
-  /// inserted into the hypertree-backed book. Pure parity port of v1
-  /// (same validation, same TP/SL kind logic, same FLAG_BRACKET_LEG
-  /// marking, same OCO linking). Pair with executeTriggerOrderV2Ix on
-  /// the trigger keepers — those fire into the same hypertree.
-  placeBracketOrderV2Ix(args: {
-    trader: PublicKey;
-    market: PublicKey;
-    parentSide: 'long' | 'short';
-    sizeLots: bigint | number;
-    parentLimitTicks: bigint | number;
-    tpTriggerId: number;
-    tpTriggerPriceTicks: bigint | number;
-    tpLimitTicks: bigint | number;
-    slTriggerId: number;
-    slTriggerPriceTicks: bigint | number;
-    slLimitTicks: bigint | number;
-    expiresAtSlot?: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const book = marketBookPda(args.market);
-    const tp = triggerOrderPda(args.market, args.trader, args.tpTriggerId);
-    const sl = triggerOrderPda(args.market, args.trader, args.slTriggerId);
-    return this.methods
-      .placeBracketOrderV2(
-        args.parentSide === 'long' ? 0 : 1,
-        args.sizeLots,
-        args.parentLimitTicks,
-        args.tpTriggerId,
-        args.tpTriggerPriceTicks,
-        args.tpLimitTicks,
-        args.slTriggerId,
-        args.slTriggerPriceTicks,
-        args.slLimitTicks,
-        args.expiresAtSlot ?? new BN(0),
-      )
-      .accountsPartial({
-        trader: args.trader,
-        market: args.market,
-        marketBook: book.address,
-        tpTrigger: tp.address,
-        slTrigger: sl.address,
-        systemProgram: SystemProgram.programId,
-      })
-      .instruction();
-  }
-
   /// Set the per-position leverage cap (Hyperliquid pattern). `cap` ∈
   /// [1, market.maxLeverage]; 0 to clear. Trader OR delegate signs.
   /// Enforced on `placeLimitOrder` intake against projected post-fill
@@ -1682,106 +1524,6 @@ export class FlashBookClient {
         authority: args.authority,
         fromState: from.address,
         toState: to.address,
-      })
-      .remainingAccounts(remaining)
-      .instruction();
-  }
-
-  /// Create a user-managed trading vault. Caller becomes the strategist
-  /// (delegate of the vault's TraderState). Vault PDA seeded by
-  /// (strategist, vaultId). The strategist can then trade by signing
-  /// with their normal keypair — `is_authorized` checks delegate.
-  createVaultIx(args: {
-    strategist: PublicKey;
-    vaultId: number;
-    name: Uint8Array; // 32 bytes
-    perfFeeBps: number;
-    minDepositQuoteLots: bigint | number;
-  }): Promise<TransactionInstruction> {
-    if (args.name.length !== 32) {
-      throw new Error('vault name must be exactly 32 bytes (UTF-8, null-padded)');
-    }
-    const vault = vaultPda(args.strategist, args.vaultId);
-    const ts = this.traderState(vault.address);
-    return this.methods
-      .createVault(args.vaultId, Array.from(args.name), args.perfFeeBps, args.minDepositQuoteLots)
-      .accountsPartial({
-        strategist: args.strategist,
-        vault: vault.address,
-        vaultTraderState: ts.address,
-        systemProgram: SystemProgram.programId,
-      })
-      .instruction();
-  }
-
-  /// Deposit quote tokens into a vault and mint shares at MARK-TO-MARKET
-  /// NAV. SPL transfer from depositor's quote ATA to the protocol vault.
-  ///
-  /// `openPositions` MUST be the vault's currently-open positions, one
-  /// `{market, position}` pair per open position; the chain rejects if
-  /// the count doesn't match `vault_trader_state.open_positions`.
-  /// Caller queries them off-chain via `getProgramAccounts` filtered on
-  /// `position.trader == vaultPda` (or by tailing FillAppliedEvent).
-  /// Pass `[]` if the vault is flat.
-  ///
-  /// MagicBlock ER compatibility: when the markets are delegated to the
-  /// ER, pass them with the ER's clone — Anchor account derivation works
-  /// transparently. The chain reads `mark_price_ticks` which is updated
-  /// inside ER batch clearing.
-  depositToVaultIx(args: {
-    depositor: PublicKey;
-    vault: PublicKey;
-    amountQuoteLots: bigint | number;
-    openPositions?: ReadonlyArray<{ market: PublicKey; position: PublicKey }>;
-  }): Promise<TransactionInstruction> {
-    const ts = this.traderState(args.vault);
-    const pos = vaultPositionPda(args.vault, args.depositor);
-    const fund = this.insuranceFund();
-    const remaining = (args.openPositions ?? []).flatMap((p) => [
-      { pubkey: p.market, isWritable: false, isSigner: false },
-      { pubkey: p.position, isWritable: false, isSigner: false },
-    ]);
-    return this.methods
-      .depositToVault(args.amountQuoteLots)
-      .accountsPartial({
-        depositor: args.depositor,
-        vault: args.vault,
-        vaultTraderState: ts.address,
-        vaultPosition: pos.address,
-        insuranceFund: fund.address,
-        systemProgram: SystemProgram.programId,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .remainingAccounts(remaining)
-      .instruction();
-  }
-
-  /// Withdraw from a vault by burning shares for proportional MTM NAV.
-  /// Same `openPositions` walk semantics as `depositToVaultIx`. Vault
-  /// collateral must cover the cash payout — strategist must close
-  /// positions first if collateral is fully invested.
-  withdrawFromVaultIx(args: {
-    depositor: PublicKey;
-    vault: PublicKey;
-    sharesToBurn: bigint | number;
-    openPositions?: ReadonlyArray<{ market: PublicKey; position: PublicKey }>;
-  }): Promise<TransactionInstruction> {
-    const ts = this.traderState(args.vault);
-    const pos = vaultPositionPda(args.vault, args.depositor);
-    const fund = this.insuranceFund();
-    const remaining = (args.openPositions ?? []).flatMap((p) => [
-      { pubkey: p.market, isWritable: false, isSigner: false },
-      { pubkey: p.position, isWritable: false, isSigner: false },
-    ]);
-    return this.methods
-      .withdrawFromVault(args.sharesToBurn)
-      .accountsPartial({
-        depositor: args.depositor,
-        vault: args.vault,
-        vaultTraderState: ts.address,
-        vaultPosition: pos.address,
-        insuranceFund: fund.address,
-        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .remainingAccounts(remaining)
       .instruction();

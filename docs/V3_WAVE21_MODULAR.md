@@ -215,12 +215,42 @@ Cannot be done with a simple program upgrade.
       cancels via core's existing cancel ix to refund rent (cleaner
       than cross-program close at this stage).
 
-### Phase 4 — Sunset the legacy ixs in core
+### Phase 4 — Sunset the legacy ixs in core ✅ SHIPPED
 
-  12. Mark core's trigger / TWAP / iceberg / vault ixs as `#[deprecated]`.
-  13. After 1 release cycle, delete them.
-  14. Singleton `FlpExposureAccount` becomes a wind-down account: only
-      `withdraw_flp_capital` allowed.
+  Soft-cutover model: delete PLACEMENT (close door on new legacy)
+  while keeping execute / cancel / replenish / withdraw to drain
+  existing legacy state. Industry-standard pattern.
+
+  Deleted from core (7 placement ixs + 7 ctxs + 7 events + helpers):
+
+    Trigger    : `place_trigger_order`
+    TWAP       : `place_twap_order`
+    Iceberg    : `place_iceberg_order_v2`
+    Bracket    : `place_bracket_order_v2`
+    Vault      : `create_vault`, `deposit_to_vault`, `withdraw_from_vault`
+    Helper     : `compute_vault_mtm_nav` (only used by deleted vault ixs)
+
+  Kept in core (drain mode for already-placed legacy):
+
+    Trigger    : `execute_trigger_order_v2`, `cancel_trigger_order`,
+                 `update_trailing_stop` (no v3 equivalent — trailing-stop
+                 fields dropped from `TriggerOrderAccountV3`)
+    TWAP       : `execute_twap_slice_v2`, `cancel_twap_order`
+    Iceberg    : `replenish_iceberg_v2`, `cancel_iceberg_v2`
+    FLP        : `deposit_flp_capital`, `withdraw_flp_capital` (legacy
+                 singleton `FlpExposureAccount` is wind-down only;
+                 `apply_flp_fill` integration tests still depend on
+                 it for setup)
+    Vault      : `settle_vault_perf_fee` (no v3 perf-fee yet — separate
+                 follow-up)
+
+  SDK builders for the 7 deleted ixs gone; demo script updated to
+  reference v3 wrapper paths.
+
+  When all legacy state has migrated (via wave-21 phase-10 migration
+  ixs) and traders have closed legacy accounts via the kept cancel
+  ixs, a future cleanup pass can delete the remaining drain-mode ixs
+  + their account types from `state.rs`.
 
 ## Backward compatibility
 
