@@ -22,6 +22,7 @@ pub mod hypertree;
 pub mod matcher;
 pub mod state;
 pub mod state_v2;
+pub mod state_v3;
 
 pub use errors::FlashBookError;
 
@@ -50,16 +51,18 @@ pub mod flash_book {
 
     // ─── Setup ──────────────────────────────────────────────────────
 
-    /// Initialize a new market and all associated PDAs (protocol-deployed).
-    /// Uses the shared `initialize_market_inner` body; the only difference
-    /// from `permissionless_initialize_market` is that `creator` is zeroed
-    /// (no creator share) and params are not envelope-clamped.
+    /// Initialize a new market and all associated PDAs. AUTHORITY-GATED:
+    /// only the protocol authority can deploy markets — Flash Book does
+    /// not support permissionless market creation. The `creator` field
+    /// on the market account is zeroed (no creator share / HIP-3-style
+    /// fee split is paid out unless the authority later patches in a
+    /// curated creator via a future migration ix).
     pub fn initialize_market(
         ctx: Context<InitializeMarket>,
         params: MarketParams,
         initial_oracle_ticks: u64,
     ) -> Result<()> {
-        initialize_market_inner(ctx, params, initial_oracle_ticks, false)
+        initialize_market_inner(ctx, params, initial_oracle_ticks)
     }
 
     /// Initialize the v2 hypertree-backed orderbook for a market.
@@ -621,312 +624,13 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Wave 21 phase 2 — CPI variant of `place_limit_order_v2`. Called
-    /// by wrapper programs (`flash-book-orders`, `-flp`, `-vaults`) via
-    /// `invoke_signed` to place orders on behalf of traders WITHOUT
-    /// the trader directly signing the core ix. The wrapper signs over
-    /// its `[CPI_AUTHORITY_SEED]` PDA; core verifies the signer is one
-    /// of the 3 expected derivations (anything else fails).
-    ///
-    /// Trust model: the wrapper has full authority over the trader's
-    /// order placement decision via its OWN state (trigger account,
-    /// vault deposit, etc.) — it already authenticated the trader's
-    /// intent at trigger / deposit time. Core trusts the wrapper to
-    /// inject an order with the trader's pubkey stamped on it.
-    ///
-    /// Pure parity with the trader-signed `place_limit_order_v2` for
-    /// every validation gate (status, min lots, tick alignment, OI cap,
-    /// expiry, flag-bit mask). Different ix entry, identical economic
-    /// behavior.
-    pub fn place_limit_order_v2_cpi(
-        ctx: Context<PlaceLimitOrderV2Cpi>,
-        side: u8,
-        size_lots: u64,
-        limit_ticks: u64,
-        flags: u8,
-        expires_at_slot: u64,
-    ) -> Result<()> {
-        // Wrapper-program signer check (~18K CU for the 3 PDA derivations).
-        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
-        let cpi_signer = ctx.accounts.cpi_authority.key();
+    // ─── REMOVED: wrapper-program CPI ixs (place_limit_order_v2_cpi,
+    // cpi_release_collateral_to_user, cpi_open_trader_state_for_trader,
+    // cpi_credit_collateral, cpi_debit_collateral, cancel_order_v2_cpi)
+    // were the cross-program CPI gate used by the now-merged wrapper
+    // programs. With monolithic flash_book the wrapper-authority gate is
+    // gone — V3 ixs operate directly.
 
-        // Mirror place_limit_order_v2 intake validation.
-        require!(side <= 1, FlashBookError::OutOfRange);
-        require!(size_lots > 0, FlashBookError::ZeroSize);
-        require!(limit_ticks > 0, FlashBookError::ZeroPrice);
-        require!(flags & !0b0011_1111 == 0, FlashBookError::OutOfRange);
-        let now_slot = Clock::get()?.slot;
-        if expires_at_slot > 0 {
-            require!(expires_at_slot > now_slot, FlashBookError::OutOfRange);
-        }
-
-        let market = &ctx.accounts.market;
-        require!(
-            market.status == MarketStatus::Active as u8
-                || market.status == MarketStatus::PostOnly as u8,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            size_lots >= market.params.min_base_lots,
-            FlashBookError::SizeBelowMinLot
-        );
-        require!(
-            limit_ticks % market.params.tick_size == 0,
-            FlashBookError::PriceNotOnTick
-        );
-
-        let oi_cap = market.params.max_oi_base_lots;
-        if oi_cap > 0 {
-            let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
-            let projected = cur.saturating_add(size_lots);
-            require!(projected <= oi_cap, FlashBookError::OpenInterestCapExceeded);
-        }
-
-        let trader_pk = ctx.accounts.trader.key();
-        let market_key = market.key();
-
-        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
-        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
-        require!(
-            handle.header.market_pubkey == market_key,
-            FlashBookError::WrongMarket
-        );
-
-        let seq = handle
-            .header
-            .order_seq_counter
-            .checked_add(1)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        handle.header.order_seq_counter = seq;
-
-        let side_is_bid = side == 0;
-        let order = state_v2::RestingOrderV2 {
-            order_id: state_v2::encode_order_id(limit_ticks, seq, side_is_bid),
-            seq,
-            price_ticks: limit_ticks,
-            size_lots,
-            expires_at_slot,
-            trader: trader_pk,
-            last_valid_slot: now_slot as u32,
-            side,
-            order_type: 0,
-            flags,
-            _pad: 0,
-        };
-        let inserted_idx = if side_is_bid {
-            handle.insert_bid(order)?
-        } else {
-            handle.insert_ask(order)?
-        };
-
-        emit!(OrderPlacedV2CpiEvent {
-            market: market_key,
-            trader: trader_pk,
-            seq,
-            side,
-            price_ticks: limit_ticks,
-            size_lots,
-            node_index: inserted_idx,
-            total_orders_after: handle.header.total_orders_active,
-            cpi_authority: cpi_signer,
-        });
-        Ok(())
-    }
-
-    /// Wave 21 phase 8b/9b — inverse CPI release of quote collateral
-    /// from the protocol's quote_vault to a user's ATA. Only callable
-    /// by the 3 wrapper programs' CPI authority PDAs. Used by:
-    ///
-    ///   • flash-book-flp's `flp_withdraw_v3` — pays an LP burning
-    ///     shares back into their ATA
-    ///   • flash-book-vaults' `vault_withdraw_v3` — pays a vault
-    ///     depositor burning shares back into their ATA
-    ///
-    /// Core signs the SPL transfer as `InsuranceFundAccount` (the
-    /// vault's authority); the wrapper authenticates the WHO + HOW
-    /// MUCH via its own state.
-    ///
-    /// Trust model: same as `place_limit_order_v2_cpi` — wrapper
-    /// authority PDAs are whitelisted; once accepted, core trusts
-    /// the wrapper's calculation of the release amount. This is
-    /// safe because (a) the wrapper signed for a SPECIFIC trader
-    /// (off-chain reconciliation against the wrapper's burn event
-    /// catches misroutes); (b) total exposure is bounded by the
-    /// wrapper's own balance accounting.
-    pub fn cpi_release_collateral_to_user(
-        ctx: Context<CpiReleaseCollateralToUser>,
-        amount_quote_lots: u64,
-    ) -> Result<()> {
-        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-
-        // Wrapper signer check — same 3-PDA whitelist as
-        // place_limit_order_v2_cpi (helper centralizes the gate).
-        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
-        let cpi_signer = ctx.accounts.cpi_authority.key();
-
-        // SPL transfer signed by InsuranceFund PDA.
-        let bump = ctx.accounts.insurance_fund.bump;
-        let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
-        let signers = &[signer_seeds];
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.quote_vault.to_account_info(),
-            to: ctx.accounts.user_quote_ata.to_account_info(),
-            authority: ctx.accounts.insurance_fund.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signers,
-        );
-        token::transfer(cpi_ctx, amount_quote_lots)?;
-
-        emit!(WrapperCollateralReleasedEvent {
-            cpi_authority: cpi_signer,
-            user: ctx.accounts.user_quote_ata.owner,
-            amount: amount_quote_lots,
-        });
-        Ok(())
-    }
-
-    /// WAVE 22 / Phase 5 — vault-trading helpers (wrapper-authorized).
-    /// All four ixs here are gated by the same 3-PDA whitelist
-    /// (orders / flp / vaults program CPI authority) used by
-    /// `place_limit_order_v2_cpi` and `cpi_release_collateral_to_user`.
-
-    /// Bootstrap a `TraderStateAccount` for an arbitrary `trader_pk`
-    /// (typically a wrapper-program PDA — e.g. a vault PDA in
-    /// flash-book-vaults). Trader cannot sign for themselves because
-    /// they are a PDA; this ix lets the wrapper open the account on
-    /// their behalf, signed by the wrapper's CPI authority.
-    pub fn cpi_open_trader_state_for_trader(
-        ctx: Context<CpiOpenTraderStateForTrader>,
-    ) -> Result<()> {
-        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
-        let s = &mut ctx.accounts.trader_state;
-        s.trader = ctx.accounts.trader_owner.key();
-        s.bump = ctx.bumps.trader_state;
-        s.collateral_quote_lots = 0;
-        s.realized_pnl_quote_lots = 0;
-        s.open_positions = 0;
-        s.toxicity_score_bps = 0;
-        s.orders_this_batch = 0;
-        s.last_batch_seen = 0;
-        s.fee_discount_bps = 0;
-        s.delegate = Pubkey::default();
-        s.referrer = Pubkey::default();
-        s.builder = Pubkey::default();
-        s.builder_max_fee_share_bps = 0;
-        s.volume_30d_quote_lots = 0;
-        s.volume_window_start_slot = Clock::get()?.slot;
-        emit!(WrapperTraderStateOpenedEvent {
-            cpi_authority: ctx.accounts.cpi_authority.key(),
-            trader: s.trader,
-        });
-        Ok(())
-    }
-
-    /// Credit a `TraderStateAccount.collateral_quote_lots` by `amount`.
-    /// Wrapper-authorized — used by `vault_deposit_v3` after the SPL
-    /// transfer lands in `quote_vault` so the vault PDA has trading
-    /// capital recognized by core's margin gate.
-    pub fn cpi_credit_collateral(
-        ctx: Context<CpiCreditOrDebitCollateral>,
-        amount_quote_lots: u64,
-    ) -> Result<()> {
-        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
-        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-        let s = &mut ctx.accounts.trader_state;
-        s.collateral_quote_lots = s
-            .collateral_quote_lots
-            .checked_add(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        emit!(WrapperCollateralCreditedEvent {
-            cpi_authority: ctx.accounts.cpi_authority.key(),
-            trader: s.trader,
-            amount: amount_quote_lots,
-            new_collateral: s.collateral_quote_lots,
-        });
-        Ok(())
-    }
-
-    /// Debit a `TraderStateAccount.collateral_quote_lots` by `amount`.
-    /// Wrapper-authorized — used by `vault_withdraw_v3` BEFORE the
-    /// inverse-CPI SPL release so the vault's core collateral matches
-    /// what's been paid out.
-    pub fn cpi_debit_collateral(
-        ctx: Context<CpiCreditOrDebitCollateral>,
-        amount_quote_lots: u64,
-    ) -> Result<()> {
-        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
-        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-        let s = &mut ctx.accounts.trader_state;
-        s.collateral_quote_lots = s
-            .collateral_quote_lots
-            .checked_sub(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
-        emit!(WrapperCollateralDebitedEvent {
-            cpi_authority: ctx.accounts.cpi_authority.key(),
-            trader: s.trader,
-            amount: amount_quote_lots,
-            new_collateral: s.collateral_quote_lots,
-        });
-        Ok(())
-    }
-
-    /// Wave 22 / Phase 5 — wrapper-authorized cancel of a resting v2
-    /// order. Counterpart to `place_limit_order_v2_cpi`. Used by
-    /// `flash-book-vaults`' `vault_cancel_order_v3` so the strategist
-    /// can manage vault-PDA orders.
-    pub fn cancel_order_v2_cpi(
-        ctx: Context<CancelOrderV2Cpi>,
-        side: u8,
-        order_id: u64,
-    ) -> Result<()> {
-        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
-        require!(side <= 1, FlashBookError::OutOfRange);
-        let trader_pk = ctx.accounts.trader.key();
-        let market_key = ctx.accounts.market.key();
-
-        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
-        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
-        require!(
-            handle.header.market_pubkey == market_key,
-            FlashBookError::WrongMarket
-        );
-
-        let side_is_bid = side == 0;
-        let idx = if side_is_bid {
-            handle.lookup_bid_by_order_id(order_id)
-        } else {
-            handle.lookup_ask_by_order_id(order_id)
-        };
-        require!(
-            idx != crate::hypertree::NIL,
-            FlashBookError::LiquidationStale
-        );
-
-        let order_seq = {
-            let order = handle.order_at(idx);
-            require!(order.trader == trader_pk, FlashBookError::WrongTrader);
-            order.seq
-        };
-
-        if side_is_bid {
-            handle.remove_bid_node(idx);
-        } else {
-            handle.remove_ask_node(idx);
-        }
-
-        emit!(OrderCancelledV2Event {
-            market: market_key,
-            trader: trader_pk,
-            order_seq,
-            side,
-            node_index: idx,
-            total_orders_after: handle.header.total_orders_active,
-        });
-        Ok(())
-    }
 
     /// V2 cancel: remove a resting order from the hypertree. Validates
     /// that the caller is the original trader (orders carry trader pubkey
@@ -2435,10 +2139,13 @@ pub mod flash_book {
             }
         }
 
-        // ── HIP-3 creator share (permissionless market deployer) ─────
-        // When the market was deployed permissionlessly, credit the
-        // deployer with `creator_share_bps` of net fee. Pull-based
-        // event — no on-chain creator account walk on the hot path.
+        // ── Curated-creator share ────────────────────────────────────
+        // If the market was migrated to a curated creator by the
+        // protocol authority, credit the creator with
+        // `creator_share_bps` of net fee. Pull-based event — no on-chain
+        // creator account walk on the hot path. For authority-deployed
+        // markets `market.creator == Pubkey::default()` and this branch
+        // is a no-op (no permissionless market creation in V3).
         let market_creator = market.creator;
         if market_creator != Pubkey::default() && market.params.creator_share_bps > 0 {
             let share = ((net_fee as u128)
@@ -4735,181 +4442,6 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Post a slashable HIP-3 deployer bond on a market. The bond signals
-    /// the depositor's commitment to the market's solvency; if the
-    /// market goes bad (oracle stale, mass insolvent liqs, etc.),
-    /// protocol governance can `slash_market_bond` to transfer up to
-    /// the full bond into the insurance fund.
-    ///
-    /// Caller signs and is the depositor (each bond is per (market,
-    /// depositor) pair — anyone can post bond on any market). SPL
-    /// transfer from depositor's quote ATA to the protocol vault. The
-    /// MarketBondAccount tracks the depositor's claim.
-    ///
-    /// Posting bond does NOT change creator share or market params; it's
-    /// a purely additive commitment signal. Off-chain UIs can rank
-    /// markets by total bond amount (sum across all bond accounts for
-    /// a market).
-    pub fn post_market_bond(
-        ctx: Context<PostMarketBond>,
-        amount_quote_lots: u64,
-    ) -> Result<()> {
-        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-
-        // SPL transfer to protocol vault (same vault as collateral / FLP).
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.depositor_quote_ata.to_account_info(),
-            to: ctx.accounts.quote_vault.to_account_info(),
-            authority: ctx.accounts.depositor.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-        );
-        token::transfer(cpi_ctx, amount_quote_lots)?;
-
-        let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
-        let bond = &mut ctx.accounts.market_bond;
-        // Lazy init on first post.
-        if bond.depositor == Pubkey::default() {
-            bond.market = ctx.accounts.market.key();
-            bond.depositor = ctx.accounts.depositor.key();
-            bond.bump = ctx.bumps.market_bond;
-            bond._pad0 = [0u8; 7];
-            bond.deposited_at_unix = now_unix;
-            bond.total_slashed_quote_lots = 0;
-        }
-        bond.amount_quote_lots = bond
-            .amount_quote_lots
-            .checked_add(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        // Adding more bond cancels any pending unbond request — the
-        // depositor is signalling they want to keep the bond live.
-        bond.unbond_request_at_unix = 0;
-
-        emit!(MarketBondPostedEvent {
-            market: bond.market,
-            depositor: bond.depositor,
-            amount_quote_lots,
-            new_total_quote_lots: bond.amount_quote_lots,
-        });
-        Ok(())
-    }
-
-    /// Request to unbond. Sets the unbond timestamp; bond cannot be
-    /// claimed until BOND_UNBOND_DELAY_SECONDS elapses. The delay
-    /// prevents withdraw-before-slash races. Re-posting bond cancels
-    /// the request (signals continued commitment).
-    pub fn request_unbond_market_bond(
-        ctx: Context<UnbondMarketBondAuth>,
-    ) -> Result<()> {
-        let bond = &mut ctx.accounts.market_bond;
-        require!(bond.amount_quote_lots > 0, FlashBookError::BondTooSmall);
-        let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
-        bond.unbond_request_at_unix = now_unix;
-        emit!(MarketBondUnbondRequestedEvent {
-            market: bond.market,
-            depositor: bond.depositor,
-            requested_at_unix: now_unix,
-            claimable_at_unix: now_unix.saturating_add(constants::BOND_UNBOND_DELAY_SECONDS),
-        });
-        Ok(())
-    }
-
-    /// Claim unbonded bond. Requires `unbond_request_at_unix > 0` AND
-    /// `now ≥ unbond_request_at_unix + BOND_UNBOND_DELAY_SECONDS`.
-    /// Transfers the FULL outstanding amount back to depositor's ATA;
-    /// MarketBondAccount stays open with amount = 0 (re-postable).
-    pub fn claim_unbonded_market_bond(
-        ctx: Context<ClaimUnbondedMarketBond>,
-    ) -> Result<()> {
-        let bond = &ctx.accounts.market_bond;
-        require!(bond.amount_quote_lots > 0, FlashBookError::BondTooSmall);
-        require!(
-            bond.unbond_request_at_unix > 0,
-            FlashBookError::BondUnbondingDelay
-        );
-        let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
-        let claimable_at = bond
-            .unbond_request_at_unix
-            .saturating_add(constants::BOND_UNBOND_DELAY_SECONDS);
-        require!(now_unix >= claimable_at, FlashBookError::BondUnbondingDelay);
-
-        let amount = bond.amount_quote_lots;
-
-        // SPL transfer back: insurance_fund PDA signs.
-        let bump = ctx.accounts.insurance_fund.bump;
-        let seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
-        let signer = &[seeds];
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.quote_vault.to_account_info(),
-            to: ctx.accounts.depositor_quote_ata.to_account_info(),
-            authority: ctx.accounts.insurance_fund.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signer,
-        );
-        token::transfer(cpi_ctx, amount)?;
-
-        let bond = &mut ctx.accounts.market_bond;
-        bond.amount_quote_lots = 0;
-        bond.unbond_request_at_unix = 0;
-
-        emit!(MarketBondClaimedEvent {
-            market: bond.market,
-            depositor: bond.depositor,
-            amount_quote_lots: amount,
-        });
-        Ok(())
-    }
-
-    /// Slash a deployer bond. Protocol authority signs (single source of
-    /// truth: insurance_fund.authority). Transfers `amount` quote-lots
-    /// from the bond into the insurance fund's balance.
-    /// Funds physically stay in the same vault — only the accounting
-    /// changes (decrement bond, increment insurance balance).
-    ///
-    /// Slash conditions are enforced off-chain by governance + monitors
-    /// (oracle staleness, insolvency events). On-chain we trust the
-    /// authority — same trust model as `withdraw_insurance_fund`.
-    pub fn slash_market_bond(
-        ctx: Context<SlashMarketBond>,
-        amount_quote_lots: u64,
-    ) -> Result<()> {
-        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-        let bond = &mut ctx.accounts.market_bond;
-        require!(
-            amount_quote_lots <= bond.amount_quote_lots,
-            FlashBookError::BondTooSmall
-        );
-        bond.amount_quote_lots = bond.amount_quote_lots.saturating_sub(amount_quote_lots);
-        bond.total_slashed_quote_lots = bond
-            .total_slashed_quote_lots
-            .saturating_add(amount_quote_lots);
-        // Cancel any pending unbond — slashing is a state change that
-        // resets the unbond clock.
-        bond.unbond_request_at_unix = 0;
-
-        let fund = &mut ctx.accounts.insurance_fund;
-        fund.balance_quote_lots = fund
-            .balance_quote_lots
-            .checked_add(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        fund.total_contributions = fund
-            .total_contributions
-            .saturating_add(amount_quote_lots);
-
-        emit!(MarketBondSlashedEvent {
-            market: bond.market,
-            depositor: bond.depositor,
-            amount_quote_lots,
-            remaining_bond_quote_lots: bond.amount_quote_lots,
-        });
-        Ok(())
-    }
-
     /// AUTO-DELEVERAGE — the safety primitive of last resort. When the
     /// insurance fund falls below `pause_threshold_quote_lots`, a sick
     /// position cannot be safely liquidated through the normal flow
@@ -5353,140 +4885,1434 @@ pub mod flash_book {
     // 2.1-compatible release we can swap to it drop-in via the Delegate /
     // Undelegate ix builders in `src/er.rs`.
 
-    /// HIP-3 / permissionless market deployment. ANY signer can call this
-    /// to deploy a new market — no protocol authority gating. The caller
-    /// becomes BOTH the market authority AND the creator (earns
-    /// `creator_share_bps` of net fee on every fill, forever). Params
-    /// are clamped to a SAFE ENVELOPE that prevents griefing the FLP /
-    /// users with hostile economics:
-    ///
-    ///   • max_leverage capped at MAX_PERMISSIONLESS_LEVERAGE (20×)
-    ///   • taker_fee_bps clamped to [10, 200] (0.1% – 2%)
-    ///   • maker_rebate_bps ≤ taker_fee_bps × 80%
-    ///   • maintenance_margin_ratio_bps ≥ 200 (2% floor)
-    ///   • initial_margin_ratio_bps ≥ maintenance × 2
-    ///   • liq_penalty_bps ∈ [50, 500]
-    ///   • creator_share_bps ≤ MAX_PERMISSIONLESS_CREATOR_SHARE_BPS (3000)
-    ///   • builder_share_bps ≤ 1500, referrer_share_bps ≤ 2500
-    ///   • max_position_lots_per_trader > 0 (must be set; no unlimited)
-    ///   • max_position_ratio_bps > 0 and ≤ 100 (≤ 1% of FLP per trader)
-    ///   • toxicity_tax_max_bps ≤ 50 (anti-griefing taxes capped)
-    ///
-    /// Anything outside the envelope rejects with OutOfRange. Inside, the
-    /// market deploys with creator = caller, authority = caller. The
-    /// caller can later call update_market_params to tune within the
-    /// envelope (the envelope is re-applied on every update).
-    ///
-    /// No bond is required in v1 — the safe envelope alone gates
-    /// griefing. A future version may add a slashable HYPE-style bond
-    /// to back the FLP exposure on the new market.
-    pub fn permissionless_initialize_market(
-        ctx: Context<InitializeMarket>,
-        params: MarketParams,
-        initial_oracle_ticks: u64,
+    // ─── V3 monolithic ixs (merged from former wrapper programs) ─────
+    //
+    // The 3 wrapper programs (`flash-book-orders`, `flash-book-flp`,
+    // `flash-book-vaults`) have been collapsed into core. All V3 PDAs
+    // (trigger_v3, twap_v3, iceberg_v3, vault_v3, vault_position_v3,
+    // flp_per_market, flp_position_v3) now live under THIS program ID.
+    // The wrapper CPI authority + 3-program whitelist are gone — these
+    // ixs do their work directly without invoke_signed across program
+    // boundaries.
+
+    // ─── Trigger orders v3 ──────────────────────────────────────────
+
+    /// Create a v3 trigger order PDA. Same trigger semantics as
+    /// `execute_trigger_order_v2` (validates side / kind / size / price /
+    /// tick alignment / expiry).
+    /// PDA seeds: `[b"trigger_v3", market, trader, trigger_id]`.
+    pub fn place_trigger_order_v3(
+        ctx: Context<PlaceTriggerOrderV3>,
+        trigger_id: u8,
+        side: u8,
+        kind: u8,
+        size_lots: u64,
+        trigger_price_ticks: u64,
+        limit_price_ticks: u64,
+        reduce_only: bool,
+        expires_at_slot: u64,
     ) -> Result<()> {
-        let clamped = clamp_permissionless_params(&params)?;
-        // Reuse the canonical init logic — same state-init invariants —
-        // and then patch the creator field after.
-        initialize_market_inner(ctx, clamped, initial_oracle_ticks, true)
-    }
-}
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(kind <= 1, FlashBookError::OutOfRange);
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(trigger_price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(limit_price_ticks > 0, FlashBookError::ZeroPrice);
 
-/// Permissionless market params validation. Returns an error if the
-/// params are outside the safe envelope; returns the clamped params on
-/// success. Clamps fields silently where it can (e.g. taker_fee 5 →
-/// MIN_PERMISSIONLESS_TAKER_FEE_BPS); rejects where ambiguity would be
-/// dangerous (e.g. max_leverage > cap).
-fn clamp_permissionless_params(p: &MarketParams) -> Result<MarketParams> {
-    const MAX_PERMISSIONLESS_LEVERAGE: u32 = 20;
-    const MIN_PERMISSIONLESS_TAKER_FEE_BPS: u32 = 10;
-    const MAX_PERMISSIONLESS_TAKER_FEE_BPS: u32 = 200;
-    const MIN_PERMISSIONLESS_MAINT_MARGIN_BPS: u32 = 200;
-    const MIN_PERMISSIONLESS_LIQ_PENALTY_BPS: u32 = 50;
-    const MAX_PERMISSIONLESS_LIQ_PENALTY_BPS: u32 = 500;
-    const MAX_PERMISSIONLESS_CREATOR_SHARE_BPS: u32 = 3_000;
-    const MAX_PERMISSIONLESS_BUILDER_SHARE_BPS: u32 = 1_500;
-    const MAX_PERMISSIONLESS_REFERRER_SHARE_BPS: u32 = 2_500;
-    const MAX_PERMISSIONLESS_POS_RATIO_BPS: u32 = 100;
-    const MAX_PERMISSIONLESS_TOXICITY_TAX_BPS: u32 = 50;
-
-    require!(
-        p.max_leverage >= 1 && p.max_leverage <= MAX_PERMISSIONLESS_LEVERAGE,
-        FlashBookError::OutOfRange
-    );
-    require!(
-        p.taker_fee_bps >= MIN_PERMISSIONLESS_TAKER_FEE_BPS
-            && p.taker_fee_bps <= MAX_PERMISSIONLESS_TAKER_FEE_BPS,
-        FlashBookError::OutOfRange
-    );
-    // maker_rebate_bps is SIGNED (i32). Permissionless markets cap the
-    // POSITIVE rebate at 80% of taker fee (insurance fund must net >0
-    // on every fill). Negative values (= maker fee) are bounded by
-    // MAX_FEE_TIER_BPS in absolute terms — large maker fees would
-    // discourage MM and harm liquidity, so we reuse the same cap.
-    let max_maker_rebate = (p.taker_fee_bps as u64).saturating_mul(80) / 100;
-    if p.maker_rebate_bps >= 0 {
+        let market = &ctx.accounts.market;
         require!(
-            (p.maker_rebate_bps as u64) <= max_maker_rebate,
+            size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            limit_price_ticks % market.params.tick_size == 0,
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            trigger_price_ticks % market.params.tick_size == 0,
+            FlashBookError::PriceNotOnTick
+        );
+
+        let now = Clock::get()?.slot;
+        if expires_at_slot > 0 {
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
+
+        let trigger = &mut ctx.accounts.trigger_order;
+        trigger.trader = ctx.accounts.trader.key();
+        trigger.market = market.key();
+        trigger.bump = ctx.bumps.trigger_order;
+        trigger.trigger_id = trigger_id;
+        trigger.side = side;
+        trigger.kind = kind;
+        trigger.flags = state_v3::TriggerOrderAccountV3::FLAG_ACTIVE
+            | if reduce_only { state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY } else { 0 };
+        trigger.size_lots = size_lots;
+        trigger.trigger_price_ticks = trigger_price_ticks;
+        trigger.limit_price_ticks = limit_price_ticks;
+        trigger.created_at_slot = now;
+        trigger.expires_at_slot = expires_at_slot;
+
+        emit!(TriggerOrderV3PlacedEvent {
+            market: market.key(),
+            trader: trigger.trader,
+            trigger_id,
+            side,
+            kind,
+            size_lots,
+            trigger_price_ticks,
+            limit_price_ticks,
+        });
+        Ok(())
+    }
+
+    /// Execute a v3 trigger — validates fire condition then injects the
+    /// resulting limit order into the hypertree directly (no CPI). The
+    /// caller is permissionless; trader was pre-authorized at placement.
+    pub fn execute_trigger_order_v3(ctx: Context<ExecuteTriggerOrderV3>) -> Result<()> {
+        let trigger = &ctx.accounts.trigger_order;
+        let market = &ctx.accounts.market;
+        require!(
+            trigger.flags & state_v3::TriggerOrderAccountV3::FLAG_ACTIVE != 0,
             FlashBookError::OutOfRange
         );
-    } else {
+
+        let now = Clock::get()?.slot;
+        if trigger.expires_at_slot > 0 {
+            require!(trigger.expires_at_slot >= now, FlashBookError::OutOfRange);
+        }
+
+        let oracle = market.oracle_price_ticks;
+        let fired = if trigger.kind == 0 {
+            oracle <= trigger.trigger_price_ticks
+        } else {
+            oracle >= trigger.trigger_price_ticks
+        };
+        require!(fired, FlashBookError::OutOfRange);
+
+        if trigger.flags & state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY != 0 {
+            let position = &ctx.accounts.position;
+            require!(position.size_lots > 0, FlashBookError::OutOfRange);
+            require!(position.side != trigger.side, FlashBookError::OutOfRange);
+            require!(
+                trigger.size_lots <= position.size_lots,
+                FlashBookError::OutOfRange
+            );
+        }
+
+        let side = trigger.side;
+        let size_lots = trigger.size_lots;
+        let limit_ticks = trigger.limit_price_ticks;
+        let trigger_id = trigger.trigger_id;
+        let trader_pk = trigger.trader;
+        let market_key = market.key();
+
+        // Inline order injection into the hypertree.
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
         require!(
-            ((-p.maker_rebate_bps) as u32) <= constants::MAX_FEE_TIER_BPS,
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+        let seq = handle
+            .header
+            .order_seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+        handle.header.order_seq_counter = seq;
+
+        let side_is_bid = side == 0;
+        let order = state_v2::RestingOrderV2 {
+            order_id: state_v2::encode_order_id(limit_ticks, seq, side_is_bid),
+            seq,
+            price_ticks: limit_ticks,
+            size_lots,
+            expires_at_slot: 0,
+            trader: trader_pk,
+            last_valid_slot: now as u32,
+            side,
+            order_type: 0,
+            flags: 0,
+            _pad: 0,
+        };
+        let inserted_idx = if side_is_bid {
+            handle.insert_bid(order)?
+        } else {
+            handle.insert_ask(order)?
+        };
+        drop(book_data);
+
+        let trigger = &mut ctx.accounts.trigger_order;
+        trigger.flags &= !state_v3::TriggerOrderAccountV3::FLAG_ACTIVE;
+
+        emit!(TriggerOrderV3ExecutedEvent {
+            market: market_key,
+            trader: trader_pk,
+            trigger_id,
+            executor: ctx.accounts.caller.key(),
+            oracle_price_ticks: oracle,
+            order_seq: seq,
+            node_index: inserted_idx,
+        });
+        Ok(())
+    }
+
+    /// Cancel a v3 trigger and close the account, refunding rent.
+    pub fn cancel_trigger_order_v3(ctx: Context<CancelTriggerOrderV3>) -> Result<()> {
+        let trader = ctx.accounts.trader.key();
+        require!(
+            ctx.accounts.trigger_order.trader == trader,
+            FlashBookError::WrongTrader
+        );
+        emit!(TriggerOrderV3CancelledEvent {
+            market: ctx.accounts.trigger_order.market,
+            trader,
+            trigger_id: ctx.accounts.trigger_order.trigger_id,
+        });
+        Ok(())
+    }
+
+    // ─── TWAP orders v3 ─────────────────────────────────────────────
+
+    /// Create a v3 TWAP order PDA.
+    pub fn place_twap_order_v3(
+        ctx: Context<PlaceTwapOrderV3>,
+        twap_id: u8,
+        side: u8,
+        slice_size_lots: u64,
+        total_size_lots: u64,
+        limit_price_ticks: u64,
+        slot_interval: u64,
+        end_slot: u64,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(slice_size_lots > 0, FlashBookError::ZeroSize);
+        require!(total_size_lots >= slice_size_lots, FlashBookError::OutOfRange);
+        require!(limit_price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(slot_interval > 0, FlashBookError::OutOfRange);
+
+        let market = &ctx.accounts.market;
+        require!(
+            limit_price_ticks % market.params.tick_size == 0,
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            slice_size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+
+        let now = Clock::get()?.slot;
+        if end_slot > 0 {
+            require!(end_slot > now, FlashBookError::OutOfRange);
+        }
+
+        let twap = &mut ctx.accounts.twap_order;
+        twap.trader = ctx.accounts.trader.key();
+        twap.market = market.key();
+        twap.bump = ctx.bumps.twap_order;
+        twap.twap_id = twap_id;
+        twap.side = side;
+        twap.flags = state_v3::TwapOrderAccountV3::FLAG_ACTIVE;
+        twap.slice_size_lots = slice_size_lots;
+        twap.total_size_lots = total_size_lots;
+        twap.size_executed_lots = 0;
+        twap.limit_price_ticks = limit_price_ticks;
+        twap.start_slot = now;
+        twap.slot_interval = slot_interval;
+        twap.end_slot = end_slot;
+        twap.last_slice_at_slot = 0;
+
+        emit!(TwapOrderV3PlacedEvent {
+            market: market.key(),
+            trader: twap.trader,
+            twap_id,
+            side,
+            total_size_lots,
+            slice_size_lots,
+            limit_price_ticks,
+            slot_interval,
+        });
+        Ok(())
+    }
+
+    /// Permissionless TWAP slice executor.
+    pub fn execute_twap_slice_v3(ctx: Context<ExecuteTwapSliceV3>) -> Result<()> {
+        let twap = &ctx.accounts.twap_order;
+        let market = &ctx.accounts.market;
+        require!(
+            twap.flags & state_v3::TwapOrderAccountV3::FLAG_ACTIVE != 0,
             FlashBookError::OutOfRange
         );
+
+        let now = Clock::get()?.slot;
+        if twap.end_slot > 0 {
+            require!(twap.end_slot >= now, FlashBookError::OutOfRange);
+        }
+        require!(
+            now >= twap.last_slice_at_slot.saturating_add(twap.slot_interval),
+            FlashBookError::OutOfRange
+        );
+
+        let remaining = twap
+            .total_size_lots
+            .checked_sub(twap.size_executed_lots)
+            .ok_or_else(|| error!(FlashBookError::OutOfRange))?;
+        require!(remaining > 0, FlashBookError::OutOfRange);
+        let slice_size = core::cmp::min(twap.slice_size_lots, remaining);
+        require!(
+            slice_size >= market.params.min_base_lots || slice_size == remaining,
+            FlashBookError::SizeBelowMinLot
+        );
+
+        let side = twap.side;
+        let limit = twap.limit_price_ticks;
+        let twap_id = twap.twap_id;
+        let trader_pk = twap.trader;
+        let market_key = market.key();
+
+        // Inline order injection.
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        require!(
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+        let seq = handle
+            .header
+            .order_seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+        handle.header.order_seq_counter = seq;
+
+        let side_is_bid = side == 0;
+        let order = state_v2::RestingOrderV2 {
+            order_id: state_v2::encode_order_id(limit, seq, side_is_bid),
+            seq,
+            price_ticks: limit,
+            size_lots: slice_size,
+            expires_at_slot: 0,
+            trader: trader_pk,
+            last_valid_slot: now as u32,
+            side,
+            order_type: 0,
+            flags: 0,
+            _pad: 0,
+        };
+        let inserted_idx = if side_is_bid {
+            handle.insert_bid(order)?
+        } else {
+            handle.insert_ask(order)?
+        };
+        drop(book_data);
+
+        let twap = &mut ctx.accounts.twap_order;
+        twap.size_executed_lots = twap
+            .size_executed_lots
+            .checked_add(slice_size)
+            .ok_or_else(|| error!(FlashBookError::OutOfRange))?;
+        twap.last_slice_at_slot = now;
+        if twap.size_executed_lots >= twap.total_size_lots {
+            twap.flags &= !state_v3::TwapOrderAccountV3::FLAG_ACTIVE;
+        }
+
+        emit!(TwapSliceV3ExecutedEvent {
+            market: market_key,
+            trader: trader_pk,
+            twap_id,
+            executor: ctx.accounts.caller.key(),
+            slice_size_lots: slice_size,
+            cumulative_executed_lots: twap.size_executed_lots,
+            order_seq: seq,
+            node_index: inserted_idx,
+        });
+        Ok(())
     }
-    require!(
-        p.maintenance_margin_ratio_bps >= MIN_PERMISSIONLESS_MAINT_MARGIN_BPS,
-        FlashBookError::OutOfRange
-    );
-    require!(
-        p.initial_margin_ratio_bps
-            >= p.maintenance_margin_ratio_bps.saturating_mul(2),
-        FlashBookError::OutOfRange
-    );
-    require!(
-        p.liq_penalty_bps >= MIN_PERMISSIONLESS_LIQ_PENALTY_BPS
-            && p.liq_penalty_bps <= MAX_PERMISSIONLESS_LIQ_PENALTY_BPS,
-        FlashBookError::OutOfRange
-    );
-    require!(
-        p.creator_share_bps <= MAX_PERMISSIONLESS_CREATOR_SHARE_BPS,
-        FlashBookError::OutOfRange
-    );
-    require!(
-        p.builder_share_bps <= MAX_PERMISSIONLESS_BUILDER_SHARE_BPS,
-        FlashBookError::OutOfRange
-    );
-    require!(
-        p.referrer_share_bps <= MAX_PERMISSIONLESS_REFERRER_SHARE_BPS,
-        FlashBookError::OutOfRange
-    );
-    require!(
-        p.max_position_lots_per_trader > 0,
-        FlashBookError::OutOfRange
-    );
-    require!(
-        p.max_position_ratio_bps > 0
-            && p.max_position_ratio_bps <= MAX_PERMISSIONLESS_POS_RATIO_BPS,
-        FlashBookError::OutOfRange
-    );
-    require!(
-        p.toxicity_tax_max_bps <= MAX_PERMISSIONLESS_TOXICITY_TAX_BPS,
-        FlashBookError::OutOfRange
-    );
-    Ok(p.clone())
+
+    /// Cancel a v3 TWAP order and close the account.
+    pub fn cancel_twap_order_v3(ctx: Context<CancelTwapOrderV3>) -> Result<()> {
+        let trader = ctx.accounts.trader.key();
+        require!(
+            ctx.accounts.twap_order.trader == trader,
+            FlashBookError::WrongTrader
+        );
+        let unfilled = ctx
+            .accounts
+            .twap_order
+            .total_size_lots
+            .saturating_sub(ctx.accounts.twap_order.size_executed_lots);
+        emit!(TwapOrderV3CancelledEvent {
+            market: ctx.accounts.twap_order.market,
+            trader,
+            twap_id: ctx.accounts.twap_order.twap_id,
+            unfilled_lots: unfilled,
+        });
+        Ok(())
+    }
+
+    // ─── Iceberg orders v3 ──────────────────────────────────────────
+
+    /// Create a v3 iceberg + seed first visible chunk directly into the
+    /// hypertree.
+    pub fn place_iceberg_order_v3(
+        ctx: Context<PlaceIcebergOrderV3>,
+        iceberg_id: u8,
+        side: u8,
+        total_size_lots: u64,
+        displayed_size_lots: u64,
+        limit_ticks: u64,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(total_size_lots > 0, FlashBookError::ZeroSize);
+        require!(displayed_size_lots > 0, FlashBookError::ZeroSize);
+        require!(
+            displayed_size_lots <= total_size_lots,
+            FlashBookError::OutOfRange
+        );
+        require!(limit_ticks > 0, FlashBookError::ZeroPrice);
+
+        let market = &ctx.accounts.market;
+        require!(
+            displayed_size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            limit_ticks % market.params.tick_size == 0,
+            FlashBookError::PriceNotOnTick
+        );
+
+        let now = Clock::get()?.slot;
+        if expires_at_slot > 0 {
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
+
+        let trader_pk = ctx.accounts.trader.key();
+        let market_key = market.key();
+        let first_chunk = displayed_size_lots.min(total_size_lots);
+
+        // Inline first-chunk insertion.
+        let inserted_seq;
+        {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            require!(
+                handle.header.market_pubkey == market_key,
+                FlashBookError::WrongMarket
+            );
+            let seq = handle
+                .header
+                .order_seq_counter
+                .checked_add(1)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            require!(seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+            handle.header.order_seq_counter = seq;
+
+            let side_is_bid = side == 0;
+            let order = state_v2::RestingOrderV2 {
+                order_id: state_v2::encode_order_id(limit_ticks, seq, side_is_bid),
+                seq,
+                price_ticks: limit_ticks,
+                size_lots: first_chunk,
+                expires_at_slot,
+                trader: trader_pk,
+                last_valid_slot: now as u32,
+                side,
+                order_type: 0,
+                flags: 0,
+                _pad: 0,
+            };
+            if side_is_bid {
+                handle.insert_bid(order)?;
+            } else {
+                handle.insert_ask(order)?;
+            }
+            inserted_seq = seq;
+        }
+
+        let iceberg = &mut ctx.accounts.iceberg_order;
+        iceberg.trader = trader_pk;
+        iceberg.market = market_key;
+        iceberg.bump = ctx.bumps.iceberg_order;
+        iceberg.iceberg_id = iceberg_id;
+        iceberg.side = side;
+        iceberg.flags = state_v3::IcebergOrderAccountV3::FLAG_ACTIVE;
+        iceberg.limit_ticks = limit_ticks;
+        iceberg.total_size_lots = total_size_lots;
+        iceberg.remaining_lots = total_size_lots.saturating_sub(first_chunk);
+        iceberg.displayed_size_lots = displayed_size_lots;
+        iceberg.child_order_seq = inserted_seq;
+        iceberg.created_at_slot = now;
+        iceberg.expires_at_slot = expires_at_slot;
+
+        emit!(IcebergOrderV3PlacedEvent {
+            market: market_key,
+            trader: trader_pk,
+            iceberg_id,
+            side,
+            total_size_lots,
+            displayed_size_lots,
+            limit_ticks,
+            first_chunk_size_lots: first_chunk,
+        });
+        Ok(())
+    }
+
+    /// Replenish v3 iceberg's next chunk — permissionless keeper.
+    pub fn replenish_iceberg_v3(ctx: Context<ReplenishIcebergV3>) -> Result<()> {
+        let iceberg = &ctx.accounts.iceberg_order;
+        let market = &ctx.accounts.market;
+        require!(
+            iceberg.flags & state_v3::IcebergOrderAccountV3::FLAG_ACTIVE != 0,
+            FlashBookError::OutOfRange
+        );
+
+        let now = Clock::get()?.slot;
+        if iceberg.expires_at_slot > 0 {
+            require!(iceberg.expires_at_slot >= now, FlashBookError::OutOfRange);
+        }
+        require!(iceberg.remaining_lots > 0, FlashBookError::OutOfRange);
+
+        let chunk = iceberg.displayed_size_lots.min(iceberg.remaining_lots);
+        let side = iceberg.side;
+        let limit = iceberg.limit_ticks;
+        let expires = iceberg.expires_at_slot;
+        let iceberg_id = iceberg.iceberg_id;
+        let trader_pk = iceberg.trader;
+        let market_key = market.key();
+
+        let inserted_seq;
+        {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            require!(
+                handle.header.market_pubkey == market_key,
+                FlashBookError::WrongMarket
+            );
+            let seq = handle
+                .header
+                .order_seq_counter
+                .checked_add(1)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            require!(seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+            handle.header.order_seq_counter = seq;
+
+            let side_is_bid = side == 0;
+            let order = state_v2::RestingOrderV2 {
+                order_id: state_v2::encode_order_id(limit, seq, side_is_bid),
+                seq,
+                price_ticks: limit,
+                size_lots: chunk,
+                expires_at_slot: expires,
+                trader: trader_pk,
+                last_valid_slot: now as u32,
+                side,
+                order_type: 0,
+                flags: 0,
+                _pad: 0,
+            };
+            if side_is_bid {
+                handle.insert_bid(order)?;
+            } else {
+                handle.insert_ask(order)?;
+            }
+            inserted_seq = seq;
+        }
+
+        let iceberg = &mut ctx.accounts.iceberg_order;
+        iceberg.remaining_lots = iceberg.remaining_lots.saturating_sub(chunk);
+        iceberg.child_order_seq = inserted_seq;
+        if iceberg.remaining_lots == 0 {
+            iceberg.flags &= !state_v3::IcebergOrderAccountV3::FLAG_ACTIVE;
+        }
+
+        emit!(IcebergV3ReplenishedEvent {
+            market: market_key,
+            trader: trader_pk,
+            iceberg_id,
+            executor: ctx.accounts.caller.key(),
+            chunk_size_lots: chunk,
+            remaining_lots: iceberg.remaining_lots,
+        });
+        Ok(())
+    }
+
+    /// Cancel a v3 iceberg and close the account.
+    pub fn cancel_iceberg_v3(ctx: Context<CancelIcebergV3>) -> Result<()> {
+        let trader = ctx.accounts.trader.key();
+        require!(
+            ctx.accounts.iceberg_order.trader == trader,
+            FlashBookError::WrongTrader
+        );
+        let unfilled = ctx
+            .accounts
+            .iceberg_order
+            .remaining_lots
+            .saturating_add(ctx.accounts.iceberg_order.displayed_size_lots);
+        emit!(IcebergV3CancelledEvent {
+            market: ctx.accounts.iceberg_order.market,
+            trader,
+            iceberg_id: ctx.accounts.iceberg_order.iceberg_id,
+            unfilled_lots: unfilled.min(ctx.accounts.iceberg_order.total_size_lots),
+        });
+        Ok(())
+    }
+
+    // ─── Bracket orders v3 ──────────────────────────────────────────
+
+    /// Atomic bracket: parent limit order + 2 OCO-linked TP/SL triggers.
+    pub fn place_bracket_order_v3(
+        ctx: Context<PlaceBracketOrderV3>,
+        parent_side: u8,
+        size_lots: u64,
+        parent_limit_ticks: u64,
+        tp_trigger_id: u8,
+        tp_trigger_price_ticks: u64,
+        tp_limit_ticks: u64,
+        sl_trigger_id: u8,
+        sl_trigger_price_ticks: u64,
+        sl_limit_ticks: u64,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        require!(parent_side <= 1, FlashBookError::OutOfRange);
+        require!(tp_trigger_id != sl_trigger_id, FlashBookError::OutOfRange);
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(parent_limit_ticks > 0, FlashBookError::ZeroPrice);
+        require!(tp_trigger_price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(sl_trigger_price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(tp_limit_ticks > 0, FlashBookError::ZeroPrice);
+        require!(sl_limit_ticks > 0, FlashBookError::ZeroPrice);
+
+        let market = &ctx.accounts.market;
+        require!(
+            size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        for p in [
+            parent_limit_ticks,
+            tp_trigger_price_ticks,
+            sl_trigger_price_ticks,
+            tp_limit_ticks,
+            sl_limit_ticks,
+        ] {
+            require!(
+                p % market.params.tick_size == 0,
+                FlashBookError::PriceNotOnTick
+            );
+        }
+
+        let now = Clock::get()?.slot;
+        if expires_at_slot > 0 {
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
+
+        if parent_side == 0 {
+            require!(
+                tp_trigger_price_ticks > parent_limit_ticks,
+                FlashBookError::OutOfRange
+            );
+            require!(
+                sl_trigger_price_ticks < parent_limit_ticks,
+                FlashBookError::OutOfRange
+            );
+        } else {
+            require!(
+                tp_trigger_price_ticks < parent_limit_ticks,
+                FlashBookError::OutOfRange
+            );
+            require!(
+                sl_trigger_price_ticks > parent_limit_ticks,
+                FlashBookError::OutOfRange
+            );
+        }
+
+        let trader_pk = ctx.accounts.trader.key();
+        let market_key = market.key();
+
+        // 1. Parent limit order injected directly.
+        {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            require!(
+                handle.header.market_pubkey == market_key,
+                FlashBookError::WrongMarket
+            );
+            let seq = handle
+                .header
+                .order_seq_counter
+                .checked_add(1)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            require!(seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
+            handle.header.order_seq_counter = seq;
+
+            let side_is_bid = parent_side == 0;
+            let order = state_v2::RestingOrderV2 {
+                order_id: state_v2::encode_order_id(parent_limit_ticks, seq, side_is_bid),
+                seq,
+                price_ticks: parent_limit_ticks,
+                size_lots,
+                expires_at_slot: 0,
+                trader: trader_pk,
+                last_valid_slot: now as u32,
+                side: parent_side,
+                order_type: 0,
+                flags: 0,
+                _pad: 0,
+            };
+            if side_is_bid {
+                handle.insert_bid(order)?;
+            } else {
+                handle.insert_ask(order)?;
+            }
+        }
+
+        // 2. Wire the two reduce-only triggers.
+        let close_side = 1 - parent_side;
+        let (tp_kind, sl_kind) = if parent_side == 0 {
+            (1u8, 0u8)
+        } else {
+            (0u8, 1u8)
+        };
+        let common_flags = state_v3::TriggerOrderAccountV3::FLAG_ACTIVE
+            | state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY;
+
+        let tp = &mut ctx.accounts.tp_trigger;
+        tp.trader = trader_pk;
+        tp.market = market_key;
+        tp.bump = ctx.bumps.tp_trigger;
+        tp.trigger_id = tp_trigger_id;
+        tp.side = close_side;
+        tp.kind = tp_kind;
+        tp.flags = common_flags;
+        tp.size_lots = size_lots;
+        tp.trigger_price_ticks = tp_trigger_price_ticks;
+        tp.limit_price_ticks = tp_limit_ticks;
+        tp.created_at_slot = now;
+        tp.expires_at_slot = expires_at_slot;
+
+        let sl = &mut ctx.accounts.sl_trigger;
+        sl.trader = trader_pk;
+        sl.market = market_key;
+        sl.bump = ctx.bumps.sl_trigger;
+        sl.trigger_id = sl_trigger_id;
+        sl.side = close_side;
+        sl.kind = sl_kind;
+        sl.flags = common_flags;
+        sl.size_lots = size_lots;
+        sl.trigger_price_ticks = sl_trigger_price_ticks;
+        sl.limit_price_ticks = sl_limit_ticks;
+        sl.created_at_slot = now;
+        sl.expires_at_slot = expires_at_slot;
+
+        emit!(BracketOrderV3PlacedEvent {
+            market: market_key,
+            trader: trader_pk,
+            parent_side,
+            size_lots,
+            parent_limit_ticks,
+            tp_trigger_id,
+            sl_trigger_id,
+            tp_trigger_price_ticks,
+            sl_trigger_price_ticks,
+        });
+        Ok(())
+    }
+
+    // ─── Vaults v3 ──────────────────────────────────────────────────
+
+    /// Strategist creates a new vault. Vault id is per-strategist (0..255).
+    pub fn create_vault_v3(
+        ctx: Context<CreateVaultV3>,
+        vault_id: u8,
+        name: [u8; 32],
+        perf_fee_bps: u32,
+    ) -> Result<()> {
+        require!(perf_fee_bps <= 5_000, FlashBookError::OutOfRange);
+
+        let v = &mut ctx.accounts.vault;
+        v.strategist = ctx.accounts.strategist.key();
+        v.bump = ctx.bumps.vault;
+        v.vault_id = vault_id;
+        v.accept_deposits = 1;
+        v._pad0 = 0;
+        v.name = name;
+        v.perf_fee_bps = perf_fee_bps;
+        v.shares_outstanding = 0;
+        v.total_capital_quote_lots = 0;
+        v.hwm_nav_per_share_u64x6 = 0;
+        v.last_perf_settlement_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+        v.total_perf_shares_minted = 0;
+
+        emit!(VaultV3CreatedEvent {
+            vault: v.key(),
+            strategist: v.strategist,
+            vault_id,
+            perf_fee_bps,
+        });
+        Ok(())
+    }
+
+    /// Bootstrap a `TraderStateAccount` for the vault PDA. Strategist
+    /// signs + pays rent. One-time setup before the first deposit.
+    pub fn vault_open_trader_state_v3(
+        ctx: Context<VaultOpenTraderStateV3>,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.strategist.key() == ctx.accounts.vault.strategist,
+            FlashBookError::Unauthorized
+        );
+
+        let s = &mut ctx.accounts.vault_trader_state;
+        s.trader = ctx.accounts.vault.key();
+        s.bump = ctx.bumps.vault_trader_state;
+        s.collateral_quote_lots = 0;
+        s.realized_pnl_quote_lots = 0;
+        s.open_positions = 0;
+        s.toxicity_score_bps = 0;
+        s.orders_this_batch = 0;
+        s.last_batch_seen = 0;
+        s.fee_discount_bps = 0;
+        s.delegate = Pubkey::default();
+        s.referrer = Pubkey::default();
+        s.builder = Pubkey::default();
+        s.builder_max_fee_share_bps = 0;
+        s.volume_30d_quote_lots = 0;
+        s.volume_window_start_slot = Clock::get()?.slot;
+
+        emit!(VaultTraderStateOpenedV3Event {
+            vault: ctx.accounts.vault.key(),
+            vault_trader_state: s.key(),
+        });
+        Ok(())
+    }
+
+    /// Depositor adds capital, mints shares pro-rata. SPL transfer
+    /// depositor ATA → protocol quote_vault; vault TraderState credited.
+    pub fn vault_deposit_v3(
+        ctx: Context<VaultDepositV3>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        require!(
+            ctx.accounts.vault.accept_deposits == 1,
+            FlashBookError::OutOfRange
+        );
+
+        // Pull tokens from depositor → quote_vault. Depositor signs as ATA owner.
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.depositor_quote_ata.to_account_info(),
+            to: ctx.accounts.quote_vault.to_account_info(),
+            authority: ctx.accounts.depositor.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+        );
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        // Credit vault's TraderState collateral.
+        let ts = &mut ctx.accounts.vault_trader_state;
+        ts.collateral_quote_lots = ts
+            .collateral_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // Share-mint math: NAV-from-collateral (pre-deposit) for accuracy.
+        let post_deposit_collateral = ts.collateral_quote_lots;
+        let pre_deposit_nav = post_deposit_collateral.saturating_sub(amount_quote_lots);
+
+        let vault = &mut ctx.accounts.vault;
+        let shares_to_mint: u64 = if vault.shares_outstanding == 0 || pre_deposit_nav == 0 {
+            amount_quote_lots
+        } else {
+            let prod = (amount_quote_lots as u128)
+                .checked_mul(vault.shares_outstanding as u128)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            let s = prod / (pre_deposit_nav as u128);
+            require!(s <= u64::MAX as u128, FlashBookError::ArithmeticOverflow);
+            s as u64
+        };
+        require!(shares_to_mint > 0, FlashBookError::ZeroSize);
+
+        vault.total_capital_quote_lots = vault
+            .total_capital_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        vault.shares_outstanding = vault
+            .shares_outstanding
+            .checked_add(shares_to_mint)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        let pos = &mut ctx.accounts.position;
+        if pos.depositor == Pubkey::default() {
+            pos.vault = vault.key();
+            pos.depositor = ctx.accounts.depositor.key();
+            pos.bump = ctx.bumps.position;
+        }
+        pos.shares = pos
+            .shares
+            .checked_add(shares_to_mint)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        pos.total_deposited_quote_lots = pos
+            .total_deposited_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        emit!(VaultDepositV3Event {
+            vault: vault.key(),
+            depositor: pos.depositor,
+            amount_quote_lots,
+            shares_minted: shares_to_mint,
+            shares_outstanding_after: vault.shares_outstanding,
+        });
+        Ok(())
+    }
+
+    /// Burn shares for pro-rata payout. Debits vault TraderState
+    /// collateral + SPL release from quote_vault → depositor ATA
+    /// (signed by InsuranceFund PDA).
+    pub fn vault_withdraw_v3(
+        ctx: Context<VaultWithdrawV3>,
+        shares_to_burn: u64,
+    ) -> Result<()> {
+        require!(shares_to_burn > 0, FlashBookError::ZeroSize);
+
+        let vault_key = ctx.accounts.vault.key();
+        let depositor_key = ctx.accounts.depositor.key();
+        let total_shares = ctx.accounts.vault.shares_outstanding;
+
+        require!(
+            ctx.accounts.position.shares >= shares_to_burn,
+            FlashBookError::OutOfRange
+        );
+        require!(total_shares >= shares_to_burn, FlashBookError::OutOfRange);
+        require!(total_shares > 0, FlashBookError::OutOfRange);
+
+        let live_nav = ctx.accounts.vault_trader_state.collateral_quote_lots as u128;
+        require!(live_nav > 0, FlashBookError::InsufficientCollateral);
+
+        let amount_u128 = (shares_to_burn as u128)
+            .checked_mul(live_nav)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+            / (total_shares as u128);
+        let amount: u64 = if amount_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            amount_u128 as u64
+        };
+        require!(amount > 0, FlashBookError::ZeroSize);
+
+        // Burn shares + decrement vault state first.
+        {
+            let vault = &mut ctx.accounts.vault;
+            let pos = &mut ctx.accounts.position;
+            vault.shares_outstanding = vault
+                .shares_outstanding
+                .saturating_sub(shares_to_burn);
+            pos.shares = pos.shares.saturating_sub(shares_to_burn);
+            pos.total_withdrawn_quote_lots = pos
+                .total_withdrawn_quote_lots
+                .checked_add(amount)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        }
+
+        // Debit core TraderState collateral.
+        let ts = &mut ctx.accounts.vault_trader_state;
+        ts.collateral_quote_lots = ts
+            .collateral_quote_lots
+            .checked_sub(amount)
+            .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+
+        // SPL release from quote_vault → depositor's ATA, signed by InsuranceFund PDA.
+        let bump = ctx.accounts.insurance_fund.bump;
+        let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
+        let signers = &[signer_seeds];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.quote_vault.to_account_info(),
+            to: ctx.accounts.depositor_quote_ata.to_account_info(),
+            authority: ctx.accounts.insurance_fund.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signers,
+        );
+        token::transfer(cpi_ctx, amount)?;
+
+        emit!(VaultWithdrawV3Event {
+            vault: vault_key,
+            depositor: depositor_key,
+            shares_burned: shares_to_burn,
+            amount_quote_lots: amount,
+            shares_outstanding_after: ctx.accounts.vault.shares_outstanding,
+        });
+        Ok(())
+    }
+
+    /// Strategist places a limit order with the vault PDA as the trader.
+    pub fn vault_place_order_v3(
+        ctx: Context<VaultPlaceOrderV3>,
+        side: u8,
+        size_lots: u64,
+        limit_ticks: u64,
+        flags: u8,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.strategist.key() == ctx.accounts.vault.strategist,
+            FlashBookError::Unauthorized
+        );
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(limit_ticks > 0, FlashBookError::ZeroPrice);
+        require!(flags & !0b0011_1111 == 0, FlashBookError::OutOfRange);
+        let now_slot = Clock::get()?.slot;
+        if expires_at_slot > 0 {
+            require!(expires_at_slot > now_slot, FlashBookError::OutOfRange);
+        }
+
+        let market = &ctx.accounts.market;
+        require!(
+            market.status == MarketStatus::Active as u8
+                || market.status == MarketStatus::PostOnly as u8,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            limit_ticks % market.params.tick_size == 0,
+            FlashBookError::PriceNotOnTick
+        );
+
+        let oi_cap = market.params.max_oi_base_lots;
+        if oi_cap > 0 {
+            let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
+            let projected = cur.saturating_add(size_lots);
+            require!(projected <= oi_cap, FlashBookError::OpenInterestCapExceeded);
+        }
+
+        let vault_pk = ctx.accounts.vault.key();
+        let market_key = market.key();
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        require!(
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+
+        let seq = handle
+            .header
+            .order_seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        handle.header.order_seq_counter = seq;
+
+        let side_is_bid = side == 0;
+        let order = state_v2::RestingOrderV2 {
+            order_id: state_v2::encode_order_id(limit_ticks, seq, side_is_bid),
+            seq,
+            price_ticks: limit_ticks,
+            size_lots,
+            expires_at_slot,
+            trader: vault_pk,
+            last_valid_slot: now_slot as u32,
+            side,
+            order_type: 0,
+            flags,
+            _pad: 0,
+        };
+        let inserted_idx = if side_is_bid {
+            handle.insert_bid(order)?
+        } else {
+            handle.insert_ask(order)?
+        };
+
+        emit!(VaultOrderPlacedV3Event {
+            vault: vault_pk,
+            market: market_key,
+            side,
+            size_lots,
+            limit_ticks,
+            order_seq: seq,
+            node_index: inserted_idx,
+        });
+        Ok(())
+    }
+
+    /// Strategist cancels a vault-PDA order.
+    pub fn vault_cancel_order_v3(
+        ctx: Context<VaultCancelOrderV3>,
+        side: u8,
+        order_id: u64,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.strategist.key() == ctx.accounts.vault.strategist,
+            FlashBookError::Unauthorized
+        );
+        require!(side <= 1, FlashBookError::OutOfRange);
+        let vault_pk = ctx.accounts.vault.key();
+        let market_key = ctx.accounts.market.key();
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        require!(
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+
+        let side_is_bid = side == 0;
+        let idx = if side_is_bid {
+            handle.lookup_bid_by_order_id(order_id)
+        } else {
+            handle.lookup_ask_by_order_id(order_id)
+        };
+        require!(idx != crate::hypertree::NIL, FlashBookError::LiquidationStale);
+
+        let order_seq = {
+            let order = handle.order_at(idx);
+            require!(order.trader == vault_pk, FlashBookError::WrongTrader);
+            order.seq
+        };
+
+        if side_is_bid {
+            handle.remove_bid_node(idx);
+        } else {
+            handle.remove_ask_node(idx);
+        }
+
+        emit!(VaultOrderCancelledV3Event {
+            vault: vault_pk,
+            market: market_key,
+            side,
+            order_id,
+            order_seq,
+            node_index: idx,
+        });
+        Ok(())
+    }
+
+    /// Strategist crystallizes the performance fee.
+    pub fn settle_vault_perf_fee_v3(
+        ctx: Context<SettleVaultPerfFeeV3>,
+    ) -> Result<()> {
+        let vault = &ctx.accounts.vault;
+        require!(
+            ctx.accounts.strategist.key() == vault.strategist,
+            FlashBookError::Unauthorized
+        );
+
+        let shares_outstanding = vault.shares_outstanding;
+        if shares_outstanding == 0 {
+            let v = &mut ctx.accounts.vault;
+            v.hwm_nav_per_share_u64x6 = constants::USD_UNIT;
+            v.last_perf_settlement_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            return Ok(());
+        }
+
+        let nav = ctx.accounts.vault_trader_state.collateral_quote_lots as u128;
+        require!(nav > 0, FlashBookError::InsufficientCollateral);
+
+        let nav_per_share_x6 =
+            nav.saturating_mul(constants::USD_UNIT as u128) / (shares_outstanding as u128);
+        let nav_per_share_u64 = if nav_per_share_x6 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            nav_per_share_x6 as u64
+        };
+
+        let prev_hwm = vault.hwm_nav_per_share_u64x6;
+        if prev_hwm == 0 {
+            let v = &mut ctx.accounts.vault;
+            v.hwm_nav_per_share_u64x6 = nav_per_share_u64;
+            v.last_perf_settlement_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            return Ok(());
+        }
+
+        require!(
+            nav_per_share_u64 > prev_hwm,
+            FlashBookError::OutOfRange
+        );
+
+        let gain_per_share_x6 = (nav_per_share_u64 - prev_hwm) as u128;
+        let total_gain =
+            gain_per_share_x6.saturating_mul(shares_outstanding as u128) / (constants::USD_UNIT as u128);
+        let fee_qlots =
+            total_gain.saturating_mul(vault.perf_fee_bps as u128) / (constants::BPS_DENOM as u128);
+        let shares_to_mint_u128 = fee_qlots.saturating_mul(shares_outstanding as u128) / nav;
+        let shares_to_mint = if shares_to_mint_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            shares_to_mint_u128 as u64
+        };
+
+        if shares_to_mint == 0 {
+            let v = &mut ctx.accounts.vault;
+            v.hwm_nav_per_share_u64x6 = nav_per_share_u64;
+            v.last_perf_settlement_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            return Ok(());
+        }
+
+        {
+            let sp = &mut ctx.accounts.strategist_position;
+            if sp.depositor == Pubkey::default() {
+                sp.vault = ctx.accounts.vault.key();
+                sp.depositor = ctx.accounts.strategist.key();
+                sp.bump = ctx.bumps.strategist_position;
+            }
+            sp.shares = sp
+                .shares
+                .checked_add(shares_to_mint)
+                .ok_or(FlashBookError::ArithmeticOverflow)?;
+        }
+
+        let vault_key = ctx.accounts.vault.key();
+        let v = &mut ctx.accounts.vault;
+        v.shares_outstanding = v
+            .shares_outstanding
+            .checked_add(shares_to_mint)
+            .ok_or(FlashBookError::ArithmeticOverflow)?;
+        v.total_perf_shares_minted = v.total_perf_shares_minted.saturating_add(shares_to_mint);
+
+        let new_nav_per_share_x6 =
+            nav.saturating_mul(constants::USD_UNIT as u128) / (v.shares_outstanding as u128);
+        v.hwm_nav_per_share_u64x6 = if new_nav_per_share_x6 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            new_nav_per_share_x6 as u64
+        };
+        v.last_perf_settlement_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+
+        emit!(VaultPerfFeeSettledV3Event {
+            vault: vault_key,
+            strategist: v.strategist,
+            shares_minted: shares_to_mint,
+            new_hwm_per_share_u64x6: v.hwm_nav_per_share_u64x6,
+        });
+        Ok(())
+    }
+
+    // ─── Per-market FLP v3 ──────────────────────────────────────────
+
+    /// Initialize a per-market FLP exposure account. Authority-only.
+    pub fn init_flp_per_market_v3(ctx: Context<InitFlpPerMarketV3>) -> Result<()> {
+        let acct = &mut ctx.accounts.exposure;
+        acct.market = ctx.accounts.market.key();
+        acct.authority = ctx.accounts.authority.key();
+        acct.bump = ctx.bumps.exposure;
+        acct.side = 255;
+        acct.size_lots = 0;
+        acct.entry_price_ticks = 0;
+        acct.total_capital_quote_lots = 0;
+        acct.realized_pnl = 0;
+        acct.lp_shares_outstanding = 0;
+
+        emit!(FlpPerMarketInitV3Event {
+            market: acct.market,
+            authority: acct.authority,
+        });
+        Ok(())
+    }
+
+    /// Record a fill on this per-market FLP exposure.
+    pub fn record_flp_fill_v3(
+        ctx: Context<RecordFlpFillV3>,
+        size_lots: u64,
+        price_ticks: u64,
+        side: u8,
+        realized_pnl_delta: i64,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(price_ticks > 0, FlashBookError::ZeroPrice);
+
+        let acct = &mut ctx.accounts.exposure;
+        require!(
+            acct.authority == ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+
+        if acct.size_lots == 0 {
+            acct.side = side;
+            acct.size_lots = size_lots;
+            acct.entry_price_ticks = price_ticks;
+        } else if acct.side == side {
+            let new_size = acct.size_lots.saturating_add(size_lots);
+            let new_entry_u128 = (acct.entry_price_ticks as u128)
+                .saturating_mul(acct.size_lots as u128)
+                .saturating_add((price_ticks as u128).saturating_mul(size_lots as u128))
+                / new_size as u128;
+            acct.size_lots = new_size;
+            acct.entry_price_ticks = if new_entry_u128 > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                new_entry_u128 as u64
+            };
+        } else if size_lots <= acct.size_lots {
+            acct.size_lots -= size_lots;
+            if acct.size_lots == 0 {
+                acct.side = 255;
+                acct.entry_price_ticks = 0;
+            }
+        } else {
+            let remaining = size_lots - acct.size_lots;
+            acct.side = side;
+            acct.size_lots = remaining;
+            acct.entry_price_ticks = price_ticks;
+        }
+
+        acct.realized_pnl = acct.realized_pnl.saturating_add(realized_pnl_delta);
+
+        emit!(FlpFillRecordedV3Event {
+            market: acct.market,
+            side,
+            size_lots,
+            price_ticks,
+            realized_pnl_delta,
+            new_side: acct.side,
+            new_size_lots: acct.size_lots,
+            new_realized_pnl: acct.realized_pnl,
+        });
+        Ok(())
+    }
+
+    /// Deposit FLP capital with REAL SPL transfer + mint pro-rata shares.
+    pub fn flp_deposit_v3(ctx: Context<FlpDepositV3>, amount_quote_lots: u64) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.lp_quote_ata.to_account_info(),
+            to: ctx.accounts.quote_vault.to_account_info(),
+            authority: ctx.accounts.lp.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+        );
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        let acct = &mut ctx.accounts.exposure;
+        let shares = if acct.lp_shares_outstanding == 0 || acct.total_capital_quote_lots == 0 {
+            amount_quote_lots
+        } else {
+            let s = (amount_quote_lots as u128).saturating_mul(acct.lp_shares_outstanding as u128)
+                / (acct.total_capital_quote_lots as u128).max(1);
+            if s > u64::MAX as u128 { u64::MAX } else { s as u64 }
+        };
+        require!(shares > 0, FlashBookError::ZeroSize);
+
+        acct.total_capital_quote_lots = acct
+            .total_capital_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or(FlashBookError::ArithmeticOverflow)?;
+        acct.lp_shares_outstanding = acct
+            .lp_shares_outstanding
+            .checked_add(shares)
+            .ok_or(FlashBookError::ArithmeticOverflow)?;
+
+        let pos = &mut ctx.accounts.position;
+        if pos.shares == 0 {
+            pos.market = acct.market;
+            pos.lp = ctx.accounts.lp.key();
+            pos.bump = ctx.bumps.position;
+        }
+        pos.shares = pos
+            .shares
+            .checked_add(shares)
+            .ok_or(FlashBookError::ArithmeticOverflow)?;
+
+        emit!(FlpDepositedV3Event {
+            market: acct.market,
+            lp: ctx.accounts.lp.key(),
+            amount_quote_lots,
+            shares_minted: shares,
+            new_total_capital: acct.total_capital_quote_lots,
+            new_shares_outstanding: acct.lp_shares_outstanding,
+        });
+        Ok(())
+    }
+
+    /// Withdraw FLP capital by burning shares + SPL release.
+    pub fn flp_withdraw_v3(ctx: Context<FlpWithdrawV3>, shares_to_burn: u64) -> Result<()> {
+        require!(shares_to_burn > 0, FlashBookError::ZeroSize);
+
+        let market_key = ctx.accounts.exposure.market;
+        let pos_shares = ctx.accounts.position.shares;
+        require!(
+            shares_to_burn <= pos_shares,
+            FlashBookError::InsufficientCollateral
+        );
+
+        let total_capital = ctx.accounts.exposure.total_capital_quote_lots;
+        let total_shares = ctx.accounts.exposure.lp_shares_outstanding;
+        require!(total_shares > 0, FlashBookError::OutOfRange);
+
+        let amount_u128 = (shares_to_burn as u128).saturating_mul(total_capital as u128)
+            / (total_shares as u128);
+        let amount = if amount_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            amount_u128 as u64
+        };
+        require!(amount > 0, FlashBookError::ZeroSize);
+
+        {
+            let acct = &mut ctx.accounts.exposure;
+            acct.lp_shares_outstanding = acct
+                .lp_shares_outstanding
+                .checked_sub(shares_to_burn)
+                .ok_or(FlashBookError::ArithmeticUnderflow)?;
+            acct.total_capital_quote_lots = acct
+                .total_capital_quote_lots
+                .checked_sub(amount)
+                .ok_or(FlashBookError::ArithmeticUnderflow)?;
+            let pos = &mut ctx.accounts.position;
+            pos.shares = pos
+                .shares
+                .checked_sub(shares_to_burn)
+                .ok_or(FlashBookError::ArithmeticUnderflow)?;
+        }
+
+        // SPL release from quote_vault → LP's ATA, signed by InsuranceFund PDA.
+        let bump = ctx.accounts.insurance_fund.bump;
+        let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
+        let signers = &[signer_seeds];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.quote_vault.to_account_info(),
+            to: ctx.accounts.lp_quote_ata.to_account_info(),
+            authority: ctx.accounts.insurance_fund.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signers,
+        );
+        token::transfer(cpi_ctx, amount)?;
+
+        emit!(FlpWithdrawnV3Event {
+            market: market_key,
+            lp: ctx.accounts.lp.key(),
+            shares_burned: shares_to_burn,
+            amount_quote_lots: amount,
+            new_total_capital: ctx.accounts.exposure.total_capital_quote_lots,
+            new_shares_outstanding: ctx.accounts.exposure.lp_shares_outstanding,
+        });
+        Ok(())
+    }
+
 }
 
-/// Shared init body for `initialize_market` and
-/// `permissionless_initialize_market`. The single difference is whether
-/// `market.creator` is set to the signer (permissionless) or zeroed
-/// (protocol).
+/// Shared init body for `initialize_market`. Permissionless market
+/// creation has been removed — markets are authority-gated and the
+/// `creator` field on the market account is zeroed (no HIP-3-style
+/// creator share is paid out unless the authority later migrates the
+/// market to a curated creator).
 fn initialize_market_inner(
     ctx: Context<InitializeMarket>,
     params: MarketParams,
     initial_oracle_ticks: u64,
-    is_permissionless: bool,
 ) -> Result<()> {
     require!(params.tick_size > 0, FlashBookError::OutOfRange);
     require!(params.base_lot_size > 0, FlashBookError::OutOfRange);
@@ -5496,11 +6322,11 @@ fn initialize_market_inner(
 
     let market = &mut ctx.accounts.market;
     market.authority = ctx.accounts.authority.key();
-    market.creator = if is_permissionless {
-        ctx.accounts.authority.key()
-    } else {
-        Pubkey::default()
-    };
+    // Authority-gated market: creator is always zeroed (no creator
+    // share). The HIP-3-style creator-share branch in `apply_fill`
+    // remains for future protocol-managed curated creators but is dead
+    // code for markets initialized today.
+    market.creator = Pubkey::default();
     market.flp_pool = ctx.accounts.flp_exposure.key();
     market.base_mint = ctx.accounts.base_mint.key();
     market.quote_mint = ctx.accounts.quote_mint.key();
@@ -5535,14 +6361,6 @@ fn initialize_market_inner(
         authority: market.authority,
         initial_oracle_ticks,
     });
-    if is_permissionless {
-        emit!(PermissionlessMarketDeployedEvent {
-            market: market.key(),
-            creator: market.creator,
-            creator_share_bps: market.params.creator_share_bps,
-            is_pre_launch: market.params.is_pre_launch,
-        });
-    }
     Ok(())
 }
 
@@ -5603,124 +6421,6 @@ pub struct PlaceLimitOrderV2<'info> {
     /// 8-byte custom disc inside the handler via `MarketBookHandle::
     /// from_account_data`. Mut because we write the new resting order
     /// node + update the header indices.
-    #[account(
-        mut,
-        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub market_book: UncheckedAccount<'info>,
-}
-
-#[derive(Accounts)]
-pub struct CpiReleaseCollateralToUser<'info> {
-    /// CPI authority — must be one of the 3 wrapper-program PDAs.
-    pub cpi_authority: Signer<'info>,
-
-    /// InsuranceFund PDA — owns the vault, signs the SPL transfer out.
-    #[account(
-        seeds = [InsuranceFundAccount::SEED],
-        bump = insurance_fund.bump,
-    )]
-    pub insurance_fund: Account<'info, InsuranceFundAccount>,
-
-    /// Source vault (program-owned, InsuranceFund authority).
-    #[account(mut, address = insurance_fund.quote_vault)]
-    pub quote_vault: Account<'info, TokenAccount>,
-
-    /// Destination — user's ATA. Mut because we credit it.
-    #[account(mut)]
-    pub user_quote_ata: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct CpiOpenTraderStateForTrader<'info> {
-    /// Wrapper CPI authority (one of the 3 wave-21 PDAs).
-    pub cpi_authority: Signer<'info>,
-
-    /// CHECK: pubkey that the new TraderState will be seeded by. For
-    /// vault trading this is the vault PDA. The TraderState's
-    /// `trader` field is set to this. Used as the seed only — no
-    /// signing required (the wrapper is the authority).
-    pub trader_owner: UncheckedAccount<'info>,
-
-    /// The wrapper PAYS for rent here. Use the cpi_authority pubkey
-    /// directly is awkward (PDA can't pay rent without lamport
-    /// transfer); instead, pass a separate fee-payer signer.
-    #[account(mut)]
-    pub payer: Signer<'info>,
-
-    #[account(
-        init,
-        payer = payer,
-        space = TraderStateAccount::space(),
-        seeds = [TraderStateAccount::SEED, trader_owner.key().as_ref()],
-        bump,
-    )]
-    pub trader_state: Box<Account<'info, TraderStateAccount>>,
-
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct CpiCreditOrDebitCollateral<'info> {
-    pub cpi_authority: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
-        bump = trader_state.bump,
-    )]
-    pub trader_state: Box<Account<'info, TraderStateAccount>>,
-}
-
-#[derive(Accounts)]
-pub struct CancelOrderV2Cpi<'info> {
-    pub cpi_authority: Signer<'info>,
-
-    /// CHECK: trader pubkey carried on the resting order. Used to
-    /// validate ownership.
-    pub trader: UncheckedAccount<'info>,
-
-    #[account(
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-
-    /// CHECK: hypertree PDA; disc validated inside handler.
-    #[account(
-        mut,
-        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub market_book: UncheckedAccount<'info>,
-}
-
-#[derive(Accounts)]
-pub struct PlaceLimitOrderV2Cpi<'info> {
-    /// CPI authority — must be the `[CPI_AUTHORITY_SEED]` PDA of one
-    /// of the 3 whitelisted wrapper programs (orders / flp / vaults).
-    /// Wrapper signs over this PDA via `invoke_signed`. Core's handler
-    /// computes the 3 expected derivations and verifies the signer
-    /// matches one of them.
-    pub cpi_authority: Signer<'info>,
-
-    /// CHECK: trader pubkey to stamp on the resulting RestingOrderV2.
-    /// NOT a signer — the wrapper authorized the trader at trigger /
-    /// vault-deposit time via its own state. Core trusts the wrapper
-    /// to inject the right trader pubkey here.
-    pub trader: UncheckedAccount<'info>,
-
-    #[account(
-        mut,
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Account<'info, MarketAccount>,
-
-    /// CHECK: PDA at the market_book seed; disc validated inside handler.
     #[account(
         mut,
         seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
@@ -7165,133 +7865,6 @@ pub struct LiquidatePositionV2<'info> {
 }
 
 #[derive(Accounts)]
-pub struct PostMarketBond<'info> {
-    #[account(mut)]
-    pub depositor: Signer<'info>,
-
-    #[account(
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-
-    #[account(
-        init_if_needed,
-        payer = depositor,
-        space = state::MarketBondAccount::space(),
-        seeds = [
-            state::MarketBondAccount::SEED,
-            market.key().as_ref(),
-            depositor.key().as_ref(),
-        ],
-        bump,
-    )]
-    pub market_bond: Box<Account<'info, state::MarketBondAccount>>,
-
-    #[account(
-        seeds = [InsuranceFundAccount::SEED],
-        bump = insurance_fund.bump,
-    )]
-    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
-
-    #[account(address = insurance_fund.quote_mint)]
-    pub quote_mint: Box<Account<'info, Mint>>,
-
-    #[account(
-        mut,
-        associated_token::mint = quote_mint,
-        associated_token::authority = depositor,
-    )]
-    pub depositor_quote_ata: Box<Account<'info, TokenAccount>>,
-
-    #[account(mut, address = insurance_fund.quote_vault)]
-    pub quote_vault: Box<Account<'info, TokenAccount>>,
-
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct UnbondMarketBondAuth<'info> {
-    /// Depositor signs — only the bond owner can request unbond.
-    pub depositor: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [
-            state::MarketBondAccount::SEED,
-            market_bond.market.as_ref(),
-            depositor.key().as_ref(),
-        ],
-        bump = market_bond.bump,
-        constraint = market_bond.depositor == depositor.key() @ FlashBookError::Unauthorized,
-    )]
-    pub market_bond: Account<'info, state::MarketBondAccount>,
-}
-
-#[derive(Accounts)]
-pub struct ClaimUnbondedMarketBond<'info> {
-    pub depositor: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [
-            state::MarketBondAccount::SEED,
-            market_bond.market.as_ref(),
-            depositor.key().as_ref(),
-        ],
-        bump = market_bond.bump,
-        constraint = market_bond.depositor == depositor.key() @ FlashBookError::Unauthorized,
-    )]
-    pub market_bond: Account<'info, state::MarketBondAccount>,
-
-    #[account(
-        seeds = [InsuranceFundAccount::SEED],
-        bump = insurance_fund.bump,
-    )]
-    pub insurance_fund: Account<'info, InsuranceFundAccount>,
-
-    #[account(address = insurance_fund.quote_mint)]
-    pub quote_mint: Account<'info, Mint>,
-
-    #[account(
-        mut,
-        associated_token::mint = quote_mint,
-        associated_token::authority = depositor,
-    )]
-    pub depositor_quote_ata: Account<'info, TokenAccount>,
-
-    #[account(mut, address = insurance_fund.quote_vault)]
-    pub quote_vault: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct SlashMarketBond<'info> {
-    pub authority: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [InsuranceFundAccount::SEED],
-        bump = insurance_fund.bump,
-        constraint = insurance_fund.authority == authority.key() @ FlashBookError::Unauthorized,
-    )]
-    pub insurance_fund: Account<'info, InsuranceFundAccount>,
-
-    #[account(
-        mut,
-        seeds = [
-            state::MarketBondAccount::SEED,
-            market_bond.market.as_ref(),
-            market_bond.depositor.as_ref(),
-        ],
-        bump = market_bond.bump,
-    )]
-    pub market_bond: Account<'info, state::MarketBondAccount>,
-}
-
-#[derive(Accounts)]
 pub struct AutoDeleverage<'info> {
     /// Anyone may call. ADL keepers compete off-chain on the (pnl ×
     /// leverage) ranking; first valid call wins.
@@ -7443,62 +8016,6 @@ pub struct BatchFillIntentEvent {
     pub maker_id: u64,
 }
 
-/// Wave 21 phase 8b/9b: emitted when a wrapper program's CPI releases
-/// collateral from the protocol vault to a user. Carries the
-/// cpi_authority pubkey (so off-chain reconciliation can attribute
-/// the release to a specific wrapper program).
-#[event]
-pub struct WrapperCollateralReleasedEvent {
-    pub cpi_authority: Pubkey,
-    pub user: Pubkey,
-    pub amount: u64,
-}
-
-/// Wave 22 phase 5 — wrapper bootstrapped a TraderState for a non-
-/// signing trader (typically a vault PDA).
-#[event]
-pub struct WrapperTraderStateOpenedEvent {
-    pub cpi_authority: Pubkey,
-    pub trader: Pubkey,
-}
-
-/// Wave 22 phase 5 — wrapper credited collateral to a trader's
-/// TraderState (vault deposit path).
-#[event]
-pub struct WrapperCollateralCreditedEvent {
-    pub cpi_authority: Pubkey,
-    pub trader: Pubkey,
-    pub amount: u64,
-    pub new_collateral: u64,
-}
-
-/// Wave 22 phase 5 — wrapper debited collateral from a trader's
-/// TraderState (vault withdraw path).
-#[event]
-pub struct WrapperCollateralDebitedEvent {
-    pub cpi_authority: Pubkey,
-    pub trader: Pubkey,
-    pub amount: u64,
-    pub new_collateral: u64,
-}
-
-/// Wave 21 phase 2: emitted when a wrapper program's CPI lands an order
-/// via `place_limit_order_v2_cpi`. Same payload as OrderPlacedV2Event
-/// PLUS the cpi_authority that signed (so off-chain reconciliation can
-/// attribute the order to a specific wrapper program).
-#[event]
-pub struct OrderPlacedV2CpiEvent {
-    pub market: Pubkey,
-    pub trader: Pubkey,
-    pub seq: u64,
-    pub side: u8,
-    pub price_ticks: u64,
-    pub size_lots: u64,
-    pub node_index: u32,
-    pub total_orders_after: u32,
-    pub cpi_authority: Pubkey,
-}
-
 /// How many price levels per side `view_book_depth_v2` returns.
 /// Capped to keep the event log payload bounded; off-chain depth
 /// reconstruction watches `OrderPlacedV2Event` + `OrderCancelledV2Event`
@@ -7511,24 +8028,6 @@ pub const BOOK_DEPTH_LEVELS: usize = 4;
 /// candidate prices), lifting the safe cap from 64 to 256 per side
 /// (~5K CU per fill at the larger N, well inside the BPF budget).
 pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 256;
-
-/// Wave 21 phase 2 — sister-program IDs that core trusts as CPI callers.
-/// Matches `programs/flash-book-orders/src/lib.rs::declare_id!`,
-/// `flash-book-flp::declare_id!`, `flash-book-vaults::declare_id!`.
-/// Reading this list = reading the trust boundary; if a wrapper isn't
-/// listed here, its CPI into core's `*_cpi` ixs will be rejected.
-pub const WAVE21_ORDERS_PROGRAM_ID: Pubkey =
-    anchor_lang::solana_program::pubkey!("2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5");
-pub const WAVE21_FLP_PROGRAM_ID: Pubkey =
-    anchor_lang::solana_program::pubkey!("eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M");
-pub const WAVE21_VAULTS_PROGRAM_ID: Pubkey =
-    anchor_lang::solana_program::pubkey!("GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt");
-
-/// PDA seed each wrapper program uses to sign CPI calls into core.
-/// Wrapper signs over `[CPI_AUTHORITY_SEED]` with its own program ID,
-/// producing a unique authority pubkey per wrapper. Core's `*_cpi`
-/// ixs check `cpi_authority.key()` against the 3 derived addresses.
-pub const CPI_AUTHORITY_SEED: &[u8] = b"cpi_authority";
 
 /// HL withdrawal floor — wave 20b. When a trader pulls collateral from
 /// `partial_withdraw_collateral` with positions still open, the remaining
@@ -7834,16 +8333,6 @@ pub struct CreatorFeeOwedEvent {
     pub amount_quote_lots: u64,
 }
 
-/// Emitted by `permissionless_initialize_market` so off-chain indexers
-/// can distinguish HIP-3 deployments from protocol-curated markets.
-#[event]
-pub struct PermissionlessMarketDeployedEvent {
-    pub market: Pubkey,
-    pub creator: Pubkey,
-    pub creator_share_bps: u32,
-    pub is_pre_launch: bool,
-}
-
 /// Per-fill trading-rewards eligibility event. Off-chain accrual
 /// computes per-trader points (notional × multipliers × time-windows).
 /// Hyperliquid HYPE-distribution model — minimal on-chain footprint
@@ -8031,37 +8520,6 @@ pub struct TwapSliceExecutedV2Event {
     pub order_seq: u64,
     /// Hypertree node index of the inserted RestingOrderV2.
     pub node_index: u32,
-}
-
-#[event]
-pub struct MarketBondPostedEvent {
-    pub market: Pubkey,
-    pub depositor: Pubkey,
-    pub amount_quote_lots: u64,
-    pub new_total_quote_lots: u64,
-}
-
-#[event]
-pub struct MarketBondUnbondRequestedEvent {
-    pub market: Pubkey,
-    pub depositor: Pubkey,
-    pub requested_at_unix: u64,
-    pub claimable_at_unix: u64,
-}
-
-#[event]
-pub struct MarketBondClaimedEvent {
-    pub market: Pubkey,
-    pub depositor: Pubkey,
-    pub amount_quote_lots: u64,
-}
-
-#[event]
-pub struct MarketBondSlashedEvent {
-    pub market: Pubkey,
-    pub depositor: Pubkey,
-    pub amount_quote_lots: u64,
-    pub remaining_bond_quote_lots: u64,
 }
 
 #[event]
@@ -8434,26 +8892,6 @@ fn validate_fee_tiers(volume_window_slots: u64, tiers: &[state::FeeTier]) -> Res
         prev_taker = Some(t.taker_fee_bps);
         prev_maker = Some(t.maker_rebate_bps);
     }
-    Ok(())
-}
-
-/// WAVE 22 phase 5 — wrapper-program CPI authority whitelist check.
-/// Returns Ok if `cpi_signer` matches the `[CPI_AUTHORITY_SEED]` PDA
-/// of one of the 3 allowed wrapper programs (orders / flp / vaults).
-/// Single source of truth for the wrapper-authorized ix gate.
-fn check_wave21_cpi_authority(cpi_signer: &Pubkey) -> Result<()> {
-    let (orders_authority, _) =
-        Pubkey::find_program_address(&[CPI_AUTHORITY_SEED], &WAVE21_ORDERS_PROGRAM_ID);
-    let (flp_authority, _) =
-        Pubkey::find_program_address(&[CPI_AUTHORITY_SEED], &WAVE21_FLP_PROGRAM_ID);
-    let (vaults_authority, _) =
-        Pubkey::find_program_address(&[CPI_AUTHORITY_SEED], &WAVE21_VAULTS_PROGRAM_ID);
-    require!(
-        *cpi_signer == orders_authority
-            || *cpi_signer == flp_authority
-            || *cpi_signer == vaults_authority,
-        FlashBookError::Unauthorized
-    );
     Ok(())
 }
 
@@ -8864,3 +9302,821 @@ fn clamp_i128_to_i64(v: i128) -> i64 {
     else { v as i64 }
 }
 
+
+// ─── V3 monolithic account contexts (merged from former wrappers) ─────────
+
+#[derive(Accounts)]
+#[instruction(trigger_id: u8)]
+pub struct PlaceTriggerOrderV3<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state_v3::TriggerOrderAccountV3::space(),
+        seeds = [
+            state_v3::TriggerOrderAccountV3::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[trigger_id],
+        ],
+        bump,
+    )]
+    pub trigger_order: Account<'info, state_v3::TriggerOrderAccountV3>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteTriggerOrderV3<'info> {
+    /// Permissionless caller pays tx fee. Trader pre-authorized at placement.
+    pub caller: Signer<'info>,
+
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: market_book PDA — disc validated inside handler.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            state_v3::TriggerOrderAccountV3::SEED,
+            market.key().as_ref(),
+            trigger_order.trader.as_ref(),
+            &[trigger_order.trigger_id],
+        ],
+        bump = trigger_order.bump,
+    )]
+    pub trigger_order: Account<'info, state_v3::TriggerOrderAccountV3>,
+
+    /// Trader's position — required for reduce-only triggers.
+    #[account(
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trigger_order.trader.as_ref()],
+        bump,
+    )]
+    pub position: Account<'info, state::PositionAccount>,
+}
+
+#[derive(Accounts)]
+pub struct CancelTriggerOrderV3<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        close = trader,
+        seeds = [
+            state_v3::TriggerOrderAccountV3::SEED,
+            trigger_order.market.as_ref(),
+            trigger_order.trader.as_ref(),
+            &[trigger_order.trigger_id],
+        ],
+        bump = trigger_order.bump,
+    )]
+    pub trigger_order: Account<'info, state_v3::TriggerOrderAccountV3>,
+}
+
+#[derive(Accounts)]
+#[instruction(twap_id: u8)]
+pub struct PlaceTwapOrderV3<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state_v3::TwapOrderAccountV3::space(),
+        seeds = [
+            state_v3::TwapOrderAccountV3::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[twap_id],
+        ],
+        bump,
+    )]
+    pub twap_order: Account<'info, state_v3::TwapOrderAccountV3>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteTwapSliceV3<'info> {
+    pub caller: Signer<'info>,
+
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: market_book PDA — disc validated inside handler.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            state_v3::TwapOrderAccountV3::SEED,
+            market.key().as_ref(),
+            twap_order.trader.as_ref(),
+            &[twap_order.twap_id],
+        ],
+        bump = twap_order.bump,
+    )]
+    pub twap_order: Account<'info, state_v3::TwapOrderAccountV3>,
+}
+
+#[derive(Accounts)]
+pub struct CancelTwapOrderV3<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        close = trader,
+        seeds = [
+            state_v3::TwapOrderAccountV3::SEED,
+            twap_order.market.as_ref(),
+            twap_order.trader.as_ref(),
+            &[twap_order.twap_id],
+        ],
+        bump = twap_order.bump,
+    )]
+    pub twap_order: Account<'info, state_v3::TwapOrderAccountV3>,
+}
+
+#[derive(Accounts)]
+#[instruction(iceberg_id: u8)]
+pub struct PlaceIcebergOrderV3<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: market_book PDA — first chunk inserted inline.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state_v3::IcebergOrderAccountV3::space(),
+        seeds = [
+            state_v3::IcebergOrderAccountV3::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[iceberg_id],
+        ],
+        bump,
+    )]
+    pub iceberg_order: Account<'info, state_v3::IcebergOrderAccountV3>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ReplenishIcebergV3<'info> {
+    pub caller: Signer<'info>,
+
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: market_book PDA — disc validated inside handler.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            state_v3::IcebergOrderAccountV3::SEED,
+            market.key().as_ref(),
+            iceberg_order.trader.as_ref(),
+            &[iceberg_order.iceberg_id],
+        ],
+        bump = iceberg_order.bump,
+    )]
+    pub iceberg_order: Account<'info, state_v3::IcebergOrderAccountV3>,
+}
+
+#[derive(Accounts)]
+pub struct CancelIcebergV3<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        close = trader,
+        seeds = [
+            state_v3::IcebergOrderAccountV3::SEED,
+            iceberg_order.market.as_ref(),
+            iceberg_order.trader.as_ref(),
+            &[iceberg_order.iceberg_id],
+        ],
+        bump = iceberg_order.bump,
+    )]
+    pub iceberg_order: Account<'info, state_v3::IcebergOrderAccountV3>,
+}
+
+#[derive(Accounts)]
+#[instruction(
+    parent_side: u8,
+    size_lots: u64,
+    parent_limit_ticks: u64,
+    tp_trigger_id: u8,
+    tp_trigger_price_ticks: u64,
+    tp_limit_ticks: u64,
+    sl_trigger_id: u8,
+)]
+pub struct PlaceBracketOrderV3<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: market_book PDA — parent injected inline.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state_v3::TriggerOrderAccountV3::space(),
+        seeds = [
+            state_v3::TriggerOrderAccountV3::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[tp_trigger_id],
+        ],
+        bump,
+    )]
+    pub tp_trigger: Account<'info, state_v3::TriggerOrderAccountV3>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = state_v3::TriggerOrderAccountV3::space(),
+        seeds = [
+            state_v3::TriggerOrderAccountV3::SEED,
+            market.key().as_ref(),
+            trader.key().as_ref(),
+            &[sl_trigger_id],
+        ],
+        bump,
+    )]
+    pub sl_trigger: Account<'info, state_v3::TriggerOrderAccountV3>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(vault_id: u8)]
+pub struct CreateVaultV3<'info> {
+    #[account(mut)]
+    pub strategist: Signer<'info>,
+
+    #[account(
+        init,
+        payer = strategist,
+        space = state_v3::VaultAccountV3::space(),
+        seeds = [state_v3::VaultAccountV3::SEED, strategist.key().as_ref(), &[vault_id]],
+        bump,
+    )]
+    pub vault: Account<'info, state_v3::VaultAccountV3>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct VaultOpenTraderStateV3<'info> {
+    #[account(mut)]
+    pub strategist: Signer<'info>,
+
+    #[account(
+        seeds = [state_v3::VaultAccountV3::SEED, vault.strategist.as_ref(), &[vault.vault_id]],
+        bump = vault.bump,
+    )]
+    pub vault: Account<'info, state_v3::VaultAccountV3>,
+
+    /// Vault PDA's TraderState — initialized here, seeded by vault PDA.
+    #[account(
+        init,
+        payer = strategist,
+        space = TraderStateAccount::space(),
+        seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
+        bump,
+    )]
+    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct VaultDepositV3<'info> {
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::VaultAccountV3::SEED, vault.strategist.as_ref(), &[vault.vault_id]],
+        bump = vault.bump,
+    )]
+    pub vault: Account<'info, state_v3::VaultAccountV3>,
+
+    #[account(
+        init_if_needed,
+        payer = depositor,
+        space = state_v3::VaultPositionAccountV3::space(),
+        seeds = [
+            state_v3::VaultPositionAccountV3::SEED,
+            vault.key().as_ref(),
+            depositor.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub position: Account<'info, state_v3::VaultPositionAccountV3>,
+
+    /// Depositor's USDC ATA — debited.
+    #[account(mut)]
+    pub depositor_quote_ata: Account<'info, TokenAccount>,
+
+    /// Protocol vault — credited.
+    #[account(mut)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    /// Vault's TraderState — credited (collateral_quote_lots).
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
+        bump = vault_trader_state.bump,
+    )]
+    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct VaultWithdrawV3<'info> {
+    pub depositor: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::VaultAccountV3::SEED, vault.strategist.as_ref(), &[vault.vault_id]],
+        bump = vault.bump,
+    )]
+    pub vault: Account<'info, state_v3::VaultAccountV3>,
+
+    #[account(
+        mut,
+        seeds = [
+            state_v3::VaultPositionAccountV3::SEED,
+            vault.key().as_ref(),
+            depositor.key().as_ref(),
+        ],
+        bump = position.bump,
+        constraint = position.depositor == depositor.key() @ FlashBookError::Unauthorized,
+    )]
+    pub position: Account<'info, state_v3::VaultPositionAccountV3>,
+
+    /// InsuranceFund PDA — signs SPL release.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    /// Protocol vault — debited.
+    #[account(mut, address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    /// Depositor's USDC ATA — credited.
+    #[account(mut)]
+    pub depositor_quote_ata: Account<'info, TokenAccount>,
+
+    /// Vault's TraderState — collateral debited.
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
+        bump = vault_trader_state.bump,
+    )]
+    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct VaultPlaceOrderV3<'info> {
+    pub strategist: Signer<'info>,
+
+    #[account(
+        seeds = [state_v3::VaultAccountV3::SEED, vault.strategist.as_ref(), &[vault.vault_id]],
+        bump = vault.bump,
+    )]
+    pub vault: Account<'info, state_v3::VaultAccountV3>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: market_book PDA — disc validated inside handler.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct VaultCancelOrderV3<'info> {
+    pub strategist: Signer<'info>,
+
+    #[account(
+        seeds = [state_v3::VaultAccountV3::SEED, vault.strategist.as_ref(), &[vault.vault_id]],
+        bump = vault.bump,
+    )]
+    pub vault: Account<'info, state_v3::VaultAccountV3>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: market_book PDA — disc validated inside handler.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SettleVaultPerfFeeV3<'info> {
+    #[account(mut)]
+    pub strategist: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::VaultAccountV3::SEED, vault.strategist.as_ref(), &[vault.vault_id]],
+        bump = vault.bump,
+        constraint = vault.strategist == strategist.key() @ FlashBookError::Unauthorized,
+    )]
+    pub vault: Account<'info, state_v3::VaultAccountV3>,
+
+    #[account(
+        init_if_needed,
+        payer = strategist,
+        space = state_v3::VaultPositionAccountV3::space(),
+        seeds = [
+            state_v3::VaultPositionAccountV3::SEED,
+            vault.key().as_ref(),
+            strategist.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub strategist_position: Account<'info, state_v3::VaultPositionAccountV3>,
+
+    /// Vault's TraderState — read-only; NAV source.
+    #[account(
+        seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
+        bump = vault_trader_state.bump,
+    )]
+    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitFlpPerMarketV3<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// CHECK: market pubkey — used as PDA seed only.
+    pub market: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = state_v3::FlpExposurePerMarketAccountV3::space(),
+        seeds = [state_v3::FlpExposurePerMarketAccountV3::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub exposure: Account<'info, state_v3::FlpExposurePerMarketAccountV3>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RecordFlpFillV3<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::FlpExposurePerMarketAccountV3::SEED, exposure.market.as_ref()],
+        bump = exposure.bump,
+    )]
+    pub exposure: Account<'info, state_v3::FlpExposurePerMarketAccountV3>,
+}
+
+#[derive(Accounts)]
+pub struct FlpDepositV3<'info> {
+    #[account(mut)]
+    pub lp: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::FlpExposurePerMarketAccountV3::SEED, exposure.market.as_ref()],
+        bump = exposure.bump,
+    )]
+    pub exposure: Account<'info, state_v3::FlpExposurePerMarketAccountV3>,
+
+    #[account(
+        init_if_needed,
+        payer = lp,
+        space = state_v3::FlpPositionAccountV3::space(),
+        seeds = [state_v3::FlpPositionAccountV3::SEED, exposure.key().as_ref(), lp.key().as_ref()],
+        bump,
+    )]
+    pub position: Account<'info, state_v3::FlpPositionAccountV3>,
+
+    /// LP's USDC ATA — debited.
+    #[account(mut)]
+    pub lp_quote_ata: Account<'info, TokenAccount>,
+
+    /// Protocol vault — credited.
+    #[account(mut)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FlpWithdrawV3<'info> {
+    #[account(mut)]
+    pub lp: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::FlpExposurePerMarketAccountV3::SEED, exposure.market.as_ref()],
+        bump = exposure.bump,
+    )]
+    pub exposure: Account<'info, state_v3::FlpExposurePerMarketAccountV3>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::FlpPositionAccountV3::SEED, exposure.key().as_ref(), lp.key().as_ref()],
+        bump = position.bump,
+        constraint = position.lp == lp.key() @ FlashBookError::Unauthorized,
+    )]
+    pub position: Account<'info, state_v3::FlpPositionAccountV3>,
+
+    /// InsuranceFund PDA — signs SPL release.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    /// Protocol vault — debited.
+    #[account(mut, address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    /// LP's USDC ATA — credited.
+    #[account(mut)]
+    pub lp_quote_ata: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+// ─── V3 events ────────────────────────────────────────────────────────────
+
+#[event]
+pub struct TriggerOrderV3PlacedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub trigger_id: u8,
+    pub side: u8,
+    pub kind: u8,
+    pub size_lots: u64,
+    pub trigger_price_ticks: u64,
+    pub limit_price_ticks: u64,
+}
+
+#[event]
+pub struct TriggerOrderV3ExecutedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub trigger_id: u8,
+    pub executor: Pubkey,
+    pub oracle_price_ticks: u64,
+    pub order_seq: u64,
+    pub node_index: u32,
+}
+
+#[event]
+pub struct TriggerOrderV3CancelledEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub trigger_id: u8,
+}
+
+#[event]
+pub struct TwapOrderV3PlacedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub twap_id: u8,
+    pub side: u8,
+    pub total_size_lots: u64,
+    pub slice_size_lots: u64,
+    pub limit_price_ticks: u64,
+    pub slot_interval: u64,
+}
+
+#[event]
+pub struct TwapSliceV3ExecutedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub twap_id: u8,
+    pub executor: Pubkey,
+    pub slice_size_lots: u64,
+    pub cumulative_executed_lots: u64,
+    pub order_seq: u64,
+    pub node_index: u32,
+}
+
+#[event]
+pub struct TwapOrderV3CancelledEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub twap_id: u8,
+    pub unfilled_lots: u64,
+}
+
+#[event]
+pub struct IcebergOrderV3PlacedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub iceberg_id: u8,
+    pub side: u8,
+    pub total_size_lots: u64,
+    pub displayed_size_lots: u64,
+    pub limit_ticks: u64,
+    pub first_chunk_size_lots: u64,
+}
+
+#[event]
+pub struct IcebergV3ReplenishedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub iceberg_id: u8,
+    pub executor: Pubkey,
+    pub chunk_size_lots: u64,
+    pub remaining_lots: u64,
+}
+
+#[event]
+pub struct IcebergV3CancelledEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub iceberg_id: u8,
+    pub unfilled_lots: u64,
+}
+
+#[event]
+pub struct BracketOrderV3PlacedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub parent_side: u8,
+    pub size_lots: u64,
+    pub parent_limit_ticks: u64,
+    pub tp_trigger_id: u8,
+    pub sl_trigger_id: u8,
+    pub tp_trigger_price_ticks: u64,
+    pub sl_trigger_price_ticks: u64,
+}
+
+#[event]
+pub struct VaultV3CreatedEvent {
+    pub vault: Pubkey,
+    pub strategist: Pubkey,
+    pub vault_id: u8,
+    pub perf_fee_bps: u32,
+}
+
+#[event]
+pub struct VaultTraderStateOpenedV3Event {
+    pub vault: Pubkey,
+    pub vault_trader_state: Pubkey,
+}
+
+#[event]
+pub struct VaultDepositV3Event {
+    pub vault: Pubkey,
+    pub depositor: Pubkey,
+    pub amount_quote_lots: u64,
+    pub shares_minted: u64,
+    pub shares_outstanding_after: u64,
+}
+
+#[event]
+pub struct VaultWithdrawV3Event {
+    pub vault: Pubkey,
+    pub depositor: Pubkey,
+    pub shares_burned: u64,
+    pub amount_quote_lots: u64,
+    pub shares_outstanding_after: u64,
+}
+
+#[event]
+pub struct VaultOrderPlacedV3Event {
+    pub vault: Pubkey,
+    pub market: Pubkey,
+    pub side: u8,
+    pub size_lots: u64,
+    pub limit_ticks: u64,
+    pub order_seq: u64,
+    pub node_index: u32,
+}
+
+#[event]
+pub struct VaultOrderCancelledV3Event {
+    pub vault: Pubkey,
+    pub market: Pubkey,
+    pub side: u8,
+    pub order_id: u64,
+    pub order_seq: u64,
+    pub node_index: u32,
+}
+
+#[event]
+pub struct VaultPerfFeeSettledV3Event {
+    pub vault: Pubkey,
+    pub strategist: Pubkey,
+    pub shares_minted: u64,
+    pub new_hwm_per_share_u64x6: u64,
+}
+
+#[event]
+pub struct FlpPerMarketInitV3Event {
+    pub market: Pubkey,
+    pub authority: Pubkey,
+}
+
+#[event]
+pub struct FlpFillRecordedV3Event {
+    pub market: Pubkey,
+    pub side: u8,
+    pub size_lots: u64,
+    pub price_ticks: u64,
+    pub realized_pnl_delta: i64,
+    pub new_side: u8,
+    pub new_size_lots: u64,
+    pub new_realized_pnl: i64,
+}
+
+#[event]
+pub struct FlpDepositedV3Event {
+    pub market: Pubkey,
+    pub lp: Pubkey,
+    pub amount_quote_lots: u64,
+    pub shares_minted: u64,
+    pub new_total_capital: u64,
+    pub new_shares_outstanding: u64,
+}
+
+#[event]
+pub struct FlpWithdrawnV3Event {
+    pub market: Pubkey,
+    pub lp: Pubkey,
+    pub shares_burned: u64,
+    pub amount_quote_lots: u64,
+    pub new_total_capital: u64,
+    pub new_shares_outstanding: u64,
+}

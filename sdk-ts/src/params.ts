@@ -65,7 +65,7 @@ export interface MarketParamsRaw {
   referrerShareBps: number;
   /** Bps of net fee credited to a taker's approved builder (HL builder codes). */
   builderShareBps: number;
-  /** Bps of net fee credited to a permissionless market's deployer (HIP-3). */
+  /** Bps of net fee credited to a curated market creator (set 0 for authority-only markets). */
   creatorShareBps: number;
   /** Pre-launch market flag — Hyperliquid pre-TGE perp pattern. */
   isPreLaunch: boolean;
@@ -85,7 +85,7 @@ export interface MarketParamsRaw {
   fundingPerPeriodMaxBps: number;
   /** Period length (seconds) for the funding cap. Typical 86_400 (24h). */
   fundingPeriodSeconds: number;
-  /** Bootstrap period (batches) for permissionless markets — caps tightened 4×. */
+  /** Bootstrap period (batches) for newly-deployed markets — risk caps tightened 4×. */
   bootstrapPeriodBatches: number;
 }
 

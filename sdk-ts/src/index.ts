@@ -4,9 +4,6 @@ export {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   ATA_PROGRAM_ID,
   FLASH_BOOK_PROGRAM_ID,
-  FLASH_BOOK_ORDERS_PROGRAM_ID,
-  FLASH_BOOK_FLP_PROGRAM_ID,
-  FLASH_BOOK_VAULTS_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   associatedTokenAddress,
   flpExposurePda,
@@ -20,7 +17,6 @@ export {
   icebergOrderPda,
   vaultPda,
   vaultPositionPda,
-  marketBondPda,
   marketBookPda,
   marketLeverageTiersPda,
   feeTiersPda,
@@ -31,7 +27,6 @@ export {
   flpPositionV3Pda,
   vaultV3Pda,
   vaultPositionV3Pda,
-  wrapperCpiAuthorityPda,
   MAGICBLOCK_DELEGATION_PROGRAM_ID,
   delegateBufferPda,
   delegationRecordPda,
@@ -51,11 +46,6 @@ export {
   FlashBookClient,
   IDL,
 } from './client.ts';
-
-export {
-  FlashBookVaultsClient,
-  VAULTS_IDL,
-} from './vaults-client.ts';
 
 export {
   fetchMarket,
@@ -137,11 +127,6 @@ export type {
   BookLevelV2,
   BookDepthV2Event,
   OrderCancelledV2Event,
-  OrderPlacedV2CpiEvent,
-  WrapperCollateralReleasedEvent,
-  WrapperTraderStateOpenedEvent,
-  WrapperCollateralCreditedEvent,
-  WrapperCollateralDebitedEvent,
   FeeTiersInitializedEvent,
   FeeTiersUpdatedEvent,
   TraderEffectiveTierEvent,

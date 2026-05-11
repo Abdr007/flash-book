@@ -454,8 +454,9 @@ async function matcherMenu(state: DemoState) {
 // ─── 4. Vaults ───────────────────────────────────────────────────────
 async function vaultsMenu(state: DemoState) {
   console.log(c.banner(' VAULTS '));
-  console.log(c.dim('  (coming next: full vault flow via FlashBookVaultsClient)'));
-  console.log(c.dim('  → For now, see scripts/sequencer.ts for the wave-22 vault surface.'));
+  console.log(c.dim('  Use FlashBookClient.createVaultV3Ix / vaultDepositV3Ix /'));
+  console.log(c.dim('  vaultPlaceOrderV3Ix etc. (monolithic — wave-23 merge).'));
+  console.log(c.dim('  → See scripts/sequencer.ts for the wave-22 vault surface.'));
   await state.rl.question(c.dim('  press enter…'));
 }
 

@@ -26,17 +26,23 @@ import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   associatedTokenAddress,
   flpExposurePda,
+  flpExposurePerMarketV3Pda,
+  flpPositionV3Pda,
   insuranceFundPda,
   lpPositionPda,
   marketPda,
   positionPda,
   traderStatePda,
   triggerOrderPda,
+  triggerOrderV3Pda,
   twapOrderPda,
+  twapOrderV3Pda,
   icebergOrderPda,
+  icebergOrderV3Pda,
   vaultPda,
   vaultPositionPda,
-  marketBondPda,
+  vaultV3Pda,
+  vaultPositionV3Pda,
   marketBookPda,
   marketLeverageTiersPda,
   feeTiersPda,
@@ -522,45 +528,6 @@ export class FlashBookClient {
         trader: args.trader,
         market: args.market,
         marketBook: book.address,
-      })
-      .instruction();
-  }
-
-  /// HIP-3 / permissionless market deployment. ANY signer can call this;
-  /// they become BOTH the market authority and the creator (and earn
-  /// `params.creatorShareBps` of net fee on every fill, forever). Params
-  /// are clamped to a SAFE ENVELOPE on chain — see
-  /// `permissionless_initialize_market` in lib.rs for the full clamp
-  /// list (max_leverage ≤ 20×, fees in [10, 200] bps, maint margin ≥ 2%,
-  /// per-trader notional ≤ 1% of FLP, etc.). Anything outside the
-  /// envelope rejects with OutOfRange.
-  permissionlessInitializeMarketIx(args: {
-    authority: PublicKey;
-    baseMint: PublicKey;
-    quoteMint: PublicKey;
-    baseVault: PublicKey;
-    quoteVault: PublicKey;
-    oracleAccount: PublicKey;
-    params: MarketParamsRaw;
-    initialOracleTicks: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const market = this.market(args.baseMint, args.quoteMint);
-    const fund = this.insuranceFund();
-    const flp = this.flpExposure();
-
-    return this.methods
-      .permissionlessInitializeMarket(args.params, args.initialOracleTicks)
-      .accountsPartial({
-        authority: args.authority,
-        baseMint: args.baseMint,
-        quoteMint: args.quoteMint,
-        baseVault: args.baseVault,
-        quoteVault: args.quoteVault,
-        oracleAccount: args.oracleAccount,
-        market: market.address,
-        insuranceFund: fund.address,
-        flpExposure: flp.address,
-        systemProgram: SystemProgram.programId,
       })
       .instruction();
   }
@@ -1420,6 +1387,570 @@ export class FlashBookClient {
       .instruction();
   }
 
+  // ─── V3 monolithic ix builders ──────────────────────────────────────
+  //
+  // V3 ixs were originally in the (now-merged) flash-book-orders /
+  // -vaults / -flp wrapper programs. After the wave-23 monolithic merge
+  // they live under FLASH_BOOK_PROGRAM_ID. Seeds + semantics unchanged.
+
+  /// PDA helpers (defaulting to FLASH_BOOK_PROGRAM_ID).
+  triggerOrderV3(market: PublicKey, trader: PublicKey, triggerId: number) {
+    return triggerOrderV3Pda(market, trader, triggerId, this.programId);
+  }
+  twapOrderV3(market: PublicKey, trader: PublicKey, twapId: number) {
+    return twapOrderV3Pda(market, trader, twapId, this.programId);
+  }
+  icebergOrderV3(market: PublicKey, trader: PublicKey, icebergId: number) {
+    return icebergOrderV3Pda(market, trader, icebergId, this.programId);
+  }
+  vaultV3(strategist: PublicKey, vaultId: number) {
+    return vaultV3Pda(strategist, vaultId, this.programId);
+  }
+  vaultPositionV3(vault: PublicKey, depositor: PublicKey) {
+    return vaultPositionV3Pda(vault, depositor, this.programId);
+  }
+  flpExposurePerMarketV3(market: PublicKey) {
+    return flpExposurePerMarketV3Pda(market, this.programId);
+  }
+  flpPositionV3(exposure: PublicKey, lp: PublicKey) {
+    return flpPositionV3Pda(exposure, lp, this.programId);
+  }
+
+  /// Create a v3 trigger order PDA.
+  placeTriggerOrderV3Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    triggerId: number;
+    side: 'long' | 'short';
+    /// 0 = fire on oracle ≤ trigger_price; 1 = fire on oracle ≥ trigger_price.
+    kind: 0 | 1;
+    sizeLots: bigint | number | BN;
+    triggerPriceTicks: bigint | number | BN;
+    limitPriceTicks: bigint | number | BN;
+    reduceOnly?: boolean;
+    expiresAtSlot?: bigint | number | BN;
+  }): Promise<TransactionInstruction> {
+    const trig = this.triggerOrderV3(args.market, args.trader, args.triggerId);
+    const sz = args.sizeLots instanceof BN ? args.sizeLots : new BN(args.sizeLots.toString());
+    const tp = args.triggerPriceTicks instanceof BN
+      ? args.triggerPriceTicks
+      : new BN(args.triggerPriceTicks.toString());
+    const lp = args.limitPriceTicks instanceof BN
+      ? args.limitPriceTicks
+      : new BN(args.limitPriceTicks.toString());
+    const exp = args.expiresAtSlot === undefined
+      ? new BN(0)
+      : args.expiresAtSlot instanceof BN
+        ? args.expiresAtSlot
+        : new BN(args.expiresAtSlot.toString());
+    return this.methods
+      .placeTriggerOrderV3(
+        args.triggerId,
+        args.side === 'long' ? 0 : 1,
+        args.kind,
+        sz,
+        tp,
+        lp,
+        args.reduceOnly ?? false,
+        exp,
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        triggerOrder: trig.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Execute a v3 trigger — permissionless caller.
+  executeTriggerOrderV3Ix(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    triggerOwner: PublicKey;
+    triggerId: number;
+  }): Promise<TransactionInstruction> {
+    const trig = this.triggerOrderV3(args.market, args.triggerOwner, args.triggerId);
+    const book = marketBookPda(args.market, this.programId);
+    const pos = positionPda(args.market, args.triggerOwner, this.programId);
+    return this.methods
+      .executeTriggerOrderV3()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        marketBook: book.address,
+        triggerOrder: trig.address,
+        position: pos.address,
+      })
+      .instruction();
+  }
+
+  /// Cancel a v3 trigger order.
+  cancelTriggerOrderV3Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    triggerId: number;
+  }): Promise<TransactionInstruction> {
+    const trig = this.triggerOrderV3(args.market, args.trader, args.triggerId);
+    return this.methods
+      .cancelTriggerOrderV3()
+      .accountsPartial({
+        trader: args.trader,
+        triggerOrder: trig.address,
+      })
+      .instruction();
+  }
+
+  /// Create a v3 TWAP order PDA.
+  placeTwapOrderV3Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    twapId: number;
+    side: 'long' | 'short';
+    sliceSizeLots: bigint | number | BN;
+    totalSizeLots: bigint | number | BN;
+    limitPriceTicks: bigint | number | BN;
+    slotInterval: bigint | number | BN;
+    endSlot?: bigint | number | BN;
+  }): Promise<TransactionInstruction> {
+    const twap = this.twapOrderV3(args.market, args.trader, args.twapId);
+    const bn = (v: bigint | number | BN) =>
+      v instanceof BN ? v : new BN(v.toString());
+    return this.methods
+      .placeTwapOrderV3(
+        args.twapId,
+        args.side === 'long' ? 0 : 1,
+        bn(args.sliceSizeLots),
+        bn(args.totalSizeLots),
+        bn(args.limitPriceTicks),
+        bn(args.slotInterval),
+        args.endSlot === undefined ? new BN(0) : bn(args.endSlot),
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        twapOrder: twap.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Execute the next TWAP slice — permissionless caller.
+  executeTwapSliceV3Ix(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+    twapId: number;
+  }): Promise<TransactionInstruction> {
+    const twap = this.twapOrderV3(args.market, args.trader, args.twapId);
+    const book = marketBookPda(args.market, this.programId);
+    return this.methods
+      .executeTwapSliceV3()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        marketBook: book.address,
+        twapOrder: twap.address,
+      })
+      .instruction();
+  }
+
+  cancelTwapOrderV3Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    twapId: number;
+  }): Promise<TransactionInstruction> {
+    const twap = this.twapOrderV3(args.market, args.trader, args.twapId);
+    return this.methods
+      .cancelTwapOrderV3()
+      .accountsPartial({
+        trader: args.trader,
+        twapOrder: twap.address,
+      })
+      .instruction();
+  }
+
+  placeIcebergOrderV3Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    icebergId: number;
+    side: 'long' | 'short';
+    totalSizeLots: bigint | number | BN;
+    displayedSizeLots: bigint | number | BN;
+    limitTicks: bigint | number | BN;
+    expiresAtSlot?: bigint | number | BN;
+  }): Promise<TransactionInstruction> {
+    const ice = this.icebergOrderV3(args.market, args.trader, args.icebergId);
+    const book = marketBookPda(args.market, this.programId);
+    const bn = (v: bigint | number | BN) =>
+      v instanceof BN ? v : new BN(v.toString());
+    return this.methods
+      .placeIcebergOrderV3(
+        args.icebergId,
+        args.side === 'long' ? 0 : 1,
+        bn(args.totalSizeLots),
+        bn(args.displayedSizeLots),
+        bn(args.limitTicks),
+        args.expiresAtSlot === undefined ? new BN(0) : bn(args.expiresAtSlot),
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        marketBook: book.address,
+        icebergOrder: ice.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  replenishIcebergV3Ix(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    trader: PublicKey;
+    icebergId: number;
+  }): Promise<TransactionInstruction> {
+    const ice = this.icebergOrderV3(args.market, args.trader, args.icebergId);
+    const book = marketBookPda(args.market, this.programId);
+    return this.methods
+      .replenishIcebergV3()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        marketBook: book.address,
+        icebergOrder: ice.address,
+      })
+      .instruction();
+  }
+
+  cancelIcebergV3Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    icebergId: number;
+  }): Promise<TransactionInstruction> {
+    const ice = this.icebergOrderV3(args.market, args.trader, args.icebergId);
+    return this.methods
+      .cancelIcebergV3()
+      .accountsPartial({
+        trader: args.trader,
+        icebergOrder: ice.address,
+      })
+      .instruction();
+  }
+
+  /// Atomic bracket: parent limit order + OCO TP/SL triggers, all in
+  /// one tx.
+  placeBracketOrderV3Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    parentSide: 'long' | 'short';
+    sizeLots: bigint | number | BN;
+    parentLimitTicks: bigint | number | BN;
+    tpTriggerId: number;
+    tpTriggerPriceTicks: bigint | number | BN;
+    tpLimitTicks: bigint | number | BN;
+    slTriggerId: number;
+    slTriggerPriceTicks: bigint | number | BN;
+    slLimitTicks: bigint | number | BN;
+    expiresAtSlot?: bigint | number | BN;
+  }): Promise<TransactionInstruction> {
+    const tp = this.triggerOrderV3(args.market, args.trader, args.tpTriggerId);
+    const sl = this.triggerOrderV3(args.market, args.trader, args.slTriggerId);
+    const book = marketBookPda(args.market, this.programId);
+    const bn = (v: bigint | number | BN) =>
+      v instanceof BN ? v : new BN(v.toString());
+    return this.methods
+      .placeBracketOrderV3(
+        args.parentSide === 'long' ? 0 : 1,
+        bn(args.sizeLots),
+        bn(args.parentLimitTicks),
+        args.tpTriggerId,
+        bn(args.tpTriggerPriceTicks),
+        bn(args.tpLimitTicks),
+        args.slTriggerId,
+        bn(args.slTriggerPriceTicks),
+        bn(args.slLimitTicks),
+        args.expiresAtSlot === undefined ? new BN(0) : bn(args.expiresAtSlot),
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        marketBook: book.address,
+        tpTrigger: tp.address,
+        slTrigger: sl.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  // ─── Vaults v3 ─────────────────────────────────────────────────────
+
+  createVaultV3Ix(args: {
+    strategist: PublicKey;
+    vaultId: number;
+    name: Uint8Array;
+    perfFeeBps: number;
+  }): Promise<TransactionInstruction> {
+    if (args.name.length !== 32) {
+      throw new Error('vault name must be exactly 32 bytes');
+    }
+    const v = this.vaultV3(args.strategist, args.vaultId);
+    return this.methods
+      .createVaultV3(args.vaultId, Array.from(args.name), args.perfFeeBps)
+      .accountsPartial({
+        strategist: args.strategist,
+        vault: v.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  vaultOpenTraderStateV3Ix(args: {
+    strategist: PublicKey;
+    vault: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const ts = traderStatePda(args.vault, this.programId);
+    return this.methods
+      .vaultOpenTraderStateV3()
+      .accountsPartial({
+        strategist: args.strategist,
+        vault: args.vault,
+        vaultTraderState: ts.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  vaultDepositV3Ix(args: {
+    depositor: PublicKey;
+    vault: PublicKey;
+    amountQuoteLots: bigint | number | BN;
+    quoteMint: PublicKey;
+    quoteVault: PublicKey;
+    depositorQuoteAta?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const pos = this.vaultPositionV3(args.vault, args.depositor);
+    const ts = traderStatePda(args.vault, this.programId);
+    const ata = args.depositorQuoteAta ?? associatedTokenAddress(args.depositor, args.quoteMint);
+    const amount =
+      args.amountQuoteLots instanceof BN
+        ? args.amountQuoteLots
+        : new BN(args.amountQuoteLots.toString());
+    return this.methods
+      .vaultDepositV3(amount)
+      .accountsPartial({
+        depositor: args.depositor,
+        vault: args.vault,
+        position: pos.address,
+        depositorQuoteAta: ata,
+        quoteVault: args.quoteVault,
+        vaultTraderState: ts.address,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  vaultWithdrawV3Ix(args: {
+    depositor: PublicKey;
+    vault: PublicKey;
+    sharesToBurn: bigint | number | BN;
+    quoteMint: PublicKey;
+    quoteVault: PublicKey;
+    depositorQuoteAta?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const pos = this.vaultPositionV3(args.vault, args.depositor);
+    const ts = traderStatePda(args.vault, this.programId);
+    const fund = insuranceFundPda(this.programId);
+    const ata = args.depositorQuoteAta ?? associatedTokenAddress(args.depositor, args.quoteMint);
+    const shares =
+      args.sharesToBurn instanceof BN
+        ? args.sharesToBurn
+        : new BN(args.sharesToBurn.toString());
+    return this.methods
+      .vaultWithdrawV3(shares)
+      .accountsPartial({
+        depositor: args.depositor,
+        vault: args.vault,
+        position: pos.address,
+        insuranceFund: fund.address,
+        quoteVault: args.quoteVault,
+        depositorQuoteAta: ata,
+        vaultTraderState: ts.address,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
+  vaultPlaceOrderV3Ix(args: {
+    strategist: PublicKey;
+    vault: PublicKey;
+    market: PublicKey;
+    side: 'long' | 'short';
+    sizeLots: bigint | number | BN;
+    limitTicks: bigint | number | BN;
+    flags?: number;
+    expiresAtSlot?: bigint | number | BN;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market, this.programId);
+    const sz = args.sizeLots instanceof BN ? args.sizeLots : new BN(args.sizeLots.toString());
+    const px = args.limitTicks instanceof BN ? args.limitTicks : new BN(args.limitTicks.toString());
+    const exp =
+      args.expiresAtSlot === undefined
+        ? new BN(0)
+        : args.expiresAtSlot instanceof BN
+          ? args.expiresAtSlot
+          : new BN(args.expiresAtSlot.toString());
+    return this.methods
+      .vaultPlaceOrderV3(args.side === 'long' ? 0 : 1, sz, px, args.flags ?? 0, exp)
+      .accountsPartial({
+        strategist: args.strategist,
+        vault: args.vault,
+        market: args.market,
+        marketBook: book.address,
+      })
+      .instruction();
+  }
+
+  vaultCancelOrderV3Ix(args: {
+    strategist: PublicKey;
+    vault: PublicKey;
+    market: PublicKey;
+    side: 'long' | 'short';
+    orderId: bigint | BN;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market, this.programId);
+    const oid = args.orderId instanceof BN ? args.orderId : new BN(args.orderId.toString());
+    return this.methods
+      .vaultCancelOrderV3(args.side === 'long' ? 0 : 1, oid)
+      .accountsPartial({
+        strategist: args.strategist,
+        vault: args.vault,
+        market: args.market,
+        marketBook: book.address,
+      })
+      .instruction();
+  }
+
+  settleVaultPerfFeeV3Ix(args: {
+    strategist: PublicKey;
+    vault: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const stratPos = this.vaultPositionV3(args.vault, args.strategist);
+    const ts = traderStatePda(args.vault, this.programId);
+    return this.methods
+      .settleVaultPerfFeeV3()
+      .accountsPartial({
+        strategist: args.strategist,
+        vault: args.vault,
+        strategistPosition: stratPos.address,
+        vaultTraderState: ts.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  // ─── Per-market FLP v3 ─────────────────────────────────────────────
+
+  initFlpPerMarketV3Ix(args: {
+    authority: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const exposure = this.flpExposurePerMarketV3(args.market);
+    return this.methods
+      .initFlpPerMarketV3()
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        exposure: exposure.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  recordFlpFillV3Ix(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    sizeLots: bigint | number | BN;
+    priceTicks: bigint | number | BN;
+    side: 'long' | 'short';
+    realizedPnlDelta: bigint | number | BN;
+  }): Promise<TransactionInstruction> {
+    const exposure = this.flpExposurePerMarketV3(args.market);
+    const bn = (v: bigint | number | BN) =>
+      v instanceof BN ? v : new BN(v.toString());
+    return this.methods
+      .recordFlpFillV3(
+        bn(args.sizeLots),
+        bn(args.priceTicks),
+        args.side === 'long' ? 0 : 1,
+        bn(args.realizedPnlDelta),
+      )
+      .accountsPartial({
+        authority: args.authority,
+        exposure: exposure.address,
+      })
+      .instruction();
+  }
+
+  flpDepositV3Ix(args: {
+    lp: PublicKey;
+    market: PublicKey;
+    amountQuoteLots: bigint | number | BN;
+    quoteMint: PublicKey;
+    quoteVault: PublicKey;
+    lpQuoteAta?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const exposure = this.flpExposurePerMarketV3(args.market);
+    const pos = this.flpPositionV3(exposure.address, args.lp);
+    const ata = args.lpQuoteAta ?? associatedTokenAddress(args.lp, args.quoteMint);
+    const amount =
+      args.amountQuoteLots instanceof BN
+        ? args.amountQuoteLots
+        : new BN(args.amountQuoteLots.toString());
+    return this.methods
+      .flpDepositV3(amount)
+      .accountsPartial({
+        lp: args.lp,
+        exposure: exposure.address,
+        position: pos.address,
+        lpQuoteAta: ata,
+        quoteVault: args.quoteVault,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  flpWithdrawV3Ix(args: {
+    lp: PublicKey;
+    market: PublicKey;
+    sharesToBurn: bigint | number | BN;
+    quoteMint: PublicKey;
+    quoteVault: PublicKey;
+    lpQuoteAta?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const exposure = this.flpExposurePerMarketV3(args.market);
+    const pos = this.flpPositionV3(exposure.address, args.lp);
+    const fund = insuranceFundPda(this.programId);
+    const ata = args.lpQuoteAta ?? associatedTokenAddress(args.lp, args.quoteMint);
+    const shares =
+      args.sharesToBurn instanceof BN
+        ? args.sharesToBurn
+        : new BN(args.sharesToBurn.toString());
+    return this.methods
+      .flpWithdrawV3(shares)
+      .accountsPartial({
+        lp: args.lp,
+        exposure: exposure.address,
+        position: pos.address,
+        insuranceFund: fund.address,
+        quoteVault: args.quoteVault,
+        lpQuoteAta: ata,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+  }
+
   /// View ix: predicted next-batch funding rate. Compose into a tx and
   /// `connection.simulateTransaction` to read the emit log without
   /// landing on chain. The PredictedFundingEvent in the logs carries
@@ -1567,88 +2098,6 @@ export class FlashBookClient {
         underwaterPosition: upos.address,
         counterTraderState: cts.address,
         counterPosition: cpos.address,
-      })
-      .instruction();
-  }
-
-  /// Post a slashable HIP-3 deployer bond. Anyone can post bond on any
-  /// market (per (market, depositor) pair). Bond is held in the protocol
-  /// quote vault; slashable by governance. Adding to an existing bond
-  /// cancels any pending unbond request.
-  postMarketBondIx(args: {
-    depositor: PublicKey;
-    market: PublicKey;
-    amountQuoteLots: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const fund = this.insuranceFund();
-    return this.methods
-      .postMarketBond(args.amountQuoteLots)
-      .accountsPartial({
-        depositor: args.depositor,
-        market: args.market,
-        insuranceFund: fund.address,
-        systemProgram: SystemProgram.programId,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .instruction();
-  }
-
-  /// Request to unbond a market bond. Sets the unbond timestamp; the
-  /// bond becomes claimable after BOND_UNBOND_DELAY_SECONDS (7 days).
-  /// Re-posting bond cancels the request.
-  requestUnbondMarketBondIx(args: {
-    depositor: PublicKey;
-    market: PublicKey;
-  }): Promise<TransactionInstruction> {
-    const bond = marketBondPda(args.market, args.depositor).address;
-    return this.methods
-      .requestUnbondMarketBond()
-      .accountsPartial({
-        depositor: args.depositor,
-        marketBond: bond,
-      })
-      .instruction();
-  }
-
-  /// Claim unbonded market bond. Requires the unbond delay to have
-  /// elapsed. Transfers the full outstanding amount back to the
-  /// depositor's quote ATA. The MarketBondAccount stays open with
-  /// amount=0 (re-postable).
-  claimUnbondedMarketBondIx(args: {
-    depositor: PublicKey;
-    market: PublicKey;
-  }): Promise<TransactionInstruction> {
-    const bond = marketBondPda(args.market, args.depositor).address;
-    const fund = this.insuranceFund();
-    return this.methods
-      .claimUnbondedMarketBond()
-      .accountsPartial({
-        depositor: args.depositor,
-        marketBond: bond,
-        insuranceFund: fund.address,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .instruction();
-  }
-
-  /// Slash a deployer bond. Protocol authority signs (single source of
-  /// truth: insurance_fund.authority). Transfers `amount` from bond
-  /// into insurance balance. Slash conditions are enforced off-chain
-  /// by governance + monitors (oracle staleness, mass insolvency).
-  slashMarketBondIx(args: {
-    authority: PublicKey;
-    market: PublicKey;
-    bondDepositor: PublicKey;
-    amountQuoteLots: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const fund = this.insuranceFund();
-    const bond = marketBondPda(args.market, args.bondDepositor).address;
-    return this.methods
-      .slashMarketBond(args.amountQuoteLots)
-      .accountsPartial({
-        authority: args.authority,
-        insuranceFund: fund.address,
-        marketBond: bond,
       })
       .instruction();
   }

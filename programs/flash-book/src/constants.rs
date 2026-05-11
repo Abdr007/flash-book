@@ -35,11 +35,9 @@ pub const MAX_FEE_TIER_BPS: u32 = 1_000;
 /// resolution).
 pub const DEFAULT_VOLUME_WINDOW_SLOTS: u64 = 3_024_000;
 
-/// HIP-3 bond unbonding delay (seconds). When a depositor requests
-/// unbond on their MarketBondAccount, they cannot claim until this
-/// many seconds have elapsed since the request. Prevents the
-/// withdraw-before-slash race after a market goes bad. 7 days = 604_800.
-pub const BOND_UNBOND_DELAY_SECONDS: u64 = 604_800;
+// HIP-3 deployer bond unbonding delay was removed alongside the
+// permissionless market creation / bond infrastructure in Flash Book
+// V3. Markets are now authority-gated only.
 
 /// Maximum stress scenarios per batch — capped to keep margin compute bounded.
 /// At 60 scenarios × 8 markets × 16 positions = 7680 evaluations per batch.

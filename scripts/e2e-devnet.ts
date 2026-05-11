@@ -61,13 +61,10 @@ async function main() {
   console.log(`  Bal:      ${((await conn.getBalance(auth.publicKey)) / 1e9).toFixed(4)} SOL`);
   const client = new FlashBookClient(conn, new Wallet(auth));
 
-  // ─── Step 1: programs deployed
-  console.log(banner('STEP 1 — 4 programs deployed on devnet'));
+  // ─── Step 1: program deployed (wave-23 monolithic)
+  console.log(banner('STEP 1 — flash_book deployed on devnet'));
   const programs = [
     ['flash_book', FLASH_BOOK_PROGRAM_ID],
-    ['flash_book_orders', new PublicKey('2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5')],
-    ['flash_book_vaults', new PublicKey('GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt')],
-    ['flash_book_flp', new PublicKey('eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M')],
   ] as const;
   for (const [name, id] of programs) {
     const info = await conn.getAccountInfo(id);

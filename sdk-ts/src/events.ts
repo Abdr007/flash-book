@@ -122,37 +122,6 @@ export enum MarketStatus {
   Closed = 4,
 }
 
-// ─── Wave 21 — wrapper-program CPI events ───────────────────────────
-
-export interface OrderPlacedV2CpiEvent extends OrderPlacedV2Event {
-  cpiAuthority: PublicKey;
-}
-
-export interface WrapperCollateralReleasedEvent {
-  cpiAuthority: PublicKey;
-  user: PublicKey;
-  amount: BN;
-}
-
-export interface WrapperTraderStateOpenedEvent {
-  cpiAuthority: PublicKey;
-  trader: PublicKey;
-}
-
-export interface WrapperCollateralCreditedEvent {
-  cpiAuthority: PublicKey;
-  trader: PublicKey;
-  amount: BN;
-  newCollateral: BN;
-}
-
-export interface WrapperCollateralDebitedEvent {
-  cpiAuthority: PublicKey;
-  trader: PublicKey;
-  amount: BN;
-  newCollateral: BN;
-}
-
 // ─── Wave 22 — fee-tier events ──────────────────────────────────────
 
 export interface FeeTiersInitializedEvent {
@@ -248,11 +217,6 @@ export type FlashBookEvent =
   | { name: 'OrderPlacedV2Event'; data: OrderPlacedV2Event }
   | { name: 'BookDepthV2Event'; data: BookDepthV2Event }
   | { name: 'OrderCancelledV2Event'; data: OrderCancelledV2Event }
-  | { name: 'OrderPlacedV2CpiEvent'; data: OrderPlacedV2CpiEvent }
-  | { name: 'WrapperCollateralReleasedEvent'; data: WrapperCollateralReleasedEvent }
-  | { name: 'WrapperTraderStateOpenedEvent'; data: WrapperTraderStateOpenedEvent }
-  | { name: 'WrapperCollateralCreditedEvent'; data: WrapperCollateralCreditedEvent }
-  | { name: 'WrapperCollateralDebitedEvent'; data: WrapperCollateralDebitedEvent }
   | { name: 'FeeTiersInitializedEvent'; data: FeeTiersInitializedEvent }
   | { name: 'FeeTiersUpdatedEvent'; data: FeeTiersUpdatedEvent }
   | { name: 'TraderEffectiveTierEvent'; data: TraderEffectiveTierEvent }

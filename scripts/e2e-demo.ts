@@ -147,17 +147,7 @@ async function main() {
     console.log(fail(`flash_book NOT deployed at ${FLASH_BOOK_PROGRAM_ID.toBase58()}`));
     process.exit(1);
   }
-  console.log(ok(`flash_book (core)    ${d(FLASH_BOOK_PROGRAM_ID.toBase58())}`));
-  // Wrapper programs are optional for the basic trade flow.
-  for (const [name, id] of [
-    ['flash_book_orders', '2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5'],
-    ['flash_book_vaults', 'GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt'],
-    ['flash_book_flp', 'eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M'],
-  ] as const) {
-    const info = await conn.getAccountInfo(new PublicKey(id));
-    if (info?.executable) console.log(ok(`${name.padEnd(20)} ${d(id)}`));
-    else console.log(d(`${name.padEnd(20)} not deployed at this cluster (optional)`));
-  }
+  console.log(ok(`flash_book (monolithic)    ${d(FLASH_BOOK_PROGRAM_ID.toBase58())}`));
 
   // ─── Step 2: airdrop SOL to authority (skip on devnet/mainnet) + create test USDC mint
   console.log(banner('STEP 2 — fund authority + create test USDC mint'));

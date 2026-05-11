@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 // Devnet bootstrap script for Flash Book V3.
 //
-// Run AFTER `solana program deploy target/deploy/{flash_book,
-// flash_book_orders,flash_book_flp,flash_book_vaults}.so`. The script:
+// Run AFTER `solana program deploy target/deploy/flash_book.so`
+// (monolithic — wave 23 merged the 3 wrappers). The script:
 //
 //   1. Creates the protocol's quote_vault TokenAccount (USDC, owned by
 //      the InsuranceFund PDA).

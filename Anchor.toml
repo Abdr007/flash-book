@@ -3,16 +3,10 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-flash_book = "HGP5GN7BHSt1geH1DxRwVGFg7g7ERU28Q2QEYf6KP24b"
-flash_book_orders = "2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5"
-flash_book_flp = "eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M"
-flash_book_vaults = "GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt"
+flash_book = "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF"
 
 [programs.devnet]
-flash_book = "HGP5GN7BHSt1geH1DxRwVGFg7g7ERU28Q2QEYf6KP24b"
-flash_book_orders = "2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5"
-flash_book_flp = "eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M"
-flash_book_vaults = "GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt"
+flash_book = "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF"
 
 [provider]
 cluster = "devnet"
@@ -24,7 +18,4 @@ test = "bun test programs/flash-book/tests"
 [workspace]
 members = [
     "programs/flash-book",
-    "programs/flash-book-orders",
-    "programs/flash-book-flp",
-    "programs/flash-book-vaults",
 ]

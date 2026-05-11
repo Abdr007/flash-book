@@ -81,10 +81,11 @@ pub enum FlashBookError {
     OcoPairMismatch = 1219,
     #[msg("ADL not eligible: insurance fund above threshold or counter unprofitable at bankruptcy price")]
     AdlNotEligible = 1220,
-    #[msg("HIP-3 deployer bond is below the slashable minimum")]
-    BondTooSmall = 1221,
-    #[msg("Bond cannot be unbonded yet — unbond delay not elapsed")]
-    BondUnbondingDelay = 1222,
+    // Codes 1221 and 1222 (BondTooSmall, BondUnbondingDelay) were
+    // retired with the removal of the HIP-3 deployer-bond infrastructure
+    // in Flash Book V3 — markets are authority-gated only. Codes are
+    // intentionally left unallocated so on-chain logs from prior
+    // deployments stay decodable.
     #[msg("Vault NAV market mismatch — passed market doesn't match position")]
     VaultNavMarketMismatch = 1223,
     #[msg("Order would push gross OI past the market's `max_oi_base_lots` cap")]

@@ -15,21 +15,6 @@ export const FLASH_BOOK_PROGRAM_ID = new PublicKey(
   'Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF',
 );
 
-/// Wave 21 program-split sister IDs. SKELETONS as of wave 21 phase 1
-/// (deployable; no functional ixs beyond `ping`). See
-/// `docs/V3_WAVE21_MODULAR.md` for the migration plan.
-export const FLASH_BOOK_ORDERS_PROGRAM_ID = new PublicKey(
-  '2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5',
-);
-
-export const FLASH_BOOK_FLP_PROGRAM_ID = new PublicKey(
-  'eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M',
-);
-
-export const FLASH_BOOK_VAULTS_PROGRAM_ID = new PublicKey(
-  'GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt',
-);
-
 export const TOKEN_PROGRAM_ID = new PublicKey(
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
 );
@@ -69,7 +54,6 @@ const TWAP_ORDER_SEED = Buffer.from('twap');
 const ICEBERG_ORDER_SEED = Buffer.from('iceberg');
 const VAULT_SEED = Buffer.from('vault');
 const VAULT_POSITION_SEED = Buffer.from('vault_position');
-const MARKET_BOND_SEED = Buffer.from('market_bond');
 const MARKET_BOOK_SEED = Buffer.from('market_book');
 
 export interface DerivedPda {
@@ -178,14 +162,6 @@ export function vaultPositionPda(
   );
 }
 
-export function marketBondPda(
-  market: PublicKey,
-  depositor: PublicKey,
-  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
-): DerivedPda {
-  return derive([MARKET_BOND_SEED, market.toBuffer(), depositor.toBuffer()], programId);
-}
-
 /// Hypertree-backed v2 orderbook account. PDA seeds [b"market_book", market].
 export function marketBookPda(
   market: PublicKey,
@@ -194,16 +170,20 @@ export function marketBookPda(
   return derive([MARKET_BOOK_SEED, market.toBuffer()], programId);
 }
 
-/// Wave 21 phase 3a: TriggerOrderAccountV3 PDA owned by `flash-book-orders`.
-/// Distinct from core's `triggerOrderPda` (core seed `b"trigger"`,
-/// orders seed `b"trigger_v3"`) so a trader can hold both legacy and
-/// v3 triggers during the migration window.
+// ─── V3 PDAs (monolithic) ────────────────────────────────────────────
+//
+// V3 PDAs were originally owned by the (now-merged) wrapper programs
+// (flash-book-orders, -flp, -vaults). After the wave-23 monolithic
+// merge, all V3 PDAs live under the same FLASH_BOOK_PROGRAM_ID. Seeds
+// are unchanged.
+
+/// TriggerOrderAccountV3 — seed `[b"trigger_v3", market, trader, trigger_id]`.
 const TRIGGER_V3_SEED = Buffer.from('trigger_v3');
 export function triggerOrderV3Pda(
   market: PublicKey,
   trader: PublicKey,
   triggerId: number,
-  ordersProgramId: PublicKey = FLASH_BOOK_ORDERS_PROGRAM_ID,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
 ): DerivedPda {
   return derive(
     [
@@ -212,17 +192,17 @@ export function triggerOrderV3Pda(
       trader.toBuffer(),
       Buffer.from([triggerId & 0xff]),
     ],
-    ordersProgramId,
+    programId,
   );
 }
 
-/// Wave 21 phase 3b: TwapOrderAccountV3 PDA under flash-book-orders.
+/// TwapOrderAccountV3 — seed `[b"twap_v3", market, trader, twap_id]`.
 const TWAP_V3_SEED = Buffer.from('twap_v3');
 export function twapOrderV3Pda(
   market: PublicKey,
   trader: PublicKey,
   twapId: number,
-  ordersProgramId: PublicKey = FLASH_BOOK_ORDERS_PROGRAM_ID,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
 ): DerivedPda {
   return derive(
     [
@@ -231,17 +211,17 @@ export function twapOrderV3Pda(
       trader.toBuffer(),
       Buffer.from([twapId & 0xff]),
     ],
-    ordersProgramId,
+    programId,
   );
 }
 
-/// Wave 21 phase 3c: IcebergOrderAccountV3 PDA under flash-book-orders.
+/// IcebergOrderAccountV3 — seed `[b"iceberg_v3", market, trader, iceberg_id]`.
 const ICEBERG_V3_SEED = Buffer.from('iceberg_v3');
 export function icebergOrderV3Pda(
   market: PublicKey,
   trader: PublicKey,
   icebergId: number,
-  ordersProgramId: PublicKey = FLASH_BOOK_ORDERS_PROGRAM_ID,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
 ): DerivedPda {
   return derive(
     [
@@ -250,68 +230,56 @@ export function icebergOrderV3Pda(
       trader.toBuffer(),
       Buffer.from([icebergId & 0xff]),
     ],
-    ordersProgramId,
+    programId,
   );
 }
 
-/// Wave 21 phase 8: per-market FLP exposure under flash-book-flp.
-/// One per market — independently ER-delegatable.
+/// Per-market FLP exposure account. Seeds `[b"flp_per_market", market]`.
 const FLP_PER_MARKET_SEED = Buffer.from('flp_per_market');
 export function flpExposurePerMarketV3Pda(
   market: PublicKey,
-  flpProgramId: PublicKey = FLASH_BOOK_FLP_PROGRAM_ID,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
 ): DerivedPda {
-  return derive([FLP_PER_MARKET_SEED, market.toBuffer()], flpProgramId);
+  return derive([FLP_PER_MARKET_SEED, market.toBuffer()], programId);
 }
 
-/// Wave 21 phase 8b: per-LP, per-market FLP shares balance under
-/// flash-book-flp. Created lazily on first `flp_deposit_v3`.
+/// Per-LP, per-market FLP shares balance. Seeds `[b"flp_position_v3", exposure, lp]`.
 const FLP_POSITION_V3_SEED = Buffer.from('flp_position_v3');
 export function flpPositionV3Pda(
   exposure: PublicKey,
   lp: PublicKey,
-  flpProgramId: PublicKey = FLASH_BOOK_FLP_PROGRAM_ID,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
 ): DerivedPda {
   return derive(
     [FLP_POSITION_V3_SEED, exposure.toBuffer(), lp.toBuffer()],
-    flpProgramId,
+    programId,
   );
 }
 
-/// Wave 21 phase 9: vault account under flash-book-vaults.
+/// VaultAccountV3 — seed `[b"vault_v3", strategist, vault_id]`.
 const VAULT_V3_SEED = Buffer.from('vault_v3');
 export function vaultV3Pda(
   strategist: PublicKey,
   vaultId: number,
-  vaultsProgramId: PublicKey = FLASH_BOOK_VAULTS_PROGRAM_ID,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
 ): DerivedPda {
   return derive(
     [VAULT_V3_SEED, strategist.toBuffer(), Buffer.from([vaultId & 0xff])],
-    vaultsProgramId,
+    programId,
   );
 }
 
-/// Wave 21 phase 9: vault depositor share account under flash-book-vaults.
+/// VaultPositionAccountV3 — seed `[b"vault_position_v3", vault, depositor]`.
 const VAULT_POSITION_V3_SEED = Buffer.from('vault_position_v3');
 export function vaultPositionV3Pda(
   vault: PublicKey,
   depositor: PublicKey,
-  vaultsProgramId: PublicKey = FLASH_BOOK_VAULTS_PROGRAM_ID,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
 ): DerivedPda {
   return derive(
     [VAULT_POSITION_V3_SEED, vault.toBuffer(), depositor.toBuffer()],
-    vaultsProgramId,
+    programId,
   );
-}
-
-/// Wave 21 phase 2: per-wrapper-program CPI signer PDA. Each wrapper
-/// (orders / flp / vaults) signs core CPI calls with this PDA. Core
-/// validates the signer matches one of the 3 expected derivations.
-const CPI_AUTHORITY_SEED = Buffer.from('cpi_authority');
-export function wrapperCpiAuthorityPda(
-  wrapperProgramId: PublicKey,
-): DerivedPda {
-  return derive([CPI_AUTHORITY_SEED], wrapperProgramId);
 }
 
 /// Per-market leverage-tier table — wave 20a (HL pattern).
@@ -328,9 +296,6 @@ export function marketLeverageTiersPda(
 
 /// WAVE 22 — global multi-tier fee table (volume-based, HL/Binance/dYdX
 /// pattern). Singleton PDA at `[b"fee_tiers"]` under flash-book-core.
-/// Authority-set; `init_fee_tiers` / `update_fee_tiers` install the
-/// schedule. Trader's effective tier is resolved from
-/// `TraderStateAccount.volume_30d_quote_lots` against this table.
 const FEE_TIERS_SEED = Buffer.from('fee_tiers');
 export function feeTiersPda(
   programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
@@ -348,10 +313,6 @@ export function feeTiersPda(
 //                          OWNED BY THE DELEGATION PROGRAM
 //   - Metadata           : [b"delegation-metadata", delegated_account]
 //                          OWNED BY THE DELEGATION PROGRAM
-//
-// SDK callers use these to compose `delegateMarketBookIx` /
-// `delegateMarketIx` accounts WITHOUT pulling the magicblock SDK as a
-// runtime dependency.
 
 export const MAGICBLOCK_DELEGATION_PROGRAM_ID = new PublicKey(
   'DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh',
