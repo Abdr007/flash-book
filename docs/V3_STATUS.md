@@ -8,10 +8,10 @@ deployment story looks like as of this commit.
 The on-chain program is **MagicBlock × Flash Trade ready**. The full v2
 hypertree orderbook is live, all five order injection paths have v2
 equivalents, MagicBlock ER delegation ixs ship for the three accounts the
-matcher hot-path mutates, the wave-21 4-program modular split is end-to-end
-(core inverse-CPI for SPL release + 6 state-copy migration ixs landed
-in this commit), and 486 tests across Rust + TypeScript hold green with
-zero compiler warnings.
+matcher hot-path mutates, the wave-21 4-program modular split is end-to-end,
+the wave-22 multi-tier volume-based fee table lands phase 1 (config +
+volume tracking + view ix; matcher integration is phase 2), and 498
+tests across Rust + TypeScript hold green with zero compiler warnings.
 
 The v1 surface remains in place (deprecated) so the existing bot / MM /
 integration tests keep working. v1 deletion is mechanical and queued for a
@@ -131,7 +131,7 @@ Zero failures, zero warnings.
 | 20a  | Multi-tier MMR (HL has up to 6 tiers per asset) | Single-tier already covers ~80% of cases via `concentration_threshold_lots` + `concentration_extra_mmr_bps`; multi-tier needs additive `MarketLeverageTiers` PDA + RiskMarketSnap plumbing through 10+ files |
 | 20b  | Withdrawal floor `max(IM, 0.1 × notional)` | Current is **stricter** (`open_positions == 0`); HL floor is a UX upgrade (allows partial withdrawal with positions), not a security fix. Implement as additive `partial_withdraw_collateral` ix when needed |
 | 21   | Modular wrapper programs | **Phases 1+2+3a-d+4+8+8b+9+9b+10 shipped — wave 21 COMPLETE.** Phase 1: 3 sister programs deployable. Phase 2: CPI surface end-to-end. Phases 3a-d: trigger / TWAP / iceberg / bracket v3 in flash-book-orders. Phase 4: 7 placement ixs sunset in core (`place_trigger_order`, `place_twap_order`, `place_iceberg_order_v2`, `place_bracket_order_v2`, `create_vault`, `deposit_to_vault`, `withdraw_from_vault`); execute/cancel/withdraw kept for legacy drain. Phase 8: per-market FLP exposure in flash-book-flp. Phase 8b: FLP deposit/withdraw with real SPL transfers (depositor signs IN; core inverse-CPI signs OUT as InsuranceFund PDA via new `cpi_release_collateral_to_user`). Phase 9: vault + position accounts in flash-book-vaults. Phase 9b: vault deposit/withdraw with real SPL transfers (same inverse-CPI pattern). Phase 10: 6 state-copy migration ixs (trigger / TWAP / iceberg in orders; per-market FLP row in flp; vault + vault-position in vaults). Per [`V3_WAVE21_MODULAR.md`](./V3_WAVE21_MODULAR.md). |
-| 22   | Fee tier table | Already exists: `TraderStateAccount.fee_discount_bps` + `set_trader_fee_tier` ix |
+| 22   | Fee tier table | **Shipped.** Multi-tier volume-based fee schedule (HL / Binance / dYdX standard). New `FeeTiersAccount` PDA at `[b"fee_tiers"]` holds up to 10 tiers (`min_volume_quote_lots`, `maker_rebate_bps`, `taker_fee_bps`). `TraderStateAccount` gains `volume_30d_quote_lots` + `volume_window_start_slot` (rolling, credited from `apply_fill` on every economic fill). Pure helper `resolve_fee_tier(volume, tiers)` picks the highest tier the trader satisfies. Authority-set via `init_fee_tiers` / `update_fee_tiers` with full validation (sorted ascending, monotone improving, all bps ≤ MAX_FEE_TIER_BPS = 1_000). View ix `view_trader_effective_tier` returns the trader's current tier + bps + window-expired flag for UI display. Legacy `set_trader_fee_tier` (admin-set per-trader discount) coexists — applies as a further percentage discount on top of the tier-resolved rate (promo / referral codes stack). Authority can encode any exchange's existing schedule (Flash Trade, HL, Binance, etc.) directly. Phase 2 (separate): wire tier-resolved rates into matcher's `apply_fill` to actually discount the per-fill fee. |
 | 23   | Certora formal spec | Full prep doc in [`V3_WAVE23_CERTORA.md`](./V3_WAVE23_CERTORA.md): 13 critical invariants formalized (matcher 5, risk 5, hypertree 4, funding 3), engagement scope $80-120K, 8-10 weeks |
 
 ## Latent items spotted along the way

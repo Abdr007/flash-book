@@ -376,3 +376,98 @@ pub fn default_scenarios(markets: &[Pubkey]) -> Vec<Scenario> {
     out.push(bs_up);
     out
 }
+
+/// WAVE 22 — pure tier resolution for the multi-tier fee table.
+///
+/// Picks the HIGHEST tier (by `min_volume`) that the trader's
+/// rolling-window volume satisfies. Returns `(maker_rebate_bps,
+/// taker_fee_bps)` for use by `apply_fill`.
+///
+/// `tiers` MUST be sorted ascending by `min_volume_quote_lots` AND
+/// the first tier MUST have `min_volume == 0` (the default tier).
+/// Both invariants are enforced at write time in
+/// `lib.rs:init_fee_tiers / update_fee_tiers`. With an empty slice
+/// (no FeeTiersAccount supplied), falls back to `(default_maker_bps,
+/// default_taker_bps)`.
+///
+/// Same shape as `tiered_mmr_bps` — pure, no Solana types.
+pub fn resolve_fee_tier(
+    default_maker_rebate_bps: u32,
+    default_taker_fee_bps: u32,
+    tiers: &[(u64, u32, u32)],
+    trader_volume_quote_lots: u64,
+) -> (u32, u32) {
+    let mut maker = default_maker_rebate_bps;
+    let mut taker = default_taker_fee_bps;
+    for (min_vol, m, t) in tiers {
+        if trader_volume_quote_lots >= *min_vol {
+            maker = *m;
+            taker = *t;
+        } else {
+            break;
+        }
+    }
+    (maker, taker)
+}
+
+#[cfg(test)]
+mod fee_tier_tests {
+    use super::*;
+
+    #[test]
+    fn empty_tiers_returns_defaults() {
+        let (m, t) = resolve_fee_tier(2, 5, &[], 1_000_000_000);
+        assert_eq!(m, 2);
+        assert_eq!(t, 5);
+    }
+
+    #[test]
+    fn picks_highest_satisfied_tier() {
+        // HL-style schedule (monotone improving):
+        //   tier 0 (vol 0):       maker 2 bps rebate, taker 5 bps fee
+        //   tier 1 ($1M):         maker 3 bps rebate, taker 4 bps fee
+        //   tier 2 ($5M):         maker 4 bps rebate, taker 3 bps fee
+        //   tier 3 ($25M):        maker 6 bps rebate, taker 2 bps fee
+        let tiers = [
+            (0u64, 2u32, 5u32),
+            (1_000_000, 3, 4),
+            (5_000_000, 4, 3),
+            (25_000_000, 6, 2),
+        ];
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 0), (2, 5));
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 999_999), (2, 5));
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 1_000_000), (3, 4));
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 4_999_999), (3, 4));
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 5_000_000), (4, 3));
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 25_000_000), (6, 2));
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, u64::MAX), (6, 2));
+    }
+
+    #[test]
+    fn boundary_inclusive() {
+        // EXACTLY the threshold qualifies for the tier (`>=`, not `>`).
+        let tiers = [(0u64, 5u32, 10u32), (1_000_000, 4, 8)];
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 1_000_000), (4, 8));
+    }
+
+    #[test]
+    fn monotone_improvement_across_volume_sweep() {
+        // Maker rebate must monotonically RISE as volume rises;
+        // taker fee must monotonically FALL.
+        let tiers = [
+            (0u64, 1u32, 10u32),
+            (10_000, 2, 9),
+            (100_000, 3, 7),
+            (1_000_000, 5, 5),
+        ];
+        let mut prev_maker = 0u32;
+        let mut prev_taker = u32::MAX;
+        for vol in [0u64, 9_999, 10_000, 99_999, 100_000, 999_999, 1_000_000, 1_000_001] {
+            let (m, t) = resolve_fee_tier(0, 0, &tiers, vol);
+            assert!(m >= prev_maker, "maker rebate must not decrease as volume rises");
+            assert!(t <= prev_taker, "taker fee must not increase as volume rises");
+            prev_maker = m;
+            prev_taker = t;
+        }
+    }
+}

@@ -24,6 +24,7 @@ export {
   marketBondPda,
   marketBookPda,
   marketLeverageTiersPda,
+  feeTiersPda,
   triggerOrderV3Pda,
   twapOrderV3Pda,
   icebergOrderV3Pda,

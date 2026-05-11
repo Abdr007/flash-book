@@ -40,6 +40,7 @@ import {
   marketBondPda,
   marketBookPda,
   marketLeverageTiersPda,
+  feeTiersPda,
   MAGICBLOCK_DELEGATION_PROGRAM_ID,
   delegateBufferPda,
   delegationRecordPda,
@@ -1033,6 +1034,101 @@ export class FlashBookClient {
         authority: args.authority,
         market: args.market,
         leverageTiers: tiersPda.address,
+      })
+      .instruction();
+  }
+
+  // ─── Wave 22 — Multi-tier fee table (volume-based) ─────────────────
+
+  /// Initialize the global fee tier table (HL/Binance/dYdX pattern).
+  /// Authority signs. Tiers MUST be sorted ascending by
+  /// `minVolumeQuoteLots`, the first tier MUST have `minVolume == 0`,
+  /// and the schedule MUST be monotone improving (taker_fee ↘,
+  /// maker_rebate ↗). All bps values within MAX_FEE_TIER_BPS = 1_000.
+  /// `volumeWindowSlots` is the rolling-window length (HL: 14d ≈
+  /// 3_024_000 slots @ 0.4s).
+  ///
+  /// Flash Trade can encode their existing tier schedule directly —
+  /// the table is fully authority-parameterized, no fixed schema.
+  initFeeTiersIx(args: {
+    authority: PublicKey;
+    volumeWindowSlots: bigint | BN;
+    tiers: ReadonlyArray<{
+      minVolumeQuoteLots: bigint | BN;
+      makerRebateBps: number;
+      takerFeeBps: number;
+    }>;
+  }): Promise<TransactionInstruction> {
+    const ixTiers = args.tiers.map((t) => ({
+      minVolumeQuoteLots:
+        t.minVolumeQuoteLots instanceof BN
+          ? t.minVolumeQuoteLots
+          : new BN(t.minVolumeQuoteLots.toString()),
+      makerRebateBps: t.makerRebateBps,
+      takerFeeBps: t.takerFeeBps,
+    }));
+    const window =
+      args.volumeWindowSlots instanceof BN
+        ? args.volumeWindowSlots
+        : new BN(args.volumeWindowSlots.toString());
+    const ft = feeTiersPda(this.programId);
+    return this.methods
+      .initFeeTiers(window, ixTiers)
+      .accountsPartial({
+        authority: args.authority,
+        feeTiers: ft.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Update the global fee tier table. Same validation as init.
+  updateFeeTiersIx(args: {
+    authority: PublicKey;
+    volumeWindowSlots: bigint | BN;
+    tiers: ReadonlyArray<{
+      minVolumeQuoteLots: bigint | BN;
+      makerRebateBps: number;
+      takerFeeBps: number;
+    }>;
+  }): Promise<TransactionInstruction> {
+    const ixTiers = args.tiers.map((t) => ({
+      minVolumeQuoteLots:
+        t.minVolumeQuoteLots instanceof BN
+          ? t.minVolumeQuoteLots
+          : new BN(t.minVolumeQuoteLots.toString()),
+      makerRebateBps: t.makerRebateBps,
+      takerFeeBps: t.takerFeeBps,
+    }));
+    const window =
+      args.volumeWindowSlots instanceof BN
+        ? args.volumeWindowSlots
+        : new BN(args.volumeWindowSlots.toString());
+    const ft = feeTiersPda(this.programId);
+    return this.methods
+      .updateFeeTiers(window, ixTiers)
+      .accountsPartial({
+        authority: args.authority,
+        feeTiers: ft.address,
+      })
+      .instruction();
+  }
+
+  /// View ix — simulate to read the trader's effective tier
+  /// (maker rebate + taker fee bps) given their current rolling-window
+  /// volume. UIs surface this for "Your tier: VIP3 — 0.025% / 0.05%"
+  /// display. Permissionless caller; trader pubkey passed as account.
+  viewTraderEffectiveTierIx(args: {
+    trader: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const ts = this.traderState(args.trader);
+    const ft = feeTiersPda(this.programId);
+    return this.methods
+      .viewTraderEffectiveTier()
+      .accountsPartial({
+        trader: args.trader,
+        traderState: ts.address,
+        feeTiers: ft.address,
       })
       .instruction();
   }

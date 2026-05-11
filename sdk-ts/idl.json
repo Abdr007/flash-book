@@ -2366,6 +2366,84 @@
       "args": []
     },
     {
+      "name": "init_fee_tiers",
+      "docs": [
+        "Initialize the protocol-wide fee tier table. Authority signs.",
+        "Multi-tier volume-based fees — HL / Binance / dYdX standard.",
+        "`volume_window_slots` = how many slots the rolling window covers",
+        "(HL: 14d ≈ 3_024_000 slots @ 0.4s/slot). Tiers MUST be:",
+        "• non-empty, length ≤ MAX_FEE_TIERS = 10",
+        "• sorted ascending by `min_volume_quote_lots`",
+        "• first tier has `min_volume_quote_lots == 0` (default tier)",
+        "• monotone improving: each tier's `taker_fee_bps` ≤ prior",
+        "tier's, each tier's `maker_rebate_bps` ≥ prior tier's",
+        "• all bps within `MAX_FEE_TIER_BPS = 1_000` (10%) — guards",
+        "against an authority typo locking traders into 90%+ fees",
+        "",
+        "Markets without this account fall back to flat",
+        "`MarketAccount.params.{maker_rebate_bps, taker_fee_bps}`."
+      ],
+      "discriminator": [
+        200,
+        48,
+        158,
+        152,
+        189,
+        234,
+        200,
+        25
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "fee_tiers",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  116,
+                  105,
+                  101,
+                  114,
+                  115
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "volume_window_slots",
+          "type": "u64"
+        },
+        {
+          "name": "tiers",
+          "type": {
+            "vec": {
+              "defined": {
+                "name": "FeeTier"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "init_market_book",
       "docs": [
         "Initialize the v2 hypertree-backed orderbook for a market.",
@@ -6702,6 +6780,67 @@
       "args": []
     },
     {
+      "name": "update_fee_tiers",
+      "docs": [
+        "Update the global fee tier table. Same validation as init.",
+        "Authority-only."
+      ],
+      "discriminator": [
+        196,
+        121,
+        165,
+        164,
+        129,
+        224,
+        44,
+        162
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "fee_tiers",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  116,
+                  105,
+                  101,
+                  114,
+                  115
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "volume_window_slots",
+          "type": "u64"
+        },
+        {
+          "name": "tiers",
+          "type": {
+            "vec": {
+              "defined": {
+                "name": "FeeTier"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "update_market_leverage_tiers",
       "docs": [
         "Update an existing per-market leverage-tier table. Same",
@@ -7497,6 +7636,85 @@
       "args": []
     },
     {
+      "name": "view_trader_effective_tier",
+      "docs": [
+        "View ix — emit the trader's effective fee tier (maker rebate +",
+        "taker fee bps) given their current rolling-window volume + the",
+        "global tier table. UIs simulate the tx and read the event for",
+        "display (\"Your tier: VIP3 — 0.025% / 0.05%\"). Permissionless.",
+        "",
+        "Window expiry semantics: if `now - volume_window_start_slot >",
+        "volume_window_slots`, the trader's effective volume is treated",
+        "as 0 (window has reset; they fall to tier 0 until the next fill",
+        "re-anchors). This matches what the next apply_fill will see."
+      ],
+      "discriminator": [
+        206,
+        233,
+        100,
+        4,
+        187,
+        94,
+        168,
+        84
+      ],
+      "accounts": [
+        {
+          "name": "trader"
+        },
+        {
+          "name": "trader_state",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fee_tiers",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  116,
+                  105,
+                  101,
+                  114,
+                  115
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "withdraw_collateral",
       "docs": [
         "Withdraw collateral. Decrements accounting + transfers from the",
@@ -8100,6 +8318,19 @@
       ]
     },
     {
+      "name": "FeeTiersAccount",
+      "discriminator": [
+        86,
+        139,
+        145,
+        128,
+        12,
+        220,
+        86,
+        154
+      ]
+    },
+    {
       "name": "FlpExposureAccount",
       "discriminator": [
         156,
@@ -8424,6 +8655,32 @@
         205,
         59,
         57
+      ]
+    },
+    {
+      "name": "FeeTiersInitializedEvent",
+      "discriminator": [
+        19,
+        74,
+        231,
+        172,
+        67,
+        32,
+        187,
+        77
+      ]
+    },
+    {
+      "name": "FeeTiersUpdatedEvent",
+      "discriminator": [
+        60,
+        23,
+        248,
+        104,
+        80,
+        137,
+        173,
+        41
       ]
     },
     {
@@ -8986,6 +9243,19 @@
       ]
     },
     {
+      "name": "TraderEffectiveTierEvent",
+      "discriminator": [
+        216,
+        227,
+        83,
+        248,
+        194,
+        179,
+        196,
+        114
+      ]
+    },
+    {
       "name": "TraderFeeTierUpdatedEvent",
       "discriminator": [
         40,
@@ -9009,6 +9279,19 @@
         244,
         43,
         49
+      ]
+    },
+    {
+      "name": "TraderTierUpgradedEvent",
+      "discriminator": [
+        86,
+        19,
+        158,
+        98,
+        197,
+        93,
+        192,
+        51
       ]
     },
     {
@@ -9865,6 +10148,152 @@
           },
           {
             "name": "amount_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FeeTier",
+      "docs": [
+        "One rung of the fee-tier table. `min_volume_quote_lots` is the",
+        "rolling-window cumulative notional (in quote lots) that the trader",
+        "must have traded to qualify. Higher tiers offer LOWER taker fees",
+        "and HIGHER maker rebates."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "min_volume_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "maker_rebate_bps",
+            "type": "u32"
+          },
+          {
+            "name": "taker_fee_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FeeTiersAccount",
+      "docs": [
+        "WAVE 22 — Multi-tier fee table. Global per-program, authority-set.",
+        "Replaces the legacy single `TraderStateAccount.fee_discount_bps`",
+        "pattern (where authority manually sets a per-trader discount) with",
+        "the HL / Binance / dYdX standard volume-tier model:",
+        "",
+        "• One global tier table (this account, PDA `[b\"fee_tiers\"]`).",
+        "• Each tier specifies a `min_volume_quote_lots` threshold + the",
+        "effective `maker_rebate_bps` and `taker_fee_bps` for traders",
+        "that have crossed it within the rolling window.",
+        "• Trader's window volume is tracked on `TraderStateAccount.",
+        "volume_30d_quote_lots`, credited on every fill (maker + taker).",
+        "• `resolve_fee_tier(volume, tiers)` picks the highest tier the",
+        "trader's cumulative window volume satisfies.",
+        "",
+        "Coexists with the legacy `fee_discount_bps`: tier's bps SUPERSEDE",
+        "market default; `fee_discount_bps` then applies as a further",
+        "percentage discount (so promo / referral codes can stack on top",
+        "of the base tier rate).",
+        "",
+        "Authority-gated: only the protocol authority can init / update."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "tier_count",
+            "type": "u8"
+          },
+          {
+            "name": "_pad0",
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            }
+          },
+          {
+            "name": "volume_window_slots",
+            "docs": [
+              "Length of the volume-tracking window in slots. Crossing this",
+              "boundary on the next apply_fill resets the trader's",
+              "`volume_30d_quote_lots` to 0 and re-anchors the window. HL",
+              "pattern uses 14 days ≈ 3_024_000 slots @ 0.4s. Authority sets",
+              "this to match their preferred review cadence."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "tiers",
+            "docs": [
+              "Sorted ascending by `min_volume_quote_lots`. Tier 0 (volume 0",
+              "threshold) is the default for new traders. Validated at",
+              "init/update — see `lib.rs:init_fee_tiers`."
+            ],
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "FeeTier"
+                  }
+                },
+                10
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "FeeTiersInitializedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "tier_count",
+            "type": "u8"
+          },
+          {
+            "name": "volume_window_slots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FeeTiersUpdatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "tier_count",
+            "type": "u8"
+          },
+          {
+            "name": "volume_window_slots",
             "type": "u64"
           }
         ]
@@ -12169,6 +12598,43 @@
       }
     },
     {
+      "name": "TraderEffectiveTierEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "tier_index",
+            "type": "u8"
+          },
+          {
+            "name": "effective_volume_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "maker_rebate_bps",
+            "type": "u32"
+          },
+          {
+            "name": "taker_fee_bps",
+            "type": "u32"
+          },
+          {
+            "name": "window_expired",
+            "docs": [
+              "True iff the trader's `volume_window_start_slot` has aged past",
+              "`volume_window_slots` AND `volume_30d_quote_lots > 0`. UIs",
+              "surface \"Tier resets on next trade\" copy."
+            ],
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
       "name": "TraderFeeTierUpdatedEvent",
       "type": {
         "kind": "struct",
@@ -12316,6 +12782,55 @@
               "conservative cap below whatever the protocol rate is."
             ],
             "type": "u32"
+          },
+          {
+            "name": "volume_30d_quote_lots",
+            "docs": [
+              "Wave 22: rolling notional traded in the current volume window",
+              "(quote lots, summed across maker + taker fills). Reset when the",
+              "window expires. Used by `resolve_fee_tier` to pick the trader's",
+              "effective maker / taker bps from `FeeTiersAccount`."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "volume_window_start_slot",
+            "docs": [
+              "Wave 22: slot at which the current volume window opened. When",
+              "`Clock::slot - this > FeeTiersAccount.volume_window_slots`, the",
+              "next apply_fill resets `volume_30d_quote_lots` and re-anchors",
+              "this. HL pattern (14-day rolling tier window)."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TraderTierUpgradedEvent",
+      "docs": [
+        "WAVE 22 — emitted by `apply_fill` whenever a trader crosses a tier",
+        "boundary (maker OR taker). Off-chain UIs surface \"🎉 You upgraded",
+        "to VIP3!\" pushes. Silent when no tier change."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_tier_index",
+            "type": "u8"
+          },
+          {
+            "name": "new_tier_index",
+            "type": "u8"
+          },
+          {
+            "name": "volume_quote_lots",
+            "type": "u64"
           }
         ]
       }

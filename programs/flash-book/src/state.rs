@@ -327,6 +327,69 @@ impl MarketLeverageTiersAccount {
     }
 }
 
+/// WAVE 22 — Multi-tier fee table. Global per-program, authority-set.
+/// Replaces the legacy single `TraderStateAccount.fee_discount_bps`
+/// pattern (where authority manually sets a per-trader discount) with
+/// the HL / Binance / dYdX standard volume-tier model:
+///
+///   • One global tier table (this account, PDA `[b"fee_tiers"]`).
+///   • Each tier specifies a `min_volume_quote_lots` threshold + the
+///     effective `maker_rebate_bps` and `taker_fee_bps` for traders
+///     that have crossed it within the rolling window.
+///   • Trader's window volume is tracked on `TraderStateAccount.
+///     volume_30d_quote_lots`, credited on every fill (maker + taker).
+///   • `resolve_fee_tier(volume, tiers)` picks the highest tier the
+///     trader's cumulative window volume satisfies.
+///
+/// Coexists with the legacy `fee_discount_bps`: tier's bps SUPERSEDE
+/// market default; `fee_discount_bps` then applies as a further
+/// percentage discount (so promo / referral codes can stack on top
+/// of the base tier rate).
+///
+/// Authority-gated: only the protocol authority can init / update.
+#[account]
+#[derive(Debug, Default)]
+pub struct FeeTiersAccount {
+    pub authority: Pubkey,
+    pub bump: u8,
+    pub tier_count: u8,
+    pub _pad0: [u8; 6],
+    /// Length of the volume-tracking window in slots. Crossing this
+    /// boundary on the next apply_fill resets the trader's
+    /// `volume_30d_quote_lots` to 0 and re-anchors the window. HL
+    /// pattern uses 14 days ≈ 3_024_000 slots @ 0.4s. Authority sets
+    /// this to match their preferred review cadence.
+    pub volume_window_slots: u64,
+    /// Sorted ascending by `min_volume_quote_lots`. Tier 0 (volume 0
+    /// threshold) is the default for new traders. Validated at
+    /// init/update — see `lib.rs:init_fee_tiers`.
+    pub tiers: [FeeTier; MAX_FEE_TIERS],
+}
+
+/// One rung of the fee-tier table. `min_volume_quote_lots` is the
+/// rolling-window cumulative notional (in quote lots) that the trader
+/// must have traded to qualify. Higher tiers offer LOWER taker fees
+/// and HIGHER maker rebates.
+#[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize, Default)]
+pub struct FeeTier {
+    pub min_volume_quote_lots: u64,
+    pub maker_rebate_bps: u32,
+    pub taker_fee_bps: u32,
+}
+
+/// HL has 7 tiers (Wood, Bronze, Silver, Gold, Platinum, Diamond, Diamond+).
+/// Binance has 9 (VIP 0-9). 10 covers both with headroom.
+pub const MAX_FEE_TIERS: usize = 10;
+
+impl FeeTiersAccount {
+    pub const SEED: &'static [u8] = b"fee_tiers";
+    pub fn space() -> usize {
+        // 8 disc + 32 authority + 1 bump + 1 count + 6 pad +
+        //   8 window_slots + MAX × (8 + 4 + 4) = 10 × 16 = 160
+        8 + 32 + 1 + 1 + 6 + 8 + (MAX_FEE_TIERS * 16)
+    }
+}
+
 #[account]
 #[derive(Debug)]
 pub struct PositionAccount {
@@ -731,6 +794,16 @@ pub struct TraderStateAccount {
     /// (functionally the same as no builder). Allows the trader to set a
     /// conservative cap below whatever the protocol rate is.
     pub builder_max_fee_share_bps: u32,
+    /// Wave 22: rolling notional traded in the current volume window
+    /// (quote lots, summed across maker + taker fills). Reset when the
+    /// window expires. Used by `resolve_fee_tier` to pick the trader's
+    /// effective maker / taker bps from `FeeTiersAccount`.
+    pub volume_30d_quote_lots: u64,
+    /// Wave 22: slot at which the current volume window opened. When
+    /// `Clock::slot - this > FeeTiersAccount.volume_window_slots`, the
+    /// next apply_fill resets `volume_30d_quote_lots` and re-anchors
+    /// this. HL pattern (14-day rolling tier window).
+    pub volume_window_start_slot: u64,
 }
 
 impl TraderStateAccount {
@@ -740,8 +813,9 @@ impl TraderStateAccount {
         // + 1 (open_positions) + 4 (toxicity) + 4 (orders_this_batch)
         // + 8 (last_batch_seen) + 4 (fee_discount_bps) + 32 (delegate)
         // + 32 (referrer) + 32 (builder) + 4 (builder_max_fee_share_bps)
-        // = 170 bytes. + 8 disc = 178. Round to 192 for headroom.
-        8 + 192
+        // + 8 (volume_30d_quote_lots) + 8 (volume_window_start_slot)
+        // = 186 bytes. + 8 disc = 194. Round to 224 for headroom.
+        8 + 224
     }
 
     /// Returns true if `signer` is authorized to act on this trader's

@@ -335,6 +335,18 @@ export function marketLeverageTiersPda(
   return derive([LEVERAGE_TIERS_SEED, market.toBuffer()], programId);
 }
 
+/// WAVE 22 — global multi-tier fee table (volume-based, HL/Binance/dYdX
+/// pattern). Singleton PDA at `[b"fee_tiers"]` under flash-book-core.
+/// Authority-set; `init_fee_tiers` / `update_fee_tiers` install the
+/// schedule. Trader's effective tier is resolved from
+/// `TraderStateAccount.volume_30d_quote_lots` against this table.
+const FEE_TIERS_SEED = Buffer.from('fee_tiers');
+export function feeTiersPda(
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
+): DerivedPda {
+  return derive([FEE_TIERS_SEED], programId);
+}
+
 // ─── MagicBlock ER delegation PDAs ────────────────────────────────────
 //
 // Mirrors `programs/flash-book/src/er.rs`:

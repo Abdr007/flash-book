@@ -1531,6 +1531,8 @@ pub mod flash_book {
         s.referrer = Pubkey::default();
         s.builder = Pubkey::default();
         s.builder_max_fee_share_bps = 0;
+        s.volume_30d_quote_lots = 0;
+        s.volume_window_start_slot = Clock::get()?.slot;
         Ok(())
     }
 
@@ -2519,6 +2521,23 @@ pub mod flash_book {
                 notional_quote_lots,
                 taker_side,
             });
+
+            // ── Wave 22 — credit rolling window volume for fee tiers ─
+            // Both maker and taker get credited the full notional
+            // (HL pattern — "30-day taker + maker volume"). Window
+            // expiry resets first, so a fill after the window boundary
+            // re-anchors at this fill's notional.
+            let now_slot = Clock::get()?.slot;
+            credit_volume_for_tier(
+                &mut ctx.accounts.taker_trader_state,
+                notional_quote_lots,
+                now_slot,
+            );
+            credit_volume_for_tier(
+                &mut ctx.accounts.maker_trader_state,
+                notional_quote_lots,
+                now_slot,
+            );
         }
 
         // ── Toxicity tax (VPIN-scaled) ────────────────────────────────
@@ -3017,6 +3036,128 @@ pub mod flash_book {
         emit!(MarketLeverageTiersUpdatedEvent {
             market: acct.market,
             tier_count: acct.tier_count,
+        });
+        Ok(())
+    }
+
+    // ─── Wave 22 — Multi-tier fee table (volume-based) ───────────────
+
+    /// Initialize the protocol-wide fee tier table. Authority signs.
+    /// Multi-tier volume-based fees — HL / Binance / dYdX standard.
+    /// `volume_window_slots` = how many slots the rolling window covers
+    /// (HL: 14d ≈ 3_024_000 slots @ 0.4s/slot). Tiers MUST be:
+    ///   • non-empty, length ≤ MAX_FEE_TIERS = 10
+    ///   • sorted ascending by `min_volume_quote_lots`
+    ///   • first tier has `min_volume_quote_lots == 0` (default tier)
+    ///   • monotone improving: each tier's `taker_fee_bps` ≤ prior
+    ///     tier's, each tier's `maker_rebate_bps` ≥ prior tier's
+    ///   • all bps within `MAX_FEE_TIER_BPS = 1_000` (10%) — guards
+    ///     against an authority typo locking traders into 90%+ fees
+    ///
+    /// Markets without this account fall back to flat
+    /// `MarketAccount.params.{maker_rebate_bps, taker_fee_bps}`.
+    pub fn init_fee_tiers(
+        ctx: Context<InitFeeTiers>,
+        volume_window_slots: u64,
+        tiers: Vec<state::FeeTier>,
+    ) -> Result<()> {
+        validate_fee_tiers(volume_window_slots, &tiers)?;
+
+        let acct = &mut ctx.accounts.fee_tiers;
+        acct.authority = ctx.accounts.authority.key();
+        acct.bump = ctx.bumps.fee_tiers;
+        acct.tier_count = tiers.len() as u8;
+        acct._pad0 = [0u8; 6];
+        acct.volume_window_slots = volume_window_slots;
+        acct.tiers = [state::FeeTier::default(); state::MAX_FEE_TIERS];
+        for (i, t) in tiers.iter().enumerate() {
+            acct.tiers[i] = *t;
+        }
+
+        emit!(FeeTiersInitializedEvent {
+            authority: acct.authority,
+            tier_count: acct.tier_count,
+            volume_window_slots,
+        });
+        Ok(())
+    }
+
+    /// Update the global fee tier table. Same validation as init.
+    /// Authority-only.
+    pub fn update_fee_tiers(
+        ctx: Context<UpdateFeeTiers>,
+        volume_window_slots: u64,
+        tiers: Vec<state::FeeTier>,
+    ) -> Result<()> {
+        validate_fee_tiers(volume_window_slots, &tiers)?;
+        require_keys_eq!(
+            ctx.accounts.fee_tiers.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+
+        let acct = &mut ctx.accounts.fee_tiers;
+        acct.tier_count = tiers.len() as u8;
+        acct.volume_window_slots = volume_window_slots;
+        acct.tiers = [state::FeeTier::default(); state::MAX_FEE_TIERS];
+        for (i, t) in tiers.iter().enumerate() {
+            acct.tiers[i] = *t;
+        }
+
+        emit!(FeeTiersUpdatedEvent {
+            authority: acct.authority,
+            tier_count: acct.tier_count,
+            volume_window_slots,
+        });
+        Ok(())
+    }
+
+    /// View ix — emit the trader's effective fee tier (maker rebate +
+    /// taker fee bps) given their current rolling-window volume + the
+    /// global tier table. UIs simulate the tx and read the event for
+    /// display ("Your tier: VIP3 — 0.025% / 0.05%"). Permissionless.
+    ///
+    /// Window expiry semantics: if `now - volume_window_start_slot >
+    /// volume_window_slots`, the trader's effective volume is treated
+    /// as 0 (window has reset; they fall to tier 0 until the next fill
+    /// re-anchors). This matches what the next apply_fill will see.
+    pub fn view_trader_effective_tier(ctx: Context<ViewTraderEffectiveTier>) -> Result<()> {
+        let s = &ctx.accounts.trader_state;
+        let f = &ctx.accounts.fee_tiers;
+        let now = Clock::get()?.slot;
+
+        let effective_volume = if now.saturating_sub(s.volume_window_start_slot)
+            > f.volume_window_slots
+        {
+            0
+        } else {
+            s.volume_30d_quote_lots
+        };
+
+        let pairs: Vec<(u64, u32, u32)> = f.tiers[..f.tier_count as usize]
+            .iter()
+            .map(|t| (t.min_volume_quote_lots, t.maker_rebate_bps, t.taker_fee_bps))
+            .collect();
+        let (maker_bps, taker_bps) =
+            matcher::risk::resolve_fee_tier(0, 0, &pairs, effective_volume);
+
+        // Identify which tier index won.
+        let mut tier_index: u8 = 0;
+        for (i, t) in f.tiers[..f.tier_count as usize].iter().enumerate() {
+            if effective_volume >= t.min_volume_quote_lots {
+                tier_index = i as u8;
+            } else {
+                break;
+            }
+        }
+
+        emit!(TraderEffectiveTierEvent {
+            trader: s.trader,
+            tier_index,
+            effective_volume_quote_lots: effective_volume,
+            maker_rebate_bps: maker_bps,
+            taker_fee_bps: taker_bps,
+            window_expired: effective_volume == 0 && s.volume_30d_quote_lots > 0,
         });
         Ok(())
     }
@@ -6454,6 +6595,55 @@ pub struct UpdateMarketLeverageTiers<'info> {
     pub leverage_tiers: Account<'info, MarketLeverageTiersAccount>,
 }
 
+// ─── Wave 22 — Multi-tier fee table ix accounts ──────────────────────
+
+#[derive(Accounts)]
+pub struct InitFeeTiers<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = state::FeeTiersAccount::space(),
+        seeds = [state::FeeTiersAccount::SEED],
+        bump,
+    )]
+    pub fee_tiers: Account<'info, state::FeeTiersAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateFeeTiers<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::FeeTiersAccount::SEED],
+        bump = fee_tiers.bump,
+    )]
+    pub fee_tiers: Account<'info, state::FeeTiersAccount>,
+}
+
+#[derive(Accounts)]
+pub struct ViewTraderEffectiveTier<'info> {
+    /// CHECK: trader pubkey — used as the trader_state seed only.
+    pub trader: UncheckedAccount<'info>,
+
+    #[account(
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        seeds = [state::FeeTiersAccount::SEED],
+        bump = fee_tiers.bump,
+    )]
+    pub fee_tiers: Account<'info, state::FeeTiersAccount>,
+}
+
 #[derive(Accounts)]
 pub struct SubmitCommit<'info> {
     pub trader: Signer<'info>,
@@ -7655,6 +7845,46 @@ pub struct MarketLeverageTiersUpdatedEvent {
     pub tier_count: u8,
 }
 
+// ─── Wave 22 — Multi-tier fee table events ───────────────────────────
+
+#[event]
+pub struct FeeTiersInitializedEvent {
+    pub authority: Pubkey,
+    pub tier_count: u8,
+    pub volume_window_slots: u64,
+}
+
+#[event]
+pub struct FeeTiersUpdatedEvent {
+    pub authority: Pubkey,
+    pub tier_count: u8,
+    pub volume_window_slots: u64,
+}
+
+#[event]
+pub struct TraderEffectiveTierEvent {
+    pub trader: Pubkey,
+    pub tier_index: u8,
+    pub effective_volume_quote_lots: u64,
+    pub maker_rebate_bps: u32,
+    pub taker_fee_bps: u32,
+    /// True iff the trader's `volume_window_start_slot` has aged past
+    /// `volume_window_slots` AND `volume_30d_quote_lots > 0`. UIs
+    /// surface "Tier resets on next trade" copy.
+    pub window_expired: bool,
+}
+
+/// WAVE 22 — emitted by `apply_fill` whenever a trader crosses a tier
+/// boundary (maker OR taker). Off-chain UIs surface "🎉 You upgraded
+/// to VIP3!" pushes. Silent when no tier change.
+#[event]
+pub struct TraderTierUpgradedEvent {
+    pub trader: Pubkey,
+    pub previous_tier_index: u8,
+    pub new_tier_index: u8,
+    pub volume_quote_lots: u64,
+}
+
 #[event]
 pub struct MarketAuthorityTransferredEvent {
     pub market: Pubkey,
@@ -8360,6 +8590,77 @@ fn validate_leverage_tiers(market: &MarketAccount, tiers: &[LeverageTier]) -> Re
         prev_min = Some(t.min_notional_quote_lots);
     }
     Ok(())
+}
+
+/// WAVE 22: validate a fee-tier table for `init_fee_tiers /
+/// update_fee_tiers`. Enforces:
+///   • Non-empty + ≤ MAX_FEE_TIERS
+///   • Sorted ascending by `min_volume_quote_lots`
+///   • Tier 0 has `min_volume == 0` (default tier required)
+///   • Monotone improving: taker fee ↘, maker rebate ↗ as volume rises
+///   • All bps within MAX_FEE_TIER_BPS
+///   • volume_window_slots is non-zero (would otherwise treat every
+///     fill as a window expiry → permanent reset)
+fn validate_fee_tiers(volume_window_slots: u64, tiers: &[state::FeeTier]) -> Result<()> {
+    require!(volume_window_slots > 0, FlashBookError::OutOfRange);
+    require!(!tiers.is_empty(), FlashBookError::OutOfRange);
+    require!(tiers.len() <= state::MAX_FEE_TIERS, FlashBookError::OutOfRange);
+    require!(
+        tiers[0].min_volume_quote_lots == 0,
+        FlashBookError::OutOfRange
+    );
+
+    let mut prev_min: Option<u64> = None;
+    let mut prev_taker: Option<u32> = None;
+    let mut prev_maker: Option<u32> = None;
+    for t in tiers {
+        require!(
+            t.taker_fee_bps <= constants::MAX_FEE_TIER_BPS,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            t.maker_rebate_bps <= constants::MAX_FEE_TIER_BPS,
+            FlashBookError::OutOfRange
+        );
+        if let Some(p) = prev_min {
+            require!(
+                t.min_volume_quote_lots > p,
+                FlashBookError::OutOfRange
+            );
+        }
+        if let Some(pt) = prev_taker {
+            require!(t.taker_fee_bps <= pt, FlashBookError::OutOfRange);
+        }
+        if let Some(pm) = prev_maker {
+            require!(t.maker_rebate_bps >= pm, FlashBookError::OutOfRange);
+        }
+        prev_min = Some(t.min_volume_quote_lots);
+        prev_taker = Some(t.taker_fee_bps);
+        prev_maker = Some(t.maker_rebate_bps);
+    }
+    Ok(())
+}
+
+/// WAVE 22 — credit a trader's rolling-window volume + re-anchor the
+/// window if it has expired (or was never seeded). Called on every
+/// economic fill from `apply_fill` for both maker and taker.
+///
+/// Window-expiry semantics: when `now - window_start >
+/// DEFAULT_VOLUME_WINDOW_SLOTS`, we RESET volume to 0 and re-anchor
+/// the window at `now` BEFORE crediting the new fill's notional. This
+/// matches HL's "rolling window resets, current trade starts the new
+/// window" pattern. `view_trader_effective_tier` mirrors this — for
+/// reads it honors the authority-configured window from FeeTiersAccount
+/// (which can be tighter or wider than the default).
+fn credit_volume_for_tier(state: &mut TraderStateAccount, notional_quote_lots: u64, now_slot: u64) {
+    let elapsed = now_slot.saturating_sub(state.volume_window_start_slot);
+    if state.volume_window_start_slot == 0 || elapsed > constants::DEFAULT_VOLUME_WINDOW_SLOTS {
+        state.volume_30d_quote_lots = 0;
+        state.volume_window_start_slot = now_slot;
+    }
+    state.volume_30d_quote_lots = state
+        .volume_30d_quote_lots
+        .saturating_add(notional_quote_lots);
 }
 
 pub fn order_type_byte_to_matcher(b: u8) -> matcher::order::OrderType {

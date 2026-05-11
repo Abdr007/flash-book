@@ -18,6 +18,23 @@ pub const BPS_DENOM: u32 = 10_000;
 /// (e.g. 5 bps base × -0.2 = -1 bps rebate to taker).
 pub const MAX_FEE_DISCOUNT_BPS: u32 = 12_000;
 
+/// WAVE 22: hard cap on any single tier's `taker_fee_bps` or
+/// `maker_rebate_bps`. 1_000 bps = 10% — well above HL's worst-tier
+/// taker fee (0.05%) and below any plausible "real" fee schedule. Acts
+/// as a typo guard at `init_fee_tiers / update_fee_tiers` write time;
+/// authority can't accidentally lock traders into 90%+ fees.
+pub const MAX_FEE_TIER_BPS: u32 = 1_000;
+
+/// WAVE 22: default volume-window length used by `apply_fill` when no
+/// `FeeTiersAccount` configuration is loaded (apply_fill stays a hot
+/// path; we don't make it load the singleton FeeTiers PDA on every
+/// fill). 14 days × 24h × 60m × 60s / 0.4 s/slot = 3_024_000 slots —
+/// matches HL's standard rolling window. Authority can override via
+/// `FeeTiersAccount.volume_window_slots` for read paths
+/// (`view_trader_effective_tier` + future matcher-integrated fee
+/// resolution).
+pub const DEFAULT_VOLUME_WINDOW_SLOTS: u64 = 3_024_000;
+
 /// HIP-3 bond unbonding delay (seconds). When a depositor requests
 /// unbond on their MarketBondAccount, they cannot claim until this
 /// many seconds have elapsed since the request. Prevents the
