@@ -893,9 +893,14 @@ pub mod flash_book {
         // ─── Phase 0: walk the hypertree to harvest live orders ──────────
         let now_slot = Clock::get()?.slot;
         let max_per_side = MAX_BATCH_ORDERS_PER_SIDE_V2;
-        let mut orders: Vec<matcher::order::Order> = Vec::with_capacity(2 * max_per_side);
-        let mut sources: Vec<(u64, hypertree::DataIndex, bool)> =
-            Vec::with_capacity(2 * max_per_side);
+        // Note: do NOT use `Vec::with_capacity(2 * max_per_side)` here.
+        // BPF heap is 32KB by default — 2 × 256 entries × ~80 bytes
+        // would alloc 40KB upfront and OOM the matcher on small books.
+        // Vec::new() defers allocation until push(); typical books
+        // have far fewer than `max_per_side` orders so the actual
+        // alloc stays well under the heap limit.
+        let mut orders: Vec<matcher::order::Order> = Vec::new();
+        let mut sources: Vec<(u64, hypertree::DataIndex, bool)> = Vec::new();
         {
             let book_data = ctx.accounts.market_book.try_borrow_data()?;
             let mut book_data_owned = book_data.to_vec();

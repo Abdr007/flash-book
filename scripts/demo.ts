@@ -796,7 +796,8 @@ async function dashboard(state: DemoState) {
     let posLine = c.dim('— no position —');
     if (posInfo) {
       try {
-        const off = 8 + 32 + 32 + 1 + 16;
+        // PositionAccount: 8 disc + 32 trader + 32 market + 1 bump + 1 side + 8 size + 8 entry
+        const off = 8 + 32 + 32 + 1;
         const side = posInfo.data.readUInt8(off);
         const size = posInfo.data.readBigUInt64LE(off + 1);
         const entry = posInfo.data.readBigUInt64LE(off + 1 + 8);
@@ -913,10 +914,81 @@ async function dashboard(state: DemoState) {
   await new Promise(() => { /* run forever until Ctrl-C */ });
 }
 
+/// Print every menu's banner + options to stdout sequentially, no
+/// readline. Lets you see what the interactive REPL looks like
+/// without typing.
+async function screenshots(state: DemoState) {
+  console.clear();
+  console.log(c.banner(' ALL MENUS — what the interactive REPL looks like '));
+  console.log('');
+
+  // Main menu
+  console.log(c.banner(' MAIN MENU '));
+  console.log('');
+  console.log(`    ${c.cyan('1)')} Trade          — place / cancel limit orders, view orderbook`);
+  console.log(`    ${c.cyan('2)')} Margin         — deposit / withdraw USDC, view positions`);
+  console.log(`    ${c.cyan('3)')} Matcher        — run a batch tick, watch fills land live`);
+  console.log(`    ${c.cyan('4)')} Vaults         — create vault, deposit, vault-trades`);
+  console.log(`    ${c.cyan('5)')} Tiers          — view fee tier table + your effective rate`);
+  console.log(`    ${c.cyan('6)')} Switch market  — change between SOL/BTC/ETH`);
+  console.log(`    ${c.cyan('7)')} Show PDAs      — print all account addresses (for Solscan)`);
+  console.log(`    ${c.cyan('q)')} Quit`);
+  console.log('');
+
+  console.log(c.banner(' [1] TRADE '));
+  console.log(`    ${c.cyan('a)')} Place limit order (long / buy)`);
+  console.log(`    ${c.cyan('b)')} Place limit order (short / sell)`);
+  console.log(`    ${c.cyan('c)')} Cancel order by ID`);
+  console.log(`    ${c.cyan('d)')} View orderbook (top depth)`);
+  console.log('');
+
+  console.log(c.banner(' [2] MARGIN '));
+  console.log(`    ${c.cyan('a)')} Open trader_state (one-time)`);
+  console.log(`    ${c.cyan('b)')} Deposit USDC`);
+  console.log(`    ${c.cyan('c)')} Withdraw USDC (full)`);
+  console.log(`    ${c.cyan('d)')} View my position on this market`);
+  console.log('');
+
+  console.log(c.banner(' [3] MATCHER '));
+  console.log(`    ${c.cyan('a)')} Run batch tick (run_batch_v2) on this market`);
+  console.log(`    ${c.cyan('b)')} Watch live event stream (Ctrl-C to stop)`);
+  console.log('');
+
+  console.log(c.banner(' [5] TIERS — live decoded from FeeTiers PDA '));
+  await tiersDisplayOnly(state);
+
+  console.log(c.banner(' [6] SWITCH MARKET '));
+  console.log(`    ${c.cyan('a)')} SOL/USDC  (default)`);
+  console.log(`    ${c.cyan('b)')} BTC/USDC`);
+  console.log(`    ${c.cyan('c)')} ETH/USDC`);
+  console.log('');
+
+  console.log(c.banner(' [7] SHOW PDAs '));
+  console.log(`  ${c.bold('Programs:')}`);
+  console.log(`    flash_book:        ${FLASH_BOOK_PROGRAM_ID.toBase58()}`);
+  console.log(`  ${c.bold('Globals:')}`);
+  console.log(`    insurance_fund:    ${insuranceFundPda().address.toBase58()}`);
+  console.log(`    flp_exposure:      ${flpExposurePda().address.toBase58()}`);
+  console.log(`    fee_tiers:         ${feeTiersPda().address.toBase58()}`);
+  console.log(`  ${c.bold('Current market:')}`);
+  console.log(`    market:            ${state.market.toBase58()}`);
+  console.log(`    market_book:       ${state.marketBook.toBase58()}`);
+  console.log(`  ${c.bold('You:')}`);
+  console.log(`    wallet:            ${state.wallet.publicKey.toBase58()}`);
+  console.log(`    trader_state:      ${traderStatePda(state.wallet.publicKey).address.toBase58()}`);
+  console.log(`    position[market]:  ${positionPda(state.market, state.wallet.publicKey).address.toBase58()}`);
+  console.log('');
+}
+
 async function main() {
   const state = await makeState();
   if (process.argv.includes('--showcase')) {
     await showcase(state);
+    state.rl.close();
+    return;
+  }
+  if (process.argv.includes('--screenshots')) {
+    await screenshots(state);
     state.rl.close();
     return;
   }
