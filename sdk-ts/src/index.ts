@@ -94,6 +94,8 @@ export const ORDER_FLAG_IOC = 1 << 2;
 export const ORDER_FLAG_JIT = 1 << 3;
 export const ORDER_FLAG_STP_CANCEL_OLDEST = 1 << 4;
 export const ORDER_FLAG_STP_CANCEL_BOTH = 2 << 4;
+/// CLOB-only (place_taker_order_v2): require full fill or revert.
+export const ORDER_FLAG_FOK = 1 << 6;
 
 export {
   subscribeToProgramEvents,

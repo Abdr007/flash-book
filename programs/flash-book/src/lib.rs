@@ -445,6 +445,201 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// CLOB-style placement — does IMMEDIATE matching against the
+    /// opposite side of the book at the maker's resting price (price-
+    /// time priority), instead of waiting for `run_batch_v2` to clear
+    /// at a uniform Walrasian price.
+    ///
+    /// Walk semantics:
+    ///   • Buy order: iterate asks best-first; while ask.price ≤ limit,
+    ///     match `min(remaining, ask.size)` at `ask.price`. Stop when
+    ///     next ask doesn't cross OR taker fully consumed.
+    ///   • Sell order: symmetric over bids (best = highest price).
+    ///
+    /// Each match emits a `BatchFillIntentEvent` (same shape the
+    /// sequencer already consumes from `run_batch_v2`). Maker order
+    /// is decremented in place if partially filled, removed if fully
+    /// consumed. Any residual taker size is inserted as a resting
+    /// limit at `limit_ticks` so the order stays live.
+    ///
+    /// Coexists with `place_limit_order_v2` (FBA-style insert). Pick
+    /// per-trader / per-order: FBA for uniform-price MEV protection,
+    /// CLOB for low-latency immediate execution.
+    pub fn place_taker_order_v2(
+        ctx: Context<PlaceLimitOrderV2>,
+        side: u8,
+        size_lots: u64,
+        limit_ticks: u64,
+        flags: u8,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(size_lots > 0, FlashBookError::ZeroSize);
+        require!(limit_ticks > 0, FlashBookError::ZeroPrice);
+        require!(flags & !0b0011_1111 == 0, FlashBookError::OutOfRange);
+        if expires_at_slot > 0 {
+            let now = Clock::get()?.slot;
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
+
+        let market = &ctx.accounts.market;
+        require!(
+            market.status == MarketStatus::Active as u8
+                || market.status == MarketStatus::PostOnly as u8,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+        require!(
+            limit_ticks % market.params.tick_size == 0,
+            FlashBookError::PriceNotOnTick
+        );
+
+        let trader_pk = ctx.accounts.trader.key();
+        let market_key = market.key();
+        let now_slot = Clock::get()?.slot;
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        require!(
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+
+        let taker_seq = handle
+            .header
+            .order_seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        handle.header.order_seq_counter = taker_seq;
+
+        let side_is_bid = side == 0;
+        let taker_order_id = state_v2::encode_order_id(limit_ticks, taker_seq, side_is_bid);
+
+        // Advanced flags (Manifest / Phoenix parity):
+        const FLAG_POST_ONLY: u8 = 1 << 0;
+        const FLAG_REDUCE_ONLY: u8 = 1 << 1;
+        const FLAG_IOC: u8 = 1 << 2;
+        const FLAG_FOK: u8 = 1 << 6; // new — fill-or-kill (advanced CLOB)
+        let post_only = flags & FLAG_POST_ONLY != 0;
+        let ioc = flags & FLAG_IOC != 0;
+        let fok = flags & FLAG_FOK != 0;
+        let _ = FLAG_REDUCE_ONLY; // reduce_only enforced upstream by margin ix
+
+        // ── Phase 1: walk opposite side, collect matchable orders ───
+        // Mid-iteration mutation is unsafe (borrow conflicts), so we
+        // collect (idx, maker_id, fill_size, price, maker_trader) and
+        // apply mutations after. Cap traversal at MAX_BATCH per side
+        // to bound CU on a single ix.
+        let mut remaining = size_lots;
+        let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey)> = Vec::new();
+        let walk_limit = MAX_BATCH_ORDERS_PER_SIDE_V2;
+
+        // Always walk to detect crossings. post_only check happens
+        // AFTER — if matches were found, the order would cross, so
+        // reject. Without this walk, post_only can't detect would-
+        // cross conditions.
+        if side_is_bid {
+            handle.for_each_ask_best_first(|idx, ask| {
+                if matches.len() >= walk_limit { return false; }
+                if remaining == 0 { return false; }
+                if ask.price_ticks > limit_ticks { return false; }
+                if ask.expires_at_slot > 0 && now_slot > ask.expires_at_slot { return true; }
+                if ask.trader == trader_pk { return true; } // skip self-trade
+                let fill = ask.size_lots.min(remaining);
+                matches.push((idx, ask.order_id, fill, ask.price_ticks, ask.trader));
+                remaining -= fill;
+                true
+            });
+        } else {
+            handle.for_each_bid_best_first(|idx, bid| {
+                if matches.len() >= walk_limit { return false; }
+                if remaining == 0 { return false; }
+                if bid.price_ticks < limit_ticks { return false; }
+                if bid.expires_at_slot > 0 && now_slot > bid.expires_at_slot { return true; }
+                if bid.trader == trader_pk { return true; }
+                let fill = bid.size_lots.min(remaining);
+                matches.push((idx, bid.order_id, fill, bid.price_ticks, bid.trader));
+                remaining -= fill;
+                true
+            });
+        }
+
+        // post_only: if walk found ANY match, the order would cross —
+        // reject (caller asked for guaranteed-maker semantics).
+        if post_only && !matches.is_empty() {
+            return err!(FlashBookError::PostOnlyWouldCross);
+        }
+
+        // FOK: require the entire order to be filled; abort if not.
+        if fok && remaining > 0 {
+            return err!(FlashBookError::FillOrKillNotFilled);
+        }
+
+        // ── Phase 2: apply each match (decrement or remove maker) ───
+        for (maker_idx, maker_id, fill_size, fill_price, maker_trader) in &matches {
+            let new_size = handle.decrement_size_at(*maker_idx, *fill_size);
+            if new_size == 0 {
+                if side_is_bid {
+                    handle.remove_ask_node(*maker_idx);
+                } else {
+                    handle.remove_bid_node(*maker_idx);
+                }
+            }
+            emit!(BatchFillIntentEvent {
+                market: market_key,
+                taker: trader_pk,
+                maker: *maker_trader,
+                taker_side: side,
+                size_lots: *fill_size,
+                price_ticks: *fill_price,
+                taker_id: taker_order_id,
+                maker_id: *maker_id,
+            });
+        }
+
+        // ── Phase 3: residual handling — IOC vs rest-as-limit ───────
+        // IOC: cancel residual (do not insert). Phoenix / Manifest /
+        // Binance IOC semantics. post_only-with-no-match falls
+        // through here to insert as pure resting limit.
+        let mut inserted_idx: hypertree::DataIndex = hypertree::NIL;
+        if remaining > 0 && !ioc {
+            let order = state_v2::RestingOrderV2 {
+                order_id: taker_order_id,
+                seq: taker_seq,
+                price_ticks: limit_ticks,
+                size_lots: remaining,
+                expires_at_slot,
+                trader: trader_pk,
+                last_valid_slot: now_slot as u32,
+                side,
+                order_type: 0,
+                flags,
+                _pad: 0,
+            };
+            inserted_idx = if side_is_bid {
+                handle.insert_bid(order)?
+            } else {
+                handle.insert_ask(order)?
+            };
+        }
+
+        emit!(TakerOrderClearedEvent {
+            market: market_key,
+            taker: trader_pk,
+            side,
+            taker_size_lots: size_lots,
+            filled_lots: size_lots - remaining,
+            residual_resting_lots: remaining,
+            match_count: matches.len() as u32,
+            taker_order_id,
+            residual_node_index: inserted_idx,
+        });
+        Ok(())
+    }
+
     /// Wave 21 phase 2 — CPI variant of `place_limit_order_v2`. Called
     /// by wrapper programs (`flash-book-orders`, `-flp`, `-vaults`) via
     /// `invoke_signed` to place orders on behalf of traders WITHOUT
@@ -8074,6 +8269,30 @@ pub struct OrderPlacedV2Event {
     pub size_lots: u64,
     pub node_index: u32,
     pub total_orders_after: u32,
+}
+
+/// CLOB summary — emitted at the END of `place_taker_order_v2`. One
+/// per CLOB-style placement, regardless of how many fills landed.
+/// Mirrors Phoenix's "OrderPlaced + Fills" composite event but as a
+/// single summary so off-chain consumers can detect "this is a CLOB
+/// path order" vs a pure resting limit.
+#[event]
+pub struct TakerOrderClearedEvent {
+    pub market: Pubkey,
+    pub taker: Pubkey,
+    pub side: u8,
+    /// Original size requested.
+    pub taker_size_lots: u64,
+    /// Sum of all `BatchFillIntentEvent` size_lots emitted from this ix.
+    pub filled_lots: u64,
+    /// Size remaining after the walk that was inserted as a resting
+    /// limit (0 if fully filled or IOC).
+    pub residual_resting_lots: u64,
+    /// Number of distinct maker orders matched.
+    pub match_count: u32,
+    pub taker_order_id: u64,
+    /// Hypertree node index of the residual resting order (NIL if none).
+    pub residual_node_index: u32,
 }
 
 /// Sequencer feed — emitted by `run_batch_v2` for every cleared fill.

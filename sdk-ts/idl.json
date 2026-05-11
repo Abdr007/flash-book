@@ -5027,6 +5027,131 @@
       ]
     },
     {
+      "name": "place_taker_order_v2",
+      "docs": [
+        "CLOB-style placement — does IMMEDIATE matching against the",
+        "opposite side of the book at the maker's resting price (price-",
+        "time priority), instead of waiting for `run_batch_v2` to clear",
+        "at a uniform Walrasian price.",
+        "",
+        "Walk semantics:",
+        "• Buy order: iterate asks best-first; while ask.price ≤ limit,",
+        "match `min(remaining, ask.size)` at `ask.price`. Stop when",
+        "next ask doesn't cross OR taker fully consumed.",
+        "• Sell order: symmetric over bids (best = highest price).",
+        "",
+        "Each match emits a `BatchFillIntentEvent` (same shape the",
+        "sequencer already consumes from `run_batch_v2`). Maker order",
+        "is decremented in place if partially filled, removed if fully",
+        "consumed. Any residual taker size is inserted as a resting",
+        "limit at `limit_ticks` so the order stays live.",
+        "",
+        "Coexists with `place_limit_order_v2` (FBA-style insert). Pick",
+        "per-trader / per-order: FBA for uniform-price MEV protection,",
+        "CLOB for low-latency immediate execution."
+      ],
+      "discriminator": [
+        102,
+        151,
+        91,
+        93,
+        208,
+        25,
+        233,
+        21
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "8-byte custom disc inside the handler via `MarketBookHandle::",
+            "from_account_data`. Mut because we write the new resting order",
+            "node + update the header indices."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "flags",
+          "type": "u8"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "post_market_bond",
       "docs": [
         "Post a slashable HIP-3 deployer bond on a market. The bond signals",
@@ -9545,6 +9670,19 @@
       ]
     },
     {
+      "name": "TakerOrderClearedEvent",
+      "discriminator": [
+        175,
+        172,
+        208,
+        220,
+        85,
+        4,
+        150,
+        45
+      ]
+    },
+    {
       "name": "ToxicityTaxAppliedEvent",
       "discriminator": [
         72,
@@ -9964,6 +10102,16 @@
       "code": 7225,
       "name": "MarkChangeClamped",
       "msg": "Mark-price change clamped — batch produced an outlier post-clearing mark"
+    },
+    {
+      "code": 7226,
+      "name": "FillOrKillNotFilled",
+      "msg": "Fill-or-kill order could not be fully filled — aborted"
+    },
+    {
+      "code": 7227,
+      "name": "PostOnlyWouldCross",
+      "msg": "Post-only order would cross the book — rejected"
     },
     {
       "code": 7300,
@@ -12955,6 +13103,73 @@
           },
           {
             "name": "node_index",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TakerOrderClearedEvent",
+      "docs": [
+        "CLOB summary — emitted at the END of `place_taker_order_v2`. One",
+        "per CLOB-style placement, regardless of how many fills landed.",
+        "Mirrors Phoenix's \"OrderPlaced + Fills\" composite event but as a",
+        "single summary so off-chain consumers can detect \"this is a CLOB",
+        "path order\" vs a pure resting limit."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "taker_size_lots",
+            "docs": [
+              "Original size requested."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "filled_lots",
+            "docs": [
+              "Sum of all `BatchFillIntentEvent` size_lots emitted from this ix."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "residual_resting_lots",
+            "docs": [
+              "Size remaining after the walk that was inserted as a resting",
+              "limit (0 if fully filled or IOC)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "match_count",
+            "docs": [
+              "Number of distinct maker orders matched."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "taker_order_id",
+            "type": "u64"
+          },
+          {
+            "name": "residual_node_index",
+            "docs": [
+              "Hypertree node index of the residual resting order (NIL if none)."
+            ],
             "type": "u32"
           }
         ]

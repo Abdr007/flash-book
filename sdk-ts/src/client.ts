@@ -415,6 +415,47 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// CLOB-style placement (Phoenix / Manifest semantics): IMMEDIATE
+  /// matching against the opposite-side book at the maker's resting
+  /// price (price-time priority), with residual inserted as resting.
+  ///
+  /// Flags (bit positions, OR-combine):
+  ///   • bit 0  POST_ONLY    — reject if any matches (must rest)
+  ///   • bit 1  REDUCE_ONLY  — only fills that reduce position
+  ///   • bit 2  IOC          — cancel residual after walk (no rest)
+  ///   • bit 3  JIT          — Drift-style JIT bonus
+  ///   • bits 4-5  STP_MODE  — self-trade prevention mode
+  ///   • bit 6  FOK          — fill-or-kill (revert if any residual)
+  ///
+  /// Use vs `placeLimitOrderV2Ix`:
+  ///   • placeLimitOrderV2:    pure rest (FBA-bound, MEV-protected)
+  ///   • placeTakerOrderV2:    CLOB immediate match (low-latency)
+  placeTakerOrderV2Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    side: 'long' | 'short';
+    sizeLots: bigint | number;
+    limitTicks: bigint | number;
+    flags?: number;
+    expiresAtSlot?: bigint | number;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    return this.methods
+      .placeTakerOrderV2(
+        args.side === 'long' ? 0 : 1,
+        args.sizeLots,
+        args.limitTicks,
+        args.flags ?? 0,
+        args.expiresAtSlot ?? new BN(0),
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        marketBook: book.address,
+      })
+      .instruction();
+  }
+
   /// V2 read-side: emit the top-N levels of the hypertree-backed book as
   /// a `BookDepthV2Event`. Pure read — never mutates state. Walks the bid
   /// + ask RBTs in best-first order via the same iterators the wave-18f

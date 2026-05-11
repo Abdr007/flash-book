@@ -92,6 +92,10 @@ pub enum FlashBookError {
     OpenInterestCapExceeded = 1224,
     #[msg("Mark-price change clamped — batch produced an outlier post-clearing mark")]
     MarkChangeClamped = 1225,
+    #[msg("Fill-or-kill order could not be fully filled — aborted")]
+    FillOrKillNotFilled = 1226,
+    #[msg("Post-only order would cross the book — rejected")]
+    PostOnlyWouldCross = 1227,
 
     // ── 1300-1399 matcher / clearing ────────────────────────────────
     #[msg("Order book buffer at capacity")]
