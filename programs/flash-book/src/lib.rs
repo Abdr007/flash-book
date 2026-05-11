@@ -649,6 +649,146 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// WAVE 22 / Phase 5 — vault-trading helpers (wrapper-authorized).
+    /// All four ixs here are gated by the same 3-PDA whitelist
+    /// (orders / flp / vaults program CPI authority) used by
+    /// `place_limit_order_v2_cpi` and `cpi_release_collateral_to_user`.
+
+    /// Bootstrap a `TraderStateAccount` for an arbitrary `trader_pk`
+    /// (typically a wrapper-program PDA — e.g. a vault PDA in
+    /// flash-book-vaults). Trader cannot sign for themselves because
+    /// they are a PDA; this ix lets the wrapper open the account on
+    /// their behalf, signed by the wrapper's CPI authority.
+    pub fn cpi_open_trader_state_for_trader(
+        ctx: Context<CpiOpenTraderStateForTrader>,
+    ) -> Result<()> {
+        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
+        let s = &mut ctx.accounts.trader_state;
+        s.trader = ctx.accounts.trader_owner.key();
+        s.bump = ctx.bumps.trader_state;
+        s.collateral_quote_lots = 0;
+        s.realized_pnl_quote_lots = 0;
+        s.open_positions = 0;
+        s.toxicity_score_bps = 0;
+        s.orders_this_batch = 0;
+        s.last_batch_seen = 0;
+        s.fee_discount_bps = 0;
+        s.delegate = Pubkey::default();
+        s.referrer = Pubkey::default();
+        s.builder = Pubkey::default();
+        s.builder_max_fee_share_bps = 0;
+        s.volume_30d_quote_lots = 0;
+        s.volume_window_start_slot = Clock::get()?.slot;
+        emit!(WrapperTraderStateOpenedEvent {
+            cpi_authority: ctx.accounts.cpi_authority.key(),
+            trader: s.trader,
+        });
+        Ok(())
+    }
+
+    /// Credit a `TraderStateAccount.collateral_quote_lots` by `amount`.
+    /// Wrapper-authorized — used by `vault_deposit_v3` after the SPL
+    /// transfer lands in `quote_vault` so the vault PDA has trading
+    /// capital recognized by core's margin gate.
+    pub fn cpi_credit_collateral(
+        ctx: Context<CpiCreditOrDebitCollateral>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        let s = &mut ctx.accounts.trader_state;
+        s.collateral_quote_lots = s
+            .collateral_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        emit!(WrapperCollateralCreditedEvent {
+            cpi_authority: ctx.accounts.cpi_authority.key(),
+            trader: s.trader,
+            amount: amount_quote_lots,
+            new_collateral: s.collateral_quote_lots,
+        });
+        Ok(())
+    }
+
+    /// Debit a `TraderStateAccount.collateral_quote_lots` by `amount`.
+    /// Wrapper-authorized — used by `vault_withdraw_v3` BEFORE the
+    /// inverse-CPI SPL release so the vault's core collateral matches
+    /// what's been paid out.
+    pub fn cpi_debit_collateral(
+        ctx: Context<CpiCreditOrDebitCollateral>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        let s = &mut ctx.accounts.trader_state;
+        s.collateral_quote_lots = s
+            .collateral_quote_lots
+            .checked_sub(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+        emit!(WrapperCollateralDebitedEvent {
+            cpi_authority: ctx.accounts.cpi_authority.key(),
+            trader: s.trader,
+            amount: amount_quote_lots,
+            new_collateral: s.collateral_quote_lots,
+        });
+        Ok(())
+    }
+
+    /// Wave 22 / Phase 5 — wrapper-authorized cancel of a resting v2
+    /// order. Counterpart to `place_limit_order_v2_cpi`. Used by
+    /// `flash-book-vaults`' `vault_cancel_order_v3` so the strategist
+    /// can manage vault-PDA orders.
+    pub fn cancel_order_v2_cpi(
+        ctx: Context<CancelOrderV2Cpi>,
+        side: u8,
+        order_id: u64,
+    ) -> Result<()> {
+        check_wave21_cpi_authority(&ctx.accounts.cpi_authority.key())?;
+        require!(side <= 1, FlashBookError::OutOfRange);
+        let trader_pk = ctx.accounts.trader.key();
+        let market_key = ctx.accounts.market.key();
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        require!(
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+
+        let side_is_bid = side == 0;
+        let idx = if side_is_bid {
+            handle.lookup_bid_by_order_id(order_id)
+        } else {
+            handle.lookup_ask_by_order_id(order_id)
+        };
+        require!(
+            idx != crate::hypertree::NIL,
+            FlashBookError::LiquidationStale
+        );
+
+        let order_seq = {
+            let order = handle.order_at(idx);
+            require!(order.trader == trader_pk, FlashBookError::WrongTrader);
+            order.seq
+        };
+
+        if side_is_bid {
+            handle.remove_bid_node(idx);
+        } else {
+            handle.remove_ask_node(idx);
+        }
+
+        emit!(OrderCancelledV2Event {
+            market: market_key,
+            trader: trader_pk,
+            order_seq,
+            side,
+            node_index: idx,
+            total_orders_after: handle.header.total_orders_active,
+        });
+        Ok(())
+    }
+
     /// V2 cancel: remove a resting order from the hypertree. Validates
     /// that the caller is the original trader (orders carry trader pubkey
     /// inline in wave 18 — wave 19 indirects through a seat). Refunds no
@@ -2321,8 +2461,65 @@ pub mod flash_book {
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
             .checked_mul(market.params.tick_size as u128)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // ── Wave 22 phase 2 — tier-resolved fees per trader ───────────
+        // When the FeeTiersAccount is supplied, resolve each trader's
+        // (maker_rebate_bps, taker_fee_bps) from their rolling-window
+        // volume against the global tier table. Falls back to flat
+        // market.params when no tier table is provided.
+        //
+        // Pre-fill volume is used so the trader doesn't get instant
+        // promotion within their own promotion-trade. Post-fill tier
+        // is computed at the bottom for the upgrade event.
+        let (
+            taker_maker_rebate_bps,
+            taker_taker_fee_bps,
+            maker_maker_rebate_bps,
+            maker_taker_fee_bps,
+            tier_pairs,
+        ): (i32, u32, i32, u32, Vec<(u64, i32, u32)>) = if let Some(ft) = &ctx.accounts.fee_tiers {
+            let pairs: Vec<(u64, i32, u32)> = ft.tiers[..ft.tier_count as usize]
+                .iter()
+                .map(|t| (t.min_volume_quote_lots, t.maker_rebate_bps, t.taker_fee_bps))
+                .collect();
+            let taker_volume = ctx.accounts.taker_trader_state.volume_30d_quote_lots;
+            let maker_volume = ctx.accounts.maker_trader_state.volume_30d_quote_lots;
+            let (tm, tt) = matcher::risk::resolve_fee_tier(
+                market.params.maker_rebate_bps,
+                market.params.taker_fee_bps,
+                &pairs,
+                taker_volume,
+            );
+            let (mm, mt) = matcher::risk::resolve_fee_tier(
+                market.params.maker_rebate_bps,
+                market.params.taker_fee_bps,
+                &pairs,
+                maker_volume,
+            );
+            (tm, tt, mm, mt, pairs)
+        } else {
+            (
+                market.params.maker_rebate_bps,
+                market.params.taker_fee_bps,
+                market.params.maker_rebate_bps,
+                market.params.taker_fee_bps,
+                Vec::new(),
+            )
+        };
+        // Capture pre-fill tier indices for upgrade-event detection.
+        let pre_taker_tier_index = tier_index_for_volume(
+            &tier_pairs,
+            ctx.accounts.taker_trader_state.volume_30d_quote_lots,
+        );
+        let pre_maker_tier_index = tier_index_for_volume(
+            &tier_pairs,
+            ctx.accounts.maker_trader_state.volume_30d_quote_lots,
+        );
+        // Suppress unused-warning when no tier table is supplied.
+        let _ = (taker_maker_rebate_bps, maker_taker_fee_bps);
+
         let base_taker_fee_u128 =
-            notional_u128.saturating_mul(market.params.taker_fee_bps as u128) / constants::BPS_DENOM as u128;
+            notional_u128.saturating_mul(taker_taker_fee_bps as u128) / constants::BPS_DENOM as u128;
         // Apply taker's per-trader fee tier discount.
         //   discount ≤ 10_000 (100%) → standard discount, fee ≥ 0
         //   discount ∈ (10_000, 12_000] → NEGATIVE fee (rebate to taker)
@@ -2347,17 +2544,33 @@ pub mod flash_book {
                 / constants::BPS_DENOM as u128;
             taker_fee_u128 = 0;
         }
-        // Effective maker rebate = base + JIT bonus (if taker was tagged).
-        // JIT bonus comes out of the protocol — paid by reducing the
-        // insurance contribution downstream, not by raising the taker
-        // fee. This is the Drift JIT economic model.
-        let mut effective_rebate_bps = market.params.maker_rebate_bps as u128;
+        // Effective maker rate = maker's TIER-RESOLVED maker_rebate_bps
+        // (SIGNED) + JIT bonus (if taker was tagged). JIT bonus comes
+        // out of the protocol — paid by reducing the insurance
+        // contribution downstream. This is the Drift JIT economic
+        // model.
+        //
+        // Sign semantics (wave 22 / negative-fee tiers):
+        //   • effective_rebate_bps_signed > 0  → maker is PAID a rebate
+        //   • effective_rebate_bps_signed < 0  → maker PAYS a fee
+        //   • effective_rebate_bps_signed == 0 → no maker fee or rebate
+        let mut effective_rebate_bps_signed: i128 = maker_maker_rebate_bps as i128;
         if taker_was_jit {
-            effective_rebate_bps =
-                effective_rebate_bps.saturating_add(market.params.jit_bonus_rebate_bps as u128);
+            effective_rebate_bps_signed = effective_rebate_bps_signed
+                .saturating_add(market.params.jit_bonus_rebate_bps as i128);
         }
-        let maker_rebate_u128 =
-            notional_u128.saturating_mul(effective_rebate_bps) / constants::BPS_DENOM as u128;
+        // Split into rebate (positive bps) and maker_fee (negative bps).
+        let (maker_rebate_u128, maker_fee_u128) = if effective_rebate_bps_signed >= 0 {
+            let r = notional_u128
+                .saturating_mul(effective_rebate_bps_signed as u128)
+                / constants::BPS_DENOM as u128;
+            (r, 0u128)
+        } else {
+            let f = notional_u128
+                .saturating_mul((-effective_rebate_bps_signed) as u128)
+                / constants::BPS_DENOM as u128;
+            (0u128, f)
+        };
         // Rebate must never exceed fee; defense against bad governance config
         // AND against discounts pushing fee below rebate. If discount drops
         // taker_fee below maker_rebate, cap rebate at the (discounted) fee.
@@ -2372,7 +2585,15 @@ pub mod flash_book {
         } else {
             maker_rebate_u128 as u64
         };
-        let net_fee = taker_fee.saturating_sub(maker_rebate);
+        let maker_fee = if maker_fee_u128 > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            maker_fee_u128 as u64
+        };
+        // Net fee to insurance fund = taker_fee + maker_fee − maker_rebate.
+        // (maker_fee and maker_rebate are mutually exclusive by the
+        // sign split above.)
+        let net_fee = taker_fee.saturating_add(maker_fee).saturating_sub(maker_rebate);
         let taker_side_enum = if taker_side == 0 { Side::Long } else { Side::Short };
         let maker_side_enum = taker_side_enum.opposite();
         let taker_trader_pk = ctx.accounts.taker_trader_state.trader;
@@ -2403,13 +2624,24 @@ pub mod flash_book {
                     .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
             }
         }
-        // Maker receives rebate.
+        // Maker receives rebate (positive `maker_rebate_bps` path) OR
+        // pays a fee (negative path — wave 22 retail tier). Mutually
+        // exclusive: at most one of `maker_rebate` / `maker_fee` is
+        // non-zero per the sign split above.
         {
             let maker_state = &mut ctx.accounts.maker_trader_state;
-            maker_state.collateral_quote_lots = maker_state
-                .collateral_quote_lots
-                .checked_add(maker_rebate)
-                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            if maker_rebate > 0 {
+                maker_state.collateral_quote_lots = maker_state
+                    .collateral_quote_lots
+                    .checked_add(maker_rebate)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            }
+            if maker_fee > 0 {
+                maker_state.collateral_quote_lots = maker_state
+                    .collateral_quote_lots
+                    .checked_sub(maker_fee)
+                    .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+            }
         }
         // Net fee to insurance fund (per fee_contribution_bps).
         // For negative-fee tier the contribution is reduced by what we
@@ -2538,6 +2770,41 @@ pub mod flash_book {
                 notional_quote_lots,
                 now_slot,
             );
+
+            // ── Wave 22 phase 2 — emit TraderTierUpgradedEvent on
+            //    tier boundary crossings (silent on no-change).
+            if !tier_pairs.is_empty() {
+                let post_taker_tier_index = tier_index_for_volume(
+                    &tier_pairs,
+                    ctx.accounts.taker_trader_state.volume_30d_quote_lots,
+                );
+                if post_taker_tier_index != pre_taker_tier_index {
+                    emit!(TraderTierUpgradedEvent {
+                        trader: taker_trader_pk,
+                        previous_tier_index: pre_taker_tier_index,
+                        new_tier_index: post_taker_tier_index,
+                        volume_quote_lots: ctx
+                            .accounts
+                            .taker_trader_state
+                            .volume_30d_quote_lots,
+                    });
+                }
+                let post_maker_tier_index = tier_index_for_volume(
+                    &tier_pairs,
+                    ctx.accounts.maker_trader_state.volume_30d_quote_lots,
+                );
+                if post_maker_tier_index != pre_maker_tier_index {
+                    emit!(TraderTierUpgradedEvent {
+                        trader: maker_trader_pk,
+                        previous_tier_index: pre_maker_tier_index,
+                        new_tier_index: post_maker_tier_index,
+                        volume_quote_lots: ctx
+                            .accounts
+                            .maker_trader_state
+                            .volume_30d_quote_lots,
+                    });
+                }
+            }
         }
 
         // ── Toxicity tax (VPIN-scaled) ────────────────────────────────
@@ -3134,7 +3401,7 @@ pub mod flash_book {
             s.volume_30d_quote_lots
         };
 
-        let pairs: Vec<(u64, u32, u32)> = f.tiers[..f.tier_count as usize]
+        let pairs: Vec<(u64, i32, u32)> = f.tiers[..f.tier_count as usize]
             .iter()
             .map(|t| (t.min_volume_quote_lots, t.maker_rebate_bps, t.taker_fee_bps))
             .collect();
@@ -4432,8 +4699,12 @@ pub mod flash_book {
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         let taker_fee_u128 =
             notional_u128.saturating_mul(market.params.taker_fee_bps as u128) / constants::BPS_DENOM as u128;
+        // FLP-as-maker case: ignore negative maker_rebate_bps (the
+        // protocol cannot charge itself a fee). Tier-tier semantics
+        // for retail makers don't apply when the maker IS the protocol.
+        let maker_rebate_pos_bps = market.params.maker_rebate_bps.max(0) as u128;
         let maker_rebate_u128 =
-            notional_u128.saturating_mul(market.params.maker_rebate_bps as u128) / constants::BPS_DENOM as u128;
+            notional_u128.saturating_mul(maker_rebate_pos_bps) / constants::BPS_DENOM as u128;
         require!(maker_rebate_u128 <= taker_fee_u128, FlashBookError::OutOfRange);
         let taker_fee = if taker_fee_u128 > u64::MAX as u128 {
             u64::MAX
@@ -5568,11 +5839,23 @@ fn clamp_permissionless_params(p: &MarketParams) -> Result<MarketParams> {
             && p.taker_fee_bps <= MAX_PERMISSIONLESS_TAKER_FEE_BPS,
         FlashBookError::OutOfRange
     );
+    // maker_rebate_bps is SIGNED (i32). Permissionless markets cap the
+    // POSITIVE rebate at 80% of taker fee (insurance fund must net >0
+    // on every fill). Negative values (= maker fee) are bounded by
+    // MAX_FEE_TIER_BPS in absolute terms — large maker fees would
+    // discourage MM and harm liquidity, so we reuse the same cap.
     let max_maker_rebate = (p.taker_fee_bps as u64).saturating_mul(80) / 100;
-    require!(
-        (p.maker_rebate_bps as u64) <= max_maker_rebate,
-        FlashBookError::OutOfRange
-    );
+    if p.maker_rebate_bps >= 0 {
+        require!(
+            (p.maker_rebate_bps as u64) <= max_maker_rebate,
+            FlashBookError::OutOfRange
+        );
+    } else {
+        require!(
+            ((-p.maker_rebate_bps) as u32) <= constants::MAX_FEE_TIER_BPS,
+            FlashBookError::OutOfRange
+        );
+    }
     require!(
         p.maintenance_margin_ratio_bps >= MIN_PERMISSIONLESS_MAINT_MARGIN_BPS,
         FlashBookError::OutOfRange
@@ -5787,6 +6070,70 @@ pub struct CpiReleaseCollateralToUser<'info> {
     pub user_quote_ata: Account<'info, TokenAccount>,
 
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct CpiOpenTraderStateForTrader<'info> {
+    /// Wrapper CPI authority (one of the 3 wave-21 PDAs).
+    pub cpi_authority: Signer<'info>,
+
+    /// CHECK: pubkey that the new TraderState will be seeded by. For
+    /// vault trading this is the vault PDA. The TraderState's
+    /// `trader` field is set to this. Used as the seed only — no
+    /// signing required (the wrapper is the authority).
+    pub trader_owner: UncheckedAccount<'info>,
+
+    /// The wrapper PAYS for rent here. Use the cpi_authority pubkey
+    /// directly is awkward (PDA can't pay rent without lamport
+    /// transfer); instead, pass a separate fee-payer signer.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = TraderStateAccount::space(),
+        seeds = [TraderStateAccount::SEED, trader_owner.key().as_ref()],
+        bump,
+    )]
+    pub trader_state: Box<Account<'info, TraderStateAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CpiCreditOrDebitCollateral<'info> {
+    pub cpi_authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
+        bump = trader_state.bump,
+    )]
+    pub trader_state: Box<Account<'info, TraderStateAccount>>,
+}
+
+#[derive(Accounts)]
+pub struct CancelOrderV2Cpi<'info> {
+    pub cpi_authority: Signer<'info>,
+
+    /// CHECK: trader pubkey carried on the resting order. Used to
+    /// validate ownership.
+    pub trader: UncheckedAccount<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: hypertree PDA; disc validated inside handler.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -6651,13 +6998,13 @@ pub struct SubmitCommit<'info> {
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
     #[account(
         mut,
         seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
         bump = commit_buffer.bump,
     )]
-    pub commit_buffer: Account<'info, CommitBufferAccount>,
+    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
 }
 
 #[derive(Accounts)]
@@ -6667,13 +7014,13 @@ pub struct SubmitRevealV2<'info> {
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
     #[account(
         mut,
         seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
         bump = commit_buffer.bump,
     )]
-    pub commit_buffer: Account<'info, CommitBufferAccount>,
+    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
     /// CHECK: hypertree PDA; disc validated inside handler.
     #[account(
         mut,
@@ -6847,28 +7194,28 @@ pub struct ApplyFill<'info> {
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
 
     #[account(
         mut,
         seeds = [InsuranceFundAccount::SEED],
         bump = insurance_fund.bump,
     )]
-    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, taker_trader_state.trader.as_ref()],
         bump = taker_trader_state.bump,
     )]
-    pub taker_trader_state: Account<'info, TraderStateAccount>,
+    pub taker_trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, maker_trader_state.trader.as_ref()],
         bump = maker_trader_state.bump,
     )]
-    pub maker_trader_state: Account<'info, TraderStateAccount>,
+    pub maker_trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(
         init_if_needed,
@@ -6877,7 +7224,7 @@ pub struct ApplyFill<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.trader.as_ref()],
         bump,
     )]
-    pub taker_position: Account<'info, state::PositionAccount>,
+    pub taker_position: Box<Account<'info, state::PositionAccount>>,
 
     #[account(
         init_if_needed,
@@ -6886,7 +7233,15 @@ pub struct ApplyFill<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), maker_trader_state.trader.as_ref()],
         bump,
     )]
-    pub maker_position: Account<'info, state::PositionAccount>,
+    pub maker_position: Box<Account<'info, state::PositionAccount>>,
+
+    /// WAVE 22 phase 2: optional global fee-tier table. When supplied,
+    /// per-trader maker rebate / taker fee bps are resolved from this
+    /// account against the trader's `volume_30d_quote_lots` (HL/Binance
+    /// pattern). When omitted (None), apply_fill falls back to the flat
+    /// `market.params.{maker_rebate_bps, taker_fee_bps}` per the
+    /// pre-tier behavior. Singleton PDA at `[b"fee_tiers"]`.
+    pub fee_tiers: Option<Box<Account<'info, state::FeeTiersAccount>>>,
 
     pub system_program: Program<'info, System>,
 }
@@ -6902,20 +7257,20 @@ pub struct PlaceBasketOrderV2<'info> {
         bump = trader_state.bump,
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(
         seeds = [FlpExposureAccount::SEED],
         bump = flp_exposure.bump,
     )]
-    pub flp_exposure: Account<'info, FlpExposureAccount>,
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
 
     // ── Leg A ──
     #[account(
         seeds = [MarketAccount::SEED, market_a.base_mint.as_ref(), market_a.quote_mint.as_ref()],
         bump = market_a.bump,
     )]
-    pub market_a: Account<'info, MarketAccount>,
+    pub market_a: Box<Account<'info, MarketAccount>>,
 
     /// CHECK: hypertree PDA for leg A; disc validated inside handler.
     #[account(
@@ -6932,14 +7287,14 @@ pub struct PlaceBasketOrderV2<'info> {
         seeds = [state::PositionAccount::SEED, market_a.key().as_ref(), trader.key().as_ref()],
         bump,
     )]
-    pub position_a: Account<'info, state::PositionAccount>,
+    pub position_a: Box<Account<'info, state::PositionAccount>>,
 
     // ── Leg B ──
     #[account(
         seeds = [MarketAccount::SEED, market_b.base_mint.as_ref(), market_b.quote_mint.as_ref()],
         bump = market_b.bump,
     )]
-    pub market_b: Account<'info, MarketAccount>,
+    pub market_b: Box<Account<'info, MarketAccount>>,
 
     /// CHECK: hypertree PDA for leg B; disc validated inside handler.
     #[account(
@@ -6956,7 +7311,7 @@ pub struct PlaceBasketOrderV2<'info> {
         seeds = [state::PositionAccount::SEED, market_b.key().as_ref(), trader.key().as_ref()],
         bump,
     )]
-    pub position_b: Account<'info, state::PositionAccount>,
+    pub position_b: Box<Account<'info, state::PositionAccount>>,
 
     pub system_program: Program<'info, System>,
 }
@@ -7220,21 +7575,21 @@ pub struct ApplyFlpFill<'info> {
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
 
     #[account(
         mut,
         seeds = [InsuranceFundAccount::SEED],
         bump = insurance_fund.bump,
     )]
-    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, taker_trader_state.trader.as_ref()],
         bump = taker_trader_state.bump,
     )]
-    pub taker_trader_state: Account<'info, TraderStateAccount>,
+    pub taker_trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(
         init_if_needed,
@@ -7243,14 +7598,14 @@ pub struct ApplyFlpFill<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.trader.as_ref()],
         bump,
     )]
-    pub taker_position: Account<'info, state::PositionAccount>,
+    pub taker_position: Box<Account<'info, state::PositionAccount>>,
 
     #[account(
         mut,
         seeds = [FlpExposureAccount::SEED],
         bump = flp_exposure.bump,
     )]
-    pub flp_exposure: Account<'info, FlpExposureAccount>,
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
 
     pub system_program: Program<'info, System>,
 }
@@ -7371,7 +7726,7 @@ pub struct LiquidatePositionV2<'info> {
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
 
     /// CHECK: PDA at market_book seed; disc validated inside handler.
     /// Mut because the synthetic close order is inserted into the
@@ -7388,7 +7743,7 @@ pub struct LiquidatePositionV2<'info> {
         seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
         bump = trader_state.bump,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(
         init_if_needed,
@@ -7397,7 +7752,7 @@ pub struct LiquidatePositionV2<'info> {
         seeds = [TraderStateAccount::SEED, caller.key().as_ref()],
         bump,
     )]
-    pub caller_trader_state: Account<'info, TraderStateAccount>,
+    pub caller_trader_state: Box<Account<'info, TraderStateAccount>>,
 
     /// MUT — wave 19e fixes a v1 latent bug: v1's LiquidatePosition has
     /// this WITHOUT `mut`, so writes to `unhealthy_since_slot` /
@@ -7408,7 +7763,7 @@ pub struct LiquidatePositionV2<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.trader.as_ref()],
         bump = position.bump,
     )]
-    pub position: Account<'info, state::PositionAccount>,
+    pub position: Box<Account<'info, state::PositionAccount>>,
 
     pub system_program: Program<'info, System>,
 }
@@ -7422,7 +7777,7 @@ pub struct PostMarketBond<'info> {
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
 
     #[account(
         init_if_needed,
@@ -7441,20 +7796,20 @@ pub struct PostMarketBond<'info> {
         seeds = [InsuranceFundAccount::SEED],
         bump = insurance_fund.bump,
     )]
-    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 
     #[account(address = insurance_fund.quote_mint)]
-    pub quote_mint: Account<'info, Mint>,
+    pub quote_mint: Box<Account<'info, Mint>>,
 
     #[account(
         mut,
         associated_token::mint = quote_mint,
         associated_token::authority = depositor,
     )]
-    pub depositor_quote_ata: Account<'info, TokenAccount>,
+    pub depositor_quote_ata: Box<Account<'info, TokenAccount>>,
 
     #[account(mut, address = insurance_fund.quote_vault)]
-    pub quote_vault: Account<'info, TokenAccount>,
+    pub quote_vault: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -7551,7 +7906,7 @@ pub struct AutoDeleverage<'info> {
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
 
     /// Insurance fund — read-only here, used to verify ADL trigger gate
     /// (balance < pause threshold).
@@ -7559,14 +7914,14 @@ pub struct AutoDeleverage<'info> {
         seeds = [InsuranceFundAccount::SEED],
         bump = insurance_fund.bump,
     )]
-    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, underwater_trader_state.trader.as_ref()],
         bump = underwater_trader_state.bump,
     )]
-    pub underwater_trader_state: Account<'info, TraderStateAccount>,
+    pub underwater_trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(
         mut,
@@ -7577,14 +7932,14 @@ pub struct AutoDeleverage<'info> {
         ],
         bump = underwater_position.bump,
     )]
-    pub underwater_position: Account<'info, state::PositionAccount>,
+    pub underwater_position: Box<Account<'info, state::PositionAccount>>,
 
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, counter_trader_state.trader.as_ref()],
         bump = counter_trader_state.bump,
     )]
-    pub counter_trader_state: Account<'info, TraderStateAccount>,
+    pub counter_trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(
         mut,
@@ -7595,7 +7950,7 @@ pub struct AutoDeleverage<'info> {
         ],
         bump = counter_position.bump,
     )]
-    pub counter_position: Account<'info, state::PositionAccount>,
+    pub counter_position: Box<Account<'info, state::PositionAccount>>,
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────
@@ -7672,6 +8027,34 @@ pub struct WrapperCollateralReleasedEvent {
     pub amount: u64,
 }
 
+/// Wave 22 phase 5 — wrapper bootstrapped a TraderState for a non-
+/// signing trader (typically a vault PDA).
+#[event]
+pub struct WrapperTraderStateOpenedEvent {
+    pub cpi_authority: Pubkey,
+    pub trader: Pubkey,
+}
+
+/// Wave 22 phase 5 — wrapper credited collateral to a trader's
+/// TraderState (vault deposit path).
+#[event]
+pub struct WrapperCollateralCreditedEvent {
+    pub cpi_authority: Pubkey,
+    pub trader: Pubkey,
+    pub amount: u64,
+    pub new_collateral: u64,
+}
+
+/// Wave 22 phase 5 — wrapper debited collateral from a trader's
+/// TraderState (vault withdraw path).
+#[event]
+pub struct WrapperCollateralDebitedEvent {
+    pub cpi_authority: Pubkey,
+    pub trader: Pubkey,
+    pub amount: u64,
+    pub new_collateral: u64,
+}
+
 /// Wave 21 phase 2: emitted when a wrapper program's CPI lands an order
 /// via `place_limit_order_v2_cpi`. Same payload as OrderPlacedV2Event
 /// PLUS the cpi_authority that signed (so off-chain reconciliation can
@@ -7696,10 +8079,11 @@ pub struct OrderPlacedV2CpiEvent {
 pub const BOOK_DEPTH_LEVELS: usize = 4;
 
 /// Per-side ceiling on orders fed into a single `run_batch_v2` clearing.
-/// The matcher is O(N²) in candidate prices × order count; capping keeps
-/// CU usage bounded. Wave 18g lifts this when the matcher is refactored
-/// to a streaming O(N log N) walk over the price ladder.
-pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 64;
+/// Wave 22 phase 6 refactored the matcher's clearing-price search from
+/// O(N²) to O(N log N) (single sort + monotone two-pointer walk over
+/// candidate prices), lifting the safe cap from 64 to 256 per side
+/// (~5K CU per fill at the larger N, well inside the BPF budget).
+pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 256;
 
 /// Wave 21 phase 2 — sister-program IDs that core trusts as CPI callers.
 /// Matches `programs/flash-book-orders/src/lib.rs::declare_id!`,
@@ -7866,7 +8250,9 @@ pub struct TraderEffectiveTierEvent {
     pub trader: Pubkey,
     pub tier_index: u8,
     pub effective_volume_quote_lots: u64,
-    pub maker_rebate_bps: u32,
+    /// SIGNED — positive = maker rebate, negative = maker fee
+    /// (wave 22 negative-fee semantics).
+    pub maker_rebate_bps: i32,
     pub taker_fee_bps: u32,
     /// True iff the trader's `volume_window_start_slot` has aged past
     /// `volume_window_slots` AND `volume_30d_quote_lots > 0`. UIs
@@ -8612,14 +8998,16 @@ fn validate_fee_tiers(volume_window_slots: u64, tiers: &[state::FeeTier]) -> Res
 
     let mut prev_min: Option<u64> = None;
     let mut prev_taker: Option<u32> = None;
-    let mut prev_maker: Option<u32> = None;
+    let mut prev_maker: Option<i32> = None;
     for t in tiers {
         require!(
             t.taker_fee_bps <= constants::MAX_FEE_TIER_BPS,
             FlashBookError::OutOfRange
         );
+        // Maker rebate is SIGNED (i32). Cap by absolute value — same
+        // typo guard as taker fee, applied to either sign of rebate.
         require!(
-            t.maker_rebate_bps <= constants::MAX_FEE_TIER_BPS,
+            t.maker_rebate_bps.unsigned_abs() <= constants::MAX_FEE_TIER_BPS,
             FlashBookError::OutOfRange
         );
         if let Some(p) = prev_min {
@@ -8632,6 +9020,9 @@ fn validate_fee_tiers(volume_window_slots: u64, tiers: &[state::FeeTier]) -> Res
             require!(t.taker_fee_bps <= pt, FlashBookError::OutOfRange);
         }
         if let Some(pm) = prev_maker {
+            // Monotone non-decreasing — higher tier never has WORSE
+            // maker treatment than a lower tier (signed comparison
+            // means -10 < 0 < +5, so retail → MM progression works).
             require!(t.maker_rebate_bps >= pm, FlashBookError::OutOfRange);
         }
         prev_min = Some(t.min_volume_quote_lots);
@@ -8639,6 +9030,43 @@ fn validate_fee_tiers(volume_window_slots: u64, tiers: &[state::FeeTier]) -> Res
         prev_maker = Some(t.maker_rebate_bps);
     }
     Ok(())
+}
+
+/// WAVE 22 phase 5 — wrapper-program CPI authority whitelist check.
+/// Returns Ok if `cpi_signer` matches the `[CPI_AUTHORITY_SEED]` PDA
+/// of one of the 3 allowed wrapper programs (orders / flp / vaults).
+/// Single source of truth for the wrapper-authorized ix gate.
+fn check_wave21_cpi_authority(cpi_signer: &Pubkey) -> Result<()> {
+    let (orders_authority, _) =
+        Pubkey::find_program_address(&[CPI_AUTHORITY_SEED], &WAVE21_ORDERS_PROGRAM_ID);
+    let (flp_authority, _) =
+        Pubkey::find_program_address(&[CPI_AUTHORITY_SEED], &WAVE21_FLP_PROGRAM_ID);
+    let (vaults_authority, _) =
+        Pubkey::find_program_address(&[CPI_AUTHORITY_SEED], &WAVE21_VAULTS_PROGRAM_ID);
+    require!(
+        *cpi_signer == orders_authority
+            || *cpi_signer == flp_authority
+            || *cpi_signer == vaults_authority,
+        FlashBookError::Unauthorized
+    );
+    Ok(())
+}
+
+/// WAVE 22 phase 2 — pure helper that returns the index of the highest
+/// tier the trader's `volume` qualifies for (0-indexed). Empty pairs →
+/// returns 0 (no tier change ever fires). Used to detect tier-upgrade
+/// boundary crossings inside `apply_fill` so we can emit a
+/// `TraderTierUpgradedEvent` only on actual change.
+fn tier_index_for_volume(pairs: &[(u64, i32, u32)], volume: u64) -> u8 {
+    let mut idx: u8 = 0;
+    for (i, (min_vol, _, _)) in pairs.iter().enumerate() {
+        if volume >= *min_vol {
+            idx = i as u8;
+        } else {
+            break;
+        }
+    }
+    idx
 }
 
 /// WAVE 22 — credit a trader's rolling-window volume + re-anchor the

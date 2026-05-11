@@ -335,8 +335,9 @@ describe('Instruction builders', () => {
       takerSide: 'long',
     });
     // sequencer, market, insurance_fund, taker_state, maker_state,
-    // taker_pos, maker_pos, sysprog
-    expect(ix.keys.length).toBe(8);
+    // taker_pos, maker_pos, fee_tiers (optional null placeholder),
+    // sysprog
+    expect(ix.keys.length).toBe(9);
   });
 
   test('cancelOrderV2Ix', async () => {

@@ -1360,6 +1360,12 @@ export class FlashBookClient {
     priceTicks: bigint | number;
     takerSide: 'long' | 'short';
     takerWasJit?: boolean;
+    /// WAVE 22 phase 2: when true, the global FeeTiersAccount PDA is
+    /// included so per-fill maker rebate / taker fee bps are resolved
+    /// from the trader's rolling-window volume against the tier table.
+    /// When false (or omitted), apply_fill falls back to flat
+    /// `market.params.{maker_rebate_bps, taker_fee_bps}`.
+    useFeeTiers?: boolean;
   }): Promise<TransactionInstruction> {
     const takerState = this.traderState(args.takerTrader);
     const makerState = this.traderState(args.makerTrader);
@@ -1381,6 +1387,13 @@ export class FlashBookClient {
         makerTraderState: makerState.address,
         takerPosition: takerPos.address,
         makerPosition: makerPos.address,
+        // Anchor requires explicit `null` for optional accounts
+        // (omission throws "Account not provided"). The cast is
+        // needed because Anchor's IDL-derived TS type omits the
+        // null union.
+        feeTiers: (args.useFeeTiers
+          ? feeTiersPda(this.programId).address
+          : null) as unknown as PublicKey,
         systemProgram: SystemProgram.programId,
       })
       .instruction();

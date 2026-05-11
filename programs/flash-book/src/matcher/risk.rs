@@ -390,13 +390,16 @@ pub fn default_scenarios(markets: &[Pubkey]) -> Vec<Scenario> {
 /// (no FeeTiersAccount supplied), falls back to `(default_maker_bps,
 /// default_taker_bps)`.
 ///
+/// `maker_rebate_bps` is SIGNED (i32) — positive = rebate paid to
+/// maker, negative = fee charged to maker (wave 22 retail tier 0).
+///
 /// Same shape as `tiered_mmr_bps` — pure, no Solana types.
 pub fn resolve_fee_tier(
-    default_maker_rebate_bps: u32,
+    default_maker_rebate_bps: i32,
     default_taker_fee_bps: u32,
-    tiers: &[(u64, u32, u32)],
+    tiers: &[(u64, i32, u32)],
     trader_volume_quote_lots: u64,
-) -> (u32, u32) {
+) -> (i32, u32) {
     let mut maker = default_maker_rebate_bps;
     let mut taker = default_taker_fee_bps;
     for (min_vol, m, t) in tiers {
@@ -429,7 +432,7 @@ mod fee_tier_tests {
         //   tier 2 ($5M):         maker 4 bps rebate, taker 3 bps fee
         //   tier 3 ($25M):        maker 6 bps rebate, taker 2 bps fee
         let tiers = [
-            (0u64, 2u32, 5u32),
+            (0u64, 2i32, 5u32),
             (1_000_000, 3, 4),
             (5_000_000, 4, 3),
             (25_000_000, 6, 2),
@@ -446,7 +449,7 @@ mod fee_tier_tests {
     #[test]
     fn boundary_inclusive() {
         // EXACTLY the threshold qualifies for the tier (`>=`, not `>`).
-        let tiers = [(0u64, 5u32, 10u32), (1_000_000, 4, 8)];
+        let tiers = [(0u64, 5i32, 10u32), (1_000_000, 4, 8)];
         assert_eq!(resolve_fee_tier(0, 0, &tiers, 1_000_000), (4, 8));
     }
 
@@ -455,17 +458,58 @@ mod fee_tier_tests {
         // Maker rebate must monotonically RISE as volume rises;
         // taker fee must monotonically FALL.
         let tiers = [
-            (0u64, 1u32, 10u32),
+            (0u64, 1i32, 10u32),
             (10_000, 2, 9),
             (100_000, 3, 7),
             (1_000_000, 5, 5),
         ];
-        let mut prev_maker = 0u32;
+        let mut prev_maker = i32::MIN;
         let mut prev_taker = u32::MAX;
         for vol in [0u64, 9_999, 10_000, 99_999, 100_000, 999_999, 1_000_000, 1_000_001] {
             let (m, t) = resolve_fee_tier(0, 0, &tiers, vol);
             assert!(m >= prev_maker, "maker rebate must not decrease as volume rises");
             assert!(t <= prev_taker, "taker fee must not increase as volume rises");
+            prev_maker = m;
+            prev_taker = t;
+        }
+    }
+
+    #[test]
+    fn negative_maker_rebate_for_retail_tier() {
+        // Wave 22: tier 0 retail PAYS a maker fee (negative rebate);
+        // higher-volume tiers cross zero into rebate.
+        //   tier 0 (vol 0):      maker -10 (10 bps fee), taker 10
+        //   tier 1 ($1M):        maker  -5 (5 bps fee),  taker 8
+        //   tier 2 ($10M):       maker   0 (free),       taker 5
+        //   tier 3 ($100M):      maker  +3 (rebate),     taker 3
+        let tiers = [
+            (0u64, -10i32, 10u32),
+            (1_000_000, -5, 8),
+            (10_000_000, 0, 5),
+            (100_000_000, 3, 3),
+        ];
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 0), (-10, 10));
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 999_999), (-10, 10));
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 1_000_000), (-5, 8));
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 10_000_000), (0, 5));
+        assert_eq!(resolve_fee_tier(0, 0, &tiers, 100_000_000), (3, 3));
+    }
+
+    #[test]
+    fn signed_monotone_across_zero_crossing() {
+        // Same schedule as above; verify monotone invariant holds.
+        let tiers = [
+            (0u64, -10i32, 10u32),
+            (1_000_000, -5, 8),
+            (10_000_000, 0, 5),
+            (100_000_000, 3, 3),
+        ];
+        let mut prev_maker = i32::MIN;
+        let mut prev_taker = u32::MAX;
+        for vol in [0u64, 1_000_000, 10_000_000, 100_000_000, u64::MAX] {
+            let (m, t) = resolve_fee_tier(0, 0, &tiers, vol);
+            assert!(m >= prev_maker, "maker rate must not regress (signed)");
+            assert!(t <= prev_taker, "taker fee must not increase");
             prev_maker = m;
             prev_taker = t;
         }

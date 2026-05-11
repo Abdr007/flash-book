@@ -61,18 +61,75 @@ pub fn clear_batch(orders: &[Order], prior_mark: Ticks) -> Result<ClearResult> {
         });
     }
 
-    // Candidate prices = union of limit prices (deduped, sorted).
+    // ── O(N log N) clearing-price search (wave 22 phase 6) ─────────────
+    //
+    // Replaces the original O(N²) per-price-loop with a single sort
+    // pass + monotone two-pointer walk. Because demand D(p) is
+    // non-increasing in p and supply S(p) is non-decreasing in p, we
+    // can maintain running running cumulative sums while walking
+    // candidate prices in ascending order — each buy/sell is touched
+    // exactly once.
+    //
+    //   D(p) = sum of buys.size where buys.limit_price >= p
+    //   S(p) = sum of sells.size where sells.limit_price <= p
+    //
+    // Sort buys ascending by limit_price; sort sells ascending by
+    // limit_price; walk prices ascending. As p rises:
+    //   • buys with limit < p become ineligible → subtract from D
+    //   • sells with limit <= p become eligible → add to S
+    //
+    // This lifts the practical cap on MAX_BATCH_ORDERS_PER_SIDE_V2
+    // (wave 22 phase 6 bumps 64 → 256) without blowing the BPF CU
+    // budget.
+
+    // Sort buys + sells by limit_price ascending (clone refs).
+    let mut buys_sorted: Vec<&Order> = buys.clone();
+    buys_sorted.sort_by_key(|o| o.limit_price.0);
+    let mut sells_sorted: Vec<&Order> = sells.clone();
+    sells_sorted.sort_by_key(|o| o.limit_price.0);
+
+    // Total buy size = D(0); we subtract as p rises and buys drop out.
+    let mut total_buy_size: u64 = 0;
+    for o in &buys_sorted {
+        total_buy_size = total_buy_size
+            .checked_add(o.size.0)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    }
+
+    // Sorted unique candidate prices.
     let mut prices: Vec<Ticks> = orders.iter().map(|o| o.limit_price).collect();
     prices.sort_by_key(|t| t.0);
     prices.dedup();
 
-    // Find max(min(D, S)).
     let mut best_volume: u64 = 0;
     let mut best_prices: Vec<Ticks> = Vec::new();
+
+    let mut buy_ptr: usize = 0; // first buy with limit_price >= current p
+    let mut sell_ptr: usize = 0; // first sell with limit_price > current p
+    let mut d_running: u64 = total_buy_size;
+    let mut s_running: u64 = 0;
+
     for p in &prices {
-        let d = sum_buys_at_or_above(&buys, *p)?;
-        let s = sum_sells_at_or_below(&sells, *p)?;
-        let v = d.0.min(s.0);
+        // Drop buys with limit_price < p from D.
+        while buy_ptr < buys_sorted.len()
+            && buys_sorted[buy_ptr].limit_price.0 < p.0
+        {
+            d_running = d_running
+                .checked_sub(buys_sorted[buy_ptr].size.0)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+            buy_ptr += 1;
+        }
+        // Add sells with limit_price <= p to S.
+        while sell_ptr < sells_sorted.len()
+            && sells_sorted[sell_ptr].limit_price.0 <= p.0
+        {
+            s_running = s_running
+                .checked_add(sells_sorted[sell_ptr].size.0)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            sell_ptr += 1;
+        }
+
+        let v = d_running.min(s_running);
         match v.cmp(&best_volume) {
             std::cmp::Ordering::Greater => {
                 best_volume = v;
@@ -249,26 +306,6 @@ pub fn clear_batch(orders: &[Order], prior_mark: Ticks) -> Result<ClearResult> {
         clearing_volume: BaseLots(best_volume),
         fills,
     })
-}
-
-fn sum_buys_at_or_above(buys: &[&Order], p: Ticks) -> Result<BaseLots> {
-    let mut total: u64 = 0;
-    for o in buys {
-        if o.limit_price.0 >= p.0 {
-            total = total.checked_add(o.size.0).ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        }
-    }
-    Ok(BaseLots(total))
-}
-
-fn sum_sells_at_or_below(sells: &[&Order], p: Ticks) -> Result<BaseLots> {
-    let mut total: u64 = 0;
-    for o in sells {
-        if o.limit_price.0 <= p.0 {
-            total = total.checked_add(o.size.0).ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        }
-    }
-    Ok(BaseLots(total))
 }
 
 fn abs_diff(a: u64, b: u64) -> u64 {

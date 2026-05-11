@@ -25,7 +25,14 @@ pub struct MarketParams {
     pub min_base_lots: u64,
 
     pub taker_fee_bps: u32,
-    pub maker_rebate_bps: u32,
+    /// Maker fee/rebate rate. SIGNED — positive = rebate paid to maker
+    /// (legacy semantics, MM incentive); negative = fee charged to maker
+    /// (low-tier retail). Crossing the sign boundary is supported on
+    /// the multi-tier fee table (FeeTier rows can mix signs across
+    /// volume tiers — e.g. tier 0 = -10 (10 bps maker fee), tier 5 =
+    /// +5 (5 bps rebate)). u32 → i32 widening preserves byte size
+    /// (4 bytes either way) so MarketParams layout is unchanged.
+    pub maker_rebate_bps: i32,
     pub toxicity_tax_max_bps: u32,
 
     pub liq_penalty_bps: u32,
@@ -373,7 +380,12 @@ pub struct FeeTiersAccount {
 #[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize, Default)]
 pub struct FeeTier {
     pub min_volume_quote_lots: u64,
-    pub maker_rebate_bps: u32,
+    /// SIGNED maker rate. Positive = rebate paid TO maker (legacy
+    /// MM-incentive semantics); negative = fee charged FROM maker
+    /// (low-tier retail). Validated to be monotone non-decreasing
+    /// across tiers (a higher-volume trader's maker treatment is
+    /// never worse than a lower-volume trader's).
+    pub maker_rebate_bps: i32,
     pub taker_fee_bps: u32,
 }
 

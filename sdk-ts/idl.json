@@ -216,6 +216,18 @@
           }
         },
         {
+          "name": "fee_tiers",
+          "docs": [
+            "WAVE 22 phase 2: optional global fee-tier table. When supplied,",
+            "per-trader maker rebate / taker fee bps are resolved from this",
+            "account against the trader's `volume_30d_quote_lots` (HL/Binance",
+            "pattern). When omitted (None), apply_fill falls back to the flat",
+            "`market.params.{maker_rebate_bps, taker_fee_bps}` per the",
+            "pre-tier behavior. Singleton PDA at `[b\"fee_tiers\"]`."
+          ],
+          "optional": true
+        },
+        {
           "name": "system_program",
           "address": "11111111111111111111111111111111"
         }
@@ -837,6 +849,103 @@
       ]
     },
     {
+      "name": "cancel_order_v2_cpi",
+      "docs": [
+        "Wave 22 / Phase 5 — wrapper-authorized cancel of a resting v2",
+        "order. Counterpart to `place_limit_order_v2_cpi`. Used by",
+        "`flash-book-vaults`' `vault_cancel_order_v3` so the strategist",
+        "can manage vault-PDA orders."
+      ],
+      "discriminator": [
+        251,
+        96,
+        192,
+        9,
+        92,
+        196,
+        243,
+        193
+      ],
+      "accounts": [
+        {
+          "name": "cpi_authority",
+          "signer": true
+        },
+        {
+          "name": "trader",
+          "docs": [
+            "validate ownership."
+          ]
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "order_id",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "cancel_trigger_order",
       "docs": [
         "Cancel a trigger order. Trader signs; account is closed and rent",
@@ -1249,6 +1358,213 @@
         {
           "name": "token_program",
           "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "cpi_credit_collateral",
+      "docs": [
+        "Credit a `TraderStateAccount.collateral_quote_lots` by `amount`.",
+        "Wrapper-authorized — used by `vault_deposit_v3` after the SPL",
+        "transfer lands in `quote_vault` so the vault PDA has trading",
+        "capital recognized by core's margin gate."
+      ],
+      "discriminator": [
+        117,
+        74,
+        71,
+        36,
+        3,
+        237,
+        30,
+        157
+      ],
+      "accounts": [
+        {
+          "name": "cpi_authority",
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "cpi_debit_collateral",
+      "docs": [
+        "Debit a `TraderStateAccount.collateral_quote_lots` by `amount`.",
+        "Wrapper-authorized — used by `vault_withdraw_v3` BEFORE the",
+        "inverse-CPI SPL release so the vault's core collateral matches",
+        "what's been paid out."
+      ],
+      "discriminator": [
+        173,
+        5,
+        0,
+        76,
+        197,
+        177,
+        107,
+        248
+      ],
+      "accounts": [
+        {
+          "name": "cpi_authority",
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader_state.trader",
+                "account": "TraderStateAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "cpi_open_trader_state_for_trader",
+      "docs": [
+        "WAVE 22 / Phase 5 — vault-trading helpers (wrapper-authorized).",
+        "All four ixs here are gated by the same 3-PDA whitelist",
+        "(orders / flp / vaults program CPI authority) used by",
+        "`place_limit_order_v2_cpi` and `cpi_release_collateral_to_user`.",
+        "Bootstrap a `TraderStateAccount` for an arbitrary `trader_pk`",
+        "(typically a wrapper-program PDA — e.g. a vault PDA in",
+        "flash-book-vaults). Trader cannot sign for themselves because",
+        "they are a PDA; this ix lets the wrapper open the account on",
+        "their behalf, signed by the wrapper's CPI authority."
+      ],
+      "discriminator": [
+        162,
+        109,
+        64,
+        101,
+        180,
+        131,
+        160,
+        61
+      ],
+      "accounts": [
+        {
+          "name": "cpi_authority",
+          "docs": [
+            "Wrapper CPI authority (one of the 3 wave-21 PDAs)."
+          ],
+          "signer": true
+        },
+        {
+          "name": "trader_owner",
+          "docs": [
+            "vault trading this is the vault PDA. The TraderState's",
+            "`trader` field is set to this. Used as the seed only — no",
+            "signing required (the wrapper is the authority)."
+          ]
+        },
+        {
+          "name": "payer",
+          "docs": [
+            "The wrapper PAYS for rent here. Use the cpi_authority pubkey",
+            "directly is awkward (PDA can't pay rent without lamport",
+            "transfer); instead, pass a separate fee-payer signer."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader_owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": []
@@ -9386,6 +9702,32 @@
       ]
     },
     {
+      "name": "WrapperCollateralCreditedEvent",
+      "discriminator": [
+        189,
+        177,
+        93,
+        94,
+        232,
+        148,
+        120,
+        122
+      ]
+    },
+    {
+      "name": "WrapperCollateralDebitedEvent",
+      "discriminator": [
+        89,
+        16,
+        152,
+        8,
+        195,
+        208,
+        94,
+        59
+      ]
+    },
+    {
       "name": "WrapperCollateralReleasedEvent",
       "discriminator": [
         135,
@@ -9396,6 +9738,19 @@
         206,
         220,
         70
+      ]
+    },
+    {
+      "name": "WrapperTraderStateOpenedEvent",
+      "discriminator": [
+        118,
+        167,
+        21,
+        194,
+        169,
+        101,
+        23,
+        200
       ]
     }
   ],
@@ -10170,7 +10525,14 @@
           },
           {
             "name": "maker_rebate_bps",
-            "type": "u32"
+            "docs": [
+              "SIGNED maker rate. Positive = rebate paid TO maker (legacy",
+              "MM-incentive semantics); negative = fee charged FROM maker",
+              "(low-tier retail). Validated to be monotone non-decreasing",
+              "across tiers (a higher-volume trader's maker treatment is",
+              "never worse than a lower-volume trader's)."
+            ],
+            "type": "i32"
           },
           {
             "name": "taker_fee_bps",
@@ -11605,7 +11967,16 @@
           },
           {
             "name": "maker_rebate_bps",
-            "type": "u32"
+            "docs": [
+              "Maker fee/rebate rate. SIGNED — positive = rebate paid to maker",
+              "(legacy semantics, MM incentive); negative = fee charged to maker",
+              "(low-tier retail). Crossing the sign boundary is supported on",
+              "the multi-tier fee table (FeeTier rows can mix signs across",
+              "volume tiers — e.g. tier 0 = -10 (10 bps maker fee), tier 5 =",
+              "+5 (5 bps rebate)). u32 → i32 widening preserves byte size",
+              "(4 bytes either way) so MarketParams layout is unchanged."
+            ],
+            "type": "i32"
           },
           {
             "name": "toxicity_tax_max_bps",
@@ -12616,7 +12987,11 @@
           },
           {
             "name": "maker_rebate_bps",
-            "type": "u32"
+            "docs": [
+              "SIGNED — positive = maker rebate, negative = maker fee",
+              "(wave 22 negative-fee semantics)."
+            ],
+            "type": "i32"
           },
           {
             "name": "taker_fee_bps",
@@ -13484,6 +13859,62 @@
       }
     },
     {
+      "name": "WrapperCollateralCreditedEvent",
+      "docs": [
+        "Wave 22 phase 5 — wrapper credited collateral to a trader's",
+        "TraderState (vault deposit path)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "cpi_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "new_collateral",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WrapperCollateralDebitedEvent",
+      "docs": [
+        "Wave 22 phase 5 — wrapper debited collateral from a trader's",
+        "TraderState (vault withdraw path)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "cpi_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "new_collateral",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "WrapperCollateralReleasedEvent",
       "docs": [
         "Wave 21 phase 8b/9b: emitted when a wrapper program's CPI releases",
@@ -13505,6 +13936,26 @@
           {
             "name": "amount",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WrapperTraderStateOpenedEvent",
+      "docs": [
+        "Wave 22 phase 5 — wrapper bootstrapped a TraderState for a non-",
+        "signing trader (typically a vault PDA)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "cpi_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
           }
         ]
       }
