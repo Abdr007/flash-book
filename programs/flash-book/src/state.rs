@@ -227,6 +227,31 @@ pub struct MarketParams {
     /// genuinely smarter signal of "actual incentive needed."
     /// Default false = HL-equivalent.
     pub funding_oi_dampening: bool,
+
+    // ─── V3 mark-price engine ────────────────────────────────────────
+    /// EMA weight (in bps) applied to a fresh fill price when blending
+    /// it into `mark_price_ticks` inside `apply_fill`.
+    ///     new_mark = alpha * fill + (1 - alpha) * old_mark
+    /// 0 = mark is never updated by fills (legacy / FBA-only behaviour).
+    /// Typical setting: 2_000 (20% weight on each fill — dampens
+    /// outlier fills but still tracks the tape). Capped at BPS_DENOM.
+    pub mark_ema_alpha_bps: u32,
+    /// Maximum allowed per-fill mark move in bps, clamped (not rejected).
+    /// If the EMA-blended new_mark differs from the prior mark by more
+    /// than this fraction, the move is clamped to ±this so a single
+    /// outlier fill cannot flash-crash the mark. 0 = unlimited.
+    /// Typical: 500 bps = 5%. Distinct from the existing per-batch
+    /// `mark_change_max_bps` (legacy FBA path).
+    pub mark_max_change_bps: u32,
+    /// Minimum number of slots between consecutive permissionless
+    /// `settle_mark` calls. Acts as a rate-limit so a single sequencer
+    /// can't spam settles. 0 = no rate limit. Typical: 10 slots ≈ 4 s.
+    pub mark_settle_min_slots: u32,
+    /// When |mark - oracle| / oracle exceeds this (in bps), every
+    /// mark-update path emits a `MarkPriceDriftEvent` so off-chain
+    /// observers can nudge `settle_mark`. 0 = drift alerts disabled.
+    /// Typical: 100 bps = 1%.
+    pub drift_alert_bps: u32,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).
@@ -273,6 +298,9 @@ pub struct MarketAccount {
     /// settlement seeds it from the current clock.
     pub period_started_at_unix: u64,
     pub period_funding_paid_abs_bps: u64,
+    /// Slot of the most recent `settle_mark` call. 0 = never settled.
+    /// Used to enforce `params.mark_settle_min_slots` rate-limit.
+    pub last_mark_settle_slot: u64,
     pub params: MarketParams,
 }
 
@@ -282,7 +310,9 @@ impl MarketAccount {
         // 8 (anchor disc) + struct fields. Borsh-conservative bound.
         // Actual size computed via std::mem::size_of for the constant fields,
         // but Anchor needs an explicit number. We pin a generous upper bound.
-        8 + 1024
+        // V3 added `last_mark_settle_slot` (8 B) + four new MarketParams
+        // u32 fields (16 B) → bumped to 1152 for headroom.
+        8 + 1152
     }
 }
 

@@ -140,6 +140,11 @@ fn default_params() -> MarketParams {
         funding_per_period_max_bps: 0,
         funding_period_seconds: 0,
         bootstrap_period_batches: 0,
+        // V3 mark-engine params (off by default — legacy/test-suite parity).
+        mark_ema_alpha_bps: 0,
+        mark_max_change_bps: 0,
+        mark_settle_min_slots: 0,
+        drift_alert_bps: 0,
     }
 }
 

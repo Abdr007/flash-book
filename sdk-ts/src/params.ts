@@ -87,6 +87,16 @@ export interface MarketParamsRaw {
   fundingPeriodSeconds: number;
   /** Bootstrap period (batches) for newly-deployed markets — risk caps tightened 4×. */
   bootstrapPeriodBatches: number;
+
+  // ── V3 mark-price engine ──────────────────────────────────────────
+  /** EMA weight (bps) on each fill price when blending into mark in apply_fill. 0 = legacy (mark frozen by fills). */
+  markEmaAlphaBps: number;
+  /** Per-fill mark-move clamp in bps (EMA path). 0 = unlimited. */
+  markMaxChangeBps: number;
+  /** Minimum slots between consecutive permissionless settle_mark calls. 0 = no rate limit. */
+  markSettleMinSlots: number;
+  /** Drift-alert threshold in bps of oracle. When |mark - oracle| / oracle exceeds this a MarkPriceDriftEvent fires. 0 = off. */
+  driftAlertBps: number;
 }
 
 /** Sensible default parameter set for SOL/BTC/ETH-style major markets. */
@@ -142,8 +152,11 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
     // FLP's tolerable concentration risk (e.g. 100 = 1% of pool).
     maxPositionRatioBps: 0,
 
-    // Liquidation incentives (off by default; opt-in per market).
-    liquidatorRewardBps: 0,
+    // Liquidation incentives — ON by default in V3. 50 bps (= 0.5% of
+    // close notional) is competitive with HL/Drift and meaningful enough
+    // to attract a third-party keeper pool. Markets that prefer
+    // protocol-only keepers can set this to 0.
+    liquidatorRewardBps: 50,
     liquidationCooldownSlots: 0,
     liquidationAuctionDurationSlots: 0,
     // JIT auction (off by default).
@@ -181,6 +194,18 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
     // Bootstrap guardrails (off by default). HIP-3 deploys should set
     // ~720 batches (~36s) to clamp first-window snipers.
     bootstrapPeriodBatches: 0,
+    // V3 mark-price engine — ON by default for major markets.
+    //   alpha=2000 (20% EMA weight on each fill)
+    //   max_change=500 (5% per-fill move clamp)
+    //   settle_min=10 slots (~4s rate-limit on permissionless settle_mark)
+    //   drift_alert=100 (alert when mark drifts >1% from oracle)
+    // Smarter than HL (mark frozen until next funding tick), Drift (oracle-only)
+    // and Phoenix (mark = mid-price only). The triple-source signal — fill
+    // EMA + oracle settle + drift alerts — is genuinely novel.
+    markEmaAlphaBps: 2_000,
+    markMaxChangeBps: 500,
+    markSettleMinSlots: 10,
+    driftAlertBps: 100,
   };
 }
 

@@ -5815,6 +5815,75 @@
       "args": []
     },
     {
+      "name": "settle_mark",
+      "docs": [
+        "PERMISSIONLESS: hard-reset `mark_price_ticks` to the current",
+        "`oracle_price_ticks`. The V3 mark-engine's second mark-update path.",
+        "",
+        "Anyone (sequencers, keepers, even traders) can call this — the only",
+        "gate is the per-market `mark_settle_min_slots` rate limit, which",
+        "prevents a single signer from spamming. The oracle's freshness and",
+        "confidence are re-validated (same `OracleTooStale` /",
+        "`OracleConfidenceTooWide` rules as `update_oracle`) so this can only",
+        "snap to a price the protocol already trusts.",
+        "",
+        "Unlike `apply_fill`'s EMA blend, this is a hard reset — designed for",
+        "thin-tape conditions where mark has drifted from the (fresh) oracle",
+        "and no fills are flowing to nudge it back. Pairs naturally with the",
+        "`MarkPriceDriftEvent` alert: off-chain observers see the drift,",
+        "call `settle_mark`, mark snaps back."
+      ],
+      "discriminator": [
+        177,
+        85,
+        37,
+        105,
+        222,
+        57,
+        127,
+        149
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Permissionless caller (anyone can settle)."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "settle_vault_perf_fee",
       "docs": [
         "Crystallize the vault's performance fee. Strategist signs.",
@@ -8980,6 +9049,19 @@
       ]
     },
     {
+      "name": "HealthGateSourceEvent",
+      "discriminator": [
+        255,
+        233,
+        71,
+        68,
+        104,
+        169,
+        20,
+        98
+      ]
+    },
+    {
       "name": "IcebergCancelledEvent",
       "discriminator": [
         64,
@@ -9107,6 +9189,32 @@
         22,
         52,
         243
+      ]
+    },
+    {
+      "name": "MarkPriceDriftEvent",
+      "discriminator": [
+        97,
+        170,
+        29,
+        37,
+        33,
+        8,
+        104,
+        148
+      ]
+    },
+    {
+      "name": "MarkPriceUpdatedEvent",
+      "discriminator": [
+        201,
+        0,
+        25,
+        13,
+        63,
+        57,
+        150,
+        203
       ]
     },
     {
@@ -11042,6 +11150,46 @@
       }
     },
     {
+      "name": "HealthGateSourceEvent",
+      "docs": [
+        "V3 liquidation engine — emitted by `liquidate_position_v2` so the",
+        "off-chain UI / keeper logs can show *which* price source flagged the",
+        "trader as unhealthy. `source` byte:",
+        "0 = mark_price was the more adverse price",
+        "1 = oracle_price was the more adverse price (dual-source gate fired)",
+        "2 = both were equal (rare)"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "mark_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "oracle_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "health_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "source",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
       "name": "IcebergCancelledEvent",
       "type": {
         "kind": "struct",
@@ -11680,6 +11828,73 @@
       }
     },
     {
+      "name": "MarkPriceDriftEvent",
+      "docs": [
+        "V3 mark engine — emitted when |mark - oracle| / oracle exceeds",
+        "`params.drift_alert_bps`. Off-chain observers use this as a nudge to",
+        "call `settle_mark` and snap the mark back to the (fresh) oracle."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "mark_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "oracle_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "drift_bps",
+            "docs": [
+              "Absolute drift in bps of oracle: |mark - oracle| × 10_000 / oracle."
+            ],
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarkPriceUpdatedEvent",
+      "docs": [
+        "V3 mark engine — emitted whenever `mark_price_ticks` is updated.",
+        "`source` byte:",
+        "0 = `apply_fill` EMA blend (last-trade-price tracking)",
+        "1 = `settle_mark` hard reset to oracle",
+        "2 = future paths (kept for forward-compat)"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "old_mark_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "new_mark_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "oracle_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "source",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
       "name": "MarketAccount",
       "docs": [
         "Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD)."
@@ -11825,6 +12040,14 @@
           },
           {
             "name": "period_funding_paid_abs_bps",
+            "type": "u64"
+          },
+          {
+            "name": "last_mark_settle_slot",
+            "docs": [
+              "Slot of the most recent `settle_mark` call. 0 = never settled.",
+              "Used to enforce `params.mark_settle_min_slots` rate-limit."
+            ],
             "type": "u64"
           },
           {
@@ -12445,6 +12668,49 @@
               "Default false = HL-equivalent."
             ],
             "type": "bool"
+          },
+          {
+            "name": "mark_ema_alpha_bps",
+            "docs": [
+              "EMA weight (in bps) applied to a fresh fill price when blending",
+              "it into `mark_price_ticks` inside `apply_fill`.",
+              "new_mark = alpha * fill + (1 - alpha) * old_mark",
+              "0 = mark is never updated by fills (legacy / FBA-only behaviour).",
+              "Typical setting: 2_000 (20% weight on each fill — dampens",
+              "outlier fills but still tracks the tape). Capped at BPS_DENOM."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "mark_max_change_bps",
+            "docs": [
+              "Maximum allowed per-fill mark move in bps, clamped (not rejected).",
+              "If the EMA-blended new_mark differs from the prior mark by more",
+              "than this fraction, the move is clamped to ±this so a single",
+              "outlier fill cannot flash-crash the mark. 0 = unlimited.",
+              "Typical: 500 bps = 5%. Distinct from the existing per-batch",
+              "`mark_change_max_bps` (legacy FBA path)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "mark_settle_min_slots",
+            "docs": [
+              "Minimum number of slots between consecutive permissionless",
+              "`settle_mark` calls. Acts as a rate-limit so a single sequencer",
+              "can't spam settles. 0 = no rate limit. Typical: 10 slots ≈ 4 s."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "drift_alert_bps",
+            "docs": [
+              "When |mark - oracle| / oracle exceeds this (in bps), every",
+              "mark-update path emits a `MarkPriceDriftEvent` so off-chain",
+              "observers can nudge `settle_mark`. 0 = drift alerts disabled.",
+              "Typical: 100 bps = 1%."
+            ],
+            "type": "u32"
           }
         ]
       }

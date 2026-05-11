@@ -41,6 +41,8 @@ export interface MarketAccount {
   totalFeesCollected: BN;
   totalToxicityTaxCollected: BN;
   totalLiquidations: BN;
+  /// V3 mark engine: slot of the most recent settle_mark call. 0 = never.
+  lastMarkSettleSlot: BN;
   params: MarketParamsAccount;
 }
 
@@ -80,6 +82,17 @@ export interface MarketParamsAccount {
   vpinEmaWindow: number;
   twapWindow: number;
   batchIntervalMs: number;
+  // Optional fields (post-Wave-22 additions). Listed as optional so
+  // historical Anchor-decoded data (which may lack them) still types.
+  // The Borsh decoder always populates them when reading on-chain data.
+  liquidatorRewardBps?: number;
+  liquidationCooldownSlots?: number;
+  liquidationAuctionDurationSlots?: number;
+  // V3 mark-price engine params.
+  markEmaAlphaBps?: number;
+  markMaxChangeBps?: number;
+  markSettleMinSlots?: number;
+  driftAlertBps?: number;
 }
 
 export interface InsuranceFundAccount {

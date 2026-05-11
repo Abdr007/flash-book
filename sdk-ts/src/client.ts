@@ -1101,6 +1101,30 @@ export class FlashBookClient {
   }
 
   /**
+   * V3 mark-engine: permissionless `settle_mark`. Snaps the market's
+   * `markPriceTicks` to the freshly-attested oracle price. Anyone can
+   * call (no authority) — the only gate is the per-market
+   * `markSettleMinSlots` rate-limit. Oracle freshness + confidence are
+   * re-checked inside the program (rejects with `OracleTooStale` /
+   * `OracleConfidenceTooWide` if violated).
+   *
+   * Pair with on-chain `MarkPriceDriftEvent` to drive a permissionless
+   * keeper that nudges the mark whenever it drifts off oracle.
+   */
+  settleMarkIx(args: {
+    caller: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    return this.methods
+      .settleMark()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+      })
+      .instruction();
+  }
+
+  /**
    * Cross-market portfolio liquidation. Walks the trader's positions
    * across multiple markets via remaining_accounts.
    *

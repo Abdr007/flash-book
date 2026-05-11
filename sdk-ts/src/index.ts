@@ -96,8 +96,10 @@ export {
   defaultScenarios,
   previewPortfolioRisk,
   initialMarginRequired,
+  previewLiquidation,
   type StressScenario,
   type RiskPreview,
+  type LiquidationPreview,
 } from './risk-preview.ts';
 
 export {
@@ -135,6 +137,9 @@ export type {
   TakerOrderClearedEvent,
   MarketLeverageTiersInitializedEvent,
   MarketLeverageTiersUpdatedEvent,
+  MarkPriceUpdatedEvent,
+  MarkPriceDriftEvent,
+  HealthGateSourceEvent,
   FlashBookEvent,
 } from './events.ts';
 

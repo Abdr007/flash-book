@@ -2360,6 +2360,94 @@ pub mod flash_book {
             batch_num: current_batch,
         });
 
+        // ── V3 mark-price engine: last-trade-price tracking ─────────
+        // Blend the fill price into `mark_price_ticks` via EMA so the
+        // gate that reads `mark_price` (the health check, the funding
+        // premium, the FLP fair value seed) tracks the tape between
+        // batches. Without this, `mark_price_ticks` would stay frozen at
+        // the value `initialize_market` wrote and `update_oracle` would
+        // never tip live positions underwater.
+        //
+        //   new_mark = (alpha * fill_price + (BPS_DENOM - alpha) * old_mark) / BPS_DENOM
+        //
+        // Then clamp the absolute change to ±`mark_max_change_bps` so a
+        // single outlier fill cannot flash-crash the mark. EMA-CLAMP, not
+        // reject — the fill itself already settled; we just dampen the
+        // effect on mark.
+        //
+        // alpha == 0 keeps the legacy behaviour (mark never updates from
+        // fills). Production should set 2_000 (20% weight per fill).
+        let alpha_bps = (market.params.mark_ema_alpha_bps as u128).min(constants::BPS_DENOM as u128);
+        let old_mark = market.mark_price_ticks;
+        if alpha_bps > 0 && old_mark > 0 {
+            let one_minus_alpha = (constants::BPS_DENOM as u128) - alpha_bps;
+            let blended_u128 = ((price_ticks as u128).saturating_mul(alpha_bps)
+                + (old_mark as u128).saturating_mul(one_minus_alpha))
+                / (constants::BPS_DENOM as u128);
+            let mut new_mark = if blended_u128 > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                blended_u128 as u64
+            };
+            // Clamp absolute change to ±mark_max_change_bps.
+            let max_change_bps = market.params.mark_max_change_bps as u128;
+            if max_change_bps > 0 && old_mark > 0 {
+                let max_delta = (old_mark as u128).saturating_mul(max_change_bps)
+                    / (constants::BPS_DENOM as u128);
+                let max_delta_u64 = if max_delta > u64::MAX as u128 {
+                    u64::MAX
+                } else {
+                    max_delta as u64
+                };
+                let upper = old_mark.saturating_add(max_delta_u64);
+                let lower = old_mark.saturating_sub(max_delta_u64);
+                if new_mark > upper {
+                    new_mark = upper;
+                } else if new_mark < lower {
+                    new_mark = lower.max(1);
+                }
+            }
+            if new_mark != old_mark && new_mark > 0 {
+                market.mark_price_ticks = new_mark;
+                emit!(MarkPriceUpdatedEvent {
+                    market: market_key,
+                    old_mark_ticks: old_mark,
+                    new_mark_ticks: new_mark,
+                    oracle_ticks: market.oracle_price_ticks,
+                    source: 0, // 0 = fill
+                });
+                // Drift alert: if mark has drifted from oracle by more
+                // than `drift_alert_bps`, emit a `MarkPriceDriftEvent`
+                // so off-chain observers can nudge `settle_mark`.
+                let drift_bps_cfg = market.params.drift_alert_bps;
+                if drift_bps_cfg > 0 && market.oracle_price_ticks > 0 {
+                    let oracle_u128 = market.oracle_price_ticks as u128;
+                    let mark_u128 = new_mark as u128;
+                    let diff_u128 = if mark_u128 > oracle_u128 {
+                        mark_u128 - oracle_u128
+                    } else {
+                        oracle_u128 - mark_u128
+                    };
+                    let drift_bps_u128 = diff_u128
+                        .saturating_mul(constants::BPS_DENOM as u128)
+                        / oracle_u128;
+                    if drift_bps_u128 >= drift_bps_cfg as u128 {
+                        let dbg = if drift_bps_u128 > u32::MAX as u128 {
+                            u32::MAX
+                        } else {
+                            drift_bps_u128 as u32
+                        };
+                        emit!(MarkPriceDriftEvent {
+                            market: market_key,
+                            mark_ticks: new_mark,
+                            oracle_ticks: market.oracle_price_ticks,
+                            drift_bps: dbg,
+                        });
+                    }
+                }
+            }
+        }
+
         // ── Multi-threshold margin warning ──────────────────────────
         // Single-position equity-vs-MMR view (cheap, no portfolio walk):
         //   equity   = collateral + unrealized_pnl(pos, mark)
@@ -2532,6 +2620,69 @@ pub mod flash_book {
         market.oracle_price_ticks = median;
         market.oracle_confidence = combined_conf;
         market.oracle_published_at_unix_seconds = combined_published_at;
+        Ok(())
+    }
+
+    /// PERMISSIONLESS: hard-reset `mark_price_ticks` to the current
+    /// `oracle_price_ticks`. The V3 mark-engine's second mark-update path.
+    ///
+    /// Anyone (sequencers, keepers, even traders) can call this — the only
+    /// gate is the per-market `mark_settle_min_slots` rate limit, which
+    /// prevents a single signer from spamming. The oracle's freshness and
+    /// confidence are re-validated (same `OracleTooStale` /
+    /// `OracleConfidenceTooWide` rules as `update_oracle`) so this can only
+    /// snap to a price the protocol already trusts.
+    ///
+    /// Unlike `apply_fill`'s EMA blend, this is a hard reset — designed for
+    /// thin-tape conditions where mark has drifted from the (fresh) oracle
+    /// and no fills are flowing to nudge it back. Pairs naturally with the
+    /// `MarkPriceDriftEvent` alert: off-chain observers see the drift,
+    /// call `settle_mark`, mark snaps back.
+    pub fn settle_mark(ctx: Context<SettleMark>) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        let market_key = market.key();
+        let current_slot = Clock::get()?.slot;
+
+        // Rate-limit: must wait `mark_settle_min_slots` between calls.
+        let min_slots = market.params.mark_settle_min_slots as u64;
+        if min_slots > 0 && market.last_mark_settle_slot > 0 {
+            let elapsed = current_slot.saturating_sub(market.last_mark_settle_slot);
+            require!(elapsed >= min_slots, FlashBookError::RateLimited);
+        }
+
+        // Oracle freshness gate — same rules as update_oracle.
+        let oracle = market.oracle_price_ticks;
+        require!(oracle > 0, FlashBookError::ZeroPrice);
+        let now = Clock::get()?.unix_timestamp.max(0) as u64;
+        let max_age = market.params.oracle_staleness_max_seconds as u64;
+        if max_age > 0 {
+            let age = now.saturating_sub(market.oracle_published_at_unix_seconds);
+            require!(age <= max_age, FlashBookError::OracleTooStale);
+        }
+        let max_conf = market.params.oracle_confidence_max_bps;
+        if max_conf > 0 {
+            let conf_bps = ((market.oracle_confidence as u128)
+                * (constants::BPS_DENOM as u128))
+                .checked_div(oracle as u128)
+                .ok_or_else(|| error!(FlashBookError::DivisionByZero))?;
+            require!(
+                conf_bps <= max_conf as u128,
+                FlashBookError::OracleConfidenceTooWide,
+            );
+        }
+
+        let old_mark = market.mark_price_ticks;
+        market.mark_price_ticks = oracle;
+        market.last_mark_settle_slot = current_slot;
+
+        emit!(MarkPriceUpdatedEvent {
+            market: market_key,
+            old_mark_ticks: old_mark,
+            new_mark_ticks: oracle,
+            oracle_ticks: oracle,
+            source: 1, // 1 = oracle_settle
+        });
+        // No drift event here — by definition mark = oracle after settle.
         Ok(())
     }
 
@@ -4287,17 +4438,54 @@ pub mod flash_book {
             require!(elapsed >= cooldown, FlashBookError::RateLimited);
         }
 
-        // Health gate (parity-port).
+        // V3 health gate — DUAL-SOURCE PRICE.
+        // The current `mark_price_ticks` is the FBA / EMA-blended mark
+        // that lags the live tape. The current `oracle_price_ticks` is
+        // the freshly attested oracle. Picking the worse of the two for
+        // the position's direction means a fresh oracle move can
+        // immediately tip a position underwater without waiting for an
+        // explicit `settle_mark` call.
+        //
+        //   LONG:  health_price = min(mark, oracle)   (lower = worse)
+        //   SHORT: health_price = max(mark, oracle)   (higher = worse)
+        //
+        // No other on-chain DEX runs dual-source health checks — most
+        // either trust oracle alone (Drift) or mark alone (Phoenix-style).
+        // The smarter combo is BOTH and pick the adverse one.
+        let pos_side = if position.side == 0 { Side::Long } else { Side::Short };
+        let mark_t = market.mark_price_ticks;
+        let oracle_t = market.oracle_price_ticks;
+        let (health_price_ticks, hp_source) = match pos_side {
+            Side::Long => {
+                if oracle_t > 0 && oracle_t < mark_t {
+                    (oracle_t, 1u8)
+                } else if oracle_t > 0 && oracle_t == mark_t {
+                    (mark_t, 2u8)
+                } else {
+                    (mark_t, 0u8)
+                }
+            }
+            Side::Short => {
+                if oracle_t > mark_t {
+                    (oracle_t, 1u8)
+                } else if oracle_t == mark_t {
+                    (mark_t, 2u8)
+                } else {
+                    (mark_t, 0u8)
+                }
+            }
+        };
+
         let pos_snap = RiskPosSnap {
             market: position.market,
-            side: if position.side == 0 { Side::Long } else { Side::Short },
+            side: pos_side,
             size_lots: position.size_lots,
             entry_price: Ticks(position.entry_price_ticks),
             cum_funding_index_at_entry: position.cum_funding_index_at_entry,
         };
         let market_snap = RiskMarketSnap {
             market: market.key(),
-            mark_price: Ticks(market.mark_price_ticks),
+            mark_price: Ticks(health_price_ticks),
             cum_funding_index: market.cum_funding_index,
             maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
             tick_size: market.params.tick_size,
@@ -4313,7 +4501,16 @@ pub mod flash_book {
         )?;
         require!(!assessment.is_healthy, FlashBookError::NotLiquidatable);
 
-        let pos_side = pos_snap.side;
+        // Emit the source for transparency — keepers and UIs can show
+        // "liquidated by oracle move" vs "liquidated by mark drift".
+        emit!(HealthGateSourceEvent {
+            market: market.key(),
+            trader: trader_state_pre.trader,
+            mark_ticks: mark_t,
+            oracle_ticks: oracle_t,
+            health_price_ticks,
+            source: hp_source,
+        });
         let close_side = pos_side.opposite();
         let penalty = market.params.liq_penalty_bps as u128;
         let oracle = market.oracle_price_ticks as u128;
@@ -6354,6 +6551,7 @@ fn initialize_market_inner(
     market.total_liquidations = 0;
     market.period_started_at_unix = 0;
     market.period_funding_paid_abs_bps = 0;
+    market.last_mark_settle_slot = 0;
     market.params = params;
 
     emit!(MarketInitializedEvent {
@@ -7082,6 +7280,22 @@ pub struct VerifyMarketInvariants<'info> {
 #[derive(Accounts)]
 pub struct UpdateOracle<'info> {
     pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+}
+
+/// V3 mark-engine: permissionless `settle_mark` accounts. The caller pays
+/// the tx fee; the per-market `mark_settle_min_slots` rate-limit
+/// prevents spam. No PDA mutations beyond the market itself.
+#[derive(Accounts)]
+pub struct SettleMark<'info> {
+    /// Permissionless caller (anyone can settle).
+    pub caller: Signer<'info>,
+
     #[account(
         mut,
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
@@ -8488,6 +8702,48 @@ pub struct MarkChangeClampedEvent {
     pub unclamped_mark_ticks: u64,
     pub clamped_mark_ticks: u64,
     pub prior_mark_ticks: u64,
+}
+
+/// V3 mark engine — emitted whenever `mark_price_ticks` is updated.
+/// `source` byte:
+///   0 = `apply_fill` EMA blend (last-trade-price tracking)
+///   1 = `settle_mark` hard reset to oracle
+///   2 = future paths (kept for forward-compat)
+#[event]
+pub struct MarkPriceUpdatedEvent {
+    pub market: Pubkey,
+    pub old_mark_ticks: u64,
+    pub new_mark_ticks: u64,
+    pub oracle_ticks: u64,
+    pub source: u8,
+}
+
+/// V3 mark engine — emitted when |mark - oracle| / oracle exceeds
+/// `params.drift_alert_bps`. Off-chain observers use this as a nudge to
+/// call `settle_mark` and snap the mark back to the (fresh) oracle.
+#[event]
+pub struct MarkPriceDriftEvent {
+    pub market: Pubkey,
+    pub mark_ticks: u64,
+    pub oracle_ticks: u64,
+    /// Absolute drift in bps of oracle: |mark - oracle| × 10_000 / oracle.
+    pub drift_bps: u32,
+}
+
+/// V3 liquidation engine — emitted by `liquidate_position_v2` so the
+/// off-chain UI / keeper logs can show *which* price source flagged the
+/// trader as unhealthy. `source` byte:
+///   0 = mark_price was the more adverse price
+///   1 = oracle_price was the more adverse price (dual-source gate fired)
+///   2 = both were equal (rare)
+#[event]
+pub struct HealthGateSourceEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub mark_ticks: u64,
+    pub oracle_ticks: u64,
+    pub health_price_ticks: u64,
+    pub source: u8,
 }
 
 #[event]

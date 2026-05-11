@@ -201,6 +201,44 @@ export interface PartialCollateralWithdrawnEvent {
   newBalance: BN;
 }
 
+// ─── V3 mark-price engine events ────────────────────────────────────
+
+/// `source` byte:
+///   0 = `apply_fill` EMA blend (last-trade-price tracking)
+///   1 = `settle_mark` hard reset to oracle
+///   2 = future paths (forward-compat)
+export interface MarkPriceUpdatedEvent {
+  market: PublicKey;
+  oldMarkTicks: BN;
+  newMarkTicks: BN;
+  oracleTicks: BN;
+  source: number;
+}
+
+/// Emitted whenever |mark - oracle| / oracle exceeds `params.driftAlertBps`.
+/// Off-chain observers use this as a nudge to call `settleMarkIx`.
+export interface MarkPriceDriftEvent {
+  market: PublicKey;
+  markTicks: BN;
+  oracleTicks: BN;
+  /// Absolute drift in bps of oracle.
+  driftBps: number;
+}
+
+/// Emitted by `liquidate_position_v2` so off-chain consumers can
+/// distinguish "liquidated by fresh oracle move" (source=1) from
+/// "liquidated by mark drift" (source=0). Only fires when the dual-source
+/// health gate actually triggers.
+export interface HealthGateSourceEvent {
+  market: PublicKey;
+  trader: PublicKey;
+  markTicks: BN;
+  oracleTicks: BN;
+  healthPriceTicks: BN;
+  /// 0 = mark, 1 = oracle, 2 = mark == oracle (rare).
+  source: number;
+}
+
 export type FlashBookEvent =
   | { name: 'MarketInitializedEvent'; data: MarketInitializedEvent }
   | { name: 'CollateralDepositedEvent'; data: CollateralDepositedEvent }
@@ -224,4 +262,7 @@ export type FlashBookEvent =
   | { name: 'BatchFillIntentEvent'; data: BatchFillIntentEvent }
   | { name: 'TakerOrderClearedEvent'; data: TakerOrderClearedEvent }
   | { name: 'MarketLeverageTiersInitializedEvent'; data: MarketLeverageTiersInitializedEvent }
-  | { name: 'MarketLeverageTiersUpdatedEvent'; data: MarketLeverageTiersUpdatedEvent };
+  | { name: 'MarketLeverageTiersUpdatedEvent'; data: MarketLeverageTiersUpdatedEvent }
+  | { name: 'MarkPriceUpdatedEvent'; data: MarkPriceUpdatedEvent }
+  | { name: 'MarkPriceDriftEvent'; data: MarkPriceDriftEvent }
+  | { name: 'HealthGateSourceEvent'; data: HealthGateSourceEvent };
