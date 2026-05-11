@@ -13,7 +13,7 @@
 import { PublicKey } from '@solana/web3.js';
 
 export const FLASH_BOOK_PROGRAM_ID = new PublicKey(
-  'HGP5GN7BHSt1geH1DxRwVGFg7g7ERU28Q2QEYf6KP24b',
+  'Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF',
 );
 
 /// Wave 21 program-split sister IDs. SKELETONS as of wave 21 phase 1

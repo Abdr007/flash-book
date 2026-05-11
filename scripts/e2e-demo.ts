@@ -61,8 +61,10 @@ const fail = (s: string) => `${C.red}✗${C.reset} ${s}`;
 const banner = (s: string) => `\n${C.cyan}${b('━'.repeat(2) + ' ' + s + ' ' + '━'.repeat(60 - s.length))}${C.reset}`;
 
 // ─── Config ──────────────────────────────────────────────────────────
-const RPC_URL = 'http://127.0.0.1:8899';
-const AUTHORITY_PATH = path.join(os.homedir(), '.config', 'solana', 'id.json');
+const RPC_URL = process.env.RPC_URL ?? 'http://127.0.0.1:8899';
+const AUTHORITY_PATH =
+  process.env.AUTHORITY_KEYPAIR ?? path.join(os.homedir(), '.config', 'solana', 'id.json');
+const TMP_PREFIX = process.env.TMP_PREFIX ?? '/tmp/flash-book-e2e';
 
 // Test prices: SOL @ $99.95 (priceTicks = 99950 with tick_size 1).
 const BASE_MINT_PRICE_TICKS = 99950n;
@@ -92,6 +94,32 @@ async function airdrop(conn: Connection, to: PublicKey, lamports: number) {
   await conn.confirmTransaction(sig, 'confirmed');
 }
 
+/// Devnet-safe funding: try airdrop first, fall back to transfer from
+/// `from` keypair. Use to fund Alice/Bob on devnet where the airdrop
+/// faucet is rate-limited.
+async function fundWallet(
+  conn: Connection,
+  to: PublicKey,
+  lamports: number,
+  from: Keypair,
+): Promise<void> {
+  const existing = await conn.getBalance(to);
+  if (existing >= lamports) return;
+  const needed = lamports - existing;
+  try {
+    await airdrop(conn, to, needed);
+  } catch {
+    const tx = new Transaction().add(
+      SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to, lamports: needed }),
+    );
+    tx.feePayer = from.publicKey;
+    tx.recentBlockhash = (await conn.getLatestBlockhash('confirmed')).blockhash;
+    tx.sign(from);
+    const sig = await conn.sendRawTransaction(tx.serialize());
+    await conn.confirmTransaction(sig, 'confirmed');
+  }
+}
+
 async function exists(conn: Connection, pk: PublicKey): Promise<boolean> {
   return (await conn.getAccountInfo(pk)) !== null;
 }
@@ -113,31 +141,34 @@ async function main() {
   }
 
   // ─── Step 1: verify programs are deployed
-  console.log(banner('STEP 1 — verify 4 programs deployed'));
-  const programs = [
-    { name: 'flash_book', id: FLASH_BOOK_PROGRAM_ID },
-    { name: 'flash_book_orders', id: new PublicKey('2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5') },
-    { name: 'flash_book_vaults', id: new PublicKey('GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt') },
-    { name: 'flash_book_flp', id: new PublicKey('eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M') },
-  ];
-  for (const p of programs) {
-    const info = await conn.getAccountInfo(p.id);
-    if (info && info.executable) {
-      console.log(ok(`${p.name.padEnd(20)} ${d(p.id.toBase58())}`));
-    } else {
-      console.log(fail(`${p.name.padEnd(20)} NOT deployed at ${p.id.toBase58()}`));
-      console.log(d(`     Deploy with: solana program deploy target/deploy/${p.name}.so --program-id target/deploy/${p.name}-keypair.json`));
-      process.exit(1);
-    }
+  console.log(banner('STEP 1 — verify programs deployed'));
+  const corePrg = await conn.getAccountInfo(FLASH_BOOK_PROGRAM_ID);
+  if (!corePrg?.executable) {
+    console.log(fail(`flash_book NOT deployed at ${FLASH_BOOK_PROGRAM_ID.toBase58()}`));
+    process.exit(1);
+  }
+  console.log(ok(`flash_book (core)    ${d(FLASH_BOOK_PROGRAM_ID.toBase58())}`));
+  // Wrapper programs are optional for the basic trade flow.
+  for (const [name, id] of [
+    ['flash_book_orders', '2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5'],
+    ['flash_book_vaults', 'GH7jCw81XvM5DsS647HNctqjy3SHvEGzG7bBVMDwYXCt'],
+    ['flash_book_flp', 'eTJb5VHJ3vwAoPWZAcMJP7ArAS5HNpyWDG5JshVyK1M'],
+  ] as const) {
+    const info = await conn.getAccountInfo(new PublicKey(id));
+    if (info?.executable) console.log(ok(`${name.padEnd(20)} ${d(id)}`));
+    else console.log(d(`${name.padEnd(20)} not deployed at this cluster (optional)`));
   }
 
-  // ─── Step 2: airdrop SOL to authority + create test USDC mint
+  // ─── Step 2: airdrop SOL to authority (skip on devnet/mainnet) + create test USDC mint
   console.log(banner('STEP 2 — fund authority + create test USDC mint'));
-  await airdrop(conn, authority.publicKey, 10 * 1e9);
+  const currentAuthBal = await conn.getBalance(authority.publicKey);
+  if (currentAuthBal < 2 * 1e9 && RPC_URL.includes('127.0.0.1')) {
+    await airdrop(conn, authority.publicKey, 10 * 1e9);
+  }
   const authBal = await conn.getBalance(authority.publicKey);
-  console.log(ok(`Authority funded:  ${(authBal / 1e9).toFixed(2)} SOL`));
+  console.log(ok(`Authority balance: ${(authBal / 1e9).toFixed(2)} SOL`));
 
-  const USDC_MINT_PATH = '/tmp/flash-book-e2e-usdc-mint.json';
+  const USDC_MINT_PATH = `${TMP_PREFIX}-usdc-mint.json`;
   let usdcMintKp: Keypair;
   if (fs.existsSync(USDC_MINT_PATH)) {
     usdcMintKp = loadKp(USDC_MINT_PATH);
@@ -159,7 +190,7 @@ async function main() {
   const client = new FlashBookClient(conn, wallet);
 
   // Quote vault keypair (re-used or fresh)
-  const QV_PATH = '/tmp/flash-book-e2e-quote-vault.json';
+  const QV_PATH = `${TMP_PREFIX}-quote-vault.json`;
   let quoteVaultKp: Keypair;
   if (fs.existsSync(QV_PATH)) {
     quoteVaultKp = loadKp(QV_PATH);
@@ -211,7 +242,7 @@ async function main() {
   }
 
   // Initialize ONE market: SOL/USDC (using a synthetic base mint).
-  const baseMintKpPath = '/tmp/flash-book-e2e-base-mint.json';
+  const baseMintKpPath = `${TMP_PREFIX}-base-mint.json`;
   let baseMintKp: Keypair;
   if (fs.existsSync(baseMintKpPath)) {
     baseMintKp = loadKp(baseMintKpPath);
@@ -254,8 +285,8 @@ async function main() {
 
   // ─── Step 4: create Alice + Bob, fund them with SOL + USDC
   console.log(banner('STEP 4 — create Alice + Bob, fund with USDC'));
-  const ALICE_PATH = '/tmp/flash-book-e2e-alice.json';
-  const BOB_PATH = '/tmp/flash-book-e2e-bob.json';
+  const ALICE_PATH = `${TMP_PREFIX}-alice.json`;
+  const BOB_PATH = `${TMP_PREFIX}-bob.json`;
   let alice: Keypair;
   let bob: Keypair;
   if (fs.existsSync(ALICE_PATH)) alice = loadKp(ALICE_PATH);
@@ -265,7 +296,7 @@ async function main() {
 
   for (const [name, kp] of [['Alice', alice], ['Bob', bob]] as const) {
     const bal = await conn.getBalance(kp.publicKey);
-    if (bal < 1e9) await airdrop(conn, kp.publicKey, 5 * 1e9);
+    if (bal < 1e9) await fundWallet(conn, kp.publicKey, 1 * 1e9, authority);
     let ata: PublicKey;
     try {
       ata = await createAssociatedTokenAccount(conn, authority, USDC, kp.publicKey);

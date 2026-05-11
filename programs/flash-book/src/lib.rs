@@ -46,7 +46,7 @@ use state::{
     MAX_LEVERAGE_TIERS,
 };
 
-declare_id!("HGP5GN7BHSt1geH1DxRwVGFg7g7ERU28Q2QEYf6KP24b");
+declare_id!("Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF");
 
 #[program]
 pub mod flash_book {
