@@ -88,7 +88,6 @@ line('base mint', baseMint);
 line('quote mint', quoteMint);
 
 const market = client.market(baseMint, quoteMint);
-const commitBuffer = client.commitBuffer(market.address);
 const insuranceFund = client.insuranceFund();
 const flpExposure = client.flpExposure();
 const traderState = client.traderState(trader.publicKey);
@@ -96,7 +95,6 @@ const counterpartyState = client.traderState(counterparty.publicKey);
 const traderPosition = client.position(market.address, trader.publicKey);
 
 line('market PDA', market.address);
-line('commit_buffer PDA', commitBuffer.address);
 line('insurance_fund PDA', insuranceFund.address);
 line('flp_exposure PDA', flpExposure.address);
 line('trader_state PDA', traderState.address);
@@ -107,7 +105,12 @@ line('trader position PDA', traderPosition.address);
 header('Phase 1 — Protocol setup (authority signs)');
 
 const ifParams = defaultInsuranceFundParams();
-const ix1 = await client.initializeInsuranceFundIx(authority.publicKey, ifParams);
+const ix1 = await client.initializeInsuranceFundIx({
+  authority: authority.publicKey,
+  params: ifParams,
+  quoteMint,
+  quoteVault,
+});
 describeIx('initialize_insurance_fund', [authority.publicKey.toBase58(), insuranceFund.address.toBase58()], {
   fee_contribution_bps: ifParams.feeContributionBps,
   toxicity_tax_bps: ifParams.toxicityTaxContributionBps,
@@ -136,14 +139,12 @@ describeIx(
   [
     authority.publicKey.toBase58(),
     market.address.toBase58(),
-    commitBuffer.address.toBase58(),
     insuranceFund.address.toBase58(),
     flpExposure.address.toBase58(),
   ],
   {
     initial_oracle_ticks: 100_000,
     flp_quote_levels: params.flpQuoteLevels,
-    batch_interval_ms: params.batchIntervalMs,
   },
 );
 
@@ -154,16 +155,38 @@ header('Phase 2 — Trader onboarding');
 const ix4 = await client.openTraderStateIx(trader.publicKey);
 describeIx('open_trader_state', [trader.publicKey.toBase58(), traderState.address.toBase58()]);
 
-const ix5 = await client.depositCollateralIx(trader.publicKey, new BN(50_000));
+const ix5 = await client.depositCollateralIx({
+  trader: trader.publicKey,
+  amount: new BN(50_000),
+  quoteMint,
+  quoteVault,
+});
 describeIx('deposit_collateral', [trader.publicKey.toBase58(), traderState.address.toBase58()], {
   amount_quote_lots: 50_000,
 });
 
-// ─── Phase 3: order intake ────────────────────────────────────────────
+// ─── Phase 3: maker rests on the CLOB ─────────────────────────────────
 
-header('Phase 3 — Order intake');
+header('Phase 3 — Maker rests on the CLOB');
 
 const ix6 = await client.placeLimitOrderV2Ix({
+  trader: counterparty.publicKey,
+  market: market.address,
+  side: 'short',
+  sizeLots: new BN(10),
+  limitTicks: new BN(99_950),
+});
+describeIx(
+  'place_limit_order_v2 (maker)',
+  [counterparty.publicKey.toBase58(), market.address.toBase58()],
+  { side: 'short', size_lots: 10, limit_ticks: 99_950, semantics: 'rest in book' },
+);
+
+// ─── Phase 4: taker walks the book ────────────────────────────────────
+
+header('Phase 4 — CLOB taker walks the book (immediate match)');
+
+const ix7 = await client.placeTakerOrderV2Ix({
   trader: trader.publicKey,
   market: market.address,
   side: 'long',
@@ -171,34 +194,19 @@ const ix6 = await client.placeLimitOrderV2Ix({
   limitTicks: new BN(99_950),
 });
 describeIx(
-  'place_limit_order_v2',
+  'place_taker_order_v2',
   [trader.publicKey.toBase58(), market.address.toBase58()],
-  { side: 'long', size_lots: 10, limit_ticks: 99_950 },
-);
-
-// ─── Phase 4: sequencer runs the batch ────────────────────────────────
-
-header('Phase 4 — Batch execution (sequencer signs)');
-
-const ix7 = await client.runBatchV2Ix({
-  sequencer: sequencer.publicKey,
-  market: market.address,
-  nowMs: new BN(Date.now()),
-});
-describeIx(
-  'run_batch_v2',
-  [
-    sequencer.publicKey.toBase58(),
-    market.address.toBase58(),
-    commitBuffer.address.toBase58(),
-    flpExposure.address.toBase58(),
-  ],
-  { now_ms: Date.now() },
+  {
+    side: 'long',
+    size_lots: 10,
+    limit_ticks: 99_950,
+    semantics: 'immediate match — emits BatchFillIntentEvent inline',
+  },
 );
 
 // ─── Phase 5: settlement ──────────────────────────────────────────────
 
-header('Phase 5 — Fill settlement');
+header('Phase 5 — Sequencer settles each inline fill');
 
 const ix8 = await client.applyFillIx({
   sequencer: sequencer.publicKey,

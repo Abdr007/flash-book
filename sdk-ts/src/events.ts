@@ -10,16 +10,6 @@ export interface MarketInitializedEvent {
   initialOracleTicks: BN;
 }
 
-export interface BatchClearedEvent {
-  market: PublicKey;
-  batchNum: BN;
-  clearingPrice: BN;
-  clearingVolume: BN;
-  fillCount: number;
-  fundingRateBpsPerSec: BN;
-  seizedBonds: BN;
-}
-
 export interface CollateralDepositedEvent {
   trader: PublicKey;
   amount: BN;
@@ -194,9 +184,9 @@ export interface TraderTierUpgradedEvent {
   volumeQuoteLots: BN;
 }
 
-/// Sequencer feed — emitted by `run_batch_v2` per cleared fill so the
-/// off-chain sequencer can dispatch apply_fill / apply_flp_fill on
-/// mainnet. FLP detection: `maker == PublicKey.default`.
+/// Sequencer feed — emitted inline per CLOB taker match so the off-chain
+/// sequencer can dispatch apply_fill / apply_flp_fill on mainnet. FLP
+/// detection: `maker == PublicKey.default`.
 export interface BatchFillIntentEvent {
   market: PublicKey;
   taker: PublicKey;
@@ -206,6 +196,20 @@ export interface BatchFillIntentEvent {
   priceTicks: BN;
   takerId: BN;
   makerId: BN;
+}
+
+/// CLOB taker-walk summary — emitted once per `place_taker_order_v2` call
+/// after the matcher walks the resting book. Carries the requested vs
+/// actually-filled vs residual-resting size + the count of inline
+/// `BatchFillIntentEvent`s emitted in the same tx.
+export interface TakerOrderClearedEvent {
+  market: PublicKey;
+  taker: PublicKey;
+  takerSide: number;
+  takerSizeLots: BN;
+  filledLots: BN;
+  residualRestingLots: BN;
+  matchCount: number;
 }
 
 // ─── Wave 20a — multi-tier MMR events ───────────────────────────────
@@ -230,7 +234,6 @@ export interface PartialCollateralWithdrawnEvent {
 
 export type FlashBookEvent =
   | { name: 'MarketInitializedEvent'; data: MarketInitializedEvent }
-  | { name: 'BatchClearedEvent'; data: BatchClearedEvent }
   | { name: 'CollateralDepositedEvent'; data: CollateralDepositedEvent }
   | { name: 'CollateralWithdrawnEvent'; data: CollateralWithdrawnEvent }
   | { name: 'PartialCollateralWithdrawnEvent'; data: PartialCollateralWithdrawnEvent }
@@ -255,5 +258,6 @@ export type FlashBookEvent =
   | { name: 'TraderEffectiveTierEvent'; data: TraderEffectiveTierEvent }
   | { name: 'TraderTierUpgradedEvent'; data: TraderTierUpgradedEvent }
   | { name: 'BatchFillIntentEvent'; data: BatchFillIntentEvent }
+  | { name: 'TakerOrderClearedEvent'; data: TakerOrderClearedEvent }
   | { name: 'MarketLeverageTiersInitializedEvent'; data: MarketLeverageTiersInitializedEvent }
   | { name: 'MarketLeverageTiersUpdatedEvent'; data: MarketLeverageTiersUpdatedEvent };

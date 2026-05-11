@@ -38,6 +38,7 @@ import {
   insuranceFundPda,
   marketBookPda,
   marketPda,
+  ORDER_FLAG_IOC,
   ORDER_FLAG_POST_ONLY,
   positionPda,
   traderStatePda,
@@ -212,7 +213,7 @@ async function mainMenu(state: DemoState): Promise<boolean> {
   console.log('');
   console.log(`    ${c.cyan('1)')} Trade          — place / cancel limit orders, view orderbook`);
   console.log(`    ${c.cyan('2)')} Margin         — deposit / withdraw USDC, view positions`);
-  console.log(`    ${c.cyan('3)')} Matcher        — run a batch tick, watch fills land live`);
+  console.log(`    ${c.cyan('3)')} CLOB Taker     — place a taker order, watch fills land live`);
   console.log(`    ${c.cyan('4)')} Vaults         — create vault, deposit, vault-trades`);
   console.log(`    ${c.cyan('5)')} Tiers          — view fee tier table + your effective rate`);
   console.log(`    ${c.cyan('6)')} Switch market  — change between SOL/BTC/ETH`);
@@ -389,23 +390,31 @@ async function marginMenu(state: DemoState) {
   }
 }
 
-// ─── 3. Matcher ──────────────────────────────────────────────────────
+// ─── 3. CLOB taker ───────────────────────────────────────────────────
 async function matcherMenu(state: DemoState) {
-  console.log(c.banner(' MATCHER '));
+  console.log(c.banner(' CLOB TAKER '));
   console.log('');
-  console.log(`    ${c.cyan('a)')} Run batch tick (run_batch_v2) on this market`);
+  console.log(`    ${c.cyan('a)')} Place taker order (immediate book walk)`);
   console.log(`    ${c.cyan('b)')} Watch live event stream (Ctrl-C to stop)`);
   console.log(`    ${c.cyan('q)')} Back`);
   console.log('');
   const choice = (await state.rl.question(c.bold('  > '))).trim();
   if (choice === 'a') {
     try {
-      const ix = await state.client.runBatchV2Ix({
-        caller: state.wallet.publicKey,
+      const sideAns = await state.rl.question(c.bold(`  Side (long/short): `));
+      const sizeStr = await state.rl.question(c.bold(`  Size (base lots): `));
+      const priceStr = await state.rl.question(c.bold(`  Limit price (ticks): `));
+      const iocAns = await state.rl.question(c.bold(`  IOC? (y/N): `));
+      const ix = await state.client.placeTakerOrderV2Ix({
+        trader: state.wallet.publicKey,
         market: state.market,
-        nowMs: BigInt(Date.now()),
+        side: sideAns.trim() === 'long' ? 'long' : 'short',
+        sizeLots: new BN(sizeStr.trim()),
+        limitTicks: new BN(priceStr.trim()),
+        flags: iocAns.toLowerCase() === 'y' ? ORDER_FLAG_IOC : 0,
+        expiresAtSlot: new BN(0),
       });
-      await sendTx(state, [ix], [], 'run_batch_v2');
+      await sendTx(state, [ix], [], 'place_taker_order_v2');
     } catch (e) {
       console.log(c.red('  ✗ ' + (e as Error).message.split('\n')[0]));
     }
@@ -634,7 +643,7 @@ async function showcase(state: DemoState) {
     ['VPIN-gated FLP pause (toxicity ≥70%)', 'No other DEX has this'],
     ['EMA-blended funding (50/50 prior)', 'HL: per-block recompute'],
     ['Modular wrapper-CPI (4 programs, indep upgrade)', 'All others: monolith'],
-    ['O(N log N) FBA matcher (256 orders/side)', 'Original O(N²): 64'],
+    ['Phoenix/Manifest-class CLOB on a hypertree book', 'Original O(N²) FBA: 64-order cap'],
   ];
   for (const [win, vs] of wins) {
     console.log(`  ${c.green('✓')} ${c.bold(win)}`);
@@ -704,7 +713,7 @@ async function splashBanner() {
 `;
   console.log(SPLASH);
   await new Promise((r) => setTimeout(r, 1000));
-  const tagline = '  ⚡  Sub-ms matcher · MagicBlock ER · 4-program modular · 10 wins over HL/Drift/Phoenix';
+  const tagline = '  ⚡  CLOB hypertree book · MagicBlock ER · 4-program modular · 10 wins over HL/Drift/Phoenix';
   for (let i = 0; i < tagline.length; i++) {
     process.stdout.write(c.cyan(tagline[i]));
     await new Promise((r) => setTimeout(r, 6));
@@ -927,7 +936,7 @@ async function screenshots(state: DemoState) {
   console.log('');
   console.log(`    ${c.cyan('1)')} Trade          — place / cancel limit orders, view orderbook`);
   console.log(`    ${c.cyan('2)')} Margin         — deposit / withdraw USDC, view positions`);
-  console.log(`    ${c.cyan('3)')} Matcher        — run a batch tick, watch fills land live`);
+  console.log(`    ${c.cyan('3)')} CLOB Taker     — place a taker order, watch fills land live`);
   console.log(`    ${c.cyan('4)')} Vaults         — create vault, deposit, vault-trades`);
   console.log(`    ${c.cyan('5)')} Tiers          — view fee tier table + your effective rate`);
   console.log(`    ${c.cyan('6)')} Switch market  — change between SOL/BTC/ETH`);
@@ -949,8 +958,8 @@ async function screenshots(state: DemoState) {
   console.log(`    ${c.cyan('d)')} View my position on this market`);
   console.log('');
 
-  console.log(c.banner(' [3] MATCHER '));
-  console.log(`    ${c.cyan('a)')} Run batch tick (run_batch_v2) on this market`);
+  console.log(c.banner(' [3] CLOB TAKER '));
+  console.log(`    ${c.cyan('a)')} Place taker order (immediate book walk)`);
   console.log(`    ${c.cyan('b)')} Watch live event stream (Ctrl-C to stop)`);
   console.log('');
 

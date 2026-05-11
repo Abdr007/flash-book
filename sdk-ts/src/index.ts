@@ -9,7 +9,6 @@ export {
   FLASH_BOOK_VAULTS_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   associatedTokenAddress,
-  commitBufferPda,
   flpExposurePda,
   insuranceFundPda,
   lpPositionPda,
@@ -60,19 +59,16 @@ export {
 
 export {
   fetchMarket,
-  fetchCommitBuffer,
   fetchInsuranceFund,
   fetchFlpExposure,
   fetchTraderState,
   fetchPosition,
   decodeAccount,
   type MarketAccount,
-  type CommitBufferAccount,
   type InsuranceFundAccount,
   type FlpExposureAccount,
   type TraderStateAccount,
   type PositionAccount,
-  type CommitRow,
   type FlpMarketExposure,
   type VpinState,
   type MarketParamsAccount,
@@ -85,9 +81,11 @@ export {
   type EventStreamCallback,
 } from './event-decoder.ts';
 
-/// Bitfield flag constants for `placeLimitOrderIx({ flags })`.
+/// Bitfield flag constants for `placeLimitOrderIx({ flags })` /
+/// `placeTakerOrderV2Ix({ flags })`.
 /// Bits 0-3 are order semantics (post_only, reduce_only, ioc, jit).
 /// Bits 4-5 are STP mode (0=cancel-newest default, 1=cancel-oldest, 2=cancel-both).
+/// Bit 6 is FOK (fill-or-kill, CLOB taker only).
 export const ORDER_FLAG_POST_ONLY = 1 << 0;
 export const ORDER_FLAG_REDUCE_ONLY = 1 << 1;
 export const ORDER_FLAG_IOC = 1 << 2;
@@ -113,23 +111,6 @@ export {
 } from './risk-preview.ts';
 
 export {
-  simulateBatchClearing,
-  fillForOrder,
-  SIM_PRIORITY,
-  type SimSide,
-  type SimOrder,
-  type SimFill,
-  type SimResult,
-} from './order-simulator.ts';
-
-export {
-  previewTrade,
-  projectPosition,
-  type PreviewTradeRequest,
-  type PreviewTradeResult,
-} from './preview-trade.ts';
-
-export {
   FlashBookErrorCode,
   errorFamily,
   errorName,
@@ -141,7 +122,6 @@ export {
 
 export type {
   MarketInitializedEvent,
-  BatchClearedEvent,
   CollateralDepositedEvent,
   CollateralWithdrawnEvent,
   PartialCollateralWithdrawnEvent,
@@ -167,6 +147,7 @@ export type {
   TraderEffectiveTierEvent,
   TraderTierUpgradedEvent,
   BatchFillIntentEvent,
+  TakerOrderClearedEvent,
   MarketLeverageTiersInitializedEvent,
   MarketLeverageTiersUpdatedEvent,
   FlashBookEvent,

@@ -28,6 +28,10 @@ export enum FlashBookErrorCode {
   PostOnlyCross = 1207,
   RateLimited = 1208,
   PositionSizeCapExceeded = 1209,
+  /// CLOB taker: post-only that would cross the resting book.
+  PostOnlyWouldCross = 1227,
+  /// CLOB taker: fill-or-kill could not be fully filled.
+  FillOrKillNotFilled = 1226,
 
   // 1300-1399 matcher
   BufferFull = 1300,
@@ -44,12 +48,6 @@ export enum FlashBookErrorCode {
   // 1500-1599 insurance fund
   InsuranceBelowFloor = 1500,
   InsuranceExhausted = 1501,
-
-  // 1600-1699 commit-reveal
-  CommitMismatch = 1600,
-  CommitExpired = 1601,
-  CommitDuplicate = 1602,
-  CommitBondRequired = 1603,
 
   // 1700-1799 delegation
   NotDelegated = 1700,
@@ -70,7 +68,6 @@ export function errorFamily(code: number): string {
   if (code >= 1300 && code < 1400) return 'matcher';
   if (code >= 1400 && code < 1500) return 'margin/liquidation';
   if (code >= 1500 && code < 1600) return 'insurance';
-  if (code >= 1600 && code < 1700) return 'commit_reveal';
   if (code >= 1700 && code < 1800) return 'delegation';
   if (code >= 1800 && code < 1900) return 'oracle';
   return 'unknown';

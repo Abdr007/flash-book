@@ -25,7 +25,6 @@ import idlJson from '../idl.json' assert { type: 'json' };
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   associatedTokenAddress,
-  commitBufferPda,
   flpExposurePda,
   insuranceFundPda,
   lpPositionPda,
@@ -95,9 +94,6 @@ export class FlashBookClient {
 
   market(baseMint: PublicKey, quoteMint: PublicKey) {
     return marketPda(baseMint, quoteMint, this.programId);
-  }
-  commitBuffer(market: PublicKey) {
-    return commitBufferPda(market, this.programId);
   }
   insuranceFund() {
     return insuranceFundPda(this.programId);
@@ -231,7 +227,6 @@ export class FlashBookClient {
     initialOracleTicks: bigint | number;
   }): Promise<TransactionInstruction> {
     const market = this.market(args.baseMint, args.quoteMint);
-    const commitBuffer = this.commitBuffer(market.address);
     const fund = this.insuranceFund();
     const flp = this.flpExposure();
 
@@ -245,7 +240,6 @@ export class FlashBookClient {
         quoteVault: args.quoteVault,
         oracleAccount: args.oracleAccount,
         market: market.address,
-        commitBuffer: commitBuffer.address,
         insuranceFund: fund.address,
         flpExposure: flp.address,
         systemProgram: SystemProgram.programId,
@@ -279,15 +273,15 @@ export class FlashBookClient {
   //
   // Lifecycle: init the v2 book on mainnet (initMarketBookIx), then
   // delegate BOTH the market_book PDA and the MarketAccount to the ER
-  // (delegateMarketBookIx + delegateMarketIx). The matcher tick
-  // (runBatchV2Ix) then runs on the ER with sub-millisecond latency;
-  // the ER auto-commits state back to mainnet at `commitFrequencyMs`.
-  // Undelegate at the end-of-life of the ER instance.
+  // (delegateMarketBookIx + delegateMarketIx). CLOB taker walks then
+  // execute on the ER with sub-millisecond latency; the ER auto-commits
+  // state back to mainnet at `commitFrequencyMs`. Undelegate at the
+  // end-of-life of the ER instance.
 
   /// Delegate the v2 hypertree market_book to the MagicBlock ER.
-  /// Production cadence target: commitFrequencyMs ≈ 50–200 (matches
-  /// the FBA cadence). Pass `validator` to pin a specific ER validator
-  /// or omit for permissionless selection.
+  /// Production cadence target: commitFrequencyMs ≈ 50–200 ms.
+  /// Pass `validator` to pin a specific ER validator or omit for
+  /// permissionless selection.
   delegateMarketBookIx(args: {
     authority: PublicKey;
     market: PublicKey;
@@ -428,7 +422,7 @@ export class FlashBookClient {
   ///   • bit 6  FOK          — fill-or-kill (revert if any residual)
   ///
   /// Use vs `placeLimitOrderV2Ix`:
-  ///   • placeLimitOrderV2:    pure rest (FBA-bound, MEV-protected)
+  ///   • placeLimitOrderV2:    maker rest (post into the hypertree book)
   ///   • placeTakerOrderV2:    CLOB immediate match (low-latency)
   placeTakerOrderV2Ix(args: {
     trader: PublicKey;
@@ -532,50 +526,6 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// V2 matcher tick: full pipeline — funding advance + EMA-blended rate +
-  /// VPIN-gated FLP virtuals + FBA Walrasian clearing + node mutation +
-  /// vol-adaptive mark band + commit-bond sweep + BatchClearedEvent emit.
-  /// Permissionless — any signer can call it (sequencer in production).
-  runBatchV2Ix(args: {
-    sequencer: PublicKey;
-    market: PublicKey;
-    nowMs: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const book = marketBookPda(args.market);
-    const commitBuffer = this.commitBuffer(args.market);
-    const flpExposure = this.flpExposure();
-    return this.methods
-      .runBatchV2(args.nowMs)
-      .accountsPartial({
-        sequencer: args.sequencer,
-        market: args.market,
-        marketBook: book.address,
-        commitBuffer: commitBuffer.address,
-        flpExposure: flpExposure.address,
-      })
-      .instruction();
-  }
-
-  /// MUST be called after `initializeMarketIx` (and before any
-  /// `submitCommit` / `submitReveal`). Initializes the commit_buffer
-  /// for the market. Split from order_buffer init to dodge an Anchor
-  /// 0.31 BPF "Overlapping copy" invariant.
-  initializeCommitBufferIx(args: {
-    authority: PublicKey;
-    market: PublicKey;
-  }): Promise<TransactionInstruction> {
-    const commitBuffer = this.commitBuffer(args.market);
-    return this.methods
-      .initializeCommitBuffer()
-      .accountsPartial({
-        authority: args.authority,
-        market: args.market,
-        commitBuffer: commitBuffer.address,
-        systemProgram: SystemProgram.programId,
-      })
-      .instruction();
-  }
-
   /// HIP-3 / permissionless market deployment. ANY signer can call this;
   /// they become BOTH the market authority and the creator (and earn
   /// `params.creatorShareBps` of net fee on every fill, forever). Params
@@ -595,7 +545,6 @@ export class FlashBookClient {
     initialOracleTicks: bigint | number;
   }): Promise<TransactionInstruction> {
     const market = this.market(args.baseMint, args.quoteMint);
-    const commitBuffer = this.commitBuffer(market.address);
     const fund = this.insuranceFund();
     const flp = this.flpExposure();
 
@@ -609,7 +558,6 @@ export class FlashBookClient {
         quoteVault: args.quoteVault,
         oracleAccount: args.oracleAccount,
         market: market.address,
-        commitBuffer: commitBuffer.address,
         insuranceFund: fund.address,
         flpExposure: flp.address,
         systemProgram: SystemProgram.programId,
@@ -947,55 +895,6 @@ export class FlashBookClient {
     return builder.instruction();
   }
 
-  submitCommitIx(args: {
-    trader: PublicKey;
-    market: PublicKey;
-    hash: Uint8Array;
-    bond: bigint | number;
-  }): Promise<TransactionInstruction> {
-    const commitBuffer = this.commitBuffer(args.market);
-    return this.methods
-      .submitCommit(Array.from(args.hash), args.bond)
-      .accountsPartial({
-        trader: args.trader,
-        market: args.market,
-        commitBuffer: commitBuffer.address,
-      })
-      .instruction();
-  }
-
-  /// V2 commit-reveal: redeem a previously-submitted commit and inject
-  /// the revealed taker order into the hypertree-backed book. Same hash
-  /// validation as v1; only the inject target differs (hypertree, not
-  /// v1 buffer). order_type byte = 1 (Taker) → matcher promotes to
-  /// Taker FIFO priority above resting limits at the same price tier.
-  submitRevealV2Ix(args: {
-    trader: PublicKey;
-    market: PublicKey;
-    side: 'long' | 'short';
-    sizeLots: bigint | number;
-    limitTicks: bigint | number;
-    nonce: Uint8Array;
-  }): Promise<TransactionInstruction> {
-    const book = marketBookPda(args.market);
-    const commitBuffer = this.commitBuffer(args.market);
-    return this.methods
-      .submitRevealV2(
-        args.side === 'long' ? 0 : 1,
-        args.sizeLots,
-        args.limitTicks,
-        Array.from(args.nonce),
-      )
-      .accountsPartial({
-        trader: args.trader,
-        market: args.market,
-        commitBuffer: commitBuffer.address,
-        marketBook: book.address,
-      })
-      .instruction();
-  }
-
-
   setMarketStatusIx(args: {
     authority: PublicKey;
     market: PublicKey;
@@ -1277,55 +1176,6 @@ export class FlashBookClient {
       return withRemaining.instruction();
     }
     return builder.instruction();
-  }
-
-  /// Delegate the commit_buffer to the MagicBlock ER. Required for ER
-  /// ticks (run_batch_v2 sweeps expired bonds via this account).
-  delegateCommitBufferIx(args: {
-    authority: PublicKey;
-    market: PublicKey;
-    commitFrequencyMs: number;
-    validator?: PublicKey | null;
-  }): Promise<TransactionInstruction> {
-    const commit = this.commitBuffer(args.market);
-    const buffer = delegateBufferPda(commit.address, this.programId);
-    const record = delegationRecordPda(commit.address);
-    const metadata = delegationMetadataPda(commit.address);
-    return this.methods
-      .delegateCommitBuffer(args.commitFrequencyMs, args.validator ?? null)
-      .accountsPartial({
-        authority: args.authority,
-        market: args.market,
-        commitBuffer: commit.address,
-        ownerProgram: this.programId,
-        delegateBuffer: buffer.address,
-        delegationRecord: record.address,
-        delegationMetadata: metadata.address,
-        systemProgram: SystemProgram.programId,
-        delegationProgram: MAGICBLOCK_DELEGATION_PROGRAM_ID,
-      })
-      .instruction();
-  }
-
-  /// Undelegate the commit_buffer from the ER back to mainnet.
-  undelegateCommitBufferIx(args: {
-    authority: PublicKey;
-    market: PublicKey;
-  }): Promise<TransactionInstruction> {
-    const commit = this.commitBuffer(args.market);
-    const buffer = delegateBufferPda(commit.address, this.programId);
-    return this.methods
-      .undelegateCommitBuffer()
-      .accountsPartial({
-        authority: args.authority,
-        market: args.market,
-        commitBuffer: commit.address,
-        ownerProgram: this.programId,
-        delegateBuffer: buffer.address,
-        systemProgram: SystemProgram.programId,
-        delegationProgram: MAGICBLOCK_DELEGATION_PROGRAM_ID,
-      })
-      .instruction();
   }
 
   /// V2 liquidation — pure parity port of v1, just retargets the close

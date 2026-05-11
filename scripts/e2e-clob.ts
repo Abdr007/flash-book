@@ -112,7 +112,7 @@ async function main() {
   console.log(`  USDC mint:  ${USDC.toBase58()}`);
   console.log(`  Market:     ${market.toBase58()}`);
 
-  // ─── Step 1: Maker (Alice) rests a limit order via FBA path
+  // ─── Step 1: Maker (Alice) rests a POST_ONLY limit order in the book
   console.log(banner('STEP 1 — Alice rests SHORT 10 @ 99950 (maker)'));
   const restIx = await client.placeLimitOrderV2Ix({
     trader: alice.publicKey,
@@ -270,7 +270,7 @@ async function main() {
   console.log(`    • POST_ONLY rejection on would-cross`);
   console.log(`    • IOC cancel-residual semantics`);
   console.log(`    • Self-trade prevention (auto-skip own resting orders)`);
-  console.log(`    • Coexists with FBA path (placeLimitOrderV2 still works)`);
+  console.log(`    • placeLimitOrderV2 rests; placeTakerOrderV2 walks — same hypertree book`);
   console.log('');
 }
 

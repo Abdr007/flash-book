@@ -5,9 +5,9 @@ import {
   FLASH_BOOK_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   associatedTokenAddress,
-  commitBufferPda,
   flpExposurePda,
   insuranceFundPda,
+  marketBookPda,
   marketPda,
   positionPda,
   traderStatePda,
@@ -34,9 +34,9 @@ describe('PDA derivation', () => {
     expect(a.address.toBase58()).not.toBe(b.address.toBase58());
   });
 
-  test('commitBufferPda derives from market', () => {
+  test('marketBookPda derives from market', () => {
     const market = marketPda(SOL, USDC).address;
-    const buf = commitBufferPda(market);
+    const buf = marketBookPda(market);
     expect(buf.address.toBytes()).toHaveLength(32);
     expect(buf.address.toBase58()).not.toBe(market.toBase58());
   });
@@ -122,12 +122,12 @@ describe('PDA derivation', () => {
 
   test('all derived addresses have valid bumps', () => {
     const market = marketPda(SOL, USDC);
-    const cbuf = commitBufferPda(market.address);
+    const book = marketBookPda(market.address);
     const trader = Keypair.generate().publicKey;
     const ts = traderStatePda(trader);
     const pos = positionPda(market.address, trader);
 
-    for (const d of [market, cbuf, ts, pos]) {
+    for (const d of [market, book, ts, pos]) {
       expect(d.bump).toBeGreaterThanOrEqual(0);
       expect(d.bump).toBeLessThan(256);
     }

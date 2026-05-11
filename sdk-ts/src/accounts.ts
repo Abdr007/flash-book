@@ -82,22 +82,6 @@ export interface MarketParamsAccount {
   batchIntervalMs: number;
 }
 
-export interface CommitBufferAccount {
-  market: PublicKey;
-  bump: number;
-  head: number;
-  commits: CommitRow[];
-}
-
-export interface CommitRow {
-  hash: number[];
-  trader: PublicKey;
-  bond: BN;
-  committedAtBatch: BN;
-  expireAtBatch: BN;
-  valid: number;
-}
-
 export interface InsuranceFundAccount {
   authority: PublicKey;
   bump: number;
@@ -167,13 +151,6 @@ export async function fetchMarket(client: FlashBookClient, address: PublicKey): 
   return (await ns(client).marketAccount.fetchNullable(address)) as MarketAccount | null;
 }
 
-export async function fetchCommitBuffer(
-  client: FlashBookClient,
-  address: PublicKey,
-): Promise<CommitBufferAccount | null> {
-  return (await ns(client).commitBufferAccount.fetchNullable(address)) as CommitBufferAccount | null;
-}
-
 export async function fetchInsuranceFund(
   client: FlashBookClient,
   address: PublicKey,
@@ -212,7 +189,6 @@ export async function fetchPosition(
 export function decodeAccount<T>(
   accountName:
     | 'marketAccount'
-    | 'commitBufferAccount'
     | 'insuranceFundAccount'
     | 'flpExposureAccount'
     | 'traderStateAccount'

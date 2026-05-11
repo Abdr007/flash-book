@@ -254,7 +254,6 @@ async function main() {
   const baseMint = baseMintKp.publicKey;
   const market = marketPda(baseMint, USDC).address;
   const book = marketBookPda(market).address;
-  const cb = client.commitBuffer(market).address;
   console.log(`  ${b('Market base mint:')} ${baseMint.toBase58()}`);
   console.log(`  ${b('Market PDA:')}       ${market.toBase58()}`);
 
@@ -276,11 +275,6 @@ async function main() {
     const ix = await client.initMarketBookIx({ authority: authority.publicKey, market });
     await send(conn, authority, [ix]);
     console.log(ok(`MarketBook initialized`));
-  }
-  if (!(await exists(conn, cb))) {
-    const ix = await client.initializeCommitBufferIx({ authority: authority.publicKey, market });
-    await send(conn, authority, [ix]);
-    console.log(ok(`CommitBuffer initialized`));
   }
 
   // ─── Step 4: create Alice + Bob, fund them with SOL + USDC
@@ -335,25 +329,13 @@ async function main() {
     console.log(ok(`${name} deposited → collateral: ${collat.toFixed(2)} USDC`));
   }
 
-  // ─── Step 6: Alice places long, Bob places short — they cross
-  console.log(banner('STEP 6 — Alice long, Bob short, crossing @ price 99950'));
+  // ─── Step 6: Alice rests as maker, Bob takes the book
+  console.log(banner('STEP 6 — Alice rests SHORT 5 @ 99950 (maker)'));
   // Order size = 5 base lots. With baseLotSize=1000, that's 5_000 base units.
   // Notional = 5 × 99950 × tick_size(1) = 499_750 quote-lots = 0.50 USDC.
   // IM required ≈ 0.50 × 250/10000 = 0.0125 USDC. Plenty of headroom.
-  const aliceLongIx = await client.placeLimitOrderV2Ix({
+  const aliceMakerIx = await client.placeLimitOrderV2Ix({
     trader: alice.publicKey,
-    market,
-    side: 'long',
-    sizeLots: new BN(5),
-    limitTicks: new BN(99950),
-    flags: 0,
-    expiresAtSlot: new BN(0),
-  });
-  await send(conn, alice, [aliceLongIx]);
-  console.log(ok(`Alice  long  5 @ 99950`));
-
-  const bobShortIx = await client.placeLimitOrderV2Ix({
-    trader: bob.publicKey,
     market,
     side: 'short',
     sizeLots: new BN(5),
@@ -361,8 +343,8 @@ async function main() {
     flags: 0,
     expiresAtSlot: new BN(0),
   });
-  await send(conn, bob, [bobShortIx]);
-  console.log(ok(`Bob    short 5 @ 99950`));
+  await send(conn, alice, [aliceMakerIx]);
+  console.log(ok(`Alice  rests SHORT 5 @ 99950 (maker — in the hypertree book)`));
 
   // Show orderbook depth.
   try {
@@ -399,55 +381,58 @@ async function main() {
     console.log(d(`  (could not read orderbook: ${(e as Error).message.split('\n')[0]})`));
   }
 
-  // ─── Step 7: run matcher tick
-  console.log(banner('STEP 7 — run_batch_v2 (matcher tick)'));
-  const runIx = await client.runBatchV2Ix({
-    sequencer: authority.publicKey,
-    market,
-    nowMs: new BN(Date.now()) as unknown as bigint,
-  });
-  // The MAX_BATCH=256 matcher allocates ~80KB of heap on the hot path
-  // (multiple Vec<Order> sized 2×256 entries). Default BPF heap is 32KB
-  // — request 256KB instead. Plus bump CU limit since FBA sort + walk
-  // can spend 400K+ on a full batch.
+  // ─── Step 7: Bob takes the book via CLOB place_taker_order_v2
+  console.log(banner('STEP 7 — Bob CLOB-sweeps LONG 5 @ 99950 (taker)'));
+  // CLOB takers walk the book inline — no run_batch_v2 needed. The matcher
+  // emits BatchFillIntentEvent per fill plus a TakerOrderClearedEvent
+  // summary inside the same tx.
   const heapIx = ComputeBudgetProgram.requestHeapFrame({ bytes: 256 * 1024 });
   const cuIx = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 });
-  const matcherSig = await send(conn, authority, [heapIx, cuIx, runIx]);
-  console.log(ok(`Matcher tick fired  ${d(matcherSig.slice(0, 20) + '…')}`));
+  const bobTakerIx = await client.placeTakerOrderV2Ix({
+    trader: bob.publicKey,
+    market,
+    side: 'long',
+    sizeLots: new BN(5),
+    limitTicks: new BN(99950),
+    flags: 0,
+    expiresAtSlot: new BN(0),
+  });
+  const takerSig = await send(conn, bob, [heapIx, cuIx, bobTakerIx]);
+  console.log(ok(`CLOB taker fired  ${d(takerSig.slice(0, 20) + '…')}`));
 
-  // Decode events from the matcher tx.
-  const matcherTx = await conn.getTransaction(matcherSig, {
+  // Decode inline events from the taker tx.
+  const takerTx = await conn.getTransaction(takerSig, {
     commitment: 'confirmed',
     maxSupportedTransactionVersion: 0,
   });
   const coder = new BorshEventCoder(IDL);
-  let batchClearedEvent: any = null;
+  let takerClearedEvent: any = null;
   const fillIntents: any[] = [];
-  for (const line of matcherTx?.meta?.logMessages ?? []) {
+  for (const line of takerTx?.meta?.logMessages ?? []) {
     if (!line.startsWith('Program data: ')) continue;
     try {
       const ev = coder.decode(line.slice('Program data: '.length).trim());
       if (!ev) continue;
-      if (ev.name === 'BatchClearedEvent') batchClearedEvent = ev.data;
+      if (ev.name === 'TakerOrderClearedEvent') takerClearedEvent = ev.data;
       if (ev.name === 'BatchFillIntentEvent') fillIntents.push(ev.data);
     } catch { /* skip */ }
   }
 
-  if (batchClearedEvent) {
-    const e = batchClearedEvent;
-    const cp = e.clearingPrice ?? e.clearing_price;
-    const cv = e.clearingVolume ?? e.clearing_volume;
-    const fc = e.fillCount ?? e.fill_count;
-    const fr = e.fundingRateBpsPerSec ?? e.funding_rate_bps_per_sec;
-    console.log(`  ${b('BatchClearedEvent:')}`);
-    console.log(`    clearing_price:  ${cp?.toString()}`);
-    console.log(`    clearing_volume: ${cv?.toString()}`);
-    console.log(`    fill_count:      ${fc}`);
-    console.log(`    funding_rate:    ${fr?.toString()} bps/sec`);
+  if (takerClearedEvent) {
+    const e = takerClearedEvent;
+    const requested = e.takerSizeLots ?? e.taker_size_lots;
+    const filled = e.filledLots ?? e.filled_lots;
+    const residual = e.residualRestingLots ?? e.residual_resting_lots;
+    const matchCount = e.matchCount ?? e.match_count;
+    console.log(`  ${b('TakerOrderClearedEvent:')}`);
+    console.log(`    requested:   ${requested?.toString()}`);
+    console.log(`    filled:      ${filled?.toString()}`);
+    console.log(`    residual:    ${residual?.toString()}`);
+    console.log(`    match_count: ${matchCount}`);
   } else {
-    console.log(fail(`No BatchClearedEvent emitted — matcher didn't fire`));
+    console.log(fail(`No TakerOrderClearedEvent emitted — taker didn't run`));
   }
-  console.log(`  ${b('BatchFillIntentEvents:')} ${fillIntents.length}`);
+  console.log(`  ${b('BatchFillIntentEvents (inline):')} ${fillIntents.length}`);
   for (const f of fillIntents) {
     const taker = f.taker instanceof PublicKey ? f.taker : new PublicKey(f.taker);
     const maker = f.maker instanceof PublicKey ? f.maker : new PublicKey(f.maker);
@@ -541,8 +526,8 @@ async function main() {
   console.log('    2. Created a test USDC mint + InsuranceFund + FlpExposure + FeeTiers + 1 market');
   console.log('    3. Funded Alice + Bob with SOL + 1000 USDC each');
   console.log('    4. Both opened trader_state + deposited 100 USDC');
-  console.log('    5. Alice placed a long order; Bob placed a crossing short');
-  console.log('    6. Matcher tick (run_batch_v2) fired BatchClearedEvent + BatchFillIntentEvent');
+  console.log('    5. Alice posted a resting SHORT (maker); Bob ran a CLOB taker LONG');
+  console.log('    6. CLOB taker walked the book inline → BatchFillIntentEvent + TakerOrderClearedEvent');
   console.log('    7. Sequencer-style apply_fill landed BOTH positions on-chain');
   console.log('    8. Both Alice + Bob now have populated positions + tier-resolved volumes');
   console.log('');

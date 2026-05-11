@@ -4,21 +4,18 @@
 //!   • funding      — sign correctness, rate clamping
 //!   • vpin         — output bounded, monotonic in imbalance
 //!   • insurance    — waterfall conservation, contribution math
-//!   • commit_reveal — hash determinism, expiry semantics
 //!
 //! Each property runs against 2,000 random inputs.
 
 use anchor_lang::prelude::Pubkey;
 use flash_book::matcher::{
-    commit_reveal::{redeem_reveal, register_commit, sweep_expired, RevealPayload},
     flp_quoter::{generate_quotes, FlpQuoterInputs, FlpQuoterParams},
     funding::advance,
     insurance::InsuranceFund,
-    lot::{BaseLots, Ticks},
+    lot::Ticks,
     order::Side,
     vpin::VpinState,
 };
-use flash_book::state::CommitRow;
 use proptest::prelude::*;
 
 // ─── flp_quoter ────────────────────────────────────────────────────────
@@ -287,84 +284,3 @@ proptest! {
     }
 }
 
-// ─── commit-reveal ─────────────────────────────────────────────────────
-
-fn empty_commits() -> Vec<CommitRow> {
-    vec![CommitRow::default(); 8]
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(2000))]
-
-    /// Committed → revealed roundtrip yields the same payload.
-    #[test]
-    fn commit_reveal_roundtrip(
-        seed in any::<u8>(),
-        size in 1u64..1000u64,
-        limit in 1u64..1000u64,
-        is_long in any::<bool>(),
-    ) {
-        let trader = Pubkey::new_from_array([seed; 32]);
-        let payload = RevealPayload {
-            trader,
-            side: if is_long { Side::Long } else { Side::Short },
-            size: BaseLots(size),
-            limit: Ticks(limit),
-            nonce: [seed; 32],
-        };
-        let mut commits = empty_commits();
-        register_commit(&mut commits, payload.hash(), trader, 1000, 1, 5)?;
-        let order = redeem_reveal(&mut commits, &payload, 2, 99)?;
-        prop_assert_eq!(order.trader, trader);
-        prop_assert_eq!(order.size, BaseLots(size));
-        prop_assert_eq!(order.limit_price, Ticks(limit));
-    }
-
-    /// Tampered reveal is rejected.
-    #[test]
-    fn commit_reveal_tamper_rejected(
-        seed in any::<u8>(),
-        size in 1u64..1000u64,
-        limit in 1u64..1000u64,
-        delta in 1u64..1000u64,
-    ) {
-        let trader = Pubkey::new_from_array([seed; 32]);
-        let payload = RevealPayload {
-            trader,
-            side: Side::Long,
-            size: BaseLots(size),
-            limit: Ticks(limit),
-            nonce: [seed; 32],
-        };
-        let mut commits = empty_commits();
-        register_commit(&mut commits, payload.hash(), trader, 1000, 1, 5)?;
-        let tampered = RevealPayload {
-            size: BaseLots(size.saturating_add(delta)),
-            ..payload
-        };
-        let r = redeem_reveal(&mut commits, &tampered, 2, 99);
-        prop_assert!(r.is_err());
-    }
-
-    /// Sweep returns the bond when the commit is past expiry.
-    #[test]
-    fn commit_sweep_returns_bond(
-        seed in any::<u8>(),
-        bond in 1u64..1_000_000u64,
-        expiry in 1u64..10u64,
-    ) {
-        let trader = Pubkey::new_from_array([seed; 32]);
-        let payload = RevealPayload {
-            trader,
-            side: Side::Long,
-            size: BaseLots(1),
-            limit: Ticks(100),
-            nonce: [0u8; 32],
-        };
-        let mut commits = empty_commits();
-        register_commit(&mut commits, payload.hash(), trader, bond, 1, expiry)?;
-        // Sweep at batch 100 (definitely past expiry).
-        let seized = sweep_expired(&mut commits, 100);
-        prop_assert_eq!(seized, bond);
-    }
-}

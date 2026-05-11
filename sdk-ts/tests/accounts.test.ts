@@ -12,16 +12,14 @@ describe('Account decoder', () => {
     expect(() => decodeAccount('marketAccount', wrongDisc)).toThrow();
   });
 
-  test('decoder accepts all 7 account names without compile-time error', () => {
+  test('decoder accepts all 5 account names without compile-time error', () => {
     const names = [
       'marketAccount',
-      'orderBufferAccount',
-      'commitBufferAccount',
       'insuranceFundAccount',
       'flpExposureAccount',
       'traderStateAccount',
       'positionAccount',
     ] as const;
-    expect(names.length).toBe(7);
+    expect(names.length).toBe(5);
   });
 });

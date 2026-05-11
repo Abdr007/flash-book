@@ -1,6 +1,6 @@
 // Live monitor — demonstrates every SDK consumer pattern in one script:
 //
-//   • Account fetchers: fetchMarket, fetchOrderBuffer, fetchTraderState,
+//   • Account fetchers: fetchMarket, fetchTraderState,
 //     fetchInsuranceFund, fetchFlpExposure
 //   • Event subscription: subscribeToProgramEvents
 //   • Risk preview: previewPortfolioRisk on a fetched portfolio
@@ -160,18 +160,21 @@ if (LIVE) {
   const sub = subscribeToProgramEvents(connection, (event, slot, sig) => {
     const ts = new Date().toISOString();
     switch (event.name) {
-      case 'BatchClearedEvent':
+      case 'TakerOrderClearedEvent':
         console.log(
-          `  [${ts}] BatchCleared slot=${slot} ` +
-            `batch=${event.data.batchNum.toString()} ` +
-            `price=${event.data.clearingPrice.toString()} ` +
-            `fills=${event.data.fillCount} sig=${sig.slice(0, 8)}…`,
+          `  [${ts}] TakerOrderCleared slot=${slot} ` +
+            `requested=${event.data.takerSizeLots.toString()} ` +
+            `filled=${event.data.filledLots.toString()} ` +
+            `residual=${event.data.residualRestingLots.toString()} ` +
+            `matches=${event.data.matchCount} sig=${sig.slice(0, 8)}…`,
         );
         break;
-      case 'LiquidationInjectedEvent':
+      case 'BatchFillIntentEvent':
         console.log(
-          `  [${ts}] 🔥 LiquidationInjected trader=${event.data.trader.toBase58().slice(0, 8)}… ` +
-            `size=${event.data.sizeLots.toString()} scenario=${event.data.worstScenarioIdx}`,
+          `  [${ts}] BatchFillIntent size=${event.data.sizeLots.toString()} ` +
+            `price=${event.data.priceTicks.toString()} ` +
+            `taker=${event.data.taker.toBase58().slice(0, 8)}… ` +
+            `maker=${event.data.maker.toBase58().slice(0, 8)}…`,
         );
         break;
       case 'FillAppliedEvent':

@@ -70,9 +70,8 @@ describe('Instruction builders', () => {
     });
     expect(ix.programId.equals(FLASH_BOOK_PROGRAM_ID)).toBe(true);
     // authority, base_mint, quote_mint, base_vault, quote_vault, oracle,
-    // market, commit_buffer, insurance, flp, sysprog (v1 order_buffer
-    // removed in wave 19i — markets use the v2 hypertree market_book PDA)
-    expect(ix.keys.length).toBe(11);
+    // market, insurance, flp, sysprog.
+    expect(ix.keys.length).toBe(10);
   });
 
   test('openTraderStateIx', async () => {
@@ -282,45 +281,22 @@ describe('Instruction builders', () => {
     expect(ix.keys.length).toBe(3);
   });
 
-  test('submitCommitIx', async () => {
+  test('placeTakerOrderV2Ix', async () => {
     const client = makeClient();
+    const trader = Keypair.generate().publicKey;
     const market = client.market(SOL, USDC).address;
-    const ix = await client.submitCommitIx({
-      trader: Keypair.generate().publicKey,
+    const ix = await client.placeTakerOrderV2Ix({
+      trader,
       market,
-      hash: new Uint8Array(32),
-      bond: new BN(1_000),
-    });
-    expect(ix.keys.length).toBe(3); // trader, market, commit_buffer
-  });
-
-  test('submitRevealV2Ix', async () => {
-    const client = makeClient();
-    const market = client.market(SOL, USDC).address;
-    const ix = await client.submitRevealV2Ix({
-      trader: Keypair.generate().publicKey,
-      market,
-      side: 'short',
+      side: 'long',
       sizeLots: new BN(1),
-      limitTicks: new BN(100_050),
-      nonce: new Uint8Array(32),
+      limitTicks: new BN(99_950),
     });
-    expect(ix.keys.length).toBe(4); // trader, market, commit_buffer, market_book
+    // trader, market, market_book
+    expect(ix.keys.length).toBe(3);
   });
 
-  // ─── Batch + settlement (3) ────────────────────────────────────────
-
-  test('runBatchV2Ix', async () => {
-    const client = makeClient();
-    const market = client.market(SOL, USDC).address;
-    const ix = await client.runBatchV2Ix({
-      sequencer: Keypair.generate().publicKey,
-      market,
-      nowMs: new BN(1_000_000),
-    });
-    // sequencer, market, market_book, commit_buffer, flp_exposure
-    expect(ix.keys.length).toBe(5);
-  });
+  // ─── Settlement (2) ────────────────────────────────────────────────
 
   test('applyFillIx', async () => {
     const client = makeClient();
@@ -493,11 +469,12 @@ describe('Instruction builders', () => {
 
   // ─── Coverage check ────────────────────────────────────────────────
 
-  test('all 22 instruction builders covered', () => {
+  test('CLOB-only instruction builders covered', () => {
     // This test serves as a tripwire: if a new instruction is added to
-    // the program, this list will fall out of sync with the test count
-    // above. v1 ix builders deleted in wave 19h; only v2 builders for
-    // injection paths shipped. v1 ix surface fully removed in wave 19i.
+    // the program, this list will fall out of sync. FBA-era ix
+    // (runBatchV2Ix, submitCommitIx, submitRevealV2Ix,
+    // initializeCommitBufferIx) removed when the protocol moved to
+    // CLOB-only matching.
     const expected = [
       'initializeInsuranceFundIx',
       'initializeFlpExposureIx',
@@ -508,11 +485,9 @@ describe('Instruction builders', () => {
       'depositFlpCapitalIx',
       'withdrawFlpCapitalIx',
       'placeLimitOrderV2Ix',
+      'placeTakerOrderV2Ix',
       'placeBasketOrderV2Ix',
       'placeBasketOrderNV2Ix',
-      'submitCommitIx',
-      'submitRevealV2Ix',
-      'runBatchV2Ix',
       'applyFillIx',
       'applyFlpFillIx',
       'cancelOrderV2Ix',
@@ -524,7 +499,7 @@ describe('Instruction builders', () => {
       'updateMarketParamsIx',
       'transferMarketAuthorityIx',
     ];
-    expect(expected.length).toBe(24);
+    expect(expected.length).toBe(22);
     const client = makeClient();
     for (const name of expected) {
       expect(typeof (client as unknown as Record<string, unknown>)[name]).toBe('function');

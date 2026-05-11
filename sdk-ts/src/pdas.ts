@@ -3,8 +3,7 @@
 // Seed conventions (must match programs/flash-book/src/state.rs and lib.rs):
 //
 //   market           ["market", base_mint, quote_mint]
-//   order_buffer     ["order_buffer", market]
-//   commit_buffer    ["commit_buffer", market]
+//   market_book      ["market_book", market]
 //   insurance_fund   ["insurance_fund"]
 //   flp_exposure     ["flp_exposure"]
 //   trader_state     ["trader_state", trader]
@@ -60,7 +59,6 @@ export function associatedTokenAddress(
 }
 
 const MARKET_SEED = Buffer.from('market');
-const COMMIT_BUFFER_SEED = Buffer.from('commit_buffer');
 const INSURANCE_FUND_SEED = Buffer.from('insurance_fund');
 const FLP_EXPOSURE_SEED = Buffer.from('flp_exposure');
 const TRADER_STATE_SEED = Buffer.from('trader_state');
@@ -90,13 +88,6 @@ export function marketPda(
   programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
 ): DerivedPda {
   return derive([MARKET_SEED, baseMint.toBuffer(), quoteMint.toBuffer()], programId);
-}
-
-export function commitBufferPda(
-  market: PublicKey,
-  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
-): DerivedPda {
-  return derive([COMMIT_BUFFER_SEED, market.toBuffer()], programId);
 }
 
 export function insuranceFundPda(programId: PublicKey = FLASH_BOOK_PROGRAM_ID): DerivedPda {

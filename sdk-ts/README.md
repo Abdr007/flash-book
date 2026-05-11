@@ -4,23 +4,24 @@ TypeScript client for the Flash Book Anchor program.
 
 ## What's in here
 
-- **PDA derivation** — `marketPda`, `orderBufferPda`, `commitBufferPda`,
-  `insuranceFundPda`, `flpExposurePda`, `traderStatePda`, `positionPda`.
+- **PDA derivation** — `marketPda`, `marketBookPda`, `insuranceFundPda`,
+  `flpExposurePda`, `traderStatePda`, `positionPda`.
 - **Typed parameter shapes** — `MarketParamsRaw`, `InsuranceFundInitParams`,
   with `defaultMajorMarketParams()` / `defaultInsuranceFundParams()`
   helpers calibrated to the Rust program's defaults.
 - **Anchor program client** — `FlashBookClient` wraps `@coral-xyz/anchor`'s
   `Program<Idl>` against the embedded `idl.json` and exposes one async
-  builder per instruction:
+  builder per CLOB instruction:
     - `initializeInsuranceFundIx`
-    - `initializeMarketIx`
+    - `initializeMarketIx` / `initMarketBookIx`
     - `openTraderStateIx`
     - `depositCollateralIx` / `withdrawCollateralIx`
-    - `placeLimitOrderIx`
-    - `submitCommitIx` / `submitRevealIx`
-    - `runBatchIx`
-    - `applyFillIx`
-- **Event types** — `BatchClearedEvent`, `FillAppliedEvent`, etc.
+    - `placeLimitOrderV2Ix` (maker rests in the hypertree book)
+    - `placeTakerOrderV2Ix` (CLOB taker walks the book inline)
+    - `cancelOrderV2Ix`
+    - `applyFillIx` / `applyFlpFillIx`
+- **Event types** — `BatchFillIntentEvent`, `TakerOrderClearedEvent`,
+  `FillAppliedEvent`, etc.
 - **Error code enum** — `FlashBookErrorCode` with `errorFamily()` and
   `errorName()` helpers for client-side classification.
 
@@ -51,22 +52,26 @@ const ix2 = await client.initializeMarketIx({
   initialOracleTicks: 100_000n,
 });
 
-// Trader flow
+// Trader flow — maker rests
 const ix3 = await client.openTraderStateIx(trader);
-const ix4 = await client.depositCollateralIx(trader, 1_000_000n);
-const ix5 = await client.placeLimitOrderIx({
+const ix4 = await client.depositCollateralIx({
+  trader, amount: 1_000_000n, quoteMint, quoteVault,
+});
+const ix5 = await client.placeLimitOrderV2Ix({
   trader,
   market: client.market(baseMint, quoteMint).address,
-  side: 'long',
+  side: 'short',
   sizeLots: 10n,
   limitTicks: 99_950n,
 });
 
-// Sequencer
-const ix6 = await client.runBatchIx({
-  sequencer,
+// Trader flow — CLOB taker walks the book inline (no batch tick needed)
+const ix6 = await client.placeTakerOrderV2Ix({
+  trader: otherTrader,
   market: client.market(baseMint, quoteMint).address,
-  nowMs: BigInt(Date.now()),
+  side: 'long',
+  sizeLots: 10n,
+  limitTicks: 99_950n,
 });
 ```
 

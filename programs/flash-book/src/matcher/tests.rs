@@ -1,8 +1,6 @@
 //! Pure-Rust unit tests for the matcher core. Mirror the TypeScript test
 //! suite in `tests/matcher.test.ts` etc.
 
-use super::commit_reveal::{redeem_reveal, register_commit, sweep_expired, RevealPayload};
-use super::fba::{clear_batch, Fill};
 use super::flp_quoter::{generate_quotes, FlpQuoterInputs, FlpQuoterParams};
 use super::funding::advance;
 use super::insurance::InsuranceFund;
@@ -15,111 +13,7 @@ use super::risk::{
     assess_margin, default_scenarios, MarketSnapshot, PositionSnapshot,
 };
 use super::vpin::VpinState;
-use crate::state::CommitRow;
 use anchor_lang::prelude::Pubkey;
-
-fn ord(
-    id: u64,
-    side: Side,
-    size: u64,
-    price: u64,
-    ot: OrderType,
-    trader_seed: u8,
-    seq: u64,
-) -> Order {
-    Order {
-        id,
-        trader: Pubkey::new_from_array([trader_seed; 32]),
-        side,
-        order_type: ot,
-        size: BaseLots(size),
-        limit_price: Ticks(price),
-        seq,
-        post_only: false,
-        stp_mode: crate::matcher::order::StpMode::CancelNewest,
-    }
-}
-
-#[test]
-fn fba_empty_returns_no_fills() {
-    let r = clear_batch(&[], Ticks(100)).unwrap();
-    assert_eq!(r.clearing_volume, BaseLots::ZERO);
-    assert!(r.fills.is_empty());
-}
-
-#[test]
-fn fba_non_crossing_no_fills() {
-    let orders = vec![
-        ord(1, Side::Long, 1, 99, OrderType::Limit, 1, 0),
-        ord(2, Side::Short, 1, 101, OrderType::Limit, 2, 1),
-    ];
-    let r = clear_batch(&orders, Ticks(100)).unwrap();
-    assert_eq!(r.clearing_volume, BaseLots::ZERO);
-}
-
-#[test]
-fn fba_crossing_uniform_price() {
-    let orders = vec![
-        ord(1, Side::Long, 1, 101, OrderType::Limit, 1, 0),
-        ord(2, Side::Short, 1, 99, OrderType::Limit, 2, 1),
-    ];
-    let r = clear_batch(&orders, Ticks(100)).unwrap();
-    assert_eq!(r.clearing_volume, BaseLots(1));
-    assert_eq!(r.fills.len(), 1);
-    assert!(r.fills[0].price.0 >= 99 && r.fills[0].price.0 <= 101);
-}
-
-#[test]
-fn fba_liquidation_priority() {
-    let orders = vec![
-        ord(1, Side::Long, 1, 105, OrderType::Taker, 1, 0),
-        ord(2, Side::Long, 1, 105, OrderType::Liquidation, 2, 1),
-        ord(3, Side::Short, 1, 95, OrderType::Limit, 3, 2),
-    ];
-    let r = clear_batch(&orders, Ticks(100)).unwrap();
-    assert_eq!(r.clearing_volume, BaseLots(1));
-    // Liquidation should fill first.
-    let liq_trader = Pubkey::new_from_array([2; 32]);
-    assert_eq!(r.fills[0].taker_trader, liq_trader);
-}
-
-#[test]
-fn fba_fifo_within_priority() {
-    let orders = vec![
-        ord(1, Side::Long, 1, 105, OrderType::Taker, 1, 100),
-        ord(2, Side::Long, 1, 105, OrderType::Taker, 2, 50),
-        ord(3, Side::Short, 1, 95, OrderType::Limit, 3, 1),
-    ];
-    let r = clear_batch(&orders, Ticks(100)).unwrap();
-    let earlier = Pubkey::new_from_array([2; 32]);
-    assert_eq!(r.fills[0].taker_trader, earlier);
-}
-
-#[test]
-fn fba_self_trade_prevention() {
-    // Same trader on both sides — no fill.
-    let orders = vec![
-        ord(1, Side::Long, 1, 105, OrderType::Limit, 7, 0),
-        ord(2, Side::Short, 1, 95, OrderType::Limit, 7, 1),
-    ];
-    let r = clear_batch(&orders, Ticks(100)).unwrap();
-    assert_eq!(r.fills.len(), 0);
-}
-
-#[test]
-fn fba_mev_neutral_within_batch() {
-    // Same orders in different submission order → identical clearing.
-    let a = vec![
-        ord(1, Side::Long, 2, 102, OrderType::Limit, 1, 10),
-        ord(2, Side::Short, 2, 98, OrderType::Limit, 2, 20),
-        ord(3, Side::Long, 1, 101, OrderType::Limit, 3, 30),
-    ];
-    let b = vec![a[2], a[0], a[1]];
-    let ra = clear_batch(&a, Ticks(100)).unwrap();
-    let rb = clear_batch(&b, Ticks(100)).unwrap();
-    assert_eq!(ra.clearing_price, rb.clearing_price);
-    assert_eq!(ra.clearing_volume, rb.clearing_volume);
-}
 
 #[test]
 fn flp_quoter_emits_balanced_ladder_when_flat() {
@@ -409,81 +303,17 @@ fn insurance_pause_threshold_gates_new_positions() {
     assert!(f.new_positions_allowed());
 }
 
-// ─── commit-reveal ──────────────────────────────────────────────────
-
-fn empty_commits() -> Vec<CommitRow> {
-    vec![CommitRow::default(); 8]
-}
-
-fn payload_for(trader: Pubkey, side: Side, size: u64, limit: u64) -> RevealPayload {
-    RevealPayload {
-        trader,
-        side,
-        size: BaseLots(size),
-        limit: Ticks(limit),
-        nonce: [7u8; 32],
-    }
-}
-
-#[test]
-fn commit_reveal_roundtrip() {
-    let mut commits = empty_commits();
-    let trader = Pubkey::new_from_array([42; 32]);
-    let p = payload_for(trader, Side::Long, 1, 100);
-    let h = p.hash();
-    register_commit(&mut commits, h, trader, 1000, 1, 5).unwrap();
-
-    let order = redeem_reveal(&mut commits, &p, 2, 999).unwrap();
-    assert_eq!(order.trader, trader);
-    assert_eq!(order.side, Side::Long);
-    assert_eq!(order.size, BaseLots(1));
-    assert_eq!(order.order_type, OrderType::Taker);
-}
-
-#[test]
-fn commit_reveal_mismatch_rejected() {
-    let mut commits = empty_commits();
-    let trader = Pubkey::new_from_array([42; 32]);
-    let p = payload_for(trader, Side::Long, 1, 100);
-    register_commit(&mut commits, p.hash(), trader, 1000, 1, 5).unwrap();
-
-    // Tamper.
-    let p_tampered = payload_for(trader, Side::Long, 2, 100);
-    let r = redeem_reveal(&mut commits, &p_tampered, 2, 999);
-    assert!(r.is_err());
-}
-
-#[test]
-fn commit_reveal_expired_rejected_and_swept() {
-    let mut commits = empty_commits();
-    let trader = Pubkey::new_from_array([42; 32]);
-    let p = payload_for(trader, Side::Long, 1, 100);
-    register_commit(&mut commits, p.hash(), trader, 1000, 1, 2).unwrap();
-
-    let r = redeem_reveal(&mut commits, &p, 10, 999);
-    assert!(r.is_err());
-
-    let seized = sweep_expired(&mut commits, 10);
-    assert_eq!(seized, 1000);
-}
-
-#[test]
-fn commit_duplicate_rejected() {
-    let mut commits = empty_commits();
-    let trader = Pubkey::new_from_array([42; 32]);
-    let p = payload_for(trader, Side::Long, 1, 100);
-    let h = p.hash();
-    register_commit(&mut commits, h, trader, 1000, 1, 5).unwrap();
-    let r = register_commit(&mut commits, h, trader, 1000, 1, 5);
-    assert!(r.is_err());
-}
-
-const _: Fill = Fill {
-    taker_id: 0,
-    maker_id: 0,
-    taker_trader: Pubkey::new_from_array([0; 32]),
-    maker_trader: Pubkey::new_from_array([0; 32]),
-    taker_side: Side::Long,
+// Order data structure marker — preserved so refactors that touch
+// the matcher's Order/Side/OrderType types are surfaced via this module's
+// test compile.
+const _: Order = Order {
+    id: 0,
+    trader: Pubkey::new_from_array([0; 32]),
+    side: Side::Long,
+    order_type: OrderType::Limit,
     size: BaseLots(0),
-    price: Ticks(0),
+    limit_price: Ticks(0),
+    seq: 0,
+    post_only: false,
+    stp_mode: crate::matcher::order::StpMode::CancelNewest,
 };

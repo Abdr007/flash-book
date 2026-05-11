@@ -1,13 +1,13 @@
-//! Flash Book — pool-backed CLOB matched by FBA on MagicBlock ER.
+//! Flash Book — pool-backed CLOB on MagicBlock ER.
 //!
 //! Anchor program. The matcher core is in [`matcher`] (pure-Rust integer
 //! arithmetic with checked overflow). This file is the on-chain shell:
 //! account validation, PDA seeds, signer checks, and matcher invocation.
 //!
 //! Phase 1 status: matcher core ✅, account types ✅, instruction handlers ✅
-//! (this file). Pending: ER delegation CPIs (blocked on upstream SDK), full
-//! Position account update during run_batch (currently emits fills as event,
-//! position state moved by separate `apply_fill` instruction).
+//! (this file). Pending: ER delegation CPIs (blocked on upstream SDK).
+//! Position state is moved by the `apply_fill` instruction in response to
+//! taker fills emitted by `place_taker_order_v2`.
 
 #![allow(unexpected_cfgs)]
 
@@ -29,19 +29,15 @@ use constants::{
     FLP_SEQ_RESERVED_OFFSET, MARK_HISTORY_LEN, MAX_BASKET_LEGS_N,
     MAX_ORDERS_PER_TRADER_PER_BATCH,
 };
-use matcher::commit_reveal::{
-    register_commit, redeem_reveal, sweep_expired, RevealPayload,
-};
-use matcher::flp_quoter::{generate_quotes, FlpQuoterInputs, FlpQuoterParams};
 use matcher::funding::funding_owed;
-use matcher::lot::{BaseLots, Ticks};
+use matcher::lot::Ticks;
 use matcher::order::Side;
 use matcher::risk::{
     assess_margin as assess_margin_fn, default_scenarios as default_scenarios_fn,
     MarketSnapshot as RiskMarketSnap, PositionSnapshot as RiskPosSnap,
 };
 use state::{
-    CommitBufferAccount, FlpExposureAccount, InsuranceFundAccount, LeverageTier,
+    FlpExposureAccount, InsuranceFundAccount, LeverageTier,
     MarketAccount, MarketLeverageTiersAccount, MarketParams, TraderStateAccount,
     MAX_LEVERAGE_TIERS,
 };
@@ -64,21 +60,6 @@ pub mod flash_book {
         initial_oracle_ticks: u64,
     ) -> Result<()> {
         initialize_market_inner(ctx, params, initial_oracle_ticks, false)
-    }
-
-    /// Initialize the commit_buffer for an existing market. MUST be
-    /// called after `initialize_market`. See `initialize_order_buffer`
-    /// docstring for the split rationale.
-    pub fn initialize_commit_buffer(
-        ctx: Context<InitializeCommitBuffer>,
-    ) -> Result<()> {
-        let market_key = ctx.accounts.market.key();
-        let commit_buf = &mut ctx.accounts.commit_buffer;
-        commit_buf.market = market_key;
-        commit_buf.bump = ctx.bumps.commit_buffer;
-        commit_buf.head = 0;
-        commit_buf.commits = [state::CommitRow::default(); state::COMMIT_BUFFER_CAP];
-        Ok(())
     }
 
     /// Initialize the v2 hypertree-backed orderbook for a market.
@@ -1060,453 +1041,6 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// V2 matcher tick: run an FBA Walrasian clearing over the resting
-    /// hypertree book, plus the full v1 bookkeeping suite, plus three
-    /// improvements over Hyperliquid / Manifest / Phoenix:
-    ///
-    ///   1. **Vol-adaptive oracle band** — the `oracle_band_bps` cap on
-    ///      the new mark widens proportionally with realized volatility,
-    ///      so legitimate vol moves aren't clamped (HL uses fixed pct →
-    ///      over-clamps during real moves; Phoenix has no band).
-    ///   2. **VPIN-gated FLP pause** — when toxicity (VPIN) exceeds
-    ///      `FLP_VPIN_PAUSE_THRESHOLD_BPS`, FLP virtual quotes are
-    ///      skipped this batch. Manifest has no LP, Phoenix has no auto-
-    ///      pause, HL has no LP-protection signal — this protects LP
-    ///      capital from toxic flow at the matcher level (not just at
-    ///      the per-fill toxicity-tax level).
-    ///   3. **EMA-blended funding rate** — the per-batch dampened rate is
-    ///      blended 50/50 with the prior `last_funding_rate_bps_per_sec`
-    ///      via EMA, smoothing the funding curve (HL recomputes from
-    ///      scratch each block — high microstructure noise).
-    ///
-    /// Off-chain settlement is identical to v1 — fills emit
-    /// `FillAppliedEvent`-shaped `BatchClearedEvent`, the sequencer
-    /// dispatches per-fill `apply_fill` / `apply_flp_fill` ixs.
-    pub fn run_batch_v2(ctx: Context<RunBatchV2>, now_ms: u64) -> Result<()> {
-        let market_key = ctx.accounts.market.key();
-
-        // ─── Phase 0: walk the hypertree to harvest live orders ──────────
-        let now_slot = Clock::get()?.slot;
-        let max_per_side = MAX_BATCH_ORDERS_PER_SIDE_V2;
-        // Note: do NOT use `Vec::with_capacity(2 * max_per_side)` here.
-        // BPF heap is 32KB by default — 2 × 256 entries × ~80 bytes
-        // would alloc 40KB upfront and OOM the matcher on small books.
-        // Vec::new() defers allocation until push(); typical books
-        // have far fewer than `max_per_side` orders so the actual
-        // alloc stays well under the heap limit.
-        let mut orders: Vec<matcher::order::Order> = Vec::new();
-        let mut sources: Vec<(u64, hypertree::DataIndex, bool)> = Vec::new();
-        {
-            let book_data = ctx.accounts.market_book.try_borrow_data()?;
-            let mut book_data_owned = book_data.to_vec();
-            let handle =
-                state_v2::MarketBookHandle::from_account_data(&mut book_data_owned)?;
-            require!(
-                handle.header.market_pubkey == market_key,
-                FlashBookError::WrongMarket
-            );
-            handle.for_each_bid_best_first(|idx, o| {
-                if orders.len() >= max_per_side
-                    || (o.expires_at_slot > 0 && now_slot > o.expires_at_slot)
-                {
-                    return orders.len() < max_per_side;
-                }
-                orders.push(matcher::order::Order {
-                    id: o.order_id,
-                    trader: o.trader,
-                    side: matcher::order::Side::Long,
-                    order_type: order_type_byte_to_matcher(o.order_type),
-                    size: matcher::lot::BaseLots(o.size_lots),
-                    limit_price: matcher::lot::Ticks(o.price_ticks),
-                    seq: o.seq,
-                    post_only: (o.flags & 0b0000_0001) != 0,
-                    stp_mode: matcher::order::StpMode::from_u8((o.flags >> 4) & 0b11),
-                });
-                sources.push((o.order_id, idx, true));
-                true
-            });
-            let bids_loaded = orders.len();
-            handle.for_each_ask_best_first(|idx, o| {
-                if (orders.len() - bids_loaded) >= max_per_side
-                    || (o.expires_at_slot > 0 && now_slot > o.expires_at_slot)
-                {
-                    return (orders.len() - bids_loaded) < max_per_side;
-                }
-                orders.push(matcher::order::Order {
-                    id: o.order_id,
-                    trader: o.trader,
-                    side: matcher::order::Side::Short,
-                    order_type: order_type_byte_to_matcher(o.order_type),
-                    size: matcher::lot::BaseLots(o.size_lots),
-                    limit_price: matcher::lot::Ticks(o.price_ticks),
-                    seq: o.seq,
-                    post_only: (o.flags & 0b0000_0001) != 0,
-                    stp_mode: matcher::order::StpMode::from_u8((o.flags >> 4) & 0b11),
-                });
-                sources.push((o.order_id, idx, false));
-                true
-            });
-        }
-
-        let market = &mut ctx.accounts.market;
-        let commit_buffer = &mut ctx.accounts.commit_buffer;
-        let flp = &ctx.accounts.flp_exposure;
-
-        // ─── Phase 1: advance funding (parity-port from v1 run_batch) ────
-        let block_delta_ms = if market.last_batch_ms == 0 {
-            0
-        } else {
-            now_ms.saturating_sub(market.last_batch_ms)
-        };
-        let mark_for_funding = if market.params.funding_premium_twap_window > 0 {
-            let win = (market.params.funding_premium_twap_window as usize)
-                .min(MARK_HISTORY_LEN)
-                .min(market.recent_clearing_count as usize);
-            if win == 0 {
-                matcher::lot::Ticks(market.mark_price_ticks)
-            } else {
-                let mut sum: u128 = 0;
-                let len = MARK_HISTORY_LEN;
-                let newest_idx = if market.current_batch == 0 {
-                    0
-                } else {
-                    (market.current_batch as usize - 1) % len
-                };
-                for k in 0..win {
-                    let idx = (newest_idx + len - k) % len;
-                    sum = sum.saturating_add(market.recent_clearing_prices[idx] as u128);
-                }
-                let avg = (sum / win as u128).min(u64::MAX as u128) as u64;
-                if avg == 0 {
-                    matcher::lot::Ticks(market.mark_price_ticks)
-                } else {
-                    matcher::lot::Ticks(avg)
-                }
-            }
-        } else {
-            matcher::lot::Ticks(market.mark_price_ticks)
-        };
-        let (raw_new_index, ftick) = matcher::funding::advance(
-            market.cum_funding_index,
-            mark_for_funding,
-            matcher::lot::Ticks(market.oracle_price_ticks),
-            block_delta_ms,
-            market.params.funding_rate_k_bps,
-            market.params.funding_rate_max_bps_per_sec,
-        )?;
-
-        // OI dampener (parity-port).
-        let (new_index, dampened_rate) = if market.params.funding_oi_dampening {
-            let total = (market.oi_long_lots as u128)
-                .saturating_add(market.oi_short_lots as u128);
-            let skew_bps: u128 = if total == 0 {
-                0
-            } else {
-                let imbalance = if market.oi_long_lots >= market.oi_short_lots {
-                    (market.oi_long_lots - market.oi_short_lots) as u128
-                } else {
-                    (market.oi_short_lots - market.oi_long_lots) as u128
-                };
-                ((imbalance.saturating_mul(constants::BPS_DENOM as u128)) / total)
-                    .min(constants::BPS_DENOM as u128)
-            };
-            let index_delta = raw_new_index.saturating_sub(market.cum_funding_index);
-            let scaled_delta = ((index_delta as i128).saturating_mul(skew_bps as i128))
-                / (constants::BPS_DENOM as i128);
-            let scaled_index = market.cum_funding_index.saturating_add(scaled_delta);
-            let scaled_rate = ((ftick.rate_bps_per_sec as i128)
-                .saturating_mul(skew_bps as i128))
-                / (constants::BPS_DENOM as i128);
-            (scaled_index, clamp_i128_to_i64(scaled_rate))
-        } else {
-            (raw_new_index, ftick.rate_bps_per_sec)
-        };
-        market.cum_funding_index = new_index;
-
-        // SMARTER-THAN-HL #1: EMA-blend the dampened rate with the prior
-        // posted rate. See `matcher::v2_bookkeeping::ema_blend_funding_rate`
-        // for the why + math + edge cases.
-        let blended_rate = matcher::v2_bookkeeping::ema_blend_funding_rate(
-            market.last_funding_rate_bps_per_sec,
-            dampened_rate,
-            market.current_batch == 0,
-        );
-        market.last_funding_rate_bps_per_sec = blended_rate;
-
-        // Per-period funding cap (parity-port).
-        if market.params.funding_per_period_max_bps > 0
-            && market.params.funding_period_seconds > 0
-        {
-            let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
-            if market.period_started_at_unix == 0
-                || now_unix.saturating_sub(market.period_started_at_unix)
-                    >= market.params.funding_period_seconds as u64
-            {
-                market.period_started_at_unix = now_unix;
-                market.period_funding_paid_abs_bps = 0;
-            }
-            let raw_delta = new_index.saturating_sub(market.cum_funding_index);
-            let abs_delta = raw_delta.unsigned_abs();
-            let abs_bps_u128 = abs_delta
-                .saturating_mul(constants::BPS_DENOM as u128)
-                >> constants::FUNDING_INDEX_FRACTIONAL_BITS;
-            let abs_bps = if abs_bps_u128 > u64::MAX as u128 {
-                u64::MAX
-            } else {
-                abs_bps_u128 as u64
-            };
-            let cap = market.params.funding_per_period_max_bps as u64;
-            let prior = market.period_funding_paid_abs_bps;
-            let projected = prior.saturating_add(abs_bps);
-            if projected > cap {
-                let allowed = cap.saturating_sub(prior) as u128;
-                let scale_den = abs_bps as u128;
-                if scale_den != 0 {
-                    let scaled_delta =
-                        (raw_delta as i128).saturating_mul(allowed as i128) / scale_den as i128;
-                    market.cum_funding_index =
-                        market.cum_funding_index.saturating_add(scaled_delta);
-                    market.period_funding_paid_abs_bps = cap;
-                    let rate_scale = ((blended_rate as i128).saturating_mul(allowed as i128))
-                        / scale_den.max(1) as i128;
-                    market.last_funding_rate_bps_per_sec = clamp_i128_to_i64(rate_scale);
-                    emit!(FundingPeriodCapHitEvent {
-                        market: market_key,
-                        period_started_at_unix: market.period_started_at_unix,
-                        cap_bps: cap,
-                        attenuated_rate_bps_per_sec: market.last_funding_rate_bps_per_sec,
-                    });
-                }
-            } else {
-                market.period_funding_paid_abs_bps = projected;
-            }
-        }
-
-        // ─── Phase 2: SMARTER-THAN-MANIFEST #2 — VPIN-gated FLP ──────────
-        // Skip FLP virtual quoting when current toxicity (VPIN) exceeds
-        // the pause threshold. Protects LP capital from informed flow.
-        let realized_vol_bps = realized_vol_bps_from_window(
-            &market.recent_clearing_prices,
-            market.recent_clearing_count,
-        );
-        let vpin_bps_now = market.vpin.as_bps();
-        let flp_paused = vpin_bps_now >= FLP_VPIN_PAUSE_THRESHOLD_BPS;
-
-        if !flp_paused {
-            let flp_pool_capital = flp.total_capital_quote_lots;
-            let flp_net_signed: i64 = {
-                let entry = flp
-                    .per_market
-                    .iter()
-                    .find(|e| e.market == market_key && e.side != 255);
-                match entry {
-                    Some(e) => {
-                        let notional_u128 = (e.size_lots as u128)
-                            .saturating_mul(e.entry_price_ticks as u128)
-                            .saturating_mul(market.params.tick_size as u128);
-                        let notional = notional_u128.min(i64::MAX as u128) as i64;
-                        if e.side == 0 { notional } else { -notional }
-                    }
-                    None => 0,
-                }
-            };
-            let utilization_bps = if flp_pool_capital > 0 {
-                let oi_total =
-                    market.oi_long_lots.saturating_add(market.oi_short_lots) as u128;
-                let notional = oi_total
-                    .saturating_mul(market.mark_price_ticks as u128)
-                    .saturating_mul(market.params.tick_size as u128);
-                ((notional / (flp_pool_capital as u128)).min(constants::BPS_DENOM as u128))
-                    as u32
-            } else {
-                0
-            };
-            let flp_params = FlpQuoterParams {
-                base_spread_bps: market.params.flp_spread_base_bps,
-                alpha_bps: market.params.flp_spread_alpha_bps,
-                beta_bps: market.params.flp_spread_beta_bps,
-                gamma_bps: market.params.flp_spread_gamma_bps,
-                kappa_bps: market.params.flp_spread_kappa_bps,
-                delta_bps: market.params.flp_spread_delta_bps,
-                inventory_lambda_bps: market.params.flp_inventory_lambda_bps,
-                depth_floor_lots: market.params.flp_depth_floor_lots,
-                max_growth_per_batch_bps: market.params.flp_max_growth_per_batch_bps,
-                levels: market.params.flp_quote_levels,
-                tick_size: market.params.tick_size,
-            };
-            let flp_inputs = FlpQuoterInputs {
-                oracle_ticks: matcher::lot::Ticks(market.oracle_price_ticks),
-                vpin_bps: vpin_bps_now,
-                realized_vol_bps,
-                pool_capital_quote_lots: flp_pool_capital,
-                pool_net_quote_lots_signed: flp_net_signed,
-                pool_gross_utilization_bps: utilization_bps,
-                oi_long_lots: market.oi_long_lots,
-                oi_short_lots: market.oi_short_lots,
-            };
-            let flp_trader = flp.key();
-            let flp_seq_base =
-                FLP_SEQ_RESERVED_OFFSET.saturating_add(market.current_batch.saturating_mul(1024));
-            let (_flp_out, flp_orders) =
-                generate_quotes(flp_params, flp_inputs, flp_trader, flp_seq_base)?;
-            for o in flp_orders {
-                orders.push(o);
-            }
-        }
-
-        // ─── Phase 3: FBA Walrasian clearing ─────────────────────────────
-        let prior_mark = matcher::lot::Ticks(market.mark_price_ticks);
-        let result = matcher::fba::clear_batch(&orders, prior_mark)?;
-
-        // ─── Sequencer feed — emit one event per fill so the off-chain
-        //    sequencer can dispatch the matching `apply_fill` /
-        //    `apply_flp_fill` ix on mainnet. The matcher itself only
-        //    mutates orderbook state; trader/position state lives in
-        //    core PDAs that the sequencer settles. Events are how we
-        //    bridge the matcher tick (potentially on the ER) to the
-        //    settlement ix (always on mainnet).
-        for fill in &result.fills {
-            emit!(BatchFillIntentEvent {
-                market: market_key,
-                taker: fill.taker_trader,
-                maker: fill.maker_trader,
-                taker_side: match fill.taker_side {
-                    matcher::order::Side::Long => 0,
-                    matcher::order::Side::Short => 1,
-                },
-                size_lots: fill.size.0,
-                price_ticks: fill.price.0,
-                taker_id: fill.taker_id,
-                maker_id: fill.maker_id,
-            });
-        }
-
-        // ─── Phase 4: apply fills back to the hypertree ──────────────────
-        let mut consumed: Vec<(u64, hypertree::DataIndex, bool, u64)> =
-            Vec::with_capacity(sources.len());
-        for fill in &result.fills {
-            for id in [fill.maker_id, fill.taker_id] {
-                let found = sources.iter().find(|(oid, _, _)| *oid == id);
-                let Some((src_id, src_idx, src_is_bid)) = found else {
-                    continue;
-                };
-                if let Some(slot) = consumed
-                    .iter_mut()
-                    .find(|(cid, _, _, _)| *cid == *src_id)
-                {
-                    slot.3 = slot.3.saturating_add(fill.size.0);
-                } else {
-                    consumed.push((*src_id, *src_idx, *src_is_bid, fill.size.0));
-                }
-            }
-        }
-        if !consumed.is_empty() {
-            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
-            let mut handle =
-                state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
-            for (_, idx, side_is_bid, total_filled) in &consumed {
-                let new_size = handle.decrement_size_at(*idx, *total_filled);
-                if new_size == 0 {
-                    if *side_is_bid {
-                        handle.remove_bid_node(*idx);
-                    } else {
-                        handle.remove_ask_node(*idx);
-                    }
-                }
-            }
-        }
-
-        // ─── Phase 5: update mark price (TWAP + VOL-ADAPTIVE band + clamp)
-        if result.clearing_volume.0 > 0 {
-            let len = MARK_HISTORY_LEN;
-            let idx = (market.current_batch as usize) % len;
-            market.recent_clearing_prices[idx] = result.clearing_price.0;
-            if (market.recent_clearing_count as usize) < len {
-                market.recent_clearing_count =
-                    market.recent_clearing_count.saturating_add(1);
-            }
-            let count = market.recent_clearing_count as usize;
-            let sum: u128 = market
-                .recent_clearing_prices
-                .iter()
-                .take(count)
-                .fold(0u128, |acc, p| acc.saturating_add(*p as u128));
-            let twap = sum
-                .checked_div(count as u128)
-                .unwrap_or(result.clearing_price.0 as u128) as u64;
-
-            // SMARTER-THAN-HL #3: vol-adaptive oracle band. See
-            // `matcher::v2_bookkeeping::vol_adaptive_band_bps` for the
-            // multiplier curve, the 4× cap rationale, and unit tests.
-            let adaptive_band_bps = matcher::v2_bookkeeping::vol_adaptive_band_bps(
-                market.params.oracle_band_bps,
-                realized_vol_bps,
-            ) as u128;
-            let band = (market.oracle_price_ticks as u128)
-                .saturating_mul(adaptive_band_bps)
-                / constants::BPS_DENOM as u128;
-            let lo = (market.oracle_price_ticks as u128).saturating_sub(band) as u64;
-            let hi = (market.oracle_price_ticks as u128)
-                .saturating_add(band)
-                .min(u64::MAX as u128) as u64;
-            let banded = twap.max(lo).min(hi);
-
-            // Mark-change sanity cap (parity-port).
-            let prior = market.mark_price_ticks as u128;
-            let cap_bps = market.params.mark_change_max_bps as u128;
-            let new_mark = if cap_bps > 0 && prior > 0 {
-                let cap_delta = prior.saturating_mul(cap_bps) / constants::BPS_DENOM as u128;
-                let cap_lo = prior.saturating_sub(cap_delta) as u64;
-                let cap_hi = prior
-                    .saturating_add(cap_delta)
-                    .min(u64::MAX as u128) as u64;
-                let clamped = banded.max(cap_lo).min(cap_hi);
-                if clamped != banded {
-                    emit!(MarkChangeClampedEvent {
-                        market: market_key,
-                        batch_num: market.current_batch,
-                        unclamped_mark_ticks: banded,
-                        clamped_mark_ticks: clamped,
-                        prior_mark_ticks: prior as u64,
-                    });
-                }
-                clamped
-            } else {
-                banded
-            };
-            market.mark_price_ticks = new_mark;
-        }
-
-        // ─── Phase 6: update VPIN (parity-port) ──────────────────────────
-        let vpin_bucket = market.params.vpin_bucket_size_lots;
-        let vpin_window = market.params.vpin_ema_window;
-        for fill in &result.fills {
-            market
-                .vpin
-                .record_fill(fill.taker_side, fill.size.0, vpin_bucket, vpin_window)?;
-        }
-
-        // ─── Phase 7: sweep expired commit-bonds (parity-port) ───────────
-        let seized = sweep_expired(&mut commit_buffer.commits, market.current_batch);
-
-        // ─── Phase 8: bookkeeping + event ────────────────────────────────
-        market.current_batch = market
-            .current_batch
-            .checked_add(1)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        market.last_batch_ms = now_ms;
-
-        emit!(BatchClearedEvent {
-            market: market_key,
-            batch_num: market.current_batch,
-            clearing_price: result.clearing_price.0,
-            clearing_volume: result.clearing_volume.0,
-            fill_count: result.fills.len() as u32,
-            funding_rate_bps_per_sec: market.last_funding_rate_bps_per_sec,
-            seized_bonds: seized,
-        });
-        Ok(())
-    }
 
     /// Initialize the FLP exposure account (one per protocol). Must run
     /// before `initialize_market`. Mints `initial_capital_quote_lots` shares
@@ -4737,119 +4271,6 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Submit a commit hash for a future taker reveal.
-    pub fn submit_commit(
-        ctx: Context<SubmitCommit>,
-        hash: [u8; 32],
-        bond: u64,
-    ) -> Result<()> {
-        let market = &ctx.accounts.market;
-        let commit_buffer = &mut ctx.accounts.commit_buffer;
-        register_commit(
-            &mut commit_buffer.commits,
-            hash,
-            ctx.accounts.trader.key(),
-            bond,
-            market.current_batch,
-            5, // expire after 5 batches
-        )
-    }
-
-    /// V2 reveal: redeem a previously-submitted commit and inject the
-    /// revealed taker order into the hypertree-backed book. Same
-    /// commit-reveal cryptography as v1 (`redeem_reveal` validates the
-    /// hash + bond against the commit_buffer); only the inject target
-    /// differs (hypertree, not v1 buffer).
-    ///
-    /// The revealed order is inserted with order_type byte = 1 (Taker)
-    /// so the matcher's FIFO mapping promotes it AHEAD of resting limits
-    /// at the same price tier — same priority semantics as v1.
-    pub fn submit_reveal_v2(
-        ctx: Context<SubmitRevealV2>,
-        side: u8,
-        size_lots: u64,
-        limit_ticks: u64,
-        nonce: [u8; 32],
-    ) -> Result<()> {
-        require!(side <= 1, FlashBookError::OutOfRange);
-        require!(size_lots > 0, FlashBookError::ZeroSize);
-        require!(limit_ticks > 0, FlashBookError::ZeroPrice);
-
-        let payload = RevealPayload {
-            trader: ctx.accounts.trader.key(),
-            side: if side == 0 { Side::Long } else { Side::Short },
-            size: BaseLots(size_lots),
-            limit: Ticks(limit_ticks),
-            nonce,
-        };
-
-        let market_key = ctx.accounts.market.key();
-        let current_batch = ctx.accounts.market.current_batch;
-        let commit_buffer = &mut ctx.accounts.commit_buffer;
-        let trader_pk = ctx.accounts.trader.key();
-        let now_slot = Clock::get()?.slot;
-
-        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
-        let mut handle =
-            state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
-        require!(
-            handle.header.market_pubkey == market_key,
-            FlashBookError::WrongMarket
-        );
-
-        // Bump seq + redeem the reveal (validates the hash + clears the commit).
-        let next_seq = handle
-            .header
-            .order_seq_counter
-            .checked_add(1)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        require!(
-            next_seq < FLP_SEQ_RESERVED_OFFSET,
-            FlashBookError::OutOfRange
-        );
-        let _matcher_order = redeem_reveal(
-            &mut commit_buffer.commits,
-            &payload,
-            current_batch,
-            next_seq,
-        )?;
-        handle.header.order_seq_counter = next_seq;
-
-        // Build + insert the resting order. order_type = 1 (Taker) so
-        // the matcher's mapping (`order_type_byte_to_matcher`) promotes
-        // it to OrderType::Taker FIFO priority.
-        let side_is_bid = side == 0;
-        let order = state_v2::RestingOrderV2 {
-            order_id: state_v2::encode_order_id(limit_ticks, next_seq, side_is_bid),
-            seq: next_seq,
-            price_ticks: limit_ticks,
-            size_lots,
-            expires_at_slot: 0,
-            trader: trader_pk,
-            last_valid_slot: now_slot as u32,
-            side,
-            order_type: 1, // Taker
-            flags: 0,
-            _pad: 0,
-        };
-        let inserted_idx = if side_is_bid {
-            handle.insert_bid(order)?
-        } else {
-            handle.insert_ask(order)?
-        };
-
-        emit!(RevealAppliedV2Event {
-            market: market_key,
-            trader: trader_pk,
-            side,
-            size_lots,
-            limit_ticks,
-            order_seq: next_seq,
-            node_index: inserted_idx,
-        });
-        Ok(())
-    }
-
     /// Apply a fill in which the FLP pool is the *maker*. Mutates the
     /// `FlpExposureAccount.per_market` entry for this market while
     /// applying the opposite-side update to the taker's `PositionAccount`.
@@ -5919,101 +5340,13 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Delegate the commit_buffer PDA to the MagicBlock ER. Required for
-    /// run_batch_v2 on the ER to call sweep_expired() against the commit
-    /// buffer (which mutates expired bonds). Pair with delegate_market_book
-    /// + delegate_market — all three must be live for full ER tick.
-    pub fn delegate_commit_buffer(
-        ctx: Context<DelegateCommitBuffer>,
-        commit_frequency_ms: u32,
-        validator: Option<Pubkey>,
-    ) -> Result<()> {
-        let market_key = ctx.accounts.market.key();
-        let bump = ctx.accounts.commit_buffer.bump;
-
-        require_keys_eq!(
-            *ctx.accounts.commit_buffer.to_account_info().owner,
-            *ctx.program_id,
-            FlashBookError::Unauthorized
-        );
-
-        let seeds_for_args: Vec<Vec<u8>> = vec![
-            CommitBufferAccount::SEED.to_vec(),
-            market_key.as_ref().to_vec(),
-            vec![bump],
-        ];
-        let signer_seeds: &[&[u8]] = &[
-            CommitBufferAccount::SEED,
-            market_key.as_ref(),
-            &[bump],
-        ];
-
-        er::cpi_delegate(
-            er::DelegateAccounts {
-                payer: ctx.accounts.authority.to_account_info(),
-                delegated_account: ctx.accounts.commit_buffer.to_account_info(),
-                owner_program: ctx.accounts.owner_program.to_account_info(),
-                delegate_buffer: ctx.accounts.delegate_buffer.to_account_info(),
-                delegation_record: ctx.accounts.delegation_record.to_account_info(),
-                delegation_metadata: ctx.accounts.delegation_metadata.to_account_info(),
-                system_program: ctx.accounts.system_program.to_account_info(),
-                delegation_program: ctx.accounts.delegation_program.to_account_info(),
-            },
-            er::DelegateArgs {
-                commit_frequency_ms,
-                seeds: seeds_for_args,
-                validator,
-            },
-            signer_seeds,
-        )?;
-
-        emit!(CommitBufferDelegatedEvent {
-            market: market_key,
-            commit_buffer: ctx.accounts.commit_buffer.key(),
-            commit_frequency_ms,
-            validator: validator.unwrap_or_default(),
-        });
-        Ok(())
-    }
-
-    /// Undelegate the commit_buffer PDA from the ER back to mainnet.
-    pub fn undelegate_commit_buffer(
-        ctx: Context<UndelegateCommitBuffer>,
-    ) -> Result<()> {
-        let market_key = ctx.accounts.market.key();
-        let bump = ctx.accounts.commit_buffer.bump;
-        let signer_seeds: &[&[u8]] = &[
-            CommitBufferAccount::SEED,
-            market_key.as_ref(),
-            &[bump],
-        ];
-
-        er::cpi_undelegate(
-            er::UndelegateAccounts {
-                payer: ctx.accounts.authority.to_account_info(),
-                delegated_account: ctx.accounts.commit_buffer.to_account_info(),
-                owner_program: ctx.accounts.owner_program.to_account_info(),
-                buffer: ctx.accounts.delegate_buffer.to_account_info(),
-                system_program: ctx.accounts.system_program.to_account_info(),
-                delegation_program: ctx.accounts.delegation_program.to_account_info(),
-            },
-            signer_seeds,
-        )?;
-
-        emit!(CommitBufferUndelegatedEvent {
-            market: market_key,
-            commit_buffer: ctx.accounts.commit_buffer.key(),
-        });
-        Ok(())
-    }
 
     // ER delegation lifecycle ixs (delegate_market_book, undelegate_market_book,
-    // delegate_market, undelegate_market, delegate_commit_buffer,
-    // undelegate_commit_buffer) ship in waves 19b + 19g via in-house CPI
-    // wrappers in `src/er.rs`. flp_exposure is intentionally NOT
-    // ER-delegatable: it's a singleton, so delegating it would bottleneck
-    // ALL markets to a single ER instance. Per-market FLP exposure is
-    // queued for wave 21 (modular wrapper programs).
+    // delegate_market, undelegate_market) ship in waves 19b + 19g via
+    // in-house CPI wrappers in `src/er.rs`. flp_exposure is intentionally
+    // NOT ER-delegatable: it's a singleton, so delegating it would
+    // bottleneck ALL markets to a single ER instance. Per-market FLP
+    // exposure is queued for wave 21 (modular wrapper programs).
     //
     // Historical note: in-house CPI sidesteps the upstream
     // `ephemeral-rollups-sdk` Solana 2.x compat issue. When upstream lands
@@ -6197,12 +5530,6 @@ fn initialize_market_inner(
     market.period_funding_paid_abs_bps = 0;
     market.params = params;
 
-    let commit_buf = &mut ctx.accounts.commit_buffer;
-    commit_buf.market = market.key();
-    commit_buf.bump = ctx.bumps.commit_buffer;
-    commit_buf.head = 0;
-    commit_buf.commits = [state::CommitRow::default(); state::COMMIT_BUFFER_CAP];
-
     emit!(MarketInitializedEvent {
         market: market.key(),
         authority: market.authority,
@@ -6245,18 +5572,6 @@ pub struct InitializeMarket<'info> {
         bump,
     )]
     pub market: Box<Account<'info, MarketAccount>>,
-
-    /// commit_buffer init alongside the market; commit-reveal needs it.
-    /// (v1 also init'd order_buffer here; deleted in wave 19i since the
-    /// hypertree-backed market_book PDA is initialized via init_market_book.)
-    #[account(
-        init,
-        payer = authority,
-        space = CommitBufferAccount::space(),
-        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
 
     #[account(
         seeds = [InsuranceFundAccount::SEED],
@@ -6452,44 +5767,6 @@ pub struct CancelOrderV2<'info> {
 }
 
 #[derive(Accounts)]
-pub struct RunBatchV2<'info> {
-    pub sequencer: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-
-    /// CHECK: PDA at the market_book seed; disc validated inside handler.
-    /// Mut because the matcher mutates filled-order sizes + removes
-    /// fully-filled nodes back to the free-list.
-    #[account(
-        mut,
-        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub market_book: UncheckedAccount<'info>,
-
-    /// Mut so commit-buffer expired-bond sweep can clear stale entries.
-    #[account(
-        mut,
-        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
-        bump = commit_buffer.bump,
-    )]
-    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
-
-    /// Read-only — feeds FLP virtual quote generation. The pool's NAV
-    /// is mutated by `apply_flp_fill` (separate ix), not by run_batch.
-    #[account(
-        seeds = [FlpExposureAccount::SEED],
-        bump = flp_exposure.bump,
-    )]
-    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
-}
-
-#[derive(Accounts)]
 pub struct DelegateMarketBook<'info> {
     /// Pays for the delegation buffer + delegation record allocation.
     #[account(mut)]
@@ -6660,29 +5937,6 @@ pub struct InitMarketBook<'info> {
         bump,
     )]
     pub market_book: UncheckedAccount<'info>,
-
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct InitializeCommitBuffer<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    #[account(
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-
-    #[account(
-        init,
-        payer = authority,
-        space = CommitBufferAccount::space(),
-        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
 
     pub system_program: Program<'info, System>,
 }
@@ -7236,45 +6490,6 @@ pub struct ViewTraderEffectiveTier<'info> {
         bump = fee_tiers.bump,
     )]
     pub fee_tiers: Account<'info, state::FeeTiersAccount>,
-}
-
-#[derive(Accounts)]
-pub struct SubmitCommit<'info> {
-    pub trader: Signer<'info>,
-    #[account(
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-    #[account(
-        mut,
-        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
-        bump = commit_buffer.bump,
-    )]
-    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
-}
-
-#[derive(Accounts)]
-pub struct SubmitRevealV2<'info> {
-    pub trader: Signer<'info>,
-    #[account(
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-    #[account(
-        mut,
-        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
-        bump = commit_buffer.bump,
-    )]
-    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
-    /// CHECK: hypertree PDA; disc validated inside handler.
-    #[account(
-        mut,
-        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub market_book: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -7899,80 +7114,6 @@ pub struct LiquidatePortfolioV2<'info> {
 }
 
 #[derive(Accounts)]
-pub struct DelegateCommitBuffer<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    #[account(
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-
-    #[account(
-        mut,
-        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
-        bump = commit_buffer.bump,
-    )]
-    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
-
-    /// CHECK: this program's account info.
-    #[account(address = crate::ID)]
-    pub owner_program: UncheckedAccount<'info>,
-
-    /// CHECK: PDA under owner_program at [b"buffer", commit_buffer].
-    #[account(mut)]
-    pub delegate_buffer: UncheckedAccount<'info>,
-
-    /// CHECK: PDA under DELEGATION_PROGRAM_ID.
-    #[account(mut)]
-    pub delegation_record: UncheckedAccount<'info>,
-
-    /// CHECK: PDA under DELEGATION_PROGRAM_ID.
-    #[account(mut)]
-    pub delegation_metadata: UncheckedAccount<'info>,
-
-    pub system_program: Program<'info, System>,
-
-    /// CHECK: MagicBlock delegation program.
-    #[account(address = er::DELEGATION_PROGRAM_ID)]
-    pub delegation_program: UncheckedAccount<'info>,
-}
-
-#[derive(Accounts)]
-pub struct UndelegateCommitBuffer<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    #[account(
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-
-    #[account(
-        mut,
-        seeds = [CommitBufferAccount::SEED, market.key().as_ref()],
-        bump = commit_buffer.bump,
-    )]
-    pub commit_buffer: Box<Account<'info, CommitBufferAccount>>,
-
-    /// CHECK: this program's account info.
-    #[account(address = crate::ID)]
-    pub owner_program: UncheckedAccount<'info>,
-
-    /// CHECK: same buffer PDA from delegate.
-    #[account(mut)]
-    pub delegate_buffer: UncheckedAccount<'info>,
-
-    pub system_program: Program<'info, System>,
-
-    /// CHECK: MagicBlock delegation program.
-    #[account(address = er::DELEGATION_PROGRAM_ID)]
-    pub delegation_program: UncheckedAccount<'info>,
-}
-
-#[derive(Accounts)]
 pub struct LiquidatePositionV2<'info> {
     #[account(mut)]
     pub caller: Signer<'info>,
@@ -8228,20 +7369,6 @@ pub struct MarketBookDelegatedEvent {
 }
 
 #[event]
-pub struct CommitBufferDelegatedEvent {
-    pub market: Pubkey,
-    pub commit_buffer: Pubkey,
-    pub commit_frequency_ms: u32,
-    pub validator: Pubkey,
-}
-
-#[event]
-pub struct CommitBufferUndelegatedEvent {
-    pub market: Pubkey,
-    pub commit_buffer: Pubkey,
-}
-
-#[event]
 pub struct MarketBookUndelegatedEvent {
     pub market: Pubkey,
     pub market_book: Pubkey,
@@ -8455,17 +7582,6 @@ pub struct MarketInitializedEvent {
 }
 
 #[event]
-pub struct BatchClearedEvent {
-    pub market: Pubkey,
-    pub batch_num: u64,
-    pub clearing_price: u64,
-    pub clearing_volume: u64,
-    pub fill_count: u32,
-    pub funding_rate_bps_per_sec: i64,
-    pub seized_bonds: u64,
-}
-
-#[event]
 pub struct CollateralDepositedEvent {
     pub trader: Pubkey,
     pub amount: u64,
@@ -8666,17 +7782,6 @@ pub struct BasketOrderNPlacedV2Event {
     pub trader: Pubkey,
     pub leg_count: u8,
     pub markets: Vec<Pubkey>,
-}
-
-#[event]
-pub struct RevealAppliedV2Event {
-    pub market: Pubkey,
-    pub trader: Pubkey,
-    pub side: u8,
-    pub size_lots: u64,
-    pub limit_ticks: u64,
-    pub order_seq: u64,
-    pub node_index: u32,
 }
 
 #[event]

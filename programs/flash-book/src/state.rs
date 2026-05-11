@@ -715,39 +715,6 @@ impl LpPositionAccount {
     }
 }
 
-/// Commit-reveal entry. Stored as a row in a per-market commit table.
-#[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize, Default)]
-pub struct CommitRow {
-    pub hash: [u8; 32],
-    pub trader: Pubkey,
-    pub bond: u64,
-    pub committed_at_batch: u64,
-    pub expire_at_batch: u64,
-    pub valid: u8, // 0 = empty slot, 1 = active
-}
-
-/// Capacity of the per-market commit-reveal table. Reduced from 64 →
-/// 16 to keep the CommitBufferAccount struct under BPF's 4 KB stack
-/// frame on Anchor's deserialize. At CAP=16 the struct is ~1.5 KB.
-/// Commits expire after a few batches, so 16 in-flight is plenty.
-pub const COMMIT_BUFFER_CAP: usize = 16;
-
-#[account]
-#[derive(Debug)]
-pub struct CommitBufferAccount {
-    pub market: Pubkey,
-    pub bump: u8,
-    pub head: u32,
-    pub commits: [CommitRow; COMMIT_BUFFER_CAP],
-}
-
-impl CommitBufferAccount {
-    pub const SEED: &'static [u8] = b"commit_buffer";
-    pub fn space() -> usize {
-        8 + 32 + 1 + 4 + (COMMIT_BUFFER_CAP * (32 + 32 + 8 + 8 + 8 + 1))
-    }
-}
-
 /// Per-trader state. Holds collateral, last-settled funding marker, and
 /// position-list pointers (Position PDAs are separate accounts; this is
 /// a lightweight index).

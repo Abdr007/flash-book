@@ -29,9 +29,9 @@ describe('Error code classification', () => {
     expect(errorFamily(FlashBookErrorCode.InsuranceExhausted)).toBe('insurance');
   });
 
-  test('commit-reveal family', () => {
-    expect(errorFamily(FlashBookErrorCode.CommitMismatch)).toBe('commit_reveal');
-    expect(errorFamily(FlashBookErrorCode.CommitExpired)).toBe('commit_reveal');
+  test('CLOB taker error codes are in order_intake family', () => {
+    expect(errorFamily(FlashBookErrorCode.PostOnlyWouldCross)).toBe('order_intake');
+    expect(errorFamily(FlashBookErrorCode.FillOrKillNotFilled)).toBe('order_intake');
   });
 
   test('unknown code returns "unknown"', () => {

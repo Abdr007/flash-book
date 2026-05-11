@@ -395,10 +395,6 @@ async fn setup_market(
     // (v1 order_buffer PDA — no longer derived; markets use the v2 hypertree
     // PDA via state_v2::MARKET_BOOK_SEED.)
     let order_buffer = Pubkey::default();
-    let (commit_buffer, _) = pda(&[
-        flash_book::state::CommitBufferAccount::SEED,
-        market.as_ref(),
-    ]);
 
     let ix = build_ix(
         flash_book::instruction::InitializeMarket {
@@ -413,7 +409,6 @@ async fn setup_market(
             AccountMeta::new_readonly(quote_vault, false),
             AccountMeta::new_readonly(oracle_account, false),
             AccountMeta::new(market, false),
-            AccountMeta::new(commit_buffer, false),
             AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
@@ -458,10 +453,6 @@ async fn setup_additional_market(
     // (v1 order_buffer PDA — no longer derived; markets use the v2 hypertree
     // PDA via state_v2::MARKET_BOOK_SEED.)
     let order_buffer = Pubkey::default();
-    let (commit_buffer, _) = pda(&[
-        flash_book::state::CommitBufferAccount::SEED,
-        market.as_ref(),
-    ]);
 
     let ix = build_ix(
         flash_book::instruction::InitializeMarket {
@@ -476,7 +467,6 @@ async fn setup_additional_market(
             AccountMeta::new_readonly(quote_vault, false),
             AccountMeta::new_readonly(oracle_account, false),
             AccountMeta::new(market, false),
-            AccountMeta::new(commit_buffer, false),
             AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
@@ -2313,10 +2303,6 @@ async fn update_oracle_rejects_stale_price() {
         quote_mint.as_ref(),
     ]);
     let order_buf = Pubkey::default();
-    let (cb, _) = pda(&[
-        flash_book::state::CommitBufferAccount::SEED,
-        market_pda.as_ref(),
-    ]);
 
     let mut params = default_params();
     params.oracle_staleness_max_seconds = 60; // 1-min max age
@@ -2334,7 +2320,6 @@ async fn update_oracle_rejects_stale_price() {
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new(cb, false),
             AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
@@ -2394,10 +2379,6 @@ async fn update_oracle_rejects_wide_confidence() {
         quote_mint.as_ref(),
     ]);
     let order_buf = Pubkey::default();
-    let (cb, _) = pda(&[
-        flash_book::state::CommitBufferAccount::SEED,
-        market_pda.as_ref(),
-    ]);
 
     let mut params = default_params();
     params.oracle_confidence_max_bps = 100; // 1% max
@@ -2415,7 +2396,6 @@ async fn update_oracle_rejects_wide_confidence() {
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new(cb, false),
             AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
@@ -2520,10 +2500,6 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
         quote_mint.as_ref(),
     ]);
     let order_buf = Pubkey::default();
-    let (cb, _) = pda(&[
-        flash_book::state::CommitBufferAccount::SEED,
-        market_pda.as_ref(),
-    ]);
 
     let mut params = default_params();
     params.oracle_quorum_max_dispersion_bps = 50; // 0.5%
@@ -2540,7 +2516,6 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new(cb, false),
             AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(flp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),

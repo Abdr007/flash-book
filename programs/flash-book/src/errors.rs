@@ -9,7 +9,6 @@ use anchor_lang::prelude::*;
 ///   1300-1399  matcher / clearing
 ///   1400-1499  margin / liquidation
 ///   1500-1599  insurance fund
-///   1600-1699  commit-reveal
 ///   1700-1799  delegation (MagicBlock ER)
 #[error_code]
 pub enum FlashBookError {
@@ -122,16 +121,6 @@ pub enum FlashBookError {
     InsuranceBelowFloor = 1500,
     #[msg("Insurance fund cannot cover bankruptcy; ADL needed")]
     InsuranceExhausted = 1501,
-
-    // ── 1600-1699 commit-reveal ─────────────────────────────────────
-    #[msg("Commit hash does not match revealed payload")]
-    CommitMismatch = 1600,
-    #[msg("Commit has expired")]
-    CommitExpired = 1601,
-    #[msg("Duplicate commit hash")]
-    CommitDuplicate = 1602,
-    #[msg("Commit bond required")]
-    CommitBondRequired = 1603,
 
     // ── 1700-1799 delegation (MagicBlock ER) ────────────────────────
     #[msg("Account not delegated to ER; instruction must run on L1")]

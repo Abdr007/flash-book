@@ -16,7 +16,6 @@
 //        a. initialize_market (with defaultMajorMarketParams + a
 //           seeded oracle price)
 //        b. init_market_book (allocates the 9864-byte hypertree PDA)
-//        c. initialize_commit_buffer
 //
 // Idempotent: each step checks for existing state via `getAccountInfo`
 // and skips if already initialized. Safe to re-run after partial failure.
@@ -254,11 +253,9 @@ async function main() {
     const baseMint = new PublicKey(m.base);
     const market = client.market(baseMint, QUOTE_MINT);
     const book = marketBookPda(market.address);
-    const cb = client.commitBuffer(market.address);
     console.log(`\n  ─ ${baseMint.toBase58().slice(0, 8)}.../${QUOTE_MINT.toBase58().slice(0, 8)}...`);
     console.log(`    market:        ${market.address.toBase58()}`);
     console.log(`    market_book:   ${book.address.toBase58()}`);
-    console.log(`    commit_buffer: ${cb.address.toBase58()}`);
 
     // The base_vault + oracle_account aren't strictly used by the v2
     // hypertree path but are required by the existing
@@ -294,16 +291,6 @@ async function main() {
         market: market.address,
       });
       await send(conn, authority, [ix], [], 'init_market_book');
-    }
-
-    if (await exists(conn, cb.address)) {
-      console.log(`    → commit_buffer already initialized, skipping`);
-    } else {
-      const ix = await client.initializeCommitBufferIx({
-        authority: authority.publicKey,
-        market: market.address,
-      });
-      await send(conn, authority, [ix], [], 'initialize_commit_buffer');
     }
   }
 
