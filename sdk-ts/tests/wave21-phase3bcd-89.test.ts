@@ -11,6 +11,7 @@ import {
   icebergOrderV3Pda,
   flpExposurePda,
   flpExposurePerMarketV3Pda,
+  flpPositionV3Pda,
   vaultPda,
   vaultV3Pda,
   vaultPositionPda,
@@ -80,6 +81,30 @@ describe('wave 21 phase 8: FlpExposurePerMarketAccountV3 PDA', () => {
     );
     const got = flpExposurePerMarketV3Pda(m);
     expect(got.address.equals(expected[0])).toBe(true);
+  });
+});
+
+describe('wave 21 phase 8b: FlpPositionAccountV3 PDA', () => {
+  test('per (lp, market) under flash-book-flp', () => {
+    const m = marketPda(SOL, USDC).address;
+    const exposure = flpExposurePerMarketV3Pda(m).address;
+    const lp1 = Keypair.generate().publicKey;
+    const lp2 = Keypair.generate().publicKey;
+    const a = flpPositionV3Pda(exposure, lp1);
+    const b = flpPositionV3Pda(exposure, lp2);
+    expect(a.address.toBytes()).toHaveLength(32);
+    expect(a.address.equals(b.address)).toBe(false);
+  });
+
+  test('correct derivation under flash-book-flp program ID', () => {
+    const m = marketPda(SOL, USDC).address;
+    const exposure = flpExposurePerMarketV3Pda(m).address;
+    const lp = Keypair.generate().publicKey;
+    const expected = PublicKey.findProgramAddressSync(
+      [Buffer.from('flp_position_v3'), exposure.toBuffer(), lp.toBuffer()],
+      FLASH_BOOK_FLP_PROGRAM_ID,
+    );
+    expect(flpPositionV3Pda(exposure, lp).address.equals(expected[0])).toBe(true);
   });
 });
 

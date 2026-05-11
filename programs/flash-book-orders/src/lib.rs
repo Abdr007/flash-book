@@ -24,7 +24,11 @@
 use anchor_lang::prelude::*;
 use flash_book::cpi::accounts::PlaceLimitOrderV2Cpi as CorePlaceLimitOrderV2Cpi;
 use flash_book::program::FlashBook as CoreFlashBook;
-use flash_book::state::{MarketAccount, PositionAccount as CorePositionAccount};
+use flash_book::state::{
+    IcebergOrderAccount as CoreIcebergOrderAccount, MarketAccount,
+    PositionAccount as CorePositionAccount, TriggerOrderAccount as CoreTriggerOrderAccount,
+    TwapOrderAccount as CoreTwapOrderAccount,
+};
 
 declare_id!("2RpeanTHjLtMDbbHNguxzvitGnJasSYwwNUtM2Gse9H5");
 
@@ -771,6 +775,131 @@ pub mod flash_book_orders {
         });
         Ok(())
     }
+
+    // ─── Wave 21 phase 10 — per-account-type state-copy migration ────
+    //
+    // Trader-signed migration ixs that read a legacy core-owned order
+    // account, initialize the matching v3 wrapper-owned account with
+    // the same state, and emit a migration event. Distinct seed
+    // prefixes (b"trigger_v3" vs core's b"trigger") let legacy + v3
+    // coexist for the duration of the migration window — traders
+    // cancel their legacy account separately via core's existing
+    // cancel ixs once they've confirmed v3 picked up.
+    //
+    // Trader signs because (a) only they should decide when to migrate
+    // their order and (b) it cleanly avoids the cross-program close
+    // problem (legacy stays alive until trader cancels via core).
+
+    /// Migrate a single legacy core trigger to TriggerOrderAccountV3.
+    /// Drops trailing-stop + OCO fields (those are reissued via
+    /// `place_bracket_order_v3` if needed).
+    pub fn migrate_trigger_to_v3(ctx: Context<MigrateTriggerToV3>) -> Result<()> {
+        let src = &ctx.accounts.legacy;
+        require!(
+            src.trader == ctx.accounts.trader.key(),
+            OrdersError::Unauthorized
+        );
+
+        let dst = &mut ctx.accounts.v3;
+        dst.trader = src.trader;
+        dst.market = src.market;
+        dst.bump = ctx.bumps.v3;
+        dst.trigger_id = src.trigger_id;
+        dst.side = src.side;
+        dst.kind = src.kind;
+        // Keep ACTIVE + REDUCE_ONLY bits; drop BRACKET_LEG (re-armed
+        // via place_bracket_order_v3 if needed).
+        dst.flags = src.flags
+            & (TriggerOrderAccountV3::FLAG_REDUCE_ONLY | TriggerOrderAccountV3::FLAG_ACTIVE);
+        dst.size_lots = src.size_lots;
+        dst.trigger_price_ticks = src.trigger_price_ticks;
+        dst.limit_price_ticks = src.limit_price_ticks;
+        dst.created_at_slot = src.created_at_slot;
+        dst.expires_at_slot = src.expires_at_slot;
+
+        emit!(LegacyTriggerMigratedV3Event {
+            trader: dst.trader,
+            market: dst.market,
+            trigger_id: dst.trigger_id,
+            legacy: src.key(),
+            v3: dst.key(),
+        });
+        Ok(())
+    }
+
+    /// Migrate a single legacy core TWAP to TwapOrderAccountV3.
+    pub fn migrate_twap_to_v3(ctx: Context<MigrateTwapToV3>) -> Result<()> {
+        let src = &ctx.accounts.legacy;
+        require!(
+            src.trader == ctx.accounts.trader.key(),
+            OrdersError::Unauthorized
+        );
+
+        let dst = &mut ctx.accounts.v3;
+        dst.trader = src.trader;
+        dst.market = src.market;
+        dst.bump = ctx.bumps.v3;
+        dst.twap_id = src.twap_id;
+        dst.side = src.side;
+        dst.flags = src.flags & TwapOrderAccountV3::FLAG_ACTIVE;
+        dst.slice_size_lots = src.slice_size_lots;
+        dst.total_size_lots = src.total_size_lots;
+        dst.size_executed_lots = src.size_executed_lots;
+        dst.limit_price_ticks = src.limit_price_ticks;
+        dst.start_slot = src.start_slot;
+        dst.slot_interval = src.slot_interval;
+        dst.end_slot = src.end_slot;
+        dst.last_slice_at_slot = src.last_slice_at_slot;
+
+        emit!(LegacyTwapMigratedV3Event {
+            trader: dst.trader,
+            market: dst.market,
+            twap_id: dst.twap_id,
+            legacy: src.key(),
+            v3: dst.key(),
+        });
+        Ok(())
+    }
+
+    /// Migrate a single legacy core iceberg to IcebergOrderAccountV3.
+    /// `child_order_seq` is dropped (reset to 0) because the v3 path
+    /// uses hypertree-resident orders identified by encoded order ID;
+    /// the next replenish_iceberg_v3 call repopulates it.
+    pub fn migrate_iceberg_to_v3(ctx: Context<MigrateIcebergToV3>) -> Result<()> {
+        let src = &ctx.accounts.legacy;
+        require!(
+            src.trader == ctx.accounts.trader.key(),
+            OrdersError::Unauthorized
+        );
+
+        let dst = &mut ctx.accounts.v3;
+        dst.trader = src.trader;
+        dst.market = src.market;
+        dst.bump = ctx.bumps.v3;
+        dst.iceberg_id = src.iceberg_id;
+        dst.side = src.side;
+        dst.flags = src.flags & IcebergOrderAccountV3::FLAG_ACTIVE;
+        dst._pad0 = [0; 4];
+        dst.limit_ticks = src.limit_ticks;
+        dst.total_size_lots = src.total_size_lots;
+        dst.remaining_lots = src.remaining_lots;
+        dst.displayed_size_lots = src.displayed_size_lots;
+        // Drop child_order_seq — v3 child is hypertree-resident,
+        // identified by encoded order_id which is rebuilt on next
+        // replenish.
+        dst.child_order_seq = 0;
+        dst.created_at_slot = src.created_at_slot;
+        dst.expires_at_slot = src.expires_at_slot;
+
+        emit!(LegacyIcebergMigratedV3Event {
+            trader: dst.trader,
+            market: dst.market,
+            iceberg_id: dst.iceberg_id,
+            legacy: src.key(),
+            v3: dst.key(),
+        });
+        Ok(())
+    }
 }
 
 // ─── Account types ────────────────────────────────────────────────────
@@ -1209,6 +1338,87 @@ pub struct PlaceBracketOrderV3<'info> {
 
 // ─── Errors + events ──────────────────────────────────────────────────
 
+// ─── Wave 21 phase 10 — migration ix accounts ───────────────────────
+
+#[derive(Accounts)]
+pub struct MigrateTriggerToV3<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    /// Legacy core-owned trigger. Anchor verifies owner = core program.
+    /// Read-only — we leave it intact (trader cancels via core after
+    /// confirming v3 state).
+    #[account(constraint = legacy.trader == trader.key() @ OrdersError::Unauthorized)]
+    pub legacy: Account<'info, CoreTriggerOrderAccount>,
+
+    /// Destination v3 account in this program's address space.
+    #[account(
+        init,
+        payer = trader,
+        space = TriggerOrderAccountV3::space(),
+        seeds = [
+            TriggerOrderAccountV3::SEED,
+            legacy.market.as_ref(),
+            legacy.trader.as_ref(),
+            &[legacy.trigger_id],
+        ],
+        bump,
+    )]
+    pub v3: Account<'info, TriggerOrderAccountV3>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateTwapToV3<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(constraint = legacy.trader == trader.key() @ OrdersError::Unauthorized)]
+    pub legacy: Account<'info, CoreTwapOrderAccount>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = TwapOrderAccountV3::space(),
+        seeds = [
+            TwapOrderAccountV3::SEED,
+            legacy.market.as_ref(),
+            legacy.trader.as_ref(),
+            &[legacy.twap_id],
+        ],
+        bump,
+    )]
+    pub v3: Account<'info, TwapOrderAccountV3>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateIcebergToV3<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(constraint = legacy.trader == trader.key() @ OrdersError::Unauthorized)]
+    pub legacy: Account<'info, CoreIcebergOrderAccount>,
+
+    #[account(
+        init,
+        payer = trader,
+        space = IcebergOrderAccountV3::space(),
+        seeds = [
+            IcebergOrderAccountV3::SEED,
+            legacy.market.as_ref(),
+            legacy.trader.as_ref(),
+            &[legacy.iceberg_id],
+        ],
+        bump,
+    )]
+    pub v3: Account<'info, IcebergOrderAccountV3>,
+
+    pub system_program: Program<'info, System>,
+}
+
 #[error_code]
 pub enum OrdersError {
     #[msg("argument out of allowed range")]
@@ -1223,6 +1433,8 @@ pub enum OrdersError {
     PriceNotOnTick,
     #[msg("wrong trader")]
     WrongTrader,
+    #[msg("unauthorized caller")]
+    Unauthorized,
 }
 
 #[event]
@@ -1340,4 +1552,33 @@ pub struct BracketOrderV3PlacedEvent {
     pub sl_trigger_id: u8,
     pub tp_trigger_price_ticks: u64,
     pub sl_trigger_price_ticks: u64,
+}
+
+// ─── Wave 21 phase 10 — migration events ────────────────────────────
+
+#[event]
+pub struct LegacyTriggerMigratedV3Event {
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub trigger_id: u8,
+    pub legacy: Pubkey,
+    pub v3: Pubkey,
+}
+
+#[event]
+pub struct LegacyTwapMigratedV3Event {
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub twap_id: u8,
+    pub legacy: Pubkey,
+    pub v3: Pubkey,
+}
+
+#[event]
+pub struct LegacyIcebergMigratedV3Event {
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub iceberg_id: u8,
+    pub legacy: Pubkey,
+    pub v3: Pubkey,
 }

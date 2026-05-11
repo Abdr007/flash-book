@@ -1598,6 +1598,8 @@ name = "flash-book-flp"
 version = "0.1.0"
 dependencies = [
  "anchor-lang",
+ "anchor-spl",
+ "flash-book",
 ]
 
 [[package]]
@@ -1613,6 +1615,8 @@ name = "flash-book-vaults"
 version = "0.1.0"
 dependencies = [
  "anchor-lang",
+ "anchor-spl",
+ "flash-book",
 ]
 
 [[package]]

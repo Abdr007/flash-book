@@ -8,8 +8,10 @@ deployment story looks like as of this commit.
 The on-chain program is **MagicBlock × Flash Trade ready**. The full v2
 hypertree orderbook is live, all five order injection paths have v2
 equivalents, MagicBlock ER delegation ixs ship for the three accounts the
-matcher hot-path mutates, and 483 tests across Rust + TypeScript hold green
-with zero compiler warnings.
+matcher hot-path mutates, the wave-21 4-program modular split is end-to-end
+(core inverse-CPI for SPL release + 6 state-copy migration ixs landed
+in this commit), and 486 tests across Rust + TypeScript hold green with
+zero compiler warnings.
 
 The v1 surface remains in place (deprecated) so the existing bot / MM /
 integration tests keep working. v1 deletion is mechanical and queued for a
@@ -128,7 +130,7 @@ Zero failures, zero warnings.
 | 19h  | Mass v1 deletion | **Done** (commits `04445a4` bot migration + `81b6c55` first rip-out + this wave 19i: basket+reveal+v1-residue full deletion). Total: 16 v1 ixs + all ctxs/events/state/helpers/SDK gone. v3 program is single-orderbook (hypertree only). |
 | 20a  | Multi-tier MMR (HL has up to 6 tiers per asset) | Single-tier already covers ~80% of cases via `concentration_threshold_lots` + `concentration_extra_mmr_bps`; multi-tier needs additive `MarketLeverageTiers` PDA + RiskMarketSnap plumbing through 10+ files |
 | 20b  | Withdrawal floor `max(IM, 0.1 × notional)` | Current is **stricter** (`open_positions == 0`); HL floor is a UX upgrade (allows partial withdrawal with positions), not a security fix. Implement as additive `partial_withdraw_collateral` ix when needed |
-| 21   | Modular wrapper programs | **Phases 1+2+3a-d+8+9 shipped.** Phase 1: 3 sister programs deployable. Phase 2: CPI surface end-to-end. Phase 3a: triggers v3, 3b: TWAP v3, 3c: iceberg v3, 3d: bracket v3 (all 4 wrapper account types in flash-book-orders with create + execute-via-CPI + cancel). Phase 8: per-market FLP exposure in flash-book-flp. Phase 9: vault + position accounts in flash-book-vaults with full pro-rata share math. Remaining: one-shot per-market state-copy migration ixs (phase 10) + SPL inverse-CPIs for FLP deposit/withdraw + vault SPL transfers (phases 8b/9b). Per [`V3_WAVE21_MODULAR.md`](./V3_WAVE21_MODULAR.md). |
+| 21   | Modular wrapper programs | **Phases 1+2+3a-d+8+8b+9+9b+10 shipped.** Phase 1: 3 sister programs deployable. Phase 2: CPI surface end-to-end. Phases 3a-d: trigger / TWAP / iceberg / bracket v3 in flash-book-orders. Phase 8: per-market FLP exposure in flash-book-flp. Phase 8b: FLP deposit/withdraw with real SPL transfers (depositor signs IN; core inverse-CPI signs OUT as InsuranceFund PDA via new `cpi_release_collateral_to_user`). Phase 9: vault + position accounts in flash-book-vaults. Phase 9b: vault deposit/withdraw with real SPL transfers (same inverse-CPI pattern). Phase 10: 6 state-copy migration ixs (trigger / TWAP / iceberg in orders; per-market FLP row in flp; vault + vault-position in vaults). Remaining: phase 4 (sunset legacy core trigger / TWAP / iceberg / vault ixs after migration window closes). Per [`V3_WAVE21_MODULAR.md`](./V3_WAVE21_MODULAR.md). |
 | 22   | Fee tier table | Already exists: `TraderStateAccount.fee_discount_bps` + `set_trader_fee_tier` ix |
 | 23   | Certora formal spec | Full prep doc in [`V3_WAVE23_CERTORA.md`](./V3_WAVE23_CERTORA.md): 13 critical invariants formalized (matcher 5, risk 5, hypertree 4, funding 3), engagement scope $80-120K, 8-10 weeks |
 

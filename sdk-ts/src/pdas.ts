@@ -273,6 +273,20 @@ export function flpExposurePerMarketV3Pda(
   return derive([FLP_PER_MARKET_SEED, market.toBuffer()], flpProgramId);
 }
 
+/// Wave 21 phase 8b: per-LP, per-market FLP shares balance under
+/// flash-book-flp. Created lazily on first `flp_deposit_v3`.
+const FLP_POSITION_V3_SEED = Buffer.from('flp_position_v3');
+export function flpPositionV3Pda(
+  exposure: PublicKey,
+  lp: PublicKey,
+  flpProgramId: PublicKey = FLASH_BOOK_FLP_PROGRAM_ID,
+): DerivedPda {
+  return derive(
+    [FLP_POSITION_V3_SEED, exposure.toBuffer(), lp.toBuffer()],
+    flpProgramId,
+  );
+}
+
 /// Wave 21 phase 9: vault account under flash-book-vaults.
 const VAULT_V3_SEED = Buffer.from('vault_v3');
 export function vaultV3Pda(

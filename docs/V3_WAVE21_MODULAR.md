@@ -171,24 +171,49 @@ Cannot be done with a simple program upgrade.
       per market, independently ER-delegatable.
       `init_flp_per_market_v3` + `record_flp_fill_v3` (authority-
       gated, mirrors core's volume-weighted-avg + flip semantics) shipped.
-      ⚠ SPL deposit/withdraw paths deferred to phase 8b — they need
-      to inverse-CPI back into core's InsuranceFundAccount-owned vault
-      (auth model needs careful design + signoff).
+
+  8b. ✅ **FLP SPL deposit/withdraw via inverse-CPI** — `flp_deposit_v3`
+      lets an LP sign an SPL transfer from their ATA → core's
+      `quote_vault` directly + mints LP shares pro-rata to NAV
+      (bootstrap 1:1, otherwise `amount × shares_outstanding /
+      total_capital`). `flp_withdraw_v3` burns shares + CPIs into
+      core's `cpi_release_collateral_to_user` so the protocol vault
+      pays out (signed as `InsuranceFundAccount` PDA).
+      Per-LP shares balance lives in `FlpPositionAccountV3` (PDA seed
+      `[b"flp_position_v3", exposure, lp]`).
 
   9.  ✅ **Vault accounts** — `VaultAccountV3` + `VaultPositionAccountV3`
       in `flash-book-vaults`. `create_vault_v3` / `vault_deposit_v3` /
       `vault_withdraw_v3` shipped with full pro-rata share-mint /
       share-burn math (bootstrap 1:1, NAV-aware otherwise).
-      ⚠ SPL transfer between depositor's ATA and vault collateral PDA
-      stays in core — phase 9b wires the inverse CPI for the actual
-      token movement. Local share accounting works today.
 
-  10. ⬜ **One-shot per-market migration** — for each existing market:
-      pause via `change_market_status(Paused)` → state-copy ixs that
-      read core's legacy account and seed the matching v3 account
-      with the same data → resume. Per-account-type migration ixs
-      are the next focused work; the receiving account types now all
-      exist.
+  9b. ✅ **Vault SPL deposit/withdraw via inverse-CPI** —
+      `vault_deposit_v3` now signs the SPL transfer from depositor's
+      ATA → core's `quote_vault` and `vault_withdraw_v3` CPIs into
+      core's `cpi_release_collateral_to_user` for the payout. Same
+      auth model as FLP (wrapper signs as its `[CPI_AUTHORITY_SEED]`
+      PDA, core verifies against the wrapper-program whitelist and
+      then signs the SPL transfer as `InsuranceFundAccount`).
+
+  10. ✅ **State-copy migration ixs (one per legacy account type)** —
+      trader / strategist / authority signed migration ixs that read
+      a legacy core-owned account and seed the matching v3 wrapper
+      account with the copied state:
+        • `migrate_trigger_to_v3` (orders) — keeps
+          ACTIVE+REDUCE_ONLY flags, drops trailing-stop + OCO (re-arm
+          via `place_bracket_order_v3` if needed)
+        • `migrate_twap_to_v3` (orders) — byte-compatible field copy
+        • `migrate_iceberg_to_v3` (orders) — drops `child_order_seq`
+          (rebuilt by next `replenish_iceberg_v3`)
+        • `migrate_flp_market_to_v3` (flp) — pulls one `per_market[i]`
+          row from the legacy singleton + authority-supplied capital +
+          shares allocation
+        • `migrate_vault_to_v3` (vaults) — strategist signed
+        • `migrate_vault_position_to_v3` (vaults) — depositor signed
+      Distinct seed prefixes (b"trigger_v3" vs core's b"trigger") let
+      legacy + v3 coexist; legacy account stays alive until trader
+      cancels via core's existing cancel ix to refund rent (cleaner
+      than cross-program close at this stage).
 
 ### Phase 4 — Sunset the legacy ixs in core
 

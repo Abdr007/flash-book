@@ -28,6 +28,7 @@ export {
   twapOrderV3Pda,
   icebergOrderV3Pda,
   flpExposurePerMarketV3Pda,
+  flpPositionV3Pda,
   vaultV3Pda,
   vaultPositionV3Pda,
   wrapperCpiAuthorityPda,

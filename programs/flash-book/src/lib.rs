@@ -577,6 +577,78 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Wave 21 phase 8b/9b — inverse CPI release of quote collateral
+    /// from the protocol's quote_vault to a user's ATA. Only callable
+    /// by the 3 wrapper programs' CPI authority PDAs. Used by:
+    ///
+    ///   • flash-book-flp's `flp_withdraw_v3` — pays an LP burning
+    ///     shares back into their ATA
+    ///   • flash-book-vaults' `vault_withdraw_v3` — pays a vault
+    ///     depositor burning shares back into their ATA
+    ///
+    /// Core signs the SPL transfer as `InsuranceFundAccount` (the
+    /// vault's authority); the wrapper authenticates the WHO + HOW
+    /// MUCH via its own state.
+    ///
+    /// Trust model: same as `place_limit_order_v2_cpi` — wrapper
+    /// authority PDAs are whitelisted; once accepted, core trusts
+    /// the wrapper's calculation of the release amount. This is
+    /// safe because (a) the wrapper signed for a SPECIFIC trader
+    /// (off-chain reconciliation against the wrapper's burn event
+    /// catches misroutes); (b) total exposure is bounded by the
+    /// wrapper's own balance accounting.
+    pub fn cpi_release_collateral_to_user(
+        ctx: Context<CpiReleaseCollateralToUser>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+
+        // Wrapper signer check — same 3-PDA whitelist as
+        // place_limit_order_v2_cpi.
+        let cpi_signer = ctx.accounts.cpi_authority.key();
+        let (orders_authority, _) = Pubkey::find_program_address(
+            &[CPI_AUTHORITY_SEED],
+            &WAVE21_ORDERS_PROGRAM_ID,
+        );
+        let (flp_authority, _) = Pubkey::find_program_address(
+            &[CPI_AUTHORITY_SEED],
+            &WAVE21_FLP_PROGRAM_ID,
+        );
+        let (vaults_authority, _) = Pubkey::find_program_address(
+            &[CPI_AUTHORITY_SEED],
+            &WAVE21_VAULTS_PROGRAM_ID,
+        );
+        require!(
+            cpi_signer == orders_authority
+                || cpi_signer == flp_authority
+                || cpi_signer == vaults_authority,
+            FlashBookError::Unauthorized
+        );
+
+        // SPL transfer signed by InsuranceFund PDA.
+        let bump = ctx.accounts.insurance_fund.bump;
+        let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
+        let signers = &[signer_seeds];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.quote_vault.to_account_info(),
+            to: ctx.accounts.user_quote_ata.to_account_info(),
+            authority: ctx.accounts.insurance_fund.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signers,
+        );
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        emit!(WrapperCollateralReleasedEvent {
+            cpi_authority: cpi_signer,
+            user: ctx.accounts.user_quote_ata.owner,
+            amount: amount_quote_lots,
+        });
+        Ok(())
+    }
+
     /// V2 cancel: remove a resting order from the hypertree. Validates
     /// that the caller is the original trader (orders carry trader pubkey
     /// inline in wave 18 — wave 19 indirects through a seat). Refunds no
@@ -6316,6 +6388,29 @@ pub struct PlaceLimitOrderV2<'info> {
 }
 
 #[derive(Accounts)]
+pub struct CpiReleaseCollateralToUser<'info> {
+    /// CPI authority — must be one of the 3 wrapper-program PDAs.
+    pub cpi_authority: Signer<'info>,
+
+    /// InsuranceFund PDA — owns the vault, signs the SPL transfer out.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    /// Source vault (program-owned, InsuranceFund authority).
+    #[account(mut, address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    /// Destination — user's ATA. Mut because we credit it.
+    #[account(mut)]
+    pub user_quote_ata: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
 pub struct PlaceLimitOrderV2Cpi<'info> {
     /// CPI authority — must be the `[CPI_AUTHORITY_SEED]` PDA of one
     /// of the 3 whitelisted wrapper programs (orders / flp / vaults).
@@ -8458,6 +8553,17 @@ pub struct OrderPlacedV2Event {
     pub size_lots: u64,
     pub node_index: u32,
     pub total_orders_after: u32,
+}
+
+/// Wave 21 phase 8b/9b: emitted when a wrapper program's CPI releases
+/// collateral from the protocol vault to a user. Carries the
+/// cpi_authority pubkey (so off-chain reconciliation can attribute
+/// the release to a specific wrapper program).
+#[event]
+pub struct WrapperCollateralReleasedEvent {
+    pub cpi_authority: Pubkey,
+    pub user: Pubkey,
+    pub amount: u64,
 }
 
 /// Wave 21 phase 2: emitted when a wrapper program's CPI lands an order
