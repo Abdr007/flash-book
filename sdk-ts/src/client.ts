@@ -2205,6 +2205,87 @@ export class FlashBookClient {
       .instruction();
   }
 
+  // ─── JIT liquidation auctions ────────────────────────────────────
+
+  /** Derive a JIT liquidation offer PDA. Seeds: jit_liq_offer | market | maker | nonce_le. */
+  jitLiquidationOfferPda(market: PublicKey, maker: PublicKey, nonce: number): {
+    address: PublicKey;
+    bump: number;
+  } {
+    const nonceBytes = Buffer.alloc(4);
+    nonceBytes.writeUInt32LE(nonce, 0);
+    const [address, bump] = PublicKey.findProgramAddressSync(
+      [Buffer.from('jit_liq_offer'), market.toBuffer(), maker.toBuffer(), nonceBytes],
+      this.programId,
+    );
+    return { address, bump };
+  }
+
+  /// Maker pre-commits a tighter close offer for any (or a specific) underwater
+  /// trader. When `liquidate_position_v2` fires, the matcher walks JIT offers
+  /// before falling back to the synthetic `oracle ± liq_penalty` close.
+  placeJitLiquidationOfferIx(args: {
+    maker: PublicKey;
+    market: PublicKey;
+    nonce: number;
+    targetTrader?: PublicKey;        // PublicKey.default = any trader
+    side: 0 | 1;                      // 0 = close LONGs (buy), 1 = close SHORTs (sell)
+    offerPriceTicks: bigint | BN;
+    maxSizeLots: bigint | BN;
+    expiresAtSlot?: bigint | BN;
+  }): Promise<TransactionInstruction> {
+    const jitOffer = this.jitLiquidationOfferPda(args.market, args.maker, args.nonce);
+    const bn = (v: bigint | number | BN) =>
+      typeof v === 'bigint' ? new BN(v.toString()) : v instanceof BN ? v : new BN(v);
+    return this.methods
+      .placeJitLiquidationOffer(
+        args.nonce,
+        args.targetTrader ?? PublicKey.default,
+        args.side,
+        bn(args.offerPriceTicks),
+        bn(args.maxSizeLots),
+        bn(args.expiresAtSlot ?? 0),
+      )
+      .accountsPartial({
+        maker: args.maker,
+        market: args.market,
+        jitOffer: jitOffer.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  cancelJitLiquidationOfferIx(args: {
+    maker: PublicKey;
+    jitOffer: PublicKey;
+  }): Promise<TransactionInstruction> {
+    return this.methods
+      .cancelJitLiquidationOffer()
+      .accountsPartial({
+        maker: args.maker,
+        jitOffer: args.jitOffer,
+      })
+      .instruction();
+  }
+
+  /// Migrate a pre-V3-mark-engine market account (1024 B body) to V3 (1152 B
+  /// body). Reallocates the account, funds the rent diff from `authority`,
+  /// and writes V3 defaults: mark_ema_alpha=2000bps, mark_max_change=500bps,
+  /// mark_settle_min_slots=10, drift_alert=100bps. Idempotent.
+  migrateMarketToV3Ix(args: {
+    authority: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    return this.methods
+      .migrateMarketToV3()
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
   // ─── Decoders ────────────────────────────────────────────────────
 
   /** Hand-rolled accounts coder, useful in tests + indexers. */

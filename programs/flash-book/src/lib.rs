@@ -4515,10 +4515,159 @@ pub mod flash_book {
         let penalty = market.params.liq_penalty_bps as u128;
         let oracle = market.oracle_price_ticks as u128;
         let penalty_delta = (oracle * penalty) / constants::BPS_DENOM as u128;
-        let limit = match close_side {
-            Side::Short => (oracle.saturating_sub(penalty_delta)) as u64,
-            Side::Long => (oracle.saturating_add(penalty_delta)) as u64,
+        let synthetic_limit_u128: u128 = match close_side {
+            Side::Short => oracle.saturating_sub(penalty_delta),
+            Side::Long => oracle.saturating_add(penalty_delta),
         };
+        let synthetic_limit = synthetic_limit_u128 as u64;
+
+        // ─── JIT LIQUIDATION AUCTION — walk pre-committed maker offers ───
+        //
+        // Each `JitLiquidationOfferAccount` in remaining_accounts that
+        // matches (market, side, target_trader-or-default, remaining>0,
+        // not-expired) is a candidate. We pick the BEST candidate — best
+        // for the protocol/trader:
+        //   close_side == Short (selling out a long): HIGHER price is BETTER
+        //                       (trader sells higher → less loss, smaller
+        //                        insurance draw, JIT maker pays a tighter
+        //                        spread).
+        //   close_side == Long  (buying back a short): LOWER price is BETTER
+        //                       (trader buys back cheaper).
+        //
+        // The selected offer's price MUST beat the synthetic limit for the
+        // trader's direction; otherwise fall back to the synthetic. This
+        // guarantees JIT NEVER makes the trader's outcome worse.
+        //
+        // No other on-chain DEX has a permissionless JIT-liquidation
+        // primitive — HL keeps liquidations private, Drift / dYdX route
+        // through external keepers + insurance. JIT auctions let any
+        // maker pre-commit a tighter price and earn the guaranteed fill.
+        let market_key_for_jit = market.key();
+        let mut jit_best_price: Option<u64> = None;
+        let mut jit_best_idx: Option<usize> = None;
+        let mut jit_best_remaining: u64 = 0;
+        let mut jit_best_maker: Pubkey = Pubkey::default();
+        for (idx, acct) in ctx.remaining_accounts.iter().enumerate() {
+            // Owner gate — must be our program.
+            if acct.owner != ctx.program_id {
+                continue;
+            }
+            // Discriminator check.
+            let data = match acct.try_borrow_data() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if data.len() < 8 {
+                continue;
+            }
+            let mut disc = [0u8; 8];
+            disc.copy_from_slice(&data[..8]);
+            let expected_disc =
+                <state_v3::JitLiquidationOfferAccount as anchor_lang::Discriminator>::DISCRIMINATOR;
+            if disc != expected_disc {
+                continue;
+            }
+            drop(data);
+            // Anchor-deserialize.
+            let parsed: state_v3::JitLiquidationOfferAccount = {
+                let data = match acct.try_borrow_data() {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let mut slice: &[u8] = &data[8..];
+                match anchor_lang::AccountDeserialize::try_deserialize_unchecked(
+                    &mut slice,
+                ) {
+                    Ok(v) => {
+                        drop(data);
+                        v
+                    }
+                    Err(_) => continue,
+                }
+            };
+            if parsed.market != market_key_for_jit {
+                continue;
+            }
+            // target_trader filter — match this trader or wildcard.
+            if parsed.target_trader != Pubkey::default()
+                && parsed.target_trader != trader_state_pre.trader
+            {
+                continue;
+            }
+            // side must equal close_side — offer.side==0 closes LONGs, side==1 closes SHORTs.
+            // pos_side==Long → close_side==Short → expects offer.side==0 (close long).
+            // pos_side==Short → close_side==Long → expects offer.side==1 (close short).
+            let expected_offer_side = if pos_side == Side::Long { 0u8 } else { 1u8 };
+            if parsed.side != expected_offer_side {
+                continue;
+            }
+            if parsed.remaining_size_lots == 0 {
+                continue;
+            }
+            if parsed.expires_at_slot != 0 && current_slot >= parsed.expires_at_slot {
+                continue;
+            }
+            // Must beat the synthetic limit. Better for trader =
+            //   close_side==Short: higher price
+            //   close_side==Long : lower price
+            let beats_synthetic = match close_side {
+                Side::Short => parsed.offer_price_ticks > synthetic_limit,
+                Side::Long => parsed.offer_price_ticks < synthetic_limit,
+            };
+            if !beats_synthetic {
+                continue;
+            }
+            // Pick best so far.
+            let better_than_best = match jit_best_price {
+                None => true,
+                Some(curr) => match close_side {
+                    Side::Short => parsed.offer_price_ticks > curr,
+                    Side::Long => parsed.offer_price_ticks < curr,
+                },
+            };
+            if better_than_best {
+                jit_best_price = Some(parsed.offer_price_ticks);
+                jit_best_idx = Some(idx);
+                jit_best_remaining = parsed.remaining_size_lots;
+                jit_best_maker = parsed.maker;
+            }
+        }
+
+        // Final close-limit price + JIT bookkeeping. If a JIT offer was
+        // selected, decrement its remaining_size and use its price.
+        let mut limit = synthetic_limit;
+        let mut jit_filled: bool = false;
+        let mut jit_fill_size: u64 = 0;
+        let mut jit_fill_price: u64 = 0;
+        let mut jit_maker_for_event: Pubkey = Pubkey::default();
+        if let (Some(best_price), Some(best_idx)) = (jit_best_price, jit_best_idx) {
+            // JIT fill size = min(close_size, JIT offer's remaining).
+            let fill_size = close_size.min(jit_best_remaining);
+            if fill_size > 0 {
+                let acct = &ctx.remaining_accounts[best_idx];
+                // Re-borrow, update remaining_size, serialize back.
+                let mut data = acct.try_borrow_mut_data()?;
+                let mut slice: &[u8] = &data[8..];
+                let mut offer: state_v3::JitLiquidationOfferAccount =
+                    anchor_lang::AccountDeserialize::try_deserialize_unchecked(
+                        &mut slice,
+                    )?;
+                offer.remaining_size_lots = offer
+                    .remaining_size_lots
+                    .checked_sub(fill_size)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+                // Serialize back. Anchor account: 8-byte disc + body.
+                let mut writer: &mut [u8] = &mut data[8..];
+                anchor_lang::AccountSerialize::try_serialize(&offer, &mut writer)?;
+                drop(data);
+
+                limit = best_price;
+                jit_filled = true;
+                jit_fill_size = fill_size;
+                jit_fill_price = best_price;
+                jit_maker_for_event = jit_best_maker;
+            }
+        }
 
         // Lazy-init caller_trader_state (parity-port).
         {
@@ -4634,6 +4783,41 @@ pub mod flash_book {
                 liquidator: ctx.accounts.caller.key(),
                 liquidatee: trader,
                 reward_quote_lots: reward_paid,
+            });
+        }
+        if jit_filled {
+            // Savings expressed in bps of the oracle: how much tighter
+            // the JIT close-price is vs the synthetic close-price for
+            // the trader's direction. Positive = JIT was better.
+            let oracle_u128 = market.oracle_price_ticks as u128;
+            let savings_bps: u32 = if oracle_u128 == 0 {
+                0
+            } else {
+                let diff = match close_side {
+                    // Short close: better = higher price → diff = jit - synthetic.
+                    Side::Short => (jit_fill_price as u128)
+                        .saturating_sub(synthetic_limit as u128),
+                    // Long close: better = lower price → diff = synthetic - jit.
+                    Side::Long => (synthetic_limit as u128)
+                        .saturating_sub(jit_fill_price as u128),
+                };
+                let bps = diff
+                    .saturating_mul(constants::BPS_DENOM as u128)
+                    / oracle_u128;
+                if bps > u32::MAX as u128 {
+                    u32::MAX
+                } else {
+                    bps as u32
+                }
+            };
+            emit!(JitLiquidationFilledEvent {
+                market: market_key,
+                trader,
+                jit_maker: jit_maker_for_event,
+                fill_size_lots: jit_fill_size,
+                fill_price_ticks: jit_fill_price,
+                synthetic_price_ticks: synthetic_limit,
+                savings_vs_synthetic_bps: savings_bps,
             });
         }
         Ok(())
@@ -6495,6 +6679,202 @@ pub mod flash_book {
             amount_quote_lots: amount,
             new_total_capital: ctx.accounts.exposure.total_capital_quote_lots,
             new_shares_outstanding: ctx.accounts.exposure.lp_shares_outstanding,
+        });
+        Ok(())
+    }
+
+    /// JIT LIQUIDATION OFFER — a maker pre-commits a "tighter than
+    /// synthetic" close price to be used when an underwater trader is
+    /// liquidated on this market. When `liquidate_position_v2` fires
+    /// against a matching trader, the matcher selects the BEST JIT
+    /// offer beating `oracle ± liq_penalty_bps` and uses that price as
+    /// the close-order limit. The trader loses less collateral, the
+    /// insurance fund draws less, the JIT maker gets a guaranteed fill
+    /// at a tighter spread than open-market.
+    ///
+    /// `side`:
+    ///   0 = will close LONG positions  (offer to BUY back the long)
+    ///   1 = will close SHORT positions (offer to SELL into the short)
+    ///
+    /// `target_trader = Pubkey::default()` is a wildcard offer (any
+    /// trader's liquidation on this market). Otherwise scoped to one
+    /// trader (useful for high-touch keeper bots).
+    ///
+    /// Collateral reservation is intentionally NOT enforced here — the
+    /// maker handles their own risk. If at fill time the maker can't
+    /// absorb the position, the normal collateral path will reject
+    /// when the maker walks the close-ask. Simpler design, no new
+    /// fields on TraderState.
+    ///
+    /// PDA seeds: `[b"jit_liq_offer", market, maker, &nonce.to_le_bytes()]`.
+    pub fn place_jit_liquidation_offer(
+        ctx: Context<PlaceJitLiquidationOffer>,
+        nonce: u32,
+        target_trader: Pubkey,
+        side: u8,
+        offer_price_ticks: u64,
+        max_size_lots: u64,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(offer_price_ticks > 0, FlashBookError::ZeroPrice);
+        require!(max_size_lots > 0, FlashBookError::ZeroSize);
+
+        let market = &ctx.accounts.market;
+        require!(
+            offer_price_ticks % market.params.tick_size == 0,
+            FlashBookError::PriceNotOnTick
+        );
+        require!(
+            max_size_lots >= market.params.min_base_lots,
+            FlashBookError::SizeBelowMinLot
+        );
+
+        let now = Clock::get()?.slot;
+        if expires_at_slot != 0 {
+            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        }
+
+        let offer = &mut ctx.accounts.jit_offer;
+        offer.bump = ctx.bumps.jit_offer;
+        offer.side = side;
+        offer._pad0 = [0u8; 2];
+        offer.nonce = nonce;
+        offer.market = market.key();
+        offer.maker = ctx.accounts.maker.key();
+        offer.target_trader = target_trader;
+        offer.offer_price_ticks = offer_price_ticks;
+        offer.max_size_lots = max_size_lots;
+        offer.remaining_size_lots = max_size_lots;
+        offer.created_at_slot = now;
+        offer.expires_at_slot = expires_at_slot;
+
+        emit!(JitLiquidationOfferPlacedEvent {
+            market: market.key(),
+            maker: offer.maker,
+            target_trader,
+            nonce,
+            side,
+            offer_price_ticks,
+            max_size_lots,
+            expires_at_slot,
+        });
+        Ok(())
+    }
+
+    /// Cancel a JIT liquidation offer and close the account, refunding
+    /// rent to the maker. Only the maker can cancel.
+    pub fn cancel_jit_liquidation_offer(
+        ctx: Context<CancelJitLiquidationOffer>,
+    ) -> Result<()> {
+        let maker = ctx.accounts.maker.key();
+        require!(
+            ctx.accounts.jit_offer.maker == maker,
+            FlashBookError::Unauthorized
+        );
+        emit!(JitLiquidationOfferCancelledEvent {
+            market: ctx.accounts.jit_offer.market,
+            maker,
+            nonce: ctx.accounts.jit_offer.nonce,
+            unfilled_size_lots: ctx.accounts.jit_offer.remaining_size_lots,
+        });
+        Ok(())
+    }
+
+    /// Migrate a market account from the pre-V3 mark-engine layout (1024 B body)
+    /// to the V3 layout (1152 B body). V3 added `last_mark_settle_slot` plus
+    /// four mark-engine params (mark_ema_alpha_bps, mark_max_change_bps,
+    /// mark_settle_min_slots, drift_alert_bps).
+    ///
+    /// Idempotent: if the account is already at the V3 size and the mark-engine
+    /// params look set, returns Ok with a log message and no state change.
+    ///
+    /// Authority-gated: only `market.authority` may call.
+    pub fn migrate_market_to_v3(ctx: Context<MigrateMarketToV3>) -> Result<()> {
+        let market_ai = &ctx.accounts.market;
+        let target_size = MarketAccount::space();
+        let current_size = market_ai.data_len();
+        let authority_key = ctx.accounts.authority.key();
+
+        // Already migrated?
+        if current_size == target_size {
+            // Check V3 fields are populated (mark_ema_alpha_bps != 0 indicates a
+            // post-migration account). If zeroed, fall through and write defaults.
+            let data = market_ai.try_borrow_data()?;
+            let mut market: MarketAccount = MarketAccount::try_deserialize(&mut &data[..])?;
+            drop(data);
+            require!(market.authority == authority_key, FlashBookError::Unauthorized);
+            if market.params.mark_ema_alpha_bps != 0 {
+                msg!("migrate_market_to_v3: account already V3 (size={}, alpha={})",
+                    current_size, market.params.mark_ema_alpha_bps);
+                return Ok(());
+            }
+            // Size OK but params zeroed — write defaults
+            market.params.mark_ema_alpha_bps = 2_000;
+            market.params.mark_max_change_bps = 500;
+            market.params.mark_settle_min_slots = 10;
+            market.params.drift_alert_bps = 100;
+            if market.last_mark_settle_slot == 0 {
+                market.last_mark_settle_slot = Clock::get()?.slot;
+            }
+            let mut data = market_ai.try_borrow_mut_data()?;
+            let mut writer = &mut data[..];
+            market.try_serialize(&mut writer)?;
+            emit!(MarketMigratedToV3Event {
+                market: market_ai.key(),
+                old_size: current_size as u32,
+                new_size: target_size as u32,
+                slot: Clock::get()?.slot,
+            });
+            return Ok(());
+        }
+
+        require!(
+            current_size < target_size,
+            FlashBookError::AlreadyInitialized
+        );
+
+        // 1. Read OLD bytes — deserialize using try_deserialize_unchecked which
+        //    skips the size check (the discriminator must still match).
+        let old_bytes = market_ai.try_borrow_data()?.to_vec();
+        let mut market: MarketAccount = MarketAccount::try_deserialize_unchecked(
+            &mut &old_bytes[..]
+        )?;
+        require!(market.authority == authority_key, FlashBookError::Unauthorized);
+
+        // 2. Realloc to V3 size. Fund the rent diff from the authority.
+        let new_minimum_balance = Rent::get()?.minimum_balance(target_size);
+        let lamports_diff = new_minimum_balance.saturating_sub(market_ai.lamports());
+        if lamports_diff > 0 {
+            let cpi_ctx = CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.authority.to_account_info(),
+                    to: market_ai.to_account_info(),
+                },
+            );
+            anchor_lang::system_program::transfer(cpi_ctx, lamports_diff)?;
+        }
+        market_ai.realloc(target_size, true)?;
+
+        // 3. Write V3 defaults
+        market.params.mark_ema_alpha_bps = 2_000;
+        market.params.mark_max_change_bps = 500;
+        market.params.mark_settle_min_slots = 10;
+        market.params.drift_alert_bps = 100;
+        market.last_mark_settle_slot = Clock::get()?.slot;
+
+        // 4. Serialize back
+        let mut data = market_ai.try_borrow_mut_data()?;
+        let mut writer = &mut data[..];
+        market.try_serialize(&mut writer)?;
+        drop(data);
+
+        emit!(MarketMigratedToV3Event {
+            market: market_ai.key(),
+            old_size: current_size as u32,
+            new_size: target_size as u32,
+            slot: Clock::get()?.slot,
         });
         Ok(())
     }
@@ -8797,6 +9177,48 @@ pub struct LiquidatorRewardedEvent {
     pub reward_quote_lots: u64,
 }
 
+// ─── JIT liquidation auction events ─────────────────────────────────
+
+/// A maker pre-committed a JIT liquidation close offer. Off-chain
+/// keepers watch this event to learn about active offers without
+/// needing to scan all program accounts.
+#[event]
+pub struct JitLiquidationOfferPlacedEvent {
+    pub market: Pubkey,
+    pub maker: Pubkey,
+    /// `Pubkey::default()` = wildcard (any trader on this market).
+    pub target_trader: Pubkey,
+    pub nonce: u32,
+    pub side: u8,
+    pub offer_price_ticks: u64,
+    pub max_size_lots: u64,
+    /// 0 = never expires.
+    pub expires_at_slot: u64,
+}
+
+#[event]
+pub struct JitLiquidationOfferCancelledEvent {
+    pub market: Pubkey,
+    pub maker: Pubkey,
+    pub nonce: u32,
+    pub unfilled_size_lots: u64,
+}
+
+/// Emitted by `liquidate_position_v2` when a JIT offer beat the
+/// synthetic `oracle ± liq_penalty_bps` close price and was used as
+/// the close-order's limit. `savings_vs_synthetic_bps` shows the
+/// magnitude of improvement for the trader (bps of oracle price).
+#[event]
+pub struct JitLiquidationFilledEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub jit_maker: Pubkey,
+    pub fill_size_lots: u64,
+    pub fill_price_ticks: u64,
+    pub synthetic_price_ticks: u64,
+    pub savings_vs_synthetic_bps: u32,
+}
+
 #[event]
 pub struct ToxicityTaxAppliedEvent {
     pub market: Pubkey,
@@ -9638,6 +10060,75 @@ pub struct CancelTriggerOrderV3<'info> {
         bump = trigger_order.bump,
     )]
     pub trigger_order: Account<'info, state_v3::TriggerOrderAccountV3>,
+}
+
+// ─── JIT Liquidation Offer contexts ─────────────────────────────────
+
+#[derive(Accounts)]
+#[instruction(nonce: u32)]
+pub struct PlaceJitLiquidationOffer<'info> {
+    #[account(mut)]
+    pub maker: Signer<'info>,
+
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        init,
+        payer = maker,
+        space = state_v3::JitLiquidationOfferAccount::space(),
+        seeds = [
+            state_v3::JitLiquidationOfferAccount::SEED,
+            market.key().as_ref(),
+            maker.key().as_ref(),
+            &nonce.to_le_bytes(),
+        ],
+        bump,
+    )]
+    pub jit_offer: Account<'info, state_v3::JitLiquidationOfferAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CancelJitLiquidationOffer<'info> {
+    #[account(mut)]
+    pub maker: Signer<'info>,
+
+    #[account(
+        mut,
+        close = maker,
+        seeds = [
+            state_v3::JitLiquidationOfferAccount::SEED,
+            jit_offer.market.as_ref(),
+            jit_offer.maker.as_ref(),
+            &jit_offer.nonce.to_le_bytes(),
+        ],
+        bump = jit_offer.bump,
+    )]
+    pub jit_offer: Account<'info, state_v3::JitLiquidationOfferAccount>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateMarketToV3<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// CHECK: layout is OLD pre-V3; we deserialize via try_deserialize_unchecked
+    /// and gate by `authority == market.authority` inside the handler.
+    /// Owner-checked: must be owned by this program (the discriminator check
+    /// inside the handler validates it's actually a Market account).
+    #[account(mut, owner = crate::ID)]
+    pub market: AccountInfo<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[event]
+pub struct MarketMigratedToV3Event {
+    pub market: Pubkey,
+    pub old_size: u32,
+    pub new_size: u32,
+    pub slot: u64,
 }
 
 #[derive(Accounts)]

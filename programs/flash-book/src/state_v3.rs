@@ -179,3 +179,86 @@ impl FlpPositionAccountV3 {
         8 + 96
     }
 }
+
+// ─── JIT liquidation offers v3 ──────────────────────────────────────
+//
+// A *maker* can pre-commit a "tighter than synthetic" close price to be
+// used WHEN any underwater trader is liquidated on this market. When
+// `liquidate_position_v2` fires, the matcher walks JIT offers first,
+// picks the best price beating the synthetic `oracle ± liq_penalty`,
+// and uses it as the close-order's limit price. The trader loses LESS
+// collateral; the insurance fund draws LESS; the maker gets a
+// guaranteed fill at a price they pre-committed.
+//
+// NO other on-chain DEX has this primitive — HL has private liquidations,
+// Drift / dYdX use external keepers + insurance. JIT auctions = public
+// pre-commit primitive where any maker can underbid the synthetic.
+//
+// Seeds: `[b"jit_liq_offer", market, maker, &nonce.to_le_bytes()]`.
+// `nonce` is a u32 the maker picks so they can have multiple concurrent
+// offers per market.
+#[account]
+#[derive(Debug)]
+pub struct JitLiquidationOfferAccount {
+    pub bump: u8,
+    /// 0=will close LONG positions (acts as a BUYER from the long → bid),
+    /// 1=will close SHORT positions (acts as a SELLER → ask). See ix
+    /// docs for the close-side mapping.
+    pub side: u8,
+    pub _pad0: [u8; 2],
+    pub nonce: u32,
+    pub market: Pubkey,
+    pub maker: Pubkey,
+    /// `Pubkey::default()` means "any trader's liquidation on this market".
+    pub target_trader: Pubkey,
+    pub offer_price_ticks: u64,
+    pub max_size_lots: u64,
+    pub remaining_size_lots: u64,
+    pub created_at_slot: u64,
+    /// 0 = never expires; otherwise must be > current_slot at placement.
+    pub expires_at_slot: u64,
+}
+impl JitLiquidationOfferAccount {
+    pub const SEED: &'static [u8] = b"jit_liq_offer";
+    pub fn space() -> usize {
+        // 8 disc
+        //   + 1 bump + 1 side + 2 pad + 4 nonce
+        //   + 32 market + 32 maker + 32 target_trader
+        //   + 8 offer_price + 8 max_size + 8 remaining_size
+        //   + 8 created_at + 8 expires_at
+        // = 8 + 152 = 160. Round up to 176.
+        8 + 168
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jit_offer_seed_is_stable() {
+        assert_eq!(JitLiquidationOfferAccount::SEED, b"jit_liq_offer");
+    }
+
+    #[test]
+    fn jit_offer_space_is_at_least_layout_size() {
+        // Underlying bytes (excluding the 8-byte Anchor disc):
+        //   1 + 1 + 2 + 4 + 32 + 32 + 32 + 8*5 = 152 bytes
+        let layout_body = 1 + 1 + 2 + 4 + 32 + 32 + 32 + 8 * 5;
+        assert!(JitLiquidationOfferAccount::space() >= 8 + layout_body);
+    }
+
+    #[test]
+    fn jit_offer_pda_seed_distinct_from_v3_others() {
+        // Confirm the JIT seed prefix doesn't collide with any sibling V3 seed
+        // (regression: someone reusing `trigger_v3` etc).
+        let jit = JitLiquidationOfferAccount::SEED;
+        assert_ne!(jit, TriggerOrderAccountV3::SEED);
+        assert_ne!(jit, TwapOrderAccountV3::SEED);
+        assert_ne!(jit, IcebergOrderAccountV3::SEED);
+        assert_ne!(jit, VaultAccountV3::SEED);
+        assert_ne!(jit, VaultPositionAccountV3::SEED);
+        assert_ne!(jit, FlpExposurePerMarketAccountV3::SEED);
+        assert_ne!(jit, FlpPositionAccountV3::SEED);
+    }
+}

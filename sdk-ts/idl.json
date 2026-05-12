@@ -790,6 +790,72 @@
       "args": []
     },
     {
+      "name": "cancel_jit_liquidation_offer",
+      "docs": [
+        "Cancel a JIT liquidation offer and close the account, refunding",
+        "rent to the maker. Only the maker can cancel."
+      ],
+      "discriminator": [
+        252,
+        243,
+        117,
+        135,
+        64,
+        239,
+        224,
+        186
+      ],
+      "accounts": [
+        {
+          "name": "maker",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "jit_offer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  106,
+                  105,
+                  116,
+                  95,
+                  108,
+                  105,
+                  113,
+                  95,
+                  111,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "jit_offer.market",
+                "account": "JitLiquidationOfferAccount"
+              },
+              {
+                "kind": "account",
+                "path": "jit_offer.maker",
+                "account": "JitLiquidationOfferAccount"
+              },
+              {
+                "kind": "account",
+                "path": "jit_offer.nonce",
+                "account": "JitLiquidationOfferAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "cancel_order_v2",
       "docs": [
         "V2 cancel: remove a resting order from the hypertree. Validates",
@@ -3741,6 +3807,51 @@
       ]
     },
     {
+      "name": "migrate_market_to_v3",
+      "docs": [
+        "Migrate a market account from the pre-V3 mark-engine layout (1024 B body)",
+        "to the V3 layout (1152 B body). V3 added `last_mark_settle_slot` plus",
+        "four mark-engine params (mark_ema_alpha_bps, mark_max_change_bps,",
+        "mark_settle_min_slots, drift_alert_bps).",
+        "",
+        "Idempotent: if the account is already at the V3 size and the mark-engine",
+        "params look set, returns Ok with a log message and no state change.",
+        "",
+        "Authority-gated: only `market.authority` may call."
+      ],
+      "discriminator": [
+        26,
+        45,
+        224,
+        159,
+        195,
+        55,
+        171,
+        224
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "docs": [
+            "and gate by `authority == market.authority` inside the handler.",
+            "Owner-checked: must be owned by this program (the discriminator check",
+            "inside the handler validates it's actually a Market account)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "open_trader_state",
       "docs": [
         "Initialize per-trader state."
@@ -4555,6 +4666,123 @@
         },
         {
           "name": "limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "place_jit_liquidation_offer",
+      "docs": [
+        "JIT LIQUIDATION OFFER — a maker pre-commits a \"tighter than",
+        "synthetic\" close price to be used when an underwater trader is",
+        "liquidated on this market. When `liquidate_position_v2` fires",
+        "against a matching trader, the matcher selects the BEST JIT",
+        "offer beating `oracle ± liq_penalty_bps` and uses that price as",
+        "the close-order limit. The trader loses less collateral, the",
+        "insurance fund draws less, the JIT maker gets a guaranteed fill",
+        "at a tighter spread than open-market.",
+        "",
+        "`side`:",
+        "0 = will close LONG positions  (offer to BUY back the long)",
+        "1 = will close SHORT positions (offer to SELL into the short)",
+        "",
+        "`target_trader = Pubkey::default()` is a wildcard offer (any",
+        "trader's liquidation on this market). Otherwise scoped to one",
+        "trader (useful for high-touch keeper bots).",
+        "",
+        "Collateral reservation is intentionally NOT enforced here — the",
+        "maker handles their own risk. If at fill time the maker can't",
+        "absorb the position, the normal collateral path will reject",
+        "when the maker walks the close-ask. Simpler design, no new",
+        "fields on TraderState.",
+        "",
+        "PDA seeds: `[b\"jit_liq_offer\", market, maker, &nonce.to_le_bytes()]`."
+      ],
+      "discriminator": [
+        211,
+        125,
+        209,
+        238,
+        93,
+        156,
+        165,
+        46
+      ],
+      "accounts": [
+        {
+          "name": "maker",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "jit_offer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  106,
+                  105,
+                  116,
+                  95,
+                  108,
+                  105,
+                  113,
+                  95,
+                  111,
+                  102,
+                  102,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "maker"
+              },
+              {
+                "kind": "arg",
+                "path": "nonce"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "nonce",
+          "type": "u32"
+        },
+        {
+          "name": "target_trader",
+          "type": "pubkey"
+        },
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "offer_price_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "max_size_lots",
           "type": "u64"
         },
         {
@@ -8579,6 +8807,19 @@
       ]
     },
     {
+      "name": "JitLiquidationOfferAccount",
+      "discriminator": [
+        206,
+        1,
+        20,
+        176,
+        157,
+        224,
+        95,
+        93
+      ]
+    },
+    {
       "name": "LpPositionAccount",
       "discriminator": [
         101,
@@ -9140,6 +9381,45 @@
       ]
     },
     {
+      "name": "JitLiquidationFilledEvent",
+      "discriminator": [
+        33,
+        133,
+        180,
+        7,
+        221,
+        207,
+        18,
+        219
+      ]
+    },
+    {
+      "name": "JitLiquidationOfferCancelledEvent",
+      "discriminator": [
+        197,
+        130,
+        21,
+        160,
+        207,
+        181,
+        181,
+        90
+      ]
+    },
+    {
+      "name": "JitLiquidationOfferPlacedEvent",
+      "discriminator": [
+        188,
+        80,
+        151,
+        90,
+        217,
+        89,
+        190,
+        239
+      ]
+    },
+    {
       "name": "LiquidationInjectedV2Event",
       "discriminator": [
         159,
@@ -9319,6 +9599,19 @@
         229,
         59,
         33
+      ]
+    },
+    {
+      "name": "MarketMigratedToV3Event",
+      "discriminator": [
+        225,
+        72,
+        182,
+        104,
+        4,
+        51,
+        67,
+        14
       ]
     },
     {
@@ -11617,6 +11910,195 @@
       }
     },
     {
+      "name": "JitLiquidationFilledEvent",
+      "docs": [
+        "Emitted by `liquidate_position_v2` when a JIT offer beat the",
+        "synthetic `oracle ± liq_penalty_bps` close price and was used as",
+        "the close-order's limit. `savings_vs_synthetic_bps` shows the",
+        "magnitude of improvement for the trader (bps of oracle price)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "jit_maker",
+            "type": "pubkey"
+          },
+          {
+            "name": "fill_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "fill_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "synthetic_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "savings_vs_synthetic_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "JitLiquidationOfferAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "docs": [
+              "0=will close LONG positions (acts as a BUYER from the long → bid),",
+              "1=will close SHORT positions (acts as a SELLER → ask). See ix",
+              "docs for the close-side mapping."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "_pad0",
+            "type": {
+              "array": [
+                "u8",
+                2
+              ]
+            }
+          },
+          {
+            "name": "nonce",
+            "type": "u32"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "maker",
+            "type": "pubkey"
+          },
+          {
+            "name": "target_trader",
+            "docs": [
+              "`Pubkey::default()` means \"any trader's liquidation on this market\"."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "offer_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "max_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "remaining_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "created_at_slot",
+            "type": "u64"
+          },
+          {
+            "name": "expires_at_slot",
+            "docs": [
+              "0 = never expires; otherwise must be > current_slot at placement."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "JitLiquidationOfferCancelledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "maker",
+            "type": "pubkey"
+          },
+          {
+            "name": "nonce",
+            "type": "u32"
+          },
+          {
+            "name": "unfilled_size_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "JitLiquidationOfferPlacedEvent",
+      "docs": [
+        "A maker pre-committed a JIT liquidation close offer. Off-chain",
+        "keepers watch this event to learn about active offers without",
+        "needing to scan all program accounts."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "maker",
+            "type": "pubkey"
+          },
+          {
+            "name": "target_trader",
+            "docs": [
+              "`Pubkey::default()` = wildcard (any trader on this market)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "nonce",
+            "type": "u32"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "offer_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "max_size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "expires_at_slot",
+            "docs": [
+              "0 = never expires."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "LeverageTier",
       "docs": [
         "One rung of the leverage tier table."
@@ -12281,6 +12763,30 @@
           {
             "name": "tier_count",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketMigratedToV3Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "old_size",
+            "type": "u32"
+          },
+          {
+            "name": "new_size",
+            "type": "u32"
+          },
+          {
+            "name": "slot",
+            "type": "u64"
           }
         ]
       }

@@ -204,7 +204,7 @@ async function main() {
   const QV_PATH = `${TMP_PREFIX}-quote-vault.json`;
   const CAROL_PATH = `${TMP_PREFIX}-carol.json`;
 
-  for (const p of [USDC_PATH, BASE_PATH, ALICE_PATH, BOB_PATH, QV_PATH]) {
+  for (const p of [USDC_PATH, BASE_PATH, ALICE_PATH, BOB_PATH]) {
     if (!fs.existsSync(p)) {
       console.log(
         fail(`Missing bootstrap artefact ${p}. Run scripts/e2e-demo.ts first.`),
@@ -216,7 +216,23 @@ async function main() {
   const baseMint = loadKp(BASE_PATH).publicKey;
   const alice = loadKp(ALICE_PATH);
   const bob = loadKp(BOB_PATH);
-  const quoteVault = loadKp(QV_PATH).publicKey;
+  // Read quote_vault from on-chain InsuranceFund (authoritative source) rather
+  // than relying on a local keypair file that may be stale.
+  const _idl = await import('../sdk-ts/idl.json', { with: { type: 'json' } });
+  const _sdk = await import('../sdk-ts/src/index.ts');
+  const _fundPda = _sdk.insuranceFundPda();
+  const _fundInfo = await conn.getAccountInfo(_fundPda.address);
+  let quoteVault: PublicKey;
+  if (_fundInfo) {
+    const _coder = new (await import('@coral-xyz/anchor')).BorshAccountsCoder(_idl.default ?? _idl);
+    const _decoded: any = _coder.decode('InsuranceFundAccount', _fundInfo.data);
+    quoteVault = _decoded.quoteVault ?? _decoded.quote_vault;
+  } else if (fs.existsSync(QV_PATH)) {
+    quoteVault = loadKp(QV_PATH).publicKey;
+  } else {
+    console.log(fail(`InsuranceFund missing and no local quote-vault keypair`));
+    process.exit(1);
+  }
   const market = marketPda(baseMint, USDC).address;
 
   // Carol = NEW victim; persist so re-runs are idempotent.

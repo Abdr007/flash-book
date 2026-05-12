@@ -179,19 +179,35 @@ async function main() {
   void _provider;
   const client = new FlashBookClient(conn, wallet);
 
-  // Quote vault keypair (re-used or fresh)
+  // Quote vault keypair. Order of precedence:
+  //   1. If InsuranceFund already exists on-chain, READ its stored quote_vault
+  //      and use that pubkey (deposit_collateral only needs the pubkey, not a
+  //      signer — InsuranceFund was the original `init` payer).
+  //   2. Else if a saved keypair exists locally, load it.
+  //   3. Else generate fresh + persist.
   const QV_PATH = `${TMP_PREFIX}-quote-vault.json`;
+  const fund = insuranceFundPda();
   let quoteVaultKp: Keypair;
-  if (fs.existsSync(QV_PATH)) {
+  let quoteVault: PublicKey;
+  const fundExists = await exists(conn, fund.address);
+  if (fundExists) {
+    // Read the InsuranceFund's stored quote_vault — that's the only valid pubkey.
+    const fundInfo = await conn.getAccountInfo(fund.address);
+    const decoded: any = client.accountsCoder().decode('InsuranceFundAccount', fundInfo!.data);
+    quoteVault = decoded.quoteVault ?? decoded.quote_vault;
+    // Dummy keypair only used as a "signer" placeholder for init_insurance_fund (which is skipped below).
+    quoteVaultKp = Keypair.generate();
+    console.log(d(`     Using on-chain quote_vault: ${quoteVault.toBase58()}`));
+  } else if (fs.existsSync(QV_PATH)) {
     quoteVaultKp = loadKp(QV_PATH);
+    quoteVault = quoteVaultKp.publicKey;
   } else {
     quoteVaultKp = Keypair.generate();
     fs.writeFileSync(QV_PATH, JSON.stringify(Array.from(quoteVaultKp.secretKey)));
+    quoteVault = quoteVaultKp.publicKey;
   }
-  const quoteVault = quoteVaultKp.publicKey;
 
-  const fund = insuranceFundPda();
-  if (await exists(conn, fund.address)) {
+  if (fundExists) {
     console.log(d(`     InsuranceFund already initialized — skipping`));
   } else {
     const ix = await client.initializeInsuranceFundIx({
