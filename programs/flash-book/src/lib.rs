@@ -6879,6 +6879,127 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Initialize the per-market Pyth oracle config PDA. After this is
+    /// initialized, `update_oracle_from_pyth` can be called by anyone to
+    /// pull a fresh price from the on-chain `PriceUpdateV2` account
+    /// posted by the Pyth Solana Receiver.
+    ///
+    /// Authority-gated: only `market.authority` may install/rotate the
+    /// feed binding (a malicious wrong feed would break the market).
+    pub fn init_market_oracle_config(
+        ctx: Context<InitMarketOracleConfig>,
+        pyth_price_feed_id: [u8; 32],
+        max_staleness_seconds: u32,
+        max_confidence_bps: u32,
+        tick_decimals: i8,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.market.authority == ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized,
+        );
+        require!(max_staleness_seconds > 0, FlashBookError::OutOfRange);
+        require!(max_confidence_bps > 0 && max_confidence_bps <= 1000, FlashBookError::OutOfRange);
+
+        let cfg = &mut ctx.accounts.oracle_config;
+        cfg.bump = ctx.bumps.oracle_config;
+        cfg.source = state_v3::MarketOracleConfigAccount::SOURCE_PYTH;
+        cfg.market = ctx.accounts.market.key();
+        cfg.pyth_price_feed_id = pyth_price_feed_id;
+        cfg.max_staleness_seconds = max_staleness_seconds;
+        cfg.max_confidence_bps = max_confidence_bps;
+        cfg.tick_decimals = tick_decimals;
+
+        emit!(MarketOracleConfigInitializedEvent {
+            market: ctx.accounts.market.key(),
+            pyth_price_feed_id,
+            max_staleness_seconds,
+            max_confidence_bps,
+            tick_decimals,
+        });
+        Ok(())
+    }
+
+    /// Permissionless: pull a fresh price from a Pyth `PriceUpdateV2`
+    /// account into the market's `oracle_*` fields. Validates:
+    ///   • feed_id matches the configured binding
+    ///   • publish_time is within `max_staleness_seconds` of current slot
+    ///   • confidence (conf/price) is within `max_confidence_bps`
+    ///
+    /// On success, writes:
+    ///   • market.oracle_price_ticks (scaled by `tick_decimals`)
+    ///   • market.oracle_confidence  (raw conf in same scale)
+    ///   • market.oracle_published_at_unix_seconds
+    ///
+    /// Anyone can call. Pyth account is the trust anchor — the caller
+    /// just funds the tx.
+    pub fn update_oracle_from_pyth(
+        ctx: Context<UpdateOracleFromPyth>,
+    ) -> Result<()> {
+        use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
+
+        let cfg = &ctx.accounts.oracle_config;
+        require!(
+            cfg.source == state_v3::MarketOracleConfigAccount::SOURCE_PYTH,
+            FlashBookError::OutOfRange,
+        );
+
+        let price_update: &Account<PriceUpdateV2> = &ctx.accounts.price_update;
+        let max_age = cfg.max_staleness_seconds as u64;
+        let price_data = price_update.get_price_no_older_than(
+            &Clock::get()?,
+            max_age,
+            &cfg.pyth_price_feed_id,
+        ).map_err(|_| error!(FlashBookError::OracleTooStale))?;
+
+        require!(price_data.price > 0, FlashBookError::ZeroPrice);
+
+        // Convert Pyth price (scaled by 10^exponent) to our tick units.
+        //   real_usd = pyth_price * 10^pyth.exponent
+        //   ticks    = real_usd / tick_value
+        //   tick_value = 10^(-tick_decimals)
+        //   ticks = pyth_price * 10^(pyth.exponent + tick_decimals)
+        let scale_exp: i32 = price_data.exponent + cfg.tick_decimals as i32;
+        let new_ticks: i64 = if scale_exp >= 0 {
+            let mul = 10i64.checked_pow(scale_exp as u32)
+                .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+            price_data.price.checked_mul(mul)
+                .ok_or(error!(FlashBookError::ArithmeticOverflow))?
+        } else {
+            let div = 10i64.checked_pow((-scale_exp) as u32)
+                .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+            price_data.price.checked_div(div)
+                .ok_or(error!(FlashBookError::DivisionByZero))?
+        };
+        require!(new_ticks > 0, FlashBookError::ZeroPrice);
+
+        // Confidence in bps of price. Pyth `conf` is in the same scale as `price`.
+        let conf_bps = (price_data.conf as u128)
+            .checked_mul(10_000)
+            .ok_or(error!(FlashBookError::ArithmeticOverflow))?
+            .checked_div(price_data.price.unsigned_abs() as u128)
+            .unwrap_or(u128::MAX);
+        require!(
+            conf_bps <= cfg.max_confidence_bps as u128,
+            FlashBookError::OracleConfidenceTooWide,
+        );
+
+        let market = &mut ctx.accounts.market;
+        market.oracle_price_ticks = new_ticks as u64;
+        market.oracle_confidence = price_data.conf;
+        market.oracle_published_at_unix_seconds = price_data.publish_time as u64;
+
+        emit!(OracleUpdatedFromPythEvent {
+            market: ctx.accounts.market.key(),
+            pyth_price: price_data.price,
+            pyth_conf: price_data.conf,
+            pyth_exponent: price_data.exponent,
+            new_oracle_ticks: new_ticks as u64,
+            confidence_bps: conf_bps.min(u32::MAX as u128) as u32,
+            publish_time: price_data.publish_time,
+        });
+        Ok(())
+    }
+
 }
 
 /// Shared init body for `initialize_market`. Permissionless market
@@ -10129,6 +10250,66 @@ pub struct MarketMigratedToV3Event {
     pub old_size: u32,
     pub new_size: u32,
     pub slot: u64,
+}
+
+#[derive(Accounts)]
+pub struct InitMarketOracleConfig<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = state_v3::MarketOracleConfigAccount::space(),
+        seeds = [state_v3::MarketOracleConfigAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub oracle_config: Account<'info, state_v3::MarketOracleConfigAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[event]
+pub struct MarketOracleConfigInitializedEvent {
+    pub market: Pubkey,
+    pub pyth_price_feed_id: [u8; 32],
+    pub max_staleness_seconds: u32,
+    pub max_confidence_bps: u32,
+    pub tick_decimals: i8,
+}
+
+#[derive(Accounts)]
+pub struct UpdateOracleFromPyth<'info> {
+    /// Permissionless caller; pays the tx fee. Pyth's PriceUpdateV2 account
+    /// is the trust anchor — the caller signing is just to pay for compute.
+    pub caller: Signer<'info>,
+
+    #[account(mut)]
+    pub market: Account<'info, MarketAccount>,
+
+    #[account(
+        seeds = [state_v3::MarketOracleConfigAccount::SEED, market.key().as_ref()],
+        bump = oracle_config.bump,
+        constraint = oracle_config.market == market.key() @ FlashBookError::WrongMarket,
+    )]
+    pub oracle_config: Account<'info, state_v3::MarketOracleConfigAccount>,
+
+    /// CHECK: deserialized via pyth-solana-receiver-sdk's account type.
+    /// The SDK's get_price_no_older_than validates feed_id matches.
+    pub price_update: Account<'info, pyth_solana_receiver_sdk::price_update::PriceUpdateV2>,
+}
+
+#[event]
+pub struct OracleUpdatedFromPythEvent {
+    pub market: Pubkey,
+    pub pyth_price: i64,
+    pub pyth_conf: u64,
+    pub pyth_exponent: i32,
+    pub new_oracle_ticks: u64,
+    pub confidence_bps: u32,
+    pub publish_time: i64,
 }
 
 #[derive(Accounts)]

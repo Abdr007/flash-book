@@ -2286,6 +2286,78 @@ export class FlashBookClient {
       .instruction();
   }
 
+  // ─── Pyth oracle integration ─────────────────────────────────────
+
+  /** Derive the MarketOracleConfig PDA. Seeds: oracle_config | market. */
+  marketOracleConfigPda(market: PublicKey): { address: PublicKey; bump: number } {
+    const [address, bump] = PublicKey.findProgramAddressSync(
+      [Buffer.from('oracle_config'), market.toBuffer()],
+      this.programId,
+    );
+    return { address, bump };
+  }
+
+  /// Authority-only: install the Pyth feed binding for a market. After this,
+  /// `updateOracleFromPyth` becomes callable by anyone.
+  ///
+  /// @param pythPriceFeedId 32-byte Pyth feed identifier (e.g. SOL/USD on mainnet)
+  /// @param maxStalenessSeconds reject pulls older than this (e.g. 30)
+  /// @param maxConfidenceBps reject pulls with conf/price > this in bps (e.g. 100 = 1%)
+  /// @param tickDecimals scale factor for converting Pyth price → market ticks.
+  ///                     With default tick=$0.001 and Pyth's typical -8 exponent, set to 3.
+  initMarketOracleConfigIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    pythPriceFeedId: Buffer | Uint8Array | number[];
+    maxStalenessSeconds: number;
+    maxConfidenceBps: number;
+    tickDecimals: number;
+  }): Promise<TransactionInstruction> {
+    const cfg = this.marketOracleConfigPda(args.market);
+    const feedId: number[] = Array.isArray(args.pythPriceFeedId)
+      ? args.pythPriceFeedId
+      : Array.from(args.pythPriceFeedId as Uint8Array);
+    if (feedId.length !== 32) {
+      throw new Error(`pythPriceFeedId must be 32 bytes, got ${feedId.length}`);
+    }
+    return this.methods
+      .initMarketOracleConfig(
+        feedId,
+        args.maxStalenessSeconds,
+        args.maxConfidenceBps,
+        args.tickDecimals,
+      )
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        oracleConfig: cfg.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Permissionless: pull a fresh price from a Pyth PriceUpdateV2 account into
+  /// the market's oracle_* fields. The caller funds the tx; Pyth's account is
+  /// the trust anchor. Validates feed_id, staleness, and confidence on-chain.
+  ///
+  /// @param priceUpdate the PriceUpdateV2 account (posted by Pyth Solana Receiver)
+  updateOracleFromPythIx(args: {
+    caller: PublicKey;
+    market: PublicKey;
+    priceUpdate: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const cfg = this.marketOracleConfigPda(args.market);
+    return this.methods
+      .updateOracleFromPyth()
+      .accountsPartial({
+        caller: args.caller,
+        market: args.market,
+        oracleConfig: cfg.address,
+        priceUpdate: args.priceUpdate,
+      })
+      .instruction();
+  }
+
   // ─── Decoders ────────────────────────────────────────────────────
 
   /** Hand-rolled accounts coder, useful in tests + indexers. */

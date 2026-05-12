@@ -2956,6 +2956,95 @@
       ]
     },
     {
+      "name": "init_market_oracle_config",
+      "docs": [
+        "Initialize the per-market Pyth oracle config PDA. After this is",
+        "initialized, `update_oracle_from_pyth` can be called by anyone to",
+        "pull a fresh price from the on-chain `PriceUpdateV2` account",
+        "posted by the Pyth Solana Receiver.",
+        "",
+        "Authority-gated: only `market.authority` may install/rotate the",
+        "feed binding (a malicious wrong feed would break the market)."
+      ],
+      "discriminator": [
+        111,
+        171,
+        49,
+        32,
+        216,
+        89,
+        132,
+        249
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "oracle_config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "pyth_price_feed_id",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "max_staleness_seconds",
+          "type": "u32"
+        },
+        {
+          "name": "max_confidence_bps",
+          "type": "u32"
+        },
+        {
+          "name": "tick_decimals",
+          "type": "i8"
+        }
+      ]
+    },
+    {
       "name": "init_trader_ata",
       "docs": [
         "Idempotently create the trader's quote ATA. Anchor's `init_if_needed`",
@@ -6960,6 +7049,84 @@
       ]
     },
     {
+      "name": "update_oracle_from_pyth",
+      "docs": [
+        "Permissionless: pull a fresh price from a Pyth `PriceUpdateV2`",
+        "account into the market's `oracle_*` fields. Validates:",
+        "• feed_id matches the configured binding",
+        "• publish_time is within `max_staleness_seconds` of current slot",
+        "• confidence (conf/price) is within `max_confidence_bps`",
+        "",
+        "On success, writes:",
+        "• market.oracle_price_ticks (scaled by `tick_decimals`)",
+        "• market.oracle_confidence  (raw conf in same scale)",
+        "• market.oracle_published_at_unix_seconds",
+        "",
+        "Anyone can call. Pyth account is the trust anchor — the caller",
+        "just funds the tx."
+      ],
+      "discriminator": [
+        6,
+        73,
+        253,
+        203,
+        156,
+        243,
+        31,
+        169
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Permissionless caller; pays the tx fee. Pyth's PriceUpdateV2 account",
+            "is the trust anchor — the caller signing is just to pay for compute."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "oracle_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "price_update",
+          "docs": [
+            "The SDK's get_price_no_older_than validates feed_id matches."
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "update_oracle_quorum",
       "docs": [
         "Update oracle price using a multi-oracle quorum (median of 3).",
@@ -8859,6 +9026,19 @@
       ]
     },
     {
+      "name": "MarketOracleConfigAccount",
+      "discriminator": [
+        207,
+        85,
+        106,
+        46,
+        123,
+        142,
+        1,
+        42
+      ]
+    },
+    {
       "name": "PositionAccount",
       "discriminator": [
         60,
@@ -8869,6 +9049,19 @@
         109,
         238,
         86
+      ]
+    },
+    {
+      "name": "PriceUpdateV2",
+      "discriminator": [
+        34,
+        241,
+        35,
+        99,
+        157,
+        126,
+        244,
+        205
       ]
     },
     {
@@ -9615,6 +9808,19 @@
       ]
     },
     {
+      "name": "MarketOracleConfigInitializedEvent",
+      "discriminator": [
+        12,
+        54,
+        202,
+        197,
+        28,
+        157,
+        185,
+        243
+      ]
+    },
+    {
       "name": "MarketParamsUpdatedEvent",
       "discriminator": [
         159,
@@ -9651,6 +9857,19 @@
         4,
         223,
         27
+      ]
+    },
+    {
+      "name": "OracleUpdatedFromPythEvent",
+      "discriminator": [
+        126,
+        94,
+        176,
+        248,
+        97,
+        94,
+        190,
+        142
       ]
     },
     {
@@ -12792,6 +13011,112 @@
       }
     },
     {
+      "name": "MarketOracleConfigAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "source",
+            "docs": [
+              "0 = legacy trusted `update_oracle` (devnet only). 1 = Pyth pull.",
+              "Future: 2 = Switchboard, 3 = TWAP, etc."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "_pad0",
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            }
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "pyth_price_feed_id",
+            "docs": [
+              "The 32-byte Pyth feed identifier (e.g. SOL/USD on mainnet is",
+              "`0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d`)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "max_staleness_seconds",
+            "type": "u32"
+          },
+          {
+            "name": "max_confidence_bps",
+            "type": "u32"
+          },
+          {
+            "name": "tick_decimals",
+            "docs": [
+              "Tick decimal scaling. With our default tick = $0.001 and Pyth's",
+              "typical -8 exponent, this is 3 (scale_exp = pyth.exponent + 3).",
+              "Configurable per market because exotic feeds may use different",
+              "exponents."
+            ],
+            "type": "i8"
+          },
+          {
+            "name": "_pad1",
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketOracleConfigInitializedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "pyth_price_feed_id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "max_staleness_seconds",
+            "type": "u32"
+          },
+          {
+            "name": "max_confidence_bps",
+            "type": "u32"
+          },
+          {
+            "name": "tick_decimals",
+            "type": "i8"
+          }
+        ]
+      }
+    },
+    {
       "name": "MarketParams",
       "docs": [
         "Per-market parameters. Set at market initialization, updated only via",
@@ -13266,6 +13591,42 @@
       }
     },
     {
+      "name": "OracleUpdatedFromPythEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "pyth_price",
+            "type": "i64"
+          },
+          {
+            "name": "pyth_conf",
+            "type": "u64"
+          },
+          {
+            "name": "pyth_exponent",
+            "type": "i32"
+          },
+          {
+            "name": "new_oracle_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "confidence_bps",
+            "type": "u32"
+          },
+          {
+            "name": "publish_time",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
       "name": "OrderCancelledV2Event",
       "type": {
         "kind": "struct",
@@ -13577,6 +13938,114 @@
           {
             "name": "current_cum_index",
             "type": "i128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PriceFeedMessage",
+      "repr": {
+        "kind": "c"
+      },
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "feed_id",
+            "docs": [
+              "`FeedId` but avoid the type alias because of compatibility issues with Anchor's `idl-build` feature."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "price",
+            "type": "i64"
+          },
+          {
+            "name": "conf",
+            "type": "u64"
+          },
+          {
+            "name": "exponent",
+            "type": "i32"
+          },
+          {
+            "name": "publish_time",
+            "docs": [
+              "The timestamp of this price update in seconds"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "prev_publish_time",
+            "docs": [
+              "The timestamp of the previous price update. This field is intended to allow users to",
+              "identify the single unique price update for any moment in time:",
+              "for any time t, the unique update is the one such that prev_publish_time < t <= publish_time.",
+              "",
+              "Note that there may not be such an update while we are migrating to the new message-sending logic,",
+              "as some price updates on pythnet may not be sent to other chains (because the message-sending",
+              "logic may not have triggered). We can solve this problem by making the message-sending mandatory",
+              "(which we can do once publishers have migrated over).",
+              "",
+              "Additionally, this field may be equal to publish_time if the message is sent on a slot where",
+              "where the aggregation was unsuccesful. This problem will go away once all publishers have",
+              "migrated over to a recent version of pyth-agent."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "ema_price",
+            "type": "i64"
+          },
+          {
+            "name": "ema_conf",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PriceUpdateV2",
+      "docs": [
+        "A price update account. This account is used by the Pyth Receiver program to store a verified price update from a Pyth price feed.",
+        "It contains:",
+        "- `write_authority`: The write authority for this account. This authority can close this account to reclaim rent or update the account to contain a different price update.",
+        "- `verification_level`: The [`VerificationLevel`] of this price update. This represents how many Wormhole guardian signatures have been verified for this price update.",
+        "- `price_message`: The actual price update.",
+        "- `posted_slot`: The slot at which this price update was posted."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "write_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "verification_level",
+            "type": {
+              "defined": {
+                "name": "VerificationLevel"
+              }
+            }
+          },
+          {
+            "name": "price_message",
+            "type": {
+              "defined": {
+                "name": "PriceFeedMessage"
+              }
+            }
+          },
+          {
+            "name": "posted_slot",
+            "type": "u64"
           }
         ]
       }
@@ -15290,6 +15759,39 @@
           {
             "name": "shares_outstanding_after",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VerificationLevel",
+      "docs": [
+        "Pyth price updates are bridged to all blockchains via Wormhole.",
+        "Using the price updates on another chain requires verifying the signatures of the Wormhole guardians.",
+        "The usual process is to check the signatures for two thirds of the total number of guardians, but this can be cumbersome on Solana because of the transaction size limits,",
+        "so we also allow for partial verification.",
+        "",
+        "This enum represents how much a price update has been verified:",
+        "- If `Full`, we have verified the signatures for two thirds of the current guardians.",
+        "- If `Partial`, only `num_signatures` guardian signatures have been checked.",
+        "",
+        "# Warning",
+        "Using partially verified price updates is dangerous, as it lowers the threshold of guardians that need to collude to produce a malicious price update."
+      ],
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Partial",
+            "fields": [
+              {
+                "name": "num_signatures",
+                "type": "u8"
+              }
+            ]
+          },
+          {
+            "name": "Full"
           }
         ]
       }

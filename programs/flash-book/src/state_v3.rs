@@ -231,6 +231,51 @@ impl JitLiquidationOfferAccount {
     }
 }
 
+// ─── Pyth oracle config (P0.1 — mainnet readiness) ──────────────────
+//
+// Per-market PDA that holds the Pyth feed ID + freshness bounds. Lives
+// alongside the market rather than expanding `MarketParams` to avoid yet
+// another account-layout migration. The `update_oracle_from_pyth` ix
+// CPI-reads the Pyth `PriceUpdateV2` account and validates the feed_id
+// matches this config before writing to `MarketAccount.oracle_*` fields.
+//
+// Seeds: `[b"oracle_config", market]`.
+#[account]
+#[derive(Debug)]
+pub struct MarketOracleConfigAccount {
+    pub bump: u8,
+    /// 0 = legacy trusted `update_oracle` (devnet only). 1 = Pyth pull.
+    /// Future: 2 = Switchboard, 3 = TWAP, etc.
+    pub source: u8,
+    pub _pad0: [u8; 6],
+    pub market: Pubkey,
+    /// The 32-byte Pyth feed identifier (e.g. SOL/USD on mainnet is
+    /// `0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d`).
+    pub pyth_price_feed_id: [u8; 32],
+    pub max_staleness_seconds: u32,
+    pub max_confidence_bps: u32,
+    /// Tick decimal scaling. With our default tick = $0.001 and Pyth's
+    /// typical -8 exponent, this is 3 (scale_exp = pyth.exponent + 3).
+    /// Configurable per market because exotic feeds may use different
+    /// exponents.
+    pub tick_decimals: i8,
+    pub _pad1: [u8; 7],
+}
+impl MarketOracleConfigAccount {
+    pub const SEED: &'static [u8] = b"oracle_config";
+    pub const SOURCE_TRUSTED: u8 = 0;
+    pub const SOURCE_PYTH: u8 = 1;
+    pub fn space() -> usize {
+        // 8 disc
+        //   + 1 bump + 1 source + 6 pad
+        //   + 32 market + 32 feed_id
+        //   + 4 + 4 max_staleness/conf
+        //   + 1 tick_decimals + 7 pad
+        // = 8 + 88 = 96. Round up to 128.
+        8 + 120
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
