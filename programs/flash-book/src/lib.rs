@@ -1079,6 +1079,37 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Authority-only: directly set the insurance fund's pause threshold.
+    /// Governance lever: raising the threshold makes the ADL trigger easier
+    /// to hit (protocol enters "auto-deleverage-eligible" state sooner —
+    /// useful during stress). Lowering it relaxes the gate.
+    ///
+    /// No solvency invariants are enforced here — the threshold is purely
+    /// a governance-set floor. Operators are free to set it ABOVE the
+    /// current balance (which is what the e2e-adl proof needs), or BELOW.
+    /// Withdraw_insurance_fund's own guard (`new_balance >= pause_threshold`)
+    /// continues to protect against accidental drains via withdrawal.
+    pub fn set_insurance_pause_threshold(
+        ctx: Context<SetInsurancePauseThreshold>,
+        new_threshold_quote_lots: u64,
+    ) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.insurance_fund.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+        let f = &mut ctx.accounts.insurance_fund;
+        let previous = f.pause_threshold_quote_lots;
+        f.pause_threshold_quote_lots = new_threshold_quote_lots;
+        emit!(InsurancePauseThresholdUpdatedEvent {
+            authority: ctx.accounts.authority.key(),
+            previous_threshold_quote_lots: previous,
+            new_threshold_quote_lots,
+            current_balance_quote_lots: f.balance_quote_lots,
+        });
+        Ok(())
+    }
+
     /// Initialize per-trader state.
     pub fn open_trader_state(ctx: Context<OpenTraderState>) -> Result<()> {
         let s = &mut ctx.accounts.trader_state;
@@ -7516,6 +7547,18 @@ pub struct WithdrawInsuranceFund<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetInsurancePauseThreshold<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
+}
+
+#[derive(Accounts)]
 pub struct OpenTraderState<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
@@ -9288,6 +9331,17 @@ pub struct AutoDeleveragedEvent {
     pub bankruptcy_price_ticks: u64,
     pub counter_gain_quote_lots: u64,
     pub executor: Pubkey,
+}
+
+/// Emitted when authority updates the insurance fund's pause threshold via
+/// `set_insurance_pause_threshold`. Lets indexers/keepers see the gate move
+/// without re-fetching the InsuranceFundAccount.
+#[event]
+pub struct InsurancePauseThresholdUpdatedEvent {
+    pub authority: Pubkey,
+    pub previous_threshold_quote_lots: u64,
+    pub new_threshold_quote_lots: u64,
+    pub current_balance_quote_lots: u64,
 }
 
 #[event]

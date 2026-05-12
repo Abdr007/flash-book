@@ -5487,6 +5487,70 @@
       "args": []
     },
     {
+      "name": "set_insurance_pause_threshold",
+      "docs": [
+        "Authority-only: directly set the insurance fund's pause threshold.",
+        "Governance lever: raising the threshold makes the ADL trigger easier",
+        "to hit (protocol enters \"auto-deleverage-eligible\" state sooner —",
+        "useful during stress). Lowering it relaxes the gate.",
+        "",
+        "No solvency invariants are enforced here — the threshold is purely",
+        "a governance-set floor. Operators are free to set it ABOVE the",
+        "current balance (which is what the e2e-adl proof needs), or BELOW.",
+        "Withdraw_insurance_fund's own guard (`new_balance >= pause_threshold`)",
+        "continues to protect against accidental drains via withdrawal."
+      ],
+      "discriminator": [
+        206,
+        211,
+        210,
+        189,
+        122,
+        242,
+        235,
+        240
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "insurance_fund",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "new_threshold_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "set_market_status",
       "docs": [
         "Update market status (authority-only).",
@@ -9561,6 +9625,19 @@
       ]
     },
     {
+      "name": "InsurancePauseThresholdUpdatedEvent",
+      "discriminator": [
+        181,
+        1,
+        121,
+        29,
+        219,
+        54,
+        237,
+        242
+      ]
+    },
+    {
       "name": "InvariantBreachDetectedEvent",
       "discriminator": [
         116,
@@ -12088,6 +12165,35 @@
               "collateral + FLP capital."
             ],
             "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "InsurancePauseThresholdUpdatedEvent",
+      "docs": [
+        "Emitted when authority updates the insurance fund's pause threshold via",
+        "`set_insurance_pause_threshold`. Lets indexers/keepers see the gate move",
+        "without re-fetching the InsuranceFundAccount."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_threshold_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "new_threshold_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "current_balance_quote_lots",
+            "type": "u64"
           }
         ]
       }

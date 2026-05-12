@@ -716,6 +716,30 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Authority-only: directly set the insurance fund's pause threshold
+  /// (quote-lots). Raising the threshold above the current balance puts
+  /// the protocol into the ADL-eligible state; lowering it relaxes the
+  /// gate. Used by governance and by stress-test rigs that need to
+  /// drive the protocol into ADL without first burning through actual
+  /// insurance balance.
+  setInsurancePauseThresholdIx(args: {
+    authority: PublicKey;
+    newThresholdQuoteLots: bigint | number | BN;
+  }): Promise<TransactionInstruction> {
+    const fund = this.insuranceFund();
+    const arg =
+      typeof args.newThresholdQuoteLots === 'object'
+        ? args.newThresholdQuoteLots
+        : new BN(args.newThresholdQuoteLots.toString());
+    return this.methods
+      .setInsurancePauseThreshold(arg)
+      .accountsPartial({
+        authority: args.authority,
+        insuranceFund: fund.address,
+      })
+      .instruction();
+  }
+
   /// Settle accrued funding for a single position. Permissionless — any
   /// signer can poke a position; `caller` pays the tx fee. The trader
   /// being settled doesn't need to sign. Idempotent: calling repeatedly
