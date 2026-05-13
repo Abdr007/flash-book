@@ -389,9 +389,9 @@ async function main() {
 
   // ─── Step 7: Bob takes the book via CLOB place_taker_order_v2
   console.log(banner('STEP 7 — Bob CLOB-sweeps LONG 5 @ 99950 (taker)'));
-  // CLOB takers walk the book inline — no run_batch_v2 needed. The matcher
-  // emits BatchFillIntentEvent per fill plus a TakerOrderClearedEvent
-  // summary inside the same tx.
+  // CLOB takers walk the book inline. The matcher emits one trailing
+  // FillBatchEvent (every per-fill row inside) plus a
+  // TakerOrderClearedEvent summary inside the same tx.
   const heapIx = ComputeBudgetProgram.requestHeapFrame({ bytes: 256 * 1024 });
   const cuIx = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 });
   const bobTakerIx = await client.placeTakerOrderV2Ix({
@@ -420,7 +420,22 @@ async function main() {
       const ev = coder.decode(line.slice('Program data: '.length).trim());
       if (!ev) continue;
       if (ev.name === 'TakerOrderClearedEvent') takerClearedEvent = ev.data;
-      if (ev.name === 'BatchFillIntentEvent') fillIntents.push(ev.data);
+      // The CLOB hot path emits one FillBatchEvent carrying every fill row.
+      if (ev.name === 'FillBatchEvent') {
+        const fb: any = ev.data;
+        for (const f of fb.fills ?? []) {
+          fillIntents.push({
+            market: fb.market,
+            taker: fb.taker,
+            maker: f.maker,
+            takerSide: fb.takerSide,
+            sizeLots: f.sizeLots,
+            priceTicks: f.priceTicks,
+            takerId: fb.takerId,
+            makerId: f.makerId,
+          });
+        }
+      }
     } catch { /* skip */ }
   }
 
@@ -438,7 +453,7 @@ async function main() {
   } else {
     console.log(fail(`No TakerOrderClearedEvent emitted — taker didn't run`));
   }
-  console.log(`  ${b('BatchFillIntentEvents (inline):')} ${fillIntents.length}`);
+  console.log(`  ${b('FillBatchEvent rows:')} ${fillIntents.length}`);
   for (const f of fillIntents) {
     const taker = f.taker instanceof PublicKey ? f.taker : new PublicKey(f.taker);
     const maker = f.maker instanceof PublicKey ? f.maker : new PublicKey(f.maker);
@@ -533,7 +548,7 @@ async function main() {
   console.log('    3. Funded Alice + Bob with SOL + 1000 USDC each');
   console.log('    4. Both opened trader_state + deposited 100 USDC');
   console.log('    5. Alice posted a resting SHORT (maker); Bob ran a CLOB taker LONG');
-  console.log('    6. CLOB taker walked the book inline → BatchFillIntentEvent + TakerOrderClearedEvent');
+  console.log('    6. CLOB taker walked the book inline → FillBatchEvent + TakerOrderClearedEvent');
   console.log('    7. Sequencer-style apply_fill landed BOTH positions on-chain');
   console.log('    8. Both Alice + Bob now have populated positions + tier-resolved volumes');
   console.log('');

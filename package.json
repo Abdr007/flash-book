@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Pool-backed CLOB matched by frequent batch auction on MagicBlock ER. Reference design + simulator for Flash.trade orderbook V3.",
+  "description": "Solana perps CLOB on a hypertree-backed orderbook, running on MagicBlock ER for sub-ms matching. The V3 orderbook for Flash.trade.",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "exports": {

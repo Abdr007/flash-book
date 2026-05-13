@@ -2,7 +2,10 @@
 // lifetimes, debug-only methods). Hygiene is upstream Manifest's concern;
 // our crate's "zero warnings ever" rule applies to first-party code only.
 #![allow(dead_code)]
-#![allow(mismatched_lifetime_syntaxes)]
+// `mismatched_lifetime_syntaxes` is a nightly-only lint; older stable rustc
+// rejects the attribute. We don't need to silence it on stable, and `#[allow]`
+// for an unknown lint emits `unknown_lints` warning — defeating the purpose.
+#![cfg_attr(feature = "nightly", allow(mismatched_lifetime_syntaxes))]
 
 // VENDORED FROM Manifest's `lib/src/lib.rs` (commit @ 2026-05-10)
 // Source: https://github.com/Bonasa-Tech/manifest/tree/main/lib

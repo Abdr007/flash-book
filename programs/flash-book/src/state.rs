@@ -232,7 +232,9 @@ pub struct MarketParams {
     /// EMA weight (in bps) applied to a fresh fill price when blending
     /// it into `mark_price_ticks` inside `apply_fill`.
     ///     new_mark = alpha * fill + (1 - alpha) * old_mark
-    /// 0 = mark is never updated by fills (legacy / FBA-only behaviour).
+    /// 0 = mark is never updated by fills (rely entirely on
+    /// `settle_mark` for resync — appropriate for markets that prefer
+    /// strict oracle-anchored mark).
     /// Typical setting: 2_000 (20% weight on each fill — dampens
     /// outlier fills but still tracks the tape). Capped at BPS_DENOM.
     pub mark_ema_alpha_bps: u32,
@@ -240,8 +242,7 @@ pub struct MarketParams {
     /// If the EMA-blended new_mark differs from the prior mark by more
     /// than this fraction, the move is clamped to ±this so a single
     /// outlier fill cannot flash-crash the mark. 0 = unlimited.
-    /// Typical: 500 bps = 5%. Distinct from the existing per-batch
-    /// `mark_change_max_bps` (legacy FBA path).
+    /// Typical: 500 bps = 5%.
     pub mark_max_change_bps: u32,
     /// Minimum number of slots between consecutive permissionless
     /// `settle_mark` calls. Acts as a rate-limit so a single sequencer

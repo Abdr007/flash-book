@@ -130,13 +130,14 @@ pub mod flash_book {
     /// After this lands, the account state lives on the ER for sub-ms
     /// matcher access; only this program (via PDA signature) can
     /// undelegate it back to mainnet. The market account must also be
-    /// delegated (see `delegate_market`) for `run_batch_v2` to mutate
-    /// mark/funding/VPIN on the ER.
+    /// delegated (see `delegate_market`) so the matcher running on the
+    /// ER can mutate mark/funding/VPIN state in lockstep with the book.
     ///
     /// `commit_frequency_ms` controls how often the ER auto-commits the
     /// state back to mainnet when the program isn't doing it explicitly.
     /// 0 disables auto-commit (only manual undelegate flushes state).
-    /// Production target: 50–200 ms (matches the FBA cadence).
+    /// Production target: 50–200 ms — short enough that liquidations on
+    /// mainnet read a near-live mark; long enough not to spam commits.
     ///
     /// `validator` pins the ER validator (None = permissionless selection).
     pub fn delegate_market_book(
@@ -197,11 +198,14 @@ pub mod flash_book {
 
     /// Undelegate the market_book PDA from the ER back to mainnet. After
     /// this lands the account state is authoritative on mainnet again
-    /// and matcher ticks must run on mainnet (`run_batch_v2` callable
-    /// directly, no ER bridging needed).
+    /// and `place_taker_order_v2` / `place_limit_order_v2` execute on
+    /// mainnet directly.
     ///
     /// Use during planned ER downtime, validator rotation, or to flush
     /// final state before a permanent shutdown of the ER instance.
+    /// Operators should call `settle_mark` shortly after undelegate to
+    /// resync the mainnet mark with the live oracle — `liquidate_position_v2`
+    /// will reject calls with a stale oracle (see oracle freshness gate).
     pub fn undelegate_market_book(ctx: Context<UndelegateMarketBook>) -> Result<()> {
         let market_key = ctx.accounts.market.key();
         let bump = ctx.bumps.market_book;
@@ -230,12 +234,12 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Delegate the MarketAccount itself to the ER. Required for
-    /// `run_batch_v2` to mutate `mark_price_ticks`, `cum_funding_index`,
+    /// Delegate the MarketAccount itself to the ER. The matcher running
+    /// on the ER mutates `mark_price_ticks`, `cum_funding_index`,
     /// `last_funding_rate_bps_per_sec`, `vpin`, `current_batch`, and
-    /// `last_batch_ms` on the ER. Pair this with `delegate_market_book`
-    /// — both delegations must be live for the matcher tick to run on
-    /// the ER.
+    /// `last_batch_ms` in lockstep with the order book. Pair this with
+    /// `delegate_market_book` — both delegations must be live for the
+    /// matcher to run on the ER without forking state between layers.
     pub fn delegate_market(
         ctx: Context<DelegateMarket>,
         commit_frequency_ms: u32,
@@ -342,50 +346,56 @@ pub mod flash_book {
         flags: u8,
         expires_at_slot: u64,
     ) -> Result<()> {
-        require!(side <= 1, FlashBookError::OutOfRange);
-        require!(size_lots > 0, FlashBookError::ZeroSize);
-        require!(limit_ticks > 0, FlashBookError::ZeroPrice);
-        // Reject unknown flag bits.
-        require!(flags & !0b0011_1111 == 0, FlashBookError::OutOfRange);
-        if expires_at_slot > 0 {
-            let now = Clock::get()?.slot;
-            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        // ── Hot-path validation (collapsed). Single Clock::get(), one
+        // bounded match per family of inputs. Branch order matches
+        // empirical frequency: malformed inputs rare → fast-path through.
+        let market = &ctx.accounts.market;
+        let now_slot = Clock::get()?.slot;
+
+        // Fast input guards (most-common-pass first).
+        if side > 1
+            || size_lots == 0
+            || limit_ticks == 0
+            || (flags & !0b0111_1111) != 0
+        {
+            return err!(FlashBookError::OutOfRange);
+        }
+        if expires_at_slot != 0 && expires_at_slot <= now_slot {
+            return err!(FlashBookError::OutOfRange);
         }
 
-        let market = &ctx.accounts.market;
-        require!(
-            market.status == MarketStatus::Active as u8
-                || market.status == MarketStatus::PostOnly as u8,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            size_lots >= market.params.min_base_lots,
-            FlashBookError::SizeBelowMinLot
-        );
-        require!(
-            limit_ticks % market.params.tick_size == 0,
-            FlashBookError::PriceNotOnTick
-        );
+        // Market-state guards.
+        let p = &market.params;
+        if market.status != MarketStatus::Active as u8
+            && market.status != MarketStatus::PostOnly as u8
+        {
+            return err!(FlashBookError::OutOfRange);
+        }
+        if size_lots < p.min_base_lots {
+            return err!(FlashBookError::SizeBelowMinLot);
+        }
+        if limit_ticks % p.tick_size != 0 {
+            return err!(FlashBookError::PriceNotOnTick);
+        }
 
-        // Per-market OI hard cap (mirror v1).
-        let oi_cap = market.params.max_oi_base_lots;
+        // Per-market OI hard cap (cold for most markets — oi_cap == 0).
+        let oi_cap = p.max_oi_base_lots;
         if oi_cap > 0 {
             let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
-            let projected = cur.saturating_add(size_lots);
-            require!(projected <= oi_cap, FlashBookError::OpenInterestCapExceeded);
+            if cur.saturating_add(size_lots) > oi_cap {
+                return err!(FlashBookError::OpenInterestCapExceeded);
+            }
         }
 
         let trader_pk = ctx.accounts.trader.key();
         let market_key = market.key();
-        let now_slot = Clock::get()?.slot;
 
         // Borrow the market_book account data + load the handle.
         let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
         let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
-        require!(
-            handle.header.market_pubkey == market_key,
-            FlashBookError::WrongMarket
-        );
+        if handle.header.market_pubkey != market_key {
+            return err!(FlashBookError::WrongMarket);
+        }
 
         // Allocate seq + build the resting order.
         let seq = handle
@@ -403,7 +413,7 @@ pub mod flash_book {
             size_lots,
             expires_at_slot,
             trader: trader_pk,
-            last_valid_slot: now_slot as u32,
+            last_valid_slot: u32::try_from(now_slot).unwrap_or(u32::MAX),
             side,
             order_type: 0, // 0 = limit (the only kind for now)
             flags,
@@ -429,10 +439,10 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// CLOB-style placement — does IMMEDIATE matching against the
-    /// opposite side of the book at the maker's resting price (price-
-    /// time priority), instead of waiting for `run_batch_v2` to clear
-    /// at a uniform Walrasian price.
+    /// Immediate CLOB-style placement — walks the opposite-side book at
+    /// the maker's resting price (strict price-time priority) and matches
+    /// against every crossable resting order until the taker is filled or
+    /// `limit_ticks` is exhausted.
     ///
     /// Walk semantics:
     ///   • Buy order: iterate asks best-first; while ask.price ≤ limit,
@@ -440,15 +450,13 @@ pub mod flash_book {
     ///     next ask doesn't cross OR taker fully consumed.
     ///   • Sell order: symmetric over bids (best = highest price).
     ///
-    /// Each match emits a `BatchFillIntentEvent` (same shape the
-    /// sequencer already consumes from `run_batch_v2`). Maker order
-    /// is decremented in place if partially filled, removed if fully
-    /// consumed. Any residual taker size is inserted as a resting
-    /// limit at `limit_ticks` so the order stays live.
-    ///
-    /// Coexists with `place_limit_order_v2` (FBA-style insert). Pick
-    /// per-trader / per-order: FBA for uniform-price MEV protection,
-    /// CLOB for low-latency immediate execution.
+    /// All matches are accumulated into a single tail `FillBatchEvent`
+    /// carrying `Vec<FillEntry>` — the off-chain sequencer iterates
+    /// those entries and dispatches `apply_fill` / `apply_flp_fill` per
+    /// row. Maker orders are decremented in place on partial fill and
+    /// removed on full consumption. Any residual taker size becomes a
+    /// resting limit at `limit_ticks` so the order stays live (unless
+    /// the IOC or FOK flag is set).
     pub fn place_taker_order_v2(
         ctx: Context<PlaceLimitOrderV2>,
         side: u8,
@@ -457,40 +465,42 @@ pub mod flash_book {
         flags: u8,
         expires_at_slot: u64,
     ) -> Result<()> {
-        require!(side <= 1, FlashBookError::OutOfRange);
-        require!(size_lots > 0, FlashBookError::ZeroSize);
-        require!(limit_ticks > 0, FlashBookError::ZeroPrice);
-        require!(flags & !0b0011_1111 == 0, FlashBookError::OutOfRange);
-        if expires_at_slot > 0 {
-            let now = Clock::get()?.slot;
-            require!(expires_at_slot > now, FlashBookError::OutOfRange);
+        // Hot-path validation: collapsed branches, single Clock::get().
+        let market = &ctx.accounts.market;
+        let now_slot = Clock::get()?.slot;
+
+        if side > 1
+            || size_lots == 0
+            || limit_ticks == 0
+            || (flags & !0b0111_1111) != 0
+        {
+            return err!(FlashBookError::OutOfRange);
+        }
+        if expires_at_slot != 0 && expires_at_slot <= now_slot {
+            return err!(FlashBookError::OutOfRange);
         }
 
-        let market = &ctx.accounts.market;
-        require!(
-            market.status == MarketStatus::Active as u8
-                || market.status == MarketStatus::PostOnly as u8,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            size_lots >= market.params.min_base_lots,
-            FlashBookError::SizeBelowMinLot
-        );
-        require!(
-            limit_ticks % market.params.tick_size == 0,
-            FlashBookError::PriceNotOnTick
-        );
+        let p = &market.params;
+        if market.status != MarketStatus::Active as u8
+            && market.status != MarketStatus::PostOnly as u8
+        {
+            return err!(FlashBookError::OutOfRange);
+        }
+        if size_lots < p.min_base_lots {
+            return err!(FlashBookError::SizeBelowMinLot);
+        }
+        if limit_ticks % p.tick_size != 0 {
+            return err!(FlashBookError::PriceNotOnTick);
+        }
 
         let trader_pk = ctx.accounts.trader.key();
         let market_key = market.key();
-        let now_slot = Clock::get()?.slot;
 
         let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
         let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
-        require!(
-            handle.header.market_pubkey == market_key,
-            FlashBookError::WrongMarket
-        );
+        if handle.header.market_pubkey != market_key {
+            return err!(FlashBookError::WrongMarket);
+        }
 
         let taker_seq = handle
             .header
@@ -502,23 +512,43 @@ pub mod flash_book {
         let side_is_bid = side == 0;
         let taker_order_id = state_v2::encode_order_id(limit_ticks, taker_seq, side_is_bid);
 
-        // Advanced flags (Manifest / Phoenix parity):
+        // Advanced flags (Phoenix / Manifest / HL parity):
+        //   bit 0  POST_ONLY    — reject if any matches (caller wants rest)
+        //   bit 1  REDUCE_ONLY  — enforced upstream by margin ix
+        //   bit 2  IOC          — cancel residual after walk (no rest)
+        //   bit 3  JIT          — Drift-style JIT bonus
+        //   bits 4-5 STP_MODE   — self-trade prevention mode
+        //   bit 6  FOK          — fill-or-kill (revert if any residual)
         const FLAG_POST_ONLY: u8 = 1 << 0;
-        const FLAG_REDUCE_ONLY: u8 = 1 << 1;
         const FLAG_IOC: u8 = 1 << 2;
-        const FLAG_FOK: u8 = 1 << 6; // new — fill-or-kill (advanced CLOB)
+        const FLAG_FOK: u8 = 1 << 6;
+        // STP modes (2 bits at positions 4-5):
+        const STP_SKIP: u8 = 0b00;           // skip own resting orders (default)
+        const STP_CANCEL_OLDEST: u8 = 0b01;  // cancel the resting maker, keep walking
+        const STP_CANCEL_BOTH: u8 = 0b10;    // reject the entire taker order
         let post_only = flags & FLAG_POST_ONLY != 0;
         let ioc = flags & FLAG_IOC != 0;
         let fok = flags & FLAG_FOK != 0;
-        let _ = FLAG_REDUCE_ONLY; // reduce_only enforced upstream by margin ix
+        let stp_mode = (flags >> 4) & 0b11;
 
         // ── Phase 1: walk opposite side, collect matchable orders ───
         // Mid-iteration mutation is unsafe (borrow conflicts), so we
-        // collect (idx, maker_id, fill_size, price, maker_trader) and
+        // collect (idx, maker_id, fill_size, price, maker_trader) for
+        // matches and DataIndex for STP_CANCEL_OLDEST removals, then
         // apply mutations after. Cap traversal at MAX_BATCH per side
         // to bound CU on a single ix.
         let mut remaining = size_lots;
-        let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey)> = Vec::new();
+        // Pre-size to the typical walk depth (most takers fill in <16
+        // levels). Skips ~3 doubling reallocs on the hot path; the
+        // worst-case walk is bounded by MAX_BATCH_ORDERS_PER_SIDE_V2
+        // and any overflow spills onto the heap via Vec's grow path.
+        // Stack-allocated fixed arrays aren't viable here: at 256-cap
+        // × 60 B per tuple the array exceeds BPF's 4 KB stack frame.
+        const TYPICAL_WALK_DEPTH: usize = 16;
+        let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey)> =
+            Vec::with_capacity(TYPICAL_WALK_DEPTH);
+        let mut stp_cancels: Vec<hypertree::DataIndex> = Vec::new();
+        let mut stp_aborted = false;
         let walk_limit = MAX_BATCH_ORDERS_PER_SIDE_V2;
 
         // Always walk to detect crossings. post_only check happens
@@ -531,7 +561,19 @@ pub mod flash_book {
                 if remaining == 0 { return false; }
                 if ask.price_ticks > limit_ticks { return false; }
                 if ask.expires_at_slot > 0 && now_slot > ask.expires_at_slot { return true; }
-                if ask.trader == trader_pk { return true; } // skip self-trade
+                if ask.trader == trader_pk {
+                    match stp_mode {
+                        STP_CANCEL_OLDEST => {
+                            stp_cancels.push(idx);
+                            return true;
+                        }
+                        STP_CANCEL_BOTH => {
+                            stp_aborted = true;
+                            return false;
+                        }
+                        STP_SKIP | _ => return true, // skip self-match, keep walking
+                    }
+                }
                 let fill = ask.size_lots.min(remaining);
                 matches.push((idx, ask.order_id, fill, ask.price_ticks, ask.trader));
                 remaining -= fill;
@@ -543,12 +585,42 @@ pub mod flash_book {
                 if remaining == 0 { return false; }
                 if bid.price_ticks < limit_ticks { return false; }
                 if bid.expires_at_slot > 0 && now_slot > bid.expires_at_slot { return true; }
-                if bid.trader == trader_pk { return true; }
+                if bid.trader == trader_pk {
+                    match stp_mode {
+                        STP_CANCEL_OLDEST => {
+                            stp_cancels.push(idx);
+                            return true;
+                        }
+                        STP_CANCEL_BOTH => {
+                            stp_aborted = true;
+                            return false;
+                        }
+                        _ => return true,
+                    }
+                }
                 let fill = bid.size_lots.min(remaining);
                 matches.push((idx, bid.order_id, fill, bid.price_ticks, bid.trader));
                 remaining -= fill;
                 true
             });
+        }
+
+        // STP_CANCEL_BOTH: a self-match was found and the caller asked
+        // us to reject the whole taker order.
+        if stp_aborted {
+            return err!(FlashBookError::SelfTrade);
+        }
+
+        // STP_CANCEL_OLDEST: cancel each self-matched resting order before
+        // applying the (non-self) matches. Best-cache stays consistent —
+        // each remove updates the cached best via the successor-capture
+        // path in remove_*_node.
+        for idx in &stp_cancels {
+            if side_is_bid {
+                handle.remove_ask_node(*idx);
+            } else {
+                handle.remove_bid_node(*idx);
+            }
         }
 
         // post_only: if walk found ANY match, the order would cross —
@@ -563,6 +635,10 @@ pub mod flash_book {
         }
 
         // ── Phase 2: apply each match (decrement or remove maker) ───
+        // Per-fill emit replaced with one batched FillBatchEvent at end —
+        // saves ~200 CU per fill (Borsh + sol_log_data overhead amortized
+        // over the whole walk instead of paid per-step).
+        let mut fills: Vec<FillEntry> = Vec::with_capacity(matches.len());
         for (maker_idx, maker_id, fill_size, fill_price, maker_trader) in &matches {
             let new_size = handle.decrement_size_at(*maker_idx, *fill_size);
             if new_size == 0 {
@@ -572,15 +648,20 @@ pub mod flash_book {
                     handle.remove_bid_node(*maker_idx);
                 }
             }
-            emit!(BatchFillIntentEvent {
-                market: market_key,
-                taker: trader_pk,
+            fills.push(FillEntry {
                 maker: *maker_trader,
-                taker_side: side,
                 size_lots: *fill_size,
                 price_ticks: *fill_price,
-                taker_id: taker_order_id,
                 maker_id: *maker_id,
+            });
+        }
+        if !fills.is_empty() {
+            emit!(FillBatchEvent {
+                market: market_key,
+                taker: trader_pk,
+                taker_side: side,
+                taker_id: taker_order_id,
+                fills,
             });
         }
 
@@ -597,7 +678,7 @@ pub mod flash_book {
                 size_lots: remaining,
                 expires_at_slot,
                 trader: trader_pk,
-                last_valid_slot: now_slot as u32,
+                last_valid_slot: u32::try_from(now_slot).unwrap_or(u32::MAX),
                 side,
                 order_type: 0,
                 flags,
@@ -646,16 +727,17 @@ pub mod flash_book {
         side: u8,
         order_id: u64,
     ) -> Result<()> {
-        require!(side <= 1, FlashBookError::OutOfRange);
+        if side > 1 {
+            return err!(FlashBookError::OutOfRange);
+        }
         let trader_pk = ctx.accounts.trader.key();
         let market_key = ctx.accounts.market.key();
 
         let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
         let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
-        require!(
-            handle.header.market_pubkey == market_key,
-            FlashBookError::WrongMarket
-        );
+        if handle.header.market_pubkey != market_key {
+            return err!(FlashBookError::WrongMarket);
+        }
 
         let side_is_bid = side == 0;
         let idx = if side_is_bid {
@@ -663,15 +745,16 @@ pub mod flash_book {
         } else {
             handle.lookup_ask_by_order_id(order_id)
         };
-        require!(
-            idx != crate::hypertree::NIL,
-            FlashBookError::LiquidationStale
-        );
+        if idx == crate::hypertree::NIL {
+            return err!(FlashBookError::LiquidationStale);
+        }
 
         // Ownership check — only the original trader can cancel.
         let order_seq = {
             let order = handle.order_at(idx);
-            require!(order.trader == trader_pk, FlashBookError::WrongTrader);
+            if order.trader != trader_pk {
+                return err!(FlashBookError::WrongTrader);
+            }
             order.seq
         };
 
@@ -1882,12 +1965,13 @@ pub mod flash_book {
     }
 
     /// Apply a single fill against the taker's and maker's Position PDAs.
-    /// Called by the sequencer after `run_batch` for each emitted Fill,
-    /// or by an off-chain bookkeeper that batches multiple fills per tx.
+    /// Called by the off-chain sequencer once per `FillEntry` row in a
+    /// `FillBatchEvent` emitted from `place_taker_order_v2`, or by an
+    /// off-chain bookkeeper that aggregates multiple fills per tx.
     ///
-    /// Trust model: `sequencer` is the same authority as `run_batch`; the
-    /// fill data is taken at face value (production version verifies via
-    /// per-batch fill buffer or Merkle proof).
+    /// Trust model: the `sequencer` signer is the configured authority;
+    /// the fill data is taken at face value (a future version verifies
+    /// via per-tx fill buffer or Merkle proof against the emitted event).
     /// `taker_was_jit`: set to true if the matched taker order was
     /// JIT-tagged (flag bit 3 on place_limit_order). The sequencer reads
     /// this from the order's stored flags. When true, the maker earns
@@ -2514,8 +2598,16 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Update oracle price (authority-only). In production this is replaced
-    /// by a Pyth read in `run_batch`.
+    /// Update oracle price (authority-only). Bootstrap / dev / fallback path
+    /// only — `update_oracle_from_pyth` (`init_market_oracle_config` +
+    /// `update_oracle_from_pyth`) is the production path and pulls directly
+    /// from the on-chain `PriceUpdateV2` account posted by the Pyth Solana
+    /// Receiver.
+    ///
+    /// IMPORTANT: any future ix that updates `market.oracle_*` MUST validate
+    /// `market.authority == ctx.accounts.authority.key()` (this ix) OR derive
+    /// the price from a verified Pyth account (the Pyth-pull ix). Both gates
+    /// are first-class — do not strip one assuming the other suffices.
     ///
     /// Hardened against the JELLY/POPCAT class of attacks (Hyperliquid 2025):
     ///
@@ -3922,11 +4014,11 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// View ix: snapshot the FLP quoter's would-be next-batch quote
-    /// ladder (no state change). Runs the same generate_quotes
-    /// computation as `run_batch` but doesn't mutate the OrderBuffer
-    /// or any other state. Emits `QuoteLadderSnapshotEvent` carrying
-    /// the top-N levels (each side) for off-chain UI rendering.
+    /// View ix: snapshot the FLP quoter's would-be next quote ladder
+    /// (no state change). Runs the same `generate_quotes` computation
+    /// the matcher consumes but doesn't mutate any state. Emits
+    /// `QuoteLadderSnapshotEvent` carrying the top-N levels (each side)
+    /// for off-chain UI rendering.
     ///
     /// Levels are interleaved bid/ask in seq order: [bid0, ask0,
     /// bid1, ask1, ...] — same emission order as the matcher would
@@ -3935,7 +4027,7 @@ pub mod flash_book {
         let market = &ctx.accounts.market;
         let flp = &ctx.accounts.flp_exposure;
 
-        // Mirror run_batch's setup of FlpQuoterParams + Inputs.
+        // Set up FlpQuoterParams + Inputs (mirrors the matcher's setup).
         let market_key = market.key();
         let flp_pool_capital = flp.total_capital_quote_lots;
         let flp_net_signed: i64 = {
@@ -4469,13 +4561,30 @@ pub mod flash_book {
             require!(elapsed >= cooldown, FlashBookError::RateLimited);
         }
 
+        // ─── ORACLE FRESHNESS GATE ─────────────────────────────────────
+        // The dual-source health check below picks the WORSE of mark and
+        // oracle. That defense relies on the oracle actually being fresh.
+        // If both mark and oracle are stale simultaneously (e.g. ER
+        // undelegate before settle_mark resyncs the cached mark AND Pyth
+        // publishing gap), the worse-of can pick a stale price and
+        // wrongfully liquidate a trader who's healthy at the live price.
+        // Refuse to liquidate when oracle is stale; let the trader keep
+        // their position until the operator either resyncs mark via
+        // settle_mark or the Pyth keeper posts a fresh price.
+        let oracle_max_age = market.params.oracle_staleness_max_seconds as u64;
+        if oracle_max_age > 0 && market.oracle_published_at_unix_seconds > 0 {
+            let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            let oracle_age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
+            require!(oracle_age <= oracle_max_age, FlashBookError::OracleTooStale);
+        }
+
         // V3 health gate — DUAL-SOURCE PRICE.
-        // The current `mark_price_ticks` is the FBA / EMA-blended mark
-        // that lags the live tape. The current `oracle_price_ticks` is
-        // the freshly attested oracle. Picking the worse of the two for
-        // the position's direction means a fresh oracle move can
-        // immediately tip a position underwater without waiting for an
-        // explicit `settle_mark` call.
+        // The current `mark_price_ticks` is the EMA-blended mark that
+        // lags the live tape by 1-2 fills. The current `oracle_price_ticks`
+        // is the freshly attested oracle (validated above for staleness).
+        // Picking the worse of the two for the position's direction means
+        // a fresh oracle move can immediately tip a position underwater
+        // without waiting for an explicit `settle_mark` call.
         //
         //   LONG:  health_price = min(mark, oracle)   (lower = worse)
         //   SHORT: health_price = max(mark, oracle)   (higher = worse)
@@ -4779,7 +4888,7 @@ pub mod flash_book {
                 size_lots: close_size,
                 expires_at_slot: 0,
                 trader,
-                last_valid_slot: current_slot as u32,
+                last_valid_slot: u32::try_from(current_slot).unwrap_or(u32::MAX),
                 side: close_side_u8,
                 order_type: 3, // 3 = Liquidation (matcher promotes priority)
                 flags: 0,
@@ -5258,7 +5367,7 @@ pub mod flash_book {
                 size_lots: close_size,
                 expires_at_slot: 0,
                 trader,
-                last_valid_slot: now_slot as u32,
+                last_valid_slot: u32::try_from(now_slot).unwrap_or(u32::MAX),
                 side: close_side_u8,
                 order_type: 3, // Liquidation
                 flags: 0,
@@ -6277,7 +6386,7 @@ pub mod flash_book {
         require!(side <= 1, FlashBookError::OutOfRange);
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(limit_ticks > 0, FlashBookError::ZeroPrice);
-        require!(flags & !0b0011_1111 == 0, FlashBookError::OutOfRange);
+        require!(flags & !0b0111_1111 == 0, FlashBookError::OutOfRange);
         let now_slot = Clock::get()?.slot;
         if expires_at_slot > 0 {
             require!(expires_at_slot > now_slot, FlashBookError::OutOfRange);
@@ -6330,7 +6439,7 @@ pub mod flash_book {
             size_lots,
             expires_at_slot,
             trader: vault_pk,
-            last_valid_slot: now_slot as u32,
+            last_valid_slot: u32::try_from(now_slot).unwrap_or(u32::MAX),
             side,
             order_type: 0,
             flags,
@@ -6826,6 +6935,17 @@ pub mod flash_book {
         let target_size = MarketAccount::space();
         let current_size = market_ai.data_len();
         let authority_key = ctx.accounts.authority.key();
+
+        // Defence in depth: target_size is computed from MarketAccount::space()
+        // which is compile-time bounded by the type layout, BUT a future
+        // schema change that inadvertently bloats MarketAccount past Solana's
+        // 10 MB account ceiling would otherwise blow up inside the runtime.
+        // Refuse at the boundary so the error is legible and the tx's compute
+        // budget isn't burned reaching a deeper panic.
+        require!(
+            target_size <= constants::SOLANA_MAX_ACCOUNT_SIZE,
+            FlashBookError::OutOfRange
+        );
 
         // Already migrated?
         if current_size == target_size {
@@ -8741,7 +8861,8 @@ pub struct TakerOrderClearedEvent {
     pub side: u8,
     /// Original size requested.
     pub taker_size_lots: u64,
-    /// Sum of all `BatchFillIntentEvent` size_lots emitted from this ix.
+    /// Sum of all `FillEntry.size_lots` emitted in the trailing
+    /// `FillBatchEvent` from this ix.
     pub filled_lots: u64,
     /// Size remaining after the walk that was inserted as a resting
     /// limit (0 if fully filled or IOC).
@@ -8753,25 +8874,30 @@ pub struct TakerOrderClearedEvent {
     pub residual_node_index: u32,
 }
 
-/// Sequencer feed — emitted by `run_batch_v2` for every cleared fill.
-/// The off-chain sequencer subscribes to these and dispatches the
-/// matching `apply_fill` / `apply_flp_fill` ix on mainnet. Carries
-/// the full per-fill payload + the order IDs (so the sequencer can
-/// dedup against its own outbox).
-///
-/// FLP detection: when `maker == FLP_VIRTUAL_TRADER` (= Pubkey::default
-/// — FLP makers don't carry a real trader pubkey), the sequencer
-/// dispatches `apply_flp_fill` instead of `apply_fill`.
-#[event]
-pub struct BatchFillIntentEvent {
-    pub market: Pubkey,
-    pub taker: Pubkey,
+/// Per-fill payload inside a `FillBatchEvent`. The redundant `market`
+/// / `taker` / `taker_side` / `taker_id` fields live once on the parent.
+/// `maker == Pubkey::default()` signals an FLP virtual-quote fill — the
+/// off-chain sequencer dispatches `apply_flp_fill` for those entries
+/// and `apply_fill` for the rest.
+#[derive(Clone, Copy, AnchorSerialize, AnchorDeserialize)]
+pub struct FillEntry {
     pub maker: Pubkey,
-    pub taker_side: u8,
     pub size_lots: u64,
     pub price_ticks: u64,
-    pub taker_id: u64,
     pub maker_id: u64,
+}
+
+/// CLOB hot-path fill feed — one event per `place_taker_order_v2` ix
+/// carrying every match in a single `Vec<FillEntry>`. The off-chain
+/// sequencer iterates `fills` and dispatches `apply_fill` / `apply_flp_fill`
+/// per entry on mainnet; `taker_id` is the dedup key for the outbox.
+#[event]
+pub struct FillBatchEvent {
+    pub market: Pubkey,
+    pub taker: Pubkey,
+    pub taker_side: u8,
+    pub taker_id: u64,
+    pub fills: Vec<FillEntry>,
 }
 
 /// How many price levels per side `view_book_depth_v2` returns.
@@ -8780,11 +8906,10 @@ pub struct BatchFillIntentEvent {
 /// for the long tail.
 pub const BOOK_DEPTH_LEVELS: usize = 4;
 
-/// Per-side ceiling on orders fed into a single `run_batch_v2` clearing.
-/// Wave 22 phase 6 refactored the matcher's clearing-price search from
-/// O(N²) to O(N log N) (single sort + monotone two-pointer walk over
-/// candidate prices), lifting the safe cap from 64 to 256 per side
-/// (~5K CU per fill at the larger N, well inside the BPF budget).
+/// Per-side ceiling on resting orders the taker can walk in a single
+/// `place_taker_order_v2` ix. Bounded by the BPF compute budget — at
+/// 256 the worst-case walk consumes ~50K CU, well within the per-tx
+/// 200K default and the 1.4M maximum.
 pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 256;
 
 /// HL withdrawal floor — wave 20b. When a trader pulls collateral from
@@ -8795,15 +8920,6 @@ pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 256;
 /// to satisfy IM, places a trade, then yanks the temporary collateral
 /// leaving only enough for maintenance margin.
 pub const WITHDRAWAL_FLOOR_BPS: u32 = 1000;
-
-/// VPIN level (bps of toxicity probability) at or above which `run_batch_v2`
-/// SKIPS FLP virtual-quote generation for the current batch. Protects LP
-/// capital from informed flow at the matcher level (the per-fill toxicity
-/// tax is a downstream defence; this is upstream — don't even quote).
-/// 7000 bps = 70%: a high-confidence "this batch is being adversarially
-/// selected" signal. Below 70% LP keeps quoting normally; the spread
-/// widens via the existing VPIN-scaled `kappa_bps` term in the FLP quoter.
-pub const FLP_VPIN_PAUSE_THRESHOLD_BPS: u32 = 7000;
 
 #[event]
 pub struct OrderCancelledV2Event {
@@ -9591,7 +9707,7 @@ fn inject_leg_into_hypertree(
         size_lots: leg.size_lots,
         expires_at_slot: 0,
         trader: trader_key,
-        last_valid_slot: now_slot as u32,
+        last_valid_slot: u32::try_from(now_slot).unwrap_or(u32::MAX),
         side: leg.side,
         order_type: 0, // limit
         flags: if leg.post_only { 0b0000_0001 } else { 0 },
@@ -9636,7 +9752,7 @@ fn inject_leg_into_hypertree_unchecked(
         size_lots: leg.size_lots,
         expires_at_slot: 0,
         trader: trader_key,
-        last_valid_slot: now_slot as u32,
+        last_valid_slot: u32::try_from(now_slot).unwrap_or(u32::MAX),
         side: leg.side,
         order_type: 0,
         flags: if leg.post_only { 0b0000_0001 } else { 0 },
@@ -9651,9 +9767,8 @@ fn inject_leg_into_hypertree_unchecked(
 }
 
 /// Map a `RestingOrderV2.order_type` byte to the matcher's OrderType.
-/// Matches v1's `slot_to_order` mapping so v2 orders fed into the same
-/// FBA clearing logic get the same FIFO priority weighting (limits
-/// behind takers, takers behind liquidations, ADL highest).
+/// Preserves the matcher's FIFO priority weighting (limits behind
+/// takers, takers behind liquidations, ADL highest).
 ///
 /// Unknown bytes default to Limit — defensive; an attacker writing a
 /// junk value in the order_type byte gets the lowest-priority bucket.

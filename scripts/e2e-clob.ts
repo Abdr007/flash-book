@@ -5,9 +5,9 @@
 //   1. Maker rests a limit order in the hypertree (placeLimitOrderV2)
 //   2. Taker places a marketable order (placeTakerOrderV2) that
 //      IMMEDIATELY walks the book and matches at the maker's resting
-//      price — no run_batch_v2 needed
-//   3. Each match emits BatchFillIntentEvent inline
-//   4. Sequencer settles each fill via apply_fill
+//      price
+//   3. All matches emit a single trailing FillBatchEvent
+//   4. Sequencer iterates fill_batch.fills and settles each via applyFill
 //
 // Plus advanced flags:
 //   • IOC (cancel residual after walk)
@@ -143,13 +143,20 @@ async function main() {
   console.log(ok(`CLOB taker fired  ${d(takerSig)}`));
 
   const evs = await decodeEvents(conn, takerSig);
-  const fills = evs.filter((e) => e.name === 'BatchFillIntentEvent');
+  const fillBatch = evs.find((e) => e.name === 'FillBatchEvent')?.data;
+  type FillRow = { taker: PublicKey; maker: PublicKey; sizeLots: any; priceTicks: any };
+  const fills: FillRow[] = fillBatch
+    ? fillBatch.fills.map((f: any) => ({
+        taker: fillBatch.taker,
+        maker: f.maker,
+        sizeLots: f.sizeLots ?? f.size_lots,
+        priceTicks: f.priceTicks ?? f.price_ticks,
+      }))
+    : [];
   const summary = evs.find((e) => e.name === 'TakerOrderClearedEvent')?.data;
   console.log(`  ${b('Inline fills emitted:')} ${fills.length}`);
   for (const f of fills) {
-    const sz = f.data.sizeLots ?? f.data.size_lots;
-    const px = f.data.priceTicks ?? f.data.price_ticks;
-    console.log(`    ${d('taker=' + new PublicKey(f.data.taker).toBase58().slice(0, 8) + '…  maker=' + new PublicKey(f.data.maker).toBase58().slice(0, 8) + '…')}  size=${sz}  price=${px}`);
+    console.log(`    ${d('taker=' + new PublicKey(f.taker).toBase58().slice(0, 8) + '…  maker=' + new PublicKey(f.maker).toBase58().slice(0, 8) + '…')}  size=${f.sizeLots}  price=${f.priceTicks}`);
   }
   if (summary) {
     const taker = summary.takerSizeLots ?? summary.taker_size_lots;
@@ -265,7 +272,7 @@ async function main() {
   console.log(`\n  ${C.green}${b('✓ Phoenix/Manifest-class CLOB live on Solana.')}${C.reset}\n`);
   console.log(`  Demonstrated:`);
   console.log(`    • Immediate matching at maker's resting price (price-time priority)`);
-  console.log(`    • Per-fill BatchFillIntentEvent emission inline`);
+  console.log(`    • One trailing FillBatchEvent carrying every fill row`);
   console.log(`    • TakerOrderClearedEvent summary (filled / residual / match_count)`);
   console.log(`    • POST_ONLY rejection on would-cross`);
   console.log(`    • IOC cancel-residual semantics`);

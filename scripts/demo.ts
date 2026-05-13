@@ -644,7 +644,7 @@ async function showcase(state: DemoState) {
     ['VPIN-gated FLP pause (toxicity ≥70%)', 'No other DEX has this'],
     ['EMA-blended funding (50/50 prior)', 'HL: per-block recompute'],
     ['Modular wrapper-CPI (4 programs, indep upgrade)', 'All others: monolith'],
-    ['Phoenix/Manifest-class CLOB on a hypertree book', 'Original O(N²) FBA: 64-order cap'],
+    ['Hypertree CLOB walked in O(log N) per taker', 'Phoenix: O(slab) cranked; Manifest: tied at log N'],
   ];
   for (const [win, vs] of wins) {
     console.log(`  ${c.green('✓')} ${c.bold(win)}`);

@@ -129,7 +129,11 @@ pub struct RestingOrderV2 {
     /// so wave 18d can ship without seat-claim plumbing.
     pub trader: Pubkey,
 
-    /// Anti-replay guard for off-chain replay tools.
+    /// Anti-replay guard for off-chain replay tools. u32 saturates to
+    /// u32::MAX (the unwrap_or path in call sites) once the validator's
+    /// slot counter exceeds 2^32 ≈ 204 years on Solana mainnet. Replay
+    /// tools that compare against this field must handle the saturation
+    /// (treat `last_valid_slot == u32::MAX` as "always valid").
     pub last_valid_slot: u32,
 
     pub side: u8,        // 0 = long/buy/bid, 1 = short/sell/ask
@@ -407,14 +411,11 @@ impl<'a> MarketBookHandle<'a> {
     /// bid given our inverted encoding) indices on the header.
     pub fn insert_bid(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
         let idx = self.alloc_node()?;
-        // Write the RBNode<RestingOrderV2> payload at idx. RedBlackTree's
-        // `insert` will fill in the RBT-bookkeeping fields (left/right/
-        // parent/color) and call `value = order` internally.
+        // O(1) cache update: capture order_id now, compare against cached
+        // best AFTER tree insertion. Both sides encode best = MIN-by-order_id.
+        let new_order_id = order.order_id;
         let new_root;
         {
-            // Pass NIL for the RBT's max-tracking slot — we don't use the
-            // RBT's notion of MAX. Our "best" is the MIN of the tree (see
-            // `encode_order_id` for why), recomputed below.
             let mut tree = RedBlackTree::<RestingOrderV2>::new(
                 self.data,
                 self.header.bids_root_index,
@@ -424,7 +425,14 @@ impl<'a> MarketBookHandle<'a> {
             new_root = tree.get_root_index();
         }
         self.header.bids_root_index = new_root;
-        self.header.bids_best_index = lookup_min_index::<RestingOrderV2>(self.data, new_root);
+        // O(1) best update: new is best iff tree was empty OR new order_id
+        // < current best's order_id. No leftmost-walk required.
+        let cur_best = self.header.bids_best_index;
+        if cur_best == NIL
+            || new_order_id < self.order_at(cur_best).order_id
+        {
+            self.header.bids_best_index = idx;
+        }
         self.header.total_orders_active = self.header.total_orders_active.saturating_add(1);
         Ok(idx)
     }
@@ -434,6 +442,7 @@ impl<'a> MarketBookHandle<'a> {
     /// natural ascending order — smallest order_id is the best ask).
     pub fn insert_ask(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
         let idx = self.alloc_node()?;
+        let new_order_id = order.order_id;
         let new_root;
         {
             let mut tree = RedBlackTree::<RestingOrderV2>::new(
@@ -445,7 +454,12 @@ impl<'a> MarketBookHandle<'a> {
             new_root = tree.get_root_index();
         }
         self.header.asks_root_index = new_root;
-        self.header.asks_best_index = lookup_min_index::<RestingOrderV2>(self.data, new_root);
+        let cur_best = self.header.asks_best_index;
+        if cur_best == NIL
+            || new_order_id < self.order_at(cur_best).order_id
+        {
+            self.header.asks_best_index = idx;
+        }
         self.header.total_orders_active = self.header.total_orders_active.saturating_add(1);
         Ok(idx)
     }
@@ -510,6 +524,26 @@ impl<'a> MarketBookHandle<'a> {
     /// when a bid is fully consumed (size hits zero) and for permissionless
     /// expired-order cleanup.
     pub fn remove_bid_node(&mut self, idx: DataIndex) {
+        // Pre-capture successor BEFORE tree mutation. MIN has no left child
+        // (leftmost by construction), so it has ≤1 child and remove_by_index
+        // skips its swap-with-successor path — meaning the successor's
+        // DataIndex remains valid after the remove. Rotations may shuffle
+        // parent/child pointers but never move VALUES between slots, so
+        // the successor's index still points at the in-order next-smallest
+        // node — which IS the new MIN once `idx` is gone. If we're not
+        // removing the best, the cached pointer is unchanged.
+        let was_best = self.header.bids_best_index == idx;
+        let new_best = if was_best {
+            let tree = RedBlackTreeReadOnly::<RestingOrderV2>::new(
+                &self.data[..],
+                self.header.bids_root_index,
+                NIL,
+            );
+            successor_index::<RestingOrderV2>(&tree, idx)
+        } else {
+            self.header.bids_best_index
+        };
+
         let new_root;
         {
             let mut tree = RedBlackTree::<RestingOrderV2>::new(
@@ -521,7 +555,7 @@ impl<'a> MarketBookHandle<'a> {
             new_root = tree.get_root_index();
         }
         self.header.bids_root_index = new_root;
-        self.header.bids_best_index = lookup_min_index::<RestingOrderV2>(self.data, new_root);
+        self.header.bids_best_index = new_best;
         self.header.total_orders_active =
             self.header.total_orders_active.saturating_sub(1);
         self.free_node(idx);
@@ -529,6 +563,18 @@ impl<'a> MarketBookHandle<'a> {
 
     /// Mirror of `remove_bid_node` for the asks RBT.
     pub fn remove_ask_node(&mut self, idx: DataIndex) {
+        let was_best = self.header.asks_best_index == idx;
+        let new_best = if was_best {
+            let tree = RedBlackTreeReadOnly::<RestingOrderV2>::new(
+                &self.data[..],
+                self.header.asks_root_index,
+                NIL,
+            );
+            successor_index::<RestingOrderV2>(&tree, idx)
+        } else {
+            self.header.asks_best_index
+        };
+
         let new_root;
         {
             let mut tree = RedBlackTree::<RestingOrderV2>::new(
@@ -540,7 +586,7 @@ impl<'a> MarketBookHandle<'a> {
             new_root = tree.get_root_index();
         }
         self.header.asks_root_index = new_root;
-        self.header.asks_best_index = lookup_min_index::<RestingOrderV2>(self.data, new_root);
+        self.header.asks_best_index = new_best;
         self.header.total_orders_active =
             self.header.total_orders_active.saturating_sub(1);
         self.free_node(idx);

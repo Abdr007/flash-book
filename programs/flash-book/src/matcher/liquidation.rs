@@ -145,6 +145,21 @@ pub fn compute_shortfall(
         .or_overflow()?
         .checked_sub(penalty)
         .or_underflow()?;
+    // ─── i128 → u64 saturation: INTENTIONAL, not a bug. ─────────────────
+    // Every arithmetic step above used `checked_*` and would have errored
+    // out on legitimate overflow (e.g. wrap, sign confusion). Reaching this
+    // point means the math succeeded; we only need to fit the i128 results
+    // into the u64 wire fields of `ShortfallResult`. The clamps below are
+    // a defensive "this notional is implausibly large; pin to u64::MAX so
+    // downstream consumers see the largest representable value rather than
+    // a wrapped tiny number". With realistic market params (max_oi_base_lots
+    // bounded, leverage capped, BPS_DENOM 10⁴) reaching u64::MAX requires
+    // a position whose dollar-notional exceeds ~$18.4 quintillion — five
+    // orders of magnitude beyond global derivatives notional.
+    //
+    // DO NOT replace this with checked_into / try_into — that would
+    // *abort the liquidation* on a numerically extreme position, leaving
+    // an unwinnable position open. Saturation is the safe failure mode.
     let penalty_u64 = if penalty < 0 { 0 } else if penalty > u64::MAX as i128 { u64::MAX } else { penalty as u64 };
     if remaining >= 0 {
         let recovered = if remaining > u64::MAX as i128 { u64::MAX } else { remaining as u64 };

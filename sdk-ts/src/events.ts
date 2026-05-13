@@ -153,24 +153,34 @@ export interface TraderTierUpgradedEvent {
   volumeQuoteLots: BN;
 }
 
-/// Sequencer feed — emitted inline per CLOB taker match so the off-chain
-/// sequencer can dispatch apply_fill / apply_flp_fill on mainnet. FLP
-/// detection: `maker == PublicKey.default`.
-export interface BatchFillIntentEvent {
-  market: PublicKey;
-  taker: PublicKey;
+/// Per-fill entry inside `FillBatchEvent.fills`. The redundant
+/// `market` / `taker` / `takerSide` / `takerId` fields live once on the
+/// parent event. `maker === PublicKey.default` signals an FLP virtual
+/// quote fill; off-chain consumers dispatch `applyFlpFill` for those
+/// rows and `applyFill` for the rest.
+export interface FillEntry {
   maker: PublicKey;
-  takerSide: number;
   sizeLots: BN;
   priceTicks: BN;
-  takerId: BN;
   makerId: BN;
+}
+
+/// CLOB hot-path fill feed — one event per `place_taker_order_v2`
+/// carrying every match in a single `fills` array. The off-chain
+/// sequencer iterates `fills` and dispatches `applyFill` /
+/// `applyFlpFill` per row.
+export interface FillBatchEvent {
+  market: PublicKey;
+  taker: PublicKey;
+  takerSide: number;
+  takerId: BN;
+  fills: FillEntry[];
 }
 
 /// CLOB taker-walk summary — emitted once per `place_taker_order_v2` call
 /// after the matcher walks the resting book. Carries the requested vs
 /// actually-filled vs residual-resting size + the count of inline
-/// `BatchFillIntentEvent`s emitted in the same tx.
+/// `FillEntry`s carried in the trailing `FillBatchEvent`.
 export interface TakerOrderClearedEvent {
   market: PublicKey;
   taker: PublicKey;
@@ -259,7 +269,7 @@ export type FlashBookEvent =
   | { name: 'FeeTiersUpdatedEvent'; data: FeeTiersUpdatedEvent }
   | { name: 'TraderEffectiveTierEvent'; data: TraderEffectiveTierEvent }
   | { name: 'TraderTierUpgradedEvent'; data: TraderTierUpgradedEvent }
-  | { name: 'BatchFillIntentEvent'; data: BatchFillIntentEvent }
+  | { name: 'FillBatchEvent'; data: FillBatchEvent }
   | { name: 'TakerOrderClearedEvent'; data: TakerOrderClearedEvent }
   | { name: 'MarketLeverageTiersInitializedEvent'; data: MarketLeverageTiersInitializedEvent }
   | { name: 'MarketLeverageTiersUpdatedEvent'; data: MarketLeverageTiersUpdatedEvent }

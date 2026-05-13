@@ -1,15 +1,12 @@
-//! Wave-18g bookkeeping helpers for `run_batch_v2`. Each function here
-//! is a small pure transform that captures one "smarter-than-HL/Phoenix/
-//! Manifest" idea — testable in isolation, called from the matcher tick.
+//! Pure-math helpers used by the matcher and by off-chain consumers
+//! that need to mirror the on-chain transforms (vol-adaptive bands,
+//! funding-rate smoothing, mark drift checks). Each function captures
+//! one idea, takes simple primitive inputs, and is unit-tested in
+//! isolation — see this file's `#[cfg(test)]` block.
 //!
-//! The full v1-parity bookkeeping (funding advance, FLP virtuals, mark
-//! TWAP, VPIN, commit sweep) lives inline in `run_batch_v2` because each
-//! step touches the MarketAccount + flp_exposure + commit_buffer
-//! contexts in interleaved ways and extracting all of it would just
-//! shift the complexity.
-//!
-//! The helpers here are the parts that can be expressed as pure math,
-//! so they get unit-tested independently:
+//! The helpers here are the parts of bookkeeping that can be expressed
+//! as pure math, decoupled from MarketAccount / FLP exposure / commit
+//! buffer plumbing:
 //!
 //!   • `vol_adaptive_band_bps`   — vol-scaled oracle band width
 //!   • `ema_blend_funding_rate`  — smoothed funding-rate transition

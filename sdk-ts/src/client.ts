@@ -336,10 +336,11 @@ export class FlashBookClient {
       .instruction();
   }
 
-  /// Delegate the MarketAccount to the ER. Required for run_batch_v2 to
-  /// mutate mark/funding/VPIN/current_batch on the ER. Pair with
-  /// delegateMarketBookIx — both delegations must be live for the
-  /// matcher tick to run on the ER.
+  /// Delegate the MarketAccount to the ER so the matcher running on
+  /// the ER can mutate mark/funding/VPIN/current_batch in lockstep with
+  /// the order book. Pair with `delegateMarketBookIx` — both delegations
+  /// must be live for the matcher to run on the ER without forking
+  /// state between layers.
   delegateMarketIx(args: {
     authority: PublicKey;
     market: PublicKey;

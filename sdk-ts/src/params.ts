@@ -180,8 +180,9 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
     concentrationThresholdLots: new BN(0),
     concentrationExtraMmrBps: 0,
     // Funding-premium TWAP dampener (off by default). Production:
-    // 4-8 batches at our 50ms FBA cadence. Smarter than HL's
-    // single-tick premium — kills funding spikes from microbursts.
+    // 4-8 settlement intervals at our ~50ms commit cadence on the ER.
+    // Smarter than HL's single-tick premium — kills funding spikes
+    // from microbursts.
     fundingPremiumTwapWindow: 0,
     // Symmetric-OI funding dampener (off by default). Production: enable
     // for non-HIP-3 markets where balanced flow is the norm. Smarter
@@ -214,7 +215,7 @@ export function defaultMajorMarketParams(): MarketParamsRaw {
  * perps but configured to disable funding (k=0), force 1x leverage, and
  * widen the FLP spread modestly. No code-level "spot mode" exists —
  * spot is just a parameter shape that makes the perp engine behave
- * like a spot market. This is by design: the FBA matcher, FLP quoter,
+ * like a spot market. This is by design: the matcher, FLP quoter,
  * commit-reveal, VPIN, and risk modules are all inherently
  * leverage-agnostic.
  */

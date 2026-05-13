@@ -76,6 +76,12 @@ pub const FLP_SEQ_RESERVED_OFFSET: u64 = 1u64 << 56;
 /// Per-trader per-batch limit on submitted orders. Spam-protection.
 pub const MAX_ORDERS_PER_TRADER_PER_BATCH: u32 = 16;
 
+/// Solana account max size (10 MB). `migrate_market_to_v3` (and any
+/// other account-reallocing ix) MUST refuse `target_size` greater than
+/// this — otherwise the realloc panics deep in the runtime and burns
+/// the tx's compute budget without surfacing a useful error.
+pub const SOLANA_MAX_ACCOUNT_SIZE: usize = 10 * 1024 * 1024;
+
 /// Hard cap on legs in a single `place_basket_order_n` call. Bounded
 /// because remaining_accounts traversal is linear in legs and each leg
 /// costs ~3 account deserialisations + a buffer re-serialise. Production

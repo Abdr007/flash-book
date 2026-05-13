@@ -1,14 +1,14 @@
 #!/usr/bin/env bun
-// Flash Book V3 Sequencer — bridges ER matcher ticks to mainnet
-// settlement. Subscribes to `BatchFillIntentEvent` on the configured
-// cluster (typically the MagicBlock ER), then dispatches the matching
-// `apply_fill` (human maker) or `apply_flp_fill` (FLP maker) ix on
-// mainnet to settle the fill into Position + TraderState PDAs.
+// Flash Book V3 Sequencer — bridges ER matcher activity to mainnet
+// settlement. Subscribes to `FillBatchEvent` on the configured cluster
+// (typically the MagicBlock ER), unfolds the `fills` array, and dispatches
+// the matching `apply_fill` (human maker) or `apply_flp_fill` (FLP maker)
+// ix on mainnet to settle each row into Position + TraderState PDAs.
 //
 // MVP scope:
 //   • WebSocket subscribe to program logs
 //   • Decode events via Anchor's BorshEventCoder
-//   • Per-fill in-memory dedup (taker_id+maker_id+slot) — defeats
+//   • Per-fill in-memory dedup (taker_id + maker_id + market) — defeats
 //     duplicate emits if WebSocket reconnects mid-batch
 //   • Sign + send apply_fill / apply_flp_fill on mainnet
 //   • Console-only logging — production hardens with Prometheus
@@ -85,7 +85,11 @@ const MAINNET_RPC = process.env.MAINNET_RPC ?? MAINNET_RPC_DEFAULT;
 // detects this and routes to apply_flp_fill instead of apply_fill.
 const FLP_MARKER = PublicKey.default;
 
-interface BatchFillIntent {
+/// A single fill row pulled out of a `FillBatchEvent`. The parent event
+/// carries `market` / `taker` / `takerSide` / `takerId` once; we flatten
+/// every `FillEntry` into this shape so the dispatcher iterates one
+/// uniform record.
+interface FillRow {
   market: PublicKey;
   taker: PublicKey;
   maker: PublicKey;
@@ -111,8 +115,32 @@ function validateRpcUrl(label: string, url: string) {
   }
 }
 
-function fillKey(f: BatchFillIntent): string {
+function fillKey(f: FillRow): string {
   return `${f.market.toBase58()}:${f.takerId}:${f.makerId}`;
+}
+
+/// Unfold a decoded `FillBatchEvent` into individual `FillRow` records.
+/// The parent event hoists the per-tx fields (market/taker/...); each
+/// `FillEntry` adds the maker-specific fields. Returns [] if the input
+/// is not a FillBatchEvent.
+function unfoldFillBatch(ev: { name: string; data: any }): FillRow[] {
+  if (ev.name !== 'FillBatchEvent') return [];
+  const d = ev.data as any;
+  const market = new PublicKey(d.market);
+  const taker = new PublicKey(d.taker);
+  const takerSide = (d.takerSide ?? d.taker_side) as number;
+  const takerId = BigInt((d.takerId ?? d.taker_id).toString());
+  const fills = (d.fills ?? []) as any[];
+  return fills.map((f) => ({
+    market,
+    taker,
+    maker: new PublicKey(f.maker),
+    takerSide,
+    sizeLots: BigInt((f.sizeLots ?? f.size_lots).toString()),
+    priceTicks: BigInt((f.priceTicks ?? f.price_ticks).toString()),
+    takerId,
+    makerId: BigInt((f.makerId ?? f.maker_id).toString()),
+  }));
 }
 
 // ─── Main ────────────────────────────────────────────────────────────
@@ -172,36 +200,39 @@ async function main() {
       } catch {
         continue; // not a flash-book event
       }
-      if (!event || event.name !== 'BatchFillIntentEvent') continue;
-      const data = event.data as BatchFillIntent;
-      const key = fillKey(data);
-      if (seen.has(key)) {
-        skippedCount++;
-        continue;
-      }
-      seen.add(key);
-      if (seen.size > SEEN_BOUND) {
-        // Trim oldest 25%; fine for MVP since dups window is small.
-        const keep = Array.from(seen).slice(SEEN_BOUND / 4);
-        seen.clear();
-        for (const k of keep) seen.add(k);
-      }
+      if (!event || event.name !== 'FillBatchEvent') continue;
+      // One FillBatchEvent carries every fill from the taker's walk —
+      // unfold and dispatch each row independently with its own dedup key.
+      for (const row of unfoldFillBatch(event)) {
+        const key = fillKey(row);
+        if (seen.has(key)) {
+          skippedCount++;
+          continue;
+        }
+        seen.add(key);
+        if (seen.size > SEEN_BOUND) {
+          // Trim oldest 25%; fine for MVP since dups window is small.
+          const keep = Array.from(seen).slice(SEEN_BOUND / 4);
+          seen.clear();
+          for (const k of keep) seen.add(k);
+        }
 
-      try {
-        await dispatch(mainnetClient, sequencer, data);
-        appliedCount++;
-      } catch (e) {
-        errorCount++;
-        console.error(`  ✗ dispatch failed for ${key}:`, (e as Error).message);
-        // Drop from dedup so a manual retry can re-process.
-        seen.delete(key);
+        try {
+          await dispatch(mainnetClient, sequencer, row);
+          appliedCount++;
+        } catch (e) {
+          errorCount++;
+          console.error(`  ✗ dispatch failed for ${key}:`, (e as Error).message);
+          // Drop from dedup so a manual retry can re-process.
+          seen.delete(key);
+        }
       }
     }
   };
 
   // Subscribe to logs. `mentions` filter limits firehose to flash-book.
   const subId = erConn.onLogs(FLASH_BOOK_PROGRAM_ID, handleLogs, 'confirmed');
-  console.log(`  ✓ subscribed (subId=${subId})  →  watching for BatchFillIntentEvent…`);
+  console.log(`  ✓ subscribed (subId=${subId})  →  watching for FillBatchEvent…`);
 
   process.on('SIGINT', async () => {
     console.log(`\n▶ Shutting down — applied=${appliedCount} errors=${errorCount}`);
@@ -216,7 +247,7 @@ async function main() {
 async function dispatch(
   client: FlashBookClient,
   sequencer: Keypair,
-  fill: BatchFillIntent,
+  fill: FillRow,
 ): Promise<void> {
   const taker = new PublicKey(fill.taker);
   const market = new PublicKey(fill.market);

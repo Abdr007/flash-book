@@ -13,8 +13,9 @@
 //     (u8, 0..255 per user-side).
 //   • Cancellation: editLimitOrder with both limit_price=0 AND size_amount=0
 //     is the canonical cancel pattern (per IDL doc string).
-//   • No FBA mark — V2 mark is the oracle. No VPIN signal exists, so the
-//     strategy's VPIN-widening branch collapses to zero on V2 (intentional).
+//   • V2 mark is the oracle directly (no on-protocol mark engine). No VPIN
+//     signal exists, so the strategy's VPIN-widening branch collapses to
+//     zero on V2 (intentional).
 //
 // We import the SDK dynamically inside method calls so consumers who don't
 // use V2 don't pay the install cost. Type signatures use a structural

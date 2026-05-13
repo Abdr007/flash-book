@@ -180,6 +180,28 @@ async function exists(conn: Connection, pk: PublicKey): Promise<boolean> {
   return (await conn.getAccountInfo(pk)) !== null;
 }
 
+/// Unfold a `FillBatchEvent` from a decoded event list into per-row
+/// objects shaped like the iteration code expects (i.e. `{data: {taker,
+/// maker, sizeLots, priceTicks, takerSide}}`). Returns an empty array
+/// if no FillBatchEvent is present.
+function unfoldFillBatch(
+  evs: Array<{ name: string; data: any }>,
+): Array<{ data: any }> {
+  const fb = evs.find((e) => e.name === 'FillBatchEvent')?.data;
+  if (!fb) return [];
+  return (fb.fills ?? []).map((f: any) => ({
+    data: {
+      taker: fb.taker,
+      maker: f.maker,
+      sizeLots: f.sizeLots ?? f.size_lots,
+      priceTicks: f.priceTicks ?? f.price_ticks,
+      takerSide: fb.takerSide ?? fb.taker_side,
+      takerId: fb.takerId ?? fb.taker_id,
+      makerId: f.makerId ?? f.maker_id,
+    },
+  }));
+}
+
 // ─── Main flow ───────────────────────────────────────────────────────
 async function main() {
   console.log(b('\n  Flash Book V3 — END-TO-END LIQUIDATION PROOF\n'));
@@ -418,7 +440,9 @@ async function main() {
   });
   const carolSig = await send(conn, carol, [heapIx, cuIx, carolTakerIx]);
   const carolEvents = await decodeEvents(conn, carolSig);
-  const fills2 = carolEvents.filter((e) => e.name === 'BatchFillIntentEvent');
+  // Hot-path CLOB emits a single FillBatchEvent; unfold its `fills` array
+  // into the per-row shape the legacy code below iterates.
+  const fills2 = unfoldFillBatch(carolEvents);
   const cleared2 = carolEvents.find((e) => e.name === 'TakerOrderClearedEvent')?.data;
   console.log(ok(`Carol taker fired  ${d(carolSig.slice(0, 20) + '…')}`));
   if (cleared2) {
@@ -606,7 +630,7 @@ async function main() {
   });
   const bobBuySig = await send(conn, bob, [heapIx, cuIx, bobBuyIx]);
   const bobEvents = await decodeEvents(conn, bobBuySig);
-  const bobFills = bobEvents.filter((e) => e.name === 'BatchFillIntentEvent');
+  const bobFills = unfoldFillBatch(bobEvents);
   const bobCleared = bobEvents.find((e) => e.name === 'TakerOrderClearedEvent')?.data;
   console.log(ok(`Bob taker fired  ${d(bobBuySig.slice(0, 20) + '…')}`));
   if (bobCleared) {

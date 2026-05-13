@@ -322,23 +322,34 @@ async function openCounterShort(
   const takerSig = await send(conn, taker, [heapIx, cuIx, takerIx]);
   console.log(ok(`${label} takes ${sideOfTaker.toUpperCase()} ${sizeLots} @ ${priceTicks}  ${d(takerSig.slice(0, 20) + '…')}`));
 
-  // Settle fills
+  // Settle fills. The CLOB hot path emits one trailing FillBatchEvent
+  // with every fill row inside; iterate fills[] and dispatch applyFill.
   const evs = await decodeEvents(conn, takerSig);
-  const fills = evs.filter((e) => e.name === 'BatchFillIntentEvent');
-  for (const f of fills) {
-    const t = new PublicKey(f.data.taker);
-    const m = new PublicKey(f.data.maker);
-    const sz = f.data.sizeLots ?? f.data.size_lots;
-    const px = f.data.priceTicks ?? f.data.price_ticks;
-    const ts = f.data.takerSide ?? f.data.taker_side;
+  type FillRow = { taker: PublicKey; maker: PublicKey; sizeLots: any; priceTicks: any; takerSide: number };
+  const rows: FillRow[] = [];
+  for (const e of evs) {
+    if (e.name === 'FillBatchEvent') {
+      const fb: any = e.data;
+      for (const f of fb.fills ?? []) {
+        rows.push({
+          taker: new PublicKey(fb.taker),
+          maker: new PublicKey(f.maker),
+          sizeLots: f.sizeLots ?? f.size_lots,
+          priceTicks: f.priceTicks ?? f.price_ticks,
+          takerSide: fb.takerSide ?? fb.taker_side,
+        });
+      }
+    }
+  }
+  for (const f of rows) {
     const ix = await client.applyFillIx({
       sequencer: authority.publicKey,
       market,
-      takerTrader: t,
-      makerTrader: m,
-      sizeLots: new BN(sz.toString()) as unknown as bigint,
-      priceTicks: new BN(px.toString()) as unknown as bigint,
-      takerSide: ts === 0 ? 'long' : 'short',
+      takerTrader: f.taker,
+      makerTrader: f.maker,
+      sizeLots: new BN(f.sizeLots.toString()) as unknown as bigint,
+      priceTicks: new BN(f.priceTicks.toString()) as unknown as bigint,
+      takerSide: f.takerSide === 0 ? 'long' : 'short',
       useFeeTiers: true,
     });
     await send(conn, authority, [ix]);
