@@ -929,12 +929,12 @@ pub mod flash_book {
         if old_idx == crate::hypertree::NIL {
             return err!(FlashBookError::LiquidationStale);
         }
-        let old_seq = {
+        let (old_seq, old_sub_index) = {
             let order = handle.order_at(old_idx);
             if order.trader != trader_pk {
                 return err!(FlashBookError::WrongTrader);
             }
-            order.seq
+            (order.seq, order.sub_index)
         };
 
         // ── Phase 2: remove the old order ─────────────────────────────
@@ -964,7 +964,8 @@ pub mod flash_book {
             side,
             order_type: 0,
             flags: new_flags,
-            sub_index: 0,
+            // Phase 2f — modify preserves the original order's sub_index.
+            sub_index: old_sub_index,
         };
         let new_idx = if side_is_bid {
             handle.insert_bid(order)?
@@ -1422,6 +1423,7 @@ pub mod flash_book {
         s.builder_max_fee_share_bps = 0;
         s.volume_30d_quote_lots = 0;
         s.volume_window_start_slot = Clock::get()?.slot;
+        s.sub_index = 0; // main account
         Ok(())
     }
 
@@ -1475,6 +1477,7 @@ pub mod flash_book {
         s.builder_max_fee_share_bps = 0;
         s.volume_30d_quote_lots = 0;
         s.volume_window_start_slot = Clock::get()?.slot;
+        s.sub_index = sub_index;
         emit!(SubAccountOpenedEvent {
             trader: ctx.accounts.trader.key(),
             sub_index,
@@ -4019,12 +4022,14 @@ pub mod flash_book {
 
         // V2 inject — into BOTH market_book PDAs.
         let now_slot = Clock::get()?.slot;
+        let trader_sub_index = ctx.accounts.trader_state.sub_index;
         let (seq_a, idx_a) = inject_leg_into_hypertree(
             &ctx.accounts.market_book_a,
             market_a_key,
             trader_key,
             &leg_a,
             now_slot,
+            trader_sub_index,
         )?;
         let (seq_b, idx_b) = inject_leg_into_hypertree(
             &ctx.accounts.market_book_b,
@@ -4032,6 +4037,7 @@ pub mod flash_book {
             trader_key,
             &leg_b,
             now_slot,
+            trader_sub_index,
         )?;
 
         emit!(BasketOrderPlacedV2Event {
@@ -4155,6 +4161,7 @@ pub mod flash_book {
 
         // Inject each leg into its market_book.
         let now_slot = Clock::get()?.slot;
+        let trader_sub_index = trader_state.sub_index;
         for (i, leg) in legs.iter().enumerate() {
             let book_ai = &remaining[i * 3 + 1];
             inject_leg_into_hypertree_unchecked(
@@ -4163,6 +4170,7 @@ pub mod flash_book {
                 trader_key,
                 leg,
                 now_slot,
+                trader_sub_index,
             )?;
         }
 
@@ -4248,7 +4256,8 @@ pub mod flash_book {
             side: trigger.side,
             order_type: 0, // limit
             flags: 0,
-            sub_index: 0,
+            // Phase 2f — V1 trigger carries its trader's sub_index.
+            sub_index: trigger.sub_index,
         };
         let inserted_idx = if side_is_bid {
             handle.insert_bid(order)?
@@ -4481,6 +4490,7 @@ pub mod flash_book {
         let twap_trader = twap.trader;
         let twap_side = twap.side;
         let twap_limit_ticks = twap.limit_price_ticks;
+        let twap_sub_index = twap.sub_index;
         let inserted_idx;
         let next_seq;
         {
@@ -4518,7 +4528,8 @@ pub mod flash_book {
                 side: twap_side,
                 order_type: 0, // limit
                 flags: 0,
-                sub_index: 0,
+                // Phase 2f — V1 TWAP slice inherits the TWAP's sub_index.
+                sub_index: twap_sub_index,
             };
             inserted_idx = if side_is_bid {
                 handle.insert_bid(order)?
@@ -4605,6 +4616,7 @@ pub mod flash_book {
         let expires_at_slot = iceberg.expires_at_slot;
         let prior_child_seq = iceberg.child_order_seq;
         let iceberg_side = iceberg.side;
+        let iceberg_sub_index = iceberg.sub_index;
 
         let inserted_idx;
         let next_seq;
@@ -4659,7 +4671,8 @@ pub mod flash_book {
                 side: iceberg_side,
                 order_type: 0, // limit
                 flags: 0,
-                sub_index: 0,
+                // Phase 2f — V1 iceberg child inherits the iceberg's sub_index.
+                sub_index: iceberg_sub_index,
             };
             inserted_idx = if side_is_bid {
                 handle.insert_bid(order)?
@@ -5702,7 +5715,10 @@ pub mod flash_book {
                 side: close_side_u8,
                 order_type: 3, // 3 = Liquidation (matcher promotes priority)
                 flags: 0,
-                sub_index: 0,
+                // Phase 2f — carry the liquidatee's sub_index so ApplyFill
+                // routes the close fill back to the same TraderState
+                // that's being liquidated (main vs sub).
+                sub_index: ctx.accounts.trader_state.sub_index,
             };
             inserted_idx = if side_is_bid {
                 handle.insert_bid(order)?
@@ -6184,7 +6200,8 @@ pub mod flash_book {
                 side: close_side_u8,
                 order_type: 3, // Liquidation
                 flags: 0,
-                sub_index: 0,
+                // Phase 2f — propagate the liquidatee's sub_index.
+                sub_index: trader_state.sub_index,
             };
             inserted_idx = if side_is_bid {
                 handle.insert_bid(order)?
@@ -6245,6 +6262,7 @@ pub mod flash_book {
         limit_price_ticks: u64,
         reduce_only: bool,
         expires_at_slot: u64,
+        sub_index: u8,
     ) -> Result<()> {
         require!(side <= 1, FlashBookError::OutOfRange);
         require!(kind <= 1, FlashBookError::OutOfRange);
@@ -6285,6 +6303,7 @@ pub mod flash_book {
         trigger.limit_price_ticks = limit_price_ticks;
         trigger.created_at_slot = now;
         trigger.expires_at_slot = expires_at_slot;
+        trigger.sub_index = sub_index;
 
         emit!(TriggerOrderV3PlacedEvent {
             market: market.key(),
@@ -6338,6 +6357,7 @@ pub mod flash_book {
         let limit_ticks = trigger.limit_price_ticks;
         let trigger_id = trigger.trigger_id;
         let trader_pk = trigger.trader;
+        let trigger_sub_index = trigger.sub_index;
         let market_key = market.key();
 
         // Inline order injection into the hypertree.
@@ -6367,7 +6387,9 @@ pub mod flash_book {
             side,
             order_type: 0,
             flags: 0,
-            sub_index: 0,
+            // Phase 2f — propagate the trigger's sub_index into the
+            // synthetic order so fills route to the right TraderState.
+            sub_index: trigger_sub_index,
         };
         let inserted_idx = if side_is_bid {
             handle.insert_bid(order)?
@@ -6418,6 +6440,7 @@ pub mod flash_book {
         limit_price_ticks: u64,
         slot_interval: u64,
         end_slot: u64,
+        sub_index: u8,
     ) -> Result<()> {
         require!(side <= 1, FlashBookError::OutOfRange);
         require!(slice_size_lots > 0, FlashBookError::ZeroSize);
@@ -6455,6 +6478,7 @@ pub mod flash_book {
         twap.slot_interval = slot_interval;
         twap.end_slot = end_slot;
         twap.last_slice_at_slot = 0;
+        twap.sub_index = sub_index;
 
         emit!(TwapOrderV3PlacedEvent {
             market: market.key(),
@@ -6502,6 +6526,7 @@ pub mod flash_book {
         let limit = twap.limit_price_ticks;
         let twap_id = twap.twap_id;
         let trader_pk = twap.trader;
+        let twap_sub_index = twap.sub_index;
         let market_key = market.key();
 
         // Inline order injection.
@@ -6531,7 +6556,8 @@ pub mod flash_book {
             side,
             order_type: 0,
             flags: 0,
-            sub_index: 0,
+            // Phase 2f — each slice carries the parent TWAP's sub_index.
+            sub_index: twap_sub_index,
         };
         let inserted_idx = if side_is_bid {
             handle.insert_bid(order)?
@@ -6596,6 +6622,7 @@ pub mod flash_book {
         displayed_size_lots: u64,
         limit_ticks: u64,
         expires_at_slot: u64,
+        sub_index: u8,
     ) -> Result<()> {
         require!(side <= 1, FlashBookError::OutOfRange);
         require!(total_size_lots > 0, FlashBookError::ZeroSize);
@@ -6654,7 +6681,7 @@ pub mod flash_book {
                 side,
                 order_type: 0,
                 flags: 0,
-                sub_index: 0,
+                sub_index,
             };
             if side_is_bid {
                 handle.insert_bid(order)?;
@@ -6671,6 +6698,8 @@ pub mod flash_book {
         iceberg.iceberg_id = iceberg_id;
         iceberg.side = side;
         iceberg.flags = state_v3::IcebergOrderAccountV3::FLAG_ACTIVE;
+        iceberg.sub_index = sub_index;
+        iceberg._pad0 = [0u8; 3];
         iceberg.limit_ticks = limit_ticks;
         iceberg.total_size_lots = total_size_lots;
         iceberg.remaining_lots = total_size_lots.saturating_sub(first_chunk);
@@ -6713,6 +6742,7 @@ pub mod flash_book {
         let expires = iceberg.expires_at_slot;
         let iceberg_id = iceberg.iceberg_id;
         let trader_pk = iceberg.trader;
+        let iceberg_sub_index = iceberg.sub_index;
         let market_key = market.key();
 
         let inserted_seq;
@@ -6743,7 +6773,9 @@ pub mod flash_book {
                 side,
                 order_type: 0,
                 flags: 0,
-                sub_index: 0,
+                // Phase 2f — replenished chunk inherits the iceberg's
+                // sub_index so children route to the same TraderState.
+                sub_index: iceberg_sub_index,
             };
             if side_is_bid {
                 handle.insert_bid(order)?;
@@ -6807,6 +6839,7 @@ pub mod flash_book {
         sl_trigger_price_ticks: u64,
         sl_limit_ticks: u64,
         expires_at_slot: u64,
+        sub_index: u8,
     ) -> Result<()> {
         require!(parent_side <= 1, FlashBookError::OutOfRange);
         require!(tp_trigger_id != sl_trigger_id, FlashBookError::OutOfRange);
@@ -6891,7 +6924,8 @@ pub mod flash_book {
                 side: parent_side,
                 order_type: 0,
                 flags: 0,
-                sub_index: 0,
+                // Phase 2f — parent + both children carry the same sub_index.
+                sub_index,
             };
             if side_is_bid {
                 handle.insert_bid(order)?;
@@ -6923,6 +6957,7 @@ pub mod flash_book {
         tp.limit_price_ticks = tp_limit_ticks;
         tp.created_at_slot = now;
         tp.expires_at_slot = expires_at_slot;
+        tp.sub_index = sub_index;
 
         let sl = &mut ctx.accounts.sl_trigger;
         sl.trader = trader_pk;
@@ -6937,6 +6972,7 @@ pub mod flash_book {
         sl.limit_price_ticks = sl_limit_ticks;
         sl.created_at_slot = now;
         sl.expires_at_slot = expires_at_slot;
+        sl.sub_index = sub_index;
 
         emit!(BracketOrderV3PlacedEvent {
             market: market_key,
@@ -7668,6 +7704,7 @@ pub mod flash_book {
         offer_price_ticks: u64,
         max_size_lots: u64,
         expires_at_slot: u64,
+        maker_sub_index: u8,
     ) -> Result<()> {
         require!(side <= 1, FlashBookError::OutOfRange);
         require!(offer_price_ticks > 0, FlashBookError::ZeroPrice);
@@ -7691,7 +7728,8 @@ pub mod flash_book {
         let offer = &mut ctx.accounts.jit_offer;
         offer.bump = ctx.bumps.jit_offer;
         offer.side = side;
-        offer._pad0 = [0u8; 2];
+        offer.maker_sub_index = maker_sub_index;
+        offer._pad0 = [0u8; 1];
         offer.nonce = nonce;
         offer.market = market.key();
         offer.maker = ctx.accounts.maker.key();
@@ -10722,6 +10760,7 @@ fn inject_leg_into_hypertree(
     trader_key: Pubkey,
     leg: &BasketLeg,
     now_slot: u64,
+    sub_index: u8,
 ) -> Result<(u64, hypertree::DataIndex)> {
     let mut book_data = market_book.try_borrow_mut_data()?;
     let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
@@ -10749,7 +10788,7 @@ fn inject_leg_into_hypertree(
         side: leg.side,
         order_type: 0, // limit
         flags: if leg.post_only { 0b0000_0001 } else { 0 },
-        sub_index: 0,
+        sub_index,
     };
     let idx = if side_is_bid {
         handle.insert_bid(order)?
@@ -10767,6 +10806,7 @@ fn inject_leg_into_hypertree_unchecked(
     trader_key: Pubkey,
     leg: &BasketLeg,
     now_slot: u64,
+    sub_index: u8,
 ) -> Result<()> {
     let mut book_data = market_book_ai.try_borrow_mut_data()?;
     let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
@@ -10794,7 +10834,7 @@ fn inject_leg_into_hypertree_unchecked(
         side: leg.side,
         order_type: 0,
         flags: if leg.post_only { 0b0000_0001 } else { 0 },
-        sub_index: 0,
+        sub_index,
     };
     if side_is_bid {
         handle.insert_bid(order)?;

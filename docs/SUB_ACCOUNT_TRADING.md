@@ -41,14 +41,29 @@ before a single line of seeds-relaxation is safe to merge.
   off-chain sequencer can derive
   `[STATE_SEED, trader.as_ref(), &[sub_index]]` and pass the right
   TraderState to ApplyFill / ApplyFlpFill.
-- **Remaining limitations (Phase 2f+):** trigger orders, JIT-
-  liquidation offers, and TWAP/iceberg/bracket execution paths still
-  default sub_index = 0 when they synthesise resting orders — their
-  surrounding state accounts (TriggerOrderAccount, JitLiquidationOffer,
-  etc.) don't carry sub_index yet. So sub-accounts can place plain
-  limit + taker orders today, but their triggers / TWAP children / JIT
-  offers route to main. Each of those is a focused follow-up
-  (1 ix + 1 state struct + 1 SDK helper per family).
+- **Phase 2f: SHIPPED.** sub_index threaded through every secondary
+  order primitive:
+  - V3 trigger orders (`place_trigger_order_v3` + `execute_trigger_order_v3`)
+  - V3 TWAP orders (`place_twap_order_v3` + `execute_twap_slice_v3`)
+  - V3 iceberg orders (`place_iceberg_order_v3` + `replenish_iceberg_v3`)
+  - V3 bracket orders (`place_bracket_order_v3` — parent + TP + SL)
+  - JIT liquidation offers (`place_jit_liquidation_offer` —
+    `maker_sub_index`)
+  - V1 trigger / TWAP / iceberg execute paths (legacy state structs
+    each gained a trailing `sub_index: u8` field, layout-compatible).
+  - `modify_order_v2` preserves the original order's `sub_index`.
+  - Basket orders (V2 + V2N) inject all legs with the trader's
+    `sub_index`.
+
+  Plus `TraderStateAccount` gained its own `sub_index` field (filled
+  in by `open_trader_state` = 0 and `open_trader_sub_account` = idx).
+  The liquidation synthetic-close in `liquidate_position_v2` /
+  `liquidate_portfolio_v2` reads `trader_state.sub_index` and writes
+  it into the synthetic `RestingOrderV2`, so a sub-account's
+  liquidation routes the close fill back to the same TraderState.
+
+  Vault orders intentionally remain `sub_index = 0` — vault accounts
+  are their own TraderState family.
 
 ## 1. The aliasing problem
 

@@ -660,6 +660,13 @@ pub struct TriggerOrderAccount {
     ///   kind=1 (sl-for-short): trigger = best_price × (1 + offset_bps)
     /// 0 = unset (first update_trailing_stop initialises from current oracle).
     pub trailing_anchor_ticks: u64,
+    /// Phase 2f — TraderState sub-account index this trigger fires
+    /// against. Layout-compatible: pre-Phase-2f accounts read this back
+    /// as 0 (main) from the trailing zeros of the allocated `space()`.
+    /// `execute_trigger_order_v2` writes this into the synthetic
+    /// RestingOrderV2.sub_index so the resulting fill routes to the
+    /// right TraderState.
+    pub sub_index: u8,
 }
 
 impl TriggerOrderAccount {
@@ -695,7 +702,11 @@ pub struct IcebergOrderAccount {
     pub side: u8,
     /// bit 0 = active. Cleared when remaining_lots == 0 OR cancelled.
     pub flags: u8,
-    pub _pad0: [u8; 5],
+    /// Phase 2f — repurposes the first byte of the prior `_pad0: [u8; 5]`.
+    /// Layout-compatible: pre-Phase-2f accounts have this byte as 0
+    /// (main TraderState) by virtue of the zero-initialised allocation.
+    pub sub_index: u8,
+    pub _pad0: [u8; 4],
     pub limit_ticks: u64,
     pub total_size_lots: u64,
     /// Lots not yet displayed in the orderbook (the hidden reservoir).
@@ -750,6 +761,10 @@ pub struct TwapOrderAccount {
     /// 0 = no end. Otherwise last slot a slice may be placed in.
     pub end_slot: u64,
     pub last_slice_at_slot: u64,
+    /// Phase 2f — TraderState sub-account index. Every slice's
+    /// synthetic RestingOrderV2 carries this so fills route to the
+    /// right TraderState. Layout-compatible (trailing zeros = 0 = main).
+    pub sub_index: u8,
 }
 
 impl TwapOrderAccount {
@@ -853,6 +868,15 @@ pub struct TraderStateAccount {
     /// next apply_fill resets `volume_30d_quote_lots` and re-anchors
     /// this. HL pattern (14-day rolling tier window).
     pub volume_window_start_slot: u64,
+    /// Phase 2f — TraderState sub-account index. `0` = main; `1..=255`
+    /// = sub. Written at `open_trader_state` (= 0) and
+    /// `open_trader_sub_account` (= the sub_index). The liquidation
+    /// synthetic-close path reads this to set the
+    /// RestingOrderV2.sub_index of the close order, so when the
+    /// underwater's position closes via ApplyFill the fill routes back
+    /// to the same TraderState that's being liquidated. Layout-
+    /// compatible (trailing zeros in allocated `space()` = 0 = main).
+    pub sub_index: u8,
 }
 
 impl TraderStateAccount {

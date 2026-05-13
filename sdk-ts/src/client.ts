@@ -1719,6 +1719,13 @@ export class FlashBookClient {
     limitPriceTicks: bigint | number | BN;
     reduceOnly?: boolean;
     expiresAtSlot?: bigint | number | BN;
+    /**
+     * Phase 2f — TraderState sub-account this trigger fires against.
+     * Default 0 = main. The trigger remembers it and `execute_trigger_order_v3`
+     * sets the synthetic RestingOrderV2.sub_index from this field so
+     * the resulting fill routes to the right TraderState.
+     */
+    subIndex?: number;
   }): Promise<TransactionInstruction> {
     const trig = this.triggerOrderV3(args.market, args.trader, args.triggerId);
     const sz = args.sizeLots instanceof BN ? args.sizeLots : new BN(args.sizeLots.toString());
@@ -1743,6 +1750,7 @@ export class FlashBookClient {
         lp,
         args.reduceOnly ?? false,
         exp,
+        args.subIndex ?? 0,
       )
       .accountsPartial({
         trader: args.trader,
@@ -1802,6 +1810,8 @@ export class FlashBookClient {
     limitPriceTicks: bigint | number | BN;
     slotInterval: bigint | number | BN;
     endSlot?: bigint | number | BN;
+    /** Phase 2f — sub-account this TWAP's children belong to. */
+    subIndex?: number;
   }): Promise<TransactionInstruction> {
     const twap = this.twapOrderV3(args.market, args.trader, args.twapId);
     const bn = (v: bigint | number | BN) =>
@@ -1815,6 +1825,7 @@ export class FlashBookClient {
         bn(args.limitPriceTicks),
         bn(args.slotInterval),
         args.endSlot === undefined ? new BN(0) : bn(args.endSlot),
+        args.subIndex ?? 0,
       )
       .accountsPartial({
         trader: args.trader,
@@ -1869,6 +1880,8 @@ export class FlashBookClient {
     displayedSizeLots: bigint | number | BN;
     limitTicks: bigint | number | BN;
     expiresAtSlot?: bigint | number | BN;
+    /** Phase 2f — sub-account this iceberg's children belong to. */
+    subIndex?: number;
   }): Promise<TransactionInstruction> {
     const ice = this.icebergOrderV3(args.market, args.trader, args.icebergId);
     const book = marketBookPda(args.market, this.programId);
@@ -1882,6 +1895,7 @@ export class FlashBookClient {
         bn(args.displayedSizeLots),
         bn(args.limitTicks),
         args.expiresAtSlot === undefined ? new BN(0) : bn(args.expiresAtSlot),
+        args.subIndex ?? 0,
       )
       .accountsPartial({
         trader: args.trader,
@@ -1942,6 +1956,8 @@ export class FlashBookClient {
     slTriggerPriceTicks: bigint | number | BN;
     slLimitTicks: bigint | number | BN;
     expiresAtSlot?: bigint | number | BN;
+    /** Phase 2f — sub-account the parent order + both child triggers belong to. */
+    subIndex?: number;
   }): Promise<TransactionInstruction> {
     const tp = this.triggerOrderV3(args.market, args.trader, args.tpTriggerId);
     const sl = this.triggerOrderV3(args.market, args.trader, args.slTriggerId);
@@ -1960,6 +1976,7 @@ export class FlashBookClient {
         bn(args.slTriggerPriceTicks),
         bn(args.slLimitTicks),
         args.expiresAtSlot === undefined ? new BN(0) : bn(args.expiresAtSlot),
+        args.subIndex ?? 0,
       )
       .accountsPartial({
         trader: args.trader,
@@ -2499,6 +2516,8 @@ export class FlashBookClient {
     offerPriceTicks: bigint | BN;
     maxSizeLots: bigint | BN;
     expiresAtSlot?: bigint | BN;
+    /** Phase 2f — maker's sub-account index. */
+    makerSubIndex?: number;
   }): Promise<TransactionInstruction> {
     const jitOffer = this.jitLiquidationOfferPda(args.market, args.maker, args.nonce);
     const bn = (v: bigint | number | BN) =>
@@ -2511,6 +2530,7 @@ export class FlashBookClient {
         bn(args.offerPriceTicks),
         bn(args.maxSizeLots),
         bn(args.expiresAtSlot ?? 0),
+        args.makerSubIndex ?? 0,
       )
       .accountsPartial({
         maker: args.maker,

@@ -26,6 +26,12 @@ pub struct TriggerOrderAccountV3 {
     pub limit_price_ticks: u64,
     pub created_at_slot: u64,
     pub expires_at_slot: u64,
+    /// Phase 2f — TraderState sub-account index this trigger fires
+    /// against. Pre-Phase-2f accounts read back as 0 (main) from the
+    /// trailing zeros of their allocated `space()`. ExecuteTriggerOrderV3
+    /// copies this into the synthetic RestingOrderV2.sub_index so the
+    /// resulting fill is routed to the right TraderState.
+    pub sub_index: u8,
 }
 
 impl TriggerOrderAccountV3 {
@@ -33,7 +39,8 @@ impl TriggerOrderAccountV3 {
     pub const FLAG_REDUCE_ONLY: u8 = 1 << 0;
     pub const FLAG_ACTIVE: u8 = 1 << 1;
     pub fn space() -> usize {
-        // 8 disc + 32+32+1+1+1+1+1 + 8+8+8+8+8 = 117. Round to 128.
+        // 8 disc + 32+32+1+1+1+1+1 + 8+8+8+8+8 + 1 (sub_index) = 118.
+        // Round to 128 (unchanged headroom).
         8 + 128
     }
 }
@@ -56,6 +63,10 @@ pub struct TwapOrderAccountV3 {
     pub slot_interval: u64,
     pub end_slot: u64,
     pub last_slice_at_slot: u64,
+    /// Phase 2f — same semantics as TriggerOrderAccountV3.sub_index.
+    /// Every child slice the TWAP emits carries this sub_index in its
+    /// RestingOrderV2.
+    pub sub_index: u8,
 }
 impl TwapOrderAccountV3 {
     pub const SEED: &'static [u8] = b"twap_v3";
@@ -75,7 +86,12 @@ pub struct IcebergOrderAccountV3 {
     pub iceberg_id: u8,
     pub side: u8,
     pub flags: u8, // bit 0: active
-    pub _pad0: [u8; 4],
+    /// Phase 2f — sub_index repurposes the first byte of the prior
+    /// `_pad0: [u8; 4]`. Pre-Phase-2f accounts have this byte as 0
+    /// (main TraderState) by virtue of the zero-initialised allocation,
+    /// so the change is layout-compatible.
+    pub sub_index: u8,
+    pub _pad0: [u8; 3],
     pub limit_ticks: u64,
     pub total_size_lots: u64,
     pub remaining_lots: u64,
@@ -205,7 +221,13 @@ pub struct JitLiquidationOfferAccount {
     /// 1=will close SHORT positions (acts as a SELLER → ask). See ix
     /// docs for the close-side mapping.
     pub side: u8,
-    pub _pad0: [u8; 2],
+    /// Phase 2f — maker's sub-account index. Repurposed from the first
+    /// byte of the prior `_pad0: [u8; 2]`. When the JIT offer fires
+    /// against an underwater position, the synthetic close order picks
+    /// up this sub_index so the maker rebate / position update lands
+    /// on the right maker TraderState.
+    pub maker_sub_index: u8,
+    pub _pad0: [u8; 1],
     pub nonce: u32,
     pub market: Pubkey,
     pub maker: Pubkey,

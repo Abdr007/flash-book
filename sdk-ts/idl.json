@@ -4809,6 +4809,10 @@
         {
           "name": "expires_at_slot",
           "type": "u64"
+        },
+        {
+          "name": "sub_index",
+          "type": "u8"
         }
       ]
     },
@@ -4898,6 +4902,10 @@
         {
           "name": "expires_at_slot",
           "type": "u64"
+        },
+        {
+          "name": "sub_index",
+          "type": "u8"
         }
       ]
     },
@@ -5015,6 +5023,10 @@
         {
           "name": "expires_at_slot",
           "type": "u64"
+        },
+        {
+          "name": "maker_sub_index",
+          "type": "u8"
         }
       ]
     },
@@ -5335,6 +5347,10 @@
         {
           "name": "expires_at_slot",
           "type": "u64"
+        },
+        {
+          "name": "sub_index",
+          "type": "u8"
         }
       ]
     },
@@ -5399,6 +5415,10 @@
         {
           "name": "end_slot",
           "type": "u64"
+        },
+        {
+          "name": "sub_index",
+          "type": "u8"
         }
       ]
     },
@@ -12279,11 +12299,20 @@
             "type": "u8"
           },
           {
+            "name": "sub_index",
+            "docs": [
+              "Phase 2f — repurposes the first byte of the prior `_pad0: [u8; 5]`.",
+              "Layout-compatible: pre-Phase-2f accounts have this byte as 0",
+              "(main TraderState) by virtue of the zero-initialised allocation."
+            ],
+            "type": "u8"
+          },
+          {
             "name": "_pad0",
             "type": {
               "array": [
                 "u8",
-                5
+                4
               ]
             }
           },
@@ -12364,11 +12393,21 @@
             "type": "u8"
           },
           {
+            "name": "sub_index",
+            "docs": [
+              "Phase 2f — sub_index repurposes the first byte of the prior",
+              "`_pad0: [u8; 4]`. Pre-Phase-2f accounts have this byte as 0",
+              "(main TraderState) by virtue of the zero-initialised allocation,",
+              "so the change is layout-compatible."
+            ],
+            "type": "u8"
+          },
+          {
             "name": "_pad0",
             "type": {
               "array": [
                 "u8",
-                4
+                3
               ]
             }
           },
@@ -12729,11 +12768,22 @@
             "type": "u8"
           },
           {
+            "name": "maker_sub_index",
+            "docs": [
+              "Phase 2f — maker's sub-account index. Repurposed from the first",
+              "byte of the prior `_pad0: [u8; 2]`. When the JIT offer fires",
+              "against an underwater position, the synthetic close order picks",
+              "up this sub_index so the maker rebate / position update lands",
+              "on the right maker TraderState."
+            ],
+            "type": "u8"
+          },
+          {
             "name": "_pad0",
             "type": {
               "array": [
                 "u8",
-                2
+                1
               ]
             }
           },
@@ -15254,6 +15304,20 @@
               "this. HL pattern (14-day rolling tier window)."
             ],
             "type": "u64"
+          },
+          {
+            "name": "sub_index",
+            "docs": [
+              "Phase 2f — TraderState sub-account index. `0` = main; `1..=255`",
+              "= sub. Written at `open_trader_state` (= 0) and",
+              "`open_trader_sub_account` (= the sub_index). The liquidation",
+              "synthetic-close path reads this to set the",
+              "RestingOrderV2.sub_index of the close order, so when the",
+              "underwater's position closes via ApplyFill the fill routes back",
+              "to the same TraderState that's being liquidated. Layout-",
+              "compatible (trailing zeros in allocated `space()` = 0 = main)."
+            ],
+            "type": "u8"
           }
         ]
       }
@@ -15483,6 +15547,18 @@
               "0 = unset (first update_trailing_stop initialises from current oracle)."
             ],
             "type": "u64"
+          },
+          {
+            "name": "sub_index",
+            "docs": [
+              "Phase 2f — TraderState sub-account index this trigger fires",
+              "against. Layout-compatible: pre-Phase-2f accounts read this back",
+              "as 0 (main) from the trailing zeros of the allocated `space()`.",
+              "`execute_trigger_order_v2` writes this into the synthetic",
+              "RestingOrderV2.sub_index so the resulting fill routes to the",
+              "right TraderState."
+            ],
+            "type": "u8"
           }
         ]
       }
@@ -15544,6 +15620,17 @@
           {
             "name": "expires_at_slot",
             "type": "u64"
+          },
+          {
+            "name": "sub_index",
+            "docs": [
+              "Phase 2f — TraderState sub-account index this trigger fires",
+              "against. Pre-Phase-2f accounts read back as 0 (main) from the",
+              "trailing zeros of their allocated `space()`. ExecuteTriggerOrderV3",
+              "copies this into the synthetic RestingOrderV2.sub_index so the",
+              "resulting fill is routed to the right TraderState."
+            ],
+            "type": "u8"
           }
         ]
       }
@@ -15792,6 +15879,15 @@
           {
             "name": "last_slice_at_slot",
             "type": "u64"
+          },
+          {
+            "name": "sub_index",
+            "docs": [
+              "Phase 2f — TraderState sub-account index. Every slice's",
+              "synthetic RestingOrderV2 carries this so fills route to the",
+              "right TraderState. Layout-compatible (trailing zeros = 0 = main)."
+            ],
+            "type": "u8"
           }
         ]
       }
@@ -15859,6 +15955,15 @@
           {
             "name": "last_slice_at_slot",
             "type": "u64"
+          },
+          {
+            "name": "sub_index",
+            "docs": [
+              "Phase 2f — same semantics as TriggerOrderAccountV3.sub_index.",
+              "Every child slice the TWAP emits carries this sub_index in its",
+              "RestingOrderV2."
+            ],
+            "type": "u8"
           }
         ]
       }
