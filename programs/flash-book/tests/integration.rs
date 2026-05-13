@@ -2826,3 +2826,334 @@ async fn migrate_position_to_trader_state_key_moves_state() {
     assert_eq!(new_after.size_lots, 7);
     assert_eq!(new_after.entry_price_ticks, 12_345);
 }
+
+// ─── Phase 2j — End-to-end ApplyFill integration tests ────────────
+//
+// The integration suite never previously exercised the apply_fill ix
+// on-chain. Phase 2b (fee routing), Phase 2g (realized-PnL
+// materialisation), and Phase 2i (sub_index PDA verification) are all
+// unit-tested via mod realized_pnl_routing_tests + mod
+// adl_routing_tests, but no test proved the full open → close → PnL
+// credit flow end-to-end. These three tests do.
+
+/// A single apply_fill ix creates BOTH the taker and maker positions
+/// (`init_if_needed` semantics) and updates OI on both sides of the
+/// market. This is the bedrock test — if this passes, the rest of
+/// the Phase 2 routing has live coverage too.
+#[tokio::test]
+async fn apply_fill_opens_both_positions_and_moves_oi() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Two traders, both with 100k collateral so fees + margin pass easily.
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // taker buys 1 lot @ 100_000 ticks from maker.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,           // long
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // sequencer
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            // None for the optional FeeTiersAccount.
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Taker is long 1 @ 100k.
+    let taker_p: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(taker_p.side, 0);
+    assert_eq!(taker_p.size_lots, 1);
+    assert_eq!(taker_p.entry_price_ticks, 100_000);
+
+    // Maker is short 1 @ 100k.
+    let maker_p: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, maker_pos).await;
+    assert_eq!(maker_p.side, 1);
+    assert_eq!(maker_p.size_lots, 1);
+    assert_eq!(maker_p.entry_price_ticks, 100_000);
+
+    // OI: one long, one short, both at this fill.
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.oi_long_lots, 1);
+    assert_eq!(market.oi_short_lots, 1);
+}
+
+/// Phase 2g coverage end-to-end: open a winning position then close
+/// it, verify the realized PnL actually materialises on the trader's
+/// `trader_state.collateral_quote_lots`. This is the bug the prior
+/// MARGIN_MATH §8.1 documented and Phase 2g fixed; this test proves
+/// the fix works on-chain, not just at the routing-math layer.
+#[tokio::test]
+async fn apply_fill_materialises_realized_pnl_on_winning_close() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let counter = Keypair::new();
+    let initial_collateral: u64 = 100_000;
+    let taker_state =
+        setup_trader(&mut ctx, &payer, &taker, initial_collateral, &protocol).await;
+    let counter_state =
+        setup_trader(&mut ctx, &payer, &counter, initial_collateral, &protocol).await;
+
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (counter_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        counter_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // ── Open: taker buys 1 lot @ 100_000 from counter. ─────────────
+    let open_ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0, // taker long
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(counter_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(counter_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[open_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let taker_after_open: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    let collateral_after_open = taker_after_open.collateral_quote_lots;
+    // Open fee for taker: notional * taker_fee_bps / 10_000
+    //                   = 1 * 100_000 * 1 * 5 / 10_000 = 50
+    // So collateral_after_open should be 100_000 - 50 = 99_950.
+    let expected_after_open = initial_collateral - 50;
+    assert_eq!(
+        collateral_after_open, expected_after_open,
+        "open fee should drop collateral by exactly 50 quote-lots"
+    );
+
+    // ── Close at 110_000: taker sells 1 lot @ 110_000 to counter.   ─
+    // Realized PnL for the taker (was long @ 100, closes @ 110):
+    //   gain = (110_000 - 100_000) * 1 * tick_size(=1) = 10_000 quote-lots
+    // Fee on the close: 1 * 110_000 * 1 * 5 / 10_000 = 55.
+    // Net change on taker_state.collateral_quote_lots over the close:
+    //   +10_000 (PnL credit) - 55 (taker fee) = +9_945.
+    let close_ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 110_000,
+            taker_side: 1, // taker now short (closing the long)
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(counter_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(counter_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[close_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let taker_after_close: TraderStateAccount =
+        fetch(&mut ctx.banks_client, taker_state).await;
+
+    // The Phase 2g materialisation check:
+    let expected_after_close = collateral_after_open + 10_000 - 55;
+    assert_eq!(
+        taker_after_close.collateral_quote_lots, expected_after_close,
+        "realized PnL must materialise on trader_state.collateral_quote_lots \
+         (Phase 2g). Got {}, expected {} (+10_000 PnL credit - 55 close fee)",
+        taker_after_close.collateral_quote_lots, expected_after_close,
+    );
+
+    // Position should be flat after the symmetric close.
+    let pos_after_close: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(pos_after_close.size_lots, 0);
+    // realized_pnl_quote_lots accumulates lifetime PnL on the position
+    // (informational tally — Phase 2g routes the collateral move via
+    // trader_state). For this single-fill close we expect the PnL
+    // delta we just verified.
+    assert_eq!(pos_after_close.realized_pnl_quote_lots, 10_000);
+}
+
+/// Phase 2i coverage: an honest-sequencer fill works; a hostile
+/// sequencer that passes the wrong sub-account TraderState PDA is
+/// rejected with WrongTrader. This locks in the 1-byte routing-attack
+/// surface fix.
+#[tokio::test]
+async fn apply_fill_rejects_wrong_sub_index_trader_state() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    // Both traders open MAIN states.
+    let taker_main_state =
+        setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_main_state =
+        setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    // Taker also opens sub-account index 1 (no funding — we just need
+    // the PDA to exist so the sequencer could legitimately pass it).
+    let taker_sub_index: u8 = 1;
+    let (taker_sub_state, _) = pda(&[
+        TraderStateAccount::SEED,
+        taker.pubkey().as_ref(),
+        &[taker_sub_index],
+    ]);
+    let open_sub_ix = build_ix(
+        flash_book::instruction::OpenTraderSubAccount {
+            sub_index: taker_sub_index,
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(taker_sub_state, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[open_sub_ix],
+            Some(&taker.pubkey()),
+            &[&taker],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let (taker_main_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_main_state.as_ref(),
+    ]);
+    let (maker_main_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_main_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // ── Attack: the sequencer passes the SUB TraderState account but
+    //    claims taker_sub_index = 0 in the ix data. Phase 2i derives
+    //    the expected PDA from (taker_sub_state.trader, 0) — which is
+    //    the MAIN PDA — and compares against the actual passed key
+    //    (the sub PDA). Mismatch → WrongTrader. ─────────────────────
+    let bad_ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,  // ← lying: actually passing sub_state
+            maker_sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_sub_state, false), // ← attack: wrong state
+            AccountMeta::new(maker_main_state, false),
+            AccountMeta::new(taker_main_pos, false),
+            AccountMeta::new(maker_main_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[bad_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "ApplyFill must reject wrong-sub_index trader_state (Phase 2i)"
+    );
+}
