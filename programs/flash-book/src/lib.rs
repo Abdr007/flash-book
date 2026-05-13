@@ -346,6 +346,7 @@ pub mod flash_book {
         limit_ticks: u64,
         flags: u8,
         expires_at_slot: u64,
+        sub_index: u8,
     ) -> Result<()> {
         // ── Hot-path validation (collapsed). Single Clock::get(), one
         // bounded match per family of inputs. Branch order matches
@@ -418,7 +419,10 @@ pub mod flash_book {
             side,
             order_type: 0, // 0 = limit (the only kind for now)
             flags,
-            _pad: 0,
+            // Phase 2e — written from the ix param so ApplyFill can
+            // resolve the correct TraderState (main or sub) when this
+            // order matches as a maker. 0 = main (default).
+            sub_index,
         };
 
         let inserted_idx = if side_is_bid {
@@ -465,6 +469,7 @@ pub mod flash_book {
         limit_ticks: u64,
         flags: u8,
         expires_at_slot: u64,
+        sub_index: u8,
     ) -> Result<()> {
         // Hot-path validation: collapsed branches, single Clock::get().
         let market = &ctx.accounts.market;
@@ -546,7 +551,10 @@ pub mod flash_book {
         // Stack-allocated fixed arrays aren't viable here: at 256-cap
         // × 60 B per tuple the array exceeds BPF's 4 KB stack frame.
         const TYPICAL_WALK_DEPTH: usize = 16;
-        let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey)> =
+        // (data_idx, maker_order_id, fill_size_lots, fill_price_ticks,
+        //  maker_pubkey, maker_sub_index) — Phase 2e adds maker_sub_index
+        // so the emitted FillEntry carries it for the sequencer.
+        let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey, u8)> =
             Vec::with_capacity(TYPICAL_WALK_DEPTH);
         let mut stp_cancels: Vec<hypertree::DataIndex> = Vec::new();
         let mut stp_aborted = false;
@@ -576,7 +584,7 @@ pub mod flash_book {
                     }
                 }
                 let fill = ask.size_lots.min(remaining);
-                matches.push((idx, ask.order_id, fill, ask.price_ticks, ask.trader));
+                matches.push((idx, ask.order_id, fill, ask.price_ticks, ask.trader, ask.sub_index));
                 remaining -= fill;
                 true
             });
@@ -600,7 +608,7 @@ pub mod flash_book {
                     }
                 }
                 let fill = bid.size_lots.min(remaining);
-                matches.push((idx, bid.order_id, fill, bid.price_ticks, bid.trader));
+                matches.push((idx, bid.order_id, fill, bid.price_ticks, bid.trader, bid.sub_index));
                 remaining -= fill;
                 true
             });
@@ -640,7 +648,7 @@ pub mod flash_book {
         // saves ~200 CU per fill (Borsh + sol_log_data overhead amortized
         // over the whole walk instead of paid per-step).
         let mut fills: Vec<FillEntry> = Vec::with_capacity(matches.len());
-        for (maker_idx, maker_id, fill_size, fill_price, maker_trader) in &matches {
+        for (maker_idx, maker_id, fill_size, fill_price, maker_trader, maker_sub_idx) in &matches {
             let new_size = handle.decrement_size_at(*maker_idx, *fill_size);
             if new_size == 0 {
                 if side_is_bid {
@@ -654,6 +662,7 @@ pub mod flash_book {
                 size_lots: *fill_size,
                 price_ticks: *fill_price,
                 maker_id: *maker_id,
+                maker_sub_index: *maker_sub_idx,
             });
         }
         if !fills.is_empty() {
@@ -663,6 +672,7 @@ pub mod flash_book {
                 taker_side: side,
                 taker_id: taker_order_id,
                 fills,
+                taker_sub_index: sub_index,
             });
         }
 
@@ -683,7 +693,10 @@ pub mod flash_book {
                 side,
                 order_type: 0,
                 flags,
-                _pad: 0,
+                // Residual taker rests as a limit order — carry the
+                // taker's sub_index so subsequent matches route to the
+                // right TraderState.
+                sub_index,
             };
             inserted_idx = if side_is_bid {
                 handle.insert_bid(order)?
@@ -951,7 +964,7 @@ pub mod flash_book {
             side,
             order_type: 0,
             flags: new_flags,
-            _pad: 0,
+            sub_index: 0,
         };
         let new_idx = if side_is_bid {
             handle.insert_bid(order)?
@@ -4235,7 +4248,7 @@ pub mod flash_book {
             side: trigger.side,
             order_type: 0, // limit
             flags: 0,
-            _pad: 0,
+            sub_index: 0,
         };
         let inserted_idx = if side_is_bid {
             handle.insert_bid(order)?
@@ -4505,7 +4518,7 @@ pub mod flash_book {
                 side: twap_side,
                 order_type: 0, // limit
                 flags: 0,
-                _pad: 0,
+                sub_index: 0,
             };
             inserted_idx = if side_is_bid {
                 handle.insert_bid(order)?
@@ -4646,7 +4659,7 @@ pub mod flash_book {
                 side: iceberg_side,
                 order_type: 0, // limit
                 flags: 0,
-                _pad: 0,
+                sub_index: 0,
             };
             inserted_idx = if side_is_bid {
                 handle.insert_bid(order)?
@@ -5689,7 +5702,7 @@ pub mod flash_book {
                 side: close_side_u8,
                 order_type: 3, // 3 = Liquidation (matcher promotes priority)
                 flags: 0,
-                _pad: 0,
+                sub_index: 0,
             };
             inserted_idx = if side_is_bid {
                 handle.insert_bid(order)?
@@ -6171,7 +6184,7 @@ pub mod flash_book {
                 side: close_side_u8,
                 order_type: 3, // Liquidation
                 flags: 0,
-                _pad: 0,
+                sub_index: 0,
             };
             inserted_idx = if side_is_bid {
                 handle.insert_bid(order)?
@@ -6354,7 +6367,7 @@ pub mod flash_book {
             side,
             order_type: 0,
             flags: 0,
-            _pad: 0,
+            sub_index: 0,
         };
         let inserted_idx = if side_is_bid {
             handle.insert_bid(order)?
@@ -6518,7 +6531,7 @@ pub mod flash_book {
             side,
             order_type: 0,
             flags: 0,
-            _pad: 0,
+            sub_index: 0,
         };
         let inserted_idx = if side_is_bid {
             handle.insert_bid(order)?
@@ -6641,7 +6654,7 @@ pub mod flash_book {
                 side,
                 order_type: 0,
                 flags: 0,
-                _pad: 0,
+                sub_index: 0,
             };
             if side_is_bid {
                 handle.insert_bid(order)?;
@@ -6730,7 +6743,7 @@ pub mod flash_book {
                 side,
                 order_type: 0,
                 flags: 0,
-                _pad: 0,
+                sub_index: 0,
             };
             if side_is_bid {
                 handle.insert_bid(order)?;
@@ -6878,7 +6891,7 @@ pub mod flash_book {
                 side: parent_side,
                 order_type: 0,
                 flags: 0,
-                _pad: 0,
+                sub_index: 0,
             };
             if side_is_bid {
                 handle.insert_bid(order)?;
@@ -7243,7 +7256,7 @@ pub mod flash_book {
             side,
             order_type: 0,
             flags,
-            _pad: 0,
+            sub_index: 0,
         };
         let inserted_idx = if side_is_bid {
             handle.insert_bid(order)?
@@ -9819,6 +9832,11 @@ pub struct FillEntry {
     pub size_lots: u64,
     pub price_ticks: u64,
     pub maker_id: u64,
+    /// Phase 2e — sub-account index of the matched maker. The
+    /// sequencer reads this to derive
+    /// `[STATE_SEED, maker.as_ref(), &[maker_sub_index]]` and pass that
+    /// account as `maker_trader_state` to ApplyFill. `0` = main.
+    pub maker_sub_index: u8,
 }
 
 /// CLOB hot-path fill feed — one event per `place_taker_order_v2` ix
@@ -9832,6 +9850,9 @@ pub struct FillBatchEvent {
     pub taker_side: u8,
     pub taker_id: u64,
     pub fills: Vec<FillEntry>,
+    /// Phase 2e — sub-account index of the taker. Same routing rule
+    /// as `FillEntry.maker_sub_index`, but for the taker side.
+    pub taker_sub_index: u8,
 }
 
 /// How many price levels per side `view_book_depth_v2` returns.
@@ -10728,7 +10749,7 @@ fn inject_leg_into_hypertree(
         side: leg.side,
         order_type: 0, // limit
         flags: if leg.post_only { 0b0000_0001 } else { 0 },
-        _pad: 0,
+        sub_index: 0,
     };
     let idx = if side_is_bid {
         handle.insert_bid(order)?
@@ -10773,7 +10794,7 @@ fn inject_leg_into_hypertree_unchecked(
         side: leg.side,
         order_type: 0,
         flags: if leg.post_only { 0b0000_0001 } else { 0 },
-        _pad: 0,
+        sub_index: 0,
     };
     if side_is_bid {
         handle.insert_bid(order)?;

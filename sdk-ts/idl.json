@@ -98,63 +98,22 @@
         },
         {
           "name": "taker_trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "taker_trader_state.trader",
-                "account": "TraderStateAccount"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: dropped strict seed so ApplyFill can route fills to",
+            "sub-account TraderStates. The position PDAs below bind each",
+            "trader_state to its position via Phase 2c trader_state.key()-",
+            "based derivation. Phase 2e (RestingOrderV2.sub_index) will",
+            "extend this so the sequencer can identify which sub-account a",
+            "resting order belongs to at fill time; until then this relaxation",
+            "is structurally safe — the position seed pair is the binding —",
+            "but only the main TraderState is reachable via the current",
+            "matcher fill-routing logic."
+          ],
+          "writable": true
         },
         {
           "name": "maker_trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "maker_trader_state.trader",
-                "account": "TraderStateAccount"
-              }
-            ]
-          }
+          "writable": true
         },
         {
           "name": "taker_position",
@@ -335,33 +294,10 @@
         },
         {
           "name": "taker_trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "taker_trader_state.trader",
-                "account": "TraderStateAccount"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: dropped strict seed — see ApplyFill above."
+          ],
+          "writable": true
         },
         {
           "name": "taker_position",
@@ -568,33 +504,10 @@
         },
         {
           "name": "underwater_trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "underwater_trader_state.trader",
-                "account": "TraderStateAccount"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above."
+          ],
+          "writable": true
         },
         {
           "name": "underwater_position",
@@ -627,33 +540,10 @@
         },
         {
           "name": "counter_trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "counter_trader_state.trader",
-                "account": "TraderStateAccount"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above."
+          ],
+          "writable": true
         },
         {
           "name": "counter_position",
@@ -1651,32 +1541,16 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: dropped strict `seeds = [SEED, trader.key().as_ref()]`",
+            "so this ix accepts either the main TraderState PDA or any sub-",
+            "account TraderState PDA. The `.trader == trader.key()`",
+            "constraint proves the signer owns the trader_state passed in",
+            "(sub PDAs are created with `.trader = parent_wallet.key()`).",
+            "Anchor's `Account<'info, TraderStateAccount>` still enforces",
+            "program ownership + discriminator match."
+          ],
+          "writable": true
         },
         {
           "name": "insurance_fund",
@@ -3690,32 +3564,14 @@
         },
         {
           "name": "trader_state",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader_state.trader",
-                "account": "TraderStateAccount"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: dropped strict seed — sub-account TraderStates have",
+            "PDAs at `[SEED, wallet, &[sub_index]]` which the self-referential",
+            "seed `[SEED, trader_state.trader.as_ref()]` does not match.",
+            "Identity is enforced by the `execution_position` PDA below,",
+            "which is keyed on `trader_state.key()` (Phase 2c). The matched",
+            "pair is what binds the liquidatee."
+          ]
         },
         {
           "name": "execution_position",
@@ -3841,33 +3697,12 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader_state.trader",
-                "account": "TraderStateAccount"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above.",
+            "The `position` PDA below binds liquidatee identity via Phase 2c",
+            "trader_state.key()-based derivation."
+          ],
+          "writable": true
         },
         {
           "name": "caller_trader_state",
@@ -4410,32 +4245,10 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: relaxed seed — see DepositCollateral above."
+          ],
+          "writable": true
         },
         {
           "name": "insurance_fund",
@@ -4597,32 +4410,10 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: relaxed seed — accepts main or sub-account TraderState."
+          ],
+          "writable": true
         },
         {
           "name": "flp_exposure",
@@ -4690,32 +4481,10 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: relaxed seed — accepts main or sub-account TraderState."
+          ],
+          "writable": true
         },
         {
           "name": "flp_exposure",
@@ -5364,6 +5133,10 @@
         {
           "name": "expires_at_slot",
           "type": "u64"
+        },
+        {
+          "name": "sub_index",
+          "type": "u8"
         }
       ]
     },
@@ -5487,6 +5260,10 @@
         {
           "name": "expires_at_slot",
           "type": "u64"
+        },
+        {
+          "name": "sub_index",
+          "type": "u8"
         }
       ]
     },
@@ -6009,32 +5786,13 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: relaxed seed — accepts main or sub-account",
+            "TraderState. The `target_position` PDA seeds use",
+            "`trader_state.key()` (Phase 2c), so positions are correctly",
+            "scoped to whichever TraderState transitioned."
+          ],
+          "writable": true
         },
         {
           "name": "target_market",
@@ -6135,32 +5893,13 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: relaxed seed — accepts main or sub-account",
+            "TraderState. The `target_position` PDA seeds use",
+            "`trader_state.key()` (Phase 2c), so positions are correctly",
+            "scoped to whichever TraderState transitioned."
+          ],
+          "writable": true
         },
         {
           "name": "target_market",
@@ -6370,32 +6109,10 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: relaxed seed — accepts main or sub-account TraderState."
+          ],
+          "writable": true
         }
       ],
       "args": [
@@ -6444,32 +6161,10 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: relaxed seed — accepts main or sub-account TraderState."
+          ],
+          "writable": true
         }
       ],
       "args": [
@@ -6546,33 +6241,13 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader_state.trader",
-                "account": "TraderStateAccount"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: dropped strict seed so the authority can target a",
+            "sub-account TraderState too. No additional constraint needed —",
+            "the `authority` Signer is gated by `insurance_fund.authority`",
+            "above, so only the protocol authority can call this ix."
+          ],
+          "writable": true
         }
       ],
       "args": [
@@ -6612,32 +6287,10 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: relaxed seed — accepts main or sub-account TraderState."
+          ],
+          "writable": true
         }
       ],
       "args": [
@@ -6718,38 +6371,21 @@
         {
           "name": "trader",
           "docs": [
-            "The trader being settled. Doesn't need to sign — settle is",
-            "permissionless. Used as a seed to derive trader_state and position."
+            "The trader being settled — informational only post-Phase-2d.",
+            "Settle is permissionless and the identity binding is now the",
+            "(trader_state, position) PDA pair, not the `trader` field on",
+            "this struct. Kept on the Accounts struct for backwards-compat",
+            "with off-chain callers that already pass it."
           ]
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: dropped strict seed so settle_funding can operate on",
+            "sub-account TraderStates too. The position PDA below binds the",
+            "pair via Phase 2c trader_state.key()-based seeds."
+          ],
+          "writable": true
         },
         {
           "name": "position",
@@ -7100,63 +6736,18 @@
         },
         {
           "name": "from_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "from_state.trader",
-                "account": "TraderStateAccount"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: dropped strict seeds so sweep can move collateral",
+            "between main and sub-account TraderStates (and between two",
+            "sub-accounts). The handler's `is_authorized(&authority.key())`",
+            "gate on each side ensures the signer owns/delegates BOTH",
+            "endpoints."
+          ],
+          "writable": true
         },
         {
           "name": "to_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "to_state.trader",
-                "account": "TraderStateAccount"
-              }
-            ]
-          }
+          "writable": true
         }
       ],
       "args": [
@@ -8832,32 +8423,9 @@
       "accounts": [
         {
           "name": "trader_state",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader_state.trader",
-                "account": "TraderStateAccount"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: view-only ix; relaxed seed accepts any TraderState."
+          ]
         }
       ],
       "args": []
@@ -9124,32 +8692,10 @@
         },
         {
           "name": "trader_state",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
+          "docs": [
+            "Phase 2d: relaxed seed — see DepositCollateral above."
+          ],
+          "writable": true
         },
         {
           "name": "insurance_fund",
@@ -12135,6 +11681,14 @@
                 }
               }
             }
+          },
+          {
+            "name": "taker_sub_index",
+            "docs": [
+              "Phase 2e — sub-account index of the taker. Same routing rule",
+              "as `FillEntry.maker_sub_index`, but for the taker side."
+            ],
+            "type": "u8"
           }
         ]
       }
@@ -12166,6 +11720,16 @@
           {
             "name": "maker_id",
             "type": "u64"
+          },
+          {
+            "name": "maker_sub_index",
+            "docs": [
+              "Phase 2e — sub-account index of the matched maker. The",
+              "sequencer reads this to derive",
+              "`[STATE_SEED, maker.as_ref(), &[maker_sub_index]]` and pass that",
+              "account as `maker_trader_state` to ApplyFill. `0` = main."
+            ],
+            "type": "u8"
           }
         ]
       }

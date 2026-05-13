@@ -31,18 +31,24 @@ before a single line of seeds-relaxation is safe to merge.
   (Deposit, Withdraw, Liquidate, ADL, ApplyFill, ApplyFlpFill,
   PartialWithdraw, SetPositionMarginMode, SettleFunding,
   PlaceBasket*, LiquidatePortfolio).
-- **Phase 2e (unplanned, biggest piece): RestingOrderV2 schema +
-  matcher fill routing.** Discovered mid-2c that PlaceLimitOrderV2 /
-  PlaceTakerOrderV2 store orders in the hypertree with
-  `RestingOrderV2.trader = wallet.key()`. No sub_index field. ApplyFill
-  reads the trader field and derives `taker_trader_state` from it,
-  always landing on the wallet's main TraderState — the sub's order
-  would route fills to main. Sub-account order PLACEMENT requires
-  RestingOrderV2 to carry a sub_index (or, more cleanly, the trader
-  field to BE the trader_state PDA rather than the wallet). That's a
-  schema change to a heavily-used type in the hypertree; the matcher,
-  every order-insertion site, and every fill-resolution site all
-  change together. Estimated separately — see §10 below.
+- **Phase 2e: SHIPPED.** RestingOrderV2 now carries `sub_index: u8`
+  (repurposed from the prior `_pad` byte — layout-compatible, existing
+  on-disk nodes read back with sub_index = 0 = main).
+  `place_limit_order_v2` and `place_taker_order_v2` take an explicit
+  `sub_index: u8` ix parameter and write it into the order. The
+  matcher carries `maker_sub_index` through each `FillEntry` and the
+  emitting `FillBatchEvent` also carries `taker_sub_index`, so the
+  off-chain sequencer can derive
+  `[STATE_SEED, trader.as_ref(), &[sub_index]]` and pass the right
+  TraderState to ApplyFill / ApplyFlpFill.
+- **Remaining limitations (Phase 2f+):** trigger orders, JIT-
+  liquidation offers, and TWAP/iceberg/bracket execution paths still
+  default sub_index = 0 when they synthesise resting orders — their
+  surrounding state accounts (TriggerOrderAccount, JitLiquidationOffer,
+  etc.) don't carry sub_index yet. So sub-accounts can place plain
+  limit + taker orders today, but their triggers / TWAP children / JIT
+  offers route to main. Each of those is a focused follow-up
+  (1 ix + 1 state struct + 1 SDK helper per family).
 
 ## 1. The aliasing problem
 

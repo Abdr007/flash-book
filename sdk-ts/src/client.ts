@@ -413,6 +413,14 @@ export class FlashBookClient {
     limitTicks: bigint | number;
     flags?: number;
     expiresAtSlot?: bigint | number;
+    /**
+     * Phase 2e — sub-account index this order belongs to. `0` (default)
+     * targets the trader's main TraderState; `1..=255` targets a
+     * pre-opened sub TraderState. The resting order remembers this so
+     * ApplyFill routes fees + PnL to the right state when this order
+     * is matched as a maker.
+     */
+    subIndex?: number;
   }): Promise<TransactionInstruction> {
     const book = marketBookPda(args.market);
     return this.methods
@@ -422,6 +430,7 @@ export class FlashBookClient {
         args.limitTicks,
         args.flags ?? 0,
         args.expiresAtSlot ?? new BN(0),
+        args.subIndex ?? 0,
       )
       .accountsPartial({
         trader: args.trader,
@@ -454,6 +463,12 @@ export class FlashBookClient {
     limitTicks: bigint | number;
     flags?: number;
     expiresAtSlot?: bigint | number;
+    /**
+     * Phase 2e — sub-account index. See {@link placeLimitOrderV2Ix}.
+     * Emitted on `FillBatchEvent.taker_sub_index` so the sequencer can
+     * route ApplyFill's `taker_trader_state` correctly.
+     */
+    subIndex?: number;
   }): Promise<TransactionInstruction> {
     const book = marketBookPda(args.market);
     return this.methods
@@ -463,6 +478,7 @@ export class FlashBookClient {
         args.limitTicks,
         args.flags ?? 0,
         args.expiresAtSlot ?? new BN(0),
+        args.subIndex ?? 0,
       )
       .accountsPartial({
         trader: args.trader,

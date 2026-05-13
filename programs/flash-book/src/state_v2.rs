@@ -140,7 +140,17 @@ pub struct RestingOrderV2 {
     pub order_type: u8,  // 0 = limit, 1 = ioc, 2 = post_only, 3 = jit
     /// Bitfield: bit0 reduce_only, bit1 post_only-shortcut, bits 2-3 STP mode.
     pub flags: u8,
-    pub _pad: u8,
+    /// Phase 2e — sub-account index this order belongs to.
+    /// `0` (default) = main TraderState `[STATE_SEED, trader.as_ref()]`.
+    /// `1..=255` = sub TraderState `[STATE_SEED, trader.as_ref(), &[sub_index]]`.
+    /// Repurposed from the prior `_pad` byte — layout-compatible because
+    /// pre-Phase-2e hypertree nodes serialised `_pad = 0`, which now
+    /// reads back as `sub_index = 0` (the main-account default).
+    /// ApplyFill / ApplyFlpFill use this to route fills + fees + PnL
+    /// to the correct TraderState. Cancel / modify do NOT need to read
+    /// it (those ixs verify the signer against `order.trader`, the
+    /// wallet, regardless of sub_index).
+    pub sub_index: u8,
 }
 
 const _: () = assert!(std::mem::size_of::<RestingOrderV2>() == 80);
@@ -199,7 +209,7 @@ pub fn probe_order(order_id: u64) -> RestingOrderV2 {
         side: 0,
         order_type: 0,
         flags: 0,
-        _pad: 0,
+        sub_index: 0,
     }
 }
 
@@ -789,7 +799,7 @@ mod tests {
             side: if side_is_bid { 0 } else { 1 },
             order_type: 0,
             flags: 0,
-            _pad: 0,
+            sub_index: 0,
         }
     }
 
