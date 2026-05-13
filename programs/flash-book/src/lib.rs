@@ -2720,10 +2720,37 @@ pub mod flash_book {
         price_ticks: u64,
         taker_side: u8,
         taker_was_jit: bool,
+        taker_sub_index: u8,
+        maker_sub_index: u8,
     ) -> Result<()> {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(price_ticks > 0, FlashBookError::ZeroPrice);
         require!(taker_side <= 1, FlashBookError::OutOfRange);
+
+        // ── Phase 2i sub-account PDA verification ───────────────────
+        // Closes the 1-byte routing-attack surface left open by Phase 2d.
+        // The Accounts struct's `seeds = [...]` constraint was dropped to
+        // permit sub-account TraderStates, but that left the sequencer
+        // free to pass ANY trader_state whose .trader field matches.
+        //
+        // This block re-derives the expected TraderState PDA from
+        // (account.trader, ix-param sub_index) and asserts it matches
+        // the account's actual PDA. The sub_index values arrive via
+        // `FillBatchEvent.{taker,maker}_sub_index` (Phase 2e), so an
+        // honest sequencer already has them; this verification just
+        // makes that contract on-chain-enforceable.
+        verify_trader_state_pda(
+            taker_sub_index,
+            ctx.accounts.taker_trader_state.trader,
+            ctx.accounts.taker_trader_state.key(),
+            ctx.program_id,
+        )?;
+        verify_trader_state_pda(
+            maker_sub_index,
+            ctx.accounts.maker_trader_state.trader,
+            ctx.accounts.maker_trader_state.key(),
+            ctx.program_id,
+        )?;
 
         let market = &mut ctx.accounts.market;
         let market_key = market.key();
@@ -5109,10 +5136,21 @@ pub mod flash_book {
         size_lots: u64,
         price_ticks: u64,
         taker_side: u8,
+        taker_sub_index: u8,
     ) -> Result<()> {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(price_ticks > 0, FlashBookError::ZeroPrice);
         require!(taker_side <= 1, FlashBookError::OutOfRange);
+
+        // Phase 2i — verify the trader_state PDA matches
+        // (taker_trader_state.trader, taker_sub_index). See apply_fill
+        // for the full rationale.
+        verify_trader_state_pda(
+            taker_sub_index,
+            ctx.accounts.taker_trader_state.trader,
+            ctx.accounts.taker_trader_state.key(),
+            ctx.program_id,
+        )?;
 
         let market = &mut ctx.accounts.market;
         let market_key = market.key();
@@ -11583,6 +11621,46 @@ fn compute_realized_pnl_routing(
     } else {
         Ok((iso_collateral, cross_collateral))
     }
+}
+
+/// Phase 2i — verify that an account presented as a TraderState was
+/// derived from the expected `(wallet, sub_index)` seed pair. Returns
+/// `WrongTrader` if the derivation doesn't match the account's actual
+/// pubkey.
+///
+/// This closes the 1-byte routing-attack surface left by Phase 2d's
+/// seeds relaxation on `ApplyFill`. The handler relaxation lets the
+/// sequencer pass any TraderState whose `.trader` field matches the
+/// order's `.trader`; without this re-derivation check, a hostile
+/// sequencer could pass `[STATE_SEED, trader, &[2]]` for an order
+/// placed by sub_index=1.
+///
+/// Seed convention (matches `open_trader_state` and
+/// `open_trader_sub_account`):
+///
+///   sub_index == 0 → `[TraderStateAccount::SEED, trader.as_ref()]`        (main)
+///   sub_index >  0 → `[TraderStateAccount::SEED, trader.as_ref(), &[sub_index]]` (sub)
+fn verify_trader_state_pda(
+    sub_index: u8,
+    trader: Pubkey,
+    actual: Pubkey,
+    program_id: &Pubkey,
+) -> Result<()> {
+    let expected = if sub_index == 0 {
+        Pubkey::find_program_address(
+            &[TraderStateAccount::SEED, trader.as_ref()],
+            program_id,
+        )
+        .0
+    } else {
+        Pubkey::find_program_address(
+            &[TraderStateAccount::SEED, trader.as_ref(), &[sub_index]],
+            program_id,
+        )
+        .0
+    };
+    require_keys_eq!(expected, actual, FlashBookError::WrongTrader);
+    Ok(())
 }
 
 /// Phase 2h — pure-math helper for the underwater loss side of ADL

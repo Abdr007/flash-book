@@ -206,6 +206,14 @@
         {
           "name": "taker_was_jit",
           "type": "bool"
+        },
+        {
+          "name": "taker_sub_index",
+          "type": "u8"
+        },
+        {
+          "name": "maker_sub_index",
+          "type": "u8"
         }
       ]
     },
@@ -382,6 +390,10 @@
         {
           "name": "taker_side",
           "type": "u8"
+        },
+        {
+          "name": "taker_sub_index",
+          "type": "u8"
         }
       ]
     },
@@ -413,9 +425,14 @@
         "",
         "Action:",
         "• close `close_size` lots from BOTH at the bankruptcy price",
-        "• underwater realizes loss (collateral debited pro-rata)",
-        "• counter realizes profit at bp (less than mark — that's the",
-        "\"give up\", which absorbs the loss insurance would have eaten)",
+        "• underwater realizes loss (Phase 2h: routed to",
+        "position.collateral_quote_lots if isolated, else",
+        "trader_state.collateral_quote_lots; saturating at 0 in both",
+        "cases — the insurance fund waterfall absorbs the remainder)",
+        "• counter realizes profit at bp (Phase 2h: credited to",
+        "position.collateral_quote_lots if isolated, else",
+        "trader_state.collateral_quote_lots; checked_add for",
+        "overflow safety)",
         "• update OI counters",
         "• emit AutoDeleveragedEvent",
         "",

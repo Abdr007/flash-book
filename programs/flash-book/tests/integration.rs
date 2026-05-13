@@ -2243,6 +2243,7 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
             size_lots: 1,
             price_ticks: 100_000,
             taker_side: 0, // long
+            taker_sub_index: 0, // main account
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer

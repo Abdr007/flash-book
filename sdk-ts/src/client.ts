@@ -1477,9 +1477,18 @@ export class FlashBookClient {
     /// their rolling-window volume against the tier table. FLP-side
     /// rebate stays flat (FLP is the protocol).
     useFeeTiers?: boolean;
+    /// Phase 2i — sub-account index of the taker. Defaults to 0 (main).
+    /// The on-chain handler re-derives the TraderState PDA from
+    /// `(takerTrader, takerSubIndex)` and rejects with WrongTrader if
+    /// the passed `takerTraderState` doesn't match. Pass the value
+    /// emitted on `FillBatchEvent.taker_sub_index`.
+    takerSubIndex?: number;
   }): Promise<TransactionInstruction> {
-    const takerState = this.traderState(args.takerTrader);
-    const takerPos = this.position(args.market, args.takerTrader);
+    const takerSubIndex = args.takerSubIndex ?? 0;
+    const takerState = takerSubIndex === 0
+      ? this.traderState(args.takerTrader)
+      : traderSubAccountPda(args.takerTrader, takerSubIndex, this.programId);
+    const takerPos = this.position(args.market, args.takerTrader, takerSubIndex);
     const flp = this.flpExposure();
     const fund = this.insuranceFund();
     return this.methods
@@ -1487,6 +1496,7 @@ export class FlashBookClient {
         args.sizeLots,
         args.priceTicks,
         args.takerSide === 'long' ? 0 : 1,
+        takerSubIndex,
       )
       .accountsPartial({
         sequencer: args.sequencer,
@@ -1522,11 +1532,24 @@ export class FlashBookClient {
     /// When false (or omitted), apply_fill falls back to flat
     /// `market.params.{maker_rebate_bps, taker_fee_bps}`.
     useFeeTiers?: boolean;
+    /// Phase 2i — sub-account index of the taker. Read from
+    /// `FillBatchEvent.taker_sub_index`. Default 0 (main).
+    takerSubIndex?: number;
+    /// Phase 2i — sub-account index of the maker. Read from
+    /// `FillEntry.maker_sub_index` on the matched resting order.
+    /// Default 0 (main).
+    makerSubIndex?: number;
   }): Promise<TransactionInstruction> {
-    const takerState = this.traderState(args.takerTrader);
-    const makerState = this.traderState(args.makerTrader);
-    const takerPos = this.position(args.market, args.takerTrader);
-    const makerPos = this.position(args.market, args.makerTrader);
+    const takerSubIndex = args.takerSubIndex ?? 0;
+    const makerSubIndex = args.makerSubIndex ?? 0;
+    const takerState = takerSubIndex === 0
+      ? this.traderState(args.takerTrader)
+      : traderSubAccountPda(args.takerTrader, takerSubIndex, this.programId);
+    const makerState = makerSubIndex === 0
+      ? this.traderState(args.makerTrader)
+      : traderSubAccountPda(args.makerTrader, makerSubIndex, this.programId);
+    const takerPos = this.position(args.market, args.takerTrader, takerSubIndex);
+    const makerPos = this.position(args.market, args.makerTrader, makerSubIndex);
     const fund = this.insuranceFund();
     return this.methods
       .applyFill(
@@ -1534,6 +1557,8 @@ export class FlashBookClient {
         args.priceTicks,
         args.takerSide === 'long' ? 0 : 1,
         args.takerWasJit ?? false,
+        takerSubIndex,
+        makerSubIndex,
       )
       .accountsPartial({
         sequencer: args.sequencer,
