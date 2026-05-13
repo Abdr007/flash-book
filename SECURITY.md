@@ -60,10 +60,13 @@ welcome but they are not new findings:
   `trader_state.key() == find_pda([STATE_SEED, trader, &[sub_index]])`.
   Documented in `docs/SUB_ACCOUNT_TRADING.md` and the COMPARISON.md
   weaknesses section.
-- **No on-chain FBA or commit-reveal.** Both are in the TypeScript
-  simulator only.
 - **No mainnet deployment / no audit.** Tracked in
   `docs/PRODUCTION_READINESS.md`.
+- **No FBA / commit-reveal on-chain — by design.** The TypeScript
+  simulator's FBA + commit-reveal pieces are research artifacts that
+  are not, and will not be, ported on-chain. Continuous CLOB is the
+  deliberate architectural pick. See `docs/COMPARISON.md` for the
+  rationale.
 
 ## Disclosure policy
 

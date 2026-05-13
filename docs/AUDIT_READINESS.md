@@ -157,11 +157,14 @@ program ix surface against the live Solana test validator. Highlights:
 These are documented gaps. Reporting them is fine; they don't need
 new analysis. See `SECURITY.md` for the full list.
 
-- **No FBA / Walrasian clearing on-chain.** TS simulator only.
-  See `docs/FBA_ON_CHAIN.md` for the migration plan.
-- **No commit-reveal on-chain.** Same. See `docs/COMMIT_REVEAL_ON_CHAIN.md`.
+- **No FBA / Walrasian clearing on-chain — by design.** TS simulator
+  only. See `docs/COMPARISON.md` for why continuous CLOB is the
+  deliberate pick over FBA.
+- **No commit-reveal on-chain — by design.** Same. Research artifact
+  in `src/commit-reveal.ts` only.
 - **No HLP-style dedicated backstop vault.** JIT-liq auction is the
-  closest analogue but opportunistic.
+  closest analogue but opportunistic. See `docs/HLP_BACKSTOP_VAULT.md`
+  for the planned Phase 3 (v0.5.0) work.
 
 ## 8. Recommended audit scope
 

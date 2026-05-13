@@ -23,6 +23,27 @@ cargo test -p flash-book             186 tests pass (lib + integration + proptes
 bun test                             257 tests pass (TypeScript)
 ```
 
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    bot["MM bot<br/>+ keepers<br/>(bot/)"]
+    sdk["SDK<br/>(sdk-ts/)"]
+    prog["Anchor program<br/>continuous CLOB<br/>+ isolated margin<br/>+ liquidation engine<br/>(programs/flash-book/)"]
+    pyth["Pyth oracle"]
+    sim["TS simulator<br/>research only<br/>(src/)"]:::ghost
+
+    bot --> sdk
+    sdk --> prog
+    pyth --> prog
+    sim -. NOT on chain .-> prog
+
+    classDef ghost fill:#eee,stroke:#aaa,color:#666,stroke-dasharray:5
+```
+
+Detailed diagrams (system, account ownership, fill flow, liquidation
+pipeline, Phase 2 timeline): [`docs/DIAGRAMS.md`](docs/DIAGRAMS.md).
+
 ## What this actually is
 
 A Solana program that implements a perp orderbook with a hypertree-backed
@@ -31,11 +52,14 @@ focus of the design work. The novel parts are in the margin model and the
 liquidation flow, not in the matching engine itself (which is a standard
 price-time-priority CLOB walk).
 
-The TypeScript `src/` directory contains a reference simulator with FBA
-Walrasian clearing and commit-reveal taker flow — these are research
-artifacts, not what runs on-chain. The on-chain matcher in
-`programs/flash-book/src/lib.rs::place_taker_order_v2` is continuous CLOB
-that walks the opposite-side hypertree best-price-first.
+The TypeScript `src/` directory contains a reference simulator with
+academic-grade FBA Walrasian clearing and commit-reveal logic. These
+are research artifacts — used to model the math; they are not, and
+will not be, ported on-chain. The on-chain matcher in
+`programs/flash-book/src/lib.rs::place_taker_order_v2` is continuous
+CLOB that walks the opposite-side hypertree best-price-first. See
+`docs/COMPARISON.md` for why continuous CLOB is the deliberate
+architectural pick over FBA.
 
 ## What's actually in the on-chain matcher
 
@@ -94,9 +118,6 @@ These are claims that appear in earlier docs but are not yet in the
 on-chain code, called out explicitly so they're not mistaken for shipping
 features:
 
-- **No FBA / Walrasian clearing on-chain.** The TS simulator in `src/`
-  has FBA logic; the on-chain matcher is continuous CLOB.
-- **No commit-reveal on-chain.** Same story — TS-only.
 - **No mainnet deployment.** Devnet only.
 - **No independent security audit.**
 - **No HLP-style dedicated backstop vault.** The FLP is an LP pool, not
@@ -223,9 +244,9 @@ bot/                        Reference MM bot + keeper suite
     telemetry.ts            Prometheus push
     hot-config.ts           Param hot-reload
 
-src/                        TypeScript reference simulator
-  matcher.ts                FBA Walrasian clearing (research)
-  commit-reveal.ts          Commit-reveal taker flow (research)
+src/                        TypeScript reference simulator (research only)
+  matcher.ts                Academic FBA Walrasian clearing — NOT shipped on-chain
+  commit-reveal.ts          Academic commit-reveal taker flow — NOT shipped on-chain
   flp-quoter.ts             FLP quoter port
   funding.ts                Funding port
   risk.ts                   Risk port
@@ -275,6 +296,8 @@ Together: 443 tests, all green at HEAD.
 
 The single load-bearing documents:
 
+- [`docs/DIAGRAMS.md`](docs/DIAGRAMS.md) — system / account / fill /
+  liquidation / Phase 2 timeline diagrams (Mermaid).
 - [`docs/COMPARISON.md`](docs/COMPARISON.md) — head-to-head with the
   major perp DEXes. Honest about where Flash Book wins and where it
   doesn't.
@@ -300,8 +323,9 @@ via `rust-toolchain.toml`.
 
 ## Acknowledgements
 
-The TypeScript reference simulator's FBA + commit-reveal pieces draw on
-Budish (FBA) and Flashbots (sealed-bid auctions). The on-chain risk
+The TypeScript reference simulator's FBA + commit-reveal pieces
+(research-only, not on-chain) draw on Budish (FBA) and Flashbots
+(sealed-bid auctions). The on-chain risk
 engine borrows from CME SPAN (stress-lattice margin), Hyperliquid
 (tiered MMR + isolated margin), and standard CEX practice (insurance
 fund + ADL waterfall). VPIN is from Easley, López de Prado, O'Hara. The

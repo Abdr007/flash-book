@@ -328,32 +328,60 @@ on-chain integration tests on devnet. Math being correct in isolation
 is not the same as math being correct under adversarial economic
 conditions with real money.
 
-### 4. No on-chain FBA / Walrasian clearing
+## Design choices the project has deliberately NOT made
 
-The TypeScript reference simulator in `src/` implements FBA with
-Walrasian uniform-price clearing. The on-chain Anchor program does NOT.
-`place_taker_order_v2` is a standard CLOB walk — best-price-first,
-match each maker at the maker's price, FIFO at each price level. This
-is the same as Hyperliquid, dYdX, and Phoenix mechanically.
+These two appeared in early marketing as "coming soon" features.
+They aren't. The on-chain matcher is and remains a continuous CLOB
+on a hypertree. Calling them weaknesses would imply we plan to fix
+them; we don't.
 
-The `batch_interval_ms` market parameter exists, but it's a bookkeeping
-period for mark TWAP and funding accrual, not an FBA clearing window.
-There is no clearing-price solver in the on-chain code.
+### Continuous CLOB, not FBA / Walrasian clearing
 
-Implementing actual on-chain FBA would require:
-- Buffer all `place_*_order` arrivals over `batch_interval_ms`
-- Solve for the demand/supply intersection (uniform clearing price)
-- Clear all matched orders at the uniform price
+`place_taker_order_v2` walks the opposite-side hypertree
+best-price-first, FIFO at each price level — same mechanics as
+Hyperliquid, dYdX, Phoenix.
 
-That's a substantial refactor of `place_limit_order_v2` /
-`place_taker_order_v2` and is not planned for this branch.
+The TypeScript reference simulator in `src/matcher.ts` has Walrasian
+uniform-price FBA as a research artifact (and it's well-tested in
+the simulator), but it doesn't run on-chain and won't. The
+`batch_interval_ms` market parameter is a bookkeeping period for
+mark TWAP and funding accrual — not a clearing window. There is no
+clearing-price solver in the on-chain code.
 
-### 5. No on-chain commit-reveal
+Continuous CLOB is the deliberate pick for two reasons:
 
-Same story. The TS simulator has `commit-reveal.ts`. The Anchor program
-has no commit / reveal accounts or state. `grep -rn
-'commit_reveal\|sealed_bid' programs/flash-book/src/` returns zero
-hits.
+1. **Same-tx fills.** A taker order matches and settles in the same
+   transaction. FBA would defer the fill to a `clear_batch` ix —
+   strictly worse latency for the taker UX.
+2. **Mechanical compatibility with the existing CLOB venue
+   landscape.** Bots and integrators that already speak Phoenix /
+   Hyperliquid / dYdX semantics don't need a different matching
+   model to read Flash Book.
+
+If you want within-batch MEV resistance you get it via shorter
+batches (the FBA approach) or via private mempools (Hyperliquid's
+approach) or via commit-reveal (next section). Flash Book opts for
+"fast continuous matching + multi-oracle quorum + dual-source price
+gate + open JIT-liquidation auction" as the protection surface.
+
+### Continuous CLOB, not commit-reveal
+
+The TS simulator's `commit-reveal.ts` is a research artifact for the
+academic permutation-invariance argument. The on-chain Anchor program
+has no commit / reveal accounts and no two-phase placement ixs.
+`grep -rn 'commit_reveal\|sealed_bid' programs/flash-book/src/`
+returns zero hits.
+
+Commit-reveal is the right primitive when within-batch sequencer
+front-running is a real threat. On Solana the threat model is
+different — there's no protocol-level mempool to sniff, and the
+existing per-trader rate limits + STP modes plus the dual-source
+liquidation price gate cover the realistic adversarial cases without
+adding a two-phase placement protocol.
+
+Commit-reveal could be revisited if Flash Book ever moves to a
+custom L1 (or to a chain with public mempools), but on Solana it
+isn't planned.
 
 ## What this means for "fast and smooth + best liquidations"
 
