@@ -31,19 +31,6 @@ export {
 } from './types.ts';
 
 export {
-  FlashBookEngine,
-  type AddMarketArgs,
-  type SubmitLimitArgs,
-  type SubmitTakerArgs,
-} from './engine.ts';
-
-export {
-  clearBatch,
-  type ClearBatchInput,
-  type MatchResult,
-} from './matcher.ts';
-
-export {
   generateFlpQuotes,
   type FlpQuoterInput,
   type FlpQuoterOutput,
@@ -81,12 +68,6 @@ export {
   recommendedFundSize,
   type BankruptcyResolution,
 } from './insurance.ts';
-
-export {
-  buildCommitHash,
-  CommitRevealRegistry,
-  type RevealPayload,
-} from './commit-reveal.ts';
 
 export { VpinCalculator, type VpinSnapshot } from './vpin.ts';
 

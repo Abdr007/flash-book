@@ -18,6 +18,7 @@ flowchart TB
         client["FlashBookClient<br/>(sdk-ts/src/client.ts)"]
         pdas["PDA derivation<br/>(sdk-ts/src/pdas.ts)"]
         events["Event decoders<br/>(sdk-ts/src/events.ts)"]
+        parity["risk/funding/insurance<br/>parity ports (src/)"]
     end
 
     subgraph chain["Solana mainnet/devnet"]
@@ -193,24 +194,19 @@ gantt
 
 Released as `v0.2.0` on `2026-05-14`.
 
-## 7. Phase 3 / future work (NOT in v0.2.0)
+## 7. Future work — what's planned, what's not
 
 ```mermaid
 flowchart LR
-    v02["v0.2.0<br/>Phase 2 complete"] --> v05_choice{"Phase 3<br/>next slice?"}
-    v05_choice --> hlp["v0.5.0 (planned)<br/>HLP-equivalent<br/>backstop vault<br/>(docs/HLP_BACKSTOP_VAULT.md)"]
-
-    classDef rejected fill:#fee,stroke:#900,color:#900
-    fba["FBA on-chain<br/>(rejected by design)"]:::rejected
-    cr["Commit-reveal on-chain<br/>(rejected by design)"]:::rejected
-
-    v0_2["v0.2.0 docs"] -.- fba
-    v0_2 -.- cr
+    v02["v0.2.0<br/>Phase 2 complete"] --> v05["v0.5.0 (planned)<br/>HLP-equivalent<br/>backstop vault"]
+    v05 --> audit["Independent audit<br/>(after Phase 3 lands)"]
+    audit --> mainnet["Mainnet deployment"]
 ```
 
-Continuous CLOB on-chain is the deliberate architectural pick.
-FBA / commit-reveal stay research-only in `src/`. See
-`docs/COMPARISON.md` for the rationale.
+Continuous CLOB is the deliberate architectural pick. FBA and
+commit-reveal are NOT planned at any future version — see
+`docs/COMPARISON.md` "design choices the project has NOT made"
+for the rationale.
 
 ## 8. Layout — where each thing lives in the repo
 
@@ -218,19 +214,15 @@ FBA / commit-reveal stay research-only in `src/`. See
 graph LR
     subgraph repo["flash-book/"]
         progs["programs/flash-book/<br/>on-chain Anchor program (Rust)"]
-        sdk["sdk-ts/<br/>TypeScript client"]
+        sdk["sdk-ts/<br/>TypeScript SDK"]
         bot["bot/<br/>reference MM bot + keepers"]
-        src["src/<br/>TS research simulator (FBA, CR)"]
-        tests["tests/<br/>TS test suite"]
+        src["src/<br/>TS parity ports of on-chain modules"]
+        tests["tests/<br/>TS parity tests"]
         docs["docs/<br/>specs + scope docs"]
     end
 
-    subgraph chain["What ships on-chain"]
-        prog["Anchor program<br/>(continuous CLOB matcher,<br/>isolated margin Phase 2,<br/>liquidation engine)"]
-    end
-
-    progs --> prog
-    sdk -. interacts with .-> prog
+    progs --> prog["Anchor program on-chain"]
+    sdk -. signs txs to .-> prog
     bot -. signs txs to .-> prog
-    src -. modelling only,<br/>NOT shipped .- prog
+    src -. mirrors math of .-> progs
 ```

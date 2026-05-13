@@ -7,7 +7,7 @@ liquidation engine, and full SDK + bot suite.
 programs/flash-book/   on-chain Solana program (Rust + Anchor)
 sdk-ts/                TypeScript client (PDA + ix builders + IDL)
 bot/                   reference MM bot + keeper suite (TypeScript)
-src/                   TypeScript reference simulator (FBA, commit-reveal)
+src/                   TypeScript parity ports of the on-chain risk / funding / FLP / VPIN modules
 docs/                  architecture, math, comparison docs
 tests/                 TypeScript test suite
 ```
@@ -19,8 +19,8 @@ Devnet. Not audited. Not production-ready. The deployed program ID is
 
 ```
 cargo build-sbf                     clean
-cargo test -p flash-book             186 tests pass (lib + integration + proptests)
-bun test                             257 tests pass (TypeScript)
+cargo test -p flash-book             211 tests pass (lib + integration + proptests)
+bun test                             236 tests pass (TypeScript)
 ```
 
 ## Architecture at a glance
@@ -29,16 +29,14 @@ bun test                             257 tests pass (TypeScript)
 flowchart LR
     bot["MM bot<br/>+ keepers<br/>(bot/)"]
     sdk["SDK<br/>(sdk-ts/)"]
+    parity["Parity math<br/>(src/)"]
     prog["Anchor program<br/>continuous CLOB<br/>+ isolated margin<br/>+ liquidation engine<br/>(programs/flash-book/)"]
     pyth["Pyth oracle"]
-    sim["TS simulator<br/>research only<br/>(src/)"]:::ghost
 
     bot --> sdk
     sdk --> prog
+    sdk --> parity
     pyth --> prog
-    sim -. NOT on chain .-> prog
-
-    classDef ghost fill:#eee,stroke:#aaa,color:#666,stroke-dasharray:5
 ```
 
 Detailed diagrams (system, account ownership, fill flow, liquidation
@@ -52,10 +50,12 @@ focus of the design work. The novel parts are in the margin model and the
 liquidation flow, not in the matching engine itself (which is a standard
 price-time-priority CLOB walk).
 
-The TypeScript `src/` directory contains a reference simulator with
-academic-grade FBA Walrasian clearing and commit-reveal logic. These
-are research artifacts — used to model the math; they are not, and
-will not be, ported on-chain. The on-chain matcher in
+The TypeScript `src/` directory holds parity ports of the on-chain
+risk, funding, liquidation, insurance, FLP-quoter, and VPIN modules.
+They mirror the on-chain math 1:1 and are used by the SDK and by
+off-chain tooling (the keepers, the bot) that needs to reproduce
+the program's calculations without round-tripping to the chain. The
+on-chain matcher in
 `programs/flash-book/src/lib.rs::place_taker_order_v2` is continuous
 CLOB that walks the opposite-side hypertree best-price-first. See
 `docs/COMPARISON.md` for why continuous CLOB is the deliberate
@@ -112,27 +112,25 @@ Verifiable in `programs/flash-book/`:
   position when insurance fund is below the pause threshold. Source:
   `lib.rs::auto_deleverage`.
 
-## What this is NOT (yet)
+## What this is NOT
 
-These are claims that appear in earlier docs but are not yet in the
-on-chain code, called out explicitly so they're not mistaken for shipping
-features:
+Called out explicitly so they're not mistaken for shipping features:
 
 - **No mainnet deployment.** Devnet only.
-- **No independent security audit.**
-- **No HLP-style dedicated backstop vault.** The FLP is an LP pool, not
-  a liquidator vault. The JIT-liquidation auction is the closest analogue
-  but is opportunistic, not always-on.
-- **Sub-account fill routing trusts the off-chain sequencer.** Phase 2d
-  relaxed TraderState seeds in `ApplyFill`; the sequencer chooses which
-  TraderState gets the fill. The handler verifies
-  `trader_state.trader == order.trader` (catches wrong-wallet) but does
-  not verify `trader_state.key() == find_pda([STATE_SEED, order.trader,
-  &[order.sub_index]])` (would catch wrong-sub_index-for-same-wallet).
-  Tracked as a follow-up.
+- **No independent security audit.** See `docs/AUDIT_READINESS.md`
+  for the hand-off doc.
+- **No HLP-style dedicated backstop vault.** The FLP is an LP pool,
+  not a liquidator vault. The JIT-liquidation auction is the closest
+  analogue but is opportunistic, not always-on. Planned for v0.5.0;
+  spec at `docs/HLP_BACKSTOP_VAULT.md`.
+- **No FBA / Walrasian clearing.** Continuous CLOB on a hypertree is
+  the deliberate architectural pick. Not coming.
+- **No commit-reveal.** Same — Solana's threat model doesn't make it
+  worth the latency cost. Not coming.
 
 See `docs/COMPARISON.md` for an honest head-to-head with Hyperliquid,
-Drift, dYdX v4, GMX v2, and Phoenix.
+Drift, dYdX v4, GMX v2, and Phoenix, including a detailed
+"design choices the project has NOT made" section.
 
 ## Quick start
 
@@ -143,12 +141,12 @@ cargo build-sbf --manifest-path programs/flash-book/Cargo.toml
 cargo test -p flash-book
 ```
 
-TypeScript SDK + simulator:
+TypeScript SDK + parity modules:
 
 ```bash
 bun install
-bun test                              # 257 tests
-bun run examples/synthetic-flow.ts    # simulator demo
+bun test                              # 236 tests
+bun run --cwd sdk-ts typecheck        # strict TS check
 ```
 
 Generate the IDL after on-chain changes:
@@ -244,16 +242,15 @@ bot/                        Reference MM bot + keeper suite
     telemetry.ts            Prometheus push
     hot-config.ts           Param hot-reload
 
-src/                        TypeScript reference simulator (research only)
-  matcher.ts                Academic FBA Walrasian clearing — NOT shipped on-chain
-  commit-reveal.ts          Academic commit-reveal taker flow — NOT shipped on-chain
+src/                        TypeScript parity ports of on-chain modules
   flp-quoter.ts             FLP quoter port
   funding.ts                Funding port
   risk.ts                   Risk port
   insurance.ts              Insurance port
   liquidation.ts            Liquidation port
   vpin.ts                   VPIN port
-  engine.ts                 Top-level simulator orchestrator
+  math.ts                   Helpers (PRNG, clamp, banding)
+  types.ts                  Domain types
 
 docs/
   ARCHITECTURE.md           System design + account lifecycle
@@ -287,10 +284,10 @@ cargo test -p flash-book
 
 ```
 bun test
-  257 tests across 31 files
+  236 tests across 28 files
 ```
 
-Together: 443 tests, all green at HEAD.
+Together: 447 tests, all green at HEAD.
 
 ## Documentation
 
@@ -323,9 +320,7 @@ via `rust-toolchain.toml`.
 
 ## Acknowledgements
 
-The TypeScript reference simulator's FBA + commit-reveal pieces
-(research-only, not on-chain) draw on Budish (FBA) and Flashbots
-(sealed-bid auctions). The on-chain risk
+The on-chain risk
 engine borrows from CME SPAN (stress-lattice margin), Hyperliquid
 (tiered MMR + isolated margin), and standard CEX practice (insurance
 fund + ADL waterfall). VPIN is from Easley, López de Prado, O'Hara. The
