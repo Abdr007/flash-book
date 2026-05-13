@@ -8543,10 +8543,9 @@ pub struct SetTraderReferrer<'info> {
     /// inside the handler.
     pub trader: Signer<'info>,
 
+    /// Phase 2d: relaxed seed — accepts main or sub-account TraderState.
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
@@ -8558,10 +8557,9 @@ pub struct SetTraderDelegate<'info> {
     /// can change this field — the delegate cannot rotate themselves out.
     pub trader: Signer<'info>,
 
+    /// Phase 2d: relaxed seed — accepts main or sub-account TraderState.
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
@@ -8582,11 +8580,11 @@ pub struct SetTraderFeeTier<'info> {
     )]
     pub insurance_fund: Account<'info, InsuranceFundAccount>,
 
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
-        bump = trader_state.bump,
-    )]
+    /// Phase 2d: dropped strict seed so the authority can target a
+    /// sub-account TraderState too. No additional constraint needed —
+    /// the `authority` Signer is gated by `insurance_fund.authority`
+    /// above, so only the protocol authority can call this ix.
+    #[account(mut)]
     pub trader_state: Account<'info, TraderStateAccount>,
 }
 
@@ -8625,18 +8623,15 @@ pub struct SweepCollateral<'info> {
     /// `is_authorized` in the handler.
     pub authority: Signer<'info>,
 
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, from_state.trader.as_ref()],
-        bump = from_state.bump,
-    )]
+    /// Phase 2d: dropped strict seeds so sweep can move collateral
+    /// between main and sub-account TraderStates (and between two
+    /// sub-accounts). The handler's `is_authorized(&authority.key())`
+    /// gate on each side ensures the signer owns/delegates BOTH
+    /// endpoints.
+    #[account(mut)]
     pub from_state: Account<'info, TraderStateAccount>,
 
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, to_state.trader.as_ref()],
-        bump = to_state.bump,
-    )]
+    #[account(mut)]
     pub to_state: Account<'info, TraderStateAccount>,
 }
 
@@ -8690,10 +8685,9 @@ pub struct SetTraderBuilder<'info> {
     /// user's will).
     pub trader: Signer<'info>,
 
+    /// Phase 2d: relaxed seed — accepts main or sub-account TraderState.
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
@@ -8917,10 +8911,15 @@ pub struct ViewTraderEffectiveTier<'info> {
 pub struct DepositCollateral<'info> {
     pub trader: Signer<'info>,
 
+    /// Phase 2d: dropped strict `seeds = [SEED, trader.key().as_ref()]`
+    /// so this ix accepts either the main TraderState PDA or any sub-
+    /// account TraderState PDA. The `.trader == trader.key()`
+    /// constraint proves the signer owns the trader_state passed in
+    /// (sub PDAs are created with `.trader = parent_wallet.key()`).
+    /// Anchor's `Account<'info, TraderStateAccount>` still enforces
+    /// program ownership + discriminator match.
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
@@ -8959,10 +8958,9 @@ pub struct DepositCollateral<'info> {
 pub struct WithdrawCollateral<'info> {
     pub trader: Signer<'info>,
 
+    /// Phase 2d: relaxed seed — see DepositCollateral above.
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
@@ -8998,10 +8996,9 @@ pub struct WithdrawCollateral<'info> {
 pub struct PartialWithdrawCollateral<'info> {
     pub trader: Signer<'info>,
 
+    /// Phase 2d: relaxed seed — see DepositCollateral above.
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
@@ -9097,10 +9094,12 @@ pub struct MigratePositionToTraderStateKey<'info> {
 pub struct SetPositionMarginMode<'info> {
     pub trader: Signer<'info>,
 
+    /// Phase 2d: relaxed seed — accepts main or sub-account
+    /// TraderState. The `target_position` PDA seeds use
+    /// `trader_state.key()` (Phase 2c), so positions are correctly
+    /// scoped to whichever TraderState transitioned.
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
@@ -9135,15 +9134,20 @@ pub struct SettleFunding<'info> {
     )]
     pub market: Account<'info, MarketAccount>,
 
-    /// The trader being settled. Doesn't need to sign — settle is
-    /// permissionless. Used as a seed to derive trader_state and position.
-    /// CHECK: identity check is enforced by PDA seed derivation below.
+    /// The trader being settled — informational only post-Phase-2d.
+    /// Settle is permissionless and the identity binding is now the
+    /// (trader_state, position) PDA pair, not the `trader` field on
+    /// this struct. Kept on the Accounts struct for backwards-compat
+    /// with off-chain callers that already pass it.
+    /// CHECK: validated against `trader_state.trader` in the handler.
     pub trader: UncheckedAccount<'info>,
 
+    /// Phase 2d: dropped strict seed so settle_funding can operate on
+    /// sub-account TraderStates too. The position PDA below binds the
+    /// pair via Phase 2c trader_state.key()-based seeds.
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
+        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
 
@@ -9174,18 +9178,19 @@ pub struct ApplyFill<'info> {
     )]
     pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, taker_trader_state.trader.as_ref()],
-        bump = taker_trader_state.bump,
-    )]
+    /// Phase 2d: dropped strict seed so ApplyFill can route fills to
+    /// sub-account TraderStates. The position PDAs below bind each
+    /// trader_state to its position via Phase 2c trader_state.key()-
+    /// based derivation. Phase 2e (RestingOrderV2.sub_index) will
+    /// extend this so the sequencer can identify which sub-account a
+    /// resting order belongs to at fill time; until then this relaxation
+    /// is structurally safe — the position seed pair is the binding —
+    /// but only the main TraderState is reachable via the current
+    /// matcher fill-routing logic.
+    #[account(mut)]
     pub taker_trader_state: Box<Account<'info, TraderStateAccount>>,
 
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, maker_trader_state.trader.as_ref()],
-        bump = maker_trader_state.bump,
-    )]
+    #[account(mut)]
     pub maker_trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(
@@ -9222,10 +9227,9 @@ pub struct PlaceBasketOrderV2<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
 
+    /// Phase 2d: relaxed seed — accepts main or sub-account TraderState.
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Box<Account<'info, TraderStateAccount>>,
@@ -9291,10 +9295,9 @@ pub struct PlaceBasketOrderV2<'info> {
 pub struct PlaceBasketOrderNV2<'info> {
     pub trader: Signer<'info>,
 
+    /// Phase 2d: relaxed seed — accepts main or sub-account TraderState.
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
         constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
@@ -9525,10 +9528,7 @@ pub struct CancelIcebergV2<'info> {
 
 #[derive(Accounts)]
 pub struct ViewPortfolioRisk<'info> {
-    #[account(
-        seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
-        bump = trader_state.bump,
-    )]
+    /// Phase 2d: view-only ix; relaxed seed accepts any TraderState.
     pub trader_state: Account<'info, TraderStateAccount>,
 }
 
@@ -9566,11 +9566,8 @@ pub struct ApplyFlpFill<'info> {
     )]
     pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, taker_trader_state.trader.as_ref()],
-        bump = taker_trader_state.bump,
-    )]
+    /// Phase 2d: dropped strict seed — see ApplyFill above.
+    #[account(mut)]
     pub taker_trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(
@@ -9618,10 +9615,12 @@ pub struct LiquidatePortfolioV2<'info> {
     )]
     pub execution_market_book: UncheckedAccount<'info>,
 
-    #[account(
-        seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
-        bump = trader_state.bump,
-    )]
+    /// Phase 2d: dropped strict seed — sub-account TraderStates have
+    /// PDAs at `[SEED, wallet, &[sub_index]]` which the self-referential
+    /// seed `[SEED, trader_state.trader.as_ref()]` does not match.
+    /// Identity is enforced by the `execution_position` PDA below,
+    /// which is keyed on `trader_state.key()` (Phase 2c). The matched
+    /// pair is what binds the liquidatee.
     pub trader_state: Account<'info, TraderStateAccount>,
 
     #[account(
@@ -9654,11 +9653,10 @@ pub struct LiquidatePositionV2<'info> {
     )]
     pub market_book: UncheckedAccount<'info>,
 
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, trader_state.trader.as_ref()],
-        bump = trader_state.bump,
-    )]
+    /// Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above.
+    /// The `position` PDA below binds liquidatee identity via Phase 2c
+    /// trader_state.key()-based derivation.
+    #[account(mut)]
     pub trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(
@@ -9705,11 +9703,8 @@ pub struct AutoDeleverage<'info> {
     )]
     pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, underwater_trader_state.trader.as_ref()],
-        bump = underwater_trader_state.bump,
-    )]
+    /// Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above.
+    #[account(mut)]
     pub underwater_trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(
@@ -9723,11 +9718,8 @@ pub struct AutoDeleverage<'info> {
     )]
     pub underwater_position: Box<Account<'info, state::PositionAccount>>,
 
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, counter_trader_state.trader.as_ref()],
-        bump = counter_trader_state.bump,
-    )]
+    /// Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above.
+    #[account(mut)]
     pub counter_trader_state: Box<Account<'info, TraderStateAccount>>,
 
     #[account(

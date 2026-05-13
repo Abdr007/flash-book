@@ -2569,3 +2569,259 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
         .await;
     assert!(result.is_err(), "dispersed-oracle update should fail");
 }
+
+// ─── Phase 2d — sub-account trading enablement tests ────────────────
+
+/// A sub-account can be the `trader_state` for `deposit_collateral` after
+/// the Phase 2d seed relaxation. Verifies the deposited collateral lands
+/// on the SUB account, not the main — proving cross-pool isolation works
+/// at the deposit boundary.
+#[tokio::test]
+async fn deposit_collateral_credits_sub_account_when_used_as_trader_state() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+
+    let trader = Keypair::new();
+    let main_state = setup_trader(&mut ctx, &payer, &trader, 0, &protocol).await;
+
+    // Open sub-account at sub_index = 1.
+    let sub_index: u8 = 1;
+    let (sub_state, _) = pda(&[
+        TraderStateAccount::SEED,
+        trader.pubkey().as_ref(),
+        &[sub_index],
+    ]);
+    let open_sub_ix = build_ix(
+        flash_book::instruction::OpenTraderSubAccount { sub_index },
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new(sub_state, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[open_sub_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Fund the trader's USDC ATA and deposit DIRECTLY to the sub-account.
+    let deposit_amount: u64 = 25_000;
+    let trader_ata = create_ata(&mut ctx, &payer, trader.pubkey(), protocol.quote_mint).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, trader_ata, deposit_amount).await;
+
+    let deposit_ix = build_ix(
+        flash_book::instruction::DepositCollateral {
+            amount_quote_lots: deposit_amount,
+        },
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            // ← The crucial bit: sub_state, not main_state, as trader_state.
+            AccountMeta::new(sub_state, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(trader_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[deposit_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let sub: TraderStateAccount = fetch(&mut ctx.banks_client, sub_state).await;
+    let main: TraderStateAccount = fetch(&mut ctx.banks_client, main_state).await;
+    assert_eq!(
+        sub.collateral_quote_lots, deposit_amount,
+        "sub-account should hold the deposited collateral"
+    );
+    assert_eq!(
+        main.collateral_quote_lots, 0,
+        "main account must NOT receive sub-account-targeted deposits"
+    );
+}
+
+/// A signer cannot deposit using another trader's TraderState as the
+/// `trader_state` argument, even though Phase 2d dropped the
+/// `seeds = [SEED, signer.key().as_ref()]` constraint. The handler-side
+/// `trader_state.trader == trader.key()` check enforces ownership.
+#[tokio::test]
+async fn deposit_collateral_rejects_wrong_trader_state() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    let alice_state = setup_trader(&mut ctx, &payer, &alice, 0, &protocol).await;
+    let _bob_state = setup_trader(&mut ctx, &payer, &bob, 0, &protocol).await;
+
+    // Bob funds his ATA but tries to deposit into Alice's TraderState.
+    let amount: u64 = 1_000;
+    let bob_ata = create_ata(&mut ctx, &payer, bob.pubkey(), protocol.quote_mint).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, bob_ata, amount).await;
+
+    let bad_ix = build_ix(
+        flash_book::instruction::DepositCollateral {
+            amount_quote_lots: amount,
+        },
+        vec![
+            AccountMeta::new_readonly(bob.pubkey(), true),
+            // ← attacker passes Alice's state instead of Bob's
+            AccountMeta::new(alice_state, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(bob_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[bad_ix],
+            Some(&bob.pubkey()),
+            &[&bob],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "deposit with wrong trader_state must fail at the handler constraint"
+    );
+}
+
+/// Migrate a Position from the legacy `(market, wallet)` PDA to the
+/// new Phase 2c `(market, trader_state)` PDA. After migration the
+/// legacy address is closed (rent refunded) and the new address holds
+/// the same on-chain state.
+#[tokio::test]
+async fn migrate_position_to_trader_state_key_moves_state() {
+    use solana_sdk::account::Account as SolanaAccount;
+    let mut pt = make_program_test();
+    let mut ctx_setup = pt.start_with_context().await;
+    let payer = ctx_setup.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx_setup, &payer).await;
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx_setup, &payer, &trader, 50_000, &protocol).await;
+
+    // Pre-seed a "legacy" Position at [POS_SEED, market, wallet] by
+    // directly setting it in the test ledger — simulates a position
+    // created pre-Phase-2c. (We cannot create one through the normal
+    // ix path anymore because the handlers all use the new PDA.)
+    let (legacy_pos, legacy_bump) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader.pubkey().as_ref(),
+    ]);
+    let pos_space = flash_book::state::PositionAccount::space();
+    let legacy_pos_data = {
+        let mut buf = vec![0u8; pos_space];
+        // 8-byte discriminator for PositionAccount.
+        let disc =
+            <flash_book::state::PositionAccount as anchor_lang::Discriminator>::DISCRIMINATOR;
+        buf[..8].copy_from_slice(&disc);
+        // Hand-pack the borsh body for an open position. The layout is
+        // controlled by the #[derive(AnchorSerialize)] order in
+        // PositionAccount; reach for the borsh writer instead of
+        // bit-twiddling so a future field reorder doesn't quietly
+        // break this test.
+        let pos = flash_book::state::PositionAccount {
+            market: market_pda,
+            trader: trader.pubkey(),
+            bump: legacy_bump,
+            side: 0,
+            size_lots: 7,
+            entry_price_ticks: 12_345,
+            collateral_quote_lots: 0,
+            cum_funding_index_at_entry: 0,
+            realized_pnl_quote_lots: 0,
+            funding_paid_quote_lots: 0,
+            last_settlement_batch: 0,
+            unhealthy_since_slot: 0,
+            last_liquidated_at_slot: 0,
+            leverage_cap: 0,
+        };
+        let serialized = anchor_lang::AnchorSerialize::try_to_vec(&pos).unwrap();
+        buf[8..8 + serialized.len()].copy_from_slice(&serialized);
+        buf
+    };
+    ctx_setup.set_account(
+        &legacy_pos,
+        &SolanaAccount {
+            lamports: 10_000_000,
+            data: legacy_pos_data,
+            owner: flash_book::ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Sanity: legacy is readable, new doesn't exist yet.
+    let legacy_before: flash_book::state::PositionAccount =
+        fetch(&mut ctx_setup.banks_client, legacy_pos).await;
+    assert_eq!(legacy_before.size_lots, 7);
+
+    let (new_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader_state.as_ref(),
+    ]);
+    let new_before = ctx_setup.banks_client.get_account(new_pos).await.unwrap();
+    assert!(new_before.is_none(), "new PDA should be empty pre-migration");
+
+    // Run the migration.
+    let ix = build_ix(
+        flash_book::instruction::MigratePositionToTraderStateKey {},
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new_readonly(trader_state, false),
+            AccountMeta::new(legacy_pos, false),
+            AccountMeta::new(new_pos, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx_setup.banks_client.get_latest_blockhash().await.unwrap();
+    ctx_setup
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Legacy should be closed, new should hold the same state.
+    let legacy_after = ctx_setup.banks_client.get_account(legacy_pos).await.unwrap();
+    assert!(
+        legacy_after.is_none() || legacy_after.unwrap().lamports == 0,
+        "legacy Position must be closed after migration"
+    );
+    let new_after: flash_book::state::PositionAccount =
+        fetch(&mut ctx_setup.banks_client, new_pos).await;
+    assert_eq!(new_after.market, market_pda);
+    assert_eq!(new_after.trader, trader.pubkey());
+    assert_eq!(new_after.side, 0);
+    assert_eq!(new_after.size_lots, 7);
+    assert_eq!(new_after.entry_price_ticks, 12_345);
+}
