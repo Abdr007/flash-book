@@ -775,6 +775,203 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// V2 cancel-all: remove every resting order owned by the caller in
+    /// this market. Walks both bid and ask RBTs, collecting indices of
+    /// orders whose `trader == caller`, then removes each in two
+    /// passes (read-only walk → mutating removes). The walk is bounded
+    /// by `MAX_CANCELS_PER_IX_V2 = 24`: a single tx that triggers more
+    /// cancels would risk the BPF CU budget. Traders with many resting
+    /// orders simply call this ix repeatedly until `cancelled_count == 0`.
+    ///
+    /// Returns silently when the trader has no resting orders — useful
+    /// as a "best-effort cleanup" the bot can call defensively.
+    pub fn cancel_all_v2(
+        ctx: Context<CancelOrderV2>,
+    ) -> Result<()> {
+        let trader_pk = ctx.accounts.trader.key();
+        let market_key = ctx.accounts.market.key();
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        if handle.header.market_pubkey != market_key {
+            return err!(FlashBookError::WrongMarket);
+        }
+
+        // Two passes per side because the walk closure borrows &handle
+        // immutably; removal needs &mut handle. Collect first, mutate after.
+        let mut bid_idxs: Vec<hypertree::DataIndex> = Vec::with_capacity(8);
+        let mut ask_idxs: Vec<hypertree::DataIndex> = Vec::with_capacity(8);
+        let cap = MAX_CANCELS_PER_IX_V2;
+
+        handle.for_each_bid_best_first(|idx, bid| {
+            if bid_idxs.len() + ask_idxs.len() >= cap { return false; }
+            if bid.trader == trader_pk {
+                bid_idxs.push(idx);
+            }
+            true
+        });
+        handle.for_each_ask_best_first(|idx, ask| {
+            if bid_idxs.len() + ask_idxs.len() >= cap { return false; }
+            if ask.trader == trader_pk {
+                ask_idxs.push(idx);
+            }
+            true
+        });
+
+        let cancelled_count = (bid_idxs.len() + ask_idxs.len()) as u32;
+        for idx in bid_idxs.iter() {
+            handle.remove_bid_node(*idx);
+        }
+        for idx in ask_idxs.iter() {
+            handle.remove_ask_node(*idx);
+        }
+
+        emit!(BulkOrderCancelledV2Event {
+            market: market_key,
+            trader: trader_pk,
+            cancelled_count,
+            total_orders_after: handle.header.total_orders_active,
+        });
+        Ok(())
+    }
+
+    /// V2 modify: atomic cancel + place in one ix. Cheaper than two
+    /// separate txs (one signature, one set of account-load costs)
+    /// and preserves the trader's intent across the cancel window —
+    /// no chance of being filled between the cancel and the replacement.
+    ///
+    /// Validates the new params against the same gates as
+    /// `place_limit_order_v2` (status, min_lot, tick alignment, OI cap)
+    /// BEFORE removing the old order so a malformed modify doesn't
+    /// silently drop the original. The new order receives a fresh
+    /// `seq` from the header's monotonic counter; off-chain consumers
+    /// must re-derive the order_id from the emitted `OrderModifiedV2Event`.
+    pub fn modify_order_v2(
+        ctx: Context<PlaceLimitOrderV2>,
+        side: u8,
+        old_order_id: u64,
+        new_size_lots: u64,
+        new_limit_ticks: u64,
+        new_flags: u8,
+        new_expires_at_slot: u64,
+    ) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let now_slot = Clock::get()?.slot;
+
+        // Fast input guards — same as place_limit_order_v2.
+        if side > 1
+            || new_size_lots == 0
+            || new_limit_ticks == 0
+            || (new_flags & !0b0111_1111) != 0
+        {
+            return err!(FlashBookError::OutOfRange);
+        }
+        if new_expires_at_slot != 0 && new_expires_at_slot <= now_slot {
+            return err!(FlashBookError::OutOfRange);
+        }
+
+        // Market-state guards.
+        let p = &market.params;
+        if market.status != MarketStatus::Active as u8
+            && market.status != MarketStatus::PostOnly as u8
+        {
+            return err!(FlashBookError::OutOfRange);
+        }
+        if new_size_lots < p.min_base_lots {
+            return err!(FlashBookError::SizeBelowMinLot);
+        }
+        if new_limit_ticks % p.tick_size != 0 {
+            return err!(FlashBookError::PriceNotOnTick);
+        }
+
+        // Per-market OI hard cap. Resting orders don't actually move OI
+        // (only fills do), so this check is conservative — guards against
+        // a market that places a huge limit hoping to manipulate the cap
+        // gate when a fill eventually lands.
+        let oi_cap = p.max_oi_base_lots;
+        if oi_cap > 0 {
+            let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
+            if cur.saturating_add(new_size_lots) > oi_cap {
+                return err!(FlashBookError::OpenInterestCapExceeded);
+            }
+        }
+
+        let trader_pk = ctx.accounts.trader.key();
+        let market_key = market.key();
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        if handle.header.market_pubkey != market_key {
+            return err!(FlashBookError::WrongMarket);
+        }
+
+        // ── Phase 1: locate + validate ownership of the old order ────
+        let side_is_bid = side == 0;
+        let old_idx = if side_is_bid {
+            handle.lookup_bid_by_order_id(old_order_id)
+        } else {
+            handle.lookup_ask_by_order_id(old_order_id)
+        };
+        if old_idx == crate::hypertree::NIL {
+            return err!(FlashBookError::LiquidationStale);
+        }
+        let old_seq = {
+            let order = handle.order_at(old_idx);
+            if order.trader != trader_pk {
+                return err!(FlashBookError::WrongTrader);
+            }
+            order.seq
+        };
+
+        // ── Phase 2: remove the old order ─────────────────────────────
+        if side_is_bid {
+            handle.remove_bid_node(old_idx);
+        } else {
+            handle.remove_ask_node(old_idx);
+        }
+
+        // ── Phase 3: allocate a new seq + build + insert the new order
+        let new_seq = handle
+            .header
+            .order_seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        handle.header.order_seq_counter = new_seq;
+
+        let new_order_id = state_v2::encode_order_id(new_limit_ticks, new_seq, side_is_bid);
+        let order = state_v2::RestingOrderV2 {
+            order_id: new_order_id,
+            seq: new_seq,
+            price_ticks: new_limit_ticks,
+            size_lots: new_size_lots,
+            expires_at_slot: new_expires_at_slot,
+            trader: trader_pk,
+            last_valid_slot: u32::try_from(now_slot).unwrap_or(u32::MAX),
+            side,
+            order_type: 0,
+            flags: new_flags,
+            _pad: 0,
+        };
+        let new_idx = if side_is_bid {
+            handle.insert_bid(order)?
+        } else {
+            handle.insert_ask(order)?
+        };
+
+        emit!(OrderModifiedV2Event {
+            market: market_key,
+            trader: trader_pk,
+            side,
+            old_seq,
+            new_seq,
+            new_price_ticks: new_limit_ticks,
+            new_size_lots,
+            new_node_index: new_idx,
+            new_order_id,
+        });
+        Ok(())
+    }
+
     /// V2 read-side: emit the top-N levels of the hypertree-backed book
     /// as an event. Walks `for_each_bid_best_first` / `for_each_ask_best_first`
     /// and packs the first BOOK_DEPTH_LEVELS=4 of each side into a single
@@ -8930,6 +9127,40 @@ pub struct OrderCancelledV2Event {
     pub node_index: u32,
     pub total_orders_after: u32,
 }
+
+/// Emitted by `cancel_all_v2`. `cancelled_count` is 0 when the trader had
+/// no resting orders (the ix is silently a no-op in that case — useful as
+/// defensive cleanup from a bot). Bounded by `MAX_CANCELS_PER_IX_V2`.
+#[event]
+pub struct BulkOrderCancelledV2Event {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub cancelled_count: u32,
+    pub total_orders_after: u32,
+}
+
+/// Emitted by `modify_order_v2` after the atomic cancel+place lands.
+/// `new_order_id` is the encoded id of the replacement order — off-chain
+/// consumers track open orders by this id (the old id is dead the moment
+/// `cancel` lands inside the ix; no one should reference it again).
+#[event]
+pub struct OrderModifiedV2Event {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub side: u8,
+    pub old_seq: u64,
+    pub new_seq: u64,
+    pub new_price_ticks: u64,
+    pub new_size_lots: u64,
+    pub new_node_index: u32,
+    pub new_order_id: u64,
+}
+
+/// Hard cap on the number of resting orders `cancel_all_v2` can remove in
+/// a single ix. Bounded by the BPF compute budget — at 24 cancels the
+/// worst-case (24 removes × ~500 CU each + 100-node walk) lands at
+/// ~14K CU, well inside the 200K default.
+pub const MAX_CANCELS_PER_IX_V2: usize = 24;
 
 #[derive(Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct BookLevelV2 {

@@ -573,6 +573,92 @@ async function benchFlashBook(conn: Connection, authority: Keypair) {
     console.log(`  cancel skipped (no OrderPlacedV2Event found in seed tx)`);
   }
 
+  // ─── SCENARIO 8: modify_order_v2 (atomic cancel + place)
+  console.log(banner('Scenario 8 — modify a resting order'));
+  // Place a fresh order, then modify it to a new price/size in a single ix.
+  const modSeed = await client.placeLimitOrderV2Ix({
+    trader: alice.publicKey,
+    market,
+    side: 'short',
+    sizeLots: new BN(1),
+    limitTicks: new BN(104500),
+    flags: 0,
+    expiresAtSlot: new BN(0),
+  });
+  const { result: modSeedTx } = await send(conn, alice, [modSeed]);
+  let modOldOrderId: BN | null = null;
+  for (const line of modSeedTx?.meta?.logMessages ?? []) {
+    if (!line.startsWith('Program data: ')) continue;
+    try {
+      const ev = eventCoder.decode(line.slice('Program data: '.length).trim());
+      if (ev?.name === 'OrderPlacedV2Event') {
+        const seq = BigInt((ev.data as any).seq.toString());
+        modOldOrderId = new BN(encodeOrderIdV2(104500n, seq, false).toString());
+        break;
+      }
+    } catch { /* skip */ }
+  }
+  if (modOldOrderId) {
+    const modIx = await client.modifyOrderV2Ix({
+      trader: alice.publicKey,
+      market,
+      side: 'short',
+      oldOrderId: modOldOrderId as unknown as bigint,
+      newSizeLots: new BN(2) as unknown as bigint,
+      newLimitTicks: new BN(104700) as unknown as bigint,
+      newFlags: 0,
+      newExpiresAtSlot: new BN(0) as unknown as bigint,
+    });
+    const tx8 = new Transaction().add(modIx);
+    tx8.feePayer = alice.publicKey;
+    tx8.recentBlockhash = (await conn.getLatestBlockhash('confirmed')).blockhash;
+    tx8.sign(alice);
+    const tx8Bytes = tx8.serialize().length;
+    const sig8 = await conn.sendRawTransaction(tx8.serialize());
+    await conn.confirmTransaction(sig8, 'confirmed');
+    const r8 = await conn.getTransaction(sig8, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+    const m8 = txMetrics(r8 as TransactionResponse, tx8Bytes);
+    console.log(`  CU: ${m8.cu}  Fee: ${m8.fee}  Size: ${m8.txBytes}  Accounts: ${m8.accountsTouched}`);
+    results.push({ scenario: 'modify_order_v2', protocol: 'flash_book', ...m8 });
+  } else {
+    console.log(`  modify skipped (no OrderPlacedV2Event in seed tx)`);
+  }
+
+  // ─── SCENARIO 9: cancel_all_v2 (bulk cancel)
+  console.log(banner('Scenario 9 — cancel_all_v2 (bulk cancel)'));
+  // Alice owns many resting asks from the depth-100 seeding. cancelAll
+  // removes up to MAX_CANCELS_PER_IX_V2 = 24 in a single ix.
+  const cancelAllIx = await client.cancelAllV2Ix({
+    trader: alice.publicKey,
+    market,
+  });
+  const tx9 = new Transaction().add(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
+    cancelAllIx,
+  );
+  tx9.feePayer = alice.publicKey;
+  tx9.recentBlockhash = (await conn.getLatestBlockhash('confirmed')).blockhash;
+  tx9.sign(alice);
+  const tx9Bytes = tx9.serialize().length;
+  const sig9 = await conn.sendRawTransaction(tx9.serialize());
+  await conn.confirmTransaction(sig9, 'confirmed');
+  const r9 = await conn.getTransaction(sig9, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+  const m9 = txMetrics(r9 as TransactionResponse, tx9Bytes);
+  // Decode the BulkOrderCancelledV2Event to report cancelled_count.
+  let bulkCount = 0;
+  for (const line of r9?.meta?.logMessages ?? []) {
+    if (!line.startsWith('Program data: ')) continue;
+    try {
+      const ev = eventCoder.decode(line.slice('Program data: '.length).trim());
+      if (ev?.name === 'BulkOrderCancelledV2Event') {
+        bulkCount = (ev.data as any).cancelledCount ?? (ev.data as any).cancelled_count ?? 0;
+        break;
+      }
+    } catch { /* skip */ }
+  }
+  console.log(`  CU: ${m9.cu}  Fee: ${m9.fee}  Size: ${m9.txBytes}  Accounts: ${m9.accountsTouched}  cancelled=${bulkCount}`);
+  results.push({ scenario: 'cancel_all_v2', protocol: 'flash_book', cancelled: bulkCount, ...m9 });
+
   // ─── Account size after ~100 orders
   const bookInfoAfter = await conn.getAccountInfo(book);
   const bookSizeAfter = bookInfoAfter?.data.length ?? 0;
@@ -693,6 +779,10 @@ async function main() {
   console.log(`taker sweeps 5 makers           | ${fmt(fb('taker_walks_5')?.cu).padEnd(11)}| ${fmt(ph.published_take_cu.sweep_5).padEnd(12)}| ${fmt(mf.published_take_cu.sweep_5)}`);
   console.log(`taker sweeps 10 makers (d=100)  | ${fmt(fb('taker_walks_10_depth_100')?.cu).padEnd(11)}| n/a         | n/a`);
   console.log(`cancel_order_v2                 | ${fmt(fb('cancel_order_v2')?.cu).padEnd(11)}| ${fmt(ph.published_cancel_cu).padEnd(12)}| ${fmt(mf.published_cancel_cu)}`);
+  console.log(`modify_order_v2 (atomic)        | ${fmt(fb('modify_order_v2')?.cu).padEnd(11)}| n/a         | n/a`);
+  const ca = fb('cancel_all_v2');
+  const caCount = (ca as any)?.cancelled ?? 0;
+  console.log(`cancel_all_v2 (bulk, ${String(caCount).padStart(2)} cancelled)  | ${fmt(ca?.cu).padEnd(11)}| n/a         | n/a`);
 
   const accSz = fb('account_size');
   console.log(`book PDA size (20 orders rest)  | ${(accSz?.after_20_orders ?? 0).toLocaleString().padEnd(11)}| ${ph.book_account_size.toLocaleString().padEnd(12)}| ${mf.book_account_size.toLocaleString()}`);

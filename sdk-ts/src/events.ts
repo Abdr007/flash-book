@@ -114,6 +114,31 @@ export interface OrderCancelledV2Event {
   totalOrdersAfter: number;
 }
 
+/// Emitted by `cancelAllV2Ix`. `cancelledCount === 0` means the trader had
+/// no resting orders (the ix is silently a no-op in that case). Iterate
+/// the ix repeatedly until cancelledCount returns 0 if you have more than
+/// MAX_CANCELS_PER_IX_V2 (24) open orders.
+export interface BulkOrderCancelledV2Event {
+  market: PublicKey;
+  trader: PublicKey;
+  cancelledCount: number;
+  totalOrdersAfter: number;
+}
+
+/// Emitted by `modifyOrderV2Ix`. `newOrderId` is the encoded id of the
+/// replacement; the old id is dead the moment the ix lands.
+export interface OrderModifiedV2Event {
+  market: PublicKey;
+  trader: PublicKey;
+  side: number;
+  oldSeq: BN;
+  newSeq: BN;
+  newPriceTicks: BN;
+  newSizeLots: BN;
+  newNodeIndex: number;
+  newOrderId: BN;
+}
+
 export enum MarketStatus {
   Inactive = 0,
   Active = 1,
@@ -265,6 +290,8 @@ export type FlashBookEvent =
   | { name: 'OrderPlacedV2Event'; data: OrderPlacedV2Event }
   | { name: 'BookDepthV2Event'; data: BookDepthV2Event }
   | { name: 'OrderCancelledV2Event'; data: OrderCancelledV2Event }
+  | { name: 'BulkOrderCancelledV2Event'; data: BulkOrderCancelledV2Event }
+  | { name: 'OrderModifiedV2Event'; data: OrderModifiedV2Event }
   | { name: 'FeeTiersInitializedEvent'; data: FeeTiersInitializedEvent }
   | { name: 'FeeTiersUpdatedEvent'; data: FeeTiersUpdatedEvent }
   | { name: 'TraderEffectiveTierEvent'; data: TraderEffectiveTierEvent }

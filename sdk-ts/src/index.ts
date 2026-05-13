@@ -129,6 +129,8 @@ export type {
   BookLevelV2,
   BookDepthV2Event,
   OrderCancelledV2Event,
+  BulkOrderCancelledV2Event,
+  OrderModifiedV2Event,
   FeeTiersInitializedEvent,
   FeeTiersUpdatedEvent,
   TraderEffectiveTierEvent,

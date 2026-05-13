@@ -533,6 +533,61 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// V2 cancel-all: remove every resting order the trader owns in this
+  /// market. Bounded by `MAX_CANCELS_PER_IX_V2 = 24` on-chain — traders
+  /// with more open orders call this ix repeatedly until the emitted
+  /// `BulkOrderCancelledV2Event.cancelled_count` returns 0.
+  cancelAllV2Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    return this.methods
+      .cancelAllV2()
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        marketBook: book.address,
+      })
+      .instruction();
+  }
+
+  /// V2 modify: atomic cancel + place. Cheaper than two separate txs
+  /// (one signature, one set of account loads) and preserves the
+  /// trader's intent across the cancel window. Validates the new params
+  /// against the same gates as `placeLimitOrderV2Ix` BEFORE removing
+  /// the old order, so a malformed modify never drops the original.
+  modifyOrderV2Ix(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    side: 'long' | 'short';
+    oldOrderId: bigint | BN;
+    newSizeLots: bigint | number | BN;
+    newLimitTicks: bigint | number | BN;
+    newFlags?: number;
+    newExpiresAtSlot?: bigint | number | BN;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    const sideU8 = args.side === 'long' ? 0 : 1;
+    const oldIdBn =
+      args.oldOrderId instanceof BN ? args.oldOrderId : new BN(args.oldOrderId.toString());
+    return this.methods
+      .modifyOrderV2(
+        sideU8,
+        oldIdBn,
+        args.newSizeLots,
+        args.newLimitTicks,
+        args.newFlags ?? 0,
+        args.newExpiresAtSlot ?? new BN(0),
+      )
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        marketBook: book.address,
+      })
+      .instruction();
+  }
+
   openTraderStateIx(trader: PublicKey): Promise<TransactionInstruction> {
     const state = this.traderState(trader);
     return this.methods
