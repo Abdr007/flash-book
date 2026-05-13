@@ -159,6 +159,7 @@ fn long_position(market: Pubkey, size: u64, entry: u64) -> PositionSnapshot {
         size_lots: size,
         entry_price: Ticks(entry),
         cum_funding_index_at_entry: 0,
+        collateral_quote_lots: 0,
     }
 }
 
@@ -169,6 +170,7 @@ fn short_position(market: Pubkey, size: u64, entry: u64) -> PositionSnapshot {
         size_lots: size,
         entry_price: Ticks(entry),
         cum_funding_index_at_entry: 0,
+        collateral_quote_lots: 0,
     }
 }
 

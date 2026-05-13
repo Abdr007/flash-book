@@ -38,6 +38,14 @@ pub struct PositionSnapshot {
     pub size_lots: u64,
     pub entry_price: Ticks,
     pub cum_funding_index_at_entry: FundingIndex,
+    /// Phase 2 isolated-margin marker.
+    /// `0`  — position is cross-margined and is evaluated against the
+    ///        trader's pooled `collateral_quote_lots`.
+    /// `>0` — position is isolated. `assess_margin_unified` filters it
+    ///        into its own singleton bucket and evaluates it against
+    ///        this collateral amount; the cross bucket sees only the
+    ///        non-isolated positions.
+    pub collateral_quote_lots: u64,
 }
 
 /// Snapshot of a market used in margin assessment.
@@ -335,6 +343,137 @@ pub fn assess_margin(
     })
 }
 
+/// Assess margin when some positions are isolated-margin.
+///
+/// ─── ISOLATED MARGIN MODEL ───────────────────────────────────────────
+///
+/// A position is "isolated" when its own `PositionAccount.collateral_quote_lots`
+/// > 0. The caller passes a map of (market → isolated_collateral) for every
+/// isolated position; positions whose market is NOT in the map are treated
+/// as cross.
+///
+/// The trader is HEALTHY iff:
+///   (a) The cross set, assessed against `cross_collateral_quote_lots`, is
+///       healthy, AND
+///   (b) EVERY isolated position, assessed as a singleton against its own
+///       isolated_collateral, is healthy.
+///
+/// Failure of ANY isolated position is sufficient to mark the trader
+/// unhealthy — but the failure is bounded: an isolated position's
+/// liquidation can only touch its own collateral and the insurance fund,
+/// never the trader's cross pool. The cross pool is insulated.
+///
+/// Returned `required_quote_lots` is the SUM of required margins across
+/// all buckets (cross required + Σ isolated required) so off-chain UIs
+/// can show total locked margin. `equity_quote_lots_signed` is the
+/// trader's TOTAL equity across both pools so the UI can render
+/// available headroom. `worst_scenario_idx` is the scenario index from
+/// the most-loaded bucket (whichever ran the closest to liquidation).
+pub fn assess_margin_split(
+    positions: &[PositionSnapshot],
+    markets: &[MarketSnapshot],
+    scenarios: &[Scenario],
+    cross_collateral_quote_lots: u64,
+    isolated_collaterals_by_market: &[(Pubkey, u64)],
+) -> Result<MarginAssessment> {
+    let find_isolated = |market: &Pubkey| -> Option<u64> {
+        isolated_collaterals_by_market
+            .iter()
+            .find(|(m, _)| m == market)
+            .map(|(_, c)| *c)
+    };
+
+    let mut cross_positions: Vec<PositionSnapshot> = Vec::with_capacity(positions.len());
+    let mut isolated_positions: Vec<(PositionSnapshot, u64)> = Vec::new();
+    for pos in positions {
+        match find_isolated(&pos.market) {
+            Some(c) => isolated_positions.push((*pos, c)),
+            None => cross_positions.push(*pos),
+        }
+    }
+
+    // (a) Cross-bucket assessment.
+    let cross = assess_margin(
+        &cross_positions,
+        markets,
+        scenarios,
+        cross_collateral_quote_lots,
+    )?;
+
+    // (b) Each isolated position assessed as a singleton against its own
+    // collateral. Track the worst loadedness ratio so we can surface the
+    // scenario index from the bucket that's closest to liquidation.
+    let mut total_required: u64 = cross.required_quote_lots;
+    let mut total_equity: i128 = cross.equity_quote_lots_signed;
+    let mut all_healthy = cross.is_healthy;
+    // Tightness metric: required − equity. Larger = closer to (or past) liquidation.
+    let mut worst_idx = cross.worst_scenario_idx;
+    let mut worst_tightness: i128 =
+        (cross.required_quote_lots as i128).checked_sub(cross.equity_quote_lots_signed).unwrap_or(0);
+
+    for (pos, iso_collateral) in &isolated_positions {
+        let singleton = [*pos];
+        let a = assess_margin(&singleton, markets, scenarios, *iso_collateral)?;
+        total_required = total_required.saturating_add(a.required_quote_lots);
+        total_equity = total_equity.saturating_add(a.equity_quote_lots_signed);
+        if !a.is_healthy {
+            all_healthy = false;
+        }
+        let tightness = (a.required_quote_lots as i128)
+            .checked_sub(a.equity_quote_lots_signed)
+            .unwrap_or(0);
+        if tightness > worst_tightness {
+            worst_tightness = tightness;
+            worst_idx = a.worst_scenario_idx;
+        }
+    }
+
+    Ok(MarginAssessment {
+        required_quote_lots: total_required,
+        equity_quote_lots_signed: total_equity,
+        is_healthy: all_healthy,
+        worst_scenario_idx: worst_idx,
+    })
+}
+
+/// Phase 2 dispatch helper. Call this from any handler that previously
+/// called `assess_margin` directly — it picks the right code path based
+/// on whether any snapshot is isolated.
+///
+/// The "isolated" decision is read from each `PositionSnapshot`'s own
+/// `collateral_quote_lots` field. Handlers that mutate per-position
+/// collateral mid-instruction (e.g. `set_position_isolated`) populate
+/// snapshots with the POST-transition value before calling.
+///
+/// When NO snapshot has `collateral_quote_lots > 0` this delegates to
+/// `assess_margin`, byte-identical to the pre-Phase-2 path. When ANY
+/// snapshot is isolated, all isolated snapshots are filtered into their
+/// own singleton buckets and the remainder is evaluated as the cross
+/// set against `cross_collateral_quote_lots`.
+pub fn assess_margin_unified(
+    positions: &[PositionSnapshot],
+    markets: &[MarketSnapshot],
+    scenarios: &[Scenario],
+    cross_collateral_quote_lots: u64,
+) -> Result<MarginAssessment> {
+    let has_isolated = positions.iter().any(|p| p.collateral_quote_lots > 0);
+    if !has_isolated {
+        return assess_margin(positions, markets, scenarios, cross_collateral_quote_lots);
+    }
+    let isolated: Vec<(Pubkey, u64)> = positions
+        .iter()
+        .filter(|p| p.collateral_quote_lots > 0)
+        .map(|p| (p.market, p.collateral_quote_lots))
+        .collect();
+    assess_margin_split(
+        positions,
+        markets,
+        scenarios,
+        cross_collateral_quote_lots,
+        &isolated,
+    )
+}
+
 /// Generate a default scenario lattice for a list of markets:
 /// - flat
 /// - per-market ±{2, 5, 10, 20}%
@@ -513,5 +652,115 @@ mod fee_tier_tests {
             prev_maker = m;
             prev_taker = t;
         }
+    }
+}
+
+#[cfg(test)]
+mod isolated_margin_tests {
+    use super::*;
+
+    fn mkt(seed: u8, mark: u64) -> (Pubkey, MarketSnapshot) {
+        let pk = Pubkey::new_from_array([seed; 32]);
+        let m = MarketSnapshot {
+            market: pk,
+            mark_price: Ticks(mark),
+            cum_funding_index: 0,
+            maintenance_margin_bps: 500, // 5%
+            tick_size: 1,
+            concentration_threshold_lots: 0,
+            concentration_extra_mmr_bps: 0,
+        };
+        (pk, m)
+    }
+
+    fn long_at(market: Pubkey, size: u64, entry: u64, iso: u64) -> PositionSnapshot {
+        PositionSnapshot {
+            market,
+            side: Side::Long,
+            size_lots: size,
+            entry_price: Ticks(entry),
+            cum_funding_index_at_entry: 0,
+            collateral_quote_lots: iso,
+        }
+    }
+
+    #[test]
+    fn unified_no_isolated_matches_assess_margin() {
+        let (mkt_a, ms_a) = mkt(1, 100);
+        let positions = vec![long_at(mkt_a, 10, 95, 0)];
+        let scenarios = default_scenarios(&[mkt_a]);
+        let unified = assess_margin_unified(&positions, &[ms_a], &scenarios, 5_000).unwrap();
+        let flat = assess_margin(&positions, &[ms_a], &scenarios, 5_000).unwrap();
+        assert_eq!(unified.is_healthy, flat.is_healthy);
+        assert_eq!(unified.required_quote_lots, flat.required_quote_lots);
+        assert_eq!(unified.equity_quote_lots_signed, flat.equity_quote_lots_signed);
+    }
+
+    #[test]
+    fn isolated_position_healthy_with_own_collateral() {
+        let (mkt_a, ms_a) = mkt(1, 100);
+        // Long 10 @ entry 95, mark 100 → unrealized profit. Iso collateral 5_000.
+        let positions = vec![long_at(mkt_a, 10, 95, 5_000)];
+        let scenarios = default_scenarios(&[mkt_a]);
+        // Cross pool empty — only the isolated bucket matters here.
+        let a = assess_margin_unified(&positions, &[ms_a], &scenarios, 0).unwrap();
+        assert!(a.is_healthy, "isolated position must use its own collateral");
+    }
+
+    #[test]
+    fn isolated_unhealthy_when_underfunded_even_if_cross_pool_huge() {
+        let (mkt_a, ms_a) = mkt(1, 100);
+        // Long with 1 lot of isolated collateral against a 1000-lot position
+        // is grossly underfunded. The cross pool of 1B quote lots MUST NOT
+        // rescue an isolated position — that's the whole point of isolation.
+        let positions = vec![long_at(mkt_a, 1_000, 95, 1)];
+        let scenarios = default_scenarios(&[mkt_a]);
+        let a = assess_margin_unified(&positions, &[ms_a], &scenarios, 1_000_000_000).unwrap();
+        assert!(
+            !a.is_healthy,
+            "fat cross pool must not insulate an under-collateralised isolated position"
+        );
+    }
+
+    #[test]
+    fn cross_set_protected_when_isolated_fails() {
+        // Mixed portfolio: cross set is robust, isolated position is bust.
+        // The trader is overall unhealthy (any isolated failure trips the
+        // unified flag) but the equity and required totals tell the UI
+        // where the deficit is.
+        let (mkt_a, ms_a) = mkt(1, 100);
+        let (mkt_b, ms_b) = mkt(2, 200);
+        let positions = vec![
+            long_at(mkt_a, 10, 95, 0),  // cross — well-collateralised by 10_000 pool
+            long_at(mkt_b, 1_000, 195, 1), // isolated — under-collateralised
+        ];
+        let scenarios = default_scenarios(&[mkt_a, mkt_b]);
+        let a = assess_margin_unified(&positions, &[ms_a, ms_b], &scenarios, 10_000).unwrap();
+        assert!(!a.is_healthy);
+
+        // Sanity: cross-only assessment over the cross subset alone IS healthy.
+        let cross_only = vec![long_at(mkt_a, 10, 95, 0)];
+        let cross_check =
+            assess_margin(&cross_only, &[ms_a, ms_b], &scenarios, 10_000).unwrap();
+        assert!(
+            cross_check.is_healthy,
+            "cross subset must be self-sufficient — isolated failure does NOT bleed back"
+        );
+    }
+
+    #[test]
+    fn split_external_map_overrides_snapshot_field() {
+        // set_position_isolated passes a POST-transition isolated map even
+        // though the snapshot's own field still reads 0 (the on-chain
+        // mutation happens after the health check). The split path must
+        // honour the external map, not the field. This locks in that
+        // contract.
+        let (mkt_a, ms_a) = mkt(1, 100);
+        let positions = vec![long_at(mkt_a, 10, 95, 0)]; // field says cross
+        let scenarios = default_scenarios(&[mkt_a]);
+        let iso_map = [(mkt_a, 5_000)]; // explicit isolated
+        let a = assess_margin_split(&positions, &[ms_a], &scenarios, 0, &iso_map).unwrap();
+        // Cross pool empty, but isolated map covers it → healthy.
+        assert!(a.is_healthy);
     }
 }

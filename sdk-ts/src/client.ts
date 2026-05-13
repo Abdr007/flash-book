@@ -663,6 +663,68 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Phase 2 — switch a position to isolated margin. `amountQuoteLots`
+  /// is reserved from the trader's pooled `TraderState.collateral_quote_lots`
+  /// against this specific position; subsequent losses on the position
+  /// (liquidation reward + health-check requirement) are bounded to the
+  /// per-position bucket. The transition fails if the trader has
+  /// another isolated position already (Phase 2 single-isolated cap).
+  ///
+  /// `otherPositions`: every OTHER position the trader holds with
+  /// size_lots > 0, passed as `(market, position)` pairs in
+  /// remainingAccounts so the post-transfer health check can stress
+  /// the full cross set.
+  setPositionIsolatedIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    amountQuoteLots: bigint | number | BN;
+    otherPositions: Array<{ market: PublicKey; position: PublicKey }>;
+  }): Promise<TransactionInstruction> {
+    const traderState = this.traderState(args.trader);
+    const targetPosition = this.position(args.market, args.trader);
+    const remaining = args.otherPositions.flatMap((p) => [
+      { pubkey: p.market, isSigner: false, isWritable: false },
+      { pubkey: p.position, isSigner: false, isWritable: false },
+    ]);
+    return this.methods
+      .setPositionIsolated(args.amountQuoteLots)
+      .accountsPartial({
+        trader: args.trader,
+        traderState: traderState.address,
+        targetMarket: args.market,
+        targetPosition: targetPosition.address,
+      })
+      .remainingAccounts(remaining)
+      .instruction();
+  }
+
+  /// Phase 2 — switch a position back to cross margin. All of the
+  /// per-position isolated collateral is returned to the trader's
+  /// pooled `TraderState.collateral_quote_lots` and the resulting
+  /// cross set must pass the standard assess_margin health check.
+  setPositionCrossIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+    otherPositions: Array<{ market: PublicKey; position: PublicKey }>;
+  }): Promise<TransactionInstruction> {
+    const traderState = this.traderState(args.trader);
+    const targetPosition = this.position(args.market, args.trader);
+    const remaining = args.otherPositions.flatMap((p) => [
+      { pubkey: p.market, isSigner: false, isWritable: false },
+      { pubkey: p.position, isSigner: false, isWritable: false },
+    ]);
+    return this.methods
+      .setPositionCross()
+      .accountsPartial({
+        trader: args.trader,
+        traderState: traderState.address,
+        targetMarket: args.market,
+        targetPosition: targetPosition.address,
+      })
+      .remainingAccounts(remaining)
+      .instruction();
+  }
+
   /// Authority-only: set a trader's per-trader fee discount in bps off
   /// the base taker fee. 0..10_000 (cap = 100% discount = zero fee).
   /// Universal CEX pattern (Binance, OKX, Bybit, Hyperliquid) — wired

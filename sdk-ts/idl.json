@@ -9,6 +9,21 @@
   "instructions": [
     {
       "name": "apply_fill",
+      "docs": [
+        "Apply a single fill against the taker's and maker's Position PDAs.",
+        "Called by the off-chain sequencer once per `FillEntry` row in a",
+        "`FillBatchEvent` emitted from `place_taker_order_v2`, or by an",
+        "off-chain bookkeeper that aggregates multiple fills per tx.",
+        "",
+        "Trust model: the `sequencer` signer is the configured authority;",
+        "the fill data is taken at face value (a future version verifies",
+        "via per-tx fill buffer or Merkle proof against the emitted event).",
+        "`taker_was_jit`: set to true if the matched taker order was",
+        "JIT-tagged (flag bit 3 on place_limit_order). The sequencer reads",
+        "this from the order's stored flags. When true, the maker earns",
+        "`market.params.jit_bonus_rebate_bps` extra rebate on top of the",
+        "base maker_rebate_bps. Passing false preserves legacy behaviour."
+      ],
       "discriminator": [
         201,
         39,
@@ -203,6 +218,14 @@
         },
         {
           "name": "fee_tiers",
+          "docs": [
+            "WAVE 22 phase 2: optional global fee-tier table. When supplied,",
+            "per-trader maker rebate / taker fee bps are resolved from this",
+            "account against the trader's `volume_30d_quote_lots` (HL/Binance",
+            "pattern). When omitted (None), apply_fill falls back to the flat",
+            "`market.params.{maker_rebate_bps, taker_fee_bps}` per the",
+            "pre-tier behavior. Singleton PDA at `[b\"fee_tiers\"]`."
+          ],
           "optional": true
         },
         {
@@ -231,6 +254,15 @@
     },
     {
       "name": "apply_flp_fill",
+      "docs": [
+        "Apply a fill in which the FLP pool is the *maker*. Mutates the",
+        "`FlpExposureAccount.per_market` entry for this market while",
+        "applying the opposite-side update to the taker's `PositionAccount`.",
+        "",
+        "Trust model: same as `apply_fill` — sequencer-authenticated; the",
+        "fill data is taken at face value (production verifies via per-batch",
+        "fill buffer or Merkle proof)."
+      ],
       "discriminator": [
         101,
         217,
@@ -390,6 +422,14 @@
         },
         {
           "name": "fee_tiers",
+          "docs": [
+            "WAVE 22 phase 2 (FLP path): optional global fee-tier table.",
+            "When supplied, the TAKER's `taker_fee_bps` is resolved per",
+            "their rolling-window volume. FLP-side maker rebate stays flat",
+            "(FLP IS the protocol — tier-tier semantics don't apply on the",
+            "maker side here). When omitted, falls back to flat",
+            "`market.params.taker_fee_bps`."
+          ],
           "optional": true
         },
         {
@@ -414,6 +454,43 @@
     },
     {
       "name": "auto_deleverage",
+      "docs": [
+        "AUTO-DELEVERAGE — the safety primitive of last resort. When the",
+        "insurance fund falls below `pause_threshold_quote_lots`, a sick",
+        "position cannot be safely liquidated through the normal flow",
+        "(the bankruptcy gap exceeds insurance buffer). ADL force-closes",
+        "the highest-ranked profitable counter-trader at the BANKRUPTCY",
+        "PRICE of the underwater position — they realize their PnL up to",
+        "the bankruptcy price (less than market would give them) and the",
+        "gap between bp and mark is what would have come from insurance.",
+        "",
+        "Permissionless. Caller passes:",
+        "• underwater (position + trader_state)",
+        "• counter_position + counter_trader_state (chosen off-chain by",
+        "ranking unrealized_pnl × leverage, highest first)",
+        "• close_size_lots (≤ min(underwater.size, counter.size))",
+        "",
+        "Eligibility checks (all enforced on-chain):",
+        "1. insurance_fund.balance < pause_threshold (ADL trigger)",
+        "2. underwater is actually unhealthy (margin assessment)",
+        "3. counter.side != underwater.side",
+        "4. counter has positive PnL at the BANKRUPTCY price (fair: we",
+        "never force a counter-trader into a loss they wouldn't have",
+        "had anyway)",
+        "",
+        "Action:",
+        "• close `close_size` lots from BOTH at the bankruptcy price",
+        "• underwater realizes loss (collateral debited pro-rata)",
+        "• counter realizes profit at bp (less than mark — that's the",
+        "\"give up\", which absorbs the loss insurance would have eaten)",
+        "• update OI counters",
+        "• emit AutoDeleveragedEvent",
+        "",
+        "Off-chain ranking is incentivised separately (operators run a",
+        "sorted-by-pnl-leverage queue keeper). On-chain we trust the",
+        "caller's ranking but enforce eligibility — invalid ranking just",
+        "rejects."
+      ],
       "discriminator": [
         210,
         69,
@@ -427,6 +504,10 @@
       "accounts": [
         {
           "name": "caller",
+          "docs": [
+            "Anyone may call. ADL keepers compete off-chain on the (pnl ×",
+            "leverage) ranking; first valid call wins."
+          ],
           "signer": true
         },
         {
@@ -460,6 +541,10 @@
         },
         {
           "name": "insurance_fund",
+          "docs": [
+            "Insurance fund — read-only here, used to verify ADL trigger gate",
+            "(balance < pause threshold)."
+          ],
           "pda": {
             "seeds": [
               {
@@ -614,6 +699,18 @@
     },
     {
       "name": "cancel_all_v2",
+      "docs": [
+        "V2 cancel-all: remove every resting order owned by the caller in",
+        "this market. Walks both bid and ask RBTs, collecting indices of",
+        "orders whose `trader == caller`, then removes each in two",
+        "passes (read-only walk → mutating removes). The walk is bounded",
+        "by `MAX_CANCELS_PER_IX_V2 = 24`: a single tx that triggers more",
+        "cancels would risk the BPF CU budget. Traders with many resting",
+        "orders simply call this ix repeatedly until `cancelled_count == 0`.",
+        "",
+        "Returns silently when the trader has no resting orders — useful",
+        "as a \"best-effort cleanup\" the bot can call defensively."
+      ],
       "discriminator": [
         207,
         62,
@@ -659,6 +756,9 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "Mut because we remove a node + update header indices + free-list."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -690,6 +790,14 @@
     },
     {
       "name": "cancel_iceberg_v2",
+      "docs": [
+        "V2: cancel an iceberg order against the hypertree-backed book.",
+        "Best-effort child removal: if the current child is still resting,",
+        "look it up via O(log n) RBT search (vs v1's O(n) buffer scan)",
+        "and remove via handle.remove_*_node. If already filled, no-op.",
+        "Closes the iceberg account (rent returned via Anchor's `close`",
+        "constraint)."
+      ],
       "discriminator": [
         184,
         246,
@@ -708,6 +816,9 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "Mut because the active child (if still resting) is removed."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -744,6 +855,9 @@
     },
     {
       "name": "cancel_iceberg_v3",
+      "docs": [
+        "Cancel a v3 iceberg and close the account."
+      ],
       "discriminator": [
         43,
         171,
@@ -769,6 +883,10 @@
     },
     {
       "name": "cancel_jit_liquidation_offer",
+      "docs": [
+        "Cancel a JIT liquidation offer and close the account, refunding",
+        "rent to the maker. Only the maker can cancel."
+      ],
       "discriminator": [
         252,
         243,
@@ -831,6 +949,17 @@
     },
     {
       "name": "cancel_order_v2",
+      "docs": [
+        "V2 cancel: remove a resting order from the hypertree. Validates",
+        "that the caller is the original trader (orders carry trader pubkey",
+        "inline in wave 18 — wave 19 indirects through a seat). Refunds no",
+        "SPL tokens — the v2 book has no escrow yet (wave 19's free-funds",
+        "optimisation handles that).",
+        "",
+        "The off-chain SDK derives `order_id` via",
+        "`encode_order_id(price_ticks, seq, side == 0)` from the",
+        "`OrderPlacedV2Event` fields."
+      ],
       "discriminator": [
         110,
         83,
@@ -876,6 +1005,9 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "Mut because we remove a node + update header indices + free-list."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -916,6 +1048,13 @@
     },
     {
       "name": "cancel_trigger_order",
+      "docs": [
+        "Cancel a trigger order. Trader signs; account is closed and rent",
+        "returned to the trader. Works whether the trigger has already fired",
+        "(active=0) or not (active=1). If this trigger participates in an",
+        "OCO bracket, the partner is also marked inactive (passed via",
+        "remaining_accounts) so it can't fire orphaned."
+      ],
       "discriminator": [
         144,
         84,
@@ -941,6 +1080,9 @@
     },
     {
       "name": "cancel_trigger_order_v3",
+      "docs": [
+        "Cancel a v3 trigger and close the account, refunding rent."
+      ],
       "discriminator": [
         196,
         14,
@@ -966,6 +1108,10 @@
     },
     {
       "name": "cancel_twap_order",
+      "docs": [
+        "Cancel a TWAP order — trader signs, account is closed, rent",
+        "returned. Works whether fully executed or partial."
+      ],
       "discriminator": [
         23,
         154,
@@ -991,6 +1137,9 @@
     },
     {
       "name": "cancel_twap_order_v3",
+      "docs": [
+        "Cancel a v3 TWAP order and close the account."
+      ],
       "discriminator": [
         134,
         25,
@@ -1016,6 +1165,16 @@
     },
     {
       "name": "close_trader_ata",
+      "docs": [
+        "Close the trader's quote ATA and refund the rent lamports to",
+        "`rent_destination`. CPIs to SPL Token's `CloseAccount`, which",
+        "enforces an empty token balance — closing a non-empty ATA fails",
+        "with `TokenError::NonNativeHasBalance` from the SPL program.",
+        "",
+        "The trader signs (they are the ATA authority). This is useful when",
+        "a trader is fully exited and wants to reclaim their rent, or when",
+        "the SDK wants to clean up an accidentally-created ATA."
+      ],
       "discriminator": [
         160,
         93,
@@ -1029,6 +1188,9 @@
       "accounts": [
         {
           "name": "trader",
+          "docs": [
+            "Trader signs — they are the ATA authority."
+          ],
           "signer": true
         },
         {
@@ -1062,6 +1224,11 @@
         },
         {
           "name": "trader_quote_ata",
+          "docs": [
+            "The ATA being closed. Constrained to be the canonical ATA for",
+            "(trader, quote_mint). SPL Token's CloseAccount will enforce that",
+            "the token balance is zero before allowing close."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -1152,6 +1319,11 @@
         },
         {
           "name": "rent_destination",
+          "docs": [
+            "Where the freed rent lamports are credited. Caller's choice — for",
+            "most onboarding flows this is the trader; for sponsored flows the",
+            "original payer might want to reclaim."
+          ],
           "writable": true
         },
         {
@@ -1163,6 +1335,9 @@
     },
     {
       "name": "create_vault_v3",
+      "docs": [
+        "Strategist creates a new vault. Vault id is per-strategist (0..255)."
+      ],
       "discriminator": [
         250,
         73,
@@ -1210,6 +1385,14 @@
     },
     {
       "name": "delegate_market",
+      "docs": [
+        "Delegate the MarketAccount itself to the ER. The matcher running",
+        "on the ER mutates `mark_price_ticks`, `cum_funding_index`,",
+        "`last_funding_rate_bps_per_sec`, `vpin`, `current_batch`, and",
+        "`last_batch_ms` in lockstep with the order book. Pair this with",
+        "`delegate_market_book` — both delegations must be live for the",
+        "matcher to run on the ER without forking state between layers."
+      ],
       "discriminator": [
         223,
         125,
@@ -1228,6 +1411,10 @@
         },
         {
           "name": "market",
+          "docs": [
+            "The market account itself becomes a delegated account; mut so we",
+            "can sign over it via seeds (PDA-as-signer for invoke_signed)."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -1295,6 +1482,22 @@
     },
     {
       "name": "delegate_market_book",
+      "docs": [
+        "Delegate the v2 hypertree market_book PDA to the MagicBlock ER.",
+        "After this lands, the account state lives on the ER for sub-ms",
+        "matcher access; only this program (via PDA signature) can",
+        "undelegate it back to mainnet. The market account must also be",
+        "delegated (see `delegate_market`) so the matcher running on the",
+        "ER can mutate mark/funding/VPIN state in lockstep with the book.",
+        "",
+        "`commit_frequency_ms` controls how often the ER auto-commits the",
+        "state back to mainnet when the program isn't doing it explicitly.",
+        "0 disables auto-commit (only manual undelegate flushes state).",
+        "Production target: 50–200 ms — short enough that liquidations on",
+        "mainnet read a near-live mark; long enough not to spam commits.",
+        "",
+        "`validator` pins the ER validator (None = permissionless selection)."
+      ],
       "discriminator": [
         36,
         70,
@@ -1308,6 +1511,9 @@
       "accounts": [
         {
           "name": "authority",
+          "docs": [
+            "Pays for the delegation buffer + delegation record allocation."
+          ],
           "writable": true,
           "signer": true
         },
@@ -1341,6 +1547,10 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "verifies the seeds + bump match. Inside the handler we additionally",
+            "verify .owner == this program (defence-in-depth — er.rs SECURITY note)."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -1369,18 +1579,31 @@
         },
         {
           "name": "owner_program",
+          "docs": [
+            "MagicBlock delegation program). Verified inside cpi_delegate via",
+            "the program ID match. Constraint pins it to this crate's program ID."
+          ],
           "address": "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF"
         },
         {
           "name": "delegate_buffer",
+          "docs": [
+            "MagicBlock delegation program initialises this; we don't preallocate."
+          ],
           "writable": true
         },
         {
           "name": "delegation_record",
+          "docs": [
+            "Initialised by the delegation program."
+          ],
           "writable": true
         },
         {
           "name": "delegation_metadata",
+          "docs": [
+            "Initialised by the delegation program."
+          ],
           "writable": true
         },
         {
@@ -1389,6 +1612,9 @@
         },
         {
           "name": "delegation_program",
+          "docs": [
+            "canonical DELEGATION_PROGRAM_ID; cpi_delegate also rechecks."
+          ],
           "address": "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
         }
       ],
@@ -1407,6 +1633,12 @@
     },
     {
       "name": "deposit_collateral",
+      "docs": [
+        "Deposit collateral. Performs an SPL transfer from the trader's",
+        "quote ATA into the global protocol vault, then credits the trader's",
+        "accounting balance. Both the SPL transfer and the accounting bump",
+        "happen atomically — partial failure rolls back the whole tx."
+      ],
       "discriminator": [
         156,
         131,
@@ -1478,10 +1710,18 @@
           }
         },
         {
-          "name": "quote_mint"
+          "name": "quote_mint",
+          "docs": [
+            "Quote mint (typically USDC). Required so `associated_token` can derive",
+            "the canonical ATA address for validation."
+          ]
         },
         {
           "name": "trader_quote_ata",
+          "docs": [
+            "Trader's USDC ATA — must be the canonical associated token account",
+            "for (trader, quote_mint). Anchor validates the address derivation."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -1572,6 +1812,9 @@
         },
         {
           "name": "quote_vault",
+          "docs": [
+            "Global vault — must be the one stored on the insurance_fund."
+          ],
           "writable": true
         },
         {
@@ -1588,6 +1831,14 @@
     },
     {
       "name": "deposit_flp_capital",
+      "docs": [
+        "Deposit capital into the FLP pool and mint shares at the current",
+        "NAV/share price. Permissionless — any signer can become an LP.",
+        "Their LpPositionAccount is created lazily via init_if_needed.",
+        "",
+        "Shares minted = amount × shares_outstanding / NAV. Bootstrap",
+        "(NAV ≤ 0 or shares_outstanding == 0) mints 1:1."
+      ],
       "discriminator": [
         70,
         218,
@@ -1631,6 +1882,9 @@
         },
         {
           "name": "lp_position",
+          "docs": [
+            "LP's per-LP share account. Created lazily on first deposit."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -1659,6 +1913,9 @@
         },
         {
           "name": "insurance_fund",
+          "docs": [
+            "Insurance fund PDA — owns the protocol vault."
+          ],
           "pda": {
             "seeds": [
               {
@@ -1798,6 +2055,16 @@
     },
     {
       "name": "execute_trigger_order_v2",
+      "docs": [
+        "V2: execute a trigger order against the hypertree-backed book.",
+        "Same trigger semantics as v1 (kind, oracle compare, reduce-only,",
+        "expiry, OCO partner deactivation) — only the order injection",
+        "target differs: insert as a `RestingOrderV2` node in the bid or",
+        "ask RBT instead of writing into the legacy flat buffer.",
+        "",
+        "Permissionless executor (any signer can fire a triggered trigger",
+        "— trader pre-authorized by creating the trigger)."
+      ],
       "discriminator": [
         5,
         228,
@@ -1811,6 +2078,9 @@
       "accounts": [
         {
           "name": "caller",
+          "docs": [
+            "Permissionless caller pays tx fee."
+          ],
           "signer": true
         },
         {
@@ -1843,6 +2113,10 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "via `MarketBookHandle::from_account_data`. Mut because the trigger",
+            "inserts a new resting order."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -1875,6 +2149,10 @@
         },
         {
           "name": "position",
+          "docs": [
+            "Trader's position — required when reduce_only flag is set.",
+            "Same lazy-load pattern as v1."
+          ],
           "pda": {
             "seeds": [
               {
@@ -1907,6 +2185,11 @@
     },
     {
       "name": "execute_trigger_order_v3",
+      "docs": [
+        "Execute a v3 trigger — validates fire condition then injects the",
+        "resulting limit order into the hypertree directly (no CPI). The",
+        "caller is permissionless; trader was pre-authorized at placement."
+      ],
       "discriminator": [
         149,
         239,
@@ -1920,6 +2203,9 @@
       "accounts": [
         {
           "name": "caller",
+          "docs": [
+            "Permissionless caller pays tx fee. Trader pre-authorized at placement."
+          ],
           "signer": true
         },
         {
@@ -1959,6 +2245,9 @@
         },
         {
           "name": "position",
+          "docs": [
+            "Trader's position — required for reduce-only triggers."
+          ],
           "pda": {
             "seeds": [
               {
@@ -1991,6 +2280,15 @@
     },
     {
       "name": "execute_twap_slice_v2",
+      "docs": [
+        "V2: execute one TWAP slice against the hypertree-backed book.",
+        "Same scheduling semantics as v1 (FLAG_ACTIVE check, end_slot",
+        "expiry, slot_interval gating, slice sizing with min_base_lots",
+        "floor, parent depletion deactivation); only the order injection",
+        "target differs (hypertree, not v1 buffer).",
+        "",
+        "Permissionless caller — pre-authorized by trader at TWAP creation."
+      ],
       "discriminator": [
         13,
         233,
@@ -2004,6 +2302,9 @@
       "accounts": [
         {
           "name": "caller",
+          "docs": [
+            "Permissionless caller pays tx fee."
+          ],
           "signer": true
         },
         {
@@ -2036,6 +2337,10 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "via `MarketBookHandle::from_account_data`. Mut because the slice",
+            "inserts a new resting order."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -2071,6 +2376,9 @@
     },
     {
       "name": "execute_twap_slice_v3",
+      "docs": [
+        "Permissionless TWAP slice executor."
+      ],
       "discriminator": [
         171,
         57,
@@ -2126,6 +2434,9 @@
     },
     {
       "name": "flp_deposit_v3",
+      "docs": [
+        "Deposit FLP capital with REAL SPL transfer + mint pro-rata shares."
+      ],
       "discriminator": [
         29,
         177,
@@ -2212,10 +2523,16 @@
         },
         {
           "name": "lp_quote_ata",
+          "docs": [
+            "LP's USDC ATA — debited."
+          ],
           "writable": true
         },
         {
           "name": "quote_vault",
+          "docs": [
+            "Protocol vault — credited."
+          ],
           "writable": true
         },
         {
@@ -2236,6 +2553,9 @@
     },
     {
       "name": "flp_withdraw_v3",
+      "docs": [
+        "Withdraw FLP capital by burning shares + SPL release."
+      ],
       "discriminator": [
         7,
         62,
@@ -2322,6 +2642,9 @@
         },
         {
           "name": "insurance_fund",
+          "docs": [
+            "InsuranceFund PDA — signs SPL release."
+          ],
           "pda": {
             "seeds": [
               {
@@ -2348,10 +2671,16 @@
         },
         {
           "name": "quote_vault",
+          "docs": [
+            "Protocol vault — debited."
+          ],
           "writable": true
         },
         {
           "name": "lp_quote_ata",
+          "docs": [
+            "LP's USDC ATA — credited."
+          ],
           "writable": true
         },
         {
@@ -2368,6 +2697,22 @@
     },
     {
       "name": "init_fee_tiers",
+      "docs": [
+        "Initialize the protocol-wide fee tier table. Authority signs.",
+        "Multi-tier volume-based fees — HL / Binance / dYdX standard.",
+        "`volume_window_slots` = how many slots the rolling window covers",
+        "(HL: 14d ≈ 3_024_000 slots @ 0.4s/slot). Tiers MUST be:",
+        "• non-empty, length ≤ MAX_FEE_TIERS = 10",
+        "• sorted ascending by `min_volume_quote_lots`",
+        "• first tier has `min_volume_quote_lots == 0` (default tier)",
+        "• monotone improving: each tier's `taker_fee_bps` ≤ prior",
+        "tier's, each tier's `maker_rebate_bps` ≥ prior tier's",
+        "• all bps within `MAX_FEE_TIER_BPS = 1_000` (10%) — guards",
+        "against an authority typo locking traders into 90%+ fees",
+        "",
+        "Markets without this account fall back to flat",
+        "`MarketAccount.params.{maker_rebate_bps, taker_fee_bps}`."
+      ],
       "discriminator": [
         200,
         48,
@@ -2430,6 +2775,9 @@
     },
     {
       "name": "init_flp_per_market_v3",
+      "docs": [
+        "Initialize a per-market FLP exposure account. Authority-only."
+      ],
       "discriminator": [
         226,
         229,
@@ -2489,6 +2837,22 @@
     },
     {
       "name": "init_market_book",
+      "docs": [
+        "Initialize the v2 hypertree-backed orderbook for a market.",
+        "Allocates a fresh PDA at `[b\"market_book\", market]` of exactly",
+        "MARKET_BOOK_TOTAL_BYTES (8264 B), stamps the v2 discriminator,",
+        "and writes an empty header with all RBT root indices = NIL.",
+        "",
+        "This is the foundation for the wave-18 orderbook rewrite. The",
+        "account is `UncheckedAccount` because the data layout",
+        "(256-byte header + 8000-byte dynamic node array) is large",
+        "enough that Anchor's `#[account(zero_copy)]` derive choke on",
+        "the `[u8; 8000]` field. Manifest's exact pattern.",
+        "",
+        "This ix runs ALONGSIDE the legacy `initialize_order_buffer` for",
+        "now; once the matcher is fully migrated (wave 18d-e), the",
+        "legacy ix is deprecated and removed."
+      ],
       "discriminator": [
         74,
         209,
@@ -2535,6 +2899,12 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "handler. Anchor's `init` constraint can't size this (8264 B",
+            "with the [u8; 8000] field), and `#[account(zero_copy)]` rejects",
+            "large array fields in its derive expansion. Manifest's pattern.",
+            "Owner check happens implicitly via the seeds derivation."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -2570,6 +2940,21 @@
     },
     {
       "name": "init_market_leverage_tiers",
+      "docs": [
+        "Initialize the per-market leverage-tier table — wave 20a.",
+        "Hyperliquid pattern: per-asset MMR scales with notional. A trader",
+        "holding $25M of BTC pays a higher MMR rate than one holding",
+        "$100K of BTC.",
+        "",
+        "Authority-gated: only the market authority can init / update.",
+        "`tiers` MUST be sorted ascending by `min_notional_quote_lots`,",
+        "non-empty, length ≤ MAX_LEVERAGE_TIERS = 8. Each tier's",
+        "`mmr_bps` MUST be ≥ market.params.maintenance_margin_bps",
+        "(tiers can only INCREASE MMR vs the baseline).",
+        "",
+        "A market with no tiers PDA falls back to the existing 2-tier",
+        "model (baseline + concentration_extra_mmr_bps)."
+      ],
       "discriminator": [
         239,
         107,
@@ -2665,6 +3050,15 @@
     },
     {
       "name": "init_market_oracle_config",
+      "docs": [
+        "Initialize the per-market Pyth oracle config PDA. After this is",
+        "initialized, `update_oracle_from_pyth` can be called by anyone to",
+        "pull a fresh price from the on-chain `PriceUpdateV2` account",
+        "posted by the Pyth Solana Receiver.",
+        "",
+        "Authority-gated: only `market.authority` may install/rotate the",
+        "feed binding (a malicious wrong feed would break the market)."
+      ],
       "discriminator": [
         111,
         171,
@@ -2745,6 +3139,16 @@
     },
     {
       "name": "init_trader_ata",
+      "docs": [
+        "Idempotently create the trader's quote ATA. Anchor's `init_if_needed`",
+        "+ `associated_token::*` constraints handle the AssociatedToken CPI:",
+        "if the ATA already exists, this is a no-op; otherwise it's created",
+        "at the canonical address with `payer` funding rent.",
+        "",
+        "Owner doesn't need to sign — anyone can fund someone else's ATA",
+        "creation. The mint is constrained to the protocol's `quote_mint`",
+        "so this can only be used to create ATAs that Flash Book accepts."
+      ],
       "discriminator": [
         148,
         208,
@@ -2758,11 +3162,19 @@
       "accounts": [
         {
           "name": "payer",
+          "docs": [
+            "Funds the ATA rent. Doesn't have to be the trader — onboarding flows",
+            "often have the protocol or a sponsor pay."
+          ],
           "writable": true,
           "signer": true
         },
         {
-          "name": "trader"
+          "name": "trader",
+          "docs": [
+            "Owner of the ATA being created. Doesn't sign: ATA creation is",
+            "permissionless under the AssociatedToken program."
+          ]
         },
         {
           "name": "insurance_fund",
@@ -2795,6 +3207,11 @@
         },
         {
           "name": "trader_quote_ata",
+          "docs": [
+            "Created idempotently if missing. Anchor CPIs the AssociatedToken",
+            "program when this account doesn't yet exist; the canonical address",
+            "is derived from (trader, quote_mint)."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -2900,6 +3317,12 @@
     },
     {
       "name": "initialize_flp_exposure",
+      "docs": [
+        "Initialize the FLP exposure account (one per protocol). Must run",
+        "before `initialize_market`. Mints `initial_capital_quote_lots` shares",
+        "to the authority at 1:1 (treasury endowment); these shares can later",
+        "be redeemed via `withdraw_flp_capital`."
+      ],
       "discriminator": [
         121,
         107,
@@ -2943,6 +3366,9 @@
         },
         {
           "name": "authority_lp_position",
+          "docs": [
+            "Treasury LpPositionAccount — initial shares are minted here."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -2983,6 +3409,12 @@
     },
     {
       "name": "initialize_insurance_fund",
+      "docs": [
+        "Initialize an insurance fund (one per protocol). Also creates the",
+        "global protocol quote vault — a TokenAccount for `quote_mint` whose",
+        "authority is the insurance_fund PDA itself. All trader collateral",
+        "and FLP capital flows through this vault."
+      ],
       "discriminator": [
         2,
         239,
@@ -3027,10 +3459,17 @@
           }
         },
         {
-          "name": "quote_mint"
+          "name": "quote_mint",
+          "docs": [
+            "The protocol's quote currency mint (typically USDC)."
+          ]
         },
         {
           "name": "quote_vault",
+          "docs": [
+            "Global protocol vault. Created with `insurance_fund` PDA as",
+            "authority so the program can sign transfers out."
+          ],
           "writable": true,
           "signer": true
         },
@@ -3068,6 +3507,14 @@
     },
     {
       "name": "initialize_market",
+      "docs": [
+        "Initialize a new market and all associated PDAs. AUTHORITY-GATED:",
+        "only the protocol authority can deploy markets — Flash Book does",
+        "not support permissionless market creation. The `creator` field",
+        "on the market account is zeroed (no creator share / HIP-3-style",
+        "fee split is paid out unless the authority later patches in a",
+        "curated creator via a future migration ix)."
+      ],
       "discriminator": [
         35,
         35,
@@ -3198,6 +3645,19 @@
     },
     {
       "name": "liquidate_portfolio_v2",
+      "docs": [
+        "V2: cross-market portfolio liquidation against the hypertree-backed",
+        "book. Pure parity port of v1's `liquidate_portfolio`:",
+        "• Walks remaining_accounts in (market, position) pairs",
+        "• Verifies owner program + trader/market binding for each pair",
+        "• Builds the joint cross-market scenario lattice",
+        "• Stress-checks via assess_margin_fn",
+        "• Injects synthetic close on EXECUTION market only",
+        "",
+        "Only the injection target differs (hypertree, not v1 buffer). The",
+        "order_type byte is set to 3 (Liquidation) so wave 19e's matcher",
+        "mapping promotes it to FIFO liquidation priority."
+      ],
       "discriminator": [
         183,
         176,
@@ -3332,6 +3792,19 @@
     },
     {
       "name": "liquidate_position_v2",
+      "docs": [
+        "V2: liquidate an unhealthy position by injecting a synthetic",
+        "close order into the hypertree-backed book.",
+        "",
+        "PURE PARITY PORT of v1's `liquidate_position` — same cooldown",
+        "gate, same stress-lattice health check, same Dutch-auction",
+        "reward curve, same `oracle ± penalty_bps` limit pricing, same",
+        "position timing updates. Only the order injection target",
+        "differs: hypertree, not v1 buffer. The order_type byte is set",
+        "to 3 (Liquidation) so the matcher's FIFO mapping (mirror of",
+        "v1's `slot_to_order`) places it AHEAD of regular limits at",
+        "the same price tier — same priority semantics as v1."
+      ],
       "discriminator": [
         23,
         124,
@@ -3378,6 +3851,10 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "Mut because the synthetic close order is inserted into the",
+            "hypertree."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -3465,6 +3942,12 @@
         },
         {
           "name": "position",
+          "docs": [
+            "MUT — wave 19e fixes a v1 latent bug: v1's LiquidatePosition has",
+            "this WITHOUT `mut`, so writes to `unhealthy_since_slot` /",
+            "`last_liquidated_at_slot` silently don't persist. Anchor doesn't",
+            "serialize back accounts not declared mut. v2 correctly marks it."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -3507,6 +3990,17 @@
     },
     {
       "name": "migrate_market_to_v3",
+      "docs": [
+        "Migrate a market account from the pre-V3 mark-engine layout (1024 B body)",
+        "to the V3 layout (1152 B body). V3 added `last_mark_settle_slot` plus",
+        "four mark-engine params (mark_ema_alpha_bps, mark_max_change_bps,",
+        "mark_settle_min_slots, drift_alert_bps).",
+        "",
+        "Idempotent: if the account is already at the V3 size and the mark-engine",
+        "params look set, returns Ok with a log message and no state change.",
+        "",
+        "Authority-gated: only `market.authority` may call."
+      ],
       "discriminator": [
         26,
         45,
@@ -3525,6 +4019,11 @@
         },
         {
           "name": "market",
+          "docs": [
+            "and gate by `authority == market.authority` inside the handler.",
+            "Owner-checked: must be owned by this program (the discriminator check",
+            "inside the handler validates it's actually a Market account)."
+          ],
           "writable": true
         },
         {
@@ -3536,6 +4035,19 @@
     },
     {
       "name": "modify_order_v2",
+      "docs": [
+        "V2 modify: atomic cancel + place in one ix. Cheaper than two",
+        "separate txs (one signature, one set of account-load costs)",
+        "and preserves the trader's intent across the cancel window —",
+        "no chance of being filled between the cancel and the replacement.",
+        "",
+        "Validates the new params against the same gates as",
+        "`place_limit_order_v2` (status, min_lot, tick alignment, OI cap)",
+        "BEFORE removing the old order so a malformed modify doesn't",
+        "silently drop the original. The new order receives a fresh",
+        "`seq` from the header's monotonic counter; off-chain consumers",
+        "must re-derive the order_id from the emitted `OrderModifiedV2Event`."
+      ],
       "discriminator": [
         54,
         217,
@@ -3582,6 +4094,11 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "8-byte custom disc inside the handler via `MarketBookHandle::",
+            "from_account_data`. Mut because we write the new resting order",
+            "node + update the header indices."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -3638,6 +4155,9 @@
     },
     {
       "name": "open_trader_state",
+      "docs": [
+        "Initialize per-trader state."
+      ],
       "discriminator": [
         155,
         147,
@@ -3726,6 +4246,31 @@
     },
     {
       "name": "partial_withdraw_collateral",
+      "docs": [
+        "Partial withdrawal that allows traders with open positions to",
+        "pull out collateral above the safety floor. Hyperliquid pattern:",
+        "post-withdrawal collateral must satisfy",
+        "`remaining >= max(IM_required, WITHDRAWAL_FLOOR_BPS * notional)`",
+        "where:",
+        "• IM_required is the standard initial-margin requirement under",
+        "the joint stress lattice (same engine as place_limit_order_v2",
+        "intake — `assess_margin_fn`)",
+        "• WITHDRAWAL_FLOOR_BPS = 1000 (10% of total notional) — HL's",
+        "anti-deposit-then-withdraw guard prevents a trader from",
+        "temporarily topping up to satisfy IM, placing a trade, then",
+        "immediately yanking the temporary collateral leaving only",
+        "enough for maintenance margin (a known footgun in v1",
+        "systems that gate only on IM)",
+        "",
+        "remaining_accounts layout: alternating (market, position) pairs",
+        "for every market the trader has a non-zero position in. Identical",
+        "to liquidate_portfolio_v2's walk pattern.",
+        "",
+        "This ix is ADDITIVE; the existing `withdraw_collateral` (which",
+        "requires `open_positions == 0`) remains as the strict-safety",
+        "path. A trader with no positions should prefer that ix —",
+        "no remaining_accounts walk, smaller fee."
+      ],
       "discriminator": [
         220,
         187,
@@ -3907,6 +4452,12 @@
     },
     {
       "name": "place_basket_order_n_v2",
+      "docs": [
+        "V2 N-leg basket order. Pure parity port of `place_basket_order_n`",
+        "— same K-distinct-markets guard, per-leg intake, caps, joint",
+        "stress lattice, rate limit. remaining_accounts layout: triples",
+        "of (market, market_book, position) per leg, so 3 × K accounts."
+      ],
       "discriminator": [
         215,
         27,
@@ -3991,6 +4542,14 @@
     },
     {
       "name": "place_basket_order_v2",
+      "docs": [
+        "V2 2-leg basket order against the hypertree-backed book. Pure",
+        "parity port of `place_basket_order` — same distinct-market guard,",
+        "same per-leg intake validation, same per-market caps, same joint",
+        "stress-lattice margin gate, same rate limit. Only the injection",
+        "target differs (per-market market_book PDA, not per-market",
+        "order_buffer)."
+      ],
       "discriminator": [
         139,
         48,
@@ -4256,6 +4815,9 @@
     },
     {
       "name": "place_bracket_order_v3",
+      "docs": [
+        "Atomic bracket: parent limit order + 2 OCO-linked TP/SL triggers."
+      ],
       "discriminator": [
         40,
         177,
@@ -4361,6 +4923,10 @@
     },
     {
       "name": "place_iceberg_order_v3",
+      "docs": [
+        "Create a v3 iceberg + seed first visible chunk directly into the",
+        "hypertree."
+      ],
       "discriminator": [
         75,
         251,
@@ -4446,6 +5012,32 @@
     },
     {
       "name": "place_jit_liquidation_offer",
+      "docs": [
+        "JIT LIQUIDATION OFFER — a maker pre-commits a \"tighter than",
+        "synthetic\" close price to be used when an underwater trader is",
+        "liquidated on this market. When `liquidate_position_v2` fires",
+        "against a matching trader, the matcher selects the BEST JIT",
+        "offer beating `oracle ± liq_penalty_bps` and uses that price as",
+        "the close-order limit. The trader loses less collateral, the",
+        "insurance fund draws less, the JIT maker gets a guaranteed fill",
+        "at a tighter spread than open-market.",
+        "",
+        "`side`:",
+        "0 = will close LONG positions  (offer to BUY back the long)",
+        "1 = will close SHORT positions (offer to SELL into the short)",
+        "",
+        "`target_trader = Pubkey::default()` is a wildcard offer (any",
+        "trader's liquidation on this market). Otherwise scoped to one",
+        "trader (useful for high-touch keeper bots).",
+        "",
+        "Collateral reservation is intentionally NOT enforced here — the",
+        "maker handles their own risk. If at fill time the maker can't",
+        "absorb the position, the normal collateral path will reject",
+        "when the maker walks the close-ask. Simpler design, no new",
+        "fields on TraderState.",
+        "",
+        "PDA seeds: `[b\"jit_liq_offer\", market, maker, &nonce.to_le_bytes()]`."
+      ],
       "discriminator": [
         211,
         125,
@@ -4537,6 +5129,21 @@
     },
     {
       "name": "place_limit_order_v2",
+      "docs": [
+        "V2 limit-order placement against the hypertree-backed orderbook.",
+        "Runs ALONGSIDE the legacy `place_limit_order` for now — operators",
+        "pick which book each market uses by calling `init_market_book`",
+        "(v2) vs `initialize_order_buffer` (legacy).",
+        "",
+        "Validation mirrors the legacy ix's intake: status-active gate,",
+        "min-base-lots, tick alignment, size cap. Then constructs a",
+        "`RestingOrderV2` carrying the trader pubkey inline (free-funds",
+        "indirection comes in wave 19) and inserts into the bids or asks",
+        "RBT inside the `MarketBookHandle`.",
+        "",
+        "`flags` accepts the same bitfield as v1: bit0 post_only, bit1",
+        "reduce_only, bit2 ioc, bit3 jit, bits 4-5 stp_mode."
+      ],
       "discriminator": [
         248,
         244,
@@ -4583,6 +5190,11 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "8-byte custom disc inside the handler via `MarketBookHandle::",
+            "from_account_data`. Mut because we write the new resting order",
+            "node + update the header indices."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -4635,6 +5247,26 @@
     },
     {
       "name": "place_taker_order_v2",
+      "docs": [
+        "Immediate CLOB-style placement — walks the opposite-side book at",
+        "the maker's resting price (strict price-time priority) and matches",
+        "against every crossable resting order until the taker is filled or",
+        "`limit_ticks` is exhausted.",
+        "",
+        "Walk semantics:",
+        "• Buy order: iterate asks best-first; while ask.price ≤ limit,",
+        "match `min(remaining, ask.size)` at `ask.price`. Stop when",
+        "next ask doesn't cross OR taker fully consumed.",
+        "• Sell order: symmetric over bids (best = highest price).",
+        "",
+        "All matches are accumulated into a single tail `FillBatchEvent`",
+        "carrying `Vec<FillEntry>` — the off-chain sequencer iterates",
+        "those entries and dispatches `apply_fill` / `apply_flp_fill` per",
+        "row. Maker orders are decremented in place on partial fill and",
+        "removed on full consumption. Any residual taker size becomes a",
+        "resting limit at `limit_ticks` so the order stays live (unless",
+        "the IOC or FOK flag is set)."
+      ],
       "discriminator": [
         102,
         151,
@@ -4681,6 +5313,11 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "8-byte custom disc inside the handler via `MarketBookHandle::",
+            "from_account_data`. Mut because we write the new resting order",
+            "node + update the header indices."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -4733,6 +5370,12 @@
     },
     {
       "name": "place_trigger_order_v3",
+      "docs": [
+        "Create a v3 trigger order PDA. Same trigger semantics as",
+        "`execute_trigger_order_v2` (validates side / kind / size / price /",
+        "tick alignment / expiry).",
+        "PDA seeds: `[b\"trigger_v3\", market, trader, trigger_id]`."
+      ],
       "discriminator": [
         77,
         233,
@@ -4798,6 +5441,9 @@
     },
     {
       "name": "place_twap_order_v3",
+      "docs": [
+        "Create a v3 TWAP order PDA."
+      ],
       "discriminator": [
         81,
         168,
@@ -4859,6 +5505,9 @@
     },
     {
       "name": "record_flp_fill_v3",
+      "docs": [
+        "Record a fill on this per-market FLP exposure."
+      ],
       "discriminator": [
         29,
         170,
@@ -4928,6 +5577,19 @@
     },
     {
       "name": "replenish_iceberg_v2",
+      "docs": [
+        "V2: replenish an iceberg's visible chunk against the hypertree-",
+        "backed book. Same iceberg semantics as v1 (FLAG_ACTIVE, expiry,",
+        "\"still_resting\" probe to avoid double-displaying, displayed-size",
+        "chunking, residual-tail allowance below min_base_lots,",
+        "auto-deactivate at zero remaining); only the order injection",
+        "target differs (hypertree, not v1 buffer).",
+        "",
+        "Lookup mechanics: the v1 buffer scan is replaced by an O(log n)",
+        "`lookup_bid/ask_by_order_id` against the hypertree using the",
+        "child's encoded order_id (recomputed from iceberg.limit_ticks +",
+        "iceberg.child_order_seq + side). NIL = fully consumed → replenish."
+      ],
       "discriminator": [
         48,
         159,
@@ -4973,6 +5635,11 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "via `MarketBookHandle::from_account_data`. Mut because we both",
+            "READ (probe by order_id for \"still resting\" check) and WRITE",
+            "(insert next chunk)."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -5008,6 +5675,9 @@
     },
     {
       "name": "replenish_iceberg_v3",
+      "docs": [
+        "Replenish v3 iceberg's next chunk — permissionless keeper."
+      ],
       "discriminator": [
         16,
         152,
@@ -5063,6 +5733,18 @@
     },
     {
       "name": "set_insurance_pause_threshold",
+      "docs": [
+        "Authority-only: directly set the insurance fund's pause threshold.",
+        "Governance lever: raising the threshold makes the ADL trigger easier",
+        "to hit (protocol enters \"auto-deleverage-eligible\" state sooner —",
+        "useful during stress). Lowering it relaxes the gate.",
+        "",
+        "No solvency invariants are enforced here — the threshold is purely",
+        "a governance-set floor. Operators are free to set it ABOVE the",
+        "current balance (which is what the e2e-adl proof needs), or BELOW.",
+        "Withdraw_insurance_fund's own guard (`new_balance >= pause_threshold`)",
+        "continues to protect against accidental drains via withdrawal."
+      ],
       "discriminator": [
         206,
         211,
@@ -5115,6 +5797,14 @@
     },
     {
       "name": "set_market_status",
+      "docs": [
+        "Update market status (authority-only).",
+        "",
+        "Status transitions:",
+        "Active → PostOnly: existing positions trade; new takers blocked",
+        "Active → Paused:   no order intake; existing positions held",
+        "Any → Closed:      terminal sunset; only liquidation + close"
+      ],
       "discriminator": [
         101,
         175,
@@ -5168,7 +5858,269 @@
       ]
     },
     {
+      "name": "set_position_cross",
+      "docs": [
+        "Transition a position from isolated-margin back to cross-margin.",
+        "All of `position.collateral_quote_lots` is returned to the",
+        "trader's pooled `trader_state.collateral_quote_lots`. The",
+        "post-transfer cross set (now including this position) must pass",
+        "the standard assess_margin health check.",
+        "",
+        "remaining_accounts layout: same as `set_position_isolated` —",
+        "alternating (market, position) pairs for every OTHER position",
+        "the trader has a non-zero size on."
+      ],
+      "discriminator": [
+        77,
+        228,
+        212,
+        50,
+        253,
+        79,
+        171,
+        11
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "target_market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "target_market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "target_market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "target_position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "target_market"
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "set_position_isolated",
+      "docs": [
+        "Transition a position from cross-margin to isolated-margin by",
+        "reserving `amount_quote_lots` of the trader's pooled collateral",
+        "against this specific position. Post-transfer health check must",
+        "pass on BOTH:",
+        "(a) the cross set (other positions + reduced trader_state pool)",
+        "(b) the isolated position itself (its new collateral vs its",
+        "own maintenance margin under stress)",
+        "",
+        "Phase 2 constraint: AT MOST ONE position can be isolated per",
+        "trader (the one being modified). If the trader has another",
+        "position that's already isolated (`collateral_quote_lots > 0`),",
+        "this ix rejects — un-isolate it first. Phase 3 lifts this to",
+        "multi-isolated-positions.",
+        "",
+        "remaining_accounts layout: alternating (market, position) pairs",
+        "for every OTHER position the trader has a non-zero size on. The",
+        "target position is passed inline (see Accounts struct); do not",
+        "re-include it in remaining_accounts."
+      ],
+      "discriminator": [
+        104,
+        163,
+        108,
+        208,
+        113,
+        19,
+        84,
+        171
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "target_market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "target_market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "target_market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "target_position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "target_market"
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "set_position_leverage",
+      "docs": [
+        "Set the per-position leverage cap. Trader (or delegate) signs.",
+        "`cap` must be ∈ [1, market.params.max_leverage]. Pass 0 to clear",
+        "(revert to using market default). Hyperliquid pattern: lets risk-",
+        "conscious traders limit their effective leverage on a single",
+        "position without affecting their other positions or the market's",
+        "global cap. The cap is enforced at place_limit_order intake on",
+        "the projected post-fill notional.",
+        "",
+        "Setting a tighter cap on a position that already exceeds it does",
+        "NOT force a liquidation — the cap only applies to NEW orders that",
+        "would grow the position. To reduce leverage on an existing",
+        "position, the trader can add collateral or close part of it."
+      ],
       "discriminator": [
         245,
         164,
@@ -5182,6 +6134,12 @@
       "accounts": [
         {
           "name": "authority",
+          "docs": [
+            "Trader OR delegate may sign — TraderStateAccount.is_authorized",
+            "gates the action via the trader_state.delegate slot. Trader is",
+            "the authority of record (position.trader); delegate is allowed",
+            "for hot-key UX patterns."
+          ],
           "signer": true
         },
         {
@@ -5281,6 +6239,19 @@
     },
     {
       "name": "set_trader_builder",
+      "docs": [
+        "Set or rotate the trader's builder pubkey + the maximum fee share",
+        "(in bps of net fee) the trader authorizes the builder to collect.",
+        "Pass Pubkey::default() to revoke. Hyperliquid builder-codes model:",
+        "a third-party UI/wallet/aggregator routing flow earns a share of",
+        "the protocol fee, capped by the user's approved max. Trader signs",
+        "— neither the protocol authority nor the builder can install one",
+        "unilaterally.",
+        "",
+        "`max_fee_share_bps` capped at BPS_DENOM (10_000 = 100% of net fee).",
+        "The on-chain emit clamps `min(market.params.builder_share_bps,",
+        "max_fee_share_bps)`."
+      ],
       "discriminator": [
         91,
         76,
@@ -5294,6 +6265,12 @@
       "accounts": [
         {
           "name": "trader",
+          "docs": [
+            "Trader signs — the user is the only one who can install or rotate",
+            "the builder for their account. Protocol authority does NOT have",
+            "this power (otherwise builders could be installed against the",
+            "user's will)."
+          ],
           "signer": true
         },
         {
@@ -5339,6 +6316,18 @@
     },
     {
       "name": "set_trader_delegate",
+      "docs": [
+        "Set or clear the trader's delegate authority. The delegate is a",
+        "pubkey allowed to sign trader-bound ix on the trader's behalf.",
+        "Pass Pubkey::default() to clear. The trader's own signature",
+        "always works regardless — delegate is additive, not exclusive.",
+        "",
+        "Use cases:",
+        "• Master/hot-key split: master holds funds; hot key trades",
+        "(Hyperliquid + dYdX standard pattern).",
+        "• Multi-sig subaccount manager.",
+        "• MM bot keypair authorized to manage a vault's positions."
+      ],
       "discriminator": [
         133,
         28,
@@ -5352,6 +6341,10 @@
       "accounts": [
         {
           "name": "trader",
+          "docs": [
+            "The trader signs to set/clear their own delegate. Only the trader",
+            "can change this field — the delegate cannot rotate themselves out."
+          ],
           "signer": true
         },
         {
@@ -5393,6 +6386,20 @@
     },
     {
       "name": "set_trader_fee_tier",
+      "docs": [
+        "Set a trader's per-trader fee discount in bps off the base taker",
+        "fee. Authority-only. Off-chain volume tracking sets this based on",
+        "30-day rolling notional — the universal pattern at every CEX",
+        "(Binance, OKX, Bybit, Hyperliquid).",
+        "",
+        "`discount_bps` is bounded to `MAX_FEE_DISCOUNT_BPS` = 12_000 (120%).",
+        "Values up to 10_000 are a normal discount (down to zero fee);",
+        "10_000..12_000 enable HL/MM-pro top-tier NEGATIVE fees — the",
+        "taker is *paid* for routing flow, with the rebate sourced from",
+        "the protocol's own insurance contribution. Apply_fill clamps the",
+        "rebate so the trader never extracts more than `max(rebate)` of",
+        "notional, and the math respects the maker rebate priority."
+      ],
       "discriminator": [
         119,
         55,
@@ -5406,10 +6413,18 @@
       "accounts": [
         {
           "name": "authority",
+          "docs": [
+            "Protocol authority (the same authority that runs init_insurance_fund).",
+            "Off-chain volume tracker → governance updates each trader's tier."
+          ],
           "signer": true
         },
         {
           "name": "insurance_fund",
+          "docs": [
+            "The insurance_fund holds the canonical authority pubkey we",
+            "validate against — single source of truth."
+          ],
           "pda": {
             "seeds": [
               {
@@ -5474,6 +6489,13 @@
     },
     {
       "name": "set_trader_referrer",
+      "docs": [
+        "Set the trader's referrer. ONE-TIME-WRITE: once set to a non-default",
+        "pubkey, the field cannot be rewritten. Anti-rotation griefing —",
+        "referrers earn off the trader for the lifetime of the account, no",
+        "\"rug your referrer\" attack vector. Set to Pubkey::default() to",
+        "opt out PERMANENTLY (also one-time-write)."
+      ],
       "discriminator": [
         212,
         78,
@@ -5487,6 +6509,10 @@
       "accounts": [
         {
           "name": "trader",
+          "docs": [
+            "Trader signs to set their own referrer. One-time-write enforced",
+            "inside the handler."
+          ],
           "signer": true
         },
         {
@@ -5528,6 +6554,24 @@
     },
     {
       "name": "settle_funding",
+      "docs": [
+        "Settle accrued funding for a single position. Computes funding owed",
+        "since the last settlement using `funding_owed(side, notional, now,",
+        "at_entry)`, debits or credits the trader's collateral_quote_lots,",
+        "accumulates `position.funding_paid_quote_lots`, and resets the",
+        "position's `cum_funding_index_at_entry` to the market's current",
+        "index. Idempotent — calling again immediately is a no-op (delta=0).",
+        "",
+        "Permissionless: anyone can poke a position to settle. This protects",
+        "the protocol against traders who never close — funding accrues into",
+        "the margin calc forever otherwise. Off-chain keepers will sweep",
+        "stale positions periodically.",
+        "",
+        "On insufficient collateral to cover positive funding owed, the",
+        "position's collateral is drained to zero (it will be liquidated on",
+        "the next risk check). We do not fail the tx because that would let",
+        "underwater positions block keepers from settling them."
+      ],
       "discriminator": [
         11,
         251,
@@ -5541,6 +6585,11 @@
       "accounts": [
         {
           "name": "caller",
+          "docs": [
+            "Permissionless — any signer can settle funding for any position.",
+            "The position's owner is determined by the position PDA's seeds,",
+            "not by who signs the tx."
+          ],
           "signer": true
         },
         {
@@ -5572,7 +6621,11 @@
           }
         },
         {
-          "name": "trader"
+          "name": "trader",
+          "docs": [
+            "The trader being settled. Doesn't need to sign — settle is",
+            "permissionless. Used as a seed to derive trader_state and position."
+          ]
         },
         {
           "name": "trader_state",
@@ -5637,6 +6690,23 @@
     },
     {
       "name": "settle_mark",
+      "docs": [
+        "PERMISSIONLESS: hard-reset `mark_price_ticks` to the current",
+        "`oracle_price_ticks`. The V3 mark-engine's second mark-update path.",
+        "",
+        "Anyone (sequencers, keepers, even traders) can call this — the only",
+        "gate is the per-market `mark_settle_min_slots` rate limit, which",
+        "prevents a single signer from spamming. The oracle's freshness and",
+        "confidence are re-validated (same `OracleTooStale` /",
+        "`OracleConfidenceTooWide` rules as `update_oracle`) so this can only",
+        "snap to a price the protocol already trusts.",
+        "",
+        "Unlike `apply_fill`'s EMA blend, this is a hard reset — designed for",
+        "thin-tape conditions where mark has drifted from the (fresh) oracle",
+        "and no fills are flowing to nudge it back. Pairs naturally with the",
+        "`MarkPriceDriftEvent` alert: off-chain observers see the drift,",
+        "call `settle_mark`, mark snaps back."
+      ],
       "discriminator": [
         177,
         85,
@@ -5650,6 +6720,9 @@
       "accounts": [
         {
           "name": "caller",
+          "docs": [
+            "Permissionless caller (anyone can settle)."
+          ],
           "signer": true
         },
         {
@@ -5686,6 +6759,18 @@
     },
     {
       "name": "settle_vault_perf_fee",
+      "docs": [
+        "Crystallize the vault's performance fee. Strategist signs.",
+        "If the current NAV/share exceeds the high-water mark, mints new",
+        "shares to the strategist's vault_position equal to:",
+        "minted_shares = (gain_per_share × shares_outstanding × perf_fee_bps)",
+        "/ (current_nav_per_share × 10_000)",
+        "and bumps the HWM to the post-mint NAV/share. If no gain (or",
+        "bootstrap with HWM=0), simply anchors HWM at current NAV/share",
+        "without minting.",
+        "",
+        "Vault must be FLAT (no open positions) so NAV is unambiguous."
+      ],
       "discriminator": [
         19,
         120,
@@ -5736,6 +6821,10 @@
         },
         {
           "name": "strategist_position",
+          "docs": [
+            "Strategist's vault_position — minted into on settle. Created",
+            "lazily on first non-zero settlement."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -5778,6 +6867,9 @@
     },
     {
       "name": "settle_vault_perf_fee_v3",
+      "docs": [
+        "Strategist crystallizes the performance fee."
+      ],
       "discriminator": [
         122,
         232,
@@ -5838,6 +6930,9 @@
         },
         {
           "name": "vault_trader_state",
+          "docs": [
+            "Vault's TraderState — read-only; NAV source."
+          ],
           "pda": {
             "seeds": [
               {
@@ -5873,6 +6968,21 @@
     },
     {
       "name": "sweep_collateral",
+      "docs": [
+        "Cross-margin sweep between two trader accounts under a common",
+        "authority. The signer must be the delegate of BOTH source and",
+        "destination trader_states. Moves `amount` quote-lots from",
+        "source.collateral_quote_lots to dest.collateral_quote_lots",
+        "atomically.",
+        "",
+        "Source can hold OPEN POSITIONS — caller passes [market, position]",
+        "pairs in remaining_accounts (count must equal source.open_positions).",
+        "Post-sweep margin is evaluated against the joint stress-lattice;",
+        "rejects if the source would become unhealthy after the withdrawal.",
+        "Source flat → pass `[]` for remaining_accounts (the legacy fast path).",
+        "",
+        "Cannot sweep to/from the same account."
+      ],
       "discriminator": [
         175,
         101,
@@ -5886,6 +6996,11 @@
       "accounts": [
         {
           "name": "authority",
+          "docs": [
+            "Master authority (trader OR delegate of BOTH source and destination",
+            "trader_states). Authorization is checked against each via",
+            "`is_authorized` in the handler."
+          ],
           "signer": true
         },
         {
@@ -5958,6 +7073,20 @@
     },
     {
       "name": "transfer_main_to_sub",
+      "docs": [
+        "Move `amount` quote-lots from the trader's MAIN trader_state into",
+        "their sub-account at `sub_index`. Useful as a \"savings\" or",
+        "strategy-segregation pattern — the sub-account is isolated from",
+        "the main account's trading exposure until Phase 2 wires trading",
+        "from sub-accounts.",
+        "",
+        "REJECTS if the main account has open positions whose maintenance",
+        "margin would be violated by the withdrawal — caller must close",
+        "or reduce exposure first. (Implemented by reading",
+        "`main.open_positions` and refusing the transfer when > 0. The",
+        "looser, position-aware check is deferred to Phase 2 alongside",
+        "the assess_margin refactor.)"
+      ],
       "discriminator": [
         65,
         193,
@@ -6020,6 +7149,10 @@
     },
     {
       "name": "transfer_market_authority",
+      "docs": [
+        "Update a trader's authority (e.g. for wallet rotation). Either the",
+        "current authority OR the trader signs."
+      ],
       "discriminator": [
         178,
         89,
@@ -6074,6 +7207,12 @@
     },
     {
       "name": "transfer_sub_to_main",
+      "docs": [
+        "Mirror of `transfer_main_to_sub`: move `amount` quote-lots from",
+        "the sub-account back to main. Same guard — refuses if the sub",
+        "account has open positions (which it can't have until Phase 2",
+        "wires trading; included now for forward-compatibility)."
+      ],
       "discriminator": [
         165,
         251,
@@ -6136,6 +7275,9 @@
     },
     {
       "name": "undelegate_market",
+      "docs": [
+        "Undelegate the MarketAccount from the ER back to mainnet."
+      ],
       "discriminator": [
         22,
         56,
@@ -6202,6 +7344,18 @@
     },
     {
       "name": "undelegate_market_book",
+      "docs": [
+        "Undelegate the market_book PDA from the ER back to mainnet. After",
+        "this lands the account state is authoritative on mainnet again",
+        "and `place_taker_order_v2` / `place_limit_order_v2` execute on",
+        "mainnet directly.",
+        "",
+        "Use during planned ER downtime, validator rotation, or to flush",
+        "final state before a permanent shutdown of the ER instance.",
+        "Operators should call `settle_mark` shortly after undelegate to",
+        "resync the mainnet mark with the live oracle — `liquidate_position_v2`",
+        "will reject calls with a stale oracle (see oracle freshness gate)."
+      ],
       "discriminator": [
         205,
         118,
@@ -6295,6 +7449,10 @@
     },
     {
       "name": "update_fee_tiers",
+      "docs": [
+        "Update the global fee tier table. Same validation as init.",
+        "Authority-only."
+      ],
       "discriminator": [
         196,
         121,
@@ -6352,6 +7510,10 @@
     },
     {
       "name": "update_market_leverage_tiers",
+      "docs": [
+        "Update an existing per-market leverage-tier table. Same",
+        "validation as init. Authority-only."
+      ],
       "discriminator": [
         172,
         24,
@@ -6442,6 +7604,18 @@
     },
     {
       "name": "update_market_params",
+      "docs": [
+        "Update mutable market parameters (authority-only).",
+        "",
+        "Immutable fields (set at initialization, NEVER mutable post-init):",
+        "- tick_size, base_lot_size, quote_lot_size, min_base_lots",
+        "These define the market's measurement primitives. Changing them",
+        "would silently invalidate every existing order and position.",
+        "",
+        "Mutable: everything else — fees, margins, FLP coefficients, funding",
+        "rates, oracle band, VPIN, batch interval. Changes are applied to the",
+        "next batch."
+      ],
       "discriminator": [
         70,
         117,
@@ -6500,6 +7674,32 @@
     },
     {
       "name": "update_oracle",
+      "docs": [
+        "Update oracle price (authority-only). Bootstrap / dev / fallback path",
+        "only — `update_oracle_from_pyth` (`init_market_oracle_config` +",
+        "`update_oracle_from_pyth`) is the production path and pulls directly",
+        "from the on-chain `PriceUpdateV2` account posted by the Pyth Solana",
+        "Receiver.",
+        "",
+        "IMPORTANT: any future ix that updates `market.oracle_*` MUST validate",
+        "`market.authority == ctx.accounts.authority.key()` (this ix) OR derive",
+        "the price from a verified Pyth account (the Pyth-pull ix). Both gates",
+        "are first-class — do not strip one assuming the other suffices.",
+        "",
+        "Hardened against the JELLY/POPCAT class of attacks (Hyperliquid 2025):",
+        "",
+        "1. **Staleness check**: rejects updates where",
+        "`now - published_at > params.oracle_staleness_max_seconds`.",
+        "Prevents using outdated prices when the oracle network has a gap.",
+        "2. **Confidence check**: rejects updates where",
+        "`confidence / price > params.oracle_confidence_max_bps`.",
+        "When upstream sources disagree (typically during low-liquidity",
+        "manipulation), the wider confidence interval is detected and",
+        "the price is rejected rather than acted upon.",
+        "",
+        "`published_at_unix_seconds` is the publisher-attested timestamp",
+        "(matches Pyth's `publish_time` field)."
+      ],
       "discriminator": [
         112,
         41,
@@ -6562,6 +7762,21 @@
     },
     {
       "name": "update_oracle_from_pyth",
+      "docs": [
+        "Permissionless: pull a fresh price from a Pyth `PriceUpdateV2`",
+        "account into the market's `oracle_*` fields. Validates:",
+        "• feed_id matches the configured binding",
+        "• publish_time is within `max_staleness_seconds` of current slot",
+        "• confidence (conf/price) is within `max_confidence_bps`",
+        "",
+        "On success, writes:",
+        "• market.oracle_price_ticks (scaled by `tick_decimals`)",
+        "• market.oracle_confidence  (raw conf in same scale)",
+        "• market.oracle_published_at_unix_seconds",
+        "",
+        "Anyone can call. Pyth account is the trust anchor — the caller",
+        "just funds the tx."
+      ],
       "discriminator": [
         6,
         73,
@@ -6575,6 +7790,10 @@
       "accounts": [
         {
           "name": "caller",
+          "docs": [
+            "Permissionless caller; pays the tx fee. Pyth's PriceUpdateV2 account",
+            "is the trust anchor — the caller signing is just to pay for compute."
+          ],
           "signer": true
         },
         {
@@ -6611,13 +7830,34 @@
           }
         },
         {
-          "name": "price_update"
+          "name": "price_update",
+          "docs": [
+            "The SDK's get_price_no_older_than validates feed_id matches."
+          ]
         }
       ],
       "args": []
     },
     {
       "name": "update_oracle_quorum",
+      "docs": [
+        "Update oracle price using a multi-oracle quorum (median of 3).",
+        "",
+        "Defense in depth against the JELLY/POPCAT class of attacks where an",
+        "attacker manipulates a single upstream price source. With three",
+        "independent sources (e.g. Pyth + Switchboard + internal TWAP), an",
+        "attacker would have to corrupt the majority simultaneously to move",
+        "the median.",
+        "",
+        "Each input has its own staleness + confidence checked individually.",
+        "Additionally: the dispersion `(max − min) / median` must be ≤",
+        "`oracle_quorum_max_dispersion_bps`. If it exceeds, the update is",
+        "rejected — sources clearly disagree, so no single one is safe to use.",
+        "",
+        "The accepted price is the median; the accepted confidence is the",
+        "max of the three (most pessimistic); the accepted publish time is",
+        "the min of the three (oldest, so the staleness gate is conservative)."
+      ],
       "discriminator": [
         174,
         73,
@@ -6695,6 +7935,27 @@
     },
     {
       "name": "update_trailing_stop",
+      "docs": [
+        "Ratchet a trailing-stop trigger order — permissionless. Reads the",
+        "current oracle and updates the trigger's anchor + price if the",
+        "oracle has moved in the trader's favour. Hyperliquid trailing-stop",
+        "pattern, generalised: works for both sides + both trigger kinds.",
+        "",
+        "Math (offset = trailing_offset_bps × oracle / 10_000):",
+        "• kind=0 (fire on ≤): SL for a long position. Best = MAX oracle.",
+        "If oracle > anchor: anchor ← oracle; trigger ← anchor − offset.",
+        "• kind=1 (fire on ≥): SL for a short position. Best = MIN oracle.",
+        "If oracle < anchor (or anchor==0): anchor ← oracle;",
+        "trigger ← anchor + offset.",
+        "",
+        "Tick-aligns the new trigger price (rounds toward the more",
+        "conservative side: kind=0 floors, kind=1 ceils so the trigger",
+        "is never less protective than intended).",
+        "",
+        "Rejects when the trigger isn't trailing (offset == 0) or already",
+        "inactive. Idempotent — calling on a \"no-progress\" oracle is a",
+        "no-op (no events emitted)."
+      ],
       "discriminator": [
         9,
         64,
@@ -6708,6 +7969,11 @@
       "accounts": [
         {
           "name": "caller",
+          "docs": [
+            "Permissionless. Caller pays tx fee. Production deployments wire",
+            "this to a per-market keeper that reads oracle ticks and calls",
+            "the ix when the favourable-direction move ≥ 1 tick."
+          ],
           "signer": true
         },
         {
@@ -6747,6 +8013,9 @@
     },
     {
       "name": "vault_cancel_order_v3",
+      "docs": [
+        "Strategist cancels a vault-PDA order."
+      ],
       "discriminator": [
         47,
         2,
@@ -6835,6 +8104,10 @@
     },
     {
       "name": "vault_deposit_v3",
+      "docs": [
+        "Depositor adds capital, mints shares pro-rata. SPL transfer",
+        "depositor ATA → protocol quote_vault; vault TraderState credited."
+      ],
       "discriminator": [
         24,
         234,
@@ -6895,14 +8168,23 @@
         },
         {
           "name": "depositor_quote_ata",
+          "docs": [
+            "Depositor's USDC ATA — debited."
+          ],
           "writable": true
         },
         {
           "name": "quote_vault",
+          "docs": [
+            "Protocol vault — credited."
+          ],
           "writable": true
         },
         {
           "name": "vault_trader_state",
+          "docs": [
+            "Vault's TraderState — credited (collateral_quote_lots)."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -6948,6 +8230,10 @@
     },
     {
       "name": "vault_open_trader_state_v3",
+      "docs": [
+        "Bootstrap a `TraderStateAccount` for the vault PDA. Strategist",
+        "signs + pays rent. One-time setup before the first deposit."
+      ],
       "discriminator": [
         60,
         24,
@@ -6969,6 +8255,9 @@
         },
         {
           "name": "vault_trader_state",
+          "docs": [
+            "Vault PDA's TraderState — initialized here, seeded by vault PDA."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -7005,6 +8294,9 @@
     },
     {
       "name": "vault_place_order_v3",
+      "docs": [
+        "Strategist places a limit order with the vault PDA as the trader."
+      ],
       "discriminator": [
         191,
         248,
@@ -7106,6 +8398,11 @@
     },
     {
       "name": "vault_withdraw_v3",
+      "docs": [
+        "Burn shares for pro-rata payout. Debits vault TraderState",
+        "collateral + SPL release from quote_vault → depositor ATA",
+        "(signed by InsuranceFund PDA)."
+      ],
       "discriminator": [
         223,
         62,
@@ -7165,6 +8462,9 @@
         },
         {
           "name": "insurance_fund",
+          "docs": [
+            "InsuranceFund PDA — signs SPL release."
+          ],
           "pda": {
             "seeds": [
               {
@@ -7191,14 +8491,23 @@
         },
         {
           "name": "quote_vault",
+          "docs": [
+            "Protocol vault — debited."
+          ],
           "writable": true
         },
         {
           "name": "depositor_quote_ata",
+          "docs": [
+            "Depositor's USDC ATA — credited."
+          ],
           "writable": true
         },
         {
           "name": "vault_trader_state",
+          "docs": [
+            "Vault's TraderState — collateral debited."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -7240,6 +8549,25 @@
     },
     {
       "name": "verify_market_invariants",
+      "docs": [
+        "Verify market invariants and auto-halt on breach.",
+        "",
+        "Permissionless: anyone can poke a market to check. The protocol",
+        "pays off-chain monitors / keepers nothing extra; calling this is",
+        "just a tx fee. On any violation, the market is auto-flipped to",
+        "Paused so no new orders can land while operators investigate.",
+        "",
+        "Currently checks:",
+        "S5 — open interest balance: oi_long_lots == oi_short_lots",
+        "(Should hold by construction of update_oi at every fill,",
+        "but a bug in fill paths could drift these. This is the",
+        "cheapest invariant to verify on-chain.)",
+        "",
+        "Future invariants this hook can absorb:",
+        "S4 — vault balance ≥ Σ trader collateral + FLP capital",
+        "S12 — FLP per-batch growth ≤ pool_capital × max_growth%",
+        "S14 — mark price within oracle band ±band_bps"
+      ],
       "discriminator": [
         247,
         131,
@@ -7253,6 +8581,10 @@
       "accounts": [
         {
           "name": "caller",
+          "docs": [
+            "Permissionless — anyone can poke the invariants. The signer just",
+            "pays the tx fee."
+          ],
           "signer": true
         },
         {
@@ -7289,6 +8621,18 @@
     },
     {
       "name": "view_book_depth_v2",
+      "docs": [
+        "V2 read-side: emit the top-N levels of the hypertree-backed book",
+        "as an event. Walks `for_each_bid_best_first` / `for_each_ask_best_first`",
+        "and packs the first BOOK_DEPTH_LEVELS=4 of each side into a single",
+        "`BookDepthV2Event`. Pure read — never mutates state.",
+        "",
+        "This is the wave-18e validation that the RBT iteration is correct:",
+        "after a series of `place_limit_order_v2` calls, the bids-best-first",
+        "walk must yield highest-priced bids first and asks-best-first walk",
+        "must yield lowest-priced asks first. The wave-18f matcher consumes",
+        "these same iterators when clearing crossed orders."
+      ],
       "discriminator": [
         210,
         87,
@@ -7330,6 +8674,9 @@
         },
         {
           "name": "market_book",
+          "docs": [
+            "happens inside the handler via `MarketBookHandle::from_account_data`."
+          ],
           "pda": {
             "seeds": [
               {
@@ -7360,6 +8707,23 @@
     },
     {
       "name": "view_portfolio_risk",
+      "docs": [
+        "View ix: cross-market portfolio risk for a trader. Walks the",
+        "trader's open positions via remaining_accounts ([market, position]",
+        "pairs, count must match `trader_state.open_positions`), runs the",
+        "stress-lattice assess, and emits `PortfolioRiskEvent` with",
+        "(collateral, unrealized_pnl, equity, required_margin, health_ratio_bps,",
+        "largest_position_market, largest_position_notional, worst_scenario_idx).",
+        "",
+        "SDK callers simulate the tx and read the event from logs without",
+        "paying for a state mutation. Single-call portfolio risk for UIs",
+        "that previously had to fetch every position + market separately",
+        "and run `previewPortfolioRisk` client-side.",
+        "",
+        "Pass `[]` for remaining_accounts if the trader has no open",
+        "positions (returns equity == collateral, required == 0,",
+        "health_ratio_bps == u32::MAX)."
+      ],
       "discriminator": [
         159,
         215,
@@ -7405,6 +8769,17 @@
     },
     {
       "name": "view_predicted_funding",
+      "docs": [
+        "View ix: compute the predicted funding rate (no state change).",
+        "Emits `PredictedFundingEvent` so callers can read the result via",
+        "tx simulation logs without paying for an actual on-chain mutation.",
+        "Useful for UIs that need to display \"next funding payment\" before",
+        "the rate crystallises in `settle_funding`.",
+        "",
+        "Math is identical to `matcher::funding::advance`'s rate",
+        "computation: premium = (mark - oracle) * 10_000 / oracle; rate",
+        "= clamp(K * premium, ±rate_max_bps_per_sec)."
+      ],
       "discriminator": [
         128,
         148,
@@ -7473,6 +8848,17 @@
     },
     {
       "name": "view_quote_ladder",
+      "docs": [
+        "View ix: snapshot the FLP quoter's would-be next quote ladder",
+        "(no state change). Runs the same `generate_quotes` computation",
+        "the matcher consumes but doesn't mutate any state. Emits",
+        "`QuoteLadderSnapshotEvent` carrying the top-N levels (each side)",
+        "for off-chain UI rendering.",
+        "",
+        "Levels are interleaved bid/ask in seq order: [bid0, ask0,",
+        "bid1, ask1, ...] — same emission order as the matcher would",
+        "see. `levels_emitted` is bounded by `params.flp_quote_levels`."
+      ],
       "discriminator": [
         146,
         190,
@@ -7541,6 +8927,17 @@
     },
     {
       "name": "view_trader_effective_tier",
+      "docs": [
+        "View ix — emit the trader's effective fee tier (maker rebate +",
+        "taker fee bps) given their current rolling-window volume + the",
+        "global tier table. UIs simulate the tx and read the event for",
+        "display (\"Your tier: VIP3 — 0.025% / 0.05%\"). Permissionless.",
+        "",
+        "Window expiry semantics: if `now - volume_window_start_slot >",
+        "volume_window_slots`, the trader's effective volume is treated",
+        "as 0 (window has reset; they fall to tier 0 until the next fill",
+        "re-anchors). This matches what the next apply_fill will see."
+      ],
       "discriminator": [
         206,
         233,
@@ -7609,6 +9006,12 @@
     },
     {
       "name": "withdraw_collateral",
+      "docs": [
+        "Withdraw collateral. Decrements accounting + transfers from the",
+        "vault back to the trader's ATA. The program signs as the",
+        "insurance_fund PDA (which owns the vault). Blocked while the",
+        "trader has open positions."
+      ],
       "discriminator": [
         115,
         135,
@@ -7655,6 +9058,10 @@
         },
         {
           "name": "insurance_fund",
+          "docs": [
+            "Insurance fund PDA — authority over the vault. The program signs",
+            "transfers out using its seeds."
+          ],
           "pda": {
             "seeds": [
               {
@@ -7790,6 +9197,24 @@
     },
     {
       "name": "withdraw_flp_capital",
+      "docs": [
+        "LP withdraws capital from the FLP pool. Blocked if it would push",
+        "utilization past 100% (current gross exposure must remain ≤ new",
+        "capital).",
+        "Burn `shares_to_burn` LP shares and withdraw the proportional NAV",
+        "claim. Caller must own the shares. Returns USDC via SPL CPI signed",
+        "by the insurance_fund PDA (vault authority).",
+        "",
+        "Amount returned = shares_to_burn × NAV / shares_outstanding.",
+        "",
+        "Position-aware solvency guard: when the FLP has open positions",
+        "(markets_count > 0), the caller must pass each active market as",
+        "`remaining_accounts`. We compute gross_exposure = Σ |size × mark|",
+        "across all per_market entries and require post-withdraw NAV ≥",
+        "gross_exposure. This lets LPs withdraw while the FLP carries",
+        "positions, as long as enough NAV remains to absorb a max-shock",
+        "loss. The empty-pool case (markets_count == 0) skips the walk."
+      ],
       "discriminator": [
         207,
         159,
@@ -7832,6 +9257,10 @@
         },
         {
           "name": "lp_position",
+          "docs": [
+            "LP's per-LP share account. Must already exist (no init_if_needed",
+            "— withdrawals require pre-existing shares)."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -7860,6 +9289,9 @@
         },
         {
           "name": "insurance_fund",
+          "docs": [
+            "Insurance fund PDA — owns the vault and signs withdrawals."
+          ],
           "pda": {
             "seeds": [
               {
@@ -7995,6 +9427,17 @@
     },
     {
       "name": "withdraw_insurance_fund",
+      "docs": [
+        "Authority withdraws excess insurance fund balance. Cannot push the",
+        "balance below `pause_threshold_quote_lots` — that gate keeps the",
+        "fund solvent enough to absorb a max-shock loss without triggering",
+        "the new-positions-paused state.",
+        "",
+        "Use case: governance rebalancing surplus contributions. The amount",
+        "is transferred from the protocol vault (PDA-signed) to the",
+        "authority's quote ATA. This does NOT route through the LP pool;",
+        "the insurance fund is governance-owned, not LP-owned."
+      ],
       "discriminator": [
         228,
         196,
@@ -8042,6 +9485,9 @@
         },
         {
           "name": "authority_quote_ata",
+          "docs": [
+            "Authority's USDC ATA — destination for withdrawn rent."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -9243,6 +10689,19 @@
       ]
     },
     {
+      "name": "PositionMarginModeChangedEvent",
+      "discriminator": [
+        199,
+        26,
+        104,
+        222,
+        149,
+        227,
+        87,
+        201
+      ]
+    },
+    {
       "name": "PredictedFundingEvent",
       "discriminator": [
         146,
@@ -10001,6 +11460,10 @@
     },
     {
       "name": "BasketLeg",
+      "docs": [
+        "One leg of a basket order. Mirrors place_limit_order's args minus",
+        "market identity (which is bound by the account context per leg)."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -10223,6 +11686,11 @@
     },
     {
       "name": "BulkOrderCancelledV2Event",
+      "docs": [
+        "Emitted by `cancel_all_v2`. `cancelled_count` is 0 when the trader had",
+        "no resting orders (the ix is silently a no-op in that case — useful as",
+        "defensive cleanup from a bot). Bounded by `MAX_CANCELS_PER_IX_V2`."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -10311,6 +11779,11 @@
     },
     {
       "name": "CreatorFeeOwedEvent",
+      "docs": [
+        "HIP-3 deployer share. Off-chain ledger credits the market creator",
+        "with `amount_quote_lots` per fill. Pull-based — no creator account",
+        "is touched in the apply_fill hot path."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -10331,6 +11804,12 @@
     },
     {
       "name": "FeeTier",
+      "docs": [
+        "One rung of the fee-tier table. `min_volume_quote_lots` is the",
+        "rolling-window cumulative notional (in quote lots) that the trader",
+        "must have traded to qualify. Higher tiers offer LOWER taker fees",
+        "and HIGHER maker rebates."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -10340,6 +11819,13 @@
           },
           {
             "name": "maker_rebate_bps",
+            "docs": [
+              "SIGNED maker rate. Positive = rebate paid TO maker (legacy",
+              "MM-incentive semantics); negative = fee charged FROM maker",
+              "(low-tier retail). Validated to be monotone non-decreasing",
+              "across tiers (a higher-volume trader's maker treatment is",
+              "never worse than a lower-volume trader's)."
+            ],
             "type": "i32"
           },
           {
@@ -10351,6 +11837,28 @@
     },
     {
       "name": "FeeTiersAccount",
+      "docs": [
+        "WAVE 22 — Multi-tier fee table. Global per-program, authority-set.",
+        "Replaces the legacy single `TraderStateAccount.fee_discount_bps`",
+        "pattern (where authority manually sets a per-trader discount) with",
+        "the HL / Binance / dYdX standard volume-tier model:",
+        "",
+        "• One global tier table (this account, PDA `[b\"fee_tiers\"]`).",
+        "• Each tier specifies a `min_volume_quote_lots` threshold + the",
+        "effective `maker_rebate_bps` and `taker_fee_bps` for traders",
+        "that have crossed it within the rolling window.",
+        "• Trader's window volume is tracked on `TraderStateAccount.",
+        "volume_30d_quote_lots`, credited on every fill (maker + taker).",
+        "• `resolve_fee_tier(volume, tiers)` picks the highest tier the",
+        "trader's cumulative window volume satisfies.",
+        "",
+        "Coexists with the legacy `fee_discount_bps`: tier's bps SUPERSEDE",
+        "market default; `fee_discount_bps` then applies as a further",
+        "percentage discount (so promo / referral codes can stack on top",
+        "of the base tier rate).",
+        "",
+        "Authority-gated: only the protocol authority can init / update."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -10377,10 +11885,22 @@
           },
           {
             "name": "volume_window_slots",
+            "docs": [
+              "Length of the volume-tracking window in slots. Crossing this",
+              "boundary on the next apply_fill resets the trader's",
+              "`volume_30d_quote_lots` to 0 and re-anchors the window. HL",
+              "pattern uses 14 days ≈ 3_024_000 slots @ 0.4s. Authority sets",
+              "this to match their preferred review cadence."
+            ],
             "type": "u64"
           },
           {
             "name": "tiers",
+            "docs": [
+              "Sorted ascending by `min_volume_quote_lots`. Tier 0 (volume 0",
+              "threshold) is the default for new traders. Validated at",
+              "init/update — see `lib.rs:init_fee_tiers`."
+            ],
             "type": {
               "array": [
                 {
@@ -10473,6 +11993,12 @@
     },
     {
       "name": "FillBatchEvent",
+      "docs": [
+        "CLOB hot-path fill feed — one event per `place_taker_order_v2` ix",
+        "carrying every match in a single `Vec<FillEntry>`. The off-chain",
+        "sequencer iterates `fills` and dispatches `apply_fill` / `apply_flp_fill`",
+        "per entry on mainnet; `taker_id` is the dedup key for the outbox."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -10507,6 +12033,13 @@
     },
     {
       "name": "FillEntry",
+      "docs": [
+        "Per-fill payload inside a `FillBatchEvent`. The redundant `market`",
+        "/ `taker` / `taker_side` / `taker_id` fields live once on the parent.",
+        "`maker == Pubkey::default()` signals an FLP virtual-quote fill — the",
+        "off-chain sequencer dispatches `apply_flp_fill` for those entries",
+        "and `apply_fill` for the rest."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -10579,11 +12112,25 @@
     },
     {
       "name": "FlpExposureAccount",
+      "docs": [
+        "FLP pool exposure across markets and per-LP share accounting.",
+        "",
+        "The pool's NAV (Net Asset Value) is `total_capital_quote_lots +",
+        "realized_pnl`. LPs own `shares` of `lp_shares_outstanding`; their",
+        "claim on NAV is `shares / lp_shares_outstanding`. Deposits mint",
+        "shares at the prevailing NAV/share price; withdrawals burn shares",
+        "for proportional NAV. This is the standard ERC-4626 vault model",
+        "adapted for Solana."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
           {
             "name": "authority",
+            "docs": [
+              "Protocol admin — manages FLP-level governance ops (initial endowment,",
+              "future emergency pause). Distinct from LPs, who own shares."
+            ],
             "type": "pubkey"
           },
           {
@@ -10592,10 +12139,18 @@
           },
           {
             "name": "total_capital_quote_lots",
+            "docs": [
+              "Aggregate quote-lot deposits + maker rebate accrual. Used as one",
+              "term of NAV; does NOT represent a single LP's claim."
+            ],
             "type": "u64"
           },
           {
             "name": "realized_pnl",
+            "docs": [
+              "Cumulative realized P&L from FLP fills across all markets. Signed.",
+              "The other term of NAV."
+            ],
             "type": "i64"
           },
           {
@@ -10604,6 +12159,10 @@
           },
           {
             "name": "lp_shares_outstanding",
+            "docs": [
+              "Total shares issued across all LpPositionAccounts. NAV/share = NAV",
+              "/ lp_shares_outstanding when nonzero."
+            ],
             "type": "u64"
           },
           {
@@ -10640,6 +12199,10 @@
     },
     {
       "name": "FlpExposurePerMarketAccountV3",
+      "docs": [
+        "Per-market FLP exposure. Replaces the singleton's per_market[] array",
+        "for independent ER-delegation per market."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -10813,6 +12376,9 @@
     },
     {
       "name": "FlpPositionAccountV3",
+      "docs": [
+        "Per-LP, per-market FLP shares balance."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -10878,6 +12444,12 @@
     },
     {
       "name": "FundingPeriodCapHitEvent",
+      "docs": [
+        "Emitted when funding hits the per-period cap and is scaled to fit.",
+        "Off-chain monitors page operators on repeated emissions (sign that",
+        "the cap is too tight or that the market is in extended one-way",
+        "funding stress)."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -10915,6 +12487,10 @@
           },
           {
             "name": "owed_quote_lots",
+            "docs": [
+              "Signed funding owed in quote lots: positive = trader paid, negative",
+              "= trader received."
+            ],
             "type": "i64"
           },
           {
@@ -10926,6 +12502,14 @@
     },
     {
       "name": "HealthGateSourceEvent",
+      "docs": [
+        "V3 liquidation engine — emitted by `liquidate_position_v2` so the",
+        "off-chain UI / keeper logs can show *which* price source flagged the",
+        "trader as unhealthy. `source` byte:",
+        "0 = mark_price was the more adverse price",
+        "1 = oracle_price was the more adverse price (dual-source gate fired)",
+        "2 = both were equal (rare)"
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -10982,6 +12566,16 @@
     },
     {
       "name": "IcebergOrderAccount",
+      "docs": [
+        "Native on-chain ICEBERG order — Hyperliquid pattern. Hides total",
+        "size by displaying only `displayed_size_lots` at a time. When the",
+        "visible child fills, a permissionless `replenish_iceberg` keeper",
+        "inserts the next chunk of `displayed_size_lots` (or the residual)",
+        "from the hidden reservoir at the same `limit_ticks`.",
+        "",
+        "PDA seeds: [b\"iceberg\", market, trader, iceberg_id]. iceberg_id is",
+        "u8 → up to 256 active icebergs per (trader, market) pair."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11007,6 +12601,9 @@
           },
           {
             "name": "flags",
+            "docs": [
+              "bit 0 = active. Cleared when remaining_lots == 0 OR cancelled."
+            ],
             "type": "u8"
           },
           {
@@ -11028,14 +12625,24 @@
           },
           {
             "name": "remaining_lots",
+            "docs": [
+              "Lots not yet displayed in the orderbook (the hidden reservoir)."
+            ],
             "type": "u64"
           },
           {
             "name": "displayed_size_lots",
+            "docs": [
+              "Size of each visible chunk. Last chunk may be smaller (residual)."
+            ],
             "type": "u64"
           },
           {
             "name": "child_order_seq",
+            "docs": [
+              "Sequence of the current child order in the OrderBuffer. 0 = no",
+              "active child (about to replenish or fully drained)."
+            ],
             "type": "u64"
           },
           {
@@ -11044,6 +12651,9 @@
           },
           {
             "name": "expires_at_slot",
+            "docs": [
+              "0 = never expires."
+            ],
             "type": "u64"
           }
         ]
@@ -11051,6 +12661,9 @@
     },
     {
       "name": "IcebergOrderAccountV3",
+      "docs": [
+        "V3 iceberg order. Seeds: `[b\"iceberg_v3\", market, trader, iceberg_id]`."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11193,6 +12806,9 @@
           },
           {
             "name": "node_index",
+            "docs": [
+              "Hypertree node index of the inserted child RestingOrderV2."
+            ],
             "type": "u32"
           }
         ]
@@ -11297,10 +12913,19 @@
           },
           {
             "name": "quote_mint",
+            "docs": [
+              "SPL mint for the protocol's quote currency (typically USDC). All",
+              "collateral and FLP capital moves through this mint."
+            ],
             "type": "pubkey"
           },
           {
             "name": "quote_vault",
+            "docs": [
+              "Global protocol vault TokenAccount. Owned by the InsuranceFundAccount",
+              "PDA (which signs transfers out via known seeds). Holds all trader",
+              "collateral + FLP capital."
+            ],
             "type": "pubkey"
           }
         ]
@@ -11308,6 +12933,11 @@
     },
     {
       "name": "InsurancePauseThresholdUpdatedEvent",
+      "docs": [
+        "Emitted when authority updates the insurance fund's pause threshold via",
+        "`set_insurance_pause_threshold`. Lets indexers/keepers see the gate move",
+        "without re-fetching the InsuranceFundAccount."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11341,6 +12971,10 @@
           },
           {
             "name": "invariant_code",
+            "docs": [
+              "Solvency invariant identifier from docs/SAFETY.md (5 = OI balance,",
+              "4 = vault conservation, etc)."
+            ],
             "type": "u8"
           },
           {
@@ -11364,6 +12998,12 @@
     },
     {
       "name": "JitLiquidationFilledEvent",
+      "docs": [
+        "Emitted by `liquidate_position_v2` when a JIT offer beat the",
+        "synthetic `oracle ± liq_penalty_bps` close price and was used as",
+        "the close-order's limit. `savings_vs_synthetic_bps` shows the",
+        "magnitude of improvement for the trader (bps of oracle price)."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11409,6 +13049,11 @@
           },
           {
             "name": "side",
+            "docs": [
+              "0=will close LONG positions (acts as a BUYER from the long → bid),",
+              "1=will close SHORT positions (acts as a SELLER → ask). See ix",
+              "docs for the close-side mapping."
+            ],
             "type": "u8"
           },
           {
@@ -11434,6 +13079,9 @@
           },
           {
             "name": "target_trader",
+            "docs": [
+              "`Pubkey::default()` means \"any trader's liquidation on this market\"."
+            ],
             "type": "pubkey"
           },
           {
@@ -11454,6 +13102,9 @@
           },
           {
             "name": "expires_at_slot",
+            "docs": [
+              "0 = never expires; otherwise must be > current_slot at placement."
+            ],
             "type": "u64"
           }
         ]
@@ -11485,6 +13136,11 @@
     },
     {
       "name": "JitLiquidationOfferPlacedEvent",
+      "docs": [
+        "A maker pre-committed a JIT liquidation close offer. Off-chain",
+        "keepers watch this event to learn about active offers without",
+        "needing to scan all program accounts."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11498,6 +13154,9 @@
           },
           {
             "name": "target_trader",
+            "docs": [
+              "`Pubkey::default()` = wildcard (any trader on this market)."
+            ],
             "type": "pubkey"
           },
           {
@@ -11518,6 +13177,9 @@
           },
           {
             "name": "expires_at_slot",
+            "docs": [
+              "0 = never expires."
+            ],
             "type": "u64"
           }
         ]
@@ -11525,6 +13187,9 @@
     },
     {
       "name": "LeverageTier",
+      "docs": [
+        "One rung of the leverage tier table."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11579,10 +13244,16 @@
           },
           {
             "name": "order_seq",
+            "docs": [
+              "Sequence assigned to the synthesized close order."
+            ],
             "type": "u64"
           },
           {
             "name": "node_index",
+            "docs": [
+              "Hypertree node index of the inserted RestingOrderV2."
+            ],
             "type": "u32"
           }
         ]
@@ -11614,6 +13285,10 @@
     },
     {
       "name": "LpPositionAccount",
+      "docs": [
+        "Per-LP share holding. PDA seeded `[b\"lp_position\", lp.key()]`. Created",
+        "lazily on first deposit via `init_if_needed`."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11627,14 +13302,24 @@
           },
           {
             "name": "shares",
+            "docs": [
+              "Shares of FlpExposureAccount.lp_shares_outstanding owned by this LP."
+            ],
             "type": "u64"
           },
           {
             "name": "total_deposited_quote_lots",
+            "docs": [
+              "Cumulative quote-lot deposits over the lifetime of this LP. Cost",
+              "basis for off-chain PnL display; does not affect on-chain math."
+            ],
             "type": "u64"
           },
           {
             "name": "total_withdrawn_quote_lots",
+            "docs": [
+              "Cumulative quote-lot withdrawals."
+            ],
             "type": "u64"
           }
         ]
@@ -11642,6 +13327,13 @@
     },
     {
       "name": "MarginThresholdCrossedEvent",
+      "docs": [
+        "Multi-threshold margin warning. Emitted when a trader's account-level",
+        "margin ratio crosses an alert threshold (75% → caution, 50% → warn,",
+        "25% → critical) so off-chain UIs can push notifications BEFORE",
+        "liquidation. Hyperliquid pattern: gives users runway to add collateral",
+        "or de-risk instead of being surprised by an MMR breach."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11655,10 +13347,16 @@
           },
           {
             "name": "level",
+            "docs": [
+              "0 = caution (75% of MMR headroom), 1 = warn (50%), 2 = critical (25%)"
+            ],
             "type": "u8"
           },
           {
             "name": "equity_to_mmr_bps",
+            "docs": [
+              "Position equity / required margin, in bps (e.g. 12_500 = 125%)."
+            ],
             "type": "u32"
           }
         ]
@@ -11666,6 +13364,12 @@
     },
     {
       "name": "MarkChangeClampedEvent",
+      "docs": [
+        "Anti-flash-crash event. Emitted when the post-batch mark would have",
+        "moved further than `params.mark_change_max_bps` and was clamped.",
+        "Off-chain monitors page operators on repeated emissions (a sign",
+        "either liquidity has thinned dramatically or the cap is too tight)."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11694,6 +13398,11 @@
     },
     {
       "name": "MarkPriceDriftEvent",
+      "docs": [
+        "V3 mark engine — emitted when |mark - oracle| / oracle exceeds",
+        "`params.drift_alert_bps`. Off-chain observers use this as a nudge to",
+        "call `settle_mark` and snap the mark back to the (fresh) oracle."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11711,6 +13420,9 @@
           },
           {
             "name": "drift_bps",
+            "docs": [
+              "Absolute drift in bps of oracle: |mark - oracle| × 10_000 / oracle."
+            ],
             "type": "u32"
           }
         ]
@@ -11718,6 +13430,13 @@
     },
     {
       "name": "MarkPriceUpdatedEvent",
+      "docs": [
+        "V3 mark engine — emitted whenever `mark_price_ticks` is updated.",
+        "`source` byte:",
+        "0 = `apply_fill` EMA blend (last-trade-price tracking)",
+        "1 = `settle_mark` hard reset to oracle",
+        "2 = future paths (kept for forward-compat)"
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11746,6 +13465,9 @@
     },
     {
       "name": "MarketAccount",
+      "docs": [
+        "Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD)."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -11755,6 +13477,14 @@
           },
           {
             "name": "creator",
+            "docs": [
+              "Curated-creator pubkey. Always zeroed by `initialize_market`",
+              "(markets are authority-gated in V3 — no permissionless creator",
+              "share is paid out). When non-default (set via a future",
+              "authority-controlled migration ix), every fill on this market",
+              "emits a CreatorFeeOwedEvent crediting the creator with",
+              "`params.creator_share_bps` of net fee."
+            ],
             "type": "pubkey"
           },
           {
@@ -11868,6 +13598,13 @@
           },
           {
             "name": "period_started_at_unix",
+            "docs": [
+              "Period bookkeeping for the funding-per-period cap. The",
+              "`period_funding_paid_abs_bps` accumulator advances with every",
+              "`settle_funding` call; resets at the start of each new period.",
+              "`period_started_at_unix == 0` means uninitialised — first",
+              "settlement seeds it from the current clock."
+            ],
             "type": "u64"
           },
           {
@@ -11876,6 +13613,10 @@
           },
           {
             "name": "last_mark_settle_slot",
+            "docs": [
+              "Slot of the most recent `settle_mark` call. 0 = never settled.",
+              "Used to enforce `params.mark_settle_min_slots` rate-limit."
+            ],
             "type": "u64"
           },
           {
@@ -11928,6 +13669,9 @@
           },
           {
             "name": "validator",
+            "docs": [
+              "Pinned ER validator pubkey, or default Pubkey if permissionless."
+            ],
             "type": "pubkey"
           }
         ]
@@ -12015,6 +13759,21 @@
     },
     {
       "name": "MarketLeverageTiersAccount",
+      "docs": [
+        "Hyperliquid-style multi-tier MMR table — wave 20a.",
+        "",
+        "Per-market account that holds up to MAX_LEVERAGE_TIERS rungs of",
+        "`(min_notional_quote_lots, mmr_bps)`. A position's effective MMR is",
+        "resolved via `matcher::risk::tiered_mmr_bps(market.maintenance_margin_bps,",
+        "tiers, position_notional)`.",
+        "",
+        "OPTIONAL: a market without this PDA falls back to the existing 2-tier",
+        "model (baseline + concentration_extra_mmr). Markets that need the full",
+        "HL leverage curve (BTC, ETH, ALT majors) can opt in via",
+        "`init_market_leverage_tiers`.",
+        "",
+        "Authority-gated: only the market authority can init / update."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -12028,6 +13787,10 @@
           },
           {
             "name": "tier_count",
+            "docs": [
+              "Number of valid tiers in `tiers[..tier_count]`. Slots beyond",
+              "`tier_count` are zero-init padding."
+            ],
             "type": "u8"
           },
           {
@@ -12041,6 +13804,10 @@
           },
           {
             "name": "tiers",
+            "docs": [
+              "Sorted ascending by `min_notional_quote_lots`. Validated at",
+              "init/update — see `lib.rs:init_market_leverage_tiers`."
+            ],
             "type": {
               "array": [
                 {
@@ -12122,6 +13889,10 @@
           },
           {
             "name": "source",
+            "docs": [
+              "0 = legacy trusted `update_oracle` (devnet only). 1 = Pyth pull.",
+              "Future: 2 = Switchboard, 3 = TWAP, etc."
+            ],
             "type": "u8"
           },
           {
@@ -12139,6 +13910,10 @@
           },
           {
             "name": "pyth_price_feed_id",
+            "docs": [
+              "The 32-byte Pyth feed identifier (e.g. SOL/USD on mainnet is",
+              "`0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d`)."
+            ],
             "type": {
               "array": [
                 "u8",
@@ -12156,6 +13931,12 @@
           },
           {
             "name": "tick_decimals",
+            "docs": [
+              "Tick decimal scaling. With our default tick = $0.001 and Pyth's",
+              "typical -8 exponent, this is 3 (scale_exp = pyth.exponent + 3).",
+              "Configurable per market because exotic feeds may use different",
+              "exponents."
+            ],
             "type": "i8"
           },
           {
@@ -12205,6 +13986,10 @@
     },
     {
       "name": "MarketParams",
+      "docs": [
+        "Per-market parameters. Set at market initialization, updated only via",
+        "governance. Mirrors `MarketParams` from the TypeScript reference."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -12230,6 +14015,15 @@
           },
           {
             "name": "maker_rebate_bps",
+            "docs": [
+              "Maker fee/rebate rate. SIGNED — positive = rebate paid to maker",
+              "(legacy semantics, MM incentive); negative = fee charged to maker",
+              "(low-tier retail). Crossing the sign boundary is supported on",
+              "the multi-tier fee table (FeeTier rows can mix signs across",
+              "volume tiers — e.g. tier 0 = -10 (10 bps maker fee), tier 5 =",
+              "+5 (5 bps rebate)). u32 → i32 widening preserves byte size",
+              "(4 bytes either way) so MarketParams layout is unchanged."
+            ],
             "type": "i32"
           },
           {
@@ -12322,66 +14116,187 @@
           },
           {
             "name": "oracle_staleness_max_seconds",
+            "docs": [
+              "Maximum age (in seconds) for an oracle price before it's rejected",
+              "as stale. Mitigates the JELLY-style attack where attackers wait",
+              "for an oracle gap to manipulate the mark."
+            ],
             "type": "u32"
           },
           {
             "name": "oracle_confidence_max_bps",
+            "docs": [
+              "Maximum oracle confidence interval as a fraction of price, in bps.",
+              "E.g. 100 = 1%. When confidence widens beyond this, oracle updates",
+              "are rejected (prevents using uncertain prices for liquidation)."
+            ],
             "type": "u32"
           },
           {
             "name": "max_position_lots_per_trader",
+            "docs": [
+              "Per-trader maximum position size on this market, in base lots.",
+              "0 = unlimited. Prevents the POPCAT-style coordinated long buildup",
+              "where a single attacker accumulates outsized concentrated risk."
+            ],
             "type": "u64"
           },
           {
             "name": "oracle_quorum_max_dispersion_bps",
+            "docs": [
+              "Multi-oracle quorum maximum dispersion as bps of the median.",
+              "E.g. 50 = if max-source - min-source > 0.5% of median, the update",
+              "is rejected because oracles disagree. 0 = no dispersion check.",
+              "Used by `update_oracle_quorum`."
+            ],
             "type": "u32"
           },
           {
             "name": "max_position_ratio_bps",
+            "docs": [
+              "Per-trader maximum position notional as bps of FLP capital.",
+              "E.g. 10 = 0.1% of FLP capital. 0 = unlimited (only the absolute",
+              "`max_position_lots_per_trader` gate applies). Computed at order",
+              "placement against the trader's projected post-fill notional and",
+              "the FLP's `total_capital_quote_lots`. Defends against cap-relative",
+              "concentration risk that the absolute lots cap can't enforce when",
+              "the pool grows or shrinks."
+            ],
             "type": "u32"
           },
           {
             "name": "liquidator_reward_bps",
+            "docs": [
+              "Bps of liquidation penalty paid to the keeper that triggers the",
+              "liquidation (a \"tip\" for being first to act). 0 = no incentive",
+              "(operators rely on protocol-level keepers). Battle-tested CLOBs",
+              "typically wire 1000-2000 bps (10-20% of penalty) to attract a",
+              "competitive liquidator pool. The remainder of the penalty flows",
+              "through the existing insurance-fund waterfall."
+            ],
             "type": "u32"
           },
           {
             "name": "liquidation_cooldown_slots",
+            "docs": [
+              "Cooldown in slots between consecutive liquidate_position calls on",
+              "the same position. Anti-cascade: prevents one underwater position",
+              "from getting hit repeatedly in adjacent blocks (each costs the",
+              "liquidatee a separate liquidation order + fee). Typical setting:",
+              "4-8 slots (~2-4 seconds). 0 = no cooldown (legacy behavior)."
+            ],
             "type": "u32"
           },
           {
             "name": "liquidation_auction_duration_slots",
+            "docs": [
+              "Slots over which the liquidator reward grows from base to full.",
+              "Dutch-style auction on the REWARD: first responders get a smaller",
+              "reward, later responders progressively larger up to the full",
+              "`liquidator_reward_bps`. 0 = reward is always full (legacy).",
+              "Typical setting: 8-16 slots (~4-8 seconds). Encourages a",
+              "competitive keeper pool to spread out instead of all racing the",
+              "same block."
+            ],
             "type": "u32"
           },
           {
             "name": "jit_bonus_rebate_bps",
+            "docs": [
+              "Drift-style JIT bonus: extra bps of rebate the maker earns when",
+              "filling a JIT-tagged taker order (flag bit 3 on place_limit_order).",
+              "0 = JIT inactive. Typical setting: 5-20 bps (0.05-0.2% of notional)",
+              "added on top of the base maker_rebate_bps. Encourages MMs to",
+              "preferentially quote against tagged flow."
+            ],
             "type": "u32"
           },
           {
             "name": "referrer_share_bps",
+            "docs": [
+              "Hyperliquid-style affiliate program: when a taker has a referrer",
+              "set on their TraderState, this many bps of the protocol's NET fee",
+              "(post-rebate, post-discount) is credited to the referrer's",
+              "TraderState collateral. 0 = referral program off. Typical: 1000-",
+              "2500 bps (10-25% of net fee)."
+            ],
             "type": "u32"
           },
           {
             "name": "builder_share_bps",
+            "docs": [
+              "Builder code share — bps of net fee credited to the `builder` pubkey",
+              "passed on the order. Frontends earn this for routing flow. 0 = off.",
+              "Typical: 500-1500 bps (5-15% of net fee). Distinct from referral",
+              "(referrer is per-trader; builder is per-order)."
+            ],
             "type": "u32"
           },
           {
             "name": "creator_share_bps",
+            "docs": [
+              "HIP-3 / permissionless-deployer share. When the market was created",
+              "permissionlessly, `MarketAccount.creator` is the deployer pubkey and",
+              "this is the share of net fees credited to them. 0 = no creator",
+              "share (typical for protocol-deployed core markets). Typical for",
+              "permissionless: 1000-3000 bps. Stacks with referrer + builder",
+              "(the *protocol* takes the residual into the insurance fund)."
+            ],
             "type": "u32"
           },
           {
             "name": "is_pre_launch",
+            "docs": [
+              "Pre-launch market flag. When true, this market is trading a",
+              "pre-TGE asset whose oracle is supplied by `update_oracle` (manual /",
+              "quorum) rather than Pyth. Off-chain UIs show a \"PRE-LAUNCH\"",
+              "badge. Hyperliquid pattern: enables price discovery on a perp",
+              "before its spot exists. On-chain semantics are identical to a",
+              "regular market — governance is expected to set tighter limits",
+              "(lower max_leverage, lower max_position_lots_per_trader) at init."
+            ],
             "type": "bool"
           },
           {
             "name": "max_oi_base_lots",
+            "docs": [
+              "Maximum gross open interest in base lots (per side: long lots OR",
+              "short lots, whichever is larger). 0 = unlimited. Acts as a hard",
+              "circuit breaker against runaway exposure on a single market —",
+              "new orders that would push OI past the cap are rejected at",
+              "place_limit_order intake. Distinct from `max_position_lots_per_trader`",
+              "(per-trader) and `max_position_ratio_bps` (per-trader as % of FLP);",
+              "this caps the WHOLE-MARKET aggregate. Typical: scaled with FLP",
+              "capital × leverage so worst-case insurance draw stays bounded."
+            ],
             "type": "u64"
           },
           {
             "name": "mark_change_max_bps",
+            "docs": [
+              "Maximum allowed mark-price change per batch in bps. 0 = unlimited",
+              "(legacy / pre-launch markets often run open). When set, the",
+              "matcher clamps the post-batch mark to ±this fraction of the",
+              "previous mark. Hyperliquid-style anti-flash-crash defense:",
+              "prevents a single thin-liquidity batch (or oracle spike that",
+              "passed the band gate) from setting an outlier mark that would",
+              "liquidate a swathe of healthy positions on the next assess.",
+              "Typical: 200-1000 bps (2%-10% per batch ≈ per 50ms)."
+            ],
             "type": "u32"
           },
           {
             "name": "concentration_threshold_lots",
+            "docs": [
+              "CME-style concentration margin tier. When a position's size_lots",
+              "crosses `concentration_threshold_lots`, its effective maintenance",
+              "margin becomes `maintenance_margin_ratio_bps +",
+              "concentration_extra_mmr_bps`. Penalises whales whose size is",
+              "harder to liquidate without market impact. 0 threshold = tier",
+              "disabled (single-MMR for the whole market). Smarter than HL's",
+              "flat per-market MMR.",
+              "Typical: threshold sized to 1-5% of FLP capital; extra 100-500 bps."
+            ],
             "type": "u64"
           },
           {
@@ -12390,38 +14305,111 @@
           },
           {
             "name": "funding_premium_twap_window",
+            "docs": [
+              "TWAP window length (in batches) for the funding-premium dampener.",
+              "0 = disabled (legacy single-tick premium). When > 0, the funding",
+              "rate uses the average of the last N batches' (mark - oracle)",
+              "premium instead of the instantaneous one — kills funding spikes",
+              "from microbursts of toxic flow that move the mark for one batch.",
+              "HL uses single-tick premium; this is mathematically smarter.",
+              "Capped at MARK_HISTORY_LEN (16). Typical: 4-8 batches."
+            ],
             "type": "u8"
           },
           {
             "name": "funding_per_period_max_bps",
+            "docs": [
+              "Funding-per-period cap (anti-gouge). When non-zero, the absolute",
+              "cumulative funding paid in a rolling window of",
+              "`funding_period_seconds` cannot exceed `funding_per_period_max_bps`",
+              "(in bps of position notional). Once the cap is hit, the funding",
+              "rate is scaled down for the remainder of the window so the",
+              "total stays at or under the cap. Smarter than HL where extended",
+              "one-way funding can drain a position without a daily ceiling.",
+              "Bookkeeping fields live on MarketAccount (period_*).",
+              "0 = disabled (legacy / HL-equivalent)."
+            ],
             "type": "u32"
           },
           {
             "name": "funding_period_seconds",
+            "docs": [
+              "Period length for the funding cap, in seconds. Typical: 86_400",
+              "(24h). Ignored if `funding_per_period_max_bps == 0`."
+            ],
             "type": "u32"
           },
           {
             "name": "bootstrap_period_batches",
+            "docs": [
+              "Bootstrap-period batches for permissionless markets. Within the",
+              "first N batches after a market is initialized, all per-trader",
+              "and whole-market position/OI caps are tightened by a factor of",
+              "4 to defend against snipers in the price-discovery window. After",
+              "`current_batch >= bootstrap_period_batches`, normal caps apply.",
+              "0 = disabled (legacy markets and protocol-curated deploys)."
+            ],
             "type": "u32"
           },
           {
             "name": "funding_oi_dampening",
+            "docs": [
+              "Symmetric-OI funding dampener. When true, the funding rate is",
+              "scaled by the OI imbalance:",
+              "skew_bps = |oi_long − oi_short| × 10_000 / (oi_long + oi_short)",
+              "dampened_rate = rate × skew_bps / 10_000",
+              "When the book is balanced (skew = 0), funding is fully dampened",
+              "(zero) — no reason to drain anyone since no side dominates.",
+              "When the book is one-sided (skew = 10_000 = 100%), funding is",
+              "at full strength to incentivise correction. HL charges full",
+              "premium-driven funding even with balanced OI; this is a",
+              "genuinely smarter signal of \"actual incentive needed.\"",
+              "Default false = HL-equivalent."
+            ],
             "type": "bool"
           },
           {
             "name": "mark_ema_alpha_bps",
+            "docs": [
+              "EMA weight (in bps) applied to a fresh fill price when blending",
+              "it into `mark_price_ticks` inside `apply_fill`.",
+              "new_mark = alpha * fill + (1 - alpha) * old_mark",
+              "0 = mark is never updated by fills (rely entirely on",
+              "`settle_mark` for resync — appropriate for markets that prefer",
+              "strict oracle-anchored mark).",
+              "Typical setting: 2_000 (20% weight on each fill — dampens",
+              "outlier fills but still tracks the tape). Capped at BPS_DENOM."
+            ],
             "type": "u32"
           },
           {
             "name": "mark_max_change_bps",
+            "docs": [
+              "Maximum allowed per-fill mark move in bps, clamped (not rejected).",
+              "If the EMA-blended new_mark differs from the prior mark by more",
+              "than this fraction, the move is clamped to ±this so a single",
+              "outlier fill cannot flash-crash the mark. 0 = unlimited.",
+              "Typical: 500 bps = 5%."
+            ],
             "type": "u32"
           },
           {
             "name": "mark_settle_min_slots",
+            "docs": [
+              "Minimum number of slots between consecutive permissionless",
+              "`settle_mark` calls. Acts as a rate-limit so a single sequencer",
+              "can't spam settles. 0 = no rate limit. Typical: 10 slots ≈ 4 s."
+            ],
             "type": "u32"
           },
           {
             "name": "drift_alert_bps",
+            "docs": [
+              "When |mark - oracle| / oracle exceeds this (in bps), every",
+              "mark-update path emits a `MarkPriceDriftEvent` so off-chain",
+              "observers can nudge `settle_mark`. 0 = drift alerts disabled.",
+              "Typical: 100 bps = 1%."
+            ],
             "type": "u32"
           }
         ]
@@ -12541,6 +14529,12 @@
     },
     {
       "name": "OrderModifiedV2Event",
+      "docs": [
+        "Emitted by `modify_order_v2` after the atomic cancel+place lands.",
+        "`new_order_id` is the encoded id of the replacement order — off-chain",
+        "consumers track open orders by this id (the old id is dead the moment",
+        "`cancel` lands inside the ix; no one should reference it again)."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -12642,14 +14636,24 @@
           },
           {
             "name": "im_required",
+            "docs": [
+              "IM required at post-withdrawal collateral (the IM-floor input)."
+            ],
             "type": "u64"
           },
           {
             "name": "notional_floor",
+            "docs": [
+              "10% × total_notional (the notional-floor input)."
+            ],
             "type": "u64"
           },
           {
             "name": "applied_floor",
+            "docs": [
+              "The active floor = max(im_required, notional_floor). Post-",
+              "withdrawal collateral must be ≥ this."
+            ],
             "type": "u64"
           }
         ]
@@ -12657,6 +14661,13 @@
     },
     {
       "name": "PortfolioRiskEvent",
+      "docs": [
+        "View ix output: cross-market portfolio risk for a trader.",
+        "Emitted by `view_portfolio_risk` so SDK callers can fetch a",
+        "trader's full risk snapshot in one tx-simulate. Equivalent to",
+        "running `previewPortfolioRisk` client-side but authoritative",
+        "(uses the same on-chain stress-lattice as liquidations do)."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -12705,6 +14716,46 @@
     },
     {
       "name": "PositionAccount",
+      "docs": [
+        "Per-(market, trader) open position.",
+        "",
+        "─── ISOLATED MARGIN DESIGN (Phase 2) ────────────────────────────────",
+        "`collateral_quote_lots` is currently a defined-but-unused field. It",
+        "is reserved as the on-chain marker for isolated-margin positions:",
+        "",
+        "collateral_quote_lots == 0  → cross margin (default, current",
+        "behavior). Position is backed by the",
+        "trader's pooled `TraderStateAccount",
+        ".collateral_quote_lots`.",
+        "",
+        "collateral_quote_lots  > 0  → isolated margin. The position is",
+        "backed ONLY by this amount; the",
+        "trader's pooled collateral is",
+        "insulated from this position's",
+        "liquidation.",
+        "",
+        "Phase 2 (separate, audited commit) wires the marker through:",
+        "",
+        "1. `assess_margin_fn` (matcher/risk.rs) — splits the trader's",
+        "position set into cross and isolated, evaluates each isolated",
+        "position against its own collateral, and only includes cross",
+        "positions in the pooled-collateral assessment.",
+        "2. `liquidate_position_v2` — when liquidating an isolated",
+        "position, the penalty + liquidator reward come out of",
+        "`position.collateral_quote_lots` first, then the insurance",
+        "fund covers any shortfall (the trader's main pool is never",
+        "touched — that's the whole point of isolated).",
+        "3. New ixs `set_position_isolated(amount)` and",
+        "`set_position_cross()` that transfer collateral between",
+        "`TraderState.collateral_quote_lots` and",
+        "`PositionAccount.collateral_quote_lots`, gated by a",
+        "post-transfer health check on BOTH the cross set and the",
+        "isolated position.",
+        "",
+        "Until Phase 2 lands, no on-chain logic writes to or reads from",
+        "this field. Off-chain code may rely on this field staying 0 for",
+        "every existing position."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -12754,14 +14805,34 @@
           },
           {
             "name": "unhealthy_since_slot",
+            "docs": [
+              "Slot at which this position was first detected as unhealthy by a",
+              "`liquidate_position` call. 0 = healthy (or has never been",
+              "liquidated). Used to compute the Dutch-auction reward curve and",
+              "to enforce the per-position cooldown. Reset to 0 once the",
+              "position closes (size_lots → 0)."
+            ],
             "type": "u64"
           },
           {
             "name": "last_liquidated_at_slot",
+            "docs": [
+              "Slot at which the most recent liquidate_position call against",
+              "this position landed. 0 = never liquidated. Used by the cooldown",
+              "gate."
+            ],
             "type": "u64"
           },
           {
             "name": "leverage_cap",
+            "docs": [
+              "Per-position leverage cap (set by trader via `set_position_leverage`).",
+              "0 = use the market's `params.max_leverage`. Otherwise capped at",
+              "`min(params.max_leverage, leverage_cap)` during margin checks.",
+              "Hyperliquid pattern: lets risk-conscious traders limit their",
+              "exposure on a per-position basis without affecting other positions.",
+              "Validated at set time: cap ∈ [1, market.max_leverage]."
+            ],
             "type": "u32"
           }
         ]
@@ -12792,7 +14863,47 @@
       }
     },
     {
+      "name": "PositionMarginModeChangedEvent",
+      "docs": [
+        "Emitted by `set_position_isolated` and `set_position_cross`.",
+        "`mode`: 0 = cross, 1 = isolated. The two collateral fields show the",
+        "post-transition state for the trader's pooled vs per-position pools."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "new_isolated_collateral_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "new_cross_collateral_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "mode",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
       "name": "PredictedFundingEvent",
+      "docs": [
+        "View ix output: predicted next-batch funding rate. Emitted by",
+        "`view_predicted_funding` so SDK callers (via tx simulation) can read",
+        "the rate from logs without paying for an actual on-chain mutation.",
+        "Off-chain UIs use this to display \"next funding payment\" before the",
+        "rate crystallises in `settle_funding`."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -12833,6 +14944,9 @@
         "fields": [
           {
             "name": "feed_id",
+            "docs": [
+              "`FeedId` but avoid the type alias because of compatibility issues with Anchor's `idl-build` feature."
+            ],
             "type": {
               "array": [
                 "u8",
@@ -12854,10 +14968,27 @@
           },
           {
             "name": "publish_time",
+            "docs": [
+              "The timestamp of this price update in seconds"
+            ],
             "type": "i64"
           },
           {
             "name": "prev_publish_time",
+            "docs": [
+              "The timestamp of the previous price update. This field is intended to allow users to",
+              "identify the single unique price update for any moment in time:",
+              "for any time t, the unique update is the one such that prev_publish_time < t <= publish_time.",
+              "",
+              "Note that there may not be such an update while we are migrating to the new message-sending logic,",
+              "as some price updates on pythnet may not be sent to other chains (because the message-sending",
+              "logic may not have triggered). We can solve this problem by making the message-sending mandatory",
+              "(which we can do once publishers have migrated over).",
+              "",
+              "Additionally, this field may be equal to publish_time if the message is sent on a slot where",
+              "where the aggregation was unsuccesful. This problem will go away once all publishers have",
+              "migrated over to a recent version of pyth-agent."
+            ],
             "type": "i64"
           },
           {
@@ -12873,6 +15004,14 @@
     },
     {
       "name": "PriceUpdateV2",
+      "docs": [
+        "A price update account. This account is used by the Pyth Receiver program to store a verified price update from a Pyth price feed.",
+        "It contains:",
+        "- `write_authority`: The write authority for this account. This authority can close this account to reclaim rent or update the account to contain a different price update.",
+        "- `verification_level`: The [`VerificationLevel`] of this price update. This represents how many Wormhole guardian signatures have been verified for this price update.",
+        "- `price_message`: The actual price update.",
+        "- `posted_slot`: The slot at which this price update was posted."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -12905,6 +15044,13 @@
     },
     {
       "name": "QuoteLadderSnapshotEvent",
+      "docs": [
+        "View ix output: snapshot of the FLP quoter's would-be next-batch",
+        "quote ladder. The ladder is deterministic given (market state, FLP",
+        "state, oracle) — off-chain consumers can re-run `generate_quotes`",
+        "with the same inputs for the full per-level array; this emit only",
+        "carries the top-level summary to keep the log compact."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -12985,6 +15131,11 @@
     },
     {
       "name": "SubAccountOpenedEvent",
+      "docs": [
+        "Emitted by `open_trader_sub_account`. The sub_account PDA is at",
+        "`[TraderStateAccount::SEED, trader.key(), &[sub_index]]`; off-chain",
+        "reconstruction uses this event to map (trader, sub_index) → PDA."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -13005,6 +15156,11 @@
     },
     {
       "name": "SubAccountTransferEvent",
+      "docs": [
+        "Emitted by `transfer_main_to_sub` and `transfer_sub_to_main`.",
+        "`direction` is 0 for main→sub, 1 for sub→main. Off-chain wallets use",
+        "this to update per-sub-account balance views."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -13037,6 +15193,13 @@
     },
     {
       "name": "TakerOrderClearedEvent",
+      "docs": [
+        "CLOB summary — emitted at the END of `place_taker_order_v2`. One",
+        "per CLOB-style placement, regardless of how many fills landed.",
+        "Mirrors Phoenix's \"OrderPlaced + Fills\" composite event but as a",
+        "single summary so off-chain consumers can detect \"this is a CLOB",
+        "path order\" vs a pure resting limit."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -13054,18 +15217,32 @@
           },
           {
             "name": "taker_size_lots",
+            "docs": [
+              "Original size requested."
+            ],
             "type": "u64"
           },
           {
             "name": "filled_lots",
+            "docs": [
+              "Sum of all `FillEntry.size_lots` emitted in the trailing",
+              "`FillBatchEvent` from this ix."
+            ],
             "type": "u64"
           },
           {
             "name": "residual_resting_lots",
+            "docs": [
+              "Size remaining after the walk that was inserted as a resting",
+              "limit (0 if fully filled or IOC)."
+            ],
             "type": "u64"
           },
           {
             "name": "match_count",
+            "docs": [
+              "Number of distinct maker orders matched."
+            ],
             "type": "u32"
           },
           {
@@ -13074,6 +15251,9 @@
           },
           {
             "name": "residual_node_index",
+            "docs": [
+              "Hypertree node index of the residual resting order (NIL if none)."
+            ],
             "type": "u32"
           }
         ]
@@ -13094,6 +15274,10 @@
           },
           {
             "name": "maker",
+            "docs": [
+              "The maker who absorbed the toxic flow (or the FLP pool PDA on",
+              "apply_flp_fill)."
+            ],
             "type": "pubkey"
           },
           {
@@ -13178,6 +15362,10 @@
           },
           {
             "name": "maker_rebate_bps",
+            "docs": [
+              "SIGNED — positive = maker rebate, negative = maker fee",
+              "(wave 22 negative-fee semantics)."
+            ],
             "type": "i32"
           },
           {
@@ -13186,6 +15374,11 @@
           },
           {
             "name": "window_expired",
+            "docs": [
+              "True iff the trader's `volume_window_start_slot` has aged past",
+              "`volume_window_slots` AND `volume_30d_quote_lots > 0`. UIs",
+              "surface \"Tier resets on next trade\" copy."
+            ],
             "type": "bool"
           }
         ]
@@ -13225,6 +15418,11 @@
     },
     {
       "name": "TraderStateAccount",
+      "docs": [
+        "Per-trader state. Holds collateral, last-settled funding marker, and",
+        "position-list pointers (Position PDAs are separate accounts; this is",
+        "a lightweight index)."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -13246,14 +15444,23 @@
           },
           {
             "name": "open_positions",
+            "docs": [
+              "Number of open positions (each in its own Position PDA)."
+            ],
             "type": "u8"
           },
           {
             "name": "toxicity_score_bps",
+            "docs": [
+              "Toxicity score in bps; updated post-fill. Used for taker-fee tier."
+            ],
             "type": "i32"
           },
           {
             "name": "orders_this_batch",
+            "docs": [
+              "Per-batch order count (rate limit)."
+            ],
             "type": "u32"
           },
           {
@@ -13262,30 +15469,88 @@
           },
           {
             "name": "fee_discount_bps",
+            "docs": [
+              "Fee tier discount in bps off the base taker fee. 0 = standard",
+              "fees; e.g. 1000 = 10% discount. Set by `set_trader_fee_tier`",
+              "(authority-only) based on off-chain 30-day rolling volume —",
+              "universal pattern at every CEX (Binance, OKX, Bybit, Hyperliquid)."
+            ],
             "type": "u32"
           },
           {
             "name": "delegate",
+            "docs": [
+              "Delegate authority. When non-default, the delegate may sign",
+              "trader-bound instructions (place_limit_order, cancel_order,",
+              "settle_funding, etc.) on the trader's behalf. Foundation for",
+              "subaccount / portfolio-margin patterns:",
+              "• Master keypair holds funds, delegates trading authority to a",
+              "hot key (Hyperliquid / dYdX standard).",
+              "• Multi-sig \"subaccount manager\" can act on behalf of the",
+              "trader without holding their funds.",
+              "Cleared by setting back to Pubkey::default(). The trader pubkey",
+              "itself ALWAYS retains authority — delegate is additive, not",
+              "exclusive (the trader can revoke at any time)."
+            ],
             "type": "pubkey"
           },
           {
             "name": "referrer",
+            "docs": [
+              "Referrer pubkey. When non-default, on every fill where this trader",
+              "is the taker, `market.params.referrer_share_bps` of the protocol's",
+              "net fee revenue is credited to the referrer's TraderState",
+              "collateral. Hyperliquid affiliate model. Pubkey::default() = no",
+              "referrer (default for all new trader_state). Set once via",
+              "`set_trader_referrer` — immutable after first set (anti-rotation",
+              "griefing)."
+            ],
             "type": "pubkey"
           },
           {
             "name": "builder",
+            "docs": [
+              "Approved builder pubkey. When non-default, on every fill where this",
+              "trader is the taker, `min(market.params.builder_share_bps,",
+              "builder_max_fee_share_bps)` of the protocol's net fee revenue is",
+              "credited to the builder via `BuilderFeeOwedEvent` (off-chain",
+              "pull-based). Hyperliquid builder-codes model: a third-party UI/",
+              "wallet/aggregator that routes flow earns a share of the fee from",
+              "the user's trades. Set/rotated/revoked freely via",
+              "`set_trader_builder`; the trader's CAP on the share keeps builders",
+              "from extracting more than the user agreed to."
+            ],
             "type": "pubkey"
           },
           {
             "name": "builder_max_fee_share_bps",
+            "docs": [
+              "Maximum fee share (in bps of net fee) the trader has authorized",
+              "the builder to take. The on-chain emit clamps the protocol-side",
+              "builder_share_bps by this. 0 = builder set but no share approved",
+              "(functionally the same as no builder). Allows the trader to set a",
+              "conservative cap below whatever the protocol rate is."
+            ],
             "type": "u32"
           },
           {
             "name": "volume_30d_quote_lots",
+            "docs": [
+              "Wave 22: rolling notional traded in the current volume window",
+              "(quote lots, summed across maker + taker fills). Reset when the",
+              "window expires. Used by `resolve_fee_tier` to pick the trader's",
+              "effective maker / taker bps from `FeeTiersAccount`."
+            ],
             "type": "u64"
           },
           {
             "name": "volume_window_start_slot",
+            "docs": [
+              "Wave 22: slot at which the current volume window opened. When",
+              "`Clock::slot - this > FeeTiersAccount.volume_window_slots`, the",
+              "next apply_fill resets `volume_30d_quote_lots` and re-anchors",
+              "this. HL pattern (14-day rolling tier window)."
+            ],
             "type": "u64"
           }
         ]
@@ -13293,6 +15558,11 @@
     },
     {
       "name": "TraderTierUpgradedEvent",
+      "docs": [
+        "WAVE 22 — emitted by `apply_fill` whenever a trader crosses a tier",
+        "boundary (maker OR taker). Off-chain UIs surface \"🎉 You upgraded",
+        "to VIP3!\" pushes. Silent when no tier change."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -13317,6 +15587,13 @@
     },
     {
       "name": "TradingRewardEligibleEvent",
+      "docs": [
+        "Per-fill trading-rewards eligibility event. Off-chain accrual",
+        "computes per-trader points (notional × multipliers × time-windows).",
+        "Hyperliquid HYPE-distribution model — minimal on-chain footprint",
+        "(one event per fill, no extra writes) so emissions can be indexed",
+        "at zero on-chain cost."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -13377,6 +15654,17 @@
     },
     {
       "name": "TriggerOrderAccount",
+      "docs": [
+        "Native on-chain trigger order — Hyperliquid pattern. The trader pre-funds",
+        "rent on a `TriggerOrderAccount` PDA. Anyone (typically a keeper) can",
+        "`execute_trigger_order` once the oracle crosses `trigger_price_ticks` in",
+        "the configured direction; the chain inserts a regular limit order into",
+        "the market's buffer. Survives bot downtime — your stop fires even if",
+        "your MM bot is offline.",
+        "",
+        "PDA seeds: [b\"trigger\", market, trader, trigger_id]. trigger_id is u8",
+        "(0..255) so each trader gets up to 256 active triggers per market."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -13398,14 +15686,32 @@
           },
           {
             "name": "side",
+            "docs": [
+              "Side of the resulting order when triggered (0 = long, 1 = short).",
+              "For closing a long position: side = 1 (short to close). For closing",
+              "a short: side = 0 (long to close)."
+            ],
             "type": "u8"
           },
           {
             "name": "kind",
+            "docs": [
+              "`kind` encodes the comparison direction:",
+              "0 = trigger when oracle ≤ trigger_price  (stop-loss for longs,",
+              "take-profit for shorts)",
+              "1 = trigger when oracle ≥ trigger_price  (take-profit for longs,",
+              "stop-loss for shorts)"
+            ],
             "type": "u8"
           },
           {
             "name": "flags",
+            "docs": [
+              "Bit 0: reduce_only — execute only if the resulting order would",
+              "shrink the trader's position (no flip).",
+              "Bit 1: active — set by `place_trigger_order`, cleared by",
+              "`execute_trigger_order` (no double-fire)."
+            ],
             "type": "u8"
           },
           {
@@ -13414,10 +15720,19 @@
           },
           {
             "name": "trigger_price_ticks",
+            "docs": [
+              "Oracle price (in ticks) at which to fire."
+            ],
             "type": "u64"
           },
           {
             "name": "limit_price_ticks",
+            "docs": [
+              "Limit price for the resulting order. 0 = market-style (uses the",
+              "current oracle ± slippage_bps configured at execute time, but for",
+              "v1 we require an explicit non-zero limit to keep the matcher",
+              "deterministic)."
+            ],
             "type": "u64"
           },
           {
@@ -13426,18 +15741,45 @@
           },
           {
             "name": "expires_at_slot",
+            "docs": [
+              "0 = never expires."
+            ],
             "type": "u64"
           },
           {
             "name": "oco_pair",
+            "docs": [
+              "OCO (One-Cancels-the-Other) partner trigger PDA. Default = no",
+              "link. When non-default, executing OR cancelling THIS trigger",
+              "also marks the partner inactive (one fires, the other dies).",
+              "Set by `place_bracket_order` to wire a TP+SL pair atomically.",
+              "The partner account is passed via the optional `oco_pair`",
+              "account on `execute_trigger_order` / `cancel_trigger_order`."
+            ],
             "type": "pubkey"
           },
           {
             "name": "trailing_offset_bps",
+            "docs": [
+              "Trailing-stop offset in bps. 0 = static trigger (legacy). When",
+              "non-zero, the trigger price RATCHETS in the favourable direction",
+              "as the oracle moves: kind=0 (fire on ≤) tracks the oracle MAX",
+              "minus offset; kind=1 (fire on ≥) tracks oracle MIN plus offset.",
+              "Hyperliquid trailing-stop pattern. Permissionless `update_trailing_stop`",
+              "keepers ratchet the trigger price; on fire, the existing",
+              "execute_trigger_order path runs unchanged."
+            ],
             "type": "u32"
           },
           {
             "name": "trailing_anchor_ticks",
+            "docs": [
+              "Best (most-favorable-to-trader) oracle price observed since",
+              "trigger placement. Used as the anchor for trailing math:",
+              "kind=0 (sl-for-long): trigger = best_price × (1 - offset_bps)",
+              "kind=1 (sl-for-short): trigger = best_price × (1 + offset_bps)",
+              "0 = unset (first update_trailing_stop initialises from current oracle)."
+            ],
             "type": "u64"
           }
         ]
@@ -13445,6 +15787,11 @@
     },
     {
       "name": "TriggerOrderAccountV3",
+      "docs": [
+        "V3 trigger order. Seeds: `[b\"trigger_v3\", market, trader, trigger_id]`.",
+        "Distinct from legacy `[b\"trigger\", ...]` so legacy + v3 triggers can",
+        "coexist during a migration window."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -13546,10 +15893,16 @@
           },
           {
             "name": "order_seq",
+            "docs": [
+              "Sequence assigned to the synthesized resting order."
+            ],
             "type": "u64"
           },
           {
             "name": "node_index",
+            "docs": [
+              "Hypertree node index of the inserted RestingOrderV2."
+            ],
             "type": "u32"
           }
         ]
@@ -13653,6 +16006,16 @@
     },
     {
       "name": "TwapOrderAccount",
+      "docs": [
+        "Native on-chain TWAP order — Hyperliquid pattern. The trader specifies",
+        "total size + slice size + interval; anyone (typically a keeper) calls",
+        "`execute_twap_slice` once per interval to insert one slice into the",
+        "market's order buffer. Slices stop firing when total filled OR end_slot",
+        "reached.",
+        "",
+        "PDA seeds: [b\"twap\", market, trader, twap_id]. twap_id is u8 → up to",
+        "256 active TWAPs per (trader, market) pair."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -13686,14 +16049,24 @@
           },
           {
             "name": "total_size_lots",
+            "docs": [
+              "Total size to execute across slices."
+            ],
             "type": "u64"
           },
           {
             "name": "size_executed_lots",
+            "docs": [
+              "Cumulative size successfully sliced into the buffer so far."
+            ],
             "type": "u64"
           },
           {
             "name": "limit_price_ticks",
+            "docs": [
+              "Limit price applied to every slice (max price for buys, min for",
+              "sells). Slice rejects placement if exceeded."
+            ],
             "type": "u64"
           },
           {
@@ -13702,10 +16075,16 @@
           },
           {
             "name": "slot_interval",
+            "docs": [
+              "Minimum slots between successive slices."
+            ],
             "type": "u64"
           },
           {
             "name": "end_slot",
+            "docs": [
+              "0 = no end. Otherwise last slot a slice may be placed in."
+            ],
             "type": "u64"
           },
           {
@@ -13717,6 +16096,9 @@
     },
     {
       "name": "TwapOrderAccountV3",
+      "docs": [
+        "V3 TWAP order. Seeds: `[b\"twap_v3\", market, trader, twap_id]`."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -13898,10 +16280,16 @@
           },
           {
             "name": "order_seq",
+            "docs": [
+              "Sequence assigned to the synthesized resting slice."
+            ],
             "type": "u64"
           },
           {
             "name": "node_index",
+            "docs": [
+              "Hypertree node index of the inserted RestingOrderV2."
+            ],
             "type": "u32"
           }
         ]
@@ -13949,6 +16337,20 @@
     },
     {
       "name": "VaultAccount",
+      "docs": [
+        "User-managed trading vault. A strategist deploys a vault and gets",
+        "trading authority over its collateral pool via the standard",
+        "TraderStateAccount.delegate mechanism. Depositors mint shares at the",
+        "current NAV; withdrawals burn shares for proportional NAV. The",
+        "strategist earns a high-water-mark performance fee, paid in newly",
+        "minted shares.",
+        "",
+        "PDA seeds: [b\"vault\", strategist, vault_id]. vault_id is u8 → up to",
+        "256 vaults per strategist. The vault's TraderStateAccount lives at",
+        "[b\"trader_state\", vault_pda] (i.e. the vault PDA is the \"trader\").",
+        "The strategist is set as `delegate` on that TraderState so they can",
+        "trade with their own keypair."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -13966,18 +16368,30 @@
           },
           {
             "name": "accept_deposits",
+            "docs": [
+              "1 if accepting deposits, 0 if closed (withdrawals always allowed)."
+            ],
             "type": "u8"
           },
           {
             "name": "_pad0",
+            "docs": [
+              "Reserved padding for alignment."
+            ],
             "type": "u8"
           },
           {
             "name": "trader_state",
+            "docs": [
+              "The vault PDA's TraderStateAccount (where collateral lives)."
+            ],
             "type": "pubkey"
           },
           {
             "name": "name",
+            "docs": [
+              "Display name (UTF-8, null-padded)."
+            ],
             "type": {
               "array": [
                 "u8",
@@ -13987,34 +16401,63 @@
           },
           {
             "name": "perf_fee_bps",
+            "docs": [
+              "Performance fee in bps of NAV growth above the high-water mark.",
+              "Charged on `settle_vault_perf_fee` by minting shares to the",
+              "strategist. Typical: 1000–2000 (10–20%). Capped at BPS_DENOM/2."
+            ],
             "type": "u32"
           },
           {
             "name": "shares_outstanding",
+            "docs": [
+              "Total shares outstanding (sum of all VaultPositionAccount.shares)."
+            ],
             "type": "u64"
           },
           {
             "name": "hwm_nav_per_share_u64x6",
+            "docs": [
+              "Q64.0 NAV-per-share at the last performance crystallization.",
+              "Stored × USD_UNIT for precision; 0 = bootstrap (perf fee not yet",
+              "settled — first settle anchors the HWM at then-current NAV/share)."
+            ],
             "type": "u64"
           },
           {
             "name": "last_perf_settlement_unix",
+            "docs": [
+              "Unix timestamp of the last performance settlement."
+            ],
             "type": "u64"
           },
           {
             "name": "min_deposit_quote_lots",
+            "docs": [
+              "Minimum deposit in quote-lots to prevent dust attacks. 0 = none."
+            ],
             "type": "u64"
           },
           {
             "name": "total_deposited_quote_lots",
+            "docs": [
+              "Cumulative quote-lots deposited across the vault's lifetime",
+              "(informational, used for ROI display)."
+            ],
             "type": "u64"
           },
           {
             "name": "total_withdrawn_quote_lots",
+            "docs": [
+              "Cumulative quote-lots withdrawn (gross, before perf fee)."
+            ],
             "type": "u64"
           },
           {
             "name": "total_perf_shares_minted",
+            "docs": [
+              "Cumulative shares minted to the strategist as perf fee."
+            ],
             "type": "u64"
           }
         ]
@@ -14022,6 +16465,9 @@
     },
     {
       "name": "VaultAccountV3",
+      "docs": [
+        "V3 vault account. Seeds: `[b\"vault_v3\", strategist, vault_id]`."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -14064,10 +16510,16 @@
           },
           {
             "name": "total_capital_quote_lots",
+            "docs": [
+              "Cumulative gross deposits over the vault's lifetime (informational)."
+            ],
             "type": "u64"
           },
           {
             "name": "hwm_nav_per_share_u64x6",
+            "docs": [
+              "HWM of NAV-per-share, scaled by USD_UNIT (1_000_000). 0 = bootstrap."
+            ],
             "type": "u64"
           },
           {
@@ -14227,6 +16679,12 @@
     },
     {
       "name": "VaultPositionAccount",
+      "docs": [
+        "Per-depositor share holding in a vault. Created lazily on first",
+        "deposit via init_if_needed.",
+        "",
+        "PDA seeds: [b\"vault_position\", vault, depositor]."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -14259,6 +16717,9 @@
     },
     {
       "name": "VaultPositionAccountV3",
+      "docs": [
+        "V3 vault depositor position. Seeds: `[b\"vault_position_v3\", vault, depositor]`."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -14359,6 +16820,19 @@
     },
     {
       "name": "VerificationLevel",
+      "docs": [
+        "Pyth price updates are bridged to all blockchains via Wormhole.",
+        "Using the price updates on another chain requires verifying the signatures of the Wormhole guardians.",
+        "The usual process is to check the signatures for two thirds of the total number of guardians, but this can be cumbersome on Solana because of the transaction size limits,",
+        "so we also allow for partial verification.",
+        "",
+        "This enum represents how much a price update has been verified:",
+        "- If `Full`, we have verified the signatures for two thirds of the current guardians.",
+        "- If `Partial`, only `num_signatures` guardian signatures have been checked.",
+        "",
+        "# Warning",
+        "Using partially verified price updates is dangerous, as it lowers the threshold of guardians that need to collude to produce a malicious price update."
+      ],
       "type": {
         "kind": "enum",
         "variants": [
@@ -14384,18 +16858,30 @@
         "fields": [
           {
             "name": "buy_pending",
+            "docs": [
+              "Pending buy volume in current open bucket."
+            ],
             "type": "u64"
           },
           {
             "name": "sell_pending",
+            "docs": [
+              "Pending sell volume in current open bucket."
+            ],
             "type": "u64"
           },
           {
             "name": "buckets_observed",
+            "docs": [
+              "Number of buckets observed so far."
+            ],
             "type": "u64"
           },
           {
             "name": "value_q32_32",
+            "docs": [
+              "Q32.32 fixed-point VPIN value (0 = balanced, FIXED_ONE = max imbalance)."
+            ],
             "type": "u64"
           }
         ]

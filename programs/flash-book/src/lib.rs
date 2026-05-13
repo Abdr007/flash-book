@@ -34,8 +34,9 @@ use matcher::funding::funding_owed;
 use matcher::lot::Ticks;
 use matcher::order::Side;
 use matcher::risk::{
-    assess_margin as assess_margin_fn, default_scenarios as default_scenarios_fn,
-    MarketSnapshot as RiskMarketSnap, PositionSnapshot as RiskPosSnap,
+    assess_margin as assess_margin_fn, assess_margin_unified as assess_margin_unified_fn,
+    default_scenarios as default_scenarios_fn, MarketSnapshot as RiskMarketSnap,
+    PositionSnapshot as RiskPosSnap,
 };
 use state::{
     FlpExposureAccount, InsuranceFundAccount, LeverageTier,
@@ -1732,6 +1733,7 @@ pub mod flash_book {
                     size_lots: position.size_lots,
                     entry_price: Ticks(position.entry_price_ticks),
                     cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                    collateral_quote_lots: position.collateral_quote_lots,
                 });
                 market_snaps.push(RiskMarketSnap {
                     market: market_ai.key(),
@@ -1745,7 +1747,7 @@ pub mod flash_book {
                 market_keys.push(market_ai.key());
             }
             let scenarios = default_scenarios_fn(&market_keys);
-            let assessment = assess_margin_fn(
+            let assessment = assess_margin_unified_fn(
                 &snaps,
                 &market_snaps,
                 &scenarios,
@@ -2136,6 +2138,7 @@ pub mod flash_book {
                     size_lots: position.size_lots,
                     entry_price: Ticks(position.entry_price_ticks),
                     cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                    collateral_quote_lots: position.collateral_quote_lots,
                 });
                 market_snaps.push(RiskMarketSnap {
                     market: m_ai.key(),
@@ -2165,7 +2168,7 @@ pub mod flash_book {
             0
         } else {
             let scenarios = default_scenarios_fn(&market_keys);
-            let assessment = assess_margin_fn(
+            let assessment = assess_margin_unified_fn(
                 &snaps,
                 &market_snaps,
                 &scenarios,
@@ -2216,6 +2219,299 @@ pub mod flash_book {
             im_required,
             notional_floor,
             applied_floor: floor,
+        });
+        Ok(())
+    }
+
+    /// Transition a position from cross-margin to isolated-margin by
+    /// reserving `amount_quote_lots` of the trader's pooled collateral
+    /// against this specific position. Post-transfer health check must
+    /// pass on BOTH:
+    ///   (a) the cross set (other positions + reduced trader_state pool)
+    ///   (b) the isolated position itself (its new collateral vs its
+    ///       own maintenance margin under stress)
+    ///
+    /// Phase 2 constraint: AT MOST ONE position can be isolated per
+    /// trader (the one being modified). If the trader has another
+    /// position that's already isolated (`collateral_quote_lots > 0`),
+    /// this ix rejects — un-isolate it first. Phase 3 lifts this to
+    /// multi-isolated-positions.
+    ///
+    /// remaining_accounts layout: alternating (market, position) pairs
+    /// for every OTHER position the trader has a non-zero size on. The
+    /// target position is passed inline (see Accounts struct); do not
+    /// re-include it in remaining_accounts.
+    pub fn set_position_isolated<'info>(
+        ctx: Context<'_, '_, '_, 'info, SetPositionMarginMode<'info>>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        let trader_pk = ctx.accounts.trader_state.trader;
+        require!(
+            ctx.accounts.target_position.trader == trader_pk,
+            FlashBookError::WrongTrader
+        );
+        require!(
+            ctx.accounts.target_position.market == ctx.accounts.target_market.key(),
+            FlashBookError::WrongMarket
+        );
+        require!(
+            ctx.accounts.target_position.size_lots > 0,
+            FlashBookError::ZeroSize
+        );
+        require!(
+            ctx.accounts.target_position.collateral_quote_lots == 0,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            amount_quote_lots <= ctx.accounts.trader_state.collateral_quote_lots,
+            FlashBookError::InsufficientCollateral
+        );
+
+        // ─── Walk remaining_accounts: build snapshots for OTHER positions.
+        let program_id = ctx.program_id;
+        let remaining = ctx.remaining_accounts;
+        require!(remaining.len() % 2 == 0, FlashBookError::OutOfRange);
+
+        let mut snaps: Vec<RiskPosSnap> = Vec::new();
+        let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
+        let mut market_keys: Vec<Pubkey> = Vec::new();
+
+        let mut i = 0usize;
+        while i + 1 < remaining.len() {
+            let m_ai = &remaining[i];
+            let p_ai = &remaining[i + 1];
+            require_keys_eq!(*m_ai.owner, *program_id, FlashBookError::Unauthorized);
+            require_keys_eq!(*p_ai.owner, *program_id, FlashBookError::Unauthorized);
+            let market: MarketAccount =
+                MarketAccount::try_deserialize(&mut &m_ai.try_borrow_data()?[..])?;
+            let position: state::PositionAccount =
+                state::PositionAccount::try_deserialize(&mut &p_ai.try_borrow_data()?[..])?;
+            require!(position.trader == trader_pk, FlashBookError::WrongTrader);
+            require!(position.market == m_ai.key(), FlashBookError::WrongMarket);
+            // Phase 2 single-isolated guard.
+            require!(
+                position.collateral_quote_lots == 0,
+                FlashBookError::OutOfRange
+            );
+            if position.size_lots > 0 {
+                snaps.push(RiskPosSnap {
+                    market: position.market,
+                    side: if position.side == 0 { Side::Long } else { Side::Short },
+                    size_lots: position.size_lots,
+                    entry_price: Ticks(position.entry_price_ticks),
+                    cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                    collateral_quote_lots: position.collateral_quote_lots,
+                });
+                market_snaps.push(RiskMarketSnap {
+                    market: m_ai.key(),
+                    mark_price: Ticks(market.mark_price_ticks),
+                    cum_funding_index: market.cum_funding_index,
+                    maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+                    tick_size: market.params.tick_size,
+                    concentration_threshold_lots: market.params.concentration_threshold_lots,
+                    concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                });
+                market_keys.push(m_ai.key());
+            }
+            i += 2;
+        }
+
+        // Add the target position too (will be in the isolated bucket).
+        let target_market = &ctx.accounts.target_market;
+        let target_pos = &ctx.accounts.target_position;
+        let target_market_key = target_market.key();
+        snaps.push(RiskPosSnap {
+            market: target_pos.market,
+            side: if target_pos.side == 0 { Side::Long } else { Side::Short },
+            size_lots: target_pos.size_lots,
+            entry_price: Ticks(target_pos.entry_price_ticks),
+            cum_funding_index_at_entry: target_pos.cum_funding_index_at_entry,
+            // Post-transition: target gets `amount_quote_lots` reserved as
+            // its isolated collateral. The split assessment derives the
+            // bucket assignment from `isolated_map` below, but we keep
+            // the snapshot field in sync as the source of truth.
+            collateral_quote_lots: amount_quote_lots,
+        });
+        market_snaps.push(RiskMarketSnap {
+            market: target_market_key,
+            mark_price: Ticks(target_market.mark_price_ticks),
+            cum_funding_index: target_market.cum_funding_index,
+            maintenance_margin_bps: target_market.params.maintenance_margin_ratio_bps,
+            tick_size: target_market.params.tick_size,
+            concentration_threshold_lots: target_market.params.concentration_threshold_lots,
+            concentration_extra_mmr_bps: target_market.params.concentration_extra_mmr_bps,
+        });
+        market_keys.push(target_market_key);
+
+        // Post-transfer state for the split assessment.
+        let post_cross_collateral = ctx
+            .accounts
+            .trader_state
+            .collateral_quote_lots
+            .checked_sub(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        let post_isolated_collateral = amount_quote_lots; // currently 0 + amount
+        let isolated_map: [(Pubkey, u64); 1] = [(target_market_key, post_isolated_collateral)];
+
+        let scenarios = default_scenarios_fn(&market_keys);
+        let assessment = matcher::risk::assess_margin_split(
+            &snaps,
+            &market_snaps,
+            &scenarios,
+            post_cross_collateral,
+            &isolated_map,
+        )?;
+        require!(
+            assessment.is_healthy,
+            FlashBookError::InsufficientCollateral
+        );
+
+        // Apply the transfer.
+        ctx.accounts.trader_state.collateral_quote_lots = post_cross_collateral;
+        ctx.accounts.target_position.collateral_quote_lots = post_isolated_collateral;
+
+        emit!(PositionMarginModeChangedEvent {
+            trader: trader_pk,
+            market: target_market_key,
+            new_isolated_collateral_quote_lots: post_isolated_collateral,
+            new_cross_collateral_quote_lots: post_cross_collateral,
+            mode: 1, // 0 = cross, 1 = isolated
+        });
+        Ok(())
+    }
+
+    /// Transition a position from isolated-margin back to cross-margin.
+    /// All of `position.collateral_quote_lots` is returned to the
+    /// trader's pooled `trader_state.collateral_quote_lots`. The
+    /// post-transfer cross set (now including this position) must pass
+    /// the standard assess_margin health check.
+    ///
+    /// remaining_accounts layout: same as `set_position_isolated` —
+    /// alternating (market, position) pairs for every OTHER position
+    /// the trader has a non-zero size on.
+    pub fn set_position_cross<'info>(
+        ctx: Context<'_, '_, '_, 'info, SetPositionMarginMode<'info>>,
+    ) -> Result<()> {
+        let trader_pk = ctx.accounts.trader_state.trader;
+        require!(
+            ctx.accounts.target_position.trader == trader_pk,
+            FlashBookError::WrongTrader
+        );
+        require!(
+            ctx.accounts.target_position.market == ctx.accounts.target_market.key(),
+            FlashBookError::WrongMarket
+        );
+        let returned = ctx.accounts.target_position.collateral_quote_lots;
+        require!(returned > 0, FlashBookError::OutOfRange);
+
+        let program_id = ctx.program_id;
+        let remaining = ctx.remaining_accounts;
+        require!(remaining.len() % 2 == 0, FlashBookError::OutOfRange);
+
+        let mut snaps: Vec<RiskPosSnap> = Vec::new();
+        let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
+        let mut market_keys: Vec<Pubkey> = Vec::new();
+
+        let mut i = 0usize;
+        while i + 1 < remaining.len() {
+            let m_ai = &remaining[i];
+            let p_ai = &remaining[i + 1];
+            require_keys_eq!(*m_ai.owner, *program_id, FlashBookError::Unauthorized);
+            require_keys_eq!(*p_ai.owner, *program_id, FlashBookError::Unauthorized);
+            let market: MarketAccount =
+                MarketAccount::try_deserialize(&mut &m_ai.try_borrow_data()?[..])?;
+            let position: state::PositionAccount =
+                state::PositionAccount::try_deserialize(&mut &p_ai.try_borrow_data()?[..])?;
+            require!(position.trader == trader_pk, FlashBookError::WrongTrader);
+            require!(position.market == m_ai.key(), FlashBookError::WrongMarket);
+            // Phase 2 single-isolated guard: only the target can have
+            // collateral_quote_lots > 0; siblings must be cross.
+            require!(
+                position.collateral_quote_lots == 0,
+                FlashBookError::OutOfRange
+            );
+            if position.size_lots > 0 {
+                snaps.push(RiskPosSnap {
+                    market: position.market,
+                    side: if position.side == 0 { Side::Long } else { Side::Short },
+                    size_lots: position.size_lots,
+                    entry_price: Ticks(position.entry_price_ticks),
+                    cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                    collateral_quote_lots: position.collateral_quote_lots,
+                });
+                market_snaps.push(RiskMarketSnap {
+                    market: m_ai.key(),
+                    mark_price: Ticks(market.mark_price_ticks),
+                    cum_funding_index: market.cum_funding_index,
+                    maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+                    tick_size: market.params.tick_size,
+                    concentration_threshold_lots: market.params.concentration_threshold_lots,
+                    concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                });
+                market_keys.push(m_ai.key());
+            }
+            i += 2;
+        }
+
+        // Add the target position into the cross set (post-transition).
+        let target_market = &ctx.accounts.target_market;
+        let target_pos = &ctx.accounts.target_position;
+        let target_market_key = target_market.key();
+        if target_pos.size_lots > 0 {
+            snaps.push(RiskPosSnap {
+                market: target_pos.market,
+                side: if target_pos.side == 0 { Side::Long } else { Side::Short },
+                size_lots: target_pos.size_lots,
+                entry_price: Ticks(target_pos.entry_price_ticks),
+                cum_funding_index_at_entry: target_pos.cum_funding_index_at_entry,
+                // Post-transition: target is cross-margined.
+                collateral_quote_lots: 0,
+            });
+            market_snaps.push(RiskMarketSnap {
+                market: target_market_key,
+                mark_price: Ticks(target_market.mark_price_ticks),
+                cum_funding_index: target_market.cum_funding_index,
+                maintenance_margin_bps: target_market.params.maintenance_margin_ratio_bps,
+                tick_size: target_market.params.tick_size,
+                concentration_threshold_lots: target_market.params.concentration_threshold_lots,
+                concentration_extra_mmr_bps: target_market.params.concentration_extra_mmr_bps,
+            });
+            market_keys.push(target_market_key);
+        }
+
+        let post_cross_collateral = ctx
+            .accounts
+            .trader_state
+            .collateral_quote_lots
+            .checked_add(returned)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // No isolated positions remain — straight assess_margin (cross-only).
+        let scenarios = default_scenarios_fn(&market_keys);
+        if !snaps.is_empty() {
+            let assessment = assess_margin_fn(
+                &snaps,
+                &market_snaps,
+                &scenarios,
+                post_cross_collateral,
+            )?;
+            require!(
+                assessment.is_healthy,
+                FlashBookError::InsufficientCollateral
+            );
+        }
+
+        // Apply the transfer.
+        ctx.accounts.trader_state.collateral_quote_lots = post_cross_collateral;
+        ctx.accounts.target_position.collateral_quote_lots = 0;
+
+        emit!(PositionMarginModeChangedEvent {
+            trader: trader_pk,
+            market: target_market_key,
+            new_isolated_collateral_quote_lots: 0,
+            new_cross_collateral_quote_lots: post_cross_collateral,
+            mode: 0,
         });
         Ok(())
     }
@@ -2278,17 +2574,43 @@ pub mod flash_book {
             owed_i128 as i64
         };
 
+        // ── Phase 2 isolated-margin funding routing ──────────────────────
+        // For an isolated position, funding owed/received moves between
+        // the per-position bucket and the protocol — NEVER the trader's
+        // cross pool. That insulation is the entire point of isolation:
+        // a runaway funding bill on an isolated short cannot drain the
+        // trader's other (cross) positions. For a cross position,
+        // behavior is unchanged: funding settles to/from the pooled
+        // `trader_state.collateral_quote_lots`.
+        //
+        // If the isolated bucket is exhausted by the owed-funding case,
+        // we truncate (same conservative `.min()` semantics as the
+        // cross path) — the unpaid remainder is effectively absorbed
+        // because `cum_funding_index_at_entry` advances unconditionally.
+        // The next health check will mark the position liquidatable.
+        let is_isolated = position.collateral_quote_lots > 0;
         if owed_i64 > 0 {
-            // Trader owes funding. Drain up to current collateral; never fail.
-            let pay = (owed_i64 as u64).min(trader_state.collateral_quote_lots);
-            trader_state.collateral_quote_lots -= pay;
+            let owed_u64 = owed_i64 as u64;
+            if is_isolated {
+                let pay = owed_u64.min(position.collateral_quote_lots);
+                position.collateral_quote_lots -= pay;
+            } else {
+                let pay = owed_u64.min(trader_state.collateral_quote_lots);
+                trader_state.collateral_quote_lots -= pay;
+            }
         } else if owed_i64 < 0 {
-            // Trader receives funding from the protocol.
             let recv = owed_i64.unsigned_abs();
-            trader_state.collateral_quote_lots = trader_state
-                .collateral_quote_lots
-                .checked_add(recv)
-                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            if is_isolated {
+                position.collateral_quote_lots = position
+                    .collateral_quote_lots
+                    .checked_add(recv)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            } else {
+                trader_state.collateral_quote_lots = trader_state
+                    .collateral_quote_lots
+                    .checked_add(recv)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            }
         }
 
         position.funding_paid_quote_lots = position
@@ -3560,7 +3882,7 @@ pub mod flash_book {
         if !snaps.is_empty() {
             let mkt_keys: Vec<Pubkey> = markets.iter().map(|m| m.market).collect();
             let scenarios = default_scenarios_fn(&mkt_keys);
-            let assessment = assess_margin_fn(
+            let assessment = assess_margin_unified_fn(
                 &snaps,
                 &markets,
                 &scenarios,
@@ -3693,7 +4015,7 @@ pub mod flash_book {
         }
         if !snaps.is_empty() {
             let scenarios = default_scenarios_fn(&market_keys);
-            let assessment = assess_margin_fn(
+            let assessment = assess_margin_unified_fn(
                 &snaps,
                 &market_snaps,
                 &scenarios,
@@ -4538,6 +4860,7 @@ pub mod flash_book {
                 size_lots: position.size_lots,
                 entry_price: Ticks(position.entry_price_ticks),
                 cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                collateral_quote_lots: position.collateral_quote_lots,
             });
             market_snaps.push(RiskMarketSnap {
                 market: market_ai.key(),
@@ -4555,7 +4878,7 @@ pub mod flash_book {
             (0u64, trader_state.collateral_quote_lots as i128, 0u32)
         } else {
             let scenarios = default_scenarios_fn(&market_keys);
-            let assessment = assess_margin_fn(
+            let assessment = assess_margin_unified_fn(
                 &snaps,
                 &market_snaps,
                 &scenarios,
@@ -4965,6 +5288,7 @@ pub mod flash_book {
             size_lots: position.size_lots,
             entry_price: Ticks(position.entry_price_ticks),
             cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+            collateral_quote_lots: position.collateral_quote_lots,
         };
         let market_snap = RiskMarketSnap {
             market: market.key(),
@@ -4976,7 +5300,10 @@ pub mod flash_book {
             concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
-        let assessment = assess_margin_fn(
+        // Unified dispatch: if position is isolated (pos_snap.collateral_quote_lots > 0),
+        // health is checked against the per-position bucket only; the cross
+        // pool is irrelevant. Cross positions check against trader_state pool.
+        let assessment = assess_margin_unified_fn(
             &[pos_snap],
             &[market_snap],
             &scenarios,
@@ -5162,6 +5489,10 @@ pub mod flash_book {
         }
 
         let market_key = market.key();
+        // Hoist values out of the immutable `position` borrow before
+        // the reward block, which needs a mutable borrow of the same
+        // account on the isolated-margin path.
+        let trader = position.trader;
 
         // Dutch-auction reward (parity-port from v1).
         let mut reward_paid: u64 = 0;
@@ -5192,19 +5523,42 @@ pub mod flash_book {
             } else {
                 reward_u128 as u64
             };
-            reward_paid = reward_u64.min(ctx.accounts.trader_state.collateral_quote_lots);
-            if reward_paid > 0 {
-                ctx.accounts.trader_state.collateral_quote_lots -= reward_paid;
-                let caller_ts = &mut ctx.accounts.caller_trader_state;
-                caller_ts.collateral_quote_lots = caller_ts
-                    .collateral_quote_lots
-                    .checked_add(reward_paid)
-                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+            // ── Phase 2 isolated-margin reward routing ───────────────────
+            // For an isolated position, the liquidator reward comes from
+            // the per-position bucket and NEVER the trader's cross pool.
+            // Capped at the isolated bucket's balance; shortfall is
+            // absorbed by the broader liquidation flow (the synthetic
+            // close-order + insurance fund settle the remaining loss).
+            // For a cross position, behavior is unchanged: reward debits
+            // the pooled trader_state.collateral_quote_lots.
+            let is_isolated = ctx.accounts.position.collateral_quote_lots > 0;
+            if is_isolated {
+                let pos = &mut ctx.accounts.position;
+                reward_paid = reward_u64.min(pos.collateral_quote_lots);
+                if reward_paid > 0 {
+                    pos.collateral_quote_lots -= reward_paid;
+                    let caller_ts = &mut ctx.accounts.caller_trader_state;
+                    caller_ts.collateral_quote_lots = caller_ts
+                        .collateral_quote_lots
+                        .checked_add(reward_paid)
+                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                }
+            } else {
+                reward_paid = reward_u64.min(ctx.accounts.trader_state.collateral_quote_lots);
+                if reward_paid > 0 {
+                    ctx.accounts.trader_state.collateral_quote_lots -= reward_paid;
+                    let caller_ts = &mut ctx.accounts.caller_trader_state;
+                    caller_ts.collateral_quote_lots = caller_ts
+                        .collateral_quote_lots
+                        .checked_add(reward_paid)
+                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                }
             }
         }
 
         // V2 inject — into the hypertree, with order_type = Liquidation (3).
-        let trader = position.trader;
+        // `trader` was hoisted above the reward block.
         let close_side_u8 = close_side as u8;
         let inserted_idx;
         let next_seq;
@@ -5397,6 +5751,7 @@ pub mod flash_book {
             size_lots: underwater.size_lots,
             entry_price: Ticks(underwater.entry_price_ticks),
             cum_funding_index_at_entry: underwater.cum_funding_index_at_entry,
+            collateral_quote_lots: underwater.collateral_quote_lots,
         };
         let market_snap = RiskMarketSnap {
             market: market.key(),
@@ -5408,7 +5763,7 @@ pub mod flash_book {
                 concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
-        let assessment = assess_margin_fn(
+        let assessment = assess_margin_unified_fn(
             &[pos_snap],
             &[market_snap],
             &scenarios,
@@ -5607,6 +5962,7 @@ pub mod flash_book {
             size_lots: exec_position.size_lots,
             entry_price: Ticks(exec_position.entry_price_ticks),
             cum_funding_index_at_entry: exec_position.cum_funding_index_at_entry,
+            collateral_quote_lots: exec_position.collateral_quote_lots,
         });
 
         let remaining = ctx.remaining_accounts;
@@ -5650,6 +6006,7 @@ pub mod flash_book {
                     size_lots: position.size_lots,
                     entry_price: Ticks(position.entry_price_ticks),
                     cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                    collateral_quote_lots: position.collateral_quote_lots,
                 });
             }
             i += 2;
@@ -5657,7 +6014,7 @@ pub mod flash_book {
 
         let market_keys: Vec<Pubkey> = market_snaps.iter().map(|m| m.market).collect();
         let scenarios = default_scenarios_fn(&market_keys);
-        let assessment = assess_margin_fn(
+        let assessment = assess_margin_unified_fn(
             &position_snaps,
             &market_snaps,
             &scenarios,
@@ -8578,6 +8935,41 @@ pub struct PartialWithdrawCollateral<'info> {
     // handler to compute total notional + IM required for the floor check.
 }
 
+/// Shared Accounts context for `set_position_isolated` and
+/// `set_position_cross`. Both ixs transfer collateral between the
+/// trader's pooled `TraderStateAccount.collateral_quote_lots` and the
+/// target position's `PositionAccount.collateral_quote_lots`, gated by
+/// a post-transfer health check on every other position the trader
+/// owns (passed via remaining_accounts).
+#[derive(Accounts)]
+pub struct SetPositionMarginMode<'info> {
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: Account<'info, TraderStateAccount>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, target_market.base_mint.as_ref(), target_market.quote_mint.as_ref()],
+        bump = target_market.bump,
+    )]
+    pub target_market: Account<'info, MarketAccount>,
+
+    #[account(
+        mut,
+        seeds = [state::PositionAccount::SEED, target_market.key().as_ref(), trader.key().as_ref()],
+        bump = target_position.bump,
+    )]
+    pub target_position: Account<'info, state::PositionAccount>,
+    // remaining_accounts: alternating (market, position) pairs for OTHER
+    // open positions the trader holds (NOT the target). Each pair is
+    // validated by the handler — owner==program_id, trader matches, etc.
+}
+
 #[derive(Accounts)]
 pub struct SettleFunding<'info> {
     /// Permissionless — any signer can settle funding for any position.
@@ -9341,6 +9733,18 @@ pub struct SubAccountTransferEvent {
     pub sub_balance_after: u64,
 }
 
+/// Emitted by `set_position_isolated` and `set_position_cross`.
+/// `mode`: 0 = cross, 1 = isolated. The two collateral fields show the
+/// post-transition state for the trader's pooled vs per-position pools.
+#[event]
+pub struct PositionMarginModeChangedEvent {
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub new_isolated_collateral_quote_lots: u64,
+    pub new_cross_collateral_quote_lots: u64,
+    pub mode: u8,
+}
+
 /// Emitted by `cancel_all_v2`. `cancelled_count` is 0 when the trader had
 /// no resting orders (the ix is silently a no-op in that case — useful as
 /// defensive cleanup from a bot). Bounded by `MAX_CANCELS_PER_IX_V2`.
@@ -10064,6 +10468,7 @@ fn project_post_leg(
             size_lots: leg.size_lots,
             entry_price: Ticks(leg.limit_ticks),
             cum_funding_index_at_entry: market.cum_funding_index,
+            collateral_quote_lots: position.collateral_quote_lots,
         }));
     }
     require!(
@@ -10103,6 +10508,7 @@ fn project_post_leg(
         size_lots: projected_size,
         entry_price: Ticks(position.entry_price_ticks),
         cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+        collateral_quote_lots: position.collateral_quote_lots,
     }))
 }
 
