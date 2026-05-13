@@ -99,11 +99,6 @@ features:
 - **No commit-reveal on-chain.** Same story — TS-only.
 - **No mainnet deployment.** Devnet only.
 - **No independent security audit.**
-- **Realized PnL doesn't materialise to collateral on close.** Closing a
-  winning position increments `pos.realized_pnl_quote_lots` but the
-  trader can't actually access the profit through the current ix set.
-  Documented as a known gap in `docs/MARGIN_MATH.md §8.1`. A future
-  `settle_realized_pnl` ix is the planned fix.
 - **No HLP-style dedicated backstop vault.** The FLP is an LP pool, not
   a liquidator vault. The JIT-liquidation auction is the closest analogue
   but is opportunistic, not always-on.

@@ -3215,16 +3215,69 @@ pub mod flash_book {
             maker_pos.last_settlement_batch = current_batch;
         }
 
-        // Snapshot pre-state so we can detect open/close transitions.
+        // Snapshot pre-state so we can detect open/close transitions
+        // AND compute the realized-PnL delta this fill produced. The
+        // delta is what `apply_fill_to_position` accumulates onto
+        // `pos.realized_pnl_quote_lots` for the closed-portion legs.
         let taker_was_open = taker_pos.size_lots > 0;
         let maker_was_open = maker_pos.size_lots > 0;
         let taker_pre_side = taker_pos.side;
         let maker_pre_side = maker_pos.side;
         let taker_pre_size = taker_pos.size_lots;
         let maker_pre_size = maker_pos.size_lots;
+        let taker_pre_realized = taker_pos.realized_pnl_quote_lots;
+        let maker_pre_realized = maker_pos.realized_pnl_quote_lots;
+        let taker_pos_isolated_for_pnl = taker_pos.collateral_quote_lots > 0;
+        let maker_pos_isolated_for_pnl = maker_pos.collateral_quote_lots > 0;
 
         apply_fill_to_position(taker_pos, taker_side_enum, size_lots, price_ticks, funding_index)?;
         apply_fill_to_position(maker_pos, maker_side_enum, size_lots, price_ticks, funding_index)?;
+
+        // ── Phase 2g realized-PnL materialisation ───────────────────
+        // `apply_fill_to_position` writes the realized-PnL delta into
+        // `pos.realized_pnl_quote_lots` on the closing leg(s) but does
+        // NOT touch any collateral bucket. That left realized PnL as
+        // an informational tally — a trader closing a winning position
+        // could see realized_pnl rise but had no way to access the
+        // profit through any subsequent ix.
+        //
+        // We close that loop here: subtract pre from post on each side
+        // to get the delta this fill produced, then debit/credit the
+        // appropriate collateral bucket. Bucket selection follows the
+        // same rule as fee routing above (isolated_for_pnl flag
+        // sampled BEFORE the apply_fill_to_position mutation):
+        //   isolated → position.collateral_quote_lots
+        //   cross    → trader_state.collateral_quote_lots
+        //
+        // Losses on an isolated bucket truncate at 0 (same conservative
+        // semantics as settle_funding) — the shortfall will trip the
+        // next health check and the position becomes liquidatable. The
+        // cross path uses checked_sub and surfaces an error rather
+        // than silently going negative.
+        let taker_pnl_delta = (taker_pos.realized_pnl_quote_lots as i128)
+            .saturating_sub(taker_pre_realized as i128);
+        let maker_pnl_delta = (maker_pos.realized_pnl_quote_lots as i128)
+            .saturating_sub(maker_pre_realized as i128);
+
+        if taker_pnl_delta != 0 {
+            apply_realized_pnl_delta(
+                taker_pnl_delta,
+                taker_pos_isolated_for_pnl,
+                &mut ctx.accounts.taker_position,
+                &mut ctx.accounts.taker_trader_state,
+            )?;
+        }
+        if maker_pnl_delta != 0 {
+            apply_realized_pnl_delta(
+                maker_pnl_delta,
+                maker_pos_isolated_for_pnl,
+                &mut ctx.accounts.maker_position,
+                &mut ctx.accounts.maker_trader_state,
+            )?;
+        }
+
+        let taker_pos = &mut ctx.accounts.taker_position;
+        let maker_pos = &mut ctx.accounts.maker_position;
 
         // Update OI counters: walk pre→post for each side.
         update_oi(market, taker_pre_side, taker_pre_size, taker_pos.side, taker_pos.size_lots)?;
@@ -5238,8 +5291,30 @@ pub mod flash_book {
         let taker_was_open = taker_pos.size_lots > 0;
         let taker_pre_side = taker_pos.side;
         let taker_pre_size = taker_pos.size_lots;
+        let taker_pre_realized = taker_pos.realized_pnl_quote_lots;
+        let taker_pos_isolated_for_pnl = taker_pos.collateral_quote_lots > 0;
 
         apply_fill_to_position(taker_pos, taker_side_enum, size_lots, price_ticks, funding_index)?;
+
+        // Phase 2g — materialise realized-PnL delta on the FLP fill
+        // path. Same routing rule as `apply_fill`: isolated → per-
+        // position bucket; cross → trader_state. The FLP side itself
+        // tracks PnL on its FlpMarketExposure entry (`apply_fill_to_flp_market`
+        // below) and the LP-share NAV walks that to compute LP value;
+        // it doesn't accumulate on `pos.realized_pnl_quote_lots` so
+        // there's nothing to settle on the FLP maker side.
+        let taker_pnl_delta = (taker_pos.realized_pnl_quote_lots as i128)
+            .saturating_sub(taker_pre_realized as i128);
+        if taker_pnl_delta != 0 {
+            apply_realized_pnl_delta(
+                taker_pnl_delta,
+                taker_pos_isolated_for_pnl,
+                &mut ctx.accounts.taker_position,
+                &mut ctx.accounts.taker_trader_state,
+            )?;
+        }
+
+        let taker_pos = &mut ctx.accounts.taker_position;
 
         update_oi(market, taker_pre_side, taker_pre_size, taker_pos.side, taker_pos.size_lots)?;
 
@@ -11346,6 +11421,204 @@ fn clamp_i128_to_i64(v: i128) -> i64 {
     if v > i64::MAX as i128 { i64::MAX }
     else if v < i64::MIN as i128 { i64::MIN }
     else { v as i64 }
+}
+
+/// Phase 2g — materialise a realized-PnL delta into the trader's
+/// collateral. Closes the gap documented in `docs/MARGIN_MATH.md §8.1`:
+/// `apply_fill_to_position` accumulates realized PnL on
+/// `pos.realized_pnl_quote_lots` (informational), and this helper
+/// converts it into actual spendable collateral so a trader closing a
+/// winning position can withdraw the profit and a trader closing a
+/// losing position has their collateral debited.
+///
+/// Bucket routing matches the fee-routing rule in `apply_fill`:
+///
+///   isolated (position.collateral_quote_lots > 0)
+///     → mutate position.collateral_quote_lots
+///   cross
+///     → mutate trader_state.collateral_quote_lots
+///
+/// Loss truncation:
+///
+///   * Isolated path: saturating_sub on the per-position bucket. If the
+///     loss exceeds the isolated collateral the bucket goes to 0 and
+///     the position becomes liquidatable on the next health check —
+///     same conservative semantics as `settle_funding`.
+///   * Cross path: checked_sub. A loss that exceeds
+///     `trader_state.collateral_quote_lots` would put the trader's
+///     pooled collateral negative, which is impossible; we return
+///     `InsufficientCollateral` so the fill aborts. In practice the
+///     pre-fill margin check should already have caught this — but
+///     defense in depth: never let collateral go negative on the cross
+///     path.
+///
+/// `delta` is signed: positive = trader gained (credit), negative =
+/// trader lost (debit).
+fn apply_realized_pnl_delta<'info>(
+    delta: i128,
+    isolated: bool,
+    position: &mut Account<'info, state::PositionAccount>,
+    trader_state: &mut Box<Account<'info, TraderStateAccount>>,
+) -> Result<()> {
+    let (new_iso, new_cross) = compute_realized_pnl_routing(
+        delta,
+        isolated,
+        position.collateral_quote_lots,
+        trader_state.collateral_quote_lots,
+    )?;
+    position.collateral_quote_lots = new_iso;
+    trader_state.collateral_quote_lots = new_cross;
+    Ok(())
+}
+
+/// Pure math for the realized-PnL routing. Returns
+/// `(new_position_collateral, new_trader_state_collateral)`. Separated
+/// from `apply_realized_pnl_delta` so the routing rules are unit
+/// testable without Anchor-account scaffolding.
+///
+/// Rules (matching `apply_realized_pnl_delta`'s contract):
+///
+/// * `delta > 0` (gain) — credit the isolated bucket if isolated,
+///   else the cross pool. `checked_add` overflows → ArithmeticOverflow.
+/// * `delta < 0` (loss) — debit the isolated bucket if isolated, else
+///   the cross pool. Isolated bucket saturates to 0 (loss-truncation,
+///   same semantics as `settle_funding`). Cross pool uses
+///   `checked_sub` and surfaces `InsufficientCollateral` rather than
+///   going negative.
+/// * `delta == 0` — no-op.
+fn compute_realized_pnl_routing(
+    delta: i128,
+    isolated: bool,
+    iso_collateral: u64,
+    cross_collateral: u64,
+) -> Result<(u64, u64)> {
+    if delta > 0 {
+        let credit_u64 = if delta > u64::MAX as i128 {
+            u64::MAX
+        } else {
+            delta as u64
+        };
+        if isolated {
+            let new_iso = iso_collateral
+                .checked_add(credit_u64)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            Ok((new_iso, cross_collateral))
+        } else {
+            let new_cross = cross_collateral
+                .checked_add(credit_u64)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            Ok((iso_collateral, new_cross))
+        }
+    } else if delta < 0 {
+        let debit_u64 = if delta < -(u64::MAX as i128) {
+            u64::MAX
+        } else {
+            (-delta) as u64
+        };
+        if isolated {
+            // Loss-truncation: saturate to 0; remainder surfaces via
+            // the next health check.
+            Ok((iso_collateral.saturating_sub(debit_u64), cross_collateral))
+        } else {
+            let new_cross = cross_collateral
+                .checked_sub(debit_u64)
+                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+            Ok((iso_collateral, new_cross))
+        }
+    } else {
+        Ok((iso_collateral, cross_collateral))
+    }
+}
+
+#[cfg(test)]
+mod realized_pnl_routing_tests {
+    use super::*;
+
+    #[test]
+    fn zero_delta_is_no_op() {
+        // Cross
+        let (iso, cross) = compute_realized_pnl_routing(0, false, 100, 5_000).unwrap();
+        assert_eq!(iso, 100);
+        assert_eq!(cross, 5_000);
+        // Isolated
+        let (iso, cross) = compute_realized_pnl_routing(0, true, 100, 5_000).unwrap();
+        assert_eq!(iso, 100);
+        assert_eq!(cross, 5_000);
+    }
+
+    #[test]
+    fn gain_credits_isolated_bucket_when_isolated() {
+        let (iso, cross) = compute_realized_pnl_routing(250, true, 1_000, 5_000).unwrap();
+        assert_eq!(iso, 1_250, "isolated bucket should receive the credit");
+        assert_eq!(cross, 5_000, "cross pool untouched on isolated path");
+    }
+
+    #[test]
+    fn gain_credits_cross_pool_when_not_isolated() {
+        let (iso, cross) = compute_realized_pnl_routing(250, false, 1_000, 5_000).unwrap();
+        assert_eq!(iso, 1_000, "isolated bucket untouched on cross path");
+        assert_eq!(cross, 5_250, "cross pool should receive the credit");
+    }
+
+    #[test]
+    fn loss_debits_isolated_bucket_when_isolated() {
+        let (iso, cross) = compute_realized_pnl_routing(-250, true, 1_000, 5_000).unwrap();
+        assert_eq!(iso, 750);
+        assert_eq!(cross, 5_000);
+    }
+
+    #[test]
+    fn loss_truncates_at_zero_on_isolated_path() {
+        // Loss larger than isolated balance — saturates to 0, NEVER goes
+        // negative and NEVER bleeds into the cross pool. The unpaid
+        // remainder is absorbed; the next health check will trip.
+        let (iso, cross) = compute_realized_pnl_routing(-2_000, true, 1_000, 5_000).unwrap();
+        assert_eq!(iso, 0);
+        assert_eq!(cross, 5_000, "cross pool MUST NOT be touched on isolated loss");
+    }
+
+    #[test]
+    fn loss_debits_cross_pool_when_not_isolated() {
+        let (iso, cross) = compute_realized_pnl_routing(-250, false, 1_000, 5_000).unwrap();
+        assert_eq!(iso, 1_000);
+        assert_eq!(cross, 4_750);
+    }
+
+    #[test]
+    fn loss_exceeding_cross_pool_returns_insufficient_collateral() {
+        let result = compute_realized_pnl_routing(-6_000, false, 1_000, 5_000);
+        assert!(result.is_err(), "loss > cross pool must error, not go negative");
+    }
+
+    #[test]
+    fn gain_overflowing_isolated_bucket_returns_overflow() {
+        let result = compute_realized_pnl_routing(10, true, u64::MAX, 5_000);
+        assert!(result.is_err(), "overflow on the isolated bucket must error");
+    }
+
+    #[test]
+    fn gain_overflowing_cross_pool_returns_overflow() {
+        let result = compute_realized_pnl_routing(10, false, 1_000, u64::MAX);
+        assert!(result.is_err(), "overflow on the cross pool must error");
+    }
+
+    #[test]
+    fn extreme_positive_delta_clamps_to_u64_max_credit() {
+        let huge = (u64::MAX as i128) + 1;
+        // Credit clamped to u64::MAX. From cross_collateral=0 this means
+        // post-credit equals u64::MAX exactly (no overflow).
+        let (_iso, cross) = compute_realized_pnl_routing(huge, false, 0, 0).unwrap();
+        assert_eq!(cross, u64::MAX);
+    }
+
+    #[test]
+    fn extreme_negative_delta_clamps_to_u64_max_debit() {
+        let huge_neg = -((u64::MAX as i128) + 1);
+        // Debit clamped to u64::MAX on the cross path; with cross_collateral
+        // = u64::MAX we land at 0 exactly.
+        let (_iso, cross) = compute_realized_pnl_routing(huge_neg, false, 0, u64::MAX).unwrap();
+        assert_eq!(cross, 0);
+    }
 }
 
 

@@ -289,30 +289,7 @@ normal operation.
 
 These are not in earlier marketing docs but are real:
 
-### 1. Realized PnL doesn't materialise on close
-
-`apply_fill_to_position` (lines 11035-11115) updates
-`pos.realized_pnl_quote_lots` on close. No code path drains it into
-`trader_state.collateral_quote_lots` or `pos.collateral_quote_lots` on
-the normal fill path. The only code path that materialises realized
-PnL into a collateral bucket is `auto_deleverage`, which writes
-directly to `trader_state.collateral_quote_lots`.
-
-Consequence: closing a profitable position via the normal fill path
-does NOT credit the trader's spendable collateral. The trader sees
-`realized_pnl_quote_lots` rise on the position, but
-`trader_state.collateral_quote_lots` is unchanged, and `withdraw_collateral`
-guards stress against `trader_state.collateral_quote_lots` alone.
-
-This is a **real bug**, documented in `docs/MARGIN_MATH.md §8.1`. The
-fix is a focused commit: either a `settle_realized_pnl(P)` ix that
-drains `pos.realized_pnl_quote_lots` into the correct bucket, or
-folding the materialisation directly into `apply_fill_to_position`
-(which requires passing trader_state into every call site).
-
-Hyperliquid, dYdX, and Drift all materialise PnL on close.
-
-### 2. No HLP-equivalent backstop vault
+### 1. No HLP-equivalent backstop vault
 
 The FLP pool participates in its own orderbook as a maker (per the
 virtual FLP quoter design), but it isn't a dedicated liquidator vault
@@ -325,7 +302,7 @@ close at `oracle ± liq_penalty_bps`. The insurance fund covers
 shortfall after that. HLP's design is more reliable in tail events
 because it's always capitalised.
 
-### 3. Sub-account fill routing trusts the off-chain sequencer
+### 2. Sub-account fill routing trusts the off-chain sequencer
 
 Phase 2d relaxed the `seeds = [...]` constraint on `taker_trader_state`
 and `maker_trader_state` in `ApplyFill`. The off-chain sequencer chooses
@@ -343,7 +320,7 @@ For an honest sequencer this is fine. For a hostile sequencer it's a
 1-byte routing attack surface. A future commit can close this by
 adding the PDA-derivation check to the ApplyFill handler.
 
-### 4. No proven mainnet record
+### 3. No proven mainnet record
 
 Hyperliquid has billions in OI and years of real-world liquidation
 events. Flash Book has 186 unit + proptest assertions and 34
@@ -351,7 +328,7 @@ on-chain integration tests on devnet. Math being correct in isolation
 is not the same as math being correct under adversarial economic
 conditions with real money.
 
-### 5. No on-chain FBA / Walrasian clearing
+### 4. No on-chain FBA / Walrasian clearing
 
 The TypeScript reference simulator in `src/` implements FBA with
 Walrasian uniform-price clearing. The on-chain Anchor program does NOT.
@@ -371,7 +348,7 @@ Implementing actual on-chain FBA would require:
 That's a substantial refactor of `place_limit_order_v2` /
 `place_taker_order_v2` and is not planned for this branch.
 
-### 6. No on-chain commit-reveal
+### 5. No on-chain commit-reveal
 
 Same story. The TS simulator has `commit-reveal.ts`. The Anchor program
 has no commit / reveal accounts or state. `grep -rn

@@ -339,31 +339,89 @@ Implementation: lines 2577–2615.
 
 ## 8. Known gaps (Phase 2b targets)
 
-### 8.1 Realized PnL materialisation
+### 8.1 Realized PnL materialisation — RESOLVED (Phase 2g)
 
-`apply_fill_to_position` (lines 11035–11115) updates
-`pos.realized_pnl_quote_lots` on close. It never reads from or writes
-to `trader_state.collateral_quote_lots` or `pos.collateral_quote_lots`.
+**Status: fixed.** The post-Phase-2g `apply_fill` and `apply_flp_fill`
+handlers now materialise the realized-PnL delta into the right
+collateral bucket on every fill, closing the gap this section
+previously documented.
 
-The only path that materialises realized PnL into a collateral bucket
-is `auto_deleverage` (lines 5839–5854), and it materialises into
-`trader_state.collateral_quote_lots` directly (separate from any
-isolation).
+#### Mechanism
 
-**Consequence:** closing a profitable position via the normal fill
-path does NOT credit the trader's spendable collateral. The trader
-sees `realized_pnl_quote_lots` rise on the position, but
-`trader_state.collateral_quote_lots` is unchanged. They cannot
-`withdraw_collateral` against the realized gain because the withdraw
-guards stress against `trader_state.collateral_quote_lots` alone.
+`apply_fill_to_position` (the pure-math helper at lib.rs:11314+) still
+accumulates the realized-PnL delta onto `pos.realized_pnl_quote_lots`
+as it did before — that field remains the per-position lifetime
+realized-PnL tally for indexers.
 
-This is a **pre-existing** protocol gap, NOT a Phase 2 regression.
-Resolving it is a focused commit: define a `settle_realized_pnl(P_m)`
-ix that drains `pos.realized_pnl_quote_lots` into the correct bucket
-(`c_m` if isolated, else `C_T`), then zero the position field.
-Alternative: fold the materialisation directly into
-`apply_fill_to_position`, but that requires passing the trader_state
-account into every call site.
+The new piece is at the `apply_fill` and `apply_flp_fill` call sites
+(lib.rs around line 3226 and 5295). Each handler now:
+
+1. Snapshots `pos.realized_pnl_quote_lots` and
+   `pos.collateral_quote_lots > 0` BEFORE the
+   `apply_fill_to_position` call.
+2. Reads the post-state and computes
+   `delta = post_realized − pre_realized`.
+3. Routes the delta to the correct bucket via
+   `apply_realized_pnl_delta(delta, isolated, &mut position, &mut trader_state)`.
+
+#### Routing rule (`compute_realized_pnl_routing`)
+
+```
+gain (delta > 0):
+    isolated → position.collateral_quote_lots += delta   (checked_add)
+    cross    → trader_state.collateral_quote_lots += delta (checked_add)
+    Overflow → ArithmeticOverflow
+
+loss (delta < 0):
+    isolated → position.collateral_quote_lots = saturating_sub
+               (the unpaid remainder is absorbed; the next health
+                check will trip)
+    cross    → trader_state.collateral_quote_lots -= |delta|
+               (checked_sub; surfaces InsufficientCollateral rather
+                than going negative)
+```
+
+The pure-math helper `compute_realized_pnl_routing(delta, isolated,
+iso_collateral, cross_collateral)` returns `(new_iso, new_cross)` and
+is covered by 11 unit tests in `mod realized_pnl_routing_tests`.
+
+#### Why isolated losses saturate (same as `settle_funding`)
+
+If a loss exceeds the per-position isolated bucket, we deliberately
+saturate at 0 rather than bleed into the cross pool. The unpaid
+shortfall is recovered through the standard liquidation flow:
+`liquidate_position_v2` reads `position.collateral_quote_lots` (now
+0), the stress lattice marks the position unhealthy, and the
+synthetic close + insurance fund + ADL waterfall absorbs the
+remainder. This keeps the I-3 "cross-pool insulation" invariant (§9)
+intact even in the loss-realisation path — an isolated position's
+losses cannot bleed back into the trader's cross collateral via the
+fill path.
+
+#### Why cross losses error instead of saturating
+
+The cross-collateral path uses `checked_sub`. In principle the
+pre-fill margin check at `place_limit_order_v2` /
+`place_taker_order_v2` should have prevented the trader from taking a
+fill they couldn't afford. If we ever reach a cross loss > pooled
+collateral here, something else has gone wrong (a stale-mark
+exploit, a bug in the margin gate); failing the fill is safer than
+silently going negative or letting the protocol absorb the
+shortfall.
+
+#### What still doesn't materialise
+
+The FLP-pool side of `apply_flp_fill` doesn't accumulate on
+`pos.realized_pnl_quote_lots` (the FLP's PnL flows through the
+`FlpMarketExposure` per-market entry and is captured in NAV walks);
+no settlement is needed there.
+
+`auto_deleverage` still writes the bankruptcy-price loss directly to
+`underwater_trader_state.collateral_quote_lots` (lib.rs:5839+). For
+isolated underwater positions this currently bypasses the
+per-position bucket — the same gap MARGIN_MATH §8.3 describes for
+ADL. Phase 2g fixed the normal-fill path; ADL routing for isolated
+positions remains §8.3 follow-up work.
 
 ### 8.2 `apply_fill` fee routing
 
@@ -417,11 +475,12 @@ Tests covering these invariants:
 
 ## 10. Versioning
 
-This document tracks the on-chain risk model as of commit `550624e`
-("feat: isolated-margin Phase 2 — split risk + per-bucket reward/
-funding routing"). Future invariant changes — particularly resolving
-§8 gaps — should update the corresponding numbered sections and the
-invariant table in §9.
+This document tracks the on-chain risk model as of the Phase 2 series
+(commits `550624e` through `495386a`) plus Phase 2g (realized-PnL
+materialisation; this document version). Future invariant changes —
+particularly resolving the remaining §8.2 and §8.3 gaps — should
+update the corresponding numbered sections and the invariant table
+in §9.
 
 ## 11. Phase 2c — Position PDA migration
 

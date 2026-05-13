@@ -54,8 +54,6 @@ We aim to acknowledge within 72 hours.
 These are tracked in code comments and `docs/`. Reporting them is
 welcome but they are not new findings:
 
-- **Realized PnL doesn't materialise to collateral on the normal fill
-  close path.** Documented in `docs/MARGIN_MATH.md §8.1`.
 - **Sub-account fill routing trusts the off-chain sequencer.** Phase 2d
   relaxed `taker_trader_state` / `maker_trader_state` seeds; the
   handler verifies `trader_state.trader == order.trader` but not
