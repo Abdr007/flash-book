@@ -3691,6 +3691,40 @@
       "args": []
     },
     {
+      "name": "open_trader_sub_account",
+      "discriminator": [
+        158,
+        58,
+        240,
+        58,
+        244,
+        53,
+        154,
+        177
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "trader_sub_account",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "sub_index",
+          "type": "u8"
+        }
+      ]
+    },
+    {
       "name": "partial_withdraw_collateral",
       "discriminator": [
         220,
@@ -5923,6 +5957,68 @@
       ]
     },
     {
+      "name": "transfer_main_to_sub",
+      "discriminator": [
+        65,
+        193,
+        66,
+        31,
+        55,
+        163,
+        131,
+        152
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "main_trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "sub_trader_state",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "sub_index",
+          "type": "u8"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "transfer_market_authority",
       "discriminator": [
         178,
@@ -5973,6 +6069,68 @@
         {
           "name": "new_authority",
           "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "transfer_sub_to_main",
+      "discriminator": [
+        165,
+        251,
+        172,
+        96,
+        248,
+        125,
+        205,
+        57
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "main_trader_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "sub_trader_state",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "sub_index",
+          "type": "u8"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
         }
       ]
     },
@@ -9134,6 +9292,32 @@
         224,
         41,
         32
+      ]
+    },
+    {
+      "name": "SubAccountOpenedEvent",
+      "discriminator": [
+        200,
+        198,
+        228,
+        241,
+        200,
+        28,
+        89,
+        46
+      ]
+    },
+    {
+      "name": "SubAccountTransferEvent",
+      "discriminator": [
+        97,
+        70,
+        163,
+        213,
+        122,
+        172,
+        223,
+        216
       ]
     },
     {
@@ -12794,6 +12978,58 @@
           },
           {
             "name": "amount_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SubAccountOpenedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "sub_index",
+            "type": "u8"
+          },
+          {
+            "name": "sub_account",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SubAccountTransferEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "sub_index",
+            "type": "u8"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "direction",
+            "type": "u8"
+          },
+          {
+            "name": "main_balance_after",
+            "type": "u64"
+          },
+          {
+            "name": "sub_balance_after",
             "type": "u64"
           }
         ]

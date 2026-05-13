@@ -33,6 +33,7 @@ import {
   marketPda,
   positionPda,
   traderStatePda,
+  traderSubAccountPda,
   triggerOrderPda,
   triggerOrderV3Pda,
   twapOrderPda,
@@ -596,6 +597,68 @@ export class FlashBookClient {
         trader,
         traderState: state.address,
         systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Open a sub-account for the trader at `subIndex` in 1..=255.
+  /// sub_index = 0 is reserved for the legacy main account (use
+  /// `openTraderStateIx`). The sub-account is a separate TraderState
+  /// PDA — for Phase 1 it can only hold collateral (transferred via
+  /// `transferMainToSubIx` / `transferSubToMainIx`). Phase 2 will
+  /// enable trading directly from sub-accounts.
+  openTraderSubAccountIx(args: {
+    trader: PublicKey;
+    subIndex: number;
+  }): Promise<TransactionInstruction> {
+    const sub = traderSubAccountPda(args.trader, args.subIndex, this.programId);
+    return this.methods
+      .openTraderSubAccount(args.subIndex)
+      .accountsPartial({
+        trader: args.trader,
+        traderSubAccount: sub.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /// Move `amount` quote-lots from the trader's main TraderState to
+  /// their sub-account at `subIndex`. Refuses if the main account has
+  /// open positions (Phase 1 conservatism — Phase 2 lifts this once
+  /// assess_margin is aware of sub-account collateral).
+  transferMainToSubIx(args: {
+    trader: PublicKey;
+    subIndex: number;
+    amount: bigint | number | BN;
+  }): Promise<TransactionInstruction> {
+    const main = this.traderState(args.trader);
+    const sub = traderSubAccountPda(args.trader, args.subIndex, this.programId);
+    return this.methods
+      .transferMainToSub(args.subIndex, args.amount)
+      .accountsPartial({
+        trader: args.trader,
+        mainTraderState: main.address,
+        subTraderState: sub.address,
+      })
+      .instruction();
+  }
+
+  /// Mirror of `transferMainToSubIx` — moves collateral from the
+  /// sub-account back to main. Refuses if the sub has open positions
+  /// (won't be possible until Phase 2, but included for symmetry).
+  transferSubToMainIx(args: {
+    trader: PublicKey;
+    subIndex: number;
+    amount: bigint | number | BN;
+  }): Promise<TransactionInstruction> {
+    const main = this.traderState(args.trader);
+    const sub = traderSubAccountPda(args.trader, args.subIndex, this.programId);
+    return this.methods
+      .transferSubToMain(args.subIndex, args.amount)
+      .accountsPartial({
+        trader: args.trader,
+        mainTraderState: main.address,
+        subTraderState: sub.address,
       })
       .instruction();
   }

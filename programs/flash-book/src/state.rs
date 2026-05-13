@@ -434,6 +434,44 @@ impl FeeTiersAccount {
     }
 }
 
+/// Per-(market, trader) open position.
+///
+/// ─── ISOLATED MARGIN DESIGN (Phase 2) ────────────────────────────────
+/// `collateral_quote_lots` is currently a defined-but-unused field. It
+/// is reserved as the on-chain marker for isolated-margin positions:
+///
+///   collateral_quote_lots == 0  → cross margin (default, current
+///                                 behavior). Position is backed by the
+///                                 trader's pooled `TraderStateAccount
+///                                 .collateral_quote_lots`.
+///
+///   collateral_quote_lots  > 0  → isolated margin. The position is
+///                                 backed ONLY by this amount; the
+///                                 trader's pooled collateral is
+///                                 insulated from this position's
+///                                 liquidation.
+///
+/// Phase 2 (separate, audited commit) wires the marker through:
+///
+///   1. `assess_margin_fn` (matcher/risk.rs) — splits the trader's
+///      position set into cross and isolated, evaluates each isolated
+///      position against its own collateral, and only includes cross
+///      positions in the pooled-collateral assessment.
+///   2. `liquidate_position_v2` — when liquidating an isolated
+///      position, the penalty + liquidator reward come out of
+///      `position.collateral_quote_lots` first, then the insurance
+///      fund covers any shortfall (the trader's main pool is never
+///      touched — that's the whole point of isolated).
+///   3. New ixs `set_position_isolated(amount)` and
+///      `set_position_cross()` that transfer collateral between
+///      `TraderState.collateral_quote_lots` and
+///      `PositionAccount.collateral_quote_lots`, gated by a
+///      post-transfer health check on BOTH the cross set and the
+///      isolated position.
+///
+/// Until Phase 2 lands, no on-chain logic writes to or reads from
+/// this field. Off-chain code may rely on this field staying 0 for
+/// every existing position.
 #[account]
 #[derive(Debug)]
 pub struct PositionAccount {

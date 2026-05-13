@@ -1411,6 +1411,152 @@ pub mod flash_book {
         Ok(())
     }
 
+    // ─── Sub-accounts (Phase 1 scaffolding) ───────────────────────────
+    //
+    // DESIGN: a wallet's MAIN trader_state lives at the existing PDA
+    //   [TraderStateAccount::SEED, trader.key().as_ref()]
+    // and sub-accounts (sub_index in 1..=255) live at the extended PDA
+    //   [TraderStateAccount::SEED, trader.key().as_ref(), &[sub_index]].
+    // sub_index = 0 is reserved as a synonym for the main account so
+    // off-chain code can treat sub_index as a single dimension.
+    //
+    // Phase 1 (this commit) provides only:
+    //   * `open_trader_sub_account(sub_index)`     — create the sub PDA
+    //   * `transfer_main_to_sub(sub_index, amount)` — move collateral in
+    //   * `transfer_sub_to_main(sub_index, amount)` — move collateral out
+    // The sub-account is a collateral parking spot — it cannot YET be
+    // used as a trading account (place_*/cancel_*/liquidate_* still
+    // require the main PDA via their `seeds = [...]` constraint).
+    //
+    // Phase 2 (separate session, audited diff) will relax the existing
+    // Accounts structs so any of the trader's PDAs (main or sub) can
+    // sign for trading, and route PositionAccount PDAs by sub_index.
+    // The Phase 2 work is intentionally separated because relaxing
+    // seeds-validation in favor of handler-side checks is a security-
+    // critical pattern that wants a focused review.
+    //
+    // The sub-account's `delegate` field works independently from the
+    // main account's — different hot keys can drive different sub-
+    // accounts. `referrer` and `builder` are also per-sub-account.
+    pub fn open_trader_sub_account(
+        ctx: Context<OpenTraderSubAccount>,
+        sub_index: u8,
+    ) -> Result<()> {
+        // sub_index 0 is reserved for the main account (which uses the
+        // legacy PDA seeds and `open_trader_state`).
+        require!(sub_index >= 1, FlashBookError::OutOfRange);
+        let s = &mut ctx.accounts.trader_sub_account;
+        s.trader = ctx.accounts.trader.key();
+        s.bump = ctx.bumps.trader_sub_account;
+        s.collateral_quote_lots = 0;
+        s.realized_pnl_quote_lots = 0;
+        s.open_positions = 0;
+        s.toxicity_score_bps = 0;
+        s.orders_this_batch = 0;
+        s.last_batch_seen = 0;
+        s.fee_discount_bps = 0;
+        s.delegate = Pubkey::default();
+        s.referrer = Pubkey::default();
+        s.builder = Pubkey::default();
+        s.builder_max_fee_share_bps = 0;
+        s.volume_30d_quote_lots = 0;
+        s.volume_window_start_slot = Clock::get()?.slot;
+        emit!(SubAccountOpenedEvent {
+            trader: ctx.accounts.trader.key(),
+            sub_index,
+            sub_account: ctx.accounts.trader_sub_account.key(),
+        });
+        Ok(())
+    }
+
+    /// Move `amount` quote-lots from the trader's MAIN trader_state into
+    /// their sub-account at `sub_index`. Useful as a "savings" or
+    /// strategy-segregation pattern — the sub-account is isolated from
+    /// the main account's trading exposure until Phase 2 wires trading
+    /// from sub-accounts.
+    ///
+    /// REJECTS if the main account has open positions whose maintenance
+    /// margin would be violated by the withdrawal — caller must close
+    /// or reduce exposure first. (Implemented by reading
+    /// `main.open_positions` and refusing the transfer when > 0. The
+    /// looser, position-aware check is deferred to Phase 2 alongside
+    /// the assess_margin refactor.)
+    pub fn transfer_main_to_sub(
+        ctx: Context<TransferBetweenSubAccounts>,
+        sub_index: u8,
+        amount: u64,
+    ) -> Result<()> {
+        require!(sub_index >= 1, FlashBookError::OutOfRange);
+        require!(amount > 0, FlashBookError::ZeroSize);
+        let main = &mut ctx.accounts.main_trader_state;
+        let sub = &mut ctx.accounts.sub_trader_state;
+        require!(
+            main.trader == sub.trader && main.trader == ctx.accounts.trader.key(),
+            FlashBookError::WrongTrader
+        );
+        require!(
+            main.open_positions == 0,
+            FlashBookError::OpenInterestCapExceeded
+        );
+        main.collateral_quote_lots = main
+            .collateral_quote_lots
+            .checked_sub(amount)
+            .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+        sub.collateral_quote_lots = sub
+            .collateral_quote_lots
+            .checked_add(amount)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        emit!(SubAccountTransferEvent {
+            trader: ctx.accounts.trader.key(),
+            sub_index,
+            amount_quote_lots: amount,
+            direction: 0, // 0 = main → sub
+            main_balance_after: main.collateral_quote_lots,
+            sub_balance_after: sub.collateral_quote_lots,
+        });
+        Ok(())
+    }
+
+    /// Mirror of `transfer_main_to_sub`: move `amount` quote-lots from
+    /// the sub-account back to main. Same guard — refuses if the sub
+    /// account has open positions (which it can't have until Phase 2
+    /// wires trading; included now for forward-compatibility).
+    pub fn transfer_sub_to_main(
+        ctx: Context<TransferBetweenSubAccounts>,
+        sub_index: u8,
+        amount: u64,
+    ) -> Result<()> {
+        require!(sub_index >= 1, FlashBookError::OutOfRange);
+        require!(amount > 0, FlashBookError::ZeroSize);
+        let main = &mut ctx.accounts.main_trader_state;
+        let sub = &mut ctx.accounts.sub_trader_state;
+        require!(
+            main.trader == sub.trader && main.trader == ctx.accounts.trader.key(),
+            FlashBookError::WrongTrader
+        );
+        require!(
+            sub.open_positions == 0,
+            FlashBookError::OpenInterestCapExceeded
+        );
+        sub.collateral_quote_lots = sub
+            .collateral_quote_lots
+            .checked_sub(amount)
+            .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+        main.collateral_quote_lots = main
+            .collateral_quote_lots
+            .checked_add(amount)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        emit!(SubAccountTransferEvent {
+            trader: ctx.accounts.trader.key(),
+            sub_index,
+            amount_quote_lots: amount,
+            direction: 1, // 1 = sub → main
+            main_balance_after: main.collateral_quote_lots,
+            sub_balance_after: sub.collateral_quote_lots,
+        });
+        Ok(())
+    }
+
     /// Set the trader's referrer. ONE-TIME-WRITE: once set to a non-default
     /// pubkey, the field cannot be rewritten. Anti-rotation griefing —
     /// referrers earn off the trader for the lifetime of the account, no
@@ -7890,6 +8036,50 @@ pub struct OpenTraderState<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Sub-account scaffolding (Phase 1). The sub PDA extends the main
+/// seed with a `sub_index` byte; sub_index = 0 is reserved for the
+/// main account (which uses the legacy `OpenTraderState` ix), so this
+/// ix accepts sub_index in 1..=255.
+#[derive(Accounts)]
+#[instruction(sub_index: u8)]
+pub struct OpenTraderSubAccount<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+    #[account(
+        init,
+        payer = trader,
+        space = TraderStateAccount::space(),
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref(), &[sub_index]],
+        bump,
+    )]
+    pub trader_sub_account: Box<Account<'info, TraderStateAccount>>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Move collateral between a trader's main account and one of their
+/// sub-accounts. Same trader signs both sides; both PDAs are derived
+/// from the same `trader` pubkey so the seeds alone enforce that the
+/// caller can only touch their own collateral.
+#[derive(Accounts)]
+#[instruction(sub_index: u8)]
+pub struct TransferBetweenSubAccounts<'info> {
+    pub trader: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = main_trader_state.bump,
+        constraint = main_trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub main_trader_state: Box<Account<'info, TraderStateAccount>>,
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref(), &[sub_index]],
+        bump = sub_trader_state.bump,
+        constraint = sub_trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub sub_trader_state: Box<Account<'info, TraderStateAccount>>,
+}
+
 #[derive(Accounts)]
 pub struct SetTraderReferrer<'info> {
     /// Trader signs to set their own referrer. One-time-write enforced
@@ -9126,6 +9316,29 @@ pub struct OrderCancelledV2Event {
     pub side: u8,
     pub node_index: u32,
     pub total_orders_after: u32,
+}
+
+/// Emitted by `open_trader_sub_account`. The sub_account PDA is at
+/// `[TraderStateAccount::SEED, trader.key(), &[sub_index]]`; off-chain
+/// reconstruction uses this event to map (trader, sub_index) → PDA.
+#[event]
+pub struct SubAccountOpenedEvent {
+    pub trader: Pubkey,
+    pub sub_index: u8,
+    pub sub_account: Pubkey,
+}
+
+/// Emitted by `transfer_main_to_sub` and `transfer_sub_to_main`.
+/// `direction` is 0 for main→sub, 1 for sub→main. Off-chain wallets use
+/// this to update per-sub-account balance views.
+#[event]
+pub struct SubAccountTransferEvent {
+    pub trader: Pubkey,
+    pub sub_index: u8,
+    pub amount_quote_lots: u64,
+    pub direction: u8,
+    pub main_balance_after: u64,
+    pub sub_balance_after: u64,
 }
 
 /// Emitted by `cancel_all_v2`. `cancelled_count` is 0 when the trader had

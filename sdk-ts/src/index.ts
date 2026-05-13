@@ -12,6 +12,7 @@ export {
   marketPda,
   positionPda,
   traderStatePda,
+  traderSubAccountPda,
   triggerOrderPda,
   twapOrderPda,
   icebergOrderPda,

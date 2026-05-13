@@ -89,6 +89,26 @@ export function traderStatePda(
   return derive([TRADER_STATE_SEED, trader.toBuffer()], programId);
 }
 
+/// Sub-account PDA. Phase 1: sub_index in 1..=255 yields a distinct PDA
+/// at `[TRADER_STATE_SEED, trader, &[sub_index]]`. sub_index = 0 returns
+/// the legacy main-account PDA (same address as `traderStatePda`).
+export function traderSubAccountPda(
+  trader: PublicKey,
+  subIndex: number,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
+): DerivedPda {
+  if (subIndex < 0 || subIndex > 255 || !Number.isInteger(subIndex)) {
+    throw new Error(`subIndex must be an integer in [0, 255], got ${subIndex}`);
+  }
+  if (subIndex === 0) {
+    return traderStatePda(trader, programId);
+  }
+  return derive(
+    [TRADER_STATE_SEED, trader.toBuffer(), Buffer.from([subIndex])],
+    programId,
+  );
+}
+
 export function positionPda(
   market: PublicKey,
   trader: PublicKey,
