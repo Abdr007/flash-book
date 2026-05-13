@@ -435,14 +435,67 @@ position is isolated.
 (only the trader-state accounts), so adding fee routing wants a ctx
 expansion in a separate audited commit.
 
-### 8.3 ADL settlement
+### 8.3 ADL settlement — RESOLVED (Phase 2h)
 
-`auto_deleverage` debits the underwater trader's cross pool
-(`underwater_trader_state.collateral_quote_lots`) directly. For an
-isolated underwater position, the bankruptcy-price loss should come
-from `position.collateral_quote_lots` first, with insurance-fund
-shortfall coverage and counter-trader gain semantics otherwise
-unchanged. Punt to Phase 2b.
+**Status: fixed.** `auto_deleverage` now routes the bankruptcy-price
+loss and the counter-trader gain to the right collateral buckets:
+
+```
+underwater isolated → position.collateral_quote_lots is debited
+                      (saturating_sub; the unpaid remainder is absorbed
+                      by the insurance fund + ADL waterfall as before;
+                      the cross pool is NEVER touched, preserving I-3)
+underwater cross    → trader_state.collateral_quote_lots is debited
+                      (saturating_sub, same as legacy ADL behaviour)
+
+counter isolated    → position.collateral_quote_lots is credited
+                      (checked_add; overflow → ArithmeticOverflow)
+counter cross       → trader_state.collateral_quote_lots is credited
+                      (checked_add; overflow → ArithmeticOverflow)
+```
+
+The pure-math helpers `route_adl_loss(isolated, loss, pos, cross)`
+and `route_adl_gain(isolated, gain, pos, cross) -> Result<(u64, u64)>`
+encapsulate the routing decision. Both are covered by 11 unit tests
+in `mod adl_routing_tests`, including the critical
+`isolated_adl_leaves_both_cross_pools_untouched` case that locks in
+I-3 end-to-end for the ADL path.
+
+#### Bankruptcy-price sourcing
+
+The bankruptcy-price `bp` calculation is
+
+```
+long  : bp = entry - C / (size · tick)
+short : bp = entry + C / (size · tick)
+```
+
+where `C` is the collateral backing the underwater position. Phase 2h
+selects `C` from the per-position bucket if the position is isolated,
+else from the cross pool:
+
+```
+C := if underwater.collateral_quote_lots > 0
+     { underwater.collateral_quote_lots }
+     else
+     { underwater_trader_state.collateral_quote_lots }
+```
+
+This matters because using the cross pool's full balance to compute
+`bp` for an isolated position would over-estimate the backstop —
+the resulting `bp` would be too favourable to the underwater trader,
+the counter-trader would be force-closed at a worse price than they
+should be, and the loss attributed to the position would exceed
+the isolated bucket. Sourcing `C` from the actual backing bucket is
+the I-3-preserving math.
+
+#### Realized-PnL bookkeeping
+
+`underwater_trader_state.realized_pnl_quote_lots -= loss` and
+`counter_trader_state.realized_pnl_quote_lots += gain` are still
+written regardless of which bucket actually moved. These are
+informational fields — indexers and UIs use them to display
+lifetime PnL summaries; they don't represent spendable collateral.
 
 ---
 
@@ -475,12 +528,12 @@ Tests covering these invariants:
 
 ## 10. Versioning
 
-This document tracks the on-chain risk model as of the Phase 2 series
-(commits `550624e` through `495386a`) plus Phase 2g (realized-PnL
-materialisation; this document version). Future invariant changes —
-particularly resolving the remaining §8.2 and §8.3 gaps — should
-update the corresponding numbered sections and the invariant table
-in §9.
+This document tracks the on-chain risk model through Phase 2h (ADL
+routing for isolated positions). With §8.1 and §8.3 resolved, the
+remaining §8 entry is §8.2 (`apply_fill` fee routing — already
+resolved in Phase 2b but kept as a section for the historical
+chain). Future invariant changes should update the corresponding
+numbered sections and the invariant table in §9.
 
 ## 11. Phase 2c — Position PDA migration
 

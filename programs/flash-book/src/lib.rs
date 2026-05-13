@@ -5889,9 +5889,14 @@ pub mod flash_book {
     ///
     /// Action:
     ///   • close `close_size` lots from BOTH at the bankruptcy price
-    ///   • underwater realizes loss (collateral debited pro-rata)
-    ///   • counter realizes profit at bp (less than mark — that's the
-    ///     "give up", which absorbs the loss insurance would have eaten)
+    ///   • underwater realizes loss (Phase 2h: routed to
+    ///     position.collateral_quote_lots if isolated, else
+    ///     trader_state.collateral_quote_lots; saturating at 0 in both
+    ///     cases — the insurance fund waterfall absorbs the remainder)
+    ///   • counter realizes profit at bp (Phase 2h: credited to
+    ///     position.collateral_quote_lots if isolated, else
+    ///     trader_state.collateral_quote_lots; checked_add for
+    ///     overflow safety)
     ///   • update OI counters
     ///   • emit AutoDeleveragedEvent
     ///
@@ -5979,9 +5984,24 @@ pub mod flash_book {
         // is exactly zero. For long: bp = entry - C / (S × tick).
         //                  short: bp = entry + C / (S × tick).
         // We compute in u128 ticks to avoid overflow at large notional.
+        //
+        // ── Phase 2h ADL routing for isolated positions ───────────────
+        // `C` (the collateral backing this position) is the per-position
+        // bucket if the position is isolated, else the trader's cross
+        // pool. Using the cross pool for an isolated position would
+        // over-estimate the available backstop and produce a too-favorable
+        // bp — the underwater trader would absorb more loss than their
+        // isolated bucket has, and the counter-trader would be force-
+        // closed at a price worse than they should be. The whole point
+        // of isolation is that THIS bucket is what backs this position.
         let tick_size = market.params.tick_size as u128;
         require!(tick_size > 0, FlashBookError::ZeroPrice);
-        let collateral = ctx.accounts.underwater_trader_state.collateral_quote_lots as u128;
+        let underwater_isolated = underwater.collateral_quote_lots > 0;
+        let collateral: u128 = if underwater_isolated {
+            underwater.collateral_quote_lots as u128
+        } else {
+            ctx.accounts.underwater_trader_state.collateral_quote_lots as u128
+        };
         let entry = underwater.entry_price_ticks as u128;
         let size = underwater.size_lots as u128;
         let denom = size.checked_mul(tick_size)
@@ -6039,26 +6059,13 @@ pub mod flash_book {
         let market_key = market.key();
         let uw_trader = underwater.trader;
         let ct_trader = counter.trader;
-        {
-            let uts = &mut ctx.accounts.underwater_trader_state;
-            uts.collateral_quote_lots = uts.collateral_quote_lots.saturating_sub(loss_quote_lots);
-            uts.realized_pnl_quote_lots = uts
-                .realized_pnl_quote_lots
-                .saturating_sub(loss_quote_lots as i64);
-        }
-        {
-            let cts = &mut ctx.accounts.counter_trader_state;
-            cts.collateral_quote_lots = cts
-                .collateral_quote_lots
-                .checked_add(counter_gain)
-                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-            cts.realized_pnl_quote_lots = cts
-                .realized_pnl_quote_lots
-                .saturating_add(counter_gain as i64);
-        }
-
-        // Reduce both positions by close_size. If a side closes to zero,
-        // decrement open_positions on that trader_state.
+        // Sample the counter's isolation flag BEFORE mutating, mirroring
+        // the apply_fill / settle_funding routing pattern.
+        let counter_isolated = counter.collateral_quote_lots > 0;
+        // Hoist the size/side snapshots from the immutable `underwater`
+        // and `counter` borrows so the mutable per-position routing
+        // below (which needs `&mut ctx.accounts.{underwater,counter}_position`)
+        // doesn't conflict via NLL.
         let uw_was_open = underwater.size_lots > 0;
         let ct_was_open = counter.size_lots > 0;
         let uw_pre_side = underwater.side;
@@ -6066,6 +6073,54 @@ pub mod flash_book {
         let uw_pre_size = underwater.size_lots;
         let ct_pre_size = counter.size_lots;
 
+        // ── Phase 2h: route the underwater loss ──────────────────────
+        // Isolated underwater → debit the per-position bucket (saturate
+        // to 0; the remainder is absorbed by the insurance fund via the
+        // existing waterfall — the cross pool is never touched, which
+        // preserves invariant I-3).
+        // Cross underwater → debit the cross pool as before.
+        // Either way, `uts.realized_pnl_quote_lots` is tracked for
+        // indexers regardless of which bucket actually moved.
+        {
+            let (new_pos_collat, new_ts_collat) = route_adl_loss(
+                underwater_isolated,
+                loss_quote_lots,
+                ctx.accounts.underwater_position.collateral_quote_lots,
+                ctx.accounts.underwater_trader_state.collateral_quote_lots,
+            );
+            ctx.accounts.underwater_position.collateral_quote_lots = new_pos_collat;
+            ctx.accounts.underwater_trader_state.collateral_quote_lots = new_ts_collat;
+        }
+        {
+            let uts = &mut ctx.accounts.underwater_trader_state;
+            uts.realized_pnl_quote_lots = uts
+                .realized_pnl_quote_lots
+                .saturating_sub(loss_quote_lots as i64);
+        }
+
+        // ── Phase 2h: route the counter gain ─────────────────────────
+        // Isolated counter → credit the per-position bucket.
+        // Cross counter    → credit the cross pool (legacy path).
+        {
+            let (new_pos_collat, new_ts_collat) = route_adl_gain(
+                counter_isolated,
+                counter_gain,
+                ctx.accounts.counter_position.collateral_quote_lots,
+                ctx.accounts.counter_trader_state.collateral_quote_lots,
+            )?;
+            ctx.accounts.counter_position.collateral_quote_lots = new_pos_collat;
+            ctx.accounts.counter_trader_state.collateral_quote_lots = new_ts_collat;
+        }
+        {
+            let cts = &mut ctx.accounts.counter_trader_state;
+            cts.realized_pnl_quote_lots = cts
+                .realized_pnl_quote_lots
+                .saturating_add(counter_gain as i64);
+        }
+
+        // Reduce both positions by close_size. If a side closes to zero,
+        // decrement open_positions on that trader_state. (Snapshot
+        // values were hoisted above the settlement block.)
         {
             let uw = &mut ctx.accounts.underwater_position;
             uw.size_lots = uw.size_lots.saturating_sub(close_size_lots);
@@ -11527,6 +11582,178 @@ fn compute_realized_pnl_routing(
         }
     } else {
         Ok((iso_collateral, cross_collateral))
+    }
+}
+
+/// Phase 2h — pure-math helper for the underwater loss side of ADL
+/// settlement. Returns `(new_position_collateral,
+/// new_trader_state_collateral)`.
+///
+/// Rule:
+///   isolated  → debit the per-position bucket, saturating to 0.
+///               Cross pool is NEVER touched (preserves I-3 cross-pool
+///               insulation). Any unpaid remainder is absorbed by the
+///               insurance fund + ADL waterfall — same conservative
+///               semantics ADL has always used for the cross path.
+///   cross     → debit the cross pool, saturating to 0.
+fn route_adl_loss(
+    isolated: bool,
+    loss_quote_lots: u64,
+    pos_collateral: u64,
+    trader_state_collateral: u64,
+) -> (u64, u64) {
+    if isolated {
+        (
+            pos_collateral.saturating_sub(loss_quote_lots),
+            trader_state_collateral,
+        )
+    } else {
+        (
+            pos_collateral,
+            trader_state_collateral.saturating_sub(loss_quote_lots),
+        )
+    }
+}
+
+/// Phase 2h — pure-math helper for the counter gain side of ADL
+/// settlement. Returns `(new_position_collateral,
+/// new_trader_state_collateral)`.
+///
+/// Rule:
+///   isolated  → credit the per-position bucket (checked_add).
+///   cross     → credit the cross pool (checked_add).
+/// Overflow → ArithmeticOverflow.
+fn route_adl_gain(
+    isolated: bool,
+    gain_quote_lots: u64,
+    pos_collateral: u64,
+    trader_state_collateral: u64,
+) -> Result<(u64, u64)> {
+    if isolated {
+        let new_pos = pos_collateral
+            .checked_add(gain_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        Ok((new_pos, trader_state_collateral))
+    } else {
+        let new_ts = trader_state_collateral
+            .checked_add(gain_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        Ok((pos_collateral, new_ts))
+    }
+}
+
+#[cfg(test)]
+mod adl_routing_tests {
+    use super::*;
+
+    // ─── Loss side ──────────────────────────────────────────────────
+
+    #[test]
+    fn loss_isolated_debits_position_bucket() {
+        let (pos, ts) = route_adl_loss(true, 100, 500, 10_000);
+        assert_eq!(pos, 400);
+        assert_eq!(ts, 10_000, "cross pool must NOT be touched on isolated loss");
+    }
+
+    #[test]
+    fn loss_isolated_saturates_at_zero_never_touches_cross() {
+        // Loss larger than the isolated bucket — saturates to 0.
+        // The remainder will be absorbed by the insurance fund via the
+        // ADL waterfall. The cross pool is NEVER debited (I-3).
+        let (pos, ts) = route_adl_loss(true, 1_000, 500, 10_000);
+        assert_eq!(pos, 0);
+        assert_eq!(ts, 10_000, "MUST NOT bleed into cross pool on isolated loss");
+    }
+
+    #[test]
+    fn loss_cross_debits_cross_pool() {
+        let (pos, ts) = route_adl_loss(false, 250, 0, 1_000);
+        assert_eq!(pos, 0, "position bucket untouched on cross path");
+        assert_eq!(ts, 750);
+    }
+
+    #[test]
+    fn loss_cross_saturates_at_zero() {
+        // Cross-path losses saturate too — ADL is the last resort and
+        // must always make progress. The remainder is absorbed by the
+        // existing insurance + ADL waterfall.
+        let (pos, ts) = route_adl_loss(false, 5_000, 0, 1_000);
+        assert_eq!(pos, 0);
+        assert_eq!(ts, 0);
+    }
+
+    #[test]
+    fn loss_zero_amount_is_no_op() {
+        let (pos, ts) = route_adl_loss(true, 0, 500, 10_000);
+        assert_eq!(pos, 500);
+        assert_eq!(ts, 10_000);
+        let (pos, ts) = route_adl_loss(false, 0, 500, 10_000);
+        assert_eq!(pos, 500);
+        assert_eq!(ts, 10_000);
+    }
+
+    // ─── Gain side ──────────────────────────────────────────────────
+
+    #[test]
+    fn gain_isolated_credits_position_bucket() {
+        let (pos, ts) = route_adl_gain(true, 250, 500, 10_000).unwrap();
+        assert_eq!(pos, 750);
+        assert_eq!(ts, 10_000, "cross pool untouched on isolated gain");
+    }
+
+    #[test]
+    fn gain_cross_credits_cross_pool() {
+        let (pos, ts) = route_adl_gain(false, 250, 500, 10_000).unwrap();
+        assert_eq!(pos, 500, "position bucket untouched on cross path");
+        assert_eq!(ts, 10_250);
+    }
+
+    #[test]
+    fn gain_isolated_overflow_errors() {
+        let result = route_adl_gain(true, 10, u64::MAX, 0);
+        assert!(result.is_err(), "isolated bucket overflow must error");
+    }
+
+    #[test]
+    fn gain_cross_overflow_errors() {
+        let result = route_adl_gain(false, 10, 0, u64::MAX);
+        assert!(result.is_err(), "cross pool overflow must error");
+    }
+
+    #[test]
+    fn gain_zero_amount_is_no_op() {
+        let (pos, ts) = route_adl_gain(true, 0, 500, 10_000).unwrap();
+        assert_eq!(pos, 500);
+        assert_eq!(ts, 10_000);
+        let (pos, ts) = route_adl_gain(false, 0, 500, 10_000).unwrap();
+        assert_eq!(pos, 500);
+        assert_eq!(ts, 10_000);
+    }
+
+    // ─── End-to-end consistency: isolated underwater + isolated counter
+    //     leaves both cross pools untouched. ────────────────────────
+
+    #[test]
+    fn isolated_adl_leaves_both_cross_pools_untouched() {
+        let uw_cross_before = 100_000u64;
+        let ct_cross_before = 50_000u64;
+        let (uw_pos_after, uw_cross_after) = route_adl_loss(
+            /* isolated */ true,
+            /* loss      */ 800,
+            /* pos       */ 1_000,
+            /* cross     */ uw_cross_before,
+        );
+        let (ct_pos_after, ct_cross_after) = route_adl_gain(
+            /* isolated */ true,
+            /* gain      */ 600,
+            /* pos       */ 200,
+            /* cross     */ ct_cross_before,
+        ).unwrap();
+        assert_eq!(uw_pos_after, 200);
+        assert_eq!(ct_pos_after, 800);
+        // Critical I-3 invariant: neither cross pool moved.
+        assert_eq!(uw_cross_after, uw_cross_before);
+        assert_eq!(ct_cross_after, ct_cross_before);
     }
 }
 
