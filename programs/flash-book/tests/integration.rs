@@ -24,7 +24,9 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-const PROGRAM_ID_STR: &str = "HGP5GN7BHSt1geH1DxRwVGFg7g7ERU28Q2QEYf6KP24b";
+// Must match `declare_id!()` in src/lib.rs — Anchor verifies this at
+// runtime via the DeclaredProgramIdMismatch gate (Anchor error 4100).
+const PROGRAM_ID_STR: &str = "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF";
 
 fn program_id() -> Pubkey {
     PROGRAM_ID_STR.parse().unwrap()
