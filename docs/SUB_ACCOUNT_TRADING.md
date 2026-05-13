@@ -25,12 +25,21 @@ before a single line of seeds-relaxation is safe to merge.
   address. All Position PDA derivations in lib.rs + the SDK have been
   updated. Main and sub-accounts now have distinct position addresses
   per market — the prerequisite for sub-account risk isolation.
-- **Phase 2d (in flight): trader_state seed relaxation** on the ~12
-  trade-path Accounts structs that carry trader_state. After this,
-  sub-accounts can be passed as the trader_state for direct-state ixs
-  (Deposit, Withdraw, Liquidate, ADL, ApplyFill, ApplyFlpFill,
-  PartialWithdraw, SetPositionMarginMode, SettleFunding,
-  PlaceBasket*, LiquidatePortfolio).
+- **Phase 2d: SHIPPED.** trader_state seed relaxation on the ~18
+  trade-path Accounts structs. Sub-accounts are accepted as the
+  trader_state for direct-state ixs (Deposit, Withdraw, Liquidate,
+  ADL, ApplyFill, ApplyFlpFill, PartialWithdraw,
+  SetPositionMarginMode, SettleFunding, PlaceBasket*,
+  LiquidatePortfolio, SweepCollateral, SetTraderReferrer /
+  Delegate / Builder / FeeTier, ViewPortfolioRisk). The handler
+  enforces `trader_state.trader == signer.key()` (or, for
+  permissionless ixs, identity comes from the position seed pair).
+- **Phase 2i: SHIPPED.** ApplyFill / ApplyFlpFill re-derive the
+  expected TraderState PDA from `(trader, sub_index)` and assert
+  against the passed account key. Closes the last remaining
+  routing-attack surface — a hostile sequencer can no longer pass a
+  different sub_index's TraderState while claiming sub_index = 0 in
+  the ix data. Phase 2j adds the end-to-end integration test.
 - **Phase 2e: SHIPPED.** RestingOrderV2 now carries `sub_index: u8`
   (repurposed from the prior `_pad` byte — layout-compatible, existing
   on-disk nodes read back with sub_index = 0 = main).

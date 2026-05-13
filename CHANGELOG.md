@@ -4,6 +4,99 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-05-14 — Phase 2 complete
+
+Tagged as `v0.2.0` on `main` at commit `66bde61`. Combines Phase 2
+(0.32.0 below) with the Phase 2g/2h/2i/2j follow-ups that closed every
+remaining gap in `docs/MARGIN_MATH.md §8`.
+
+### Added (Phase 2g — realized-PnL materialisation)
+
+`apply_fill` and `apply_flp_fill` now drain the realized-PnL delta
+into the correct collateral bucket on every fill. Pre-2g, closing a
+profitable position incremented `pos.realized_pnl_quote_lots` but no
+code path drained it into `trader_state.collateral_quote_lots` — the
+trader's spendable collateral stayed unchanged. Hyperliquid / dYdX /
+Drift all materialise on close; Flash Book now does too.
+
+Routing helpers `apply_realized_pnl_delta` + pure-math
+`compute_realized_pnl_routing` with 11 unit tests in
+`mod realized_pnl_routing_tests`. Isolated path saturates losses at
+the per-position bucket (preserves I-3); cross path uses checked_sub
+(`InsufficientCollateral` rather than going negative).
+
+### Added (Phase 2h — ADL settlement routing for isolated positions)
+
+`auto_deleverage` previously debited the underwater trader's cross
+pool with the bankruptcy-price loss regardless of whether the
+position was isolated — a violation of I-3. Phase 2h routes the
+loss to the per-position bucket when isolated (saturating to 0; the
+insurance fund waterfall absorbs the remainder) and the counter
+gain to the per-position bucket when the counter is isolated. The
+bankruptcy-price computation also sources `C` from the right bucket
+so `bp` reflects the actual backing collateral, not the cross pool's
+unrelated balance.
+
+Routing helpers `route_adl_loss` + `route_adl_gain` with 11 unit
+tests in `mod adl_routing_tests`, including the critical
+`isolated_adl_leaves_both_cross_pools_untouched` invariant
+lock-in.
+
+### Added (Phase 2i — sub_index PDA verification in ApplyFill)
+
+Closes the 1-byte routing-attack surface left by Phase 2d's seed
+relaxation on `taker_trader_state` / `maker_trader_state`. The
+handler now re-derives the expected TraderState PDA from
+`(order.trader, order.sub_index)` and asserts against the passed
+account key. `apply_fill` and `apply_flp_fill` gain `taker_sub_index`
+/ `maker_sub_index` ix params (the sub_index values arrive via the
+Phase 2e events, so an honest sequencer already had them).
+
+New helper `verify_trader_state_pda(sub_index, trader, actual,
+program_id)`.
+
+### Added (Phase 2j — end-to-end ApplyFill integration tests)
+
+Three new on-chain integration tests covering the fill path that
+previously had ZERO E2E coverage:
+
+* `apply_fill_opens_both_positions_and_moves_oi` — bedrock test;
+  a single apply_fill init's both positions and updates OI.
+* `apply_fill_materialises_realized_pnl_on_winning_close` — Phase 2g
+  coverage on-chain. Opens long at 100_000, closes at 110_000,
+  asserts trader_state.collateral_quote_lots ends at the exact
+  expected value (+10_000 PnL credit - 55 close fee).
+* `apply_fill_rejects_wrong_sub_index_trader_state` — Phase 2i
+  coverage on-chain. Hostile sequencer attempt to pass sub-state
+  while claiming sub_index=0 fails with WrongTrader.
+
+### Final test counts (this release)
+
+```
+122 lib unit tests          (matcher + pure-math routing + state)
+ 37 integration tests       (was 34, +3 from Phase 2j)
+  6 isolated-margin proptests (2000 cases each)
+  6 risk proptests
+ 14 module proptests
+ 19 new-features proptests
+  7 liquidation proptests
+───
+211 tests, all green
+cargo build-sbf clean
+```
+
+### Closed gaps
+
+After this release, `docs/MARGIN_MATH.md §8` has no remaining open
+items. The previous v0.32.0 known-gap section listed:
+
+* Realized PnL materialisation — **fixed (Phase 2g)**
+* ADL settlement routing for isolated positions — **fixed (Phase 2h)**
+* ApplyFill sequencer trust — **fixed (Phase 2i)**
+
+The `docs/SUB_ACCOUNT_TRADING.md §0` status section is current as
+of this release.
+
 ## [0.32.0] — 2026-05-14 — Phase 2: isolated margin + sub-account trading
 
 Eight commits implementing isolated-margin end-to-end and enabling

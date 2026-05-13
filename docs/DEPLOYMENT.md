@@ -22,31 +22,37 @@ solana airdrop 2
 
 ## 1. Build (BPF)
 
-> **Note:** this step is currently blocked on Solana platform-tools v1.48
-> (rustc 1.84) being incompatible with a transitive `constant_time_eq`
-> edition2024 dep. Track upstream and revisit when v1.49+ ships, or pin
-> a compatible blake3 version. Native `cargo build` works for testing.
-
 ```bash
 cd /path/to/flash-book
+cargo build-sbf --manifest-path programs/flash-book/Cargo.toml
+# or, equivalently:
 anchor build
 ```
 
 This produces:
-- `target/deploy/flash_book.so` — the BPF program binary
-- `target/idl/flash_book.json` — the Anchor IDL
-- `target/types/flash_book.ts` — TypeScript IDL (optional, for fully-typed `Program<T>`)
+- `target/sbf-solana-solana/release/flash_book.so` (or
+  `target/deploy/flash_book.so` via Anchor) — the BPF program binary
+- `target/idl/flash_book.json` — the Anchor IDL (or regenerate
+  via `anchor idl build -p flash_book > idl/flash_book.json`)
+
+The build is clean as of Phase 2j (commit `66bde61`). Earlier
+versions of this runbook noted a `constant_time_eq` edition2024
+dependency conflict — resolved by Solana platform-tools v1.49+.
 
 ## 2. Deploy
 
 ```bash
-solana program deploy target/deploy/flash_book.so \
+solana program deploy target/sbf-solana-solana/release/flash_book.so \
   --program-id keys/flash_book-keypair.json
 ```
 
-Capture the printed program ID. If you need to override the hardcoded
-`FBookV1111111111111111111111111111111111111` placeholder, regenerate
-with `anchor keys sync` after building.
+Capture the printed program ID. The declared ID lives in
+`programs/flash-book/src/lib.rs::declare_id!()` and in `Anchor.toml`;
+both must match the deployed key. Current devnet ID:
+`Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF`. If you need to
+override, regenerate with `anchor keys sync` after building and
+update `tests/integration.rs::PROGRAM_ID_STR` to match (it's pinned
+at file scope for the runtime DeclaredProgramIdMismatch check).
 
 ## 3. Initialize protocol PDAs (one-time)
 
