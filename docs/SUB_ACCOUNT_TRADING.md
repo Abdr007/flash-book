@@ -18,11 +18,31 @@ before a single line of seeds-relaxation is safe to merge.
 
 ## 0. Status
 
-- **Not started.** The trade-path Accounts structs are unchanged.
-- Sub-accounts (from Phase 1) remain collateral-only. They can be
-  created and exchange balance with `main_trader_state` via
-  `transfer_main_to_sub` / `transfer_sub_to_main`. They cannot be the
-  `trader_state` of any trade-path instruction.
+- **Phase 2c (foundation): SHIPPED.** Position PDAs now key on
+  `trader_state.key()` instead of `wallet.key()`. The migration ix
+  `migrate_position_to_trader_state_key` moves legacy
+  `(market, wallet)` positions to the new `(market, trader_state)`
+  address. All Position PDA derivations in lib.rs + the SDK have been
+  updated. Main and sub-accounts now have distinct position addresses
+  per market — the prerequisite for sub-account risk isolation.
+- **Phase 2d (in flight): trader_state seed relaxation** on the ~12
+  trade-path Accounts structs that carry trader_state. After this,
+  sub-accounts can be passed as the trader_state for direct-state ixs
+  (Deposit, Withdraw, Liquidate, ADL, ApplyFill, ApplyFlpFill,
+  PartialWithdraw, SetPositionMarginMode, SettleFunding,
+  PlaceBasket*, LiquidatePortfolio).
+- **Phase 2e (unplanned, biggest piece): RestingOrderV2 schema +
+  matcher fill routing.** Discovered mid-2c that PlaceLimitOrderV2 /
+  PlaceTakerOrderV2 store orders in the hypertree with
+  `RestingOrderV2.trader = wallet.key()`. No sub_index field. ApplyFill
+  reads the trader field and derives `taker_trader_state` from it,
+  always landing on the wallet's main TraderState — the sub's order
+  would route fills to main. Sub-account order PLACEMENT requires
+  RestingOrderV2 to carry a sub_index (or, more cleanly, the trader
+  field to BE the trader_state PDA rather than the wallet). That's a
+  schema change to a heavily-used type in the hypertree; the matcher,
+  every order-insertion site, and every fill-resolution site all
+  change together. Estimated separately — see §10 below.
 
 ## 1. The aliasing problem
 
@@ -326,12 +346,111 @@ once both ship.
 
 ## 9. Recommended next step
 
-1. Owner picks A / B / C.
-2. If A or B: stand up the migration ix + tests in commit 1.
-3. Relax the 15 trade-path Accounts structs in commits 2-4 (grouped
-   by domain: collateral mgmt → order placement → fills → liquidation).
-4. Position PDA migration in commit 5 (only A/B).
-5. SDK + IDL in commit 6.
+1. ~~Owner picks A / B / C.~~ Option B chosen and shipped in Phase 2c.
+2. ~~Migration ix.~~ Shipped — `migrate_position_to_trader_state_key`.
+3. **Phase 2d — relax the ~12 trade-path Accounts structs.** Group by
+   domain across 2-3 commits: (a) collateral management (Deposit,
+   Withdraw, PartialWithdraw, SetPositionMarginMode); (b)
+   liquidation (LiquidatePositionV2, LiquidatePortfolioV2,
+   AutoDeleverage, SettleFunding); (c) fills (ApplyFill, ApplyFlpFill,
+   PlaceBasket*). Each commit independently buildable and testable.
+4. **Phase 2e — sub-account order placement.** See §10. Roughly the
+   largest single architectural change still pending.
 
 Each commit independently buildable, testable, and reviewable. **Do
 not bundle.**
+
+## 10. Phase 2e — sub-account order placement
+
+The hypertree-backed order book stores resting orders as
+`RestingOrderV2` (in `state_v2.rs`). The `trader` field is the WALLET
+pubkey, set at insertion time from `ctx.accounts.trader.key()`. The
+hypertree itself is keyed by `(price_ticks, seq)` not by trader, but
+every fill resolution reads the `RestingOrderV2.trader` field to
+look up the matched `taker_trader_state` / `maker_trader_state`.
+
+Today (Phase 2c) the lookup uses
+`[STATE_SEED, restingOrder.trader.as_ref()]` — the main TraderState
+PDA. There is no way to route a fill to a sub-account's TraderState
+because the order doesn't know which sub-account placed it.
+
+**Options for 2e:**
+
+### Option E.1 — Add `sub_index: u8` to RestingOrderV2
+
+```rust
+pub struct RestingOrderV2 {
+    // ...existing 32 bytes for order_id, seq, price_ticks, size_lots,
+    // expires_at_slot, trader, last_valid_slot, side, order_type, flags...
+    pub _pad: u8,        // ← was padding; now sub_index
+    // ...rest of fields unchanged.
+}
+```
+
+`flags` byte already exists; we could repurpose an unused flag bit OR
+take a single padding byte. Either is a layout-compatible change AS
+LONG AS we audit the on-disk hypertree node size invariants.
+
+PlaceLimitOrderV2 / PlaceTakerOrderV2 need a `sub_index: u8` ix
+parameter, written into the order at insertion.
+
+ApplyFill resolves the trader_state PDA from
+`(restingOrder.trader, restingOrder.sub_index)`:
+
+```
+seed = if sub_index == 0 {
+    [STATE_SEED, restingOrder.trader.as_ref()]
+} else {
+    [STATE_SEED, restingOrder.trader.as_ref(), &[sub_index]]
+};
+```
+
+But Anchor's `seeds = [...]` can't conditionalise — so ApplyFill drops
+the strict seed constraint on taker_/maker_trader_state and validates
+the trader_state PDA matches expected in the handler.
+
+### Option E.2 — Change `RestingOrderV2.trader` to BE the trader_state PDA
+
+Conceptually cleaner: orders carry the TraderState identity directly,
+not the wallet. Eliminates the sub_index ambiguity entirely — every
+order's `trader` field is a TraderState PDA, main or sub. Hypertree
+node layout unchanged (it's still 32 bytes).
+
+Off-chain consumers that expected `.trader` to be the wallet break
+unless they re-derive. SDK provides a `RestingOrderV2.tradedBy(state)`
+helper that resolves the wallet from the TraderState PDA.
+
+### Option E.3 — Keep RestingOrderV2 as-is; route fills via remaining_accounts
+
+ApplyFill takes EITHER the main trader_state OR a sub-account
+trader_state as a remaining_account pair, and the handler verifies it
+matches the resting order's intended target. The off-chain sequencer
+that builds ApplyFill ixs has access to the order's source context
+(it indexes placements) and can route accordingly.
+
+Cheapest implementation but pushes correctness into the off-chain
+sequencer trust boundary.
+
+### Recommendation
+
+**Option E.1 (sub_index byte).** It's a minimal schema change (one
+byte that was already padding), keeps the hypertree mechanism
+mechanically identical, makes the on-chain identity explicit, and
+doesn't break existing off-chain consumers (they continue to read
+`RestingOrderV2.trader` as a wallet pubkey, and sub_index defaults to
+0 = main for all currently-resting orders).
+
+### Effort estimate (Phase 2e)
+
+| Slice | LOC |
+|---|---|
+| `RestingOrderV2.sub_index` field + (de)serialisation | ~80 |
+| PlaceLimitOrderV2 / PlaceTakerOrderV2 ix param + write | ~120 |
+| ApplyFill / ApplyFlpFill: handler-side trader_state PDA derivation | ~200 |
+| Hypertree migration ix (sub_index defaults to 0 for legacy nodes) | ~150 |
+| SDK updates (PlaceLimit/PlaceTaker builders + RestingOrderV2 decoder) | ~120 |
+| New tests (sub places order → sub gets the fill) | ~250 |
+| MARGIN_MATH + ARCHITECTURE update | ~50 |
+| **Total** | **~970** |
+
+Best executed across 3-4 commits, each independently auditable.

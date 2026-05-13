@@ -2229,10 +2229,11 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
 
     let trader = Keypair::new();
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    // Phase 2c: Position PDAs key on the trader_state PDA, not the wallet.
     let (taker_pos, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
-        trader.pubkey().as_ref(),
+        trader_state.as_ref(),
     ]);
 
     // Apply a fill where trader buys 1 lot @ 100,000 from FLP.

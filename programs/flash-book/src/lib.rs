@@ -1558,6 +1558,62 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Phase 2c migration — move a Position from the LEGACY PDA
+    /// `[POS_SEED, market, wallet]` to the NEW Phase 2c PDA
+    /// `[POS_SEED, market, trader_state.key()]`. The new derivation
+    /// makes sub-account positions distinct from main, which is the
+    /// prerequisite for sub-account trading.
+    ///
+    /// Per (wallet, market). Only main-account positions need to be
+    /// migrated — sub-account positions don't exist pre-2c. The legacy
+    /// PDA is closed and rent refunded to the trader. The new PDA is
+    /// init'd with the same on-chain state (size, side, entry, funding
+    /// indices, realized PnL, isolated collateral, timing fields).
+    ///
+    /// Idempotent in the sense that calling it a second time fails
+    /// because the legacy PDA no longer exists at the old address;
+    /// callers can safely re-run after partial failure.
+    pub fn migrate_position_to_trader_state_key(
+        ctx: Context<MigratePositionToTraderStateKey>,
+    ) -> Result<()> {
+        let legacy = &ctx.accounts.legacy_position;
+        let new_bump = ctx.bumps.new_position;
+        let market_key = ctx.accounts.market.key();
+
+        require!(
+            legacy.trader == ctx.accounts.trader.key(),
+            FlashBookError::WrongTrader
+        );
+        require!(legacy.market == market_key, FlashBookError::WrongMarket);
+        // Note: legacy.collateral_quote_lots can be > 0 post Phase 2 if
+        // the position was isolated — that value is preserved.
+
+        let new_pos = &mut ctx.accounts.new_position;
+        new_pos.market = legacy.market;
+        new_pos.trader = legacy.trader;
+        new_pos.side = legacy.side;
+        new_pos.size_lots = legacy.size_lots;
+        new_pos.entry_price_ticks = legacy.entry_price_ticks;
+        new_pos.cum_funding_index_at_entry = legacy.cum_funding_index_at_entry;
+        new_pos.realized_pnl_quote_lots = legacy.realized_pnl_quote_lots;
+        new_pos.funding_paid_quote_lots = legacy.funding_paid_quote_lots;
+        new_pos.last_settlement_batch = legacy.last_settlement_batch;
+        new_pos.unhealthy_since_slot = legacy.unhealthy_since_slot;
+        new_pos.last_liquidated_at_slot = legacy.last_liquidated_at_slot;
+        new_pos.collateral_quote_lots = legacy.collateral_quote_lots;
+        new_pos.bump = new_bump;
+
+        emit!(PositionMigratedEvent {
+            trader: legacy.trader,
+            market: market_key,
+            size_lots: legacy.size_lots,
+            collateral_quote_lots: legacy.collateral_quote_lots,
+        });
+        // Anchor closes `legacy_position` via the `close = trader`
+        // constraint on the Accounts struct, refunding rent.
+        Ok(())
+    }
+
     /// Set the trader's referrer. ONE-TIME-WRITE: once set to a non-default
     /// pubkey, the field cannot be rewritten. Anti-rotation griefing —
     /// referrers earn off the trader for the lifetime of the account, no
@@ -8549,15 +8605,14 @@ pub struct SetPositionLeverage<'info> {
     pub market: Account<'info, MarketAccount>,
 
     #[account(
-        seeds = [TraderStateAccount::SEED, position.trader.as_ref()],
-        bump = trader_state.bump,
+        constraint = trader_state.trader == position.trader @ FlashBookError::WrongTrader,
         constraint = trader_state.is_authorized(&authority.key()) @ FlashBookError::Unauthorized,
     )]
     pub trader_state: Account<'info, TraderStateAccount>,
 
     #[account(
         mut,
-        seeds = [state::PositionAccount::SEED, market.key().as_ref(), position.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
         bump = position.bump,
     )]
     pub position: Account<'info, state::PositionAccount>,
@@ -8982,6 +9037,59 @@ pub struct PartialWithdrawCollateral<'info> {
 /// Shared Accounts context for `set_position_isolated` and
 /// `set_position_cross`. Both ixs transfer collateral between the
 /// trader's pooled `TraderStateAccount.collateral_quote_lots` and the
+/// Phase 2c migration — move a Position from the LEGACY PDA
+/// `[POS_SEED, market, wallet]` to the NEW PDA
+/// `[POS_SEED, market, trader_state.key()]`. The trader signs to
+/// receive the rent refund on the closed legacy account. The new
+/// account is `init`'d (it must not pre-exist) so this ix is a
+/// one-shot per (wallet, market). Failure to land leaves both PDAs in
+/// a clean state for retry.
+#[derive(Accounts)]
+pub struct MigratePositionToTraderStateKey<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    #[account(
+        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: Box<Account<'info, TraderStateAccount>>,
+
+    /// LEGACY position at `[POS_SEED, market, wallet]`. Closed by this
+    /// ix; rent refunded to `trader`.
+    #[account(
+        mut,
+        close = trader,
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader.key().as_ref()],
+        bump = legacy_position.bump,
+    )]
+    pub legacy_position: Box<Account<'info, state::PositionAccount>>,
+
+    /// NEW position at the Phase 2c PDA. `init` (not init_if_needed) so
+    /// migration can only run when the new slot is empty — protects
+    /// against accidental double-migration overwriting state.
+    #[account(
+        init,
+        payer = trader,
+        space = state::PositionAccount::space(),
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
+        bump,
+    )]
+    pub new_position: Box<Account<'info, state::PositionAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Shared Accounts context for `set_position_isolated` and
+/// `set_position_cross`. Both ixs transfer collateral between the
+/// trader's pooled `TraderStateAccount.collateral_quote_lots` and the
 /// target position's `PositionAccount.collateral_quote_lots`, gated by
 /// a post-transfer health check on every other position the trader
 /// owns (passed via remaining_accounts).
@@ -9005,7 +9113,7 @@ pub struct SetPositionMarginMode<'info> {
 
     #[account(
         mut,
-        seeds = [state::PositionAccount::SEED, target_market.key().as_ref(), trader.key().as_ref()],
+        seeds = [state::PositionAccount::SEED, target_market.key().as_ref(), trader_state.key().as_ref()],
         bump = target_position.bump,
     )]
     pub target_position: Account<'info, state::PositionAccount>,
@@ -9041,7 +9149,7 @@ pub struct SettleFunding<'info> {
 
     #[account(
         mut,
-        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader.key().as_ref()],
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
         bump,
     )]
     pub position: Account<'info, state::PositionAccount>,
@@ -9084,7 +9192,7 @@ pub struct ApplyFill<'info> {
         init_if_needed,
         payer = sequencer,
         space = state::PositionAccount::space(),
-        seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.key().as_ref()],
         bump,
     )]
     pub taker_position: Box<Account<'info, state::PositionAccount>>,
@@ -9093,7 +9201,7 @@ pub struct ApplyFill<'info> {
         init_if_needed,
         payer = sequencer,
         space = state::PositionAccount::space(),
-        seeds = [state::PositionAccount::SEED, market.key().as_ref(), maker_trader_state.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), maker_trader_state.key().as_ref()],
         bump,
     )]
     pub maker_position: Box<Account<'info, state::PositionAccount>>,
@@ -9147,7 +9255,7 @@ pub struct PlaceBasketOrderV2<'info> {
         init_if_needed,
         payer = trader,
         space = state::PositionAccount::space(),
-        seeds = [state::PositionAccount::SEED, market_a.key().as_ref(), trader.key().as_ref()],
+        seeds = [state::PositionAccount::SEED, market_a.key().as_ref(), trader_state.key().as_ref()],
         bump,
     )]
     pub position_a: Box<Account<'info, state::PositionAccount>>,
@@ -9171,7 +9279,7 @@ pub struct PlaceBasketOrderV2<'info> {
         init_if_needed,
         payer = trader,
         space = state::PositionAccount::space(),
-        seeds = [state::PositionAccount::SEED, market_b.key().as_ref(), trader.key().as_ref()],
+        seeds = [state::PositionAccount::SEED, market_b.key().as_ref(), trader_state.key().as_ref()],
         bump,
     )]
     pub position_b: Box<Account<'info, state::PositionAccount>>,
@@ -9236,9 +9344,20 @@ pub struct ExecuteTriggerOrderV2<'info> {
 
     /// Trader's position — required when reduce_only flag is set.
     /// Same lazy-load pattern as v1.
+    ///
+    /// Phase 2c migration: trigger orders are wallet-scoped (the
+    /// TriggerOrderAccount carries the wallet pubkey, not a
+    /// trader_state PDA). Anchor cannot derive the trader_state PDA
+    /// inside a seeds expression, so we drop the strict seed
+    /// constraint here and validate the position's identity via
+    /// data-field checks in the handler:
+    ///   require!(position.market == market.key())
+    ///   require!(position.trader == trigger_order.trader)
+    /// Sub-account triggers will require a TriggerOrderAccount
+    /// schema update (add `sub_index`) before they're enableable.
     #[account(
-        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trigger_order.trader.as_ref()],
-        bump,
+        constraint = position.market == market.key() @ FlashBookError::WrongMarket,
+        constraint = position.trader == trigger_order.trader @ FlashBookError::WrongTrader,
     )]
     pub position: Account<'info, state::PositionAccount>,
 }
@@ -9458,7 +9577,7 @@ pub struct ApplyFlpFill<'info> {
         init_if_needed,
         payer = sequencer,
         space = state::PositionAccount::space(),
-        seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.key().as_ref()],
         bump,
     )]
     pub taker_position: Box<Account<'info, state::PositionAccount>>,
@@ -9506,7 +9625,7 @@ pub struct LiquidatePortfolioV2<'info> {
     pub trader_state: Account<'info, TraderStateAccount>,
 
     #[account(
-        seeds = [state::PositionAccount::SEED, execution_market.key().as_ref(), trader_state.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, execution_market.key().as_ref(), trader_state.key().as_ref()],
         bump = execution_position.bump,
     )]
     pub execution_position: Account<'info, state::PositionAccount>,
@@ -9557,7 +9676,7 @@ pub struct LiquidatePositionV2<'info> {
     /// serialize back accounts not declared mut. v2 correctly marks it.
     #[account(
         mut,
-        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
         bump = position.bump,
     )]
     pub position: Box<Account<'info, state::PositionAccount>>,
@@ -9598,7 +9717,7 @@ pub struct AutoDeleverage<'info> {
         seeds = [
             state::PositionAccount::SEED,
             market.key().as_ref(),
-            underwater_trader_state.trader.as_ref(),
+            underwater_trader_state.key().as_ref(),
         ],
         bump = underwater_position.bump,
     )]
@@ -9616,7 +9735,7 @@ pub struct AutoDeleverage<'info> {
         seeds = [
             state::PositionAccount::SEED,
             market.key().as_ref(),
-            counter_trader_state.trader.as_ref(),
+            counter_trader_state.key().as_ref(),
         ],
         bump = counter_position.bump,
     )]
@@ -9775,6 +9894,18 @@ pub struct SubAccountTransferEvent {
     pub direction: u8,
     pub main_balance_after: u64,
     pub sub_balance_after: u64,
+}
+
+/// Emitted by `migrate_position_to_trader_state_key`. Carries the
+/// position's pre-migration core state for off-chain audit; indexers
+/// re-key from the legacy `[POS_SEED, market, wallet]` PDA to the
+/// new `[POS_SEED, market, trader_state]` PDA after this event lands.
+#[event]
+pub struct PositionMigratedEvent {
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub size_lots: u64,
+    pub collateral_quote_lots: u64,
 }
 
 /// Emitted by `set_position_isolated` and `set_position_cross`.
@@ -11220,9 +11351,14 @@ pub struct ExecuteTriggerOrderV3<'info> {
     pub trigger_order: Account<'info, state_v3::TriggerOrderAccountV3>,
 
     /// Trader's position — required for reduce-only triggers.
+    /// Phase 2c: dropped strict seed (TriggerOrderAccountV3 is
+    /// wallet-scoped; Anchor cannot derive trader_state PDA inside
+    /// the seeds expression). Identity is enforced by data fields.
+    /// Sub-account triggers require a TriggerOrderAccountV3 schema
+    /// addition for sub_index before they become useful.
     #[account(
-        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trigger_order.trader.as_ref()],
-        bump,
+        constraint = position.market == market.key() @ FlashBookError::WrongMarket,
+        constraint = position.trader == trigger_order.trader @ FlashBookError::WrongTrader,
     )]
     pub position: Account<'info, state::PositionAccount>,
 }

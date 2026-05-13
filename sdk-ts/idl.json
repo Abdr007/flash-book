@@ -180,8 +180,7 @@
               },
               {
                 "kind": "account",
-                "path": "taker_trader_state.trader",
-                "account": "TraderStateAccount"
+                "path": "taker_trader_state"
               }
             ]
           }
@@ -210,8 +209,7 @@
               },
               {
                 "kind": "account",
-                "path": "maker_trader_state.trader",
-                "account": "TraderStateAccount"
+                "path": "maker_trader_state"
               }
             ]
           }
@@ -389,8 +387,7 @@
               },
               {
                 "kind": "account",
-                "path": "taker_trader_state.trader",
-                "account": "TraderStateAccount"
+                "path": "taker_trader_state"
               }
             ]
           }
@@ -623,8 +620,7 @@
               },
               {
                 "kind": "account",
-                "path": "underwater_trader_state.trader",
-                "account": "TraderStateAccount"
+                "path": "underwater_trader_state"
               }
             ]
           }
@@ -683,8 +679,7 @@
               },
               {
                 "kind": "account",
-                "path": "counter_trader_state.trader",
-                "account": "TraderStateAccount"
+                "path": "counter_trader_state"
               }
             ]
           }
@@ -2151,34 +2146,19 @@
           "name": "position",
           "docs": [
             "Trader's position — required when reduce_only flag is set.",
-            "Same lazy-load pattern as v1."
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              },
-              {
-                "kind": "account",
-                "path": "trigger_order.trader",
-                "account": "TriggerOrderAccount"
-              }
-            ]
-          }
+            "Same lazy-load pattern as v1.",
+            "",
+            "Phase 2c migration: trigger orders are wallet-scoped (the",
+            "TriggerOrderAccount carries the wallet pubkey, not a",
+            "trader_state PDA). Anchor cannot derive the trader_state PDA",
+            "inside a seeds expression, so we drop the strict seed",
+            "constraint here and validate the position's identity via",
+            "data-field checks in the handler:",
+            "require!(position.market == market.key())",
+            "require!(position.trader == trigger_order.trader)",
+            "Sub-account triggers will require a TriggerOrderAccount",
+            "schema update (add `sub_index`) before they're enableable."
+          ]
         }
       ],
       "args": []
@@ -2246,34 +2226,13 @@
         {
           "name": "position",
           "docs": [
-            "Trader's position — required for reduce-only triggers."
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              },
-              {
-                "kind": "account",
-                "path": "trigger_order.trader",
-                "account": "TriggerOrderAccountV3"
-              }
-            ]
-          }
+            "Trader's position — required for reduce-only triggers.",
+            "Phase 2c: dropped strict seed (TriggerOrderAccountV3 is",
+            "wallet-scoped; Anchor cannot derive trader_state PDA inside",
+            "the seeds expression). Identity is enforced by data fields.",
+            "Sub-account triggers require a TriggerOrderAccountV3 schema",
+            "addition for sub_index before they become useful."
+          ]
         }
       ],
       "args": []
@@ -3781,8 +3740,7 @@
               },
               {
                 "kind": "account",
-                "path": "trader_state.trader",
-                "account": "TraderStateAccount"
+                "path": "trader_state"
               }
             ]
           }
@@ -3970,8 +3928,7 @@
               },
               {
                 "kind": "account",
-                "path": "trader_state.trader",
-                "account": "TraderStateAccount"
+                "path": "trader_state"
               }
             ]
           }
@@ -4025,6 +3982,171 @@
             "inside the handler validates it's actually a Market account)."
           ],
           "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "migrate_position_to_trader_state_key",
+      "docs": [
+        "Phase 2c migration — move a Position from the LEGACY PDA",
+        "`[POS_SEED, market, wallet]` to the NEW Phase 2c PDA",
+        "`[POS_SEED, market, trader_state.key()]`. The new derivation",
+        "makes sub-account positions distinct from main, which is the",
+        "prerequisite for sub-account trading.",
+        "",
+        "Per (wallet, market). Only main-account positions need to be",
+        "migrated — sub-account positions don't exist pre-2c. The legacy",
+        "PDA is closed and rent refunded to the trader. The new PDA is",
+        "init'd with the same on-chain state (size, side, entry, funding",
+        "indices, realized PnL, isolated collateral, timing fields).",
+        "",
+        "Idempotent in the sense that calling it a second time fails",
+        "because the legacy PDA no longer exists at the old address;",
+        "callers can safely re-run after partial failure."
+      ],
+      "discriminator": [
+        208,
+        149,
+        28,
+        59,
+        151,
+        65,
+        226,
+        45
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_state",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "legacy_position",
+          "docs": [
+            "LEGACY position at `[POS_SEED, market, wallet]`. Closed by this",
+            "ix; rent refunded to `trader`."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "trader"
+              }
+            ]
+          }
+        },
+        {
+          "name": "new_position",
+          "docs": [
+            "NEW position at the Phase 2c PDA. `init` (not init_if_needed) so",
+            "migration can only run when the new slot is empty — protects",
+            "against accidental double-migration overwriting state."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "trader_state"
+              }
+            ]
+          }
         },
         {
           "name": "system_program",
@@ -4699,7 +4821,7 @@
               },
               {
                 "kind": "account",
-                "path": "trader"
+                "path": "trader_state"
               }
             ]
           }
@@ -4784,7 +4906,7 @@
               },
               {
                 "kind": "account",
-                "path": "trader"
+                "path": "trader_state"
               }
             ]
           }
@@ -5966,7 +6088,7 @@
               },
               {
                 "kind": "account",
-                "path": "trader"
+                "path": "trader_state"
               }
             ]
           }
@@ -6092,7 +6214,7 @@
               },
               {
                 "kind": "account",
-                "path": "trader"
+                "path": "trader_state"
               }
             ]
           }
@@ -6171,33 +6293,7 @@
           }
         },
         {
-          "name": "trader_state",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "position.trader",
-                "account": "PositionAccount"
-              }
-            ]
-          }
+          "name": "trader_state"
         },
         {
           "name": "position",
@@ -6223,8 +6319,7 @@
               },
               {
                 "kind": "account",
-                "path": "position.trader",
-                "account": "PositionAccount"
+                "path": "trader_state"
               }
             ]
           }
@@ -6680,7 +6775,7 @@
               },
               {
                 "kind": "account",
-                "path": "trader"
+                "path": "trader_state"
               }
             ]
           }
@@ -10699,6 +10794,19 @@
         227,
         87,
         201
+      ]
+    },
+    {
+      "name": "PositionMigratedEvent",
+      "discriminator": [
+        52,
+        72,
+        109,
+        53,
+        108,
+        189,
+        48,
+        169
       ]
     },
     {
@@ -14891,6 +14999,36 @@
           {
             "name": "mode",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PositionMigratedEvent",
+      "docs": [
+        "Emitted by `migrate_position_to_trader_state_key`. Carries the",
+        "position's pre-migration core state for off-chain audit; indexers",
+        "re-key from the legacy `[POS_SEED, market, wallet]` PDA to the",
+        "new `[POS_SEED, market, trader_state]` PDA after this event lands."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "collateral_quote_lots",
+            "type": "u64"
           }
         ]
       }

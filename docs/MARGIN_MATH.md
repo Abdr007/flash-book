@@ -422,3 +422,37 @@ This document tracks the on-chain risk model as of commit `550624e`
 funding routing"). Future invariant changes — particularly resolving
 §8 gaps — should update the corresponding numbered sections and the
 invariant table in §9.
+
+## 11. Phase 2c — Position PDA migration
+
+The Phase 2c follow-up commit migrated Position PDAs from being keyed
+on the trader's wallet to being keyed on the trader_state PDA:
+
+```
+Pre-2c   : [POS_SEED, market.key(), wallet.key()]
+Post-2c  : [POS_SEED, market.key(), trader_state.key()]
+```
+
+This is the foundation for sub-account trading (Phase 2d): each
+TraderStateAccount — main or sub — now has its own distinct
+PositionAccount per market. Pre-2c, main and sub would have aliased
+onto the same position, defeating risk isolation.
+
+Migration is provided as a one-shot per (wallet, market) ix:
+`migrate_position_to_trader_state_key`. It reads the legacy position,
+init's a new position at the trader_state-keyed address with the same
+on-chain state (size, side, entry, funding indices, realized PnL,
+isolated collateral, timing fields), closes the legacy position, and
+refunds rent to the trader. The new account is `init` (not
+`init_if_needed`) so a second migration attempt against an existing
+new position fails — protects against accidental double-migration.
+
+`docs/SUB_ACCOUNT_TRADING.md` covers the architectural rationale and
+the remaining Phase 2d/2e work (RestingOrderV2 schema + matcher fill
+routing) required for sub-accounts to PLACE orders rather than just
+hold collateral.
+
+The PDA change does NOT alter any margin-math invariants in §1–§9 of
+this document. Position seeds are an account-derivation concern; the
+risk model operates on PositionSnapshots which carry the same data
+fields regardless of where the on-chain position lives.

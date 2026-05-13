@@ -109,7 +109,37 @@ export function traderSubAccountPda(
   );
 }
 
+/**
+ * Phase 2c — Position PDAs are now keyed on the trader_state PDA, not
+ * the wallet. This makes sub-accounts (with their own trader_state
+ * PDAs) have distinct positions per market, the prerequisite for
+ * sub-account trading.
+ *
+ * Pre-2c: `[POSITION_SEED, market, wallet]`
+ * Post-2c: `[POSITION_SEED, market, traderStatePda]`
+ *
+ * Callers holding only a wallet pubkey should derive the trader_state
+ * PDA first via {@link traderStatePda} (or {@link traderSubAccountPda}
+ * for sub-accounts) and pass that here.
+ */
 export function positionPda(
+  market: PublicKey,
+  traderState: PublicKey,
+  programId: PublicKey = FLASH_BOOK_PROGRAM_ID,
+): DerivedPda {
+  return derive(
+    [POSITION_SEED, market.toBuffer(), traderState.toBuffer()],
+    programId,
+  );
+}
+
+/**
+ * Backwards-compat helper: derives the Position PDA at the LEGACY
+ * (pre-Phase-2c) address `[POSITION_SEED, market, wallet]`. Used by
+ * tooling that needs to read positions from devnet state created
+ * before the migration, and by the migration ix itself.
+ */
+export function positionPdaLegacy(
   market: PublicKey,
   trader: PublicKey,
   programId: PublicKey = FLASH_BOOK_PROGRAM_ID,

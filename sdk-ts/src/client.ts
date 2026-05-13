@@ -32,6 +32,7 @@ import {
   lpPositionPda,
   marketPda,
   positionPda,
+  positionPdaLegacy,
   traderStatePda,
   traderSubAccountPda,
   triggerOrderPda,
@@ -111,8 +112,21 @@ export class FlashBookClient {
   traderState(trader: PublicKey) {
     return traderStatePda(trader, this.programId);
   }
-  position(market: PublicKey, trader: PublicKey) {
-    return positionPda(market, trader, this.programId);
+  /**
+   * Derive the Position PDA for a (market, trader, subIndex) tuple.
+   *
+   * Phase 2c: Position PDAs are keyed on the trader_state PDA, not on
+   * the wallet. `subIndex = 0` (default) → main TraderState; `1..=255`
+   * → a sub-account TraderState. Callers that already have a
+   * trader_state PDA should use the lower-level {@link positionPda}
+   * directly.
+   */
+  position(market: PublicKey, trader: PublicKey, subIndex: number = 0) {
+    const traderStatePdaForLookup =
+      subIndex === 0
+        ? traderStatePda(trader, this.programId).address
+        : traderSubAccountPda(trader, subIndex, this.programId).address;
+    return positionPda(market, traderStatePdaForLookup, this.programId);
   }
   lpPosition(lp: PublicKey) {
     return lpPositionPda(lp, this.programId);
@@ -722,6 +736,37 @@ export class FlashBookClient {
         targetPosition: targetPosition.address,
       })
       .remainingAccounts(remaining)
+      .instruction();
+  }
+
+  /// Phase 2c migration — move a Position from the LEGACY PDA
+  /// `[POSITION_SEED, market, wallet]` to the new Phase 2c PDA
+  /// `[POSITION_SEED, market, traderStatePda]`. One-shot per
+  /// (wallet, market). The legacy position is closed and rent
+  /// refunded to the trader. The trader's main TraderStateAccount
+  /// is the receiving "address" — only main-account positions need
+  /// to be migrated, because sub-account positions did not exist
+  /// before Phase 2c.
+  ///
+  /// Use {@link positionPdaLegacy} from `@flash-book/sdk/pdas` to
+  /// read the legacy PDA off-chain before migrating.
+  migratePositionToTraderStateKeyIx(args: {
+    trader: PublicKey;
+    market: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const traderState = this.traderState(args.trader);
+    const legacyPosition = positionPdaLegacy(args.market, args.trader, this.programId);
+    const newPosition = positionPda(args.market, traderState.address, this.programId);
+    return this.methods
+      .migratePositionToTraderStateKey()
+      .accountsPartial({
+        trader: args.trader,
+        market: args.market,
+        traderState: traderState.address,
+        legacyPosition: legacyPosition.address,
+        newPosition: newPosition.address,
+        systemProgram: SystemProgram.programId,
+      })
       .instruction();
   }
 
