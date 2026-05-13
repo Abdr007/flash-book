@@ -2808,13 +2808,31 @@ pub mod flash_book {
         // margin gate ensured this at intake time, but we double-check).
         // For NEGATIVE-fee tier traders, taker_fee == 0 and we credit the
         // taker the rebate sourced from the protocol contribution.
+        //
+        // ── Phase 2 isolated-margin fee routing ──────────────────────────
+        // Read the per-position `collateral_quote_lots` BEFORE the
+        // apply_fill_to_position mutation — its value is the source of
+        // truth for whether the fill counts as "fee against an isolated
+        // bucket" (>0) or "fee against the cross pool" (0). For a brand-
+        // new position freshly init'd by this ix the value is 0 (cross
+        // by default), matching the intent.
+        let taker_pos_isolated = ctx.accounts.taker_position.collateral_quote_lots > 0;
+        let maker_pos_isolated = ctx.accounts.maker_position.collateral_quote_lots > 0;
         {
-            let taker_state = &mut ctx.accounts.taker_trader_state;
             if taker_fee > 0 {
-                taker_state.collateral_quote_lots = taker_state
-                    .collateral_quote_lots
-                    .checked_sub(taker_fee)
-                    .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+                if taker_pos_isolated {
+                    let p = &mut ctx.accounts.taker_position;
+                    p.collateral_quote_lots = p
+                        .collateral_quote_lots
+                        .checked_sub(taker_fee)
+                        .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+                } else {
+                    let s = &mut ctx.accounts.taker_trader_state;
+                    s.collateral_quote_lots = s
+                        .collateral_quote_lots
+                        .checked_sub(taker_fee)
+                        .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+                }
             }
             if taker_negative_rebate_u128 > 0 {
                 let neg_rebate_u64 = if taker_negative_rebate_u128 > u64::MAX as u128 {
@@ -2822,10 +2840,19 @@ pub mod flash_book {
                 } else {
                     taker_negative_rebate_u128 as u64
                 };
-                taker_state.collateral_quote_lots = taker_state
-                    .collateral_quote_lots
-                    .checked_add(neg_rebate_u64)
-                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                if taker_pos_isolated {
+                    let p = &mut ctx.accounts.taker_position;
+                    p.collateral_quote_lots = p
+                        .collateral_quote_lots
+                        .checked_add(neg_rebate_u64)
+                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                } else {
+                    let s = &mut ctx.accounts.taker_trader_state;
+                    s.collateral_quote_lots = s
+                        .collateral_quote_lots
+                        .checked_add(neg_rebate_u64)
+                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                }
             }
         }
         // Maker receives rebate (positive `maker_rebate_bps` path) OR
@@ -2833,18 +2860,35 @@ pub mod flash_book {
         // exclusive: at most one of `maker_rebate` / `maker_fee` is
         // non-zero per the sign split above.
         {
-            let maker_state = &mut ctx.accounts.maker_trader_state;
             if maker_rebate > 0 {
-                maker_state.collateral_quote_lots = maker_state
-                    .collateral_quote_lots
-                    .checked_add(maker_rebate)
-                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                if maker_pos_isolated {
+                    let p = &mut ctx.accounts.maker_position;
+                    p.collateral_quote_lots = p
+                        .collateral_quote_lots
+                        .checked_add(maker_rebate)
+                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                } else {
+                    let s = &mut ctx.accounts.maker_trader_state;
+                    s.collateral_quote_lots = s
+                        .collateral_quote_lots
+                        .checked_add(maker_rebate)
+                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                }
             }
             if maker_fee > 0 {
-                maker_state.collateral_quote_lots = maker_state
-                    .collateral_quote_lots
-                    .checked_sub(maker_fee)
-                    .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+                if maker_pos_isolated {
+                    let p = &mut ctx.accounts.maker_position;
+                    p.collateral_quote_lots = p
+                        .collateral_quote_lots
+                        .checked_sub(maker_fee)
+                        .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+                } else {
+                    let s = &mut ctx.accounts.maker_trader_state;
+                    s.collateral_quote_lots = s
+                        .collateral_quote_lots
+                        .checked_sub(maker_fee)
+                        .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+                }
             }
         }
         // Net fee to insurance fund (per fee_contribution_bps).
