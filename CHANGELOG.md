@@ -4,6 +4,82 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0] — 2026-05-14 — Phase 2: isolated margin + sub-account trading
+
+Eight commits implementing isolated-margin end-to-end and enabling
+sub-accounts to trade through every primitive. See `docs/MARGIN_MATH.md`
+and `docs/SUB_ACCOUNT_TRADING.md` for the formal specs.
+
+### Added
+
+- **Isolated-margin Phase 2 (split risk + per-bucket routing).**
+  `matcher/risk.rs::assess_margin_split` evaluates each isolated
+  position as a singleton against its own `collateral_quote_lots`. The
+  cross set is evaluated separately against the pooled collateral.
+  Healthy iff every bucket is independently healthy. New
+  `assess_margin_unified` dispatcher wires this into all 8 trade-path
+  call sites + both liquidation health checks. Liquidator reward
+  routing now debits the per-position bucket on isolated paths.
+  `settle_funding` likewise routes per-position. New `set_position_isolated`
+  / `set_position_cross` ixs; new `migrate_position_to_trader_state_key`
+  ix. `apply_fill` fee routing for isolated positions. 5 unit + 6
+  proptests covering the bucket independence invariants.
+- **Position PDA migration to trader_state.key()-based seeds**
+  (Phase 2c). `[POS_SEED, market, wallet]` →
+  `[POS_SEED, market, trader_state]`. Sub-accounts now have distinct
+  positions per market.
+- **Sub-account trading enabled across all primitives** (Phase 2d–2f).
+  `trader_state` seeds relaxed on 18 trade-path Accounts structs;
+  `RestingOrderV2.sub_index` repurposed from `_pad`;
+  `FillEntry.maker_sub_index` + `FillBatchEvent.taker_sub_index` so
+  the sequencer can route fills correctly. `TraderStateAccount` and
+  every secondary-order state struct (`TriggerOrderAccount{,V3}`,
+  `TwapOrderAccount{,V3}`, `IcebergOrderAccount{,V3}`,
+  `JitLiquidationOfferAccount`) carry sub_index; place / execute
+  paths propagate it. Synthetic close orders in `liquidate_position_v2`
+  + `liquidate_portfolio_v2` carry the liquidatee's sub_index.
+- **`docs/MARGIN_MATH.md`** — audit-grade margin model spec with §9
+  invariants table cross-referenced to handlers + tests.
+- **`docs/SUB_ACCOUNT_TRADING.md`** — Phase 2c–2f scope, design
+  choices, what's done vs pending.
+- **6 isolated-margin proptests** in `tests/proptest_isolated.rs`,
+  2000 random cases each.
+- **3 sub-account integration tests** verifying the deposit /
+  wrong-trader-rejection / position-migration paths.
+
+### Fixed
+
+- `tests/integration.rs` hardcoded program ID aligned to
+  `declare_id!()` — unblocks all 31 integration tests (previously
+  100% failing with DeclaredProgramIdMismatch).
+
+### Documentation
+
+- `README.md` rewritten to reflect on-chain reality (continuous CLOB,
+  not FBA — the FBA / commit-reveal pieces are in the TypeScript
+  reference simulator only).
+- `docs/COMPARISON.md` rewritten with file:line-cited claims and a
+  dedicated "honest weaknesses" section.
+
+### Known gaps (documented, not fixed in this release)
+
+- Realized PnL doesn't materialise to `trader_state.collateral_quote_lots`
+  on the normal fill close path. `auto_deleverage` is the only code
+  path that materialises. Tracked in `MARGIN_MATH.md §8.1`.
+- ApplyFill's `taker_trader_state` / `maker_trader_state` accept any
+  TraderState whose `.trader` matches the order's `.trader`; the
+  handler does not verify the trader_state PDA matches
+  `[STATE_SEED, trader, &[sub_index]]`. Honest-sequencer-trust model.
+
+### Stats
+
+```
+8 commits, ~21,500 lines (mostly IDL regen + COMPARISON.md rewrite).
+cargo test -p flash-book — 186 tests pass (was 95).
+bun test — 257 tests pass.
+cargo build-sbf — clean.
+```
+
 ## [0.31.0] — 2026-05-08
 
 ### Added — multi-oracle quorum (median-of-3 + dispersion gate)

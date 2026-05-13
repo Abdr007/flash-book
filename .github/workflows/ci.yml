@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    name: Test (Bun ${{ matrix.bun }})
+  ts:
+    name: TypeScript (Bun ${{ matrix.bun }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -19,9 +19,44 @@ jobs:
         with:
           bun-version: ${{ matrix.bun }}
       - run: bun install --frozen-lockfile
-      - name: Typecheck
+      - name: Typecheck (root)
         run: bunx tsc --noEmit
+      - name: Typecheck (sdk-ts)
+        run: bun run --cwd sdk-ts typecheck
       - name: Test
         run: bun test
       - name: Run synthetic flow example
         run: bun run examples/synthetic-flow.ts
+
+  rust:
+    name: Rust on-chain program
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check -p flash-book
+      - name: Lib + integration tests
+        run: cargo test -p flash-book
+      - name: Run all proptest suites
+        run: |
+          cargo test -p flash-book --test proptest_risk
+          cargo test -p flash-book --test proptest_isolated
+          cargo test -p flash-book --test proptest_liquidation
+          cargo test -p flash-book --test proptest_new_features
+          cargo test -p flash-book --test proptest_modules
+
+  sbf:
+    name: cargo build-sbf (BPF release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Solana toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+      - name: Build SBF
+        run: cargo build-sbf --manifest-path programs/flash-book/Cargo.toml

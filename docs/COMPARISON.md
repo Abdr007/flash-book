@@ -1,422 +1,424 @@
-# Flash Book vs every modern orderbook DEX
+# Flash Book vs other perp DEXes
 
-How Flash Book compares to the state of the art (2026 Q2 snapshot).
-Updated to reflect everything shipped through wave 11 — beyond the
-wave-5 baseline this adds: bracket orders, user-managed trading vaults
-(MTM NAV), cross-margin sweep (position-aware), per-position leverage
-caps, native ADL with off-chain ranking + on-chain bankruptcy-price
-math, slashable HIP-3 deployer bond, mass cancel, GTT order expiry,
-4-mode self-trade prevention, on-chain trailing stops, native iceberg
-orders, anti-flash-crash mark-cap + whole-market OI cap, 7 keepers
-shipped in `@flash-book/bot`, view ixs for predicted funding + FLP
-quote ladder snapshot.
+Honest head-to-head against Hyperliquid, Drift v2, dYdX v4, Phoenix, GMX
+v2, and Aevo. Claims about Flash Book are backed by file:line references
+into `programs/flash-book/`; claims about competitors are sourced to
+their public docs and linked at the bottom.
+
+This document supersedes the marketing draft. The earlier version
+overclaimed "FBA Walrasian clearing" and "commit-reveal" as on-chain
+features — neither is in the on-chain program. The TypeScript simulator
+in `src/` has FBA + commit-reveal as research artifacts; the actual
+Anchor program is continuous CLOB on a hypertree. This rewrite reflects
+the on-chain reality.
 
 ## TL;DR
 
-- **Matcher**: only venue running Frequent Batch Auction (FBA) with Walrasian
-  uniform-price clearing at HFT cadence (50 ms).
-- **MEV resistance**: only venue with both **commit-reveal** AND **batched
-  matching** — sandwich attacks are mathematically impossible within a batch.
-- **Pool-backed CLOB**: only venue where the LP pool participates in its OWN
-  orderbook as a permanent maker-of-last-resort.
-- **Liquidations**: only venue with **in-loop** liquidations (resolve in the
-  same batch they're triggered in) PLUS partial-close + Dutch-reward auction
-  + per-position cooldown.
-- **LP model**: ERC-4626-style NAV vault with multi-LP shares, position-aware
-  withdraw guard. Most other venues are single-pool (GLP, FLP, JLP) or
-  no-pool (Drift, Phoenix, dYdX).
-- **Order types**: Phoenix-grade (post_only, reduce_only, IOC, JIT) on
-  the on-chain matcher; OCO, Iceberg, Trailing stop in the off-chain bot.
-- **Bot suite**: only project that ships a venue-agnostic MM bot + 4-keeper
-  suite + backtester + telemetry + smart router across V2 + V3 in the
-  same repo.
+Flash Book's defensible novelty is the **risk + liquidation engine**, not
+the matching engine.
 
-## The matrix — perp orderbook DEXes
+- **Matching:** continuous CLOB on a hypertree, no different in mechanics
+  from Hyperliquid / dYdX v4 / Phoenix.
+- **Margin:** stress-lattice (CME SPAN-style) with strict cross/isolated
+  bucket independence (Phase 2). No competitor combines both.
+- **Liquidations:** dual-source price gate + Dutch-auction reward +
+  per-position cooldown + per-bucket reward routing + JIT-liquidation
+  auction. No single competitor has all of these.
+- **Funding:** cumulative-index per-block, settled lazily on-chain.
+  Granular than Hyperliquid / dYdX / Drift hourly snapshots.
+- **Sub-accounts:** full trading via distinct Position PDAs per
+  TraderState. Phase 2c–2f.
 
-| | Hyperliquid | Drift v2 | dYdX v4 | Aevo | Phoenix | OpenBook | Vertex | Injective | **Flash Book V3** |
-|---|---|---|---|---|---|---|---|---|---|
-| Chain | own L1 | Solana | Cosmos chain | OP L2 | Solana | Solana | Arbitrum | own Cosmos | **Solana + ER** |
-| Latency | ~50 ms | ~400 ms | ~1 s | ~2 s | block | block | ~50 ms | ~600 ms | **~50 ms** |
-| Matching primitive | continuous CLOB | DLOB + JIT + vAMM | continuous CLOB | RFQ batch | atomic CLOB | continuous CLOB | CLOB + AMM | continuous CLOB | **FBA Walrasian** |
-| Within-engine MEV resistance | partial | no | partial | no | atomic only | no | no | no | **FBA + commit-reveal** |
-| Pool-backed CLOB | no | partial (vAMM) | no | no | no | no | hybrid | no | **yes (virtual FLP)** |
-| Funding cadence | 1 h | 1 h | 1 h | 1 h | n/a | n/a | 1 h | 1 h | **per-block (~10 ms)** |
-| On-chain funding settlement | no (off-chain) | no (lazy) | no (lazy) | no (lazy) | n/a | n/a | no | no | **`settle_funding` ix** |
-| Liquidation model | keeper bots | JIT + keepers | keeper bots | keeper bots | n/a | n/a | keeper bots | keeper bots | **in-loop + cooldown + Dutch reward** |
-| Partial liquidation | yes | yes | partial | no | n/a | n/a | partial | partial | **yes (Hyperliquid + Drift patterns)** |
-| Cross-margin | yes | yes | yes | yes | n/a | no | yes | yes | **stress-lattice** |
-| Insurance fund waterfall | yes (with ADL) | yes (with ADL) | yes (with ADL) | yes (with ADL) | n/a | n/a | yes | yes | **fund + ADL + governance withdraw cap** |
-| Multi-LP NAV vault | no (single GLP) | no | no | no | n/a | n/a | partial | no | **yes (ERC-4626 shares)** |
-| Position-aware FLP withdraw | n/a | n/a | n/a | n/a | n/a | n/a | partial | n/a | **yes (mark-aware)** |
-| Spot markets via same matcher | no (separate) | yes | yes | no | yes | yes | yes | yes | **yes (param recipe)** |
-| Cross-market basket orders | no | no | no | no | no | no | no | no | **yes (`place_basket_order_n`, ≤4 legs)** |
-| Multi-oracle quorum | yes | partial | yes | yes | n/a | n/a | partial | yes | **median-of-3 + dispersion gate** |
-| Real-time invariant monitor | partial | no | no | no | no | no | no | no | **`verify_market_invariants` + auto-pause** |
-| Reduce-only / IOC / JIT flags | yes | yes | yes | yes | yes | partial | partial | yes | **yes (flag bitfield)** |
-| Tiered fees | volume tiers | volume tiers | volume tiers | volume tiers | n/a | n/a | volume tiers | volume tiers | **discount + NEGATIVE-fee top tier (-20% of base)** |
-| Native on-chain trigger (SL/TP) orders | yes | partial | partial | partial | no | no | partial | partial | **yes (`place_trigger_order` + reduce_only + GTT)** |
-| Native on-chain TWAP orders | yes | no | no | no | no | no | no | no | **yes (`place_twap_order` + permissionless slice exec)** |
-| Native on-chain bracket orders (atomic OCO TP+SL) | partial | no | no | no | no | no | no | no | **yes (`place_bracket_order` — single-tx parent + 2 OCO triggers)** |
-| Native on-chain trailing stops | yes | no | no | no | no | no | no | no | **yes (`update_trailing_stop` permissionless ratchet)** |
-| Native on-chain iceberg orders | yes | no | no | no | no | no | no | no | **yes (`place_iceberg_order` + permissionless replenish)** |
-| Mass cancel (single-tx flatten) | yes | partial | partial | partial | no | no | partial | partial | **yes (`cancel_all_orders_in_market`)** |
-| GTT order expiry | yes | partial | partial | yes | no | no | partial | yes | **yes (`expires_at_slot` on every order)** |
-| Self-trade prevention modes | 4 modes | partial | partial | partial | partial | no | partial | partial | **3 modes (CancelNewest / CancelOldest / CancelBoth)** |
-| Builder codes (frontend fee share) | yes | no | no | no | no | no | no | no | **yes (`set_trader_builder` + `BuilderFeeOwedEvent`)** |
-| Referral / affiliate program | yes | no | no | no | no | no | no | no | **yes (`set_trader_referrer`, one-time-write, anti-rotation)** |
-| Multi-threshold pre-liq margin alerts | yes | partial | partial | no | no | no | no | no | **yes (3 tiers, on-chain emit per fill)** |
-| Permissionless market creation (HIP-3) | **yes** | no | no | no | no | no | no | no | **yes (`permissionless_initialize_market`, safe envelope)** |
-| HIP-3 slashable deployer bond | yes | n/a | n/a | n/a | n/a | n/a | n/a | n/a | **yes (`MarketBondAccount` + 7-day unbond delay)** |
-| Pre-launch (pre-TGE) perp markets | yes | no | no | no | no | no | no | no | **yes (`is_pre_launch` flag)** |
-| Trading rewards / points eligibility | yes (HYPE) | no | no | no | no | no | no | partial | **yes (per-fill `TradingRewardEligibleEvent`)** |
-| User-managed trading vaults (with HWM perf fee) | yes | no | no | no | no | no | no | no | **yes (`VaultAccount`, MTM NAV via market walk)** |
-| Auto-Deleverage (ADL) | yes | partial | yes | partial | n/a | n/a | partial | partial | **yes (`auto_deleverage` + bankruptcy-price math)** |
-| Per-position leverage cap | yes | no | no | no | no | no | no | no | **yes (`set_position_leverage`)** |
-| Cross-margin sweep between subaccounts | yes | yes | yes | partial | n/a | n/a | partial | yes | **yes (`sweep_collateral` — position-aware via MTM walk)** |
-| Anti-flash-crash mark sanity cap | yes | partial | partial | partial | n/a | n/a | partial | partial | **yes (`mark_change_max_bps` per-batch clamp)** |
-| Whole-market OI hard cap | yes | yes | yes | yes | n/a | n/a | yes | yes | **yes (`max_oi_base_lots`)** |
-| View: predicted funding | yes | partial | partial | partial | n/a | n/a | partial | partial | **yes (`view_predicted_funding` ix + simulate)** |
-| View: orderbook quote ladder | yes | yes | yes | yes | yes | yes | yes | yes | **yes (`view_quote_ladder` ix — deterministic re-quote)** |
-| Trader delegate / subaccount | yes | subaccounts | subaccounts | sub | n/a | n/a | partial | yes | **delegate slot (master/hot-key split)** |
-| Decentralized | mostly | yes | yes | partial | yes | yes | yes | yes | **yes** |
-| Settles to Solana mainnet | no | yes | no | no | yes | yes | no | no | **yes** |
+Where Flash Book demonstrably loses:
+- Battle-testedness (Hyperliquid has years and billions in OI).
+- Speed (Hyperliquid's in-consensus orderbook at ~70 ms median is
+  unmatched).
+- Realized PnL doesn't materialise to collateral on close (real bug,
+  documented).
 
-## What's genuinely novel about Flash Book
+## The matrix
 
-A design is novel iff no other shipped venue has the *combination*. Subsets
-exist; the union does not.
+| | Hyperliquid | Drift v2 | dYdX v4 | GMX v2 | Phoenix | **Flash Book** |
+|---|---|---|---|---|---|---|
+| Chain | own L1 (HyperBFT) | Solana | own Cosmos chain | Arbitrum | Solana | **Solana (+ MagicBlock ER target)** |
+| Consensus / block time | HotStuff variant, ~70 ms [1] | Solana, ~400 ms slot | CometBFT, ~1 s, < 2 s final [4] | Arbitrum ~250 ms | Solana | **Solana ~400 ms** |
+| Matching engine | continuous CLOB at L1 consensus [1] | DLOB (off-chain keepers) + JIT auction + vAMM [3] | continuous CLOB in validator mempool [4] | oracle-priced, pool counterparty [5] | atomic CLOB (no perps) | **continuous CLOB on hypertree** |
+| Orderbook in chain state | yes (L1) | no (keeper-maintained) | no (mempool, not consensus) | n/a | yes (transient) | **yes (`market_book` PDA)** |
+| Matching primitive | price-time priority FIFO | DLOB walk + Dutch JIT for takers | price-time FIFO | n/a | price-time FIFO | **price-time FIFO** |
+| Funding cadence | hourly settlement [2] | hourly [3] | hourly epoch, governance-tunable [4] | continuous borrow fees; funding to weak side [5] | n/a | **per-block cumulative index** |
+| Funding settlement | implicit (charged on touch) | implicit | implicit | implicit | n/a | **explicit `settle_funding` ix** |
+| Liquidation executor | HLP vault [2] | open keeper bots [6] | validators / keepers [4] | keeper bots, Chainlink [5] | n/a | **open keeper bots + JIT-offer makers** |
+| Liquidation reward | HLP captures spread [2] | per-size fee | governance-set fee | keeper fee | n/a | **Dutch auction 0% → 100% over `liquidation_auction_duration_slots`** |
+| Liquidation price gate | mark = blend of CEX prices + own book [2] | maintenance margin breach | maintenance margin breach | oracle [5] | n/a | **dual-source: worse-of(mark, oracle); refuses on stale oracle** |
+| Partial liquidation | yes | yes | yes | n/a | n/a | **yes (`requested_close_lots`)** |
+| Per-position cooldown | not documented | no | no | no | n/a | **`liquidation_cooldown_slots`** |
+| JIT-liquidation auction (open) | HLP only (single vault) | no | no | no | n/a | **`place_jit_liquidation_offer` — any maker** |
+| Cross margin | yes | yes (cross-collateral, asset weights) [6] | yes | n/a | n/a | **stress-lattice (CME SPAN-style)** |
+| Isolated margin | yes | yes | yes | n/a | n/a | **yes (Phase 2; strict bucket insulation)** |
+| Sub-accounts | yes | yes | yes | n/a | n/a | **yes (Phase 2c–2f; main + 255 sub PDAs per wallet)** |
+| Insurance fund | yes | yes | yes | n/a | n/a | **yes (`InsuranceFundAccount`)** |
+| ADL | yes (after HLP backstop) [2] | yes | yes | n/a | n/a | **yes (`auto_deleverage` ix, bankruptcy-price math)** |
+| Multi-oracle quorum | internal aggregation | partial | yes | Chainlink Data Streams | n/a | **median-of-3 + dispersion gate (`update_oracle_quorum`)** |
+| Mark price | TWAP + CEX blend [2] | oracle + DLOB | oracle + book | oracle | last trade | **EMA-blended cleared-trade prices, banded by oracle** |
+| Open source | partial (HyperEVM contracts only) | yes | yes | yes | yes | **yes** |
+| Production mainnet record | billions in OI | hundreds of millions | hundreds of millions | hundreds of millions | live | **devnet only, no audit** |
 
-### 1. Pool-backed CLOB — Virtual FLP Quoter
+## What's actually novel in Flash Book (verified against code)
 
-Closest cousins:
-- **Drift's vAMM** is virtual — no real LP capital backs it. Losses fall on
-  insurance fund + protocol.
-- **GLP / GLM / JLP** are real LP pools but counterparty-only — they don't
-  participate in any orderbook.
-- **Phoenix** is spot CLOB without any pool.
-- **Vertex** has hybrid CLOB + AMM but the AMM serves price discovery, not
-  permanent maker-of-last-resort.
+A claim is "novel" only if the combination doesn't exist on any
+shipped competitor. Subsets exist; the union does not. Every claim
+below links to the source file.
 
-Flash Book makes the FLP pool a **participant in its own book**. Real LP
-capital backs every quote level. Human MMs compete *inside* the pool's
-spread; flow MMs decline falls back to the pool at the same price.
-LPs earn (1) maker rebates from FLP fills, (2) realized PnL from FLP
-positions, (3) toxicity tax share — all flowing into NAV automatically
-across multi-LP shares.
+### 1. Isolated-margin with strict bucket independence
 
-### 2. FBA Walrasian clearing at HFT cadence
+`programs/flash-book/src/matcher/risk.rs:assess_margin_split` partitions
+a trader's positions into a cross bucket and per-position isolated
+buckets. The trader is healthy iff EVERY bucket is independently
+healthy. A fat cross pool cannot rescue an under-collateralised
+isolated position (test:
+`isolated_unhealthy_when_underfunded_even_if_cross_pool_huge`), and an
+isolated failure cannot bleed into the cross set
+(`cross_set_protected_when_isolated_fails`).
 
-Closest cousins:
-- **CowSwap** is FBA but slow (per-block on Ethereum, 12 s).
-- **Penumbra** is batch swap with shielded orders, Cosmos-native, not perp.
-- **Phoenix** is atomic continuous matching, not FBA.
-- **IEX** has a 350μs speed bump but is continuous after that.
+This is stricter than Drift's isolated margin, which permits
+cross-collateral spillover in some paths. Hyperliquid's isolated margin
+is similar in concept but the bucket math isn't formally documented.
+Flash Book's spec lives in `docs/MARGIN_MATH.md` with proptest coverage
+(`tests/proptest_isolated.rs`, 6 properties × 2000 cases each).
 
-Flash Book runs Walrasian clearing every 50 ms. The 240× cadence advantage
-over CowSwap is what makes it competitive with continuous CLOBs while
-preserving FBA's mathematical MEV neutrality (no within-batch frontrunning;
-all fills clear at the same price).
+### 2. Stress-lattice margin
 
-### 3. Sub-100 ms commit-reveal
+`risk.rs:assess_margin` evaluates every margin check against a finite
+scenario lattice (flat + per-market ±2/5/10/20% + all-up/down 10% +
+black-swan ±30%). The worst-case loss drives the maintenance
+requirement.
 
-No deployed perp DEX uses commit-reveal at all. Closest analogue: Flashbots
-sealed-bid auctions (12 s on Ethereum). Flash Book runs 50 ms commit + 50 ms
-reveal = 100 ms total. Imperceptible to humans, devastating to MEV searchers.
+CME SPAN does this with hundreds of scenarios; Flash Book uses 13. The
+math is in `docs/MARGIN_MATH.md §4`.
 
-### 4. In-loop liquidations + Dutch reward auction + cooldown
+No other on-chain perp DEX I can find does this. Hyperliquid uses
+linear haircuts. dYdX uses tier-based margin per market. Drift uses
+risk buckets.
 
-Every other venue uses external keeper bots. Drift's "JIT auction" gets
-closest — MMs Dutch-auction over user orders — but liquidations themselves
-are still keeper-driven first-to-confirm-wins. Flash Book has THREE layers:
+### 3. Dual-source liquidation price gate
 
-1. **In-loop**: matcher injects the close order into the SAME batch that
-   detected the unhealthy state. No external race.
-2. **Dutch reward auction**: when keepers DO call `liquidate_position`,
-   the reward scales 0% → 100% over `liquidation_auction_duration_slots`
-   (typical 8–16 slots). Spreads keeper participation across slots.
-3. **Per-position cooldown**: same position can't be liquidated twice
-   within `liquidation_cooldown_slots`. Anti-cascade.
-4. **Partial liquidation**: keeper specifies size; chain validates ≤
-   position size. Hyperliquid pattern — avoids over-closing traders who
-   only briefly dipped under maintenance.
-5. **Liquidator reward** from liquidatee collateral (capped). Drift/dYdX
-   tip-based incentive for a competitive keeper pool.
+`lib.rs:5222-5244`. For each liquidation health check, picks
+`min(mark, oracle)` for long positions, `max(mark, oracle)` for short
+positions. A fresh oracle move can tip a position underwater without
+waiting for `settle_mark`. Plus oracle-staleness gate at `lib.rs:5202`
+refuses to liquidate when the oracle is stale.
 
-### 5. Continuous per-block funding + on-chain settlement
+GMX uses oracle alone (with Chainlink Data Streams). Most CLOB venues
+use mark alone. The dual-source picking is genuinely different.
 
-Hyperliquid, dYdX, Drift, Aevo, GMX all use ≥ 1-hour funding cadence,
-settled lazily off-chain or only when positions touch. Per-block funding
-is technically possible on any chain but economically unjustifiable when
-each tx costs gas. ER's free compute makes it feasible.
+### 4. Open JIT-liquidation auction
 
-Flash Book additionally adds an explicit **`settle_funding` instruction**:
-funding actually moves into trader collateral on-chain rather than
-implicit accrual that requires position-touch to realize. A keeper sweep
-keeps stale positions current.
+`lib.rs::place_jit_liquidation_offer`. Any maker pre-commits a tighter
+close price for a specific or wildcard underwater trader. When
+`liquidate_position_v2` fires and a JIT offer beats the synthetic
+`oracle ± liq_penalty_bps` price, the close fills at the JIT price.
 
-### 6. Stress-lattice cross-margin
+Hyperliquid's HLP backstop is conceptually similar — a vault always
+ready to absorb underwater positions — but it's one entity. Flash
+Book's JIT offers are open and competitive. Multiple makers can post
+offers simultaneously; the best price wins per fill.
 
-Hyperliquid uses linear haircuts with cross-asset recognition. dYdX uses
-tier-based margin per market. Mango uses health ratio. Drift uses risk
-buckets.
+Caveat: opportunistic, not always-on. If no JIT bids exist, Flash Book
+falls back to synthetic close at `oracle ± liq_penalty`. HLP, being
+always-funded LP capital, is structurally more reliable in tail events.
 
-Flash Book evaluates the portfolio under a finite set of correlated stress
-scenarios. Hedged positions collapse to zero directional risk in every
-scenario, leaving only maintenance margin on stressed notional. Borrowed
-from CME SPAN — simpler (45 scenarios vs SPAN's hundreds).
+### 5. Per-bucket Dutch reward routing (Phase 2)
 
-### 7. Multi-LP NAV vault (ERC-4626-style)
+`lib.rs:5495-5547` (verified — I edited this in Phase 2). The
+Dutch-auction liquidator reward scales 0% → 100% over
+`liquidation_auction_duration_slots`. When the target position is
+isolated, the reward debits `position.collateral_quote_lots` (the
+per-position bucket). The cross pool is never touched.
 
-Other DEXes:
-- **GLP / GLM / JLP** are single-pool with mint/burn at oracle index price.
-  Late depositors don't dilute (they buy in at fair NAV) but it's not a
-  share-based system.
-- **Drift** doesn't have an LP pool for the orderbook side.
-- **Phoenix** has no LP pool.
+This is the practical payoff of the strict bucket independence: a
+trader's isolated-position liquidation cannot drain the collateral
+backing their other positions.
 
-Flash Book has per-LP `LpPositionAccount` PDAs holding shares of total
-`lp_shares_outstanding`. NAV = `total_capital + realized_pnl`. Maker rebates,
-realized PnL, and toxicity-tax shares all flow into NAV automatically;
-LPs benefit pro-rata. Withdraws burn shares for proportional NAV claim.
+### 6. Per-position cooldown
 
-### 8. Toxicity tax routed to MAKERS, not the protocol
+`lib.rs:5184-5189`. Same position cannot be liquidated twice within
+`liquidation_cooldown_slots`. Anti-cascade primitive — prevents a
+liquidator from re-firing on a position that briefly recovered and
+dipped again.
 
-Most venues that compute a VPIN-like toxicity signal use it for spread
-widening (the FLP quoter does this too) but don't route value back. We
-do both:
+Standard in CEX matching engines. Less standard on-chain — I can't find
+this in Drift / dYdX / GMX source.
 
-1. The taker pays a toxicity tax on top of the regular fee, scaled by the
-   current VPIN.
-2. The tax is split between the insurance fund (resilience) and the maker
-   (compensation for absorbing toxic flow).
+### 7. Funding routes per bucket (Phase 2)
 
-This is structurally important: it makes maker-side compensation match the
-adverse-selection cost they bear. Maker yield rises specifically during
-high-VPIN periods, which is when MMs would otherwise pull back.
+`lib.rs::settle_funding`. Funding owed by or received on an isolated
+position now moves between the per-position bucket and the protocol,
+not the trader's pooled `trader_state.collateral_quote_lots`. Cross
+positions settle to the pool as before. Same isolation principle as
+the liquidation reward routing.
 
-### 9. Cross-market basket orders with joint margin gate
+### 8. Sub-accounts with distinct positions
 
-`place_basket_order` (2-leg explicit) and `place_basket_order_n` (≤4 legs
-via `remaining_accounts`). Both run a SINGLE cross-market stress-lattice
-gate against the projected post-leg state. The cross-margin hedge benefit
-materializes natively — a long-short basket sees reduced required margin
-in correlated stress scenarios, mirroring the existing `liquidate_portfolio`
-cross-margin recognition.
+Phase 2c migrated Position PDAs from `[POS_SEED, market, wallet]` to
+`[POS_SEED, market, trader_state_pda]`. Main and sub-accounts now have
+distinct positions per market — the prerequisite for risk isolation.
 
-No other Solana orderbook DEX has this. Hyperliquid has bracket orders
-(child orders triggered by parent fill) but not single-tx multi-market
-basket placement with joint risk evaluation.
+Phase 2d relaxed `trader_state` seeds on the trade-path Accounts
+structs so sub-accounts can drive deposit / withdraw / liquidate / ADL
+/ settle-funding / set-margin-mode / basket-place.
 
-### 10. Position-aware FLP withdraw
+Phase 2e added a `sub_index: u8` to `RestingOrderV2` (repurposing the
+prior `_pad` byte, layout-compatible), and to `FillEntry` /
+`FillBatchEvent`. The sequencer reads sub_index to route ApplyFill
+correctly.
 
-Most LP-pool DEXes block withdrawals if the pool has open exposure (or
-allow them and let the pool become undercollateralized — silent risk).
-Flash Book walks `remaining_accounts` of all active markets, computes
-gross exposure at current marks, and requires post-withdraw NAV ≥ gross
-exposure. LPs can withdraw safely while the pool carries positions, up
-to the point where remaining capital still covers all open exposure.
+Phase 2f threaded sub_index through trigger, TWAP, iceberg, bracket,
+and JIT-offer state structs so every secondary order primitive routes
+fills correctly. Spec: `docs/SUB_ACCOUNT_TRADING.md`.
 
-### 11. Real-time invariant monitor + kill switch
+Hyperliquid and Drift both have sub-accounts. The differences:
 
-`verify_market_invariants` (permissionless) checks documented solvency
-invariants (S5: OI balance, with S4/S12/S14 plumbed for follow-up) and
-auto-flips the market to `Paused` on breach. Off-chain monitors page
-operators on the emitted `InvariantBreachDetectedEvent`. No comparable
-on-chain primitive on any other DEX — most rely on off-chain monitoring
-and manual response.
+- Flash Book's strict bucket independence at the risk-math level is
+  stronger than Drift's.
+- Flash Book's sub-account TraderStates have INDEPENDENT positions per
+  market (Option B from `SUB_ACCOUNT_TRADING.md §2`), so isolated
+  risk strategies are mechanically guaranteed at the PDA level, not
+  just at the bookkeeping level.
 
-### 12. Multi-oracle quorum
+## Math: where Flash Book is genuinely sound
 
-`update_oracle_quorum` accepts 3 prices, takes the median, rejects if
-the dispersion exceeds `oracle_quorum_max_dispersion_bps`. Hyperliquid
-runs an internal oracle aggregation; Pyth itself uses publisher quorum.
-Flash Book brings the quorum check to the consumer side — even with a
-single Pyth feed, additional sources can be wired by the operator.
+### Stress lattice (`risk.rs::assess_margin`)
 
-### 13. Native trigger + TWAP orders that survive bot downtime
+```
+equity      = collateral + Σ unrealized_pnl(P, mark) − Σ funding_owed(P, mark)
+required    = max_{σ ∈ scenarios}  Σ_P  loss(P, stressed(P, σ)) + mm(P, stressed(P, σ))
+is_healthy  = equity ≥ required
+```
 
-Hyperliquid is the only other venue where stop-loss and TWAP orders live
-on-chain (most DEXes leave them as off-chain bot logic — your stop fires
-ONLY if your bot is online). Flash Book matches this: `place_trigger_order`
-and `place_twap_order` create durable PDAs; permissionless keepers
-(`execute_trigger_order` / `execute_twap_slice`) fire them when the
-condition is met. Trigger orders support reduce-only + expiry. TWAPs
-slice into time-spaced limit orders at a capped price. Both gracefully
-handle the final-slice residual to preserve `min_base_lots` invariants.
+Saturating arithmetic at every step; clamps to `i128` boundaries before
+final cast. Implemented in integer math; no floats. 6 risk proptests +
+6 isolated proptests × 2000 random cases each prove the invariants in
+`docs/MARGIN_MATH.md §9`.
 
-### 14. HIP-3 + Flash V2's pool backing — the synthesis
+### Funding (cumulative-index pattern)
 
-Hyperliquid's HIP-3 is the gold standard for permissionless market
-deployment: anyone stakes HYPE, deploys a market, earns fees forever.
-Flash Book matches the deployment surface (`permissionless_initialize_market`,
-caller becomes creator + earns `creator_share_bps` of net fee) but
-backs it with Flash V2's pool model — every quote level is real LP
-capital, not a vAMM or a virtual book. The result: anyone can list a
-market, the FLP backstops liquidity from day one, and the deployer
-earns alongside the LPs and protocol.
+`matcher/funding.rs::funding_owed`. Per-block `cum_funding_index`
+advances; on settlement, `owed = (cum_funding_now -
+cum_funding_at_entry) * notional`. Same pattern as Compound/Aave
+interest accrual — exact, no drift. Hourly snapshots
+(HL/dYdX/Drift) approximate this.
 
-The on-chain safe envelope (max 20× leverage, fees in [10, 200] bps,
-maint margin ≥ 2%, ≤1% of FLP per trader, etc.) prevents the obvious
-griefing attacks that other "permissionless" venues quietly enable.
+### Tiered MMR (Hyperliquid-pattern)
 
-### 15. Builder codes + negative-fee top tier — making professional flow profitable
+`matcher/risk.rs::tiered_mmr_bps`. Per-market tier table maps
+`(min_notional, mmr_bps)` ascending. Effective MMR is the largest
+tier's `mmr_bps` whose `min_notional ≤ position.notional`. Whales
+on big positions get charged higher maintenance margin. Sort order
+enforced at write-time in `lib.rs::init_market_leverage_tiers`.
 
-Builder codes (`set_trader_builder`): a frontend/aggregator earns up to
-the user's approved cap (`builder_max_fee_share_bps`) per fill. Trader
-signs the install — protocol authority cannot install a builder against
-the user's will (anti-rug). HL parity.
+### Multi-oracle quorum (`lib.rs::update_oracle_quorum`)
 
-Negative-fee top tier: `set_trader_fee_tier` accepts up to 12_000 bps
-(120%). Values > 10_000 enable rebates *to the taker* — the protocol
-pays the top-volume MMs out of its own insurance contribution (never
-from maker rebates, never overdrawing insurance). Direct port of the
-HL VIP / MM-pro tier model. Backward-compatible: 0..10_000 still works
-as a positive-fee discount.
+3 prices in, median out. Rejects if `(max - min) / median >
+oracle_quorum_max_dispersion_bps`. Conservative aggregation: takes the
+max confidence interval of any input as the accepted confidence. Plus
+oracle-staleness gates in `liquidate_position_v2:5202` and
+`auto_deleverage`.
 
-## Where Flash Book is NOT first
+## Trading speed — head to head
 
-Honest about what's not novel:
+| Venue | Effective trading latency |
+|---|---|
+| **Hyperliquid** | ~70 ms median, < 500 ms p99 [1] — in-consensus orderbook |
+| **Phoenix** | one Solana slot (~400 ms) — atomic CLOB |
+| **Drift v2** | ~5 s for JIT-auction path (deliberate Dutch window) [3] |
+| **dYdX v4** | ~1 s block, < 2 s finality [4] — orderbook in mempool, fills hit consensus |
+| **Flash Book (Solana base)** | one Solana slot (~400 ms) for limit orders; same for taker walk |
+| **Flash Book (MagicBlock ER target)** | depends on ER validator; targeted 10–50 ms but unverified in production on this branch |
 
-- **VPIN** has been used in HFT firms since 2012 (Easley et al.). Applying
-  it on-chain inside a matcher is novel; the metric itself isn't.
-- **Avellaneda-Stoikov inventory model** is from 2008. Used here as the
-  FLP quoter basis.
-- **Walrasian clearing** is from 1874. FBA at HFT cadence: Budish 2015.
-- **Cumulative-index interest accrual** is the Compound/Aave pattern.
-- **Insurance fund + ADL waterfall** is standard CEX practice (BitMEX
-  2018) ported to DEX context (Hyperliquid, dYdX, Drift).
-- **Reduce-only / IOC / FOK** order types are decades-old TIF semantics
-  from FIX gateways.
-- **OCO / Iceberg / Trailing stop** are commodified CEX features.
-- **JIT auction** for taker orders is Drift's (and Robinhood's) pattern.
-- **Subaccount delegation** is Hyperliquid + dYdX standard.
+Hyperliquid is the only venue running an in-consensus orderbook at
+sub-100 ms. Their architectural choice (HyperBFT custom L1) is what
+makes that possible — every place / cancel / fill is a L1 transaction
+[1].
 
-The novelty is the **synthesis** — combining all these into one matcher,
-on one rollup, with the bot/keeper/backtester suite + smart router that
-ships *with* the protocol.
+Flash Book's hot path on Solana base layer is bounded by Solana slot
+time. The MagicBlock ER delegation path could be competitive but needs
+the ER validator to be running.
 
-## Bot + ops suite — vs other DEXes
+## Smoothness — fill UX
 
-Most DEXes ship the protocol and let market makers build their own bots.
-Flash Book ships:
+For takers, the experience matters more than raw block time:
 
-| Component | Hyperliquid | Drift v2 | dYdX v4 | **Flash Book** |
-|---|---|---|---|---|
-| Reference MM bot | community | community | community | **`@flash-book/bot` ships** |
-| Multi-market quoting in one process | community | community | community | **`MultiMarketBot`** |
-| Quote diffing (skip re-quote on small moves) | community | community | community | **per-market `priceDiffBps`** |
-| Backtester (replay tape through strategy) | community | community | community | **`Backtester` class** |
-| Liquidation keeper | open-source | open-source | open-source | **`LiquidationKeeper` ships** |
-| Funding sweep keeper | n/a (lazy) | n/a (lazy) | n/a (lazy) | **`FundingKeeper` ships** |
-| Invariant monitor keeper | community | community | community | **`InvariantMonitor` ships** |
-| ATA cleanup keeper | n/a (no SPL ATA) | community | n/a | **`AtaCleanupKeeper` ships** |
-| ADL keeper | n/a (centralized) | community | community | **`AdlKeeper` ships (off-chain ranking, on-chain eligibility)** |
-| Trailing-stop ratchet keeper | n/a (in MM bot) | community | community | **`TrailingStopKeeper` ships** |
-| Iceberg replenishment keeper | n/a (in MM bot) | community | community | **`IcebergKeeper` ships** |
-| Keeper auto-discovery | community | community | community | **`getProgramAccounts` scanner ships** |
-| Multi-venue smart router | community | community | community | **`SmartRouter` (V2+V3)** |
-| Telemetry (Prometheus) | community | community | community | **`MetricsRegistry` + push** |
-| Hot config reload | community | community | community | **`HotConfigReloader`** |
-| Advanced order types (OCO/Iceberg/Trailing) | community | partial | community | **NATIVE on chain + bot-side `OcoOrder`/`IcebergOrder`/`TrailingStopOrder` for cross-venue** |
+- **Hyperliquid:** no off-chain step. Order in, fill out, no auction
+  wait. Smoothest UX.
+- **Drift:** deliberate 5 s JIT auction window — MMs Dutch-bid the
+  fill price. Trader gets a better fill on average but waits.
+- **dYdX:** orderbook is in mempool; fills happen mid-block; finality
+  ~1 s.
+- **Flash Book:** `place_taker_order_v2` walks the book and produces
+  fills in the same tx (one Solana slot). Comparable to Phoenix /
+  Manifest pattern.
+- **GMX:** oracle keeper round-trip; minutes-to-seconds depending on
+  congestion. Smoothest pool-only experience but no real orderbook.
 
-Flash Book is the only protocol where every box above is shipped first-party,
-audited together, and tested against the on-chain state machine in the same
-CI.
+## Liquidation — head to head
 
-## CEX comparison — feature parity
+| Property | HL | Drift | dYdX v4 | GMX | **Flash Book** |
+|---|---|---|---|---|---|
+| Trigger condition | maintenance margin breach [2] | maintenance margin breach [6] | maintenance margin breach [4] | oracle [5] | **stress-lattice margin breach + dual-source price** |
+| Executor | HLP vault [2] | open keepers | validators | keepers | **open keepers + JIT makers** |
+| Partial close | yes | yes | yes | n/a | **yes** |
+| Reward to executor | HLP captures spread [2] | flat fee per size | governance-set fee | flat fee | **Dutch auction 0% → 100%** |
+| Per-position cooldown | not documented | no | no | n/a | **yes** |
+| ADL trigger | HLP backstop fails [2] | insurance fund deficit | insurance fund deficit | n/a | **insurance fund below pause threshold** |
+| Reward routing on isolated positions | not strict | not strict (can touch cross) | n/a | n/a | **strict per-position bucket (Phase 2)** |
+| Stale-oracle refusal | not documented | not documented | not documented | n/a | **yes (`lib.rs:5202`)** |
 
-How does Flash Book stack up against the major centralized exchanges traders
-already know?
+**Where Hyperliquid wins:** HLP is a dedicated liquidator vault with
+real LP capital backing every liquidation. Flash Book's JIT-offer
+auction is open and competitive, but opportunistic — if no JIT bids
+exist, the protocol falls back to synthetic close which can leave
+the insurance fund holding more bag than HLP's design.
 
-| Feature | Binance / OKX / Bybit / Coinbase | **Flash Book** |
+**Where Flash Book wins:** the dual-source price gate, per-bucket
+reward routing, and per-position cooldown collectively give a more
+adversarial-test-tight liquidation surface. HL's HLP is a stronger
+backstop in tail events; Flash Book's plumbing is more rigorous in
+normal operation.
+
+## Where Flash Book is honestly weaker
+
+These are not in earlier marketing docs but are real:
+
+### 1. Realized PnL doesn't materialise on close
+
+`apply_fill_to_position` (lines 11035-11115) updates
+`pos.realized_pnl_quote_lots` on close. No code path drains it into
+`trader_state.collateral_quote_lots` or `pos.collateral_quote_lots` on
+the normal fill path. The only code path that materialises realized
+PnL into a collateral bucket is `auto_deleverage`, which writes
+directly to `trader_state.collateral_quote_lots`.
+
+Consequence: closing a profitable position via the normal fill path
+does NOT credit the trader's spendable collateral. The trader sees
+`realized_pnl_quote_lots` rise on the position, but
+`trader_state.collateral_quote_lots` is unchanged, and `withdraw_collateral`
+guards stress against `trader_state.collateral_quote_lots` alone.
+
+This is a **real bug**, documented in `docs/MARGIN_MATH.md §8.1`. The
+fix is a focused commit: either a `settle_realized_pnl(P)` ix that
+drains `pos.realized_pnl_quote_lots` into the correct bucket, or
+folding the materialisation directly into `apply_fill_to_position`
+(which requires passing trader_state into every call site).
+
+Hyperliquid, dYdX, and Drift all materialise PnL on close.
+
+### 2. No HLP-equivalent backstop vault
+
+The FLP pool participates in its own orderbook as a maker (per the
+virtual FLP quoter design), but it isn't a dedicated liquidator vault
+that always backstops underwater positions. The JIT-liquidation auction
+primitive is the closest substitute — any maker can pre-commit a
+tighter close price — but it's opportunistic, not always-on.
+
+In a tail event with no JIT bids, Flash Book falls back to synthetic
+close at `oracle ± liq_penalty_bps`. The insurance fund covers
+shortfall after that. HLP's design is more reliable in tail events
+because it's always capitalised.
+
+### 3. Sub-account fill routing trusts the off-chain sequencer
+
+Phase 2d relaxed the `seeds = [...]` constraint on `taker_trader_state`
+and `maker_trader_state` in `ApplyFill`. The off-chain sequencer chooses
+which TraderState to pass.
+
+The handler enforces `trader_state.trader == order.trader` (Phase 2d),
+which catches a malicious sequencer trying to route fills to a
+different wallet. It does NOT verify
+`trader_state.key() == find_pda([STATE_SEED, order.trader, &[order.sub_index]])`,
+which would catch a malicious sequencer trying to mis-route within the
+same wallet (e.g., route a sub_index=1 order's fill to the main
+TraderState).
+
+For an honest sequencer this is fine. For a hostile sequencer it's a
+1-byte routing attack surface. A future commit can close this by
+adding the PDA-derivation check to the ApplyFill handler.
+
+### 4. No proven mainnet record
+
+Hyperliquid has billions in OI and years of real-world liquidation
+events. Flash Book has 186 unit + proptest assertions and 34
+on-chain integration tests on devnet. Math being correct in isolation
+is not the same as math being correct under adversarial economic
+conditions with real money.
+
+### 5. No on-chain FBA / Walrasian clearing
+
+The TypeScript reference simulator in `src/` implements FBA with
+Walrasian uniform-price clearing. The on-chain Anchor program does NOT.
+`place_taker_order_v2` is a standard CLOB walk — best-price-first,
+match each maker at the maker's price, FIFO at each price level. This
+is the same as Hyperliquid, dYdX, and Phoenix mechanically.
+
+The `batch_interval_ms` market parameter exists, but it's a bookkeeping
+period for mark TWAP and funding accrual, not an FBA clearing window.
+There is no clearing-price solver in the on-chain code.
+
+Implementing actual on-chain FBA would require:
+- Buffer all `place_*_order` arrivals over `batch_interval_ms`
+- Solve for the demand/supply intersection (uniform clearing price)
+- Clear all matched orders at the uniform price
+
+That's a substantial refactor of `place_limit_order_v2` /
+`place_taker_order_v2` and is not planned for this branch.
+
+### 6. No on-chain commit-reveal
+
+Same story. The TS simulator has `commit-reveal.ts`. The Anchor program
+has no commit / reveal accounts or state. `grep -rn
+'commit_reveal\|sealed_bid' programs/flash-book/src/` returns zero
+hits.
+
+## What this means for "fast and smooth + best liquidations"
+
+The fair scoreboard:
+
+| Dimension | Best | Why |
 |---|---|---|
-| Sub-block matching latency | yes (microseconds) | **yes (~50 ms FBA cadence)** |
-| Limit / market / IOC / FOK / Post-only | yes | **yes (flag bitfield)** |
-| OCO / Iceberg / Trailing stop | yes | **yes (off-chain bot)** |
-| Reduce-only | yes | **yes** |
-| Cross-margin / portfolio margin | yes | **yes (stress-lattice)** |
-| Subaccounts | yes | **delegate slot (foundation)** |
-| Tiered fees by 30-day volume | yes | **yes (off-chain volume + on-chain `set_trader_fee_tier`)** |
-| Maker rebates | yes | **yes (+ JIT bonus)** |
-| MEV-resistant matching | yes (centralized) | **yes (FBA + commit-reveal)** |
-| Insurance fund | yes | **yes (with governance withdraw cap)** |
-| Live PnL / position UI | yes | (separate `flash-ui` repo) |
-| Volume rebates | yes | **yes (off-chain tier table → `set_trader_fee_tier` on-chain, with negative-fee top tier)** |
-| Custody | centralized (counterparty risk) | **non-custodial (you sign)** |
-| Permissionless market creation | no | **yes (HIP-3-style: `permissionless_initialize_market` with safe envelope)** |
-| Pre-TGE perp listings | partial | **yes (`is_pre_launch` flag, governance-set oracle)** |
-| Native stop-loss / TWAP that survive bot downtime | yes | **yes (on-chain `TriggerOrderAccount` + `TwapOrderAccount`)** |
-| Frontend revenue share / builder codes | n/a | **yes (`set_trader_builder` + `BuilderFeeOwedEvent`)** |
-| Referral / affiliate program | yes | **yes (`set_trader_referrer`, one-time-write)** |
-| Trading-rewards / points eligibility (HYPE-style) | n/a (token rewards) | **yes (per-fill `TradingRewardEligibleEvent`)** |
-| Open-source matcher | no | **yes (this repo)** |
-| Open-source MM bot | no | **yes (`@flash-book/bot`)** |
+| **Raw speed** | Hyperliquid | ~70 ms in-consensus orderbook is genuinely unmatched |
+| **Trading smoothness** | Hyperliquid > Drift > Flash Book | HL has no off-chain step; Drift's JIT is clean UX; Flash Book depends on ER latency in practice |
+| **Liquidation math** | **Flash Book** (after Phase 2) | Stress-lattice + dual-source price + isolated bucket strict insulation + JIT auction + per-position cooldown |
+| **Liquidation tail-event reliability** | Hyperliquid | HLP is always-on; Flash Book's JIT auction is opportunistic |
+| **Funding math** | Flash Book | Cumulative-index per-block beats hourly snapshots IF the settle keeper runs |
+| **Margin model rigor** | Flash Book | Stress lattice + isolated bucket independence is more formally defined than competitors |
+| **Battle-testedness** | Hyperliquid | No contest |
+| **Open-source auditability** | Flash Book / Drift (tie) | Both fully open; both at similar audit cost |
 
-The CEX UX features — order types, fee tiers, hot reload, telemetry —
-are all there. What you GAIN by going on-chain: non-custodial,
-MEV-neutral matching, audited matcher, open keeper economics, and a
-reference bot you can fork.
+**Where Flash Book is most defensible** is in liquidation correctness —
+the Phase 2 work (split risk, per-bucket reward routing,
+`settle_funding` routing, sub-account isolation) collectively makes it
+one of the most rigorously-bucketed liquidation engines on any
+DEX, with formal math in `MARGIN_MATH.md` and proptest coverage. That's
+the strongest defensible claim.
 
-## Why this matters for Flash Trade
+**Where Flash Book loses today** is raw speed (Solana slot floor), real
+mainnet exposure (devnet only), and tail-event backstop strength (no
+HLP equivalent).
 
-Flash V2 today is a pool-only oracle-priced perp protocol. As volume
-scales, two structural problems compound:
+## Sources
 
-1. **Toxic flow eats the pool.** Informed traders pick off the pool when
-   oracle lags reality. The pool's defenses (spread, OI fees, funding) are
-   blunt. LP yield decays.
-2. **No real price discovery.** Without an orderbook, Flash has no native
-   price discovery — it's a price-taker of Pyth. Pyth bugs or manipulation
-   propagate directly.
+[1] [Hyperliquid Architecture Deep Dive — CleanSky](https://cleansky.io/blog/hyperliquid-architecture-hypercore-hyperevm-2026/)
+[2] [Hyperliquid Liquidations docs](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/liquidations)
+    [Hyperliquid Margining docs](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/margining)
+[3] [Inside Drift: Architecting a High-Performance Orderbook on Solana — Yong kang Chia](https://extremelysunnyyk.medium.com/inside-drift-architecting-a-high-performance-orderbook-on-solana-612a98b8ac17)
+[4] [dYdX v4 Architecture Overview — dydx.xyz blog](https://www.dydx.xyz/blog/v4-technical-architecture-overview)
+[5] [GMX V2 Trading docs](https://docs.gmx.io/docs/trading/v2/)
+[6] [Drift Protocol — Liquidations docs](https://docs.drift.trade/protocol/trading/liquidations)
+    [Drift Protocol — Liquidation Engine docs](https://docs.drift.trade/protocol/trading/liquidations/liquidation-engine)
 
-Flash Book V3 fixes both:
+## Versioning
 
-1. **MMs absorb informed flow first.** The pool only takes flow MMs decline,
-   which is structurally less profitable for MMs. By selection, the
-   remaining pool flow is more profitable for the LPs. Toxicity tax routes
-   directly to the maker who absorbed the toxic flow.
-2. **Real price discovery.** Mark price is the TWAP of actual cleared
-   trades (banded by oracle). Manipulating it requires actually clearing
-   volume — the manipulator pays for every basis point moved.
-3. **LPs scale linearly.** Multi-LP NAV vault means yield can be spread
-   across N LPs without coordination. Flash today is a single GLP-style
-   pool; Flash Book is permissionless to deposit.
-4. **Production-ready ops.** The bot + keeper + backtester + telemetry
-   suite means Flash doesn't need to wait for community tooling to ship V3.
-
-The Pareto improvement claim: retail UX is identical-or-better than today,
-LP yield is structurally higher, the protocol gains real price discovery,
-and Flash Trade gains the most advanced on-chain matcher ever shipped.
-
-## What we deliberately did NOT clone from Hyperliquid
-
-The wave-5-era exclusion list got obsoleted as we shipped the items.
-Updated honest list (still genuinely deferred or non-engineering):
-
-- **Subaccounts as a separate account type.** Achievable today via the
-  existing `delegate` slot on TraderStateAccount (master keypair holds
-  funds + delegates trading authority). Plus `sweep_collateral` (now
-  position-aware) handles cross-margin rebalance. A separate
-  SubaccountAccount type adds duplicated state and account
-  permutations for negligible UX gain — every subaccount need is
-  already coverable.
-- **HYPE-style governance token.** We emit `TradingRewardEligibleEvent`
-  per fill so any token launch can compute eligibility off-chain; the
-  token itself is a governance + tokenomics decision, not an
-  engineering one. Trading-rewards plumbing is wired.
-- **Cross-asset cross-collateral** (e.g. SOL collateral backing SOL
-  perp). Requires per-asset oracle weighting in every margin
-  computation — substantial refactor of the stress lattice. Tracked
-  for a future architectural pass.
-- **CME-style margin tier scaling** (margin requirement scales with
-  position size). We use a single per-market maintenance margin ratio
-  + the per-trader leverage cap; tier scaling would touch the
-  property-tested risk module surface. Tracked.
-- **Block-trade RFQ.** Whales can negotiate via OTC desks today and
-  settle via existing trade ixs. A native RFQ surface is mostly an
-  off-chain matching layer; on-chain primitives are already
-  sufficient.
-
-The previously-listed "deferred" items (HIP-3 bond, user vaults,
-position-specific leverage) all SHIPPED. Updates inline in the matrix
-above.
+This document reflects the on-chain protocol at commit `31c4b3a`
+("Phase 2f"). The Phase 2 series (`550624e`, `4dc8ad9`, `bd41703`,
+`6fb1e34`, `8981652`, `31c4b3a`) is what makes the isolated-margin /
+sub-account claims accurate. Earlier marketing material that mentioned
+FBA / commit-reveal as on-chain features predated this honesty pass.
