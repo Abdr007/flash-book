@@ -1815,6 +1815,9 @@ pub mod flash_book {
                     tick_size: market_acct.params.tick_size,
                     concentration_threshold_lots: market_acct.params.concentration_threshold_lots,
                     concentration_extra_mmr_bps: market_acct.params.concentration_extra_mmr_bps,
+                    side_oi_lots: 0,
+                    oi_mmr_slope_bps_per_million_lots: 0,
+                    oi_mmr_max_extra_bps: 0,
                 });
                 market_keys.push(market_ai.key());
             }
@@ -2220,6 +2223,9 @@ pub mod flash_book {
                     tick_size: market.params.tick_size,
                     concentration_threshold_lots: market.params.concentration_threshold_lots,
                     concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                    side_oi_lots: 0,
+                    oi_mmr_slope_bps_per_million_lots: 0,
+                    oi_mmr_max_extra_bps: 0,
                 });
                 market_keys.push(m_ai.key());
             }
@@ -2383,6 +2389,9 @@ pub mod flash_book {
                     tick_size: market.params.tick_size,
                     concentration_threshold_lots: market.params.concentration_threshold_lots,
                     concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                    side_oi_lots: 0,
+                    oi_mmr_slope_bps_per_million_lots: 0,
+                    oi_mmr_max_extra_bps: 0,
                 });
                 market_keys.push(m_ai.key());
             }
@@ -2413,6 +2422,9 @@ pub mod flash_book {
             tick_size: target_market.params.tick_size,
             concentration_threshold_lots: target_market.params.concentration_threshold_lots,
             concentration_extra_mmr_bps: target_market.params.concentration_extra_mmr_bps,
+            side_oi_lots: 0,
+            oi_mmr_slope_bps_per_million_lots: 0,
+            oi_mmr_max_extra_bps: 0,
         });
         market_keys.push(target_market_key);
 
@@ -2520,6 +2532,9 @@ pub mod flash_book {
                     tick_size: market.params.tick_size,
                     concentration_threshold_lots: market.params.concentration_threshold_lots,
                     concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                    side_oi_lots: 0,
+                    oi_mmr_slope_bps_per_million_lots: 0,
+                    oi_mmr_max_extra_bps: 0,
                 });
                 market_keys.push(m_ai.key());
             }
@@ -2548,6 +2563,9 @@ pub mod flash_book {
                 tick_size: target_market.params.tick_size,
                 concentration_threshold_lots: target_market.params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: target_market.params.concentration_extra_mmr_bps,
+                side_oi_lots: 0,
+                oi_mmr_slope_bps_per_million_lots: 0,
+                oi_mmr_max_extra_bps: 0,
             });
             market_keys.push(target_market_key);
         }
@@ -3286,20 +3304,28 @@ pub mod flash_book {
         let maker_pnl_delta = (maker_pos.realized_pnl_quote_lots as i128)
             .saturating_sub(maker_pre_realized as i128);
 
+        // Wave 24d: route positive deltas through the H-haircut reserve
+        // when the per-position haircut state is provided. Losses always
+        // debit collateral directly (loss seniority).
+        let now_slot = Clock::get()?.slot;
         if taker_pnl_delta != 0 {
-            apply_realized_pnl_delta(
+            apply_realized_pnl_delta_v2(
                 taker_pnl_delta,
                 taker_pos_isolated_for_pnl,
                 &mut ctx.accounts.taker_position,
                 &mut ctx.accounts.taker_trader_state,
+                ctx.accounts.taker_position_haircut.as_mut(),
+                now_slot,
             )?;
         }
         if maker_pnl_delta != 0 {
-            apply_realized_pnl_delta(
+            apply_realized_pnl_delta_v2(
                 maker_pnl_delta,
                 maker_pos_isolated_for_pnl,
                 &mut ctx.accounts.maker_position,
                 &mut ctx.accounts.maker_trader_state,
+                ctx.accounts.maker_position_haircut.as_mut(),
+                now_slot,
             )?;
         }
 
@@ -3517,6 +3543,16 @@ pub mod flash_book {
             );
         }
 
+        // Wave 26b — optional envelope gate. Rejects out-of-cap moves
+        // before mutating the market.
+        let now_slot = Clock::get()?.slot;
+        gate_oracle_update(
+            ctx.accounts.envelope_config.as_mut(),
+            price_ticks,
+            now_slot,
+        )?;
+
+        let market = &mut ctx.accounts.market;
         market.oracle_price_ticks = price_ticks;
         market.oracle_confidence = confidence;
         market.oracle_published_at_unix_seconds = published_at_unix_seconds;
@@ -3601,6 +3637,15 @@ pub mod flash_book {
         let combined_conf = confidences.iter().copied().max().unwrap_or(0);
         let combined_published_at = published_at_unix_seconds.iter().copied().min().unwrap_or(0);
 
+        // Wave 26b — optional envelope gate on the accepted median.
+        let now_slot = Clock::get()?.slot;
+        gate_oracle_update(
+            ctx.accounts.envelope_config.as_mut(),
+            median,
+            now_slot,
+        )?;
+
+        let market = &mut ctx.accounts.market;
         market.oracle_price_ticks = median;
         market.oracle_confidence = combined_conf;
         market.oracle_published_at_unix_seconds = combined_published_at;
@@ -3793,6 +3838,30 @@ pub mod flash_book {
         );
         require!(
             new_params.oracle_band_bps <= constants::BPS_DENOM,
+            FlashBookError::OutOfRange
+        );
+
+        // AUDIT FIX — Explicit absolute caps on margin ratios.
+        // Without these, authority could set MMR/IM to >= 100%, which
+        // would instantly mark every existing position liquidatable.
+        // 5000 bps (50%) is a generous ceiling — well above any plausible
+        // market parameter (BTC = 5%, exotic alt = 30% in typical CEX
+        // configs). Tighter than BPS_DENOM to prevent griefing.
+        require!(
+            new_params.maintenance_margin_ratio_bps < 5_000,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.initial_margin_ratio_bps < 5_000,
+            FlashBookError::OutOfRange
+        );
+        // Concentration extra MMR must also be bounded so MMR + extra
+        // doesn't push past 50% combined.
+        require!(
+            new_params
+                .maintenance_margin_ratio_bps
+                .saturating_add(new_params.concentration_extra_mmr_bps)
+                < 5_000,
             FlashBookError::OutOfRange
         );
 
@@ -4013,6 +4082,43 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Wave 30 — Authority burn. Permanently relinquish authority over
+    /// this market by setting `market.authority` to `Pubkey::default()`.
+    /// This is a one-way operation: once burned, no further
+    /// `update_market_params`, `set_market_status`, or
+    /// `transfer_market_authority` can succeed on this market.
+    ///
+    /// The kill-switch (`set_market_status`) is intentionally also
+    /// burned along with the rest — true progressive decentralization
+    /// means giving up the ability to pause too. Operators who need a
+    /// safety net should burn authority only AFTER the market has
+    /// proven stable for some operating period.
+    ///
+    /// Emits `MarketAuthorityBurnedEvent` as the canonical
+    /// "this market is now fully decentralised" signal — clients,
+    /// indexers, and risk monitors should treat it as a permanent
+    /// state change.
+    pub fn burn_market_authority(ctx: Context<UpdateMarketAuthority>) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        require_keys_eq!(
+            market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+        require!(
+            market.authority != Pubkey::default(),
+            FlashBookError::Unauthorized
+        );
+        let prev = market.authority;
+        market.authority = Pubkey::default();
+        emit!(MarketAuthorityBurnedEvent {
+            market: market.key(),
+            previous_authority: prev,
+            burn_slot: Clock::get()?.slot,
+        });
+        Ok(())
+    }
+
     // ─── Order intake ───────────────────────────────────────────────
 
     /// V2 2-leg basket order against the hypertree-backed book. Pure
@@ -4073,6 +4179,9 @@ pub mod flash_book {
                 tick_size: market.params.tick_size,
                 concentration_threshold_lots: market.params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                side_oi_lots: 0,
+                oi_mmr_slope_bps_per_million_lots: 0,
+                oi_mmr_max_extra_bps: 0,
             });
         }
         if !snaps.is_empty() {
@@ -4210,6 +4319,9 @@ pub mod flash_book {
                 tick_size: markets[i].params.tick_size,
                 concentration_threshold_lots: markets[i].params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: markets[i].params.concentration_extra_mmr_bps,
+                side_oi_lots: 0,
+                oi_mmr_slope_bps_per_million_lots: 0,
+                oi_mmr_max_extra_bps: 0,
             });
         }
         if !snaps.is_empty() {
@@ -4283,6 +4395,18 @@ pub mod flash_book {
         let now = Clock::get()?.slot;
         if trigger.expires_at_slot > 0 {
             require!(trigger.expires_at_slot >= now, FlashBookError::OutOfRange);
+        }
+
+        // AUDIT FIX (Wave 27c) — Oracle staleness gate on trigger
+        // execution. Without this, a stale oracle could force-fire
+        // a trigger at a price that doesn't reflect the live market,
+        // bypassing the trader's intent. Mirrors liquidate_position_v2's
+        // staleness gate.
+        let oracle_max_age = market.params.oracle_staleness_max_seconds as u64;
+        if oracle_max_age > 0 && market.oracle_published_at_unix_seconds > 0 {
+            let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            let oracle_age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
+            require!(oracle_age <= oracle_max_age, FlashBookError::OracleTooStale);
         }
 
         let oracle = market.oracle_price_ticks;
@@ -5076,6 +5200,9 @@ pub mod flash_book {
                 tick_size: market_acct.params.tick_size,
                 concentration_threshold_lots: market_acct.params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: market_acct.params.concentration_extra_mmr_bps,
+                side_oi_lots: 0,
+                oi_mmr_slope_bps_per_million_lots: 0,
+                oi_mmr_max_extra_bps: 0,
             });
             market_keys.push(market_ai.key());
         }
@@ -5343,12 +5470,18 @@ pub mod flash_book {
         // there's nothing to settle on the FLP maker side.
         let taker_pnl_delta = (taker_pos.realized_pnl_quote_lots as i128)
             .saturating_sub(taker_pre_realized as i128);
+        // Wave 24d: route positive deltas through H-haircut reserve when
+        // the per-position haircut state is provided. Losses always
+        // debit collateral directly.
+        let now_slot_flp = Clock::get()?.slot;
         if taker_pnl_delta != 0 {
-            apply_realized_pnl_delta(
+            apply_realized_pnl_delta_v2(
                 taker_pnl_delta,
                 taker_pos_isolated_for_pnl,
                 &mut ctx.accounts.taker_position,
                 &mut ctx.accounts.taker_trader_state,
+                ctx.accounts.taker_position_haircut.as_mut(),
+                now_slot_flp,
             )?;
         }
 
@@ -5537,6 +5670,9 @@ pub mod flash_book {
             tick_size: market.params.tick_size,
             concentration_threshold_lots: market.params.concentration_threshold_lots,
             concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+            side_oi_lots: 0,
+            oi_mmr_slope_bps_per_million_lots: 0,
+            oi_mmr_max_extra_bps: 0,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         // Unified dispatch: if position is isolated (pos_snap.collateral_quote_lots > 0),
@@ -6008,6 +6144,9 @@ pub mod flash_book {
             tick_size: market.params.tick_size,
                 concentration_threshold_lots: market.params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+            side_oi_lots: 0,
+            oi_mmr_slope_bps_per_million_lots: 0,
+            oi_mmr_max_extra_bps: 0,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         let assessment = assess_margin_unified_fn(
@@ -6252,6 +6391,9 @@ pub mod flash_book {
             tick_size: exec_market.params.tick_size,
             concentration_threshold_lots: exec_market.params.concentration_threshold_lots,
             concentration_extra_mmr_bps: exec_market.params.concentration_extra_mmr_bps,
+            side_oi_lots: 0,
+            oi_mmr_slope_bps_per_million_lots: 0,
+            oi_mmr_max_extra_bps: 0,
         });
         position_snaps.push(RiskPosSnap {
             market: exec_position.market,
@@ -6296,6 +6438,9 @@ pub mod flash_book {
                     tick_size: market.params.tick_size,
                     concentration_threshold_lots: market.params.concentration_threshold_lots,
                     concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                    side_oi_lots: 0,
+                    oi_mmr_slope_bps_per_million_lots: 0,
+                    oi_mmr_max_extra_bps: 0,
                 });
                 position_snaps.push(RiskPosSnap {
                     market: position.market,
@@ -6431,6 +6576,11 @@ pub mod flash_book {
         reduce_only: bool,
         expires_at_slot: u64,
         sub_index: u8,
+        // Wave 27a — slippage cap. 0 = no cap (legacy behavior).
+        // For side==0 (long buying): cap = MAX admissible oracle price
+        //   at execution time. Trigger refuses to fire if oracle > cap.
+        // For side==1 (short selling): cap = MIN admissible oracle.
+        acceptable_price_ticks: u64,
     ) -> Result<()> {
         require!(side <= 1, FlashBookError::OutOfRange);
         require!(kind <= 1, FlashBookError::OutOfRange);
@@ -6452,6 +6602,29 @@ pub mod flash_book {
             FlashBookError::PriceNotOnTick
         );
 
+        // Wave 27a: validate acceptable_price tick alignment (when set).
+        if acceptable_price_ticks > 0 {
+            require!(
+                acceptable_price_ticks % market.params.tick_size == 0,
+                FlashBookError::PriceNotOnTick
+            );
+            // Sanity: cap must sit on the "worse" side of the trigger
+            // price. A long-buy cap below the trigger would always
+            // breach (trigger fired ≥ trigger_price ≥ cap), making the
+            // trigger un-fireable. Catch the misuse at place time.
+            match side {
+                0 => require!(
+                    acceptable_price_ticks >= trigger_price_ticks,
+                    FlashBookError::OutOfRange
+                ),
+                1 => require!(
+                    acceptable_price_ticks <= trigger_price_ticks,
+                    FlashBookError::OutOfRange
+                ),
+                _ => unreachable!(),
+            }
+        }
+
         let now = Clock::get()?.slot;
         if expires_at_slot > 0 {
             require!(expires_at_slot > now, FlashBookError::OutOfRange);
@@ -6472,6 +6645,8 @@ pub mod flash_book {
         trigger.created_at_slot = now;
         trigger.expires_at_slot = expires_at_slot;
         trigger.sub_index = sub_index;
+        trigger.acceptable_price_ticks = acceptable_price_ticks;
+        trigger._reserved = [0; 8];
 
         emit!(TriggerOrderV3PlacedEvent {
             market: market.key(),
@@ -6502,6 +6677,15 @@ pub mod flash_book {
             require!(trigger.expires_at_slot >= now, FlashBookError::OutOfRange);
         }
 
+        // AUDIT FIX (Wave 27c) — Oracle staleness gate on v3 trigger
+        // execution. Same rationale as v2 path.
+        let oracle_max_age = market.params.oracle_staleness_max_seconds as u64;
+        if oracle_max_age > 0 && market.oracle_published_at_unix_seconds > 0 {
+            let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            let oracle_age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
+            require!(oracle_age <= oracle_max_age, FlashBookError::OracleTooStale);
+        }
+
         let oracle = market.oracle_price_ticks;
         let fired = if trigger.kind == 0 {
             oracle <= trigger.trigger_price_ticks
@@ -6509,6 +6693,31 @@ pub mod flash_book {
             oracle >= trigger.trigger_price_ticks
         };
         require!(fired, FlashBookError::OutOfRange);
+
+        // Wave 27a — slippage cap check. If oracle has gapped past the
+        // acceptable price, the trigger deactivates (so it doesn't
+        // re-fire at this gapped value) and emits the cancellation
+        // event. Trader can re-place if they still want to act.
+        if state_v3::TriggerOrderAccountV3::slippage_cap_breached(
+            trigger.acceptable_price_ticks,
+            trigger.side,
+            oracle,
+        ) {
+            let market_key = market.key();
+            let trader_pk = trigger.trader;
+            let trigger_id = trigger.trigger_id;
+            let acceptable_price = trigger.acceptable_price_ticks;
+            let trigger_mut = &mut ctx.accounts.trigger_order;
+            trigger_mut.flags &= !state_v3::TriggerOrderAccountV3::FLAG_ACTIVE;
+            emit!(TriggerOrderV3SlippageCancelledEvent {
+                market: market_key,
+                trader: trader_pk,
+                trigger_id,
+                oracle_price_ticks: oracle,
+                acceptable_price_ticks: acceptable_price,
+            });
+            return Err(error!(FlashBookError::TriggerSlippageExceeded));
+        }
 
         if trigger.flags & state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY != 0 {
             let position = &ctx.accounts.position;
@@ -6609,6 +6818,9 @@ pub mod flash_book {
         slot_interval: u64,
         end_slot: u64,
         sub_index: u8,
+        // Wave 27b — slippage cap, same semantics as
+        // TriggerOrderAccountV3.acceptable_price_ticks. 0 = no cap.
+        acceptable_price_ticks: u64,
     ) -> Result<()> {
         require!(side <= 1, FlashBookError::OutOfRange);
         require!(slice_size_lots > 0, FlashBookError::ZeroSize);
@@ -6625,6 +6837,28 @@ pub mod flash_book {
             slice_size_lots >= market.params.min_base_lots,
             FlashBookError::SizeBelowMinLot
         );
+
+        // Wave 27b — cap tick alignment + direction sanity.
+        if acceptable_price_ticks > 0 {
+            require!(
+                acceptable_price_ticks % market.params.tick_size == 0,
+                FlashBookError::PriceNotOnTick
+            );
+            // For a long buy, cap must be ≥ limit_price. For a short
+            // sell, cap must be ≤ limit_price. Otherwise the cap is
+            // wrong-sided and would always reject — catch at place.
+            match side {
+                0 => require!(
+                    acceptable_price_ticks >= limit_price_ticks,
+                    FlashBookError::OutOfRange
+                ),
+                1 => require!(
+                    acceptable_price_ticks <= limit_price_ticks,
+                    FlashBookError::OutOfRange
+                ),
+                _ => unreachable!(),
+            }
+        }
 
         let now = Clock::get()?.slot;
         if end_slot > 0 {
@@ -6647,6 +6881,8 @@ pub mod flash_book {
         twap.end_slot = end_slot;
         twap.last_slice_at_slot = 0;
         twap.sub_index = sub_index;
+        twap.acceptable_price_ticks = acceptable_price_ticks;
+        twap._reserved = [0; 7];
 
         emit!(TwapOrderV3PlacedEvent {
             market: market.key(),
@@ -6689,6 +6925,37 @@ pub mod flash_book {
             slice_size >= market.params.min_base_lots || slice_size == remaining,
             FlashBookError::SizeBelowMinLot
         );
+
+        // Wave 27b — slippage cap on the slice. If oracle has moved
+        // past the cap, abort this slice (but keep TWAP active for
+        // next interval). Different from triggers, which deactivate
+        // on breach — TWAPs are durable schedulers.
+        //
+        // AUDIT FIX (Wave 27c) — Only consult oracle when it's fresh.
+        // Stale oracle could bypass or trigger the slippage cap based
+        // on stale data; either is wrong. When stale, skip the slice
+        // entirely (TWAP stays active for next interval).
+        let oracle_max_age_twap = market.params.oracle_staleness_max_seconds as u64;
+        if oracle_max_age_twap > 0 && market.oracle_published_at_unix_seconds > 0 {
+            let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            let oracle_age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
+            require!(oracle_age <= oracle_max_age_twap, FlashBookError::OracleTooStale);
+        }
+        let oracle = market.oracle_price_ticks;
+        if state_v3::TriggerOrderAccountV3::slippage_cap_breached(
+            twap.acceptable_price_ticks,
+            twap.side,
+            oracle,
+        ) {
+            emit!(TwapSliceV3SlippageSkippedEvent {
+                market: market.key(),
+                trader: twap.trader,
+                twap_id: twap.twap_id,
+                oracle_price_ticks: oracle,
+                acceptable_price_ticks: twap.acceptable_price_ticks,
+            });
+            return Err(error!(FlashBookError::TriggerSlippageExceeded));
+        }
 
         let side = twap.side;
         let limit = twap.limit_price_ticks;
@@ -8153,6 +8420,14 @@ pub mod flash_book {
             FlashBookError::OracleConfidenceTooWide,
         );
 
+        // Wave 26b — optional envelope gate on the new Pyth price.
+        let now_slot = Clock::get()?.slot;
+        gate_oracle_update(
+            ctx.accounts.envelope_config.as_mut(),
+            new_ticks as u64,
+            now_slot,
+        )?;
+
         let market = &mut ctx.accounts.market;
         market.oracle_price_ticks = new_ticks as u64;
         market.oracle_confidence = price_data.conf;
@@ -8170,6 +8445,584 @@ pub mod flash_book {
         Ok(())
     }
 
+    // ─── Wave 24b — H-haircut instructions ──────────────────────────
+    //
+    // Four permissionless ix that operate on the sibling PDAs added in
+    // Wave 24a (`MarketHaircutStateAccount` + `PositionHaircutStateAccount`).
+    // Pure math lives in `matcher::haircut`; these are the on-chain
+    // surface that exposes it.
+
+    /// One-time per market: seed `MarketHaircutStateAccount` with the
+    /// configured warmup window and an initial residual. Authority-gated
+    /// because the initial residual is a trust input until automated
+    /// reconciliation lands.
+    pub fn initialize_haircut_state(
+        ctx: Context<InitializeHaircutState>,
+        h_min_slots: u64,
+        h_max_slots: u64,
+        initial_residual_quote_lots: u128,
+    ) -> Result<()> {
+        matcher::haircut::validate_market_params(h_min_slots, h_max_slots)
+            .map_err(map_haircut_error)?;
+
+        let st = &mut ctx.accounts.haircut_state;
+        st.market = ctx.accounts.market.key();
+        st.bump = ctx.bumps.haircut_state;
+        st._pad0 = [0; 7];
+        st.residual_quote_lots = initial_residual_quote_lots;
+        st.matured_pos_total_quote_lots = 0;
+        st.realized_loss_total_quote_lots = 0;
+        st.dust_accrued_quote_lots = 0;
+        st.h_min_slots = h_min_slots;
+        st.h_max_slots = h_max_slots;
+        st.h_scaled_cached = matcher::haircut::H_DENOM as u64;
+        st.h_cached_at_slot = Clock::get()?.slot;
+        st._reserved = [0; 64];
+
+        emit!(HaircutInitializedEvent {
+            market: st.market,
+            h_min_slots,
+            h_max_slots,
+            initial_residual_quote_lots,
+        });
+        Ok(())
+    }
+
+    /// Permissionless: advance a position's reserve → matured pipeline.
+    /// Anyone can call. Idempotent — calling at the same slot twice
+    /// produces a no-op on the second call.
+    ///
+    /// Refuses (errors `HaircutNothingToMature`) when nothing has
+    /// matured since the last call. This is intentional: keepers
+    /// should batch positions and only crank ones that have actually
+    /// progressed, to keep tx churn low.
+    pub fn mature_position(ctx: Context<MaturePosition>) -> Result<()> {
+        let now_slot = Clock::get()?.slot;
+        let pos_haircut = &mut ctx.accounts.position_haircut;
+        let market_haircut = &mut ctx.accounts.haircut_state;
+
+        let pre = matcher::haircut::PositionHaircutSnapshot {
+            released_reserve_quote_lots: pos_haircut.released_reserve_quote_lots,
+            released_attached_at_slot: pos_haircut.released_attached_at_slot,
+            matured_pos_quote_lots: pos_haircut.matured_pos_quote_lots,
+            original_reserve_at_attach: pos_haircut.original_reserve_at_attach,
+        };
+
+        let (post, delta) = matcher::haircut::apply_mature(
+            pre,
+            now_slot,
+            market_haircut.h_min_slots,
+            market_haircut.h_max_slots,
+        )
+        .map_err(map_haircut_error)?;
+
+        require!(delta > 0, FlashBookError::HaircutNothingToMature);
+
+        pos_haircut.released_reserve_quote_lots = post.released_reserve_quote_lots;
+        pos_haircut.released_attached_at_slot = post.released_attached_at_slot;
+        pos_haircut.matured_pos_quote_lots = post.matured_pos_quote_lots;
+        pos_haircut.original_reserve_at_attach = post.original_reserve_at_attach;
+
+        market_haircut.matured_pos_total_quote_lots = market_haircut
+            .matured_pos_total_quote_lots
+            .checked_add(delta as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        emit!(PositionMaturedEvent {
+            market: market_haircut.market,
+            position: pos_haircut.position,
+            matured_delta: delta,
+            matured_pos_after: post.matured_pos_quote_lots,
+        });
+        Ok(())
+    }
+
+    /// Permissionless: convert a position's `matured_pos` into a
+    /// collateral credit at the current `h`, with the dust accrued to
+    /// the market's haircut state (drains to insurance via
+    /// `flush_haircut_dust`).
+    ///
+    /// The credit is **NOT** moved into the trader's collateral by this
+    /// ix yet — that's Wave 24c (because the wire-in needs to touch
+    /// `apply_realized_pnl_delta` and pick the isolated/cross routing).
+    /// Wave 24b lands the math + state-only mutation surface so the
+    /// math can be exercised on-chain independently of the credit path.
+    /// `PositionConvertedEvent` carries the credit amount so keepers
+    /// and indexers can see it.
+    pub fn convert_position(ctx: Context<ConvertPosition>) -> Result<()> {
+        let pos_haircut = &mut ctx.accounts.position_haircut;
+        let market_haircut = &mut ctx.accounts.haircut_state;
+
+        require!(
+            pos_haircut.matured_pos_quote_lots > 0,
+            FlashBookError::HaircutNothingToConvert
+        );
+
+        let pre = matcher::haircut::PositionHaircutSnapshot {
+            released_reserve_quote_lots: pos_haircut.released_reserve_quote_lots,
+            released_attached_at_slot: pos_haircut.released_attached_at_slot,
+            matured_pos_quote_lots: pos_haircut.matured_pos_quote_lots,
+            original_reserve_at_attach: pos_haircut.original_reserve_at_attach,
+        };
+        let matured_at_call = pre.matured_pos_quote_lots;
+
+        let h_scaled = matcher::haircut::compute_h(
+            market_haircut.residual_quote_lots,
+            market_haircut.matured_pos_total_quote_lots,
+        );
+        let (post, credit, dust) = matcher::haircut::apply_convert(pre, h_scaled);
+
+        pos_haircut.matured_pos_quote_lots = post.matured_pos_quote_lots;
+
+        // Market state: subtract matured from the global denominator,
+        // accrue dust, debit residual by the credit (the trader extracted
+        // real value).
+        market_haircut.matured_pos_total_quote_lots = market_haircut
+            .matured_pos_total_quote_lots
+            .checked_sub(matured_at_call as u128)
+            .ok_or_else(|| error!(FlashBookError::HaircutResidualUnderflow))?;
+        market_haircut.dust_accrued_quote_lots = market_haircut
+            .dust_accrued_quote_lots
+            .checked_add(dust as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        market_haircut.residual_quote_lots = market_haircut
+            .residual_quote_lots
+            .checked_sub(credit as u128)
+            .ok_or_else(|| error!(FlashBookError::HaircutResidualUnderflow))?;
+
+        // Cache the freshly-computed h for off-chain readers.
+        market_haircut.h_scaled_cached = h_scaled.min(u64::MAX as u128) as u64;
+        market_haircut.h_cached_at_slot = Clock::get()?.slot;
+
+        emit!(PositionConvertedEvent {
+            market: market_haircut.market,
+            position: pos_haircut.position,
+            credit_quote_lots: credit,
+            dust_quote_lots: dust,
+            h_scaled,
+        });
+        Ok(())
+    }
+
+    /// Permissionless: drain accumulated haircut dust to the insurance
+    /// fund. Keeper hook; runs at most once per slot per market in
+    /// practice (the dust accrues slowly from many converts).
+    ///
+    /// Wave 24b lands the math + event emission. Actual SPL transfer
+    /// from haircut state's claim into the insurance fund's balance
+    /// counter happens here; the underlying vault token doesn't move
+    /// (insurance and haircut both live in the same vault) — only the
+    /// accounting counters do.
+    pub fn flush_haircut_dust(ctx: Context<FlushHaircutDust>) -> Result<()> {
+        let market_haircut = &mut ctx.accounts.haircut_state;
+        let insurance = &mut ctx.accounts.insurance_fund;
+
+        let dust = market_haircut.dust_accrued_quote_lots;
+        require!(dust > 0, FlashBookError::HaircutNothingToConvert);
+
+        // Move accounting: dust → insurance balance counter.
+        let dust_u64: u64 = if dust > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            dust as u64
+        };
+        insurance.balance_quote_lots = insurance
+            .balance_quote_lots
+            .checked_add(dust_u64)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        insurance.total_contributions = insurance
+            .total_contributions
+            .checked_add(dust_u64)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        market_haircut.dust_accrued_quote_lots = market_haircut
+            .dust_accrued_quote_lots
+            .checked_sub(dust_u64 as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+
+        emit!(HaircutDustFlushedEvent {
+            market: market_haircut.market,
+            dust_quote_lots: dust_u64,
+            insurance_balance_after: insurance.balance_quote_lots,
+        });
+        Ok(())
+    }
+
+    // ─── Wave 24c — additional H-haircut surface ────────────────────
+
+    /// Permissionless: lazy-init a per-position `PositionHaircutStateAccount`.
+    /// Called once per (market, position) before the first
+    /// `release_gain_to_haircut` against it. Wave 24d/e will replace
+    /// this with `init_if_needed` inside `apply_fill`'s gain path.
+    pub fn init_position_haircut_state(ctx: Context<InitPositionHaircutState>) -> Result<()> {
+        let st = &mut ctx.accounts.position_haircut;
+        st.market = ctx.accounts.position.market;
+        st.position = ctx.accounts.position.key();
+        st.bump = ctx.bumps.position_haircut;
+        st._pad0 = [0; 7];
+        st.released_reserve_quote_lots = 0;
+        st.released_attached_at_slot = 0;
+        st.matured_pos_quote_lots = 0;
+        st.original_reserve_at_attach = 0;
+        st._reserved = [0; 24];
+
+        emit!(PositionHaircutInitializedEvent {
+            market: st.market,
+            position: st.position,
+        });
+        Ok(())
+    }
+
+    /// Wave 24c — interim: route an explicit amount of a position's
+    /// already-credited collateral INTO the haircut reserve.
+    ///
+    /// This is what Wave 24d will do automatically inside `apply_fill`:
+    /// when a fill realizes positive PnL on an opted-in market, the
+    /// credit flows to the reserve instead of straight to collateral.
+    /// Until that wire-in lands, this ix lets the sequencer / authority
+    /// retroactively opt a position into the haircut by moving N lots
+    /// of its collateral into the reserve.
+    ///
+    /// Authority-gated (market.authority) for safety — anyone calling
+    /// this could move trader funds into a reserve the trader doesn't
+    /// know about. In practice the sequencer holds market authority.
+    ///
+    /// Bucket: routes from `position.collateral_quote_lots` (isolated
+    /// bucket) if positive, else from `trader_state.collateral_quote_lots`
+    /// (cross bucket). Pre-existing behaviour mirrored from
+    /// `compute_realized_pnl_routing`.
+    pub fn release_gain_to_haircut(
+        ctx: Context<ReleaseGainToHaircut>,
+        gain_quote_lots: u64,
+    ) -> Result<()> {
+        require!(gain_quote_lots > 0, FlashBookError::HaircutZeroGain);
+        require_keys_eq!(
+            ctx.accounts.market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+
+        let position = &mut ctx.accounts.position;
+        let trader_state = &mut ctx.accounts.trader_state;
+        let pos_haircut = &mut ctx.accounts.position_haircut;
+        let market_haircut = &mut ctx.accounts.haircut_state;
+
+        // Same bucket-selection rule as `compute_realized_pnl_routing`.
+        let isolated = position.collateral_quote_lots > 0;
+        if isolated {
+            position.collateral_quote_lots = position
+                .collateral_quote_lots
+                .checked_sub(gain_quote_lots)
+                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+        } else {
+            trader_state.collateral_quote_lots = trader_state
+                .collateral_quote_lots
+                .checked_sub(gain_quote_lots)
+                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+        }
+
+        // Push the moved amount into the position's reserve via the
+        // pure module — same path apply_fill will use in Wave 24d.
+        let now_slot = Clock::get()?.slot;
+        let pre = matcher::haircut::PositionHaircutSnapshot {
+            released_reserve_quote_lots: pos_haircut.released_reserve_quote_lots,
+            released_attached_at_slot: pos_haircut.released_attached_at_slot,
+            matured_pos_quote_lots: pos_haircut.matured_pos_quote_lots,
+            original_reserve_at_attach: pos_haircut.original_reserve_at_attach,
+        };
+        let post = matcher::haircut::apply_release(pre, gain_quote_lots, now_slot)
+            .map_err(map_haircut_error)?;
+
+        pos_haircut.released_reserve_quote_lots = post.released_reserve_quote_lots;
+        pos_haircut.released_attached_at_slot = post.released_attached_at_slot;
+        pos_haircut.matured_pos_quote_lots = post.matured_pos_quote_lots;
+        pos_haircut.original_reserve_at_attach = post.original_reserve_at_attach;
+
+        // The collateral that just moved into the reserve was previously
+        // backed by Residual (the protocol's surplus). Now that it lives
+        // in the reserve and will eventually convert at h ≤ 1, the
+        // protocol's effective liability to this trader is bounded
+        // above by `gain_quote_lots`. Residual itself doesn't change at
+        // the release step — only at the convert step (which decrements
+        // Residual by the credit actually paid out).
+
+        emit!(GainReleasedToHaircutEvent {
+            market: market_haircut.market,
+            position: pos_haircut.position,
+            gain_quote_lots,
+            reserve_after: pos_haircut.released_reserve_quote_lots,
+            isolated,
+        });
+        Ok(())
+    }
+
+    // ─── Wave 26a — Envelope config ─────────────────────────────────
+
+    /// Authority-only: set or update the per-market envelope config.
+    /// Validates via `matcher::envelope::prove_envelope` — bad params
+    /// cannot be written. Bumps `version` on every successful call so
+    /// downstream readers can detect updates.
+    ///
+    /// Idempotent re-runs (passing identical params) succeed and bump
+    /// the version; this is intentional so authorities can prove the
+    /// envelope on every rotation without needing to detect changes
+    /// off-chain.
+    pub fn set_envelope_config(
+        ctx: Context<SetEnvelopeConfig>,
+        max_price_move_bps_per_slot: u32,
+        max_accrual_dt_slots: u64,
+        max_abs_funding_e9_per_slot: i64,
+        maintenance_bps: u32,
+        liquidation_fee_bps: u32,
+        min_liquidation_abs_lots: u64,
+        min_nonzero_mm_req_lots: u64,
+    ) -> Result<()> {
+        let params = matcher::envelope::EnvelopeParams {
+            max_price_move_bps_per_slot,
+            max_accrual_dt_slots,
+            max_abs_funding_e9_per_slot,
+            maintenance_bps,
+            liquidation_fee_bps,
+            min_liquidation_abs_lots,
+            min_nonzero_mm_req_lots,
+        };
+        matcher::envelope::prove_envelope(&params).map_err(map_envelope_error)?;
+
+        let cfg = &mut ctx.accounts.envelope_config;
+        if cfg.market == Pubkey::default() {
+            // First init.
+            cfg.market = ctx.accounts.market.key();
+            cfg.bump = ctx.bumps.envelope_config;
+            cfg._pad0 = [0; 7];
+            cfg._pad1 = [0; 4];
+            cfg._reserved = [0; 32];
+            cfg.version = 0;
+            // Wave 26b gate-state defaults (zero = no prior observation).
+            cfg.last_observed_slot = 0;
+            cfg.last_observed_price_ticks = 0;
+            cfg.gate_passes = 0;
+            cfg.gate_rejects = 0;
+        }
+        cfg.write_params(&params);
+        cfg.last_proven_at_slot = Clock::get()?.slot;
+        cfg.version = cfg.version.saturating_add(1);
+
+        emit!(EnvelopeConfigSetEvent {
+            market: cfg.market,
+            version: cfg.version,
+            max_price_move_bps_per_slot,
+            max_accrual_dt_slots,
+            maintenance_bps,
+            liquidation_fee_bps,
+        });
+        Ok(())
+    }
+
+    /// Permissionless: re-run `prove_envelope` against the stored
+    /// params. Emits a structured event with `passed: bool`. Lets
+    /// keepers / monitors verify periodically that the params still
+    /// satisfy the envelope inequality (in case future changes to
+    /// the envelope's absolute bounds make a previously-valid config
+    /// no longer prove).
+    pub fn verify_envelope_config(ctx: Context<VerifyEnvelopeConfig>) -> Result<()> {
+        let cfg = &ctx.accounts.envelope_config;
+        let params = cfg.params();
+        let passed = matcher::envelope::prove_envelope(&params).is_ok();
+        emit!(EnvelopeVerifiedEvent {
+            market: cfg.market,
+            version: cfg.version,
+            passed,
+        });
+        Ok(())
+    }
+
+    /// Permissionless runtime gate: given a proposed (old_price,
+    /// new_price, dt) triple, verify it respects the per-slot price
+    /// move cap stored in the envelope config. Returns successfully
+    /// iff the move is admissible; reverts otherwise.
+    ///
+    /// This is the surface Wave 26b will hook into the mark-EMA
+    /// update path inside `apply_fill`. Today it's a callable ix so
+    /// off-chain bots / sequencers can pre-flight a price update
+    /// without simulating the full apply_fill.
+    pub fn gate_envelope_price_move(
+        ctx: Context<GateEnvelopePriceMove>,
+        old_price_ticks: u64,
+        new_price_ticks: u64,
+        dt_slots: u64,
+    ) -> Result<()> {
+        let cfg = &ctx.accounts.envelope_config;
+        matcher::envelope::gate_price_move(
+            old_price_ticks,
+            new_price_ticks,
+            dt_slots,
+            cfg.max_price_move_bps_per_slot,
+        )
+        .map_err(map_envelope_error)?;
+        Ok(())
+    }
+
+    // ─── Wave 25a — A/K/F/B side accrual init ───────────────────────
+
+    /// Authority-only: initialize the per-market side accrual state.
+    /// Both sides start in Normal mode with A == ADL_ONE and K/F/B
+    /// at zero. Wave 25b will rewire `settle_funding` and
+    /// `auto_deleverage` to operate on this account.
+    ///
+    /// Idempotent in the sense that re-running the ix on an existing
+    /// account is impossible (Anchor's `init` constraint).
+    pub fn initialize_side_accrual(
+        ctx: Context<InitializeSideAccrual>,
+        initial_price_ticks: u64,
+        initial_slot: u64,
+    ) -> Result<()> {
+        let acc = &mut ctx.accounts.side_accrual;
+        acc.market = ctx.accounts.market.key();
+        acc.bump = ctx.bumps.side_accrual;
+        acc._pad0 = [0; 7];
+
+        // Long side defaults.
+        acc.long_a = matcher::side_accrual::ADL_ONE;
+        acc.long_k = 0;
+        acc.long_f = 0;
+        acc.long_b = 0;
+        acc.long_mode = 0; // Normal
+        acc.long_epoch = 0;
+        acc._long_pad = [0; 3];
+        acc.long_slot_last = initial_slot;
+        acc.long_price_last = initial_price_ticks;
+
+        // Short side defaults.
+        acc.short_a = matcher::side_accrual::ADL_ONE;
+        acc.short_k = 0;
+        acc.short_f = 0;
+        acc.short_b = 0;
+        acc.short_mode = 0;
+        acc.short_epoch = 0;
+        acc._short_pad = [0; 3];
+        acc.short_slot_last = initial_slot;
+        acc.short_price_last = initial_price_ticks;
+
+        acc._reserved = [0; 64];
+
+        emit!(SideAccrualInitializedEvent {
+            market: acc.market,
+            initial_price_ticks,
+            initial_slot,
+        });
+        Ok(())
+    }
+
+    /// Wave 24e — Permissionless: walk all internal-consistency
+    /// invariants over the market's haircut state and emit a structured
+    /// report event.
+    ///
+    /// Checks:
+    ///   • residual ≥ 0 (trivial for u128, but for future-proofing)
+    ///   • h_min ≤ h_max ≤ ABS_MAX_H_MAX_SLOTS
+    ///   • h_scaled_cached ∈ [0, H_DENOM]
+    ///   • h_scaled_cached == compute_h(residual, matured_total)  (if cache fresh)
+    ///   • dust_accrued ≤ realized_loss_total + matured_pos_total
+    ///
+    /// Does NOT cross-check against the live SPL vault balance — that
+    /// needs per-market committed-collateral accounting (Wave 28).
+    /// Keepers should run this every N slots; downstream monitoring
+    /// catches `HaircutInvariantsCheckedEvent` and pages if `passed`
+    /// drops to false.
+    pub fn verify_haircut_invariants(ctx: Context<VerifyHaircutInvariants>) -> Result<()> {
+        let st = &ctx.accounts.haircut_state;
+        let report = matcher::haircut::verify_invariants(
+            st.residual_quote_lots,
+            st.matured_pos_total_quote_lots,
+            st.realized_loss_total_quote_lots,
+            st.dust_accrued_quote_lots,
+            st.h_min_slots,
+            st.h_max_slots,
+            st.h_scaled_cached,
+            st.h_cached_at_slot,
+        );
+        emit!(HaircutInvariantsCheckedEvent {
+            market: st.market,
+            passed: report.all_ok(),
+            bitmask: report.bitmask(),
+            residual_quote_lots: st.residual_quote_lots,
+            matured_pos_total_quote_lots: st.matured_pos_total_quote_lots,
+            dust_accrued_quote_lots: st.dust_accrued_quote_lots,
+            h_scaled_cached: st.h_scaled_cached,
+        });
+        Ok(())
+    }
+
+    /// Wave 24f — Permissionless: probe the protocol-level solvency
+    /// invariant by reading on-chain balances directly. Asserts
+    /// `vault.amount ≥ insurance.balance + flp.total_capital`. Any
+    /// deviation indicates accounting drift between the SPL vault and
+    /// the protocol's bookkeeping — call the kill switch.
+    ///
+    /// Foundational sanity check. Doesn't reconcile committed trader
+    /// collateral (that requires iterating positions; out of scope
+    /// for a single-tx check). Catches the gross failure modes:
+    ///   • Vault drained below the LP claims (programmatic bug)
+    ///   • Insurance balance > vault (double-credit accounting bug)
+    ///   • FLP capital not reflected in vault (lost-funds bug)
+    pub fn verify_protocol_solvency(ctx: Context<VerifyProtocolSolvency>) -> Result<()> {
+        let vault_amount = ctx.accounts.quote_vault.amount;
+        let insurance_bal = ctx.accounts.insurance_fund.balance_quote_lots;
+        let flp_capital = ctx.accounts.flp_exposure.total_capital_quote_lots;
+
+        let minimum_required = insurance_bal
+            .checked_add(flp_capital)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        let solvent = vault_amount >= minimum_required;
+        let surplus = if solvent {
+            vault_amount.saturating_sub(minimum_required)
+        } else {
+            0
+        };
+
+        emit!(ProtocolSolvencyCheckedEvent {
+            vault_quote_lots: vault_amount,
+            insurance_quote_lots: insurance_bal,
+            flp_capital_quote_lots: flp_capital,
+            minimum_required_quote_lots: minimum_required,
+            surplus_quote_lots: surplus,
+            solvent,
+        });
+
+        // Hard fail if insolvent. The transaction reverts; the event
+        // is rolled back. Off-chain monitors should poll this ix
+        // regularly and page if it errors.
+        require!(solvent, FlashBookError::HaircutResidualUnderflow);
+        Ok(())
+    }
+
+    /// Authority-only: set/grow the per-market Residual explicitly.
+    /// Interim mechanism until Wave 28's per-market FLP attribution
+    /// wires Residual into automatic delta-tracking on every money
+    /// move. Production deployments should reconcile against on-chain
+    /// balances before each call. Signed deltas — pass negative to
+    /// shrink (e.g. on payout audit).
+    pub fn seed_residual(
+        ctx: Context<SeedResidual>,
+        delta: i128,
+    ) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+        let st = &mut ctx.accounts.haircut_state;
+        let new_residual = matcher::haircut::apply_residual_delta(st.residual_quote_lots, delta)
+            .map_err(map_haircut_error)?;
+        st.residual_quote_lots = new_residual;
+        emit!(ResidualSeededEvent {
+            market: st.market,
+            delta,
+            new_residual,
+        });
+        Ok(())
+    }
 }
 
 /// Shared init body for `initialize_market`. Permissionless market
@@ -8333,6 +9186,411 @@ pub struct CancelOrderV2<'info> {
         bump,
     )]
     pub market_book: UncheckedAccount<'info>,
+}
+
+// ─── Wave 24b — H-haircut account contexts ──────────────────────────
+
+#[derive(Accounts)]
+pub struct InitializeHaircutState<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    /// Authority must match the market's authority — same trust model
+    /// as `update_market_params`.
+    #[account(
+        seeds = [state::MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, state::MarketAccount>>,
+    #[account(
+        init,
+        payer = authority,
+        space = state_v3::MarketHaircutStateAccount::space(),
+        seeds = [state_v3::MarketHaircutStateAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MaturePosition<'info> {
+    /// Permissionless — anyone can crank.
+    #[account(mut)]
+    pub keeper: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::MarketHaircutStateAccount::SEED, haircut_state.market.as_ref()],
+        bump = haircut_state.bump,
+    )]
+    pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
+
+    /// The Position the per-position haircut state attaches to.
+    /// Re-derive its PDA via the account's stored fields so we don't
+    /// have to thread market/trader through ix args.
+    #[account(
+        seeds = [state::PositionAccount::SEED, position.market.as_ref(), position.trader.as_ref()],
+        bump = position.bump,
+        constraint = position.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub position: Box<Account<'info, state::PositionAccount>>,
+
+    #[account(
+        mut,
+        seeds = [
+            state_v3::PositionHaircutStateAccount::SEED,
+            position.market.as_ref(),
+            position.key().as_ref(),
+        ],
+        bump = position_haircut.bump,
+        constraint = position_haircut.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
+        constraint = position_haircut.position == position.key() @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub position_haircut: Box<Account<'info, state_v3::PositionHaircutStateAccount>>,
+}
+
+#[derive(Accounts)]
+pub struct ConvertPosition<'info> {
+    #[account(mut)]
+    pub keeper: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::MarketHaircutStateAccount::SEED, haircut_state.market.as_ref()],
+        bump = haircut_state.bump,
+    )]
+    pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
+
+    #[account(
+        seeds = [state::PositionAccount::SEED, position.market.as_ref(), position.trader.as_ref()],
+        bump = position.bump,
+        constraint = position.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub position: Box<Account<'info, state::PositionAccount>>,
+
+    #[account(
+        mut,
+        seeds = [
+            state_v3::PositionHaircutStateAccount::SEED,
+            position.market.as_ref(),
+            position.key().as_ref(),
+        ],
+        bump = position_haircut.bump,
+        constraint = position_haircut.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
+        constraint = position_haircut.position == position.key() @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub position_haircut: Box<Account<'info, state_v3::PositionHaircutStateAccount>>,
+}
+
+#[derive(Accounts)]
+pub struct FlushHaircutDust<'info> {
+    #[account(mut)]
+    pub keeper: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::MarketHaircutStateAccount::SEED, haircut_state.market.as_ref()],
+        bump = haircut_state.bump,
+    )]
+    pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
+
+    #[account(
+        mut,
+        seeds = [state::InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Box<Account<'info, state::InsuranceFundAccount>>,
+}
+
+#[derive(Accounts)]
+pub struct InitPositionHaircutState<'info> {
+    /// Permissionless — anyone can pay for lazy init.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        seeds = [state::PositionAccount::SEED, position.market.as_ref(), position.trader.as_ref()],
+        bump = position.bump,
+    )]
+    pub position: Box<Account<'info, state::PositionAccount>>,
+
+    /// Market haircut state — verifies the market is opted in.
+    #[account(
+        seeds = [state_v3::MarketHaircutStateAccount::SEED, position.market.as_ref()],
+        bump = haircut_state.bump,
+    )]
+    pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = state_v3::PositionHaircutStateAccount::space(),
+        seeds = [
+            state_v3::PositionHaircutStateAccount::SEED,
+            position.market.as_ref(),
+            position.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub position_haircut: Box<Account<'info, state_v3::PositionHaircutStateAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ReleaseGainToHaircut<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [state::MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, state::MarketAccount>>,
+
+    #[account(
+        mut,
+        seeds = [state::PositionAccount::SEED, position.market.as_ref(), position.trader.as_ref()],
+        bump = position.bump,
+        constraint = position.market == market.key() @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub position: Box<Account<'info, state::PositionAccount>>,
+
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, position.trader.as_ref()],
+        bump = trader_state.bump,
+        constraint = trader_state.trader == position.trader @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: Box<Account<'info, TraderStateAccount>>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::MarketHaircutStateAccount::SEED, market.key().as_ref()],
+        bump = haircut_state.bump,
+    )]
+    pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
+
+    #[account(
+        mut,
+        seeds = [
+            state_v3::PositionHaircutStateAccount::SEED,
+            position.market.as_ref(),
+            position.key().as_ref(),
+        ],
+        bump = position_haircut.bump,
+        constraint = position_haircut.market == market.key() @ FlashBookError::HaircutStateMismatch,
+        constraint = position_haircut.position == position.key() @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub position_haircut: Box<Account<'info, state_v3::PositionHaircutStateAccount>>,
+}
+
+#[derive(Accounts)]
+pub struct VerifyHaircutInvariants<'info> {
+    /// Permissionless — anyone can crank.
+    pub keeper: Signer<'info>,
+
+    #[account(
+        seeds = [state_v3::MarketHaircutStateAccount::SEED, haircut_state.market.as_ref()],
+        bump = haircut_state.bump,
+    )]
+    pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
+}
+
+#[derive(Accounts)]
+pub struct SetEnvelopeConfig<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [state::MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, state::MarketAccount>>,
+
+    /// init_if_needed so the same ix handles both first-set and update.
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = state_v3::MarketEnvelopeConfigAccount::space(),
+        seeds = [state_v3::MarketEnvelopeConfigAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub envelope_config: Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct VerifyProtocolSolvency<'info> {
+    /// Permissionless caller.
+    pub keeper: Signer<'info>,
+
+    #[account(
+        seeds = [state::InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Box<Account<'info, state::InsuranceFundAccount>>,
+
+    #[account(
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
+    )]
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+
+    /// The protocol's quote-token vault.
+    #[account(address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+}
+
+#[derive(Accounts)]
+pub struct VerifyEnvelopeConfig<'info> {
+    pub keeper: Signer<'info>,
+
+    #[account(
+        seeds = [state_v3::MarketEnvelopeConfigAccount::SEED, envelope_config.market.as_ref()],
+        bump = envelope_config.bump,
+    )]
+    pub envelope_config: Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>,
+}
+
+#[derive(Accounts)]
+pub struct GateEnvelopePriceMove<'info> {
+    pub keeper: Signer<'info>,
+
+    #[account(
+        seeds = [state_v3::MarketEnvelopeConfigAccount::SEED, envelope_config.market.as_ref()],
+        bump = envelope_config.bump,
+    )]
+    pub envelope_config: Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeSideAccrual<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [state::MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, state::MarketAccount>>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = state_v3::MarketSideAccrualAccount::space(),
+        seeds = [state_v3::MarketSideAccrualAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub side_accrual: Box<Account<'info, state_v3::MarketSideAccrualAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SeedResidual<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [state::MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, state::MarketAccount>>,
+
+    #[account(
+        mut,
+        seeds = [state_v3::MarketHaircutStateAccount::SEED, market.key().as_ref()],
+        bump = haircut_state.bump,
+        constraint = haircut_state.market == market.key() @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
+}
+
+/// Map pure-math haircut errors to FlashBookError codes. Used by every
+/// haircut ix that calls into `matcher::haircut`.
+fn map_haircut_error(e: matcher::haircut::HaircutError) -> anchor_lang::error::Error {
+    use matcher::haircut::HaircutError::*;
+    match e {
+        Overflow => error!(FlashBookError::ArithmeticOverflow),
+        Underflow => error!(FlashBookError::ArithmeticUnderflow),
+        InvertedWindow => error!(FlashBookError::HaircutInvertedWindow),
+        WindowTooLarge => error!(FlashBookError::HaircutWindowTooLarge),
+        ZeroGain => error!(FlashBookError::HaircutZeroGain),
+    }
+}
+
+/// Wave 26b — shared runtime gate used by all three oracle-update ix.
+///
+/// When `envelope_config` is `Some(...)`:
+///   1. If `last_observed_slot == 0` (first observation), the gate is
+///      skipped (no prior price to compare). `now_slot`/`new_price`
+///      are recorded as the new baseline.
+///   2. Otherwise: compute `dt = now_slot - last_observed_slot`, call
+///      `gate_price_move(last_price, new_price, dt,
+///      max_price_move_bps_per_slot)`. Reject → bubble up.
+///   3. On success: record `(now_slot, new_price)` and bump
+///      `gate_passes`.
+///
+/// When `envelope_config` is `None`: no-op (legacy behavior).
+fn gate_oracle_update<'info>(
+    envelope_config: Option<&mut Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>>,
+    new_price_ticks: u64,
+    now_slot: u64,
+) -> Result<()> {
+    let Some(cfg) = envelope_config else {
+        return Ok(());
+    };
+    if cfg.last_observed_slot == 0 {
+        // First observation — seed and skip gate.
+        cfg.last_observed_slot = now_slot;
+        cfg.last_observed_price_ticks = new_price_ticks;
+        cfg.gate_passes = cfg.gate_passes.saturating_add(1);
+        return Ok(());
+    }
+    let dt = now_slot.saturating_sub(cfg.last_observed_slot);
+    // Same-slot updates are allowed iff the new price equals the old
+    // one (no movement). gate_price_move rejects strict zero dt.
+    if dt == 0 {
+        if new_price_ticks == cfg.last_observed_price_ticks {
+            return Ok(());
+        }
+        cfg.gate_rejects = cfg.gate_rejects.saturating_add(1);
+        return Err(error!(FlashBookError::EnvelopeSameSlotMove));
+    }
+    let last_price = cfg.last_observed_price_ticks;
+    matcher::envelope::gate_price_move(
+        last_price,
+        new_price_ticks,
+        dt,
+        cfg.max_price_move_bps_per_slot,
+    )
+    .map_err(|e| {
+        cfg.gate_rejects = cfg.gate_rejects.saturating_add(1);
+        map_envelope_error(e)
+    })?;
+    cfg.last_observed_slot = now_slot;
+    cfg.last_observed_price_ticks = new_price_ticks;
+    cfg.gate_passes = cfg.gate_passes.saturating_add(1);
+    Ok(())
+}
+
+/// Map pure-math envelope errors to FlashBookError codes. Wave 26.
+fn map_envelope_error(e: matcher::envelope::EnvelopeError) -> anchor_lang::error::Error {
+    use matcher::envelope::EnvelopeError::*;
+    match e {
+        PriceCapZero | PriceCapTooLarge => error!(FlashBookError::EnvelopePriceCapInvalid),
+        AccrualDtZero | AccrualDtTooLarge => error!(FlashBookError::EnvelopeAccrualWindowInvalid),
+        FundingCapTooLarge => error!(FlashBookError::EnvelopeFundingCapInvalid),
+        MaintenanceZero | MaintenanceTooLarge => error!(FlashBookError::EnvelopeMaintenanceInvalid),
+        LiqFeeTooLarge => error!(FlashBookError::EnvelopeLiqFeeInvalid),
+        Overflow => error!(FlashBookError::ArithmeticOverflow),
+        SameSlotMove => error!(FlashBookError::EnvelopeSameSlotMove),
+        PriceMoveExceedsCap => error!(FlashBookError::EnvelopePriceMoveExceedsCap),
+        EnvelopeViolated { .. } => error!(FlashBookError::EnvelopeViolated),
+    }
 }
 
 #[derive(Accounts)]
@@ -9006,6 +10264,18 @@ pub struct UpdateOracle<'info> {
         bump = market.bump,
     )]
     pub market: Account<'info, MarketAccount>,
+
+    /// Wave 26b — optional envelope gate. When supplied, the proposed
+    /// price move is checked against `gate_price_move(p_last, p_new,
+    /// dt_slots, max_price_move_bps_per_slot)`. Reject → entire ix
+    /// reverts. When omitted: pre-Wave-26b behavior (no gate).
+    #[account(
+        mut,
+        seeds = [state_v3::MarketEnvelopeConfigAccount::SEED, market.key().as_ref()],
+        bump = envelope_config.bump,
+        constraint = envelope_config.market == market.key() @ FlashBookError::EnvelopePriceCapInvalid,
+    )]
+    pub envelope_config: Option<Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>>,
 }
 
 /// V3 mark-engine: permissionless `settle_mark` accounts. The caller pays
@@ -9438,6 +10708,51 @@ pub struct ApplyFill<'info> {
     /// pre-tier behavior. Singleton PDA at `[b"fee_tiers"]`.
     pub fee_tiers: Option<Box<Account<'info, state::FeeTiersAccount>>>,
 
+    /// WAVE 24d — optional per-market H-haircut state. When provided
+    /// (along with the per-position haircut accounts below), positive
+    /// realized PnL on this fill routes into the position's reserve
+    /// instead of crediting collateral directly. Losses always debit
+    /// collateral (loss seniority).
+    ///
+    /// When omitted: bit-for-bit identical to pre-Wave-24d behavior.
+    #[account(
+        mut,
+        seeds = [state_v3::MarketHaircutStateAccount::SEED, market.key().as_ref()],
+        bump = market_haircut.bump,
+        constraint = market_haircut.market == market.key() @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub market_haircut: Option<Box<Account<'info, state_v3::MarketHaircutStateAccount>>>,
+
+    /// Per-taker-position haircut state. Must be present iff
+    /// `market_haircut` is present. The taker_position must already
+    /// have been initialized via `init_position_haircut_state`.
+    #[account(
+        mut,
+        seeds = [
+            state_v3::PositionHaircutStateAccount::SEED,
+            market.key().as_ref(),
+            taker_position.key().as_ref(),
+        ],
+        bump = taker_position_haircut.bump,
+        constraint = taker_position_haircut.market == market.key() @ FlashBookError::HaircutStateMismatch,
+        constraint = taker_position_haircut.position == taker_position.key() @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub taker_position_haircut: Option<Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
+
+    /// Per-maker-position haircut state. Same shape as taker.
+    #[account(
+        mut,
+        seeds = [
+            state_v3::PositionHaircutStateAccount::SEED,
+            market.key().as_ref(),
+            maker_position.key().as_ref(),
+        ],
+        bump = maker_position_haircut.bump,
+        constraint = maker_position_haircut.market == market.key() @ FlashBookError::HaircutStateMismatch,
+        constraint = maker_position_haircut.position == maker_position.key() @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub maker_position_haircut: Option<Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -9812,6 +11127,33 @@ pub struct ApplyFlpFill<'info> {
     /// maker side here). When omitted, falls back to flat
     /// `market.params.taker_fee_bps`.
     pub fee_tiers: Option<Box<Account<'info, state::FeeTiersAccount>>>,
+
+    /// WAVE 24d — optional H-haircut routing on the FLP fill path.
+    /// Same opt-in shape as ApplyFill: provide market_haircut +
+    /// taker_position_haircut to route the trader's positive PnL into
+    /// the reserve. FLP itself doesn't accumulate realized PnL on a
+    /// Position PDA — there's nothing maker-side to route, so no
+    /// maker_position_haircut here.
+    #[account(
+        mut,
+        seeds = [state_v3::MarketHaircutStateAccount::SEED, market.key().as_ref()],
+        bump = market_haircut.bump,
+        constraint = market_haircut.market == market.key() @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub market_haircut: Option<Box<Account<'info, state_v3::MarketHaircutStateAccount>>>,
+
+    #[account(
+        mut,
+        seeds = [
+            state_v3::PositionHaircutStateAccount::SEED,
+            market.key().as_ref(),
+            taker_position.key().as_ref(),
+        ],
+        bump = taker_position_haircut.bump,
+        constraint = taker_position_haircut.market == market.key() @ FlashBookError::HaircutStateMismatch,
+        constraint = taker_position_haircut.position == taker_position.key() @ FlashBookError::HaircutStateMismatch,
+    )]
+    pub taker_position_haircut: Option<Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
 
     pub system_program: Program<'info, System>,
 }
@@ -10234,6 +11576,121 @@ pub struct FlpExposureInitializedEvent {
 pub struct FlpCapitalUpdatedEvent {
     pub new_total: u64,
     pub delta: i64,
+}
+
+// ─── Wave 24b — H-haircut events ────────────────────────────────────
+
+#[event]
+pub struct HaircutInitializedEvent {
+    pub market: Pubkey,
+    pub h_min_slots: u64,
+    pub h_max_slots: u64,
+    pub initial_residual_quote_lots: u128,
+}
+
+#[event]
+pub struct PositionMaturedEvent {
+    pub market: Pubkey,
+    pub position: Pubkey,
+    pub matured_delta: u64,
+    pub matured_pos_after: u64,
+}
+
+#[event]
+pub struct PositionConvertedEvent {
+    pub market: Pubkey,
+    pub position: Pubkey,
+    pub credit_quote_lots: u64,
+    pub dust_quote_lots: u64,
+    pub h_scaled: u128,
+}
+
+#[event]
+pub struct HaircutDustFlushedEvent {
+    pub market: Pubkey,
+    pub dust_quote_lots: u64,
+    pub insurance_balance_after: u64,
+}
+
+#[event]
+pub struct PositionHaircutInitializedEvent {
+    pub market: Pubkey,
+    pub position: Pubkey,
+}
+
+#[event]
+pub struct GainReleasedToHaircutEvent {
+    pub market: Pubkey,
+    pub position: Pubkey,
+    pub gain_quote_lots: u64,
+    pub reserve_after: u64,
+    pub isolated: bool,
+}
+
+#[event]
+pub struct ResidualSeededEvent {
+    pub market: Pubkey,
+    pub delta: i128,
+    pub new_residual: u128,
+}
+
+#[event]
+pub struct HaircutInvariantsCheckedEvent {
+    pub market: Pubkey,
+    pub passed: bool,
+    pub bitmask: u8,
+    pub residual_quote_lots: u128,
+    pub matured_pos_total_quote_lots: u128,
+    pub dust_accrued_quote_lots: u128,
+    pub h_scaled_cached: u64,
+}
+
+#[event]
+pub struct SideAccrualInitializedEvent {
+    pub market: Pubkey,
+    pub initial_price_ticks: u64,
+    pub initial_slot: u64,
+}
+
+#[event]
+pub struct EnvelopeConfigSetEvent {
+    pub market: Pubkey,
+    pub version: u32,
+    pub max_price_move_bps_per_slot: u32,
+    pub max_accrual_dt_slots: u64,
+    pub maintenance_bps: u32,
+    pub liquidation_fee_bps: u32,
+}
+
+#[event]
+pub struct EnvelopeVerifiedEvent {
+    pub market: Pubkey,
+    pub version: u32,
+    pub passed: bool,
+}
+
+/// Wave 24f — emitted on every `verify_protocol_solvency` invocation.
+/// Carries the full balance snapshot so monitors can detect drift even
+/// in the absence of `passed: false` (e.g., surplus declining over time
+/// might signal a slow leak).
+/// Wave 30 — emitted when an authority permanently burns their
+/// control over a market. One-way state change; the market is now
+/// fully decentralised.
+#[event]
+pub struct MarketAuthorityBurnedEvent {
+    pub market: Pubkey,
+    pub previous_authority: Pubkey,
+    pub burn_slot: u64,
+}
+
+#[event]
+pub struct ProtocolSolvencyCheckedEvent {
+    pub vault_quote_lots: u64,
+    pub insurance_quote_lots: u64,
+    pub flp_capital_quote_lots: u64,
+    pub minimum_required_quote_lots: u64,
+    pub surplus_quote_lots: u64,
+    pub solvent: bool,
 }
 
 #[event]
@@ -11564,6 +13021,58 @@ fn apply_realized_pnl_delta<'info>(
     Ok(())
 }
 
+/// Wave 24d — apply_realized_pnl_delta with optional H-haircut routing.
+///
+/// When `position_haircut` is `Some(...)`:
+///   - positive delta (gain) is pushed into the reserve via
+///     `matcher::haircut::apply_release`. **No collateral mutation.**
+///     The credit lands in collateral only after the warmup completes
+///     and `convert_position` is called (Wave 24c ix).
+///   - negative delta (loss) bypasses the haircut entirely and debits
+///     collateral directly — losses are senior to capital.
+///
+/// When `position_haircut` is `None`: identical to
+/// `apply_realized_pnl_delta` v1 (the legacy direct credit/debit path).
+///
+/// This is the **opt-in** wire-in: markets without a HaircutState
+/// keep their existing behaviour bit-for-bit. Markets with HaircutState
+/// (+ a per-position HaircutState provided in remaining accounts) gain
+/// the junior-claim protection automatically on every fill.
+fn apply_realized_pnl_delta_v2<'info>(
+    delta: i128,
+    isolated: bool,
+    position: &mut Account<'info, state::PositionAccount>,
+    trader_state: &mut Box<Account<'info, TraderStateAccount>>,
+    position_haircut: Option<&mut Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
+    now_slot: u64,
+) -> Result<()> {
+    if delta > 0 {
+        if let Some(ph) = position_haircut {
+            // Haircut path: route to reserve, no collateral mutation.
+            let gain_u64: u64 = if delta > u64::MAX as i128 {
+                u64::MAX
+            } else {
+                delta as u64
+            };
+            let pre = matcher::haircut::PositionHaircutSnapshot {
+                released_reserve_quote_lots: ph.released_reserve_quote_lots,
+                released_attached_at_slot: ph.released_attached_at_slot,
+                matured_pos_quote_lots: ph.matured_pos_quote_lots,
+                original_reserve_at_attach: ph.original_reserve_at_attach,
+            };
+            let post = matcher::haircut::apply_release(pre, gain_u64, now_slot)
+                .map_err(map_haircut_error)?;
+            ph.released_reserve_quote_lots = post.released_reserve_quote_lots;
+            ph.released_attached_at_slot = post.released_attached_at_slot;
+            ph.matured_pos_quote_lots = post.matured_pos_quote_lots;
+            ph.original_reserve_at_attach = post.original_reserve_at_attach;
+            return Ok(());
+        }
+    }
+    // Loss path AND legacy non-haircut gain path both fall through to v1.
+    apply_realized_pnl_delta(delta, isolated, position, trader_state)
+}
+
 /// Pure math for the realized-PnL routing. Returns
 /// `(new_position_collateral, new_trader_state_collateral)`. Separated
 /// from `apply_realized_pnl_delta` so the routing rules are unit
@@ -12129,6 +13638,16 @@ pub struct UpdateOracleFromPyth<'info> {
     /// CHECK: deserialized via pyth-solana-receiver-sdk's account type.
     /// The SDK's get_price_no_older_than validates feed_id matches.
     pub price_update: Account<'info, pyth_solana_receiver_sdk::price_update::PriceUpdateV2>,
+
+    /// Wave 26b — optional envelope gate. Same semantics as on
+    /// `UpdateOracle`. When omitted: legacy Pyth-pull behavior.
+    #[account(
+        mut,
+        seeds = [state_v3::MarketEnvelopeConfigAccount::SEED, market.key().as_ref()],
+        bump = envelope_config.bump,
+        constraint = envelope_config.market == market.key() @ FlashBookError::EnvelopePriceCapInvalid,
+    )]
+    pub envelope_config: Option<Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>>,
 }
 
 #[event]
@@ -12698,6 +14217,18 @@ pub struct TriggerOrderV3ExecutedEvent {
     pub node_index: u32,
 }
 
+/// Wave 27a — emitted when a trigger fires but the oracle has gapped
+/// past the trader's acceptable_price slippage cap. The trigger
+/// deactivates rather than filling at a much worse price than intended.
+#[event]
+pub struct TriggerOrderV3SlippageCancelledEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub trigger_id: u8,
+    pub oracle_price_ticks: u64,
+    pub acceptable_price_ticks: u64,
+}
+
 #[event]
 pub struct TriggerOrderV3CancelledEvent {
     pub market: Pubkey,
@@ -12727,6 +14258,18 @@ pub struct TwapSliceV3ExecutedEvent {
     pub cumulative_executed_lots: u64,
     pub order_seq: u64,
     pub node_index: u32,
+}
+
+/// Wave 27b — emitted when a TWAP slice would fire but the slippage
+/// cap is breached. The slice is skipped; the TWAP stays active for
+/// future intervals.
+#[event]
+pub struct TwapSliceV3SlippageSkippedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub twap_id: u8,
+    pub oracle_price_ticks: u64,
+    pub acceptable_price_ticks: u64,
 }
 
 #[event]

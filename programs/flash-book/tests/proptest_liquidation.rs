@@ -23,6 +23,9 @@ fn market(mark: u64) -> MarketSnapshot {
         tick_size: 1,
         concentration_threshold_lots: 0,
         concentration_extra_mmr_bps: 0,
+        side_oi_lots: 0,
+        oi_mmr_slope_bps_per_million_lots: 0,
+        oi_mmr_max_extra_bps: 0,
     }
 }
 

@@ -1970,6 +1970,8 @@ async fn update_oracle_authority_only() {
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
+            // Wave 26b — None sentinel for optional envelope_config.
+            AccountMeta::new_readonly(flash_book::ID, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2012,6 +2014,7 @@ async fn update_oracle_authority_only() {
         vec![
             AccountMeta::new_readonly(attacker.pubkey(), true),
             AccountMeta::new(market_pda, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2074,6 +2077,7 @@ async fn transfer_market_authority_rotates_keys() {
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2255,6 +2259,10 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
             // Wave 22 phase 2 — Optional<FeeTiersAccount>. Anchor's
             // convention for "None" is the program ID itself.
             AccountMeta::new_readonly(flash_book::ID, false),
+            // Wave 24d — Optional<MarketHaircutStateAccount> + taker
+            // Optional<PositionHaircutStateAccount> on FLP path.
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -2355,6 +2363,7 @@ async fn update_oracle_rejects_stale_price() {
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2435,6 +2444,8 @@ async fn update_oracle_rejects_wide_confidence() {
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
+            // Wave 26b — None sentinel for optional envelope_config.
+            AccountMeta::new_readonly(flash_book::ID, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2474,6 +2485,7 @@ async fn update_oracle_quorum_writes_median_with_three_close_sources() {
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2556,6 +2568,7 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2885,6 +2898,11 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
             AccountMeta::new(maker_pos, false),
             // None for the optional FeeTiersAccount.
             AccountMeta::new_readonly(flash_book::ID, false),
+            // Wave 24d — three None sentinels for optional H-haircut
+            // accounts (market + taker_position + maker_position).
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -2970,6 +2988,10 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(counter_pos, false),
             AccountMeta::new_readonly(flash_book::ID, false),
+            // Wave 24d — three None sentinels for optional H-haircut.
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -3018,6 +3040,10 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             AccountMeta::new(counter_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(counter_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            // Wave 24d — three None sentinels for optional H-haircut.
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
             AccountMeta::new_readonly(flash_book::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
@@ -3138,6 +3164,10 @@ async fn apply_fill_rejects_wrong_sub_index_trader_state() {
             AccountMeta::new(maker_main_state, false),
             AccountMeta::new(taker_main_pos, false),
             AccountMeta::new(maker_main_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            // Wave 24d — three None sentinels for optional H-haircut.
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
             AccountMeta::new_readonly(flash_book::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],

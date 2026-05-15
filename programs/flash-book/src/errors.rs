@@ -142,6 +142,48 @@ pub enum FlashBookError {
     OraclePausedConfidence = 1802,
     #[msg("Oracle quorum dispersion exceeds configured maximum — sources disagree")]
     OracleQuorumDispersionTooWide = 1803,
+
+    // ── 1900-1999 haircut (Wave 24) ─────────────────────────────────
+    #[msg("Haircut warmup window inverted (h_min > h_max)")]
+    HaircutInvertedWindow = 1900,
+    #[msg("Haircut warmup window exceeds absolute cap")]
+    HaircutWindowTooLarge = 1901,
+    #[msg("Haircut release rejected zero gain")]
+    HaircutZeroGain = 1902,
+    #[msg("Haircut residual would underflow")]
+    HaircutResidualUnderflow = 1903,
+    #[msg("Haircut state not initialized for this market")]
+    HaircutNotInitialized = 1904,
+    #[msg("Position haircut state mismatched market/position")]
+    HaircutStateMismatch = 1905,
+    #[msg("Nothing to mature — reserve is zero or warmup hasn't started")]
+    HaircutNothingToMature = 1906,
+    #[msg("Nothing to convert — matured_pos is zero")]
+    HaircutNothingToConvert = 1907,
+
+    // ── 2000-2099 envelope (Wave 26) ────────────────────────────────
+    #[msg("Envelope price cap zero or out of range")]
+    EnvelopePriceCapInvalid = 2000,
+    #[msg("Envelope accrual window zero or too large")]
+    EnvelopeAccrualWindowInvalid = 2001,
+    #[msg("Envelope funding cap exceeds absolute bound")]
+    EnvelopeFundingCapInvalid = 2002,
+    #[msg("Envelope maintenance bps zero or ≥ BPS_DENOM")]
+    EnvelopeMaintenanceInvalid = 2003,
+    #[msg("Envelope liquidation fee bps ≥ BPS_DENOM")]
+    EnvelopeLiqFeeInvalid = 2004,
+    #[msg("Envelope inequality violated for some notional N")]
+    EnvelopeViolated = 2005,
+    #[msg("Envelope same-slot price move rejected")]
+    EnvelopeSameSlotMove = 2006,
+    #[msg("Envelope price move exceeds per-slot cap")]
+    EnvelopePriceMoveExceedsCap = 2007,
+    #[msg("Envelope config not initialized for market")]
+    EnvelopeNotInitialized = 2008,
+
+    // ── 2100-2199 trigger orders (Wave 27) ──────────────────────────
+    #[msg("Trigger slippage cap breached — oracle moved past acceptable_price")]
+    TriggerSlippageExceeded = 2100,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

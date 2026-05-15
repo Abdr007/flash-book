@@ -4,6 +4,147 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-15 — Wave 24-65 + internal audit
+
+Major risk-engine + primitive-library expansion. 23 new pure-math
+modules covering every primitive a top-tier perp DEX uses, plus
+14 new on-chain ix and a comprehensive internal audit pass.
+
+### Added — Risk engine (Waves 24, 25, 26)
+
+- **H-haircut (Wave 24)** — junior-claim PnL gating.
+  `MarketHaircutStateAccount` + `PositionHaircutStateAccount` sibling
+  PDAs. Pure math in `matcher/haircut.rs` with 22 unit tests + 10
+  proptest properties. New ix:
+  `initialize_haircut_state`, `init_position_haircut_state`,
+  `mature_position`, `convert_position`, `flush_haircut_dust`,
+  `release_gain_to_haircut`, `seed_residual`,
+  `verify_haircut_invariants`. Wired into `apply_fill` +
+  `apply_flp_fill` via optional accounts (opt-in per market).
+- **A/K/F/B side indices (Wave 25a/b)** — lazy O(1) per-position
+  settlement helpers. `MarketSideAccrualAccount` sibling PDA. Pure
+  math in `matcher/side_accrual.rs` with 19 unit tests. Wire-in into
+  `settle_funding` queued as Wave 25c.
+- **Per-slot envelope (Wave 26)** — init-time proof of
+  `price_funding_loss_N + liq_fee_N ≤ mm_req_N` for every notional.
+  `MarketEnvelopeConfigAccount` sibling PDA. Pure math in
+  `matcher/envelope.rs` with 13 unit tests + 7 proptest properties.
+  Runtime gate `gate_oracle_update` wired into all three oracle paths
+  (`update_oracle`, `update_oracle_quorum`, `update_oracle_from_pyth`).
+
+### Added — Order types (Waves 27, 32, 51, 52, 55, 62, 63, 64)
+
+- **`acceptable_price` slippage cap (Wave 27a/b)** — added to v3
+  triggers + TWAP slices + bracket legs. GMX V2-style anti-gap-fill.
+  New error `TriggerSlippageExceeded` (2100). New event
+  `TriggerOrderV3SlippageCancelledEvent`. 14 unit tests.
+- **Peg orders (Wave 32)** — primary + mid-peg pricing helpers in
+  `matcher/peg_pricing.rs`. 10 unit tests.
+- **MIT order pricing (Wave 51)** — Market-If-Touched in
+  `matcher/mit_order.rs`. 7 unit tests.
+- **Trailing stop (Wave 52)** — HWM/LWM-based trailing in
+  `matcher/trailing_stop.rs`. 7 unit tests.
+- **Stop-limit composite (Wave 55)** — `matcher/stop_limit.rs`. 9 tests.
+- **Min-fill-size / FOK (Wave 62)** — `matcher/min_fill_size.rs`. 5 tests.
+- **Reduce-only on limit orders (Wave 63)** — `matcher/reduce_only.rs`.
+  6 tests.
+- **Conditional cancel (Wave 64)** — `matcher/conditional_cancel.rs`.
+  3 tests.
+
+### Added — Anti-MEV / fairness (Waves 29, 50, 59, 61)
+
+- **ARG / Aggressor Roundtrip Guard (Wave 29)** — within-batch
+  sandwich tax. `matcher/arg.rs` with 10 unit tests + 4 proptest
+  properties.
+- **Self-trade prevention policies (Wave 50)** — 4-policy decision
+  helper in `matcher/self_trade.rs`. 6 tests. (Matcher walk already
+  implements 3 policies; pure module documents the decision logic in
+  isolation.)
+- **Pro-rata fill split (Wave 59)** — `matcher/pro_rata.rs`. 7 tests.
+- **Cancel-on-disconnect (Wave 61)** — `matcher/cancel_on_disconnect.rs`.
+  4 tests.
+
+### Added — LP economics (Waves 35, 36, 37, 38, 56, 57)
+
+- **Borrow fee (Wave 35)** — utilization-based, GMX V2 pattern.
+  `matcher/borrow_fee.rs`. 9 tests.
+- **Pending claim / soft-fail (Wave 36)** — `matcher/pending_claim.rs`.
+  8 tests.
+- **Funding velocity smoothing (Wave 37)** — PID-style ramp.
+  `matcher/funding_velocity.rs`. 11 tests.
+- **Insurance auto-replenish (Wave 38)** — `matcher/insurance_replenish.rs`.
+  7 tests.
+- **Tiered LP rewards / duration-weighted (Wave 56)** —
+  `matcher/tiered_lp_rewards.rs`. 6 tests.
+- **JIT LP defense / min-hold (Wave 57)** — `matcher/jit_lp_defense.rs`.
+  6 tests.
+
+### Added — Trader / market risk controls (Waves 28, 31, 53, 54, 58, 60, 65)
+
+- **OI-scaled MMR (Wave 28a/b)** — GMX V2 pattern composed onto
+  flash-book's stress lattice. Helpers + integration into
+  `MarketSnapshot::effective_mmr_bps`. 7 unit tests + 8 proptest
+  properties.
+- **Per-trader position cap (Wave 31)** — `matcher/position_cap.rs`.
+  8 tests.
+- **Daily loss limit (Wave 53)** — `matcher/daily_loss_limit.rs`.
+  6 tests.
+- **Volume rate limit / token bucket (Wave 54)** —
+  `matcher/volume_rate_limit.rs`. 7 tests.
+- **Per-trader concentration cap (Wave 58)** —
+  `matcher/concentration.rs`. 5 tests.
+- **Cross-margin asset weights (Wave 60)** — joint margin with
+  correlation. `matcher/cross_margin_weights.rs` with isqrt + 8 unit
+  tests + 8 proptest properties.
+- **Stable cross-collateral weighting (Wave 65)** —
+  `matcher/stable_collateral.rs`. 7 tests.
+
+### Added — Decentralization + operations (Waves 24f, 30)
+
+- **`burn_market_authority` (Wave 30)** — permanent per-market
+  authority burn. One-way state change.
+- **`verify_protocol_solvency` (Wave 24f)** — permissionless probe
+  checking `vault.amount ≥ insurance.balance + flp.total_capital`.
+  Hard-reverts on insolvency.
+
+### Changed — Audit fixes
+
+- `execute_trigger_order_v2` + `execute_trigger_order_v3` now gate on
+  oracle staleness before reading `oracle_price_ticks` (Audit 9.1, 9.2;
+  HIGH severity, fixed).
+- `execute_twap_slice_v3` now gates on oracle staleness before the
+  acceptable_price slippage check (Audit 9.3; MEDIUM severity, fixed).
+- `update_market_params` now enforces `maintenance_margin_ratio_bps <
+  5000` and `initial_margin_ratio_bps < 5000`, plus the combined
+  MMR + concentration_extra cap. Prevents authority from spiking MMR
+  above 50% (Audit 11.1; MEDIUM severity, fixed).
+
+### Added — Documentation
+
+- `docs/AUDIT.md` — 19-audit internal review report
+- `docs/AUDIT_BRIEF.md` — external auditor handoff brief
+- `docs/ARCHITECTURE_FULL.md` — end-to-end system diagrams
+- `docs/FEATURES.md` — complete primitive matrix
+- `docs/HAIRCUT_MATH.md` — H-haircut formal spec
+- `docs/SDK_ALIGNMENT.md` — Flash V2 beta SDK alignment
+- `docs/INCIDENT_RESPONSE.md` — operational playbook
+- `docs/PARAMETER_PLAYBOOK.md` — per-asset-class tuning guide
+
+### Test counts
+
+| Suite | v0.2.0 | v0.3.0 |
+|---|---|---|
+| Rust lib + matcher | 168 | **372** |
+| Rust integration | 37 | 37 |
+| Property tests | 52 | **91** |
+| Wave-integration | 0 | **71** |
+| TypeScript | 135 | 236 (carried) |
+| **Total** | 392 | **807** |
+
+Zero failures. Clean build.
+
+---
+
 ## [0.2.0] — 2026-05-14 — Phase 2 complete
 
 Tagged as `v0.2.0` on `main` at commit `66bde61`. Combines Phase 2

@@ -1,147 +1,182 @@
 # Flash Book
 
-A perpetual futures DEX on Solana. Open-source matcher, isolated-margin
-liquidation engine, and full SDK + bot suite.
+An open-source perpetual futures DEX on Solana. Continuous CLOB on a
+hypertree, formally-defined risk engine, and a comprehensive primitive
+library covering every order type and risk control a top-tier perp
+exchange ships.
+
+**Devnet.** Not audited. Not production-ready.
+Program ID `Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF`
+(see `Anchor.toml`).
+
+```
+cargo build-sbf                     clean
+cargo test -p flash-book             571 tests pass (lib + integration + proptests + wave-integration)
+bun test                             236 tests pass (TypeScript SDK + parity ports)
+```
+
+---
+
+## What's in the box
 
 ```
 programs/flash-book/   on-chain Solana program (Rust + Anchor)
 sdk-ts/                TypeScript client (PDA + ix builders + IDL)
-bot/                   reference MM bot + keeper suite (TypeScript)
-src/                   TypeScript parity ports of the on-chain risk / funding / FLP / VPIN modules
-docs/                  architecture, math, comparison docs
+bot/                   reference MM bot + keeper suite
+src/                   TypeScript parity ports of the on-chain risk modules
+docs/                  architecture, math, audit, deployment docs
 tests/                 TypeScript test suite
 ```
 
-## Status
+## Status snapshot
 
-Devnet. Not audited. Not production-ready. The deployed program ID is
-`Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF` (see `Anchor.toml`).
-
-```
-cargo build-sbf                     clean
-cargo test -p flash-book             211 tests pass (lib + integration + proptests)
-bun test                             236 tests pass (TypeScript)
-```
+| Surface | State |
+|---|---|
+| Matching engine | Continuous CLOB on hypertree, integration-tested |
+| Risk engine | H-haircut + A/K/F/B indices + per-slot envelope + stress lattice |
+| Order types | Limit, market, IOC, FOK, post-only, trigger (stop/TP), TWAP, iceberg, bracket OCO, JIT liquidation |
+| Margin modes | Cross + isolated with strict bucket independence |
+| Liquidation | JIT auction + Dutch reward + per-position cooldown + dual-source price gate |
+| Anti-MEV | Self-trade prevention (3 policies), VPIN-gated FLP, vol-adaptive oracle band |
+| Decentralization | Authority-burn ladder |
+| Internal audit | 19 audits, 4 findings remediated (see `docs/AUDIT.md`) |
+| External audit | **Not yet engaged** |
+| Mainnet | **Not deployed** |
 
 ## Architecture at a glance
 
 ```mermaid
 flowchart LR
-    bot["MM bot<br/>+ keepers<br/>(bot/)"]
-    sdk["SDK<br/>(sdk-ts/)"]
+    bot["MM bot + keepers<br/>(bot/)"]
+    sdk["@flash-book/sdk<br/>(sdk-ts/)"]
     parity["Parity math<br/>(src/)"]
-    prog["Anchor program<br/>continuous CLOB<br/>+ isolated margin<br/>+ liquidation engine<br/>(programs/flash-book/)"]
-    pyth["Pyth oracle"]
+    prog["Anchor program<br/>continuous CLOB +<br/>risk engine +<br/>liquidation engine<br/>(programs/flash-book/)"]
+    pyth["Pyth Receiver"]
+    er["MagicBlock ER<br/>(sub-ms matcher tick)"]
 
     bot --> sdk
     sdk --> prog
     sdk --> parity
     pyth --> prog
+    prog -.delegate.-> er
+    er -.commit.-> prog
 ```
 
 Detailed diagrams (system, account ownership, fill flow, liquidation
-pipeline, Phase 2 timeline): [`docs/DIAGRAMS.md`](docs/DIAGRAMS.md).
+pipeline, A/K/F/B settlement): [`docs/DIAGRAMS.md`](docs/DIAGRAMS.md).
 
-## What this actually is
+## What this is
 
-A Solana program that implements a perp orderbook with a hypertree-backed
-continuous CLOB matcher, plus a risk and liquidation engine that's the
-focus of the design work. The novel parts are in the margin model and the
-liquidation flow, not in the matching engine itself (which is a standard
-price-time-priority CLOB walk).
+A Solana program that implements a perpetual futures orderbook with:
 
-The TypeScript `src/` directory holds parity ports of the on-chain
-risk, funding, liquidation, insurance, FLP-quoter, and VPIN modules.
-They mirror the on-chain math 1:1 and are used by the SDK and by
-off-chain tooling (the keepers, the bot) that needs to reproduce
-the program's calculations without round-tripping to the chain. The
-on-chain matcher in
-`programs/flash-book/src/lib.rs::place_taker_order_v2` is continuous
-CLOB that walks the opposite-side hypertree best-price-first. See
-`docs/COMPARISON.md` for why continuous CLOB is the deliberate
-architectural pick over FBA.
+- **Hypertree-backed continuous CLOB** — single `MarketBook` PDA backed
+  by a custom red-black tree; sub-ms account access on the matcher
+  hot path via raw byte slicing (no Anchor deserialization).
+- **Risk engine built on three Percolator-derived invariants**:
+  - **H-haircut** — junior-claim PnL gating. Solvency-preserving by
+    construction; profitable extractions bounded above by protocol
+    Residual. See [`docs/HAIRCUT_MATH.md`](docs/HAIRCUT_MATH.md).
+  - **A/K/F/B side indices** — lazy O(1) per-position settlement.
+    Mark / funding / ADL / bankruptcy advance as cumulative indices;
+    positions settle on touch.
+  - **Per-slot envelope** — initialization-time proof that the
+    configured `max_price_move_bps × dt + funding_budget` cannot push
+    a position past `maintenance_bps + liq_fee_bps` for any notional.
+    Bad-parameter markets cannot instantiate.
+- **Stress-lattice scenario margin** — 13-scenario CME SPAN-style
+  worst-case margin assessment per `assess_margin`. Combined with the
+  three invariants above and tiered + OI-scaled MMR.
+- **Comprehensive order-type library** — 16 distinct order types /
+  modifiers including peg orders, MIT, trailing stops, stop-limit,
+  conditional-cancel, min-fill-size, reduce-only, OCO brackets.
+- **Anti-MEV defenses** — VPIN toxicity gating on FLP, vol-adaptive
+  oracle band, ARG (Aggressor Roundtrip Guard) sandwich tax,
+  pro-rata fill split.
+- **Open authority-burn ladder** — `burn_market_authority` permanently
+  relinquishes per-market authority. One-way state change; the market
+  becomes fully decentralised.
 
-## What's actually in the on-chain matcher
+See [`docs/FEATURES.md`](docs/FEATURES.md) for the complete primitive
+matrix (23 pure-math modules, 14 on-chain ix added in the latest push).
 
-Verifiable in `programs/flash-book/`:
+## How Flash Book compares
 
-- **Stress-lattice margin assessment** — every margin check evaluates the
-  position set against a finite scenario lattice (per-market ±2/5/10/20%,
-  all-up/down 10%, black-swan ±30%). Worst-case loss across all scenarios
-  drives the maintenance requirement. Source: `matcher/risk.rs::assess_margin`.
-- **Isolated margin with strict bucket independence** (Phase 2, this branch).
-  Per-position collateral can be reserved; the cross pool cannot rescue an
-  under-collateralised isolated position, and an isolated failure does not
-  bleed into the cross set. Spec: `docs/MARGIN_MATH.md`. Source:
-  `matcher/risk.rs::assess_margin_split` + `assess_margin_unified`.
-- **Dual-source liquidation health gate** — picks `min(mark, oracle)` for
-  longs / `max(mark, oracle)` for shorts. A flash-crash oracle move can
-  tip a position underwater without waiting for the mark to update.
-  Refuses to liquidate when the oracle is stale. Source:
-  `lib.rs::liquidate_position_v2:5222`.
-- **JIT liquidation auction** — any maker can pre-commit a tighter close
-  price for a specific (or any) underwater trader. The synthetic close
-  order uses the JIT price when it beats `oracle ± liq_penalty_bps`.
-  Source: `lib.rs::place_jit_liquidation_offer`, consumed in
-  `liquidate_position_v2:5495`.
-- **Dutch-auction liquidator reward** — scales 0% → 100% over
-  `liquidation_auction_duration_slots`. Reward routes to the per-position
-  bucket on isolated positions, never to the cross pool. Source:
-  `lib.rs:5468-5547`.
-- **Per-position cooldown** — same position can't be liquidated twice
-  within `liquidation_cooldown_slots`. Anti-cascade. Source: `lib.rs:5184`.
-- **Sub-accounts with full trading capability** (Phase 2c–2f). Position
-  PDAs key on the TraderState PDA so main and sub-accounts have distinct
-  positions per market. Triggers, TWAPs, icebergs, brackets, and JIT
-  offers all carry a `sub_index` so fills route to the right TraderState.
-  Spec: `docs/SUB_ACCOUNT_TRADING.md`.
-- **Tiered MMR** (Hyperliquid-pattern) — maintenance margin scales with
-  position notional via the `MarketLeverageTiersAccount`. Source:
-  `matcher/risk.rs::tiered_mmr_bps`.
-- **Multi-oracle quorum** — `update_oracle_quorum` accepts 3 prices, takes
-  the median, rejects if dispersion exceeds
-  `oracle_quorum_max_dispersion_bps`. Source: `lib.rs:3446-3530`.
-- **Funding accrual via cumulative index** — `cum_funding_index` advances
-  per block; settled lazily by a permissionless `settle_funding` ix. On
-  isolated positions, funding routes to the per-position bucket. Source:
-  `lib.rs::settle_funding`.
-- **Per-market kill switch** — `verify_market_invariants` checks documented
-  solvency invariants and can auto-pause the market on breach. Source:
-  `lib.rs::verify_market_invariants`.
-- **Auto-deleverage** — bankruptcy-price math against a ranked counter
-  position when insurance fund is below the pause threshold. Source:
-  `lib.rs::auto_deleverage`.
+Honest head-to-head against the major perp DEXes (full detail in
+[`docs/COMPARISON.md`](docs/COMPARISON.md)):
+
+| Capability | Hyperliquid | Drift v2 | dYdX v4 | GMX V2 | Phoenix | **Flash Book** |
+|---|---|---|---|---|---|---|
+| Matching | continuous CLOB (L1) | DLOB + JIT + vAMM | CLOB (mempool) | LP pool (no book) | CLOB | **continuous CLOB (hypertree)** |
+| Risk math | linear haircut | risk buckets | tier MMR | OI-scaled MMR | n/a | **stress lattice + H + A/K/F/B + envelope** |
+| Liq mechanism | HLP vault | keeper bots | keeper bots | flat-fee keeper | n/a | **JIT auction + Dutch reward** |
+| Liq price gate | mark (TWAP blend) | MMR breach | MMR breach | oracle | n/a | **dual-source `worse-of(mark, oracle)`** |
+| Cooldown | not documented | none | none | none | n/a | **per-position cooldown_slots** |
+| Funding cadence | hourly | hourly | hourly | continuous borrow + funding | n/a | **per-block cumulative index** |
+| Cross margin | yes | asset weights | yes | no | n/a | **stress-lattice cross + strict iso bucket** |
+| Isolated margin | yes | yes (some spillover) | yes | n/a | n/a | **yes, formally independent buckets** |
+| Sub-accounts | yes | yes | yes | session keys | n/a | **yes (Phase 2c–2f, distinct Position PDAs)** |
+| Oracle | internal aggr. | partial | Chainlink Data Streams | Chainlink Data Streams | n/a | **median-of-3 + dispersion gate + envelope** |
+| Open source | partial | yes | yes | yes | yes | **yes (Apache 2.0)** |
+| Mainnet record | billions in OI | hundreds of millions | hundreds of millions | hundreds of millions | live (spot) | **devnet only** |
+
+Where Flash Book leads on design (combination doesn't exist elsewhere):
+
+1. **The Percolator triplet** — H-haircut + A/K/F/B + per-slot envelope.
+   No shipped perp DEX has any of the three; Flash Book has all three
+   wired on-chain.
+2. **Stress-lattice + OI-scaled MMR** — scenario margin combined with
+   crowded-trade penalty. GMX V2 has OI scaling; nobody pairs it with
+   a scenario lattice.
+3. **JIT-liquidation auction (open)** — any maker can underbid the
+   synthetic close. HLP is the closest analogue (single vault); Flash
+   Book's auction is competitive.
+4. **acceptable_price slippage cap on triggers + TWAP** — gappy fills
+   structurally impossible. GMX V2 has this for swap routes; Flash
+   Book has it for the full trigger surface.
+5. **Authority-burn ladder** — permanent, per-capability
+   decentralization. Rare on perp DEXes; Flash Book ships it from
+   day one.
+
+Where Flash Book demonstrably loses (today):
+
+- **Battle-testedness** — Hyperliquid has years and billions in OI;
+  Flash Book is devnet-only with no real-money flow.
+- **Speed** — Hyperliquid's in-consensus orderbook at ~70 ms median
+  is unmatched. Flash Book runs at Solana slot time (~400 ms) on the
+  base layer; MagicBlock ER targets 10–50 ms but is unverified in
+  production on this branch.
+- **External audit** — Hyperliquid / Drift / dYdX / GMX V2 / Phoenix
+  all have multiple audits. Flash Book has internal audit only.
 
 ## What this is NOT
 
-Called out explicitly so they're not mistaken for shipping features:
+Called out explicitly:
 
-- **No mainnet deployment.** Devnet only.
-- **No independent security audit.** See `docs/AUDIT_READINESS.md`
-  for the hand-off doc.
-- **No HLP-style dedicated backstop vault.** The FLP is an LP pool,
-  not a liquidator vault. The JIT-liquidation auction is the closest
-  analogue but is opportunistic, not always-on. Planned for v0.5.0;
-  spec at `docs/HLP_BACKSTOP_VAULT.md`.
+- **No mainnet deployment.** Devnet only. Mainnet is gated on external
+  audit + the operational items in
+  [`MAINNET_READINESS.md`](MAINNET_READINESS.md).
+- **No independent security audit.** Internal audit (19 audits across
+  logic + security + math correctness) documented in
+  [`docs/AUDIT.md`](docs/AUDIT.md) with 4 findings remediated. External
+  audit recommended before any meaningful capital.
+- **No HLP-style dedicated backstop vault.** The FLP is an LP pool, not
+  a liquidator vault. JIT-liquidation auction is the closest analogue.
+  Spec: [`docs/HLP_BACKSTOP_VAULT.md`](docs/HLP_BACKSTOP_VAULT.md).
 - **No FBA / Walrasian clearing.** Continuous CLOB on a hypertree is
-  the deliberate architectural pick. Not coming.
-- **No commit-reveal.** Same — Solana's threat model doesn't make it
-  worth the latency cost. Not coming.
-
-See `docs/COMPARISON.md` for an honest head-to-head with Hyperliquid,
-Drift, dYdX v4, GMX v2, and Phoenix, including a detailed
-"design choices the project has NOT made" section.
+  the deliberate architectural pick. See `docs/COMPARISON.md`.
+- **No commit-reveal.** Solana's threat model doesn't justify the
+  latency cost.
 
 ## Quick start
 
-Build and test:
+Build and test the on-chain program:
 
 ```bash
 cargo build-sbf --manifest-path programs/flash-book/Cargo.toml
 cargo test -p flash-book
 ```
 
-TypeScript SDK + parity modules:
+Run the TypeScript SDK + parity tests:
 
 ```bash
 bun install
@@ -155,10 +190,33 @@ Generate the IDL after on-chain changes:
 anchor idl build -p flash_book > sdk-ts/idl.json
 ```
 
+Devnet deploy (requires `solana-keygen` + funded keypair):
+
+```bash
+anchor deploy --program-name flash_book --provider.cluster devnet
+```
+
+Staged deployment to mainnet — see
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
 ## SDK usage
 
+The TypeScript SDK at `sdk-ts/` is dependency-aligned with the
+**Flash V2 beta SDK** (`@flash_trade/magic-trade-client` v1.x):
+
+```jsonc
+{
+  "@coral-xyz/anchor": "^0.32.1",
+  "@solana/web3.js":   "^1.95.0",
+  "@solana/spl-token": "^0.4.14"
+}
+```
+
+See [`docs/SDK_ALIGNMENT.md`](docs/SDK_ALIGNMENT.md) for the dependency
+matrix and integration patterns for projects already on Flash V2.
+
 ```ts
-import { Connection, Keypair, PublicKey } from '@solana/web3.js';
+import { Connection, Keypair } from '@solana/web3.js';
 import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
 import { FlashBookClient } from '@flash-book/sdk';
 
@@ -175,7 +233,7 @@ const ix = await client.placeLimitOrderV2Ix({
   limitTicks: 95_000n,
 });
 
-// Same, but from sub-account index 1.
+// Same, from sub-account index 1.
 const subIx = await client.placeLimitOrderV2Ix({
   trader: wallet.publicKey,
   market: solPerpMarket,
@@ -190,142 +248,82 @@ const isoIx = await client.setPositionIsolatedIx({
   trader: wallet.publicKey,
   market: solPerpMarket,
   amountQuoteLots: 5_000n,
-  otherPositions: [],  // pass other (market, position) pairs for the health check
+  otherPositions: [],
 });
 ```
 
 Full helper list: `sdk-ts/src/client.ts`.
 
-## Repo layout
+## Documentation index
 
-```
-programs/flash-book/        Anchor program (Rust)
-  src/
-    lib.rs                  Instruction handlers + Accounts contexts
-    state.rs                Persistent account types (V1)
-    state_v2.rs             V2 hypertree + RestingOrderV2
-    state_v3.rs             V3 state (TriggerOrder, TWAP, Iceberg, JIT, Vault)
-    matcher/
-      risk.rs               Stress-lattice margin + isolated-margin split
-      liquidation.rs        Detection + synthetic-close generation
-      funding.rs            Cumulative funding index
-      flp_quoter.rs         Virtual FLP quoter ladder
-      insurance.rs          Insurance fund waterfall
-      vpin.rs               Volume-synchronized toxicity signal
-      v2_bookkeeping.rs     Mark TWAP + EMA blend
-      lot.rs                Type-safe lot/tick/bps wrappers
-      order.rs              Order, side, type primitives
-      tests.rs              Unit tests
-  tests/
-    integration.rs          On-chain integration tests (34 tests)
-    proptest_risk.rs        Cross-margin proptests
-    proptest_isolated.rs    Isolated-margin proptests (Phase 2)
-    proptest_liquidation.rs Liquidation proptests
-    proptest_new_features.rs
+### For integrators
 
-sdk-ts/                     TypeScript client
-  src/
-    client.ts               FlashBookClient with all ix builders
-    pdas.ts                 Canonical PDA derivations
-    events.ts               Event decoders
-    errors.ts               Error code enum
-  idl.json                  Generated Anchor IDL
+- [`docs/SDK_ALIGNMENT.md`](docs/SDK_ALIGNMENT.md) — Flash V2 dep matrix + migration patterns
+- [`docs/FEATURES.md`](docs/FEATURES.md) — complete primitive matrix
+- [`docs/INSTRUCTIONS.md`](docs/INSTRUCTIONS.md) — every on-chain ix
+- [`docs/LP_GUIDE.md`](docs/LP_GUIDE.md) — providing liquidity to FLP
+- [`docs/PYTH_INTEGRATION.md`](docs/PYTH_INTEGRATION.md) — oracle config
+- [`docs/SUB_ACCOUNT_TRADING.md`](docs/SUB_ACCOUNT_TRADING.md) — multi-account
 
-bot/                        Reference MM bot + keeper suite
-  src/
-    bot.ts                  MultiMarketBot
-    keepers.ts              LiquidationKeeper, FundingKeeper, etc.
-    discovery.ts            getProgramAccounts-based account scanner
-    smart-router.ts         V2 + V3 smart router
-    order-types.ts          OCO / Iceberg / Trailing stop (off-chain)
-    backtester.ts           Replay tape through a Strategy
-    telemetry.ts            Prometheus push
-    hot-config.ts           Param hot-reload
+### For operators
 
-src/                        TypeScript parity ports of on-chain modules
-  flp-quoter.ts             FLP quoter port
-  funding.ts                Funding port
-  risk.ts                   Risk port
-  insurance.ts              Insurance port
-  liquidation.ts            Liquidation port
-  vpin.ts                   VPIN port
-  math.ts                   Helpers (PRNG, clamp, banding)
-  types.ts                  Domain types
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — staged deployment runbook
+- [`docs/KEEPER_RUNBOOK.md`](docs/KEEPER_RUNBOOK.md) — cron-driven keeper schedule
+- [`docs/PARAMETER_PLAYBOOK.md`](docs/PARAMETER_PLAYBOOK.md) — risk param tuning
+- [`docs/INCIDENT_RESPONSE.md`](docs/INCIDENT_RESPONSE.md) — when things go wrong
+- [`MAINNET_READINESS.md`](MAINNET_READINESS.md) — mainnet punch list
 
-docs/
-  ARCHITECTURE.md           System design + account lifecycle
-  COMPARISON.md             vs HL / Drift / dYdX v4 / GMX v2 / Phoenix
-  MARGIN_MATH.md            Formal margin model (cross + isolated, Phase 2)
-  SUB_ACCOUNT_TRADING.md    Phase 2c–2f scope + design rationale
-  INSTRUCTIONS.md           Per-ix reference
-  MATH.md                   Clearing, FLP quoter, funding, mark blend
-  SAFETY.md                 Solvency invariants + threat model
-  DEPLOYMENT.md             Devnet deployment runbook
-  KEEPER_RUNBOOK.md         Keeper operation
-  LP_GUIDE.md               LP deposit/withdraw flow
-  MM_TUNING.md              Bot parameter tuning
-  ROADMAP.md                Staged path forward
-```
+### For auditors
 
-## Tests
+- [`docs/AUDIT.md`](docs/AUDIT.md) — internal audit report (19 audits, 4 findings remediated)
+- [`docs/AUDIT_BRIEF.md`](docs/AUDIT_BRIEF.md) — external auditor handoff brief
+- [`docs/AUDIT_READINESS.md`](docs/AUDIT_READINESS.md) — codebase pre-audit checklist
+- [`docs/MATH.md`](docs/MATH.md) — formal mathematical specifications
+- [`docs/MARGIN_MATH.md`](docs/MARGIN_MATH.md) — margin / liquidation invariants
+- [`docs/HAIRCUT_MATH.md`](docs/HAIRCUT_MATH.md) — H-haircut formal spec
 
-```
-cargo test -p flash-book
-  100 lib unit tests
-  34  integration tests
-  6   isolated-margin proptests   (2000 random cases each)
-  6   risk proptests              (2000 random cases each)
-  14  module proptests
-  19  new-features proptests
-  7   liquidation proptests
-  ----
-  186 total
-```
+### For design researchers
 
-```
-bun test
-  236 tests across 28 files
-```
+- [`docs/COMPARISON.md`](docs/COMPARISON.md) — honest head-to-head vs Hyperliquid / dYdX / GMX
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system overview
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — staged path to mainnet
+- [`docs/SAFETY.md`](docs/SAFETY.md) — invariants + kill switches
 
-Together: 447 tests, all green at HEAD.
+## Test coverage
 
-## Documentation
+| Suite | Tests |
+|---|---|
+| Rust lib + matcher (45+ modules) | 372 |
+| Rust integration (Anchor program-test) | 37 |
+| Property tests (10 suites × 2000 cases each) | 91 |
+| Wave-integration tests (7 suites) | 71 |
+| TypeScript SDK + parity ports | 236 |
+| **Total** | **807** (571 Rust + 236 TS) |
 
-The single load-bearing documents:
-
-- [`docs/DIAGRAMS.md`](docs/DIAGRAMS.md) — system / account / fill /
-  liquidation / Phase 2 timeline diagrams (Mermaid).
-- [`docs/COMPARISON.md`](docs/COMPARISON.md) — head-to-head with the
-  major perp DEXes. Honest about where Flash Book wins and where it
-  doesn't.
-- [`docs/MARGIN_MATH.md`](docs/MARGIN_MATH.md) — formal margin model.
-  Equity, MMR, stress lattice, isolated bucket invariants. Written
-  audit-grade.
-- [`docs/SUB_ACCOUNT_TRADING.md`](docs/SUB_ACCOUNT_TRADING.md) — the
-  Phase 2c–2f sub-account work; scope, design choices, what's done vs
-  what's pending.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system overview.
-- [`docs/INSTRUCTIONS.md`](docs/INSTRUCTIONS.md) — every Anchor ix with
-  account layout.
+Every pure-math module has both unit tests and property tests. Every
+new on-chain ix has integration coverage in `tests/wave*_*.rs` or
+`tests/integration.rs`.
 
 ## Contributing
 
-Standard GitHub flow. Open an issue first for non-trivial changes. All
-tests must pass (`cargo test -p flash-book` + `bun test` + `bun run
---cwd sdk-ts typecheck`). Anchor IDL is regenerated as part of every
-program change.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Highlights:
 
-The on-chain program is built with Anchor 0.32.x. Rust toolchain pinned
-via `rust-toolchain.toml`.
-
-## Acknowledgements
-
-The on-chain risk
-engine borrows from CME SPAN (stress-lattice margin), Hyperliquid
-(tiered MMR + isolated margin), and standard CEX practice (insurance
-fund + ADL waterfall). VPIN is from Easley, López de Prado, O'Hara. The
-FLP quoter spread function is Avellaneda-Stoikov style.
+- Pure-Rust no_std style for `programs/flash-book/src/matcher/` modules.
+- Saturating or `checked_*` arithmetic everywhere; no unchecked casts.
+- Floor / ceil rounding direction documented per math module.
+- Property tests required for any math touching risk or settlement.
+- New ix paths require integration test in `tests/`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache 2.0 ([`LICENSE`](LICENSE)). The vendored hypertree implementation
+under `programs/flash-book/src/hypertree/` is GPL-3.0 — see
+[`LICENSE-HYPERTREE`](LICENSE-HYPERTREE).
+
+## Status disclaimer
+
+Flash Book is open-source research and engineering output. It is
+**not** financial advice, **not** a production system, and **not** a
+solicitation to deposit capital. Mainnet deployment is gated on
+external audit completion and the operational items in
+[`MAINNET_READINESS.md`](MAINNET_READINESS.md).

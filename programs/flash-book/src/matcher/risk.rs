@@ -65,22 +65,106 @@ pub struct MarketSnapshot {
     /// 0 threshold = tier disabled (legacy single-mmr behaviour).
     pub concentration_threshold_lots: u64,
     pub concentration_extra_mmr_bps: u32,
+    // ─── Wave 28b — OI-scaled MMR inputs ─────────────────────────────
+    /// Side OI in lots, for the side this *position* is on. Caller is
+    /// responsible for passing `long_oi_lots` for long positions,
+    /// `short_oi_lots` for shorts. Defaults to 0 (Wave 28 disabled).
+    pub side_oi_lots: u64,
+    /// Per-million-lots slope, in bps. `100` ⇒ +1 bp extra MMR per
+    /// 10_000 lots of side OI. `0` disables OI scaling entirely.
+    pub oi_mmr_slope_bps_per_million_lots: u32,
+    /// Cap on the OI-scaled extra. Default 0 (no cap) = relies on the
+    /// natural saturation of u32 bps. Production should set non-zero.
+    pub oi_mmr_max_extra_bps: u32,
 }
 
 impl MarketSnapshot {
     /// Effective maintenance margin in bps for a position of size
-    /// `size_lots` on this market. Applies the concentration tier
-    /// extra if the position crosses the threshold.
+    /// `size_lots` on this market. Stacks all three contributions:
+    ///   1. base `maintenance_margin_bps`
+    ///   2. CME-style concentration extra (size ≥ threshold)
+    ///   3. Wave 28b OI-scaled crowded-trade extra (heavy-side OI)
+    ///
+    /// All terms are additive; total saturates on u32 overflow.
     pub fn effective_mmr_bps(&self, size_lots: u64) -> u32 {
-        if self.concentration_threshold_lots > 0
+        let base_with_conc = if self.concentration_threshold_lots > 0
             && size_lots >= self.concentration_threshold_lots
         {
             self.maintenance_margin_bps
                 .saturating_add(self.concentration_extra_mmr_bps)
         } else {
             self.maintenance_margin_bps
-        }
+        };
+        let oi_extra = oi_scaled_mmr_extra_bps(
+            self.side_oi_lots,
+            self.oi_mmr_slope_bps_per_million_lots,
+            // 0 max means "no cap"; the helper treats that as
+            // min(extra, 0) → 0, which is wrong. Convert to u32::MAX
+            // so the cap is effectively absent.
+            if self.oi_mmr_max_extra_bps == 0 {
+                u32::MAX
+            } else {
+                self.oi_mmr_max_extra_bps
+            },
+        );
+        base_with_conc.saturating_add(oi_extra)
     }
+}
+
+/// Wave 28a — GMX V2-style OI-scaled MMR.
+///
+/// Adds a *crowded-trade* penalty on top of the existing tier table:
+/// when the heavy-side open interest grows, every position on the
+/// imbalanced side pays incrementally more maintenance margin. This
+/// is the cheap, orthogonal complement to flash-book's stress-lattice
+/// scenario margin — the lattice models worst-case scenario losses;
+/// OI scaling models concentration risk.
+///
+/// Formula:
+/// ```text
+/// oi_extra_bps = floor(side_oi_lots × oi_mmr_slope_bps_per_million_lots / 1_000_000)
+/// effective_mmr = base_mmr + oi_extra_bps
+/// ```
+///
+/// `oi_mmr_slope_bps_per_million_lots = 100` means "add 1 bp per
+/// million lots of side OI". A side with 50M lots OI sees +50 bps
+/// extra MMR on every position. Linear, monotone, cheap.
+///
+/// Capped by `oi_mmr_max_extra_bps` to bound the worst-case effect.
+///
+/// Pure function. Returns the **extra** bps to add on top of the
+/// existing tier/concentration MMR. Caller stacks them.
+pub fn oi_scaled_mmr_extra_bps(
+    side_oi_lots: u64,
+    slope_bps_per_million_lots: u32,
+    max_extra_bps: u32,
+) -> u32 {
+    if slope_bps_per_million_lots == 0 {
+        return 0;
+    }
+    // side_oi_lots × slope / 1_000_000.
+    // side_oi_lots ≤ u64::MAX, slope ≤ u32::MAX → product ≤ u64::MAX × u32::MAX < u128::MAX.
+    let scaled = (side_oi_lots as u128).saturating_mul(slope_bps_per_million_lots as u128);
+    let extra = scaled / 1_000_000;
+    (extra.min(max_extra_bps as u128) as u32).min(max_extra_bps)
+}
+
+/// Compose the full effective MMR for a position: stress-lattice tier
+/// + concentration extra (existing) + OI-scaled extra (Wave 28a).
+///
+/// `tiers` is the Hyperliquid-style tier table; pass `&[]` to skip.
+/// `oi_slope` + `oi_max` are the Wave 28a knobs; pass `(0, 0)` to skip.
+pub fn effective_mmr_bps_full(
+    base_mmr_bps: u32,
+    tiers: &[(u64, u32)],
+    position_notional_quote_lots: u128,
+    side_oi_lots: u64,
+    oi_slope_bps_per_million_lots: u32,
+    oi_max_extra_bps: u32,
+) -> u32 {
+    let tier_mmr = tiered_mmr_bps(base_mmr_bps, tiers, position_notional_quote_lots);
+    let oi_extra = oi_scaled_mmr_extra_bps(side_oi_lots, oi_slope_bps_per_million_lots, oi_max_extra_bps);
+    tier_mmr.saturating_add(oi_extra)
 }
 
 /// Hyperliquid-style multi-tier MMR. Each tier is a
@@ -151,6 +235,74 @@ mod tier_tests {
         for n in [99u128, 100, 999, 1_000, 9_999, 10_000, 1_000_000] {
             let now = tiered_mmr_bps(100, &tiers, n);
             assert!(now >= prev, "non-monotone at {}: prev={} now={}", n, prev, now);
+            prev = now;
+        }
+    }
+
+    // ─── Wave 28a tests ─────────────────────────────────────────
+
+    #[test]
+    fn oi_scaled_zero_slope_returns_zero() {
+        assert_eq!(oi_scaled_mmr_extra_bps(1_000_000, 0, 1_000), 0);
+        assert_eq!(oi_scaled_mmr_extra_bps(u64::MAX, 0, 1_000), 0);
+    }
+
+    #[test]
+    fn oi_scaled_linear_with_oi() {
+        // slope=100 bps per million lots → 1 bp per 10_000 lots.
+        // 1M lots × 100 / 1M = 100 → 100 bps.
+        assert_eq!(oi_scaled_mmr_extra_bps(1_000_000, 100, 10_000), 100);
+        // 500k lots × 100 / 1M = 50 → 50 bps.
+        assert_eq!(oi_scaled_mmr_extra_bps(500_000, 100, 10_000), 50);
+        // 10M lots × 100 / 1M = 1000 → 1000 bps.
+        assert_eq!(oi_scaled_mmr_extra_bps(10_000_000, 100, 10_000), 1_000);
+    }
+
+    #[test]
+    fn oi_scaled_capped_at_max() {
+        // Slope would give 10_000 bps; cap is 500 → 500.
+        assert_eq!(oi_scaled_mmr_extra_bps(100_000_000, 100, 500), 500);
+    }
+
+    #[test]
+    fn oi_scaled_handles_extreme_inputs_without_overflow() {
+        // u64::MAX × u32::MAX would overflow u64 but fits in u128.
+        let _ = oi_scaled_mmr_extra_bps(u64::MAX, u32::MAX, 10_000);
+        // Doesn't panic.
+    }
+
+    #[test]
+    fn effective_mmr_full_stacks_tier_and_oi() {
+        // base 100, tier @ 1M → 200, OI 500k slope 100 cap 1000 → +50.
+        // Effective = 200 + 50 = 250.
+        let tiers = [(1_000_000u64, 200u32)];
+        let r = effective_mmr_bps_full(100, &tiers, 1_500_000, 500_000, 100, 1_000);
+        assert_eq!(r, 250);
+    }
+
+    #[test]
+    fn effective_mmr_full_no_oi_matches_pure_tiered() {
+        let tiers = [(1_000_000u64, 200u32)];
+        let with_oi = effective_mmr_bps_full(100, &tiers, 1_500_000, 0, 100, 1_000);
+        let without = tiered_mmr_bps(100, &tiers, 1_500_000);
+        assert_eq!(with_oi, without);
+    }
+
+    #[test]
+    fn effective_mmr_full_no_tier_matches_pure_oi() {
+        // No tiers → just base + OI extra.
+        let extra = oi_scaled_mmr_extra_bps(1_000_000, 100, 1_000);
+        let composed = effective_mmr_bps_full(100, &[], 0, 1_000_000, 100, 1_000);
+        assert_eq!(composed, 100 + extra);
+    }
+
+    #[test]
+    fn effective_mmr_full_monotone_in_oi() {
+        let tiers = [(1_000u64, 200u32)];
+        let mut prev = 0u32;
+        for oi in [0u64, 100_000, 500_000, 1_000_000, 5_000_000] {
+            let now = effective_mmr_bps_full(100, &tiers, 10_000, oi, 50, 2_000);
+            assert!(now >= prev, "non-monotone at oi={}", oi);
             prev = now;
         }
     }
@@ -669,6 +821,9 @@ mod isolated_margin_tests {
             tick_size: 1,
             concentration_threshold_lots: 0,
             concentration_extra_mmr_bps: 0,
+            side_oi_lots: 0,
+            oi_mmr_slope_bps_per_million_lots: 0,
+            oi_mmr_max_extra_bps: 0,
         };
         (pk, m)
     }

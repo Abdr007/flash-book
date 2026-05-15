@@ -1,6 +1,30 @@
-# Flash Book V3 — Mainnet Readiness
+# Flash Book — Mainnet Readiness
 
-Status: **devnet-functional, mainnet-blocked on items below**. This document is the punch list. Items are categorized P0 (blocks mainnet), P1 (should ship before launch), P2 (post-launch tracked).
+Status: **devnet-functional, mainnet-blocked on external audit + ops
+items below**. This document is the punch list. Items are categorized
+P0 (blocks mainnet), P1 (should ship before launch), P2 (post-launch
+tracked).
+
+## Updated punch list (post Wave 24-65 build-out)
+
+| # | Item | P | Status |
+|---|---|---|---|
+| 0 | **External audit engagement** | P0 | **Not yet started** |
+| 1 | Real oracle integration (Pyth) | P0 | ✅ shipped (`update_oracle_from_pyth`) |
+| 2 | Authority = multisig (Squads V4) | P0 | Pre-deploy ops; pubkey swap, no code |
+| 3 | Mark-price plumbing audit | P0 | ✅ Internal audit passed (`AUDIT.md` §15) |
+| 4 | Liquidator reward economics audit | P0 | ✅ Internal audit passed (`AUDIT.md` §7) |
+| 4a | Oracle staleness on triggers + TWAP | P0 | ✅ Fixed in Wave 27c (`AUDIT.md` §9.1/9.2/9.3) |
+| 4b | `update_market_params` parameter bounds | P0 | ✅ Fixed in Wave 28b (`AUDIT.md` §11) |
+| 5 | Test coverage gaps | P1 | ✅ 571 Rust + 236 TS = 807 tests passing |
+| 6 | Devnet → mainnet config diff | P1 | See checklist below |
+| 7 | Off-chain components (Docker images) | P1 | Pending |
+| 8 | Compute-budget validation | P1 | Pending profiling |
+| 9 | JIT liquidation auction tooling | P2 | Spec ready, impl pending |
+| 10 | Stress benchmark suite | P2 | Pending |
+| 11 | Frontend / SDK polish + npm publish | P2 | Pending |
+| 12 | Wire-in Wave 25c (settle_funding rewrite) | P2 | Pure module ready |
+| 13 | Wire-in Wave 29b-65b (10+ other waves) | P2 | Pure modules ready, see `FEATURES.md` |
 
 ---
 
