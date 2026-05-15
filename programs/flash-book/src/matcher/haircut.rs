@@ -2,7 +2,9 @@
 //!
 //! Profit is junior to capital. A single global ratio
 //!
-//!     h = min(Residual, MaturedPos) / MaturedPos
+//! ```text
+//! h = min(Residual, MaturedPos) / MaturedPos
+//! ```
 //!
 //! scales every profitable position's released positive PnL by the same
 //! floor-rounded fraction. Capital is never haircut. Losses settle

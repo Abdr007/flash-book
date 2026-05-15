@@ -132,7 +132,7 @@ async function ensureValidator(): Promise<ChildProcess | null> {
     '--gossip-port', '18903',
     '--dynamic-port-range', '18910-18950',
     '--ledger', '/tmp/benchmark-validator',
-    '--bpf-program', 'Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF', FLASH_BOOK_SO,
+    '--bpf-program', '5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq', FLASH_BOOK_SO,
   ];
   // agave 2.x test-validator does not auto-load SPL Token / ATA when --reset
   // is used. Dump them once with:
@@ -736,7 +736,7 @@ async function main() {
 
   // Verify deployed programs (validator loaded them via --upgradeable-program / --bpf-program flags)
   const programs = [
-    { name: 'flash_book', id: new PublicKey('Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF') },
+    { name: 'flash_book', id: new PublicKey('5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq') },
     { name: 'spl_token', id: SPL_TOKEN_ID },
     { name: 'ata', id: ATA_ID },
     { name: 'phoenix', id: PHOENIX_ID },

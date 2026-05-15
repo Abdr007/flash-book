@@ -5,7 +5,7 @@
 set -euo pipefail
 
 WALLET="$HOME/.config/solana/id.json"
-PROGRAM_ID="Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF"
+PROGRAM_ID="5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
 PROGRAM_SO="target/deploy/flash_book.so"
 PROGRAM_KP="target/deploy/flash_book-keypair.json"
 

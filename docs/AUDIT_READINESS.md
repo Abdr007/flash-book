@@ -6,7 +6,7 @@ real money. Read top-down — each section gates the one below.
 ## 0. Status
 
 Devnet. Not audited. Not production. Target program ID
-`Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF` (per `Anchor.toml`).
+`5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq` (per `Anchor.toml`).
 The on-chain code has passed 211 deterministic tests and is layout-
 compatible across the Phase 2 series of account-struct migrations,
 but it has not seen adversarial review by an independent firm.

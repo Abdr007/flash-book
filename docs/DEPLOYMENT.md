@@ -49,7 +49,7 @@ solana program deploy target/sbf-solana-solana/release/flash_book.so \
 Capture the printed program ID. The declared ID lives in
 `programs/flash-book/src/lib.rs::declare_id!()` and in `Anchor.toml`;
 both must match the deployed key. Current devnet ID:
-`Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF`. If you need to
+`5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq`. If you need to
 override, regenerate with `anchor keys sync` after building and
 update `tests/integration.rs::PROGRAM_ID_STR` to match (it's pinned
 at file scope for the runtime DeclaredProgramIdMismatch check).

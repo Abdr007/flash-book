@@ -44,6 +44,19 @@ jobs:
           cargo test -p flash-book --test proptest_liquidation
           cargo test -p flash-book --test proptest_new_features
           cargo test -p flash-book --test proptest_modules
+          cargo test -p flash-book --test proptest_haircut
+          cargo test -p flash-book --test proptest_envelope
+          cargo test -p flash-book --test proptest_arg
+          cargo test -p flash-book --test proptest_cross_margin
+      - name: Run all wave-integration tests
+        run: |
+          cargo test -p flash-book --test wave24b_haircut_ix
+          cargo test -p flash-book --test wave24c_release
+          cargo test -p flash-book --test wave24d_apply_fill_haircut
+          cargo test -p flash-book --test wave24e_25a
+          cargo test -p flash-book --test wave26a_envelope_ix
+          cargo test -p flash-book --test wave26b_runtime_gate
+          cargo test -p flash-book --test wave27a_trigger_slippage
 
   sbf:
     name: cargo build-sbf (BPF release)

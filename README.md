@@ -6,7 +6,7 @@ library covering every order type and risk control a top-tier perp
 exchange ships.
 
 **Devnet.** Not audited. Not production-ready.
-Program ID `Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF`
+Program ID `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq`
 (see `Anchor.toml`).
 
 ```

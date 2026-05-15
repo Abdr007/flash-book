@@ -26,7 +26,7 @@ use solana_sdk::{
 
 // Must match `declare_id!()` in src/lib.rs — Anchor verifies this at
 // runtime via the DeclaredProgramIdMismatch gate (Anchor error 4100).
-const PROGRAM_ID_STR: &str = "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF";
+const PROGRAM_ID_STR: &str = "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq";
 
 fn program_id() -> Pubkey {
     PROGRAM_ID_STR.parse().unwrap()

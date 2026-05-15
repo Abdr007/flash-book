@@ -22,7 +22,7 @@ flowchart TB
     end
 
     subgraph chain["Solana mainnet/devnet"]
-        program["Flash Book program<br/>Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF"]
+        program["Flash Book program<br/>5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"]
         pyth["Pyth oracle"]
         spl["SPL token program"]
     end

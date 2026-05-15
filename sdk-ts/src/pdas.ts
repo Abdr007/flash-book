@@ -12,7 +12,7 @@
 import { PublicKey } from '@solana/web3.js';
 
 export const FLASH_BOOK_PROGRAM_ID = new PublicKey(
-  'Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF',
+  '5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq',
 );
 
 export const TOKEN_PROGRAM_ID = new PublicKey(

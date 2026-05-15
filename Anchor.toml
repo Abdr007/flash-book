@@ -3,10 +3,10 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-flash_book = "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF"
+flash_book = "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
 
 [programs.devnet]
-flash_book = "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF"
+flash_book = "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
 
 [provider]
 cluster = "devnet"

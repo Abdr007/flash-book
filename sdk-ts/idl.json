@@ -1,5 +1,5 @@
 {
-  "address": "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF",
+  "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq",
   "metadata": {
     "name": "flash_book",
     "version": "0.1.0",
@@ -1346,7 +1346,7 @@
         },
         {
           "name": "owner_program",
-          "address": "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF"
+          "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
         },
         {
           "name": "delegate_buffer",
@@ -1485,7 +1485,7 @@
             "MagicBlock delegation program). Verified inside cpi_delegate via",
             "the program ID match. Constraint pins it to this crate's program ID."
           ],
-          "address": "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF"
+          "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
         },
         {
           "name": "delegate_buffer",
@@ -7048,7 +7048,7 @@
         },
         {
           "name": "owner_program",
-          "address": "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF"
+          "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
         },
         {
           "name": "delegate_buffer",
@@ -7153,7 +7153,7 @@
         },
         {
           "name": "owner_program",
-          "address": "Di8ZzxmMb5Ho2xWHbvcAxKPjcaVXTCM7U5xe5Gm7uLVF"
+          "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
         },
         {
           "name": "delegate_buffer",
