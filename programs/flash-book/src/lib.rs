@@ -46,6 +46,20 @@ use state::{
 
 declare_id!("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
 
+#[cfg(not(feature = "no-entrypoint"))]
+solana_security_txt::security_txt! {
+    name: "Flash Book",
+    project_url: "https://github.com/Abdr007/flash-book",
+    contacts: "link:https://github.com/Abdr007/flash-book/issues,link:https://github.com/Abdr007/flash-book/security/advisories/new",
+    policy: "https://github.com/Abdr007/flash-book/blob/main/SECURITY.md",
+    preferred_languages: "en",
+    source_code: "https://github.com/Abdr007/flash-book",
+    source_revision: env!("CARGO_PKG_VERSION"),
+    source_release: env!("CARGO_PKG_VERSION"),
+    auditors: "Internal audit only — see https://github.com/Abdr007/flash-book/blob/main/docs/AUDIT.md. External audit not yet engaged.",
+    acknowledgements: "Risk-engine design derived from Percolator (aeyakovenko/percolator) and GMX V2 (gmx-io/gmx-synthetics). See docs/RESEARCH_NOTES.md for attribution."
+}
+
 #[program]
 pub mod flash_book {
     use super::*;

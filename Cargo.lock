@@ -1597,6 +1597,7 @@ dependencies = [
  "serde_json",
  "solana-program-test",
  "solana-sdk",
+ "solana-security-txt",
  "spl-associated-token-account 3.0.3",
  "spl-token 6.0.0",
  "thiserror 2.0.18",
