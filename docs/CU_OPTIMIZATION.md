@@ -60,6 +60,30 @@ big risk account is plain Borsh `#[account]` (NOT `zero_copy`):
 `apply_fill` deserializes **up to 10** of these, then Anchor **re-serializes
 every `mut` one on exit**. That is the bulk of the remaining ~42k CU.
 
+## Profiling — where `apply_fill`'s CU actually goes (measured)
+
+Instrumented `apply_fill` with `sol_log_compute_units()` checkpoints and read
+the per-section deltas from the program-test log. For the **open** fill
+(~51.7k CU with checkpoints in place):
+
+| Section | CU | Note |
+|---|---|---|
+| **Before the handler body runs** | **~32,500** | Anchor **Borsh deserialize** of 6 accounts + auth + sub-account PDA verify + (open only) position **init** |
+| Fee computation | 4,868 | tier resolution + fee/rebate math |
+| Fee attribution + toxicity + **the actual fill application** | ~1,400 | the matcher settlement itself is *tiny* |
+| PnL routing | 383 | |
+| **After the handler body** | **~12,500** | `FillAppliedEvent` emit + Anchor **Borsh re-serialize** of every `mut` account on exit |
+
+Steady-state (**close**, no init): ~26.5k CU is spent **before the handler even
+starts** — pure Anchor Borsh deserialization of the 6 accounts.
+
+**Verdict: ~45k of ~51k is the Anchor Borsh ser/deser framework, not our
+logic.** The handler is ~6.6k. This empirically confirms the thesis and kills
+the alternatives: optimizing handler logic, emits, or math is pointless — the
+*entire* remaining win is in **account serialization**. The biggest single
+contributors are `MarketAccount` (largest struct, deserialized in every ix) and
+the 2× `Position`/`TraderState` (deserialized twice per fill).
+
 ## Phase 1 — the 70% lever: zero-copy / Quasar migration
 
 Research (SPL-token): Pinocchio cuts **88–95%** of CU, **~70% from just the
