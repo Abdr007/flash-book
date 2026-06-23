@@ -284,6 +284,5 @@ All financial computation uses:
 The matcher uses `1e-12` as the comparison epsilon for "zero size remaining"
 to avoid floating-point round-off creating perpetual partial fills.
 
-For production (Rust), all matching arithmetic moves to integer lot/tick
-space — no floating-point in the matcher path. The simulator's float math
-is a faithful reference but not the production target.
+All matching arithmetic is in integer lot/tick space — no floating-point
+in the matcher path.

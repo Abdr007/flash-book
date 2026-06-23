@@ -65,7 +65,7 @@ Using the SDK:
 ```ts
 import { Connection, Keypair } from '@solana/web3.js';
 import { Wallet } from '@coral-xyz/anchor';
-import { FlashBookClient, defaultInsuranceFundParams } from '@flash-book/sdk';
+import { FlashBookClient, defaultInsuranceFundParams } from './client';
 
 const conn = new Connection('https://api.devnet.solana.com');
 const authority = /* load deployer keypair */;
@@ -83,7 +83,7 @@ For each (base_mint, quote_mint) pair, plus pre-created token vaults
 and an oracle account (Pyth price account on mainnet):
 
 ```ts
-import { defaultMajorMarketParams } from '@flash-book/sdk';
+import { defaultMajorMarketParams } from './client';
 
 const initTx = new Transaction().add(
   await client.initializeMarketIx({
@@ -157,7 +157,7 @@ await sendAndConfirmTransaction(
 Subscribe to events to consume fills:
 
 ```ts
-import { subscribeToProgramEvents } from '@flash-book/sdk';
+import { subscribeToProgramEvents } from './client';
 
 subscribeToProgramEvents(conn, (event, slot, sig) => {
   if (event.name === 'BatchClearedEvent') {
@@ -173,7 +173,7 @@ mutate the affected Position PDAs.
 ## 8. Run a liquidation bot
 
 ```ts
-import { previewPortfolioRisk, fetchPosition, fetchTraderState, fetchMarket } from '@flash-book/sdk';
+import { previewPortfolioRisk, fetchPosition, fetchTraderState, fetchMarket } from './client';
 
 async function checkAndLiquidate(traderPk: PublicKey) {
   const position = await fetchPosition(client, client.position(market, traderPk).address);
@@ -209,7 +209,7 @@ async function checkAndLiquidate(traderPk: PublicKey) {
 ## 9. Operational pause (circuit breaker)
 
 ```ts
-import { MarketStatus } from '@flash-book/sdk';
+import { MarketStatus } from './client';
 
 await sendAndConfirmTransaction(
   conn,

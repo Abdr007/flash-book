@@ -10,7 +10,7 @@ This doc shows how to switch a market to the Pyth path.
 ## One-time setup per market (authority)
 
 ```typescript
-import { FlashBookClient } from '@flash-book/sdk';
+import { FlashBookClient } from './client';
 // Pyth feed IDs — fetch from https://www.pyth.network/developers/price-feed-ids
 // SOL/USD mainnet:
 const SOL_USD_FEED_ID = Buffer.from(

@@ -92,7 +92,7 @@ These hold by construction (proven by 2_000-case proptest in
 **Q: How do I deposit?**
 A: Use the SDK builder. From TypeScript:
 ```ts
-import { FlashBookClient } from '@flash-book/sdk';
+import { FlashBookClient } from './client';
 const ix = await client.depositFlpCapitalIx({
   authority: myWallet.publicKey,
   amountQuoteLots: new BN(1_000_000_000), // 1000 USDC at 6 decimals

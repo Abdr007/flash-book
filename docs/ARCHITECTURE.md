@@ -289,12 +289,6 @@ fields to zero/equivalent). The matcher's hot path doesn't grow.
   emits `QuoteLadderSnapshotEvent` (top-level summary; full ladder is
   deterministically recoverable off-chain).
 
-### Bot suite (`@flash-book/bot`)
-8 keepers ship: liquidation, funding, invariant, ATA cleanup, ADL,
-trailing-stop, iceberg, bond-monitor. Each shares the `Keeper` base
-class (start/stop/stats); discovery is operator-supplied (no
-`getProgramAccounts` scans by default — keeps RPC load predictable).
-
 ### MagicBlock ER compatibility
 Every new ix and view operates through Anchor's standard PDA
 derivation + Borsh accessors that work transparently when the market
