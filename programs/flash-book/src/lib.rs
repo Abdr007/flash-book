@@ -9635,7 +9635,7 @@ pub struct MaturePosition<'info> {
         bump = position.bump,
         constraint = position.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
     )]
-    pub position: Box<Account<'info, state::PositionAccount>>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         mut,
@@ -9668,7 +9668,7 @@ pub struct ConvertPosition<'info> {
         bump = position.bump,
         constraint = position.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
     )]
-    pub position: Box<Account<'info, state::PositionAccount>>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         mut,
@@ -9714,7 +9714,7 @@ pub struct InitPositionHaircutState<'info> {
         seeds = [state::PositionAccount::SEED, position.market.as_ref(), position.trader.as_ref()],
         bump = position.bump,
     )]
-    pub position: Box<Account<'info, state::PositionAccount>>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     /// Market haircut state — verifies the market is opted in.
     #[account(
@@ -9755,7 +9755,7 @@ pub struct ReleaseGainToHaircut<'info> {
         bump = position.bump,
         constraint = position.market == market.key() @ FlashBookError::HaircutStateMismatch,
     )]
-    pub position: Box<Account<'info, state::PositionAccount>>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         mut,
@@ -10572,7 +10572,7 @@ pub struct SetPositionLeverage<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
         bump = position.bump,
     )]
-    pub position: Account<'info, state::PositionAccount>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 }
 
 #[derive(Accounts)]
@@ -11038,7 +11038,7 @@ pub struct MigratePositionToTraderStateKey<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader.key().as_ref()],
         bump = legacy_position.bump,
     )]
-    pub legacy_position: Box<Account<'info, state::PositionAccount>>,
+    pub legacy_position: AccountLoader<'info, state::PositionAccount>,
 
     /// NEW position at the Phase 2c PDA. `init` (not init_if_needed) so
     /// migration can only run when the new slot is empty — protects
@@ -11050,7 +11050,7 @@ pub struct MigratePositionToTraderStateKey<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
         bump,
     )]
-    pub new_position: Box<Account<'info, state::PositionAccount>>,
+    pub new_position: AccountLoader<'info, state::PositionAccount>,
 
     pub system_program: Program<'info, System>,
 }
@@ -11086,7 +11086,7 @@ pub struct SetPositionMarginMode<'info> {
         seeds = [state::PositionAccount::SEED, target_market.key().as_ref(), trader_state.key().as_ref()],
         bump = target_position.bump,
     )]
-    pub target_position: Account<'info, state::PositionAccount>,
+    pub target_position: AccountLoader<'info, state::PositionAccount>,
     // remaining_accounts: alternating (market, position) pairs for OTHER
     // open positions the trader holds (NOT the target). Each pair is
     // validated by the handler — owner==program_id, trader matches, etc.
@@ -11127,7 +11127,7 @@ pub struct SettleFunding<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
         bump,
     )]
-    pub position: Account<'info, state::PositionAccount>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     /// RISK-1: funding is a money-moving ix and MUST delta-track the
     /// solvency residual (`V − C_tot − I`), exactly like deposit/withdraw/
@@ -11184,7 +11184,7 @@ pub struct ApplyFill<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.key().as_ref()],
         bump,
     )]
-    pub taker_position: Box<Account<'info, state::PositionAccount>>,
+    pub taker_position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         init_if_needed,
@@ -11193,7 +11193,7 @@ pub struct ApplyFill<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), maker_trader_state.key().as_ref()],
         bump,
     )]
-    pub maker_position: Box<Account<'info, state::PositionAccount>>,
+    pub maker_position: AccountLoader<'info, state::PositionAccount>,
 
     /// WAVE 22 phase 2: optional global fee-tier table. When supplied,
     /// per-trader maker rebate / taker fee bps are resolved from this
@@ -11291,7 +11291,7 @@ pub struct PlaceBasketOrderV2<'info> {
         seeds = [state::PositionAccount::SEED, market_a.key().as_ref(), trader_state.key().as_ref()],
         bump,
     )]
-    pub position_a: Box<Account<'info, state::PositionAccount>>,
+    pub position_a: AccountLoader<'info, state::PositionAccount>,
 
     // ── Leg B ──
     #[account(
@@ -11315,7 +11315,7 @@ pub struct PlaceBasketOrderV2<'info> {
         seeds = [state::PositionAccount::SEED, market_b.key().as_ref(), trader_state.key().as_ref()],
         bump,
     )]
-    pub position_b: Box<Account<'info, state::PositionAccount>>,
+    pub position_b: AccountLoader<'info, state::PositionAccount>,
 
     pub system_program: Program<'info, System>,
 }
@@ -11391,7 +11391,7 @@ pub struct ExecuteTriggerOrderV2<'info> {
         constraint = position.market == market.key() @ FlashBookError::WrongMarket,
         constraint = position.trader == trigger_order.trader @ FlashBookError::WrongTrader,
     )]
-    pub position: Account<'info, state::PositionAccount>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 }
 
 #[derive(Accounts)]
@@ -11606,7 +11606,7 @@ pub struct ApplyFlpFill<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.key().as_ref()],
         bump,
     )]
-    pub taker_position: Box<Account<'info, state::PositionAccount>>,
+    pub taker_position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         mut,
@@ -11683,7 +11683,7 @@ pub struct LiquidatePortfolioV2<'info> {
         seeds = [state::PositionAccount::SEED, execution_market.key().as_ref(), trader_state.key().as_ref()],
         bump = execution_position.bump,
     )]
-    pub execution_position: Account<'info, state::PositionAccount>,
+    pub execution_position: AccountLoader<'info, state::PositionAccount>,
     // remaining_accounts: alternating [Market, Position] pairs for the
     // trader's other markets (cross-margin assessment).
 }
@@ -11733,7 +11733,7 @@ pub struct LiquidatePositionV2<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
         bump = position.bump,
     )]
-    pub position: Box<Account<'info, state::PositionAccount>>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     pub system_program: Program<'info, System>,
 }
@@ -11772,7 +11772,7 @@ pub struct AutoDeleverage<'info> {
         ],
         bump = underwater_position.bump,
     )]
-    pub underwater_position: Box<Account<'info, state::PositionAccount>>,
+    pub underwater_position: AccountLoader<'info, state::PositionAccount>,
 
     /// Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above.
     #[account(mut)]
@@ -11787,7 +11787,7 @@ pub struct AutoDeleverage<'info> {
         ],
         bump = counter_position.bump,
     )]
-    pub counter_position: Box<Account<'info, state::PositionAccount>>,
+    pub counter_position: AccountLoader<'info, state::PositionAccount>,
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────
@@ -13525,7 +13525,7 @@ fn clamp_i128_to_i64(v: i128) -> i64 {
 fn apply_realized_pnl_delta<'info>(
     delta: i128,
     isolated: bool,
-    position: &mut Account<'info, state::PositionAccount>,
+    position: &mut AccountLoader<'info, state::PositionAccount>,
     trader_state: &mut AccountLoader<'info, TraderStateAccount>,
 ) -> Result<()> {
     let cross_collateral = trader_state.load()?.collateral_quote_lots;
@@ -13560,7 +13560,7 @@ fn apply_realized_pnl_delta<'info>(
 fn apply_realized_pnl_delta_v2<'info>(
     delta: i128,
     isolated: bool,
-    position: &mut Account<'info, state::PositionAccount>,
+    position: &mut AccountLoader<'info, state::PositionAccount>,
     trader_state: &mut AccountLoader<'info, TraderStateAccount>,
     position_haircut: Option<&mut Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
     now_slot: u64,
@@ -14053,7 +14053,7 @@ pub struct ExecuteTriggerOrderV3<'info> {
         constraint = position.market == market.key() @ FlashBookError::WrongMarket,
         constraint = position.trader == trigger_order.trader @ FlashBookError::WrongTrader,
     )]
-    pub position: Account<'info, state::PositionAccount>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 }
 
 #[derive(Accounts)]
