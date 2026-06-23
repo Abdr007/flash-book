@@ -141,6 +141,96 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Grow an existing v2 `market_book` PDA in place by `additional_nodes`
+    /// hypertree slots — this is what breaks the 100-node init cap. Only the
+    /// market authority may call it (same gate as `init_market_book`).
+    ///
+    /// Solana caps one realloc at `MAX_PERMITTED_DATA_INCREASE` (10 KiB ≈ 106
+    /// nodes), so growing a book all the way to `MAX_NODES_EXPANDED` takes
+    /// several calls. The authority tops up rent for the new bytes so the
+    /// account stays rent-exempt.
+    ///
+    /// MUST run on the BASE LAYER with the book UNdelegated: reallocating an
+    /// ER-delegated account would desync the delegation record. The owner
+    /// check below rejects a delegated account (its owner is the delegation
+    /// program, not us).
+    pub fn expand_market_book(
+        ctx: Context<ExpandMarketBook>,
+        additional_nodes: u32,
+    ) -> Result<()> {
+        require!(additional_nodes > 0, FlashBookError::OutOfRange);
+
+        let book_ai = ctx.accounts.market_book.to_account_info();
+
+        // Defence-in-depth: the PDA must still be owned by us. A delegated
+        // book is owned by the delegation program — realloc would be illegal
+        // and would corrupt the delegation record.
+        require_keys_eq!(
+            *book_ai.owner,
+            *ctx.program_id,
+            FlashBookError::Unauthorized
+        );
+
+        let additional_bytes = (additional_nodes as usize)
+            .checked_mul(state_v2::NODE_TOTAL_BYTES)
+            .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+        require!(
+            additional_bytes
+                <= anchor_lang::solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE,
+            FlashBookError::OutOfRange
+        );
+
+        let old_len = book_ai.data_len();
+        let new_len = old_len
+            .checked_add(additional_bytes)
+            .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+        require!(
+            new_len <= state_v2::MARKET_BOOK_MAX_TOTAL_BYTES,
+            FlashBookError::OutOfRange
+        );
+
+        // Top up rent so the larger account stays rent-exempt.
+        let rent = Rent::get()?;
+        let new_minimum = rent.minimum_balance(new_len);
+        let cur_lamports = book_ai.lamports();
+        if new_minimum > cur_lamports {
+            let topup = new_minimum.saturating_sub(cur_lamports);
+            anchor_lang::solana_program::program::invoke(
+                &anchor_lang::solana_program::system_instruction::transfer(
+                    &ctx.accounts.authority.key(),
+                    &book_ai.key(),
+                    topup,
+                ),
+                &[
+                    ctx.accounts.authority.to_account_info(),
+                    book_ai.clone(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+
+        // Grow in place; zero-init the appended tail so the bump allocator
+        // and free-list see clean memory.
+        book_ai.realloc(new_len, true)?;
+
+        // Sanity: the grown account must still parse as a valid book (disc +
+        // node-aligned size). Cheap, and catches a botched realloc loudly.
+        {
+            let mut data = book_ai.try_borrow_mut_data()?;
+            let _ = state_v2::MarketBookHandle::from_account_data(&mut data)?;
+        }
+
+        emit!(MarketBookExpandedEvent {
+            market: ctx.accounts.market.key(),
+            market_book: book_ai.key(),
+            old_bytes: old_len as u32,
+            new_bytes: new_len as u32,
+            max_nodes: ((new_len - state_v2::MARKET_BOOK_PREFIX_BYTES)
+                / state_v2::NODE_TOTAL_BYTES) as u32,
+        });
+        Ok(())
+    }
+
     /// Delegate the v2 hypertree market_book PDA to the MagicBlock ER.
     /// After this lands, the account state lives on the ER for sub-ms
     /// matcher access; only this program (via PDA signature) can
@@ -10028,6 +10118,34 @@ pub struct InitMarketBook<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Grow a market_book PDA in place (`expand_market_book`). Same authority
+/// gate and seed binding as `InitMarketBook`; the book is reallocated in the
+/// handler so it's `UncheckedAccount` (Anchor can't size a variable account).
+#[derive(Accounts)]
+pub struct ExpandMarketBook<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; reallocated via `AccountInfo::realloc` in the
+    /// handler. The seeds derivation binds it to this market; the handler
+    /// re-asserts program ownership before growing it.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 /// ER-side commit (and commit-and-undelegate). Permissionless like Phoenix-ER:
 /// the Magic program + validator enforce commit semantics, and the CPI fails
 /// loudly on a non-delegated account. Authority control lives on the base-layer
@@ -11624,6 +11742,16 @@ pub struct MarketBookInitializedEvent {
     pub market_book: Pubkey,
     pub total_bytes: u32,
     pub data_bytes: u32,
+}
+
+#[event]
+pub struct MarketBookExpandedEvent {
+    pub market: Pubkey,
+    pub market_book: Pubkey,
+    pub old_bytes: u32,
+    pub new_bytes: u32,
+    /// Node capacity after this expansion = (new_bytes − 264) / 96.
+    pub max_nodes: u32,
 }
 
 #[event]

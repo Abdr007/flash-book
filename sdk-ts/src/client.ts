@@ -290,6 +290,28 @@ export class FlashBookClient {
       .instruction();
   }
 
+  /// Grow an existing v2 market_book PDA in place by `additionalNodes`
+  /// hypertree slots — breaks the 100-node init cap. Authority-gated; the
+  /// authority tops up rent for the new bytes. Solana caps one realloc at
+  /// ~106 nodes (10 KiB), so growing to the ceiling takes several calls.
+  /// MUST run on the base layer with the book UNdelegated.
+  expandMarketBookIx(args: {
+    authority: PublicKey;
+    market: PublicKey;
+    additionalNodes: number;
+  }): Promise<TransactionInstruction> {
+    const book = marketBookPda(args.market);
+    return this.methods
+      .expandMarketBook(args.additionalNodes)
+      .accountsPartial({
+        authority: args.authority,
+        market: args.market,
+        marketBook: book.address,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+  }
+
   // ─── MagicBlock ER delegation ─────────────────────────────────────────
   //
   // Lifecycle: init the v2 book on mainnet (initMarketBookIx), then

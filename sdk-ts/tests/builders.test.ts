@@ -174,8 +174,8 @@ describe('Instruction builders', () => {
       market: Keypair.generate().publicKey,
       trader: Keypair.generate().publicKey,
     });
-    // caller, market, trader, trader_state, position
-    expect(ix.keys.length).toBe(5);
+    // caller, market, trader, trader_state, position, haircut_state
+    expect(ix.keys.length).toBe(6);
   });
 
   test('closeTraderAtaIx', async () => {
@@ -311,9 +311,9 @@ describe('Instruction builders', () => {
       takerSide: 'long',
     });
     // sequencer, market, insurance_fund, taker_state, maker_state,
-    // taker_pos, maker_pos, fee_tiers (optional null placeholder),
-    // sysprog
-    expect(ix.keys.length).toBe(9);
+    // taker_pos, maker_pos, fee_tiers, market_haircut,
+    // taker_position_haircut, maker_position_haircut, sysprog
+    expect(ix.keys.length).toBe(12);
   });
 
   test('cancelOrderV2Ix', async () => {
@@ -340,9 +340,10 @@ describe('Instruction builders', () => {
       priceTicks: new BN(99_950),
       takerSide: 'long',
     });
-    // sequencer, market, insurance_fund, taker_state, taker_pos, flp,
-    // fee_tiers (optional null placeholder), sysprog
-    expect(ix.keys.length).toBe(8);
+    // sequencer, market, insurance_fund, taker_state, taker_pos,
+    // flp_exposure, fee_tiers, market_haircut, taker_position_haircut,
+    // sysprog
+    expect(ix.keys.length).toBe(10);
   });
 
   // ─── Liquidation (2) ───────────────────────────────────────────────
@@ -413,7 +414,7 @@ describe('Instruction builders', () => {
       confidence: new BN(50),
       publishedAtUnixSeconds: new BN(1_700_000_000),
     });
-    expect(ix.keys.length).toBe(2);
+    expect(ix.keys.length).toBe(3); // authority, market, envelope_config
   });
 
   test('updateOracleQuorumIx', async () => {
@@ -430,7 +431,7 @@ describe('Instruction builders', () => {
         new BN(1_700_000_000),
       ],
     });
-    expect(ix.keys.length).toBe(2); // authority, market
+    expect(ix.keys.length).toBe(3); // authority, market, envelope_config
   });
 
   test('setMarketStatusIx', async () => {
@@ -469,6 +470,20 @@ describe('Instruction builders', () => {
 
   // ─── Coverage check ────────────────────────────────────────────────
 
+  test('expandMarketBookIx', async () => {
+    const client = makeClient();
+    const ix = await client.expandMarketBookIx({
+      authority: Keypair.generate().publicKey,
+      market: Keypair.generate().publicKey,
+      additionalNodes: 50,
+    });
+    expect(ix.programId.equals(FLASH_BOOK_PROGRAM_ID)).toBe(true);
+    // authority, market, market_book, system_program
+    expect(ix.keys.length).toBe(4);
+    // u32 additional_nodes is encoded into the data after the 8-byte disc.
+    expect(ix.data.length).toBeGreaterThan(8);
+  });
+
   test('CLOB-only instruction builders covered', () => {
     // This test serves as a tripwire: if a new instruction is added to
     // the program, this list will fall out of sync. FBA-era ix
@@ -498,8 +513,9 @@ describe('Instruction builders', () => {
       'setMarketStatusIx',
       'updateMarketParamsIx',
       'transferMarketAuthorityIx',
+      'expandMarketBookIx',
     ];
-    expect(expected.length).toBe(22);
+    expect(expected.length).toBe(23);
     const client = makeClient();
     for (const name of expected) {
       expect(typeof (client as unknown as Record<string, unknown>)[name]).toBe('function');

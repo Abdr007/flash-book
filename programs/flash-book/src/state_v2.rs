@@ -29,9 +29,11 @@ use crate::hypertree::{
     RedBlackTreeReadOnly, RedBlackTreeReadOperationsHelpers, NIL,
 };
 
-/// Bytes available for hypertree nodes after the fixed header. 100 nodes
-/// of 96 bytes each. Enough for ~50 orders per side + 50 claimed seats
-/// in the v1 layout. Realloc-to-grow ix follows in wave 18d.
+/// Bytes available for hypertree nodes after the fixed header **at init**.
+/// 100 nodes of 96 bytes each — ~50 orders per side + 50 claimed seats.
+/// This is no longer the hard ceiling: `expand_market_book` grows the
+/// account in place up to `MARKET_BOOK_MAX_DATA_BYTES`. The live capacity
+/// is always `MarketBookHandle::data.len()`, NOT this constant.
 pub const MARKET_BOOK_DATA_BYTES: usize = 9_600;
 
 /// Each RBNode<V> = 16-byte RBT header + V (the payload).
@@ -42,7 +44,18 @@ pub const MARKET_BOOK_DATA_BYTES: usize = 9_600;
 /// seat and shrink back to 80B.
 pub const NODE_PAYLOAD_BYTES: usize = 80;
 pub const NODE_TOTAL_BYTES: usize = 96;
+
+/// Node count the account holds **at init**. After `expand_market_book`
+/// the live capacity is `MarketBookHandle::data.len() / NODE_TOTAL_BYTES`.
 pub const MAX_NODES: usize = MARKET_BOOK_DATA_BYTES / NODE_TOTAL_BYTES;
+
+/// Hard ceiling on nodes after expansion. 10,000 nodes keeps the data
+/// region under 1 MiB — well inside DataIndex(u32) addressing and Solana's
+/// 10 MiB per-account limit — while giving each side ~5,000 resting orders.
+pub const MAX_NODES_EXPANDED: usize = 10_000;
+
+/// Data region after a full expansion. = 960,000 bytes.
+pub const MARKET_BOOK_MAX_DATA_BYTES: usize = MAX_NODES_EXPANDED * NODE_TOTAL_BYTES;
 
 // ─── Header ──────────────────────────────────────────────────────────
 
@@ -339,9 +352,22 @@ pub const MARKET_BOOK_SEED: &[u8] = b"market_book";
 /// in raw account dumps. "FB BK MK BK 01 …" = Flash Book / Book / Market.
 pub const MARKET_BOOK_DISC: [u8; 8] = [0xFB, 0xBA, 0x00, 0x4B, 0x4D, 0x4B, 0x42, 0x01];
 
-/// Total byte size of a MarketBookAccount (disc + header + data).
-/// = 8 + 256 + 8000 = 8264 bytes.
-pub const MARKET_BOOK_TOTAL_BYTES: usize = 8 + 256 + MARKET_BOOK_DATA_BYTES;
+/// Fixed prefix every MarketBookAccount carries before the node array:
+/// 8-byte discriminator + 256-byte header.
+pub const MARKET_BOOK_DISC_BYTES: usize = 8;
+pub const MARKET_BOOK_HEADER_BYTES: usize = 256;
+pub const MARKET_BOOK_PREFIX_BYTES: usize =
+    MARKET_BOOK_DISC_BYTES + MARKET_BOOK_HEADER_BYTES;
+
+/// Total byte size of a freshly-initialised MarketBookAccount
+/// (disc + header + initial data). = 8 + 256 + 9600 = 9864 bytes.
+pub const MARKET_BOOK_TOTAL_BYTES: usize =
+    MARKET_BOOK_PREFIX_BYTES + MARKET_BOOK_DATA_BYTES;
+
+/// Largest a MarketBookAccount may grow to via `expand_market_book`.
+/// = 264 + 960,000 = 960,264 bytes.
+pub const MARKET_BOOK_MAX_TOTAL_BYTES: usize =
+    MARKET_BOOK_PREFIX_BYTES + MARKET_BOOK_MAX_DATA_BYTES;
 
 pub struct MarketBookHandle<'a> {
     pub header: &'a mut MarketBookHeader,
@@ -352,8 +378,14 @@ impl<'a> MarketBookHandle<'a> {
     /// Validate the 8-byte discriminator and split a market_book account's
     /// raw data into header + dynamic-array slices.
     pub fn from_account_data(data: &'a mut [u8]) -> Result<Self> {
+        // Accept any size from the initial layout up to the expansion cap,
+        // as long as the dynamic region is a whole number of nodes. This is
+        // what lets a book grown by `expand_market_book` load — the old
+        // `== MARKET_BOOK_TOTAL_BYTES` check capped every book at 100 nodes.
         require!(
-            data.len() == MARKET_BOOK_TOTAL_BYTES,
+            data.len() >= MARKET_BOOK_TOTAL_BYTES
+                && data.len() <= MARKET_BOOK_MAX_TOTAL_BYTES
+                && (data.len() - MARKET_BOOK_PREFIX_BYTES) % NODE_TOTAL_BYTES == 0,
             crate::errors::FlashBookError::OutOfRange
         );
         require!(
@@ -422,11 +454,14 @@ impl<'a> MarketBookHandle<'a> {
         if free_idx != NIL && free_idx != FREE_LIST_END {
             return Ok(free_idx);
         }
-        // Bump-alloc from the unused tail.
+        // Bump-alloc from the unused tail. The ceiling is the LIVE capacity
+        // (`self.data` is the dynamic region after the 264-byte prefix), not
+        // the init-size constant — so a book grown by `expand_market_book`
+        // can allocate into the new tail.
         let next_offset = self.header.num_bytes_allocated;
         let end = next_offset.saturating_add(NODE_TOTAL_BYTES as u32);
         require!(
-            (end as usize) <= MARKET_BOOK_DATA_BYTES,
+            (end as usize) <= self.data.len(),
             crate::errors::FlashBookError::BufferFull
         );
         self.header.num_bytes_allocated = end;
@@ -1083,6 +1118,89 @@ mod tests {
         assert_eq!(handle.header.bids_best_index, NIL);
         assert_eq!(handle.header.total_orders_active, 0);
         assert!(collect_bids(&handle).is_empty());
+    }
+
+    // ─── expand_market_book (capacity growth past the 100-node cap) ──────
+
+    /// Mirror the on-chain `realloc(.., zero_init=true)` by appending zeroed
+    /// node slots to the account buffer — exactly what `expand_market_book`
+    /// hands back to the matcher.
+    fn grow_book(mut data: Vec<u8>, additional_nodes: usize) -> Vec<u8> {
+        data.resize(data.len() + additional_nodes * NODE_TOTAL_BYTES, 0);
+        data
+    }
+
+    #[test]
+    fn bump_allocator_fills_initial_capacity_then_rejects() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        // The initial region holds exactly MAX_NODES (100) nodes.
+        for i in 1..=MAX_NODES as u64 {
+            handle.insert_bid(make_order(i, i, true)).unwrap();
+        }
+        assert_eq!(handle.header.total_orders_active, MAX_NODES as u32);
+        // The next allocation overflows the initial region.
+        assert!(
+            handle.insert_bid(make_order(9_999, 9_999, true)).is_err(),
+            "101st insert must hit BufferFull"
+        );
+    }
+
+    #[test]
+    fn from_account_data_accepts_grown_and_rejects_bad_sizes() {
+        // A book grown by 50 node slots loads fine.
+        let grown = grow_book(make_book(), 50);
+        let mut g = grown.clone();
+        assert!(MarketBookHandle::from_account_data(&mut g).is_ok());
+
+        // One byte past a whole node → misaligned → rejected.
+        let mut bad = grown.clone();
+        bad.push(0);
+        assert!(MarketBookHandle::from_account_data(&mut bad).is_err());
+
+        // Smaller than the initial layout → rejected.
+        let mut small = vec![0u8; MARKET_BOOK_TOTAL_BYTES - NODE_TOTAL_BYTES];
+        assert!(MarketBookHandle::from_account_data(&mut small).is_err());
+
+        // Larger than the expansion ceiling → rejected (disc stamped so only
+        // the size check can trip).
+        let mut huge = vec![0u8; MARKET_BOOK_MAX_TOTAL_BYTES + NODE_TOTAL_BYTES];
+        huge[..8].copy_from_slice(&MARKET_BOOK_DISC);
+        assert!(MarketBookHandle::from_account_data(&mut huge).is_err());
+    }
+
+    #[test]
+    fn expand_lets_book_grow_past_initial_cap() {
+        // Fill the initial 100-node region to the brim.
+        let mut data = make_book();
+        {
+            let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+            for i in 1..=MAX_NODES as u64 {
+                handle.insert_bid(make_order(i, i, true)).unwrap();
+            }
+            assert!(handle.insert_bid(make_order(7_777, 7_777, true)).is_err());
+        }
+
+        // Grow by 20 node slots — the on-chain `expand_market_book` effect.
+        let mut grown = grow_book(data, 20);
+        let mut handle = MarketBookHandle::from_account_data(&mut grown).unwrap();
+
+        // The freshly-grown tail now accepts 20 more orders.
+        for i in 0..20u64 {
+            handle
+                .insert_bid(make_order(1_000 + i, 1_000 + i, true))
+                .unwrap();
+        }
+        assert_eq!(handle.header.total_orders_active, (MAX_NODES + 20) as u32);
+        // Capacity is now 120 — the 121st overflows again.
+        assert!(handle.insert_bid(make_order(2_000, 2_000, true)).is_err());
+
+        // Integrity survives the grow: every bid still in descending order.
+        let bids = collect_bids(&handle);
+        assert_eq!(bids.len(), MAX_NODES + 20);
+        for w in bids.windows(2) {
+            assert!(w[0] > w[1], "bids must stay descending after expand");
+        }
     }
 
 }

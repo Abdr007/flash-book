@@ -2753,6 +2753,111 @@
       "args": []
     },
     {
+      "name": "expand_market_book",
+      "docs": [
+        "Grow an existing v2 `market_book` PDA in place by `additional_nodes`",
+        "hypertree slots — this is what breaks the 100-node init cap. Only the",
+        "market authority may call it (same gate as `init_market_book`).",
+        "",
+        "Solana caps one realloc at `MAX_PERMITTED_DATA_INCREASE` (10 KiB ≈ 106",
+        "nodes), so growing a book all the way to `MAX_NODES_EXPANDED` takes",
+        "several calls. The authority tops up rent for the new bytes so the",
+        "account stays rent-exempt.",
+        "",
+        "MUST run on the BASE LAYER with the book UNdelegated: reallocating an",
+        "ER-delegated account would desync the delegation record. The owner",
+        "check below rejects a delegated account (its owner is the delegation",
+        "program, not us)."
+      ],
+      "discriminator": [
+        192,
+        2,
+        120,
+        76,
+        141,
+        174,
+        162,
+        145
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "handler. The seeds derivation binds it to this market; the handler",
+            "re-asserts program ownership before growing it."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "additional_nodes",
+          "type": "u32"
+        }
+      ]
+    },
+    {
       "name": "flp_deposit_v3",
       "docs": [
         "Deposit FLP capital with REAL SPL transfer + mint pro-rata shares."
@@ -12223,6 +12328,19 @@
       ]
     },
     {
+      "name": "MarketBookExpandedEvent",
+      "discriminator": [
+        199,
+        235,
+        184,
+        245,
+        15,
+        24,
+        179,
+        179
+      ]
+    },
+    {
       "name": "MarketBookInitializedEvent",
       "discriminator": [
         23,
@@ -15918,6 +16036,37 @@
               "Pinned ER validator pubkey, or default Pubkey if permissionless."
             ],
             "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketBookExpandedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "market_book",
+            "type": "pubkey"
+          },
+          {
+            "name": "old_bytes",
+            "type": "u32"
+          },
+          {
+            "name": "new_bytes",
+            "type": "u32"
+          },
+          {
+            "name": "max_nodes",
+            "docs": [
+              "Node capacity after this expansion = (new_bytes − 264) / 96."
+            ],
+            "type": "u32"
           }
         ]
       }
