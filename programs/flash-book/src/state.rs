@@ -818,92 +818,66 @@ impl LpPositionAccount {
 /// Per-trader state. Holds collateral, last-settled funding marker, and
 /// position-list pointers (Position PDAs are separate accounts; this is
 /// a lightweight index).
-#[account]
+#[account(zero_copy)]
 #[derive(Debug)]
 pub struct TraderStateAccount {
+    // ── CU Phase 1: zero-copy Pod layout ─────────────────────────────────
+    // Fields are ordered by DESCENDING alignment (Pubkey[u8;32] → i64/u64 →
+    // i32/u32 → u8 → tail pad) so the struct has NO implicit padding and is
+    // `bytemuck::Pod` for `#[account(zero_copy)]`. Only u8/u32/i32/u64/i64
+    // (NO u128) so host and SBF alignments match. Total body = 192 bytes.
     pub trader: Pubkey,
-    pub bump: u8,
+    /// Delegate authority. When non-default, the delegate may sign
+    /// trader-bound instructions on the trader's behalf (subaccount /
+    /// portfolio-margin patterns). Cleared via Pubkey::default(). The
+    /// trader ALWAYS retains authority — delegate is additive.
+    pub delegate: Pubkey,
+    /// Referrer pubkey (Hyperliquid affiliate model). Set once via
+    /// `set_trader_referrer` — immutable after first set.
+    pub referrer: Pubkey,
+    /// Approved builder pubkey (Hyperliquid builder-codes). Set/rotated via
+    /// `set_trader_builder`; the trader's CAP keeps builders bounded.
+    pub builder: Pubkey,
+
     pub collateral_quote_lots: u64,
     pub realized_pnl_quote_lots: i64,
-    /// Number of open positions (each in its own Position PDA).
-    pub open_positions: u8,
+    pub last_batch_seen: u64,
+    /// Wave 22: rolling notional in the current volume window (quote lots,
+    /// maker + taker). Reset on window expiry; drives `resolve_fee_tier`.
+    pub volume_30d_quote_lots: u64,
+    /// Wave 22: slot the current volume window opened.
+    pub volume_window_start_slot: u64,
+
     /// Toxicity score in bps; updated post-fill. Used for taker-fee tier.
     pub toxicity_score_bps: i32,
     /// Per-batch order count (rate limit).
     pub orders_this_batch: u32,
-    pub last_batch_seen: u64,
-    /// Fee tier discount in bps off the base taker fee. 0 = standard
-    /// fees; e.g. 1000 = 10% discount. Set by `set_trader_fee_tier`
-    /// (authority-only) based on off-chain 30-day rolling volume —
-    /// universal pattern at every CEX (Binance, OKX, Bybit, Hyperliquid).
+    /// Fee tier discount in bps off the base taker fee (set by
+    /// `set_trader_fee_tier`, authority-only).
     pub fee_discount_bps: u32,
-    /// Delegate authority. When non-default, the delegate may sign
-    /// trader-bound instructions (place_limit_order, cancel_order,
-    /// settle_funding, etc.) on the trader's behalf. Foundation for
-    /// subaccount / portfolio-margin patterns:
-    ///   • Master keypair holds funds, delegates trading authority to a
-    ///     hot key (Hyperliquid / dYdX standard).
-    ///   • Multi-sig "subaccount manager" can act on behalf of the
-    ///     trader without holding their funds.
-    /// Cleared by setting back to Pubkey::default(). The trader pubkey
-    /// itself ALWAYS retains authority — delegate is additive, not
-    /// exclusive (the trader can revoke at any time).
-    pub delegate: Pubkey,
-    /// Referrer pubkey. When non-default, on every fill where this trader
-    /// is the taker, `market.params.referrer_share_bps` of the protocol's
-    /// net fee revenue is credited to the referrer's TraderState
-    /// collateral. Hyperliquid affiliate model. Pubkey::default() = no
-    /// referrer (default for all new trader_state). Set once via
-    /// `set_trader_referrer` — immutable after first set (anti-rotation
-    /// griefing).
-    pub referrer: Pubkey,
-    /// Approved builder pubkey. When non-default, on every fill where this
-    /// trader is the taker, `min(market.params.builder_share_bps,
-    /// builder_max_fee_share_bps)` of the protocol's net fee revenue is
-    /// credited to the builder via `BuilderFeeOwedEvent` (off-chain
-    /// pull-based). Hyperliquid builder-codes model: a third-party UI/
-    /// wallet/aggregator that routes flow earns a share of the fee from
-    /// the user's trades. Set/rotated/revoked freely via
-    /// `set_trader_builder`; the trader's CAP on the share keeps builders
-    /// from extracting more than the user agreed to.
-    pub builder: Pubkey,
-    /// Maximum fee share (in bps of net fee) the trader has authorized
-    /// the builder to take. The on-chain emit clamps the protocol-side
-    /// builder_share_bps by this. 0 = builder set but no share approved
-    /// (functionally the same as no builder). Allows the trader to set a
-    /// conservative cap below whatever the protocol rate is.
+    /// Max fee share (bps of net fee) the trader authorized the builder
+    /// to take; the on-chain emit clamps builder_share_bps by this.
     pub builder_max_fee_share_bps: u32,
-    /// Wave 22: rolling notional traded in the current volume window
-    /// (quote lots, summed across maker + taker fills). Reset when the
-    /// window expires. Used by `resolve_fee_tier` to pick the trader's
-    /// effective maker / taker bps from `FeeTiersAccount`.
-    pub volume_30d_quote_lots: u64,
-    /// Wave 22: slot at which the current volume window opened. When
-    /// `Clock::slot - this > FeeTiersAccount.volume_window_slots`, the
-    /// next apply_fill resets `volume_30d_quote_lots` and re-anchors
-    /// this. HL pattern (14-day rolling tier window).
-    pub volume_window_start_slot: u64,
-    /// Phase 2f — TraderState sub-account index. `0` = main; `1..=255`
-    /// = sub. Written at `open_trader_state` (= 0) and
-    /// `open_trader_sub_account` (= the sub_index). The liquidation
-    /// synthetic-close path reads this to set the
-    /// RestingOrderV2.sub_index of the close order, so when the
-    /// underwater's position closes via ApplyFill the fill routes back
-    /// to the same TraderState that's being liquidated. Layout-
-    /// compatible (trailing zeros in allocated `space()` = 0 = main).
+
+    pub bump: u8,
+    /// Number of open positions (each in its own Position PDA).
+    pub open_positions: u8,
+    /// Phase 2f — sub-account index. `0` = main; `1..=255` = sub. Set at
+    /// `open_trader_state` (0) / `open_trader_sub_account` (sub_index).
     pub sub_index: u8,
+    pub _pad: [u8; 5],
 }
 
 impl TraderStateAccount {
     pub const SEED: &'static [u8] = b"trader_state";
     pub fn space() -> usize {
-        // body = 32 (trader) + 1 (bump) + 8 (collateral) + 8 (realized_pnl)
-        // + 1 (open_positions) + 4 (toxicity) + 4 (orders_this_batch)
-        // + 8 (last_batch_seen) + 4 (fee_discount_bps) + 32 (delegate)
-        // + 32 (referrer) + 32 (builder) + 4 (builder_max_fee_share_bps)
-        // + 8 (volume_30d_quote_lots) + 8 (volume_window_start_slot)
-        // = 186 bytes. + 8 disc = 194. Round to 224 for headroom.
-        8 + 224
+        // CU Phase 1: zero-copy Pod account. AccountLoader requires the
+        // allocated data length to EQUAL `8 (disc) + size_of::<Self>()`
+        // EXACTLY — any "headroom" padding makes `load*()` fail with
+        // bytemuck SizeMismatch. The struct is laid out in descending
+        // alignment with an explicit `_pad` tail so size_of == 192 with
+        // no implicit padding.
+        8 + std::mem::size_of::<Self>()
     }
 
     /// Returns true if `signer` is authorized to act on this trader's

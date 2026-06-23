@@ -1581,9 +1581,12 @@ pub mod flash_book {
 
     /// Initialize per-trader state.
     pub fn open_trader_state(ctx: Context<OpenTraderState>) -> Result<()> {
-        let s = &mut ctx.accounts.trader_state;
-        s.trader = ctx.accounts.trader.key();
-        s.bump = ctx.bumps.trader_state;
+        let trader_key = ctx.accounts.trader.key();
+        let bump = ctx.bumps.trader_state;
+        let slot = Clock::get()?.slot;
+        let mut s = ctx.accounts.trader_state.load_init()?;
+        s.trader = trader_key;
+        s.bump = bump;
         s.collateral_quote_lots = 0;
         s.realized_pnl_quote_lots = 0;
         s.open_positions = 0;
@@ -1596,7 +1599,7 @@ pub mod flash_book {
         s.builder = Pubkey::default();
         s.builder_max_fee_share_bps = 0;
         s.volume_30d_quote_lots = 0;
-        s.volume_window_start_slot = Clock::get()?.slot;
+        s.volume_window_start_slot = slot;
         s.sub_index = 0; // main account
         Ok(())
     }
@@ -1635,23 +1638,28 @@ pub mod flash_book {
         // sub_index 0 is reserved for the main account (which uses the
         // legacy PDA seeds and `open_trader_state`).
         require!(sub_index >= 1, FlashBookError::OutOfRange);
-        let s = &mut ctx.accounts.trader_sub_account;
-        s.trader = ctx.accounts.trader.key();
-        s.bump = ctx.bumps.trader_sub_account;
-        s.collateral_quote_lots = 0;
-        s.realized_pnl_quote_lots = 0;
-        s.open_positions = 0;
-        s.toxicity_score_bps = 0;
-        s.orders_this_batch = 0;
-        s.last_batch_seen = 0;
-        s.fee_discount_bps = 0;
-        s.delegate = Pubkey::default();
-        s.referrer = Pubkey::default();
-        s.builder = Pubkey::default();
-        s.builder_max_fee_share_bps = 0;
-        s.volume_30d_quote_lots = 0;
-        s.volume_window_start_slot = Clock::get()?.slot;
-        s.sub_index = sub_index;
+        let trader_key = ctx.accounts.trader.key();
+        let bump = ctx.bumps.trader_sub_account;
+        let slot = Clock::get()?.slot;
+        {
+            let mut s = ctx.accounts.trader_sub_account.load_init()?;
+            s.trader = trader_key;
+            s.bump = bump;
+            s.collateral_quote_lots = 0;
+            s.realized_pnl_quote_lots = 0;
+            s.open_positions = 0;
+            s.toxicity_score_bps = 0;
+            s.orders_this_batch = 0;
+            s.last_batch_seen = 0;
+            s.fee_discount_bps = 0;
+            s.delegate = Pubkey::default();
+            s.referrer = Pubkey::default();
+            s.builder = Pubkey::default();
+            s.builder_max_fee_share_bps = 0;
+            s.volume_30d_quote_lots = 0;
+            s.volume_window_start_slot = slot;
+            s.sub_index = sub_index;
+        }
         emit!(SubAccountOpenedEvent {
             trader: ctx.accounts.trader.key(),
             sub_index,
@@ -1679,10 +1687,11 @@ pub mod flash_book {
     ) -> Result<()> {
         require!(sub_index >= 1, FlashBookError::OutOfRange);
         require!(amount > 0, FlashBookError::ZeroSize);
-        let main = &mut ctx.accounts.main_trader_state;
-        let sub = &mut ctx.accounts.sub_trader_state;
+        let trader_key = ctx.accounts.trader.key();
+        let mut main = ctx.accounts.main_trader_state.load_mut()?;
+        let mut sub = ctx.accounts.sub_trader_state.load_mut()?;
         require!(
-            main.trader == sub.trader && main.trader == ctx.accounts.trader.key(),
+            main.trader == sub.trader && main.trader == trader_key,
             FlashBookError::WrongTrader
         );
         require!(
@@ -1698,7 +1707,7 @@ pub mod flash_book {
             .checked_add(amount)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         emit!(SubAccountTransferEvent {
-            trader: ctx.accounts.trader.key(),
+            trader: trader_key,
             sub_index,
             amount_quote_lots: amount,
             direction: 0, // 0 = main → sub
@@ -1719,10 +1728,11 @@ pub mod flash_book {
     ) -> Result<()> {
         require!(sub_index >= 1, FlashBookError::OutOfRange);
         require!(amount > 0, FlashBookError::ZeroSize);
-        let main = &mut ctx.accounts.main_trader_state;
-        let sub = &mut ctx.accounts.sub_trader_state;
+        let trader_key = ctx.accounts.trader.key();
+        let mut main = ctx.accounts.main_trader_state.load_mut()?;
+        let mut sub = ctx.accounts.sub_trader_state.load_mut()?;
         require!(
-            main.trader == sub.trader && main.trader == ctx.accounts.trader.key(),
+            main.trader == sub.trader && main.trader == trader_key,
             FlashBookError::WrongTrader
         );
         require!(
@@ -1738,7 +1748,7 @@ pub mod flash_book {
             .checked_add(amount)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         emit!(SubAccountTransferEvent {
-            trader: ctx.accounts.trader.key(),
+            trader: trader_key,
             sub_index,
             amount_quote_lots: amount,
             direction: 1, // 1 = sub → main
@@ -1813,13 +1823,13 @@ pub mod flash_book {
         ctx: Context<SetTraderReferrer>,
         referrer: Pubkey,
     ) -> Result<()> {
-        let s = &mut ctx.accounts.trader_state;
-        require!(s.referrer == Pubkey::default(), FlashBookError::OutOfRange);
-        s.referrer = referrer;
-        emit!(TraderReferrerSetEvent {
-            trader: s.trader,
-            referrer,
-        });
+        let trader = {
+            let mut s = ctx.accounts.trader_state.load_mut()?;
+            require!(s.referrer == Pubkey::default(), FlashBookError::OutOfRange);
+            s.referrer = referrer;
+            s.trader
+        };
+        emit!(TraderReferrerSetEvent { trader, referrer });
         Ok(())
     }
 
@@ -1837,11 +1847,14 @@ pub mod flash_book {
         ctx: Context<SetTraderDelegate>,
         new_delegate: Pubkey,
     ) -> Result<()> {
-        let s = &mut ctx.accounts.trader_state;
-        let prev = s.delegate;
-        s.delegate = new_delegate;
+        let (trader, prev) = {
+            let mut s = ctx.accounts.trader_state.load_mut()?;
+            let prev = s.delegate;
+            s.delegate = new_delegate;
+            (s.trader, prev)
+        };
         emit!(TraderDelegateUpdatedEvent {
-            trader: s.trader,
+            trader,
             previous: prev,
             new: new_delegate,
         });
@@ -1868,10 +1881,13 @@ pub mod flash_book {
             discount_bps <= constants::MAX_FEE_DISCOUNT_BPS,
             FlashBookError::OutOfRange
         );
-        let s = &mut ctx.accounts.trader_state;
-        s.fee_discount_bps = discount_bps;
+        let trader = {
+            let mut s = ctx.accounts.trader_state.load_mut()?;
+            s.fee_discount_bps = discount_bps;
+            s.trader
+        };
         emit!(TraderFeeTierUpdatedEvent {
-            trader: s.trader,
+            trader,
             discount_bps,
         });
         Ok(())
@@ -1930,12 +1946,15 @@ pub mod flash_book {
         amount: u64,
     ) -> Result<()> {
         require!(amount > 0, FlashBookError::ZeroSize);
-        let from = &ctx.accounts.from_state;
-        let to = &ctx.accounts.to_state;
-        require!(from.trader != to.trader, FlashBookError::OutOfRange);
         let signer = ctx.accounts.authority.key();
-        require!(from.is_authorized(&signer), FlashBookError::Unauthorized);
-        require!(to.is_authorized(&signer), FlashBookError::Unauthorized);
+        let (from_trader, from_open_positions, from_collateral) = {
+            let from = ctx.accounts.from_state.load()?;
+            let to = ctx.accounts.to_state.load()?;
+            require!(from.trader != to.trader, FlashBookError::OutOfRange);
+            require!(from.is_authorized(&signer), FlashBookError::Unauthorized);
+            require!(to.is_authorized(&signer), FlashBookError::Unauthorized);
+            (from.trader, from.open_positions, from.collateral_quote_lots)
+        };
 
         // Position-aware margin gate. If source has open positions:
         //   1. Walk remaining_accounts as [market, position] pairs.
@@ -1944,12 +1963,11 @@ pub mod flash_book {
         //      using POST-sweep collateral (`from.collateral - amount`).
         //   4. Reject if not healthy.
         // No open positions → skip the walk (cheap fast path).
-        if from.open_positions > 0 {
-            let post_sweep_collateral = from
-                .collateral_quote_lots
+        if from_open_positions > 0 {
+            let post_sweep_collateral = from_collateral
                 .checked_sub(amount)
                 .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
-            let expected = from.open_positions as usize;
+            let expected = from_open_positions as usize;
             require!(
                 ctx.remaining_accounts.len() == expected * 2,
                 FlashBookError::OutOfRange
@@ -1970,7 +1988,7 @@ pub mod flash_book {
                 let position_data = position_ai.try_borrow_data()?;
                 let position: state::PositionAccount =
                     state::PositionAccount::try_deserialize(&mut &position_data[..])?;
-                require!(position.trader == from.trader, FlashBookError::WrongTrader);
+                require!(position.trader == from_trader, FlashBookError::WrongTrader);
                 require!(position.market == market_ai.key(), FlashBookError::WrongMarket);
 
                 snaps.push(RiskPosSnap {
@@ -2008,21 +2026,24 @@ pub mod flash_book {
             require!(assessment.is_healthy, FlashBookError::TraderLiquidatable);
         }
 
-        let from = &mut ctx.accounts.from_state;
-        from.collateral_quote_lots = from
-            .collateral_quote_lots
-            .checked_sub(amount)
-            .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
-        let to = &mut ctx.accounts.to_state;
-        to.collateral_quote_lots = to
-            .collateral_quote_lots
-            .checked_add(amount)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let to_trader = {
+            let mut from = ctx.accounts.from_state.load_mut()?;
+            from.collateral_quote_lots = from
+                .collateral_quote_lots
+                .checked_sub(amount)
+                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+            let mut to = ctx.accounts.to_state.load_mut()?;
+            to.collateral_quote_lots = to
+                .collateral_quote_lots
+                .checked_add(amount)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            to.trader
+        };
 
         emit!(CollateralSweptEvent {
             authority: signer,
-            from: ctx.accounts.from_state.trader,
-            to: ctx.accounts.to_state.trader,
+            from: from_trader,
+            to: to_trader,
             amount_quote_lots: amount,
         });
         Ok(())
@@ -2046,8 +2067,11 @@ pub mod flash_book {
             ctx.accounts.strategist.key() == vault.strategist,
             FlashBookError::Unauthorized
         );
-        let ts = &ctx.accounts.vault_trader_state;
-        require!(ts.open_positions == 0, FlashBookError::SweepRequiresFlat);
+        let (ts_open_positions, ts_collateral) = {
+            let ts = ctx.accounts.vault_trader_state.load()?;
+            (ts.open_positions, ts.collateral_quote_lots)
+        };
+        require!(ts_open_positions == 0, FlashBookError::SweepRequiresFlat);
 
         let shares_outstanding = vault.shares_outstanding;
         // No depositors yet → nothing to settle. Anchor HWM at unit price.
@@ -2058,7 +2082,7 @@ pub mod flash_book {
             return Ok(());
         }
 
-        let nav = ts.collateral_quote_lots as u128;
+        let nav = ts_collateral as u128;
         // Current NAV per share, scaled by USD_UNIT for fixed-point precision.
         // nav_per_share_x6 = nav × USD_UNIT / shares_outstanding
         let nav_per_share_x6 = (nav.saturating_mul(constants::USD_UNIT as u128))
@@ -2173,19 +2197,22 @@ pub mod flash_book {
             max_fee_share_bps <= constants::BPS_DENOM as u32,
             FlashBookError::OutOfRange
         );
-        let s = &mut ctx.accounts.trader_state;
-        let prev = s.builder;
-        s.builder = builder;
-        s.builder_max_fee_share_bps = if builder == Pubkey::default() {
-            0
-        } else {
-            max_fee_share_bps
+        let (trader, prev, new_max_share) = {
+            let mut s = ctx.accounts.trader_state.load_mut()?;
+            let prev = s.builder;
+            s.builder = builder;
+            s.builder_max_fee_share_bps = if builder == Pubkey::default() {
+                0
+            } else {
+                max_fee_share_bps
+            };
+            (s.trader, prev, s.builder_max_fee_share_bps)
         };
         emit!(TraderBuilderUpdatedEvent {
-            trader: s.trader,
+            trader,
             previous: prev,
             new: builder,
-            max_fee_share_bps: s.builder_max_fee_share_bps,
+            max_fee_share_bps: new_max_share,
         });
         Ok(())
     }
@@ -2244,15 +2271,18 @@ pub mod flash_book {
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
         // Accounting.
-        let s = &mut ctx.accounts.trader_state;
-        s.collateral_quote_lots = s
-            .collateral_quote_lots
-            .checked_add(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let (trader, new_balance) = {
+            let mut s = ctx.accounts.trader_state.load_mut()?;
+            s.collateral_quote_lots = s
+                .collateral_quote_lots
+                .checked_add(amount_quote_lots)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            (s.trader, s.collateral_quote_lots)
+        };
         emit!(CollateralDepositedEvent {
-            trader: s.trader,
+            trader,
             amount: amount_quote_lots,
-            new_balance: s.collateral_quote_lots,
+            new_balance,
         });
         Ok(())
     }
@@ -2270,7 +2300,7 @@ pub mod flash_book {
         // Pre-flight checks (do these before the transfer so we don't
         // mutate vault state on a rejected withdrawal).
         {
-            let s = &ctx.accounts.trader_state;
+            let s = ctx.accounts.trader_state.load()?;
             require!(s.open_positions == 0, FlashBookError::InsufficientCollateral);
             require!(
                 amount_quote_lots <= s.collateral_quote_lots,
@@ -2295,15 +2325,18 @@ pub mod flash_book {
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
         // Accounting.
-        let s = &mut ctx.accounts.trader_state;
-        s.collateral_quote_lots = s
-            .collateral_quote_lots
-            .checked_sub(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        let (trader, new_balance) = {
+            let mut s = ctx.accounts.trader_state.load_mut()?;
+            s.collateral_quote_lots = s
+                .collateral_quote_lots
+                .checked_sub(amount_quote_lots)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+            (s.trader, s.collateral_quote_lots)
+        };
         emit!(CollateralWithdrawnEvent {
-            trader: s.trader,
+            trader,
             amount: amount_quote_lots,
-            new_balance: s.collateral_quote_lots,
+            new_balance,
         });
         Ok(())
     }
@@ -2337,20 +2370,18 @@ pub mod flash_book {
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
 
-        // Pre-flight: amount available.
-        {
-            let s = &ctx.accounts.trader_state;
+        // Walk remaining_accounts in (market, position) pairs to build
+        // the post-withdrawal margin snapshot.
+        let trader_state_key = ctx.accounts.trader_state.key();
+        let (trader_pk, open, current_collateral) = {
+            let s = ctx.accounts.trader_state.load()?;
+            // Pre-flight: amount available.
             require!(
                 amount_quote_lots <= s.collateral_quote_lots,
                 FlashBookError::InsufficientCollateral,
             );
-        }
-
-        // Walk remaining_accounts in (market, position) pairs to build
-        // the post-withdrawal margin snapshot.
-        let trader_pk = ctx.accounts.trader_state.trader;
-        let trader_state_key = ctx.accounts.trader_state.key();
-        let open = ctx.accounts.trader_state.open_positions as usize;
+            (s.trader, s.open_positions as usize, s.collateral_quote_lots)
+        };
         let program_id = ctx.program_id;
         let remaining = ctx.remaining_accounts;
         // C-2: the caller MUST supply EVERY open position. Exact-count +
@@ -2432,10 +2463,7 @@ pub mod flash_book {
         }
 
         // Pre-mutate snapshot of the post-withdrawal collateral.
-        let post_collateral = ctx
-            .accounts
-            .trader_state
-            .collateral_quote_lots
+        let post_collateral = current_collateral
             .checked_sub(amount_quote_lots)
             .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
 
@@ -2487,12 +2515,14 @@ pub mod flash_book {
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
         // Accounting.
-        let s = &mut ctx.accounts.trader_state;
-        s.collateral_quote_lots = post_collateral;
+        {
+            let mut s = ctx.accounts.trader_state.load_mut()?;
+            s.collateral_quote_lots = post_collateral;
+        }
         emit!(PartialCollateralWithdrawnEvent {
-            trader: s.trader,
+            trader: trader_pk,
             amount: amount_quote_lots,
-            new_balance: s.collateral_quote_lots,
+            new_balance: post_collateral,
             im_required,
             notional_floor,
             applied_floor: floor,
@@ -2523,7 +2553,10 @@ pub mod flash_book {
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-        let trader_pk = ctx.accounts.trader_state.trader;
+        let (trader_pk, ts_open, ts_collateral) = {
+            let ts = ctx.accounts.trader_state.load()?;
+            (ts.trader, ts.open_positions as usize, ts.collateral_quote_lots)
+        };
         require!(
             ctx.accounts.target_position.trader == trader_pk,
             FlashBookError::WrongTrader
@@ -2541,14 +2574,14 @@ pub mod flash_book {
             FlashBookError::OutOfRange
         );
         require!(
-            amount_quote_lots <= ctx.accounts.trader_state.collateral_quote_lots,
+            amount_quote_lots <= ts_collateral,
             FlashBookError::InsufficientCollateral
         );
 
         // ─── Walk remaining_accounts: build snapshots for OTHER positions.
         let program_id = ctx.program_id;
         let trader_state_key = ctx.accounts.trader_state.key();
-        let open = ctx.accounts.trader_state.open_positions as usize;
+        let open = ts_open;
         let target_market_key_pre = ctx.accounts.target_market.key();
         let remaining = ctx.remaining_accounts;
         // H-1: the target position is passed as a named account, so the
@@ -2655,10 +2688,7 @@ pub mod flash_book {
         market_keys.push(target_market_key);
 
         // Post-transfer state for the split assessment.
-        let post_cross_collateral = ctx
-            .accounts
-            .trader_state
-            .collateral_quote_lots
+        let post_cross_collateral = ts_collateral
             .checked_sub(amount_quote_lots)
             .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
         let post_isolated_collateral = amount_quote_lots; // currently 0 + amount
@@ -2678,7 +2708,7 @@ pub mod flash_book {
         );
 
         // Apply the transfer.
-        ctx.accounts.trader_state.collateral_quote_lots = post_cross_collateral;
+        ctx.accounts.trader_state.load_mut()?.collateral_quote_lots = post_cross_collateral;
         ctx.accounts.target_position.collateral_quote_lots = post_isolated_collateral;
 
         emit!(PositionMarginModeChangedEvent {
@@ -2703,7 +2733,10 @@ pub mod flash_book {
     pub fn set_position_cross<'info>(
         ctx: Context<'_, '_, '_, 'info, SetPositionMarginMode<'info>>,
     ) -> Result<()> {
-        let trader_pk = ctx.accounts.trader_state.trader;
+        let (trader_pk, ts_open, ts_collateral) = {
+            let ts = ctx.accounts.trader_state.load()?;
+            (ts.trader, ts.open_positions as usize, ts.collateral_quote_lots)
+        };
         require!(
             ctx.accounts.target_position.trader == trader_pk,
             FlashBookError::WrongTrader
@@ -2717,7 +2750,7 @@ pub mod flash_book {
 
         let program_id = ctx.program_id;
         let trader_state_key = ctx.accounts.trader_state.key();
-        let open = ctx.accounts.trader_state.open_positions as usize;
+        let open = ts_open;
         let target_market_key_pre = ctx.accounts.target_market.key();
         let remaining = ctx.remaining_accounts;
         // H-1: same coverage invariant as set_position_isolated — the
@@ -2818,10 +2851,7 @@ pub mod flash_book {
             market_keys.push(target_market_key);
         }
 
-        let post_cross_collateral = ctx
-            .accounts
-            .trader_state
-            .collateral_quote_lots
+        let post_cross_collateral = ts_collateral
             .checked_add(returned)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
 
@@ -2841,7 +2871,7 @@ pub mod flash_book {
         }
 
         // Apply the transfer.
-        ctx.accounts.trader_state.collateral_quote_lots = post_cross_collateral;
+        ctx.accounts.trader_state.load_mut()?.collateral_quote_lots = post_cross_collateral;
         ctx.accounts.target_position.collateral_quote_lots = 0;
 
         emit!(PositionMarginModeChangedEvent {
@@ -2873,7 +2903,7 @@ pub mod flash_book {
     pub fn settle_funding(ctx: Context<SettleFunding>) -> Result<()> {
         let market = &ctx.accounts.market;
         let position = &mut ctx.accounts.position;
-        let trader_state = &mut ctx.accounts.trader_state;
+        let mut trader_state = ctx.accounts.trader_state.load_mut()?;
 
         // No-op for empty positions.
         if position.size_lots == 0 {
@@ -3053,16 +3083,16 @@ pub mod flash_book {
         // makes that contract on-chain-enforceable.
         verify_trader_state_pda(
             taker_sub_index,
-            ctx.accounts.taker_trader_state.trader,
+            ctx.accounts.taker_trader_state.load()?.trader,
             ctx.accounts.taker_trader_state.key(),
-            ctx.accounts.taker_trader_state.bump,
+            ctx.accounts.taker_trader_state.load()?.bump,
             ctx.program_id,
         )?;
         verify_trader_state_pda(
             maker_sub_index,
-            ctx.accounts.maker_trader_state.trader,
+            ctx.accounts.maker_trader_state.load()?.trader,
             ctx.accounts.maker_trader_state.key(),
-            ctx.accounts.maker_trader_state.bump,
+            ctx.accounts.maker_trader_state.load()?.bump,
             ctx.program_id,
         )?;
 
@@ -3099,8 +3129,8 @@ pub mod flash_book {
                 .iter()
                 .map(|t| (t.min_volume_quote_lots, t.maker_rebate_bps, t.taker_fee_bps))
                 .collect();
-            let taker_volume = ctx.accounts.taker_trader_state.volume_30d_quote_lots;
-            let maker_volume = ctx.accounts.maker_trader_state.volume_30d_quote_lots;
+            let taker_volume = ctx.accounts.taker_trader_state.load()?.volume_30d_quote_lots;
+            let maker_volume = ctx.accounts.maker_trader_state.load()?.volume_30d_quote_lots;
             let (tm, tt) = matcher::risk::resolve_fee_tier(
                 market.params.maker_rebate_bps,
                 market.params.taker_fee_bps,
@@ -3126,11 +3156,11 @@ pub mod flash_book {
         // Capture pre-fill tier indices for upgrade-event detection.
         let pre_taker_tier_index = tier_index_for_volume(
             &tier_pairs,
-            ctx.accounts.taker_trader_state.volume_30d_quote_lots,
+            ctx.accounts.taker_trader_state.load()?.volume_30d_quote_lots,
         );
         let pre_maker_tier_index = tier_index_for_volume(
             &tier_pairs,
-            ctx.accounts.maker_trader_state.volume_30d_quote_lots,
+            ctx.accounts.maker_trader_state.load()?.volume_30d_quote_lots,
         );
         // Suppress unused-warning when no tier table is supplied.
         let _ = (taker_maker_rebate_bps, maker_taker_fee_bps);
@@ -3144,7 +3174,7 @@ pub mod flash_book {
         // resolves to a credit on taker collateral; the rebate is sourced
         // from the protocol's insurance contribution downstream so it
         // can't push the insurance fund negative.
-        let discount_bps_full = ctx.accounts.taker_trader_state.fee_discount_bps as u128;
+        let discount_bps_full = ctx.accounts.taker_trader_state.load()?.fee_discount_bps as u128;
         let discount_bps = discount_bps_full.min(constants::MAX_FEE_DISCOUNT_BPS as u128);
         let mut taker_fee_u128 = base_taker_fee_u128;
         let mut taker_negative_rebate_u128: u128 = 0;
@@ -3213,8 +3243,8 @@ pub mod flash_book {
         let net_fee = taker_fee.saturating_add(maker_fee).saturating_sub(maker_rebate);
         let taker_side_enum = if taker_side == 0 { Side::Long } else { Side::Short };
         let maker_side_enum = taker_side_enum.opposite();
-        let taker_trader_pk = ctx.accounts.taker_trader_state.trader;
-        let maker_trader_pk = ctx.accounts.maker_trader_state.trader;
+        let taker_trader_pk = ctx.accounts.taker_trader_state.load()?.trader;
+        let maker_trader_pk = ctx.accounts.maker_trader_state.load()?.trader;
 
         // Apply fees BEFORE position state is mutated, so reads are clean.
         // Taker pays fee from collateral (must have it; place_limit_order's
@@ -3240,7 +3270,7 @@ pub mod flash_book {
                         .checked_sub(taker_fee)
                         .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
                 } else {
-                    let s = &mut ctx.accounts.taker_trader_state;
+                    let mut s = ctx.accounts.taker_trader_state.load_mut()?;
                     s.collateral_quote_lots = s
                         .collateral_quote_lots
                         .checked_sub(taker_fee)
@@ -3260,7 +3290,7 @@ pub mod flash_book {
                         .checked_add(neg_rebate_u64)
                         .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
                 } else {
-                    let s = &mut ctx.accounts.taker_trader_state;
+                    let mut s = ctx.accounts.taker_trader_state.load_mut()?;
                     s.collateral_quote_lots = s
                         .collateral_quote_lots
                         .checked_add(neg_rebate_u64)
@@ -3281,7 +3311,7 @@ pub mod flash_book {
                         .checked_add(maker_rebate)
                         .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
                 } else {
-                    let s = &mut ctx.accounts.maker_trader_state;
+                    let mut s = ctx.accounts.maker_trader_state.load_mut()?;
                     s.collateral_quote_lots = s
                         .collateral_quote_lots
                         .checked_add(maker_rebate)
@@ -3296,7 +3326,7 @@ pub mod flash_book {
                         .checked_sub(maker_fee)
                         .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
                 } else {
-                    let s = &mut ctx.accounts.maker_trader_state;
+                    let mut s = ctx.accounts.maker_trader_state.load_mut()?;
                     s.collateral_quote_lots = s
                         .collateral_quote_lots
                         .checked_sub(maker_fee)
@@ -3338,14 +3368,14 @@ pub mod flash_book {
         // with the share so off-chain integrators can credit referrer
         // balances. Pull-based (no on-chain referrer account walk) keeps
         // ApplyFill's account list bounded; off-chain ledger pays out.
-        let taker_referrer = ctx.accounts.taker_trader_state.referrer;
+        let taker_referrer = ctx.accounts.taker_trader_state.load()?.referrer;
         if taker_referrer != Pubkey::default() && market.params.referrer_share_bps > 0 {
             let share = ((net_fee as u128)
                 .saturating_mul(market.params.referrer_share_bps as u128)
                 / (constants::BPS_DENOM as u128)) as u64;
             if share > 0 {
                 emit!(ReferralOwedEvent {
-                    taker: ctx.accounts.taker_trader_state.trader,
+                    taker: taker_trader_pk,
                     referrer: taker_referrer,
                     amount_quote_lots: share,
                 });
@@ -3357,8 +3387,10 @@ pub mod flash_book {
         // for off-chain accrual. Rate = min(market builder_share_bps,
         // trader-approved cap). Pull-based (no on-chain builder account
         // walk) keeps ApplyFill's account list bounded.
-        let taker_builder = ctx.accounts.taker_trader_state.builder;
-        let trader_builder_cap = ctx.accounts.taker_trader_state.builder_max_fee_share_bps;
+        let (taker_builder, trader_builder_cap) = {
+            let s = ctx.accounts.taker_trader_state.load()?;
+            (s.builder, s.builder_max_fee_share_bps)
+        };
         if taker_builder != Pubkey::default()
             && market.params.builder_share_bps > 0
             && trader_builder_cap > 0
@@ -3369,7 +3401,7 @@ pub mod flash_book {
                 ((net_fee as u128).saturating_mul(effective_bps) / (constants::BPS_DENOM as u128)) as u64;
             if share > 0 {
                 emit!(BuilderFeeOwedEvent {
-                    taker: ctx.accounts.taker_trader_state.trader,
+                    taker: taker_trader_pk,
                     builder: taker_builder,
                     amount_quote_lots: share,
                 });
@@ -3428,44 +3460,40 @@ pub mod flash_book {
                 &mut ctx.accounts.taker_trader_state,
                 notional_quote_lots,
                 now_slot,
-            );
+            )?;
             credit_volume_for_tier(
                 &mut ctx.accounts.maker_trader_state,
                 notional_quote_lots,
                 now_slot,
-            );
+            )?;
 
             // ── Wave 22 phase 2 — emit TraderTierUpgradedEvent on
             //    tier boundary crossings (silent on no-change).
             if !tier_pairs.is_empty() {
+                let taker_post_volume = ctx.accounts.taker_trader_state.load()?.volume_30d_quote_lots;
                 let post_taker_tier_index = tier_index_for_volume(
                     &tier_pairs,
-                    ctx.accounts.taker_trader_state.volume_30d_quote_lots,
+                    taker_post_volume,
                 );
                 if post_taker_tier_index != pre_taker_tier_index {
                     emit!(TraderTierUpgradedEvent {
                         trader: taker_trader_pk,
                         previous_tier_index: pre_taker_tier_index,
                         new_tier_index: post_taker_tier_index,
-                        volume_quote_lots: ctx
-                            .accounts
-                            .taker_trader_state
-                            .volume_30d_quote_lots,
+                        volume_quote_lots: taker_post_volume,
                     });
                 }
+                let maker_post_volume = ctx.accounts.maker_trader_state.load()?.volume_30d_quote_lots;
                 let post_maker_tier_index = tier_index_for_volume(
                     &tier_pairs,
-                    ctx.accounts.maker_trader_state.volume_30d_quote_lots,
+                    maker_post_volume,
                 );
                 if post_maker_tier_index != pre_maker_tier_index {
                     emit!(TraderTierUpgradedEvent {
                         trader: maker_trader_pk,
                         previous_tier_index: pre_maker_tier_index,
                         new_tier_index: post_maker_tier_index,
-                        volume_quote_lots: ctx
-                            .accounts
-                            .maker_trader_state
-                            .volume_30d_quote_lots,
+                        volume_quote_lots: maker_post_volume,
                     });
                 }
             }
@@ -3492,10 +3520,10 @@ pub mod flash_book {
                 tax_u128 as u64
             };
             // Cap to taker's available collateral — never fail the fill.
-            let tax = tax_uncapped.min(ctx.accounts.taker_trader_state.collateral_quote_lots);
+            let tax = tax_uncapped.min(ctx.accounts.taker_trader_state.load()?.collateral_quote_lots);
             if tax > 0 {
                 // Deduct from taker.
-                ctx.accounts.taker_trader_state.collateral_quote_lots -= tax;
+                ctx.accounts.taker_trader_state.load_mut()?.collateral_quote_lots -= tax;
                 // Split: insurance fund gets `tox_contribution_bps`, maker
                 // receives the remainder as a toxic-flow rebate.
                 let to_insurance = (tax as u128)
@@ -3515,7 +3543,7 @@ pub mod flash_book {
                         .saturating_add(to_insurance);
                 }
                 {
-                    let maker_state = &mut ctx.accounts.maker_trader_state;
+                    let mut maker_state = ctx.accounts.maker_trader_state.load_mut()?;
                     maker_state.collateral_quote_lots = maker_state
                         .collateral_quote_lots
                         .checked_add(to_maker)
@@ -3635,17 +3663,21 @@ pub mod flash_book {
         // Update open_positions transitions on TraderState.
         let taker_is_open = taker_pos.size_lots > 0;
         let maker_is_open = maker_pos.size_lots > 0;
-        let taker_state = &mut ctx.accounts.taker_trader_state;
-        if !taker_was_open && taker_is_open {
-            taker_state.open_positions = taker_state.open_positions.saturating_add(1);
-        } else if taker_was_open && !taker_is_open {
-            taker_state.open_positions = taker_state.open_positions.saturating_sub(1);
+        {
+            let mut taker_state = ctx.accounts.taker_trader_state.load_mut()?;
+            if !taker_was_open && taker_is_open {
+                taker_state.open_positions = taker_state.open_positions.saturating_add(1);
+            } else if taker_was_open && !taker_is_open {
+                taker_state.open_positions = taker_state.open_positions.saturating_sub(1);
+            }
         }
-        let maker_state = &mut ctx.accounts.maker_trader_state;
-        if !maker_was_open && maker_is_open {
-            maker_state.open_positions = maker_state.open_positions.saturating_add(1);
-        } else if maker_was_open && !maker_is_open {
-            maker_state.open_positions = maker_state.open_positions.saturating_sub(1);
+        {
+            let mut maker_state = ctx.accounts.maker_trader_state.load_mut()?;
+            if !maker_was_open && maker_is_open {
+                maker_state.open_positions = maker_state.open_positions.saturating_add(1);
+            } else if maker_was_open && !maker_is_open {
+                maker_state.open_positions = maker_state.open_positions.saturating_sub(1);
+            }
         }
 
         emit!(FillAppliedEvent {
@@ -3752,16 +3784,18 @@ pub mod flash_book {
         //   required = position_notional × mmr_bps / 10_000
         // Emit on threshold crossings (250%/200%/125%) so off-chain UIs
         // can push pre-liquidation alerts. Hyperliquid pattern.
+        let taker_collateral_now = ctx.accounts.taker_trader_state.load()?.collateral_quote_lots;
+        let maker_collateral_now = ctx.accounts.maker_trader_state.load()?.collateral_quote_lots;
         for (pos, trader_pk, collateral) in [
             (
                 &*ctx.accounts.taker_position,
                 taker_trader_pk,
-                ctx.accounts.taker_trader_state.collateral_quote_lots,
+                taker_collateral_now,
             ),
             (
                 &*ctx.accounts.maker_position,
                 maker_trader_pk,
-                ctx.accounts.maker_trader_state.collateral_quote_lots,
+                maker_collateral_now,
             ),
         ] {
             if pos.size_lots == 0 {
@@ -4316,7 +4350,7 @@ pub mod flash_book {
     /// as 0 (window has reset; they fall to tier 0 until the next fill
     /// re-anchors). This matches what the next apply_fill will see.
     pub fn view_trader_effective_tier(ctx: Context<ViewTraderEffectiveTier>) -> Result<()> {
-        let s = &ctx.accounts.trader_state;
+        let s = ctx.accounts.trader_state.load()?;
         let f = &ctx.accounts.fee_tiers;
         let now = Clock::get()?.slot;
 
@@ -4526,27 +4560,29 @@ pub mod flash_book {
                 &snaps,
                 &markets,
                 &scenarios,
-                ctx.accounts.trader_state.collateral_quote_lots,
+                ctx.accounts.trader_state.load()?.collateral_quote_lots,
             )?;
             require!(assessment.is_healthy, FlashBookError::TraderLiquidatable);
         }
 
         // Rate limit (parity).
-        let trader_state = &mut ctx.accounts.trader_state;
-        if trader_state.last_batch_seen != market_a.current_batch {
-            trader_state.last_batch_seen = market_a.current_batch;
-            trader_state.orders_this_batch = 0;
+        {
+            let mut trader_state = ctx.accounts.trader_state.load_mut()?;
+            if trader_state.last_batch_seen != market_a.current_batch {
+                trader_state.last_batch_seen = market_a.current_batch;
+                trader_state.orders_this_batch = 0;
+            }
+            require!(
+                trader_state.orders_this_batch.saturating_add(2)
+                    <= MAX_ORDERS_PER_TRADER_PER_BATCH,
+                FlashBookError::RateLimited
+            );
+            trader_state.orders_this_batch += 2;
         }
-        require!(
-            trader_state.orders_this_batch.saturating_add(2)
-                <= MAX_ORDERS_PER_TRADER_PER_BATCH,
-            FlashBookError::RateLimited
-        );
-        trader_state.orders_this_batch += 2;
 
         // V2 inject — into BOTH market_book PDAs.
         let now_slot = Clock::get()?.slot;
-        let trader_sub_index = ctx.accounts.trader_state.sub_index;
+        let trader_sub_index = ctx.accounts.trader_state.load()?.sub_index;
         let (seq_a, idx_a) = inject_leg_into_hypertree(
             &ctx.accounts.market_book_a,
             market_a_key,
@@ -4666,30 +4702,32 @@ pub mod flash_book {
                 &snaps,
                 &market_snaps,
                 &scenarios,
-                ctx.accounts.trader_state.collateral_quote_lots,
+                ctx.accounts.trader_state.load()?.collateral_quote_lots,
             )?;
             require!(assessment.is_healthy, FlashBookError::TraderLiquidatable);
         }
 
         // Rate limit (parity).
-        let trader_state = &mut ctx.accounts.trader_state;
-        if trader_state.last_batch_seen != markets[0].current_batch {
-            trader_state.last_batch_seen = markets[0].current_batch;
-            trader_state.orders_this_batch = 0;
-        }
         let leg_count_u32 = u32::try_from(legs.len()).unwrap_or(u32::MAX);
-        require!(
-            trader_state.orders_this_batch.saturating_add(leg_count_u32)
-                <= MAX_ORDERS_PER_TRADER_PER_BATCH,
-            FlashBookError::RateLimited
-        );
-        trader_state.orders_this_batch = trader_state
-            .orders_this_batch
-            .saturating_add(leg_count_u32);
+        let trader_sub_index = {
+            let mut trader_state = ctx.accounts.trader_state.load_mut()?;
+            if trader_state.last_batch_seen != markets[0].current_batch {
+                trader_state.last_batch_seen = markets[0].current_batch;
+                trader_state.orders_this_batch = 0;
+            }
+            require!(
+                trader_state.orders_this_batch.saturating_add(leg_count_u32)
+                    <= MAX_ORDERS_PER_TRADER_PER_BATCH,
+                FlashBookError::RateLimited
+            );
+            trader_state.orders_this_batch = trader_state
+                .orders_this_batch
+                .saturating_add(leg_count_u32);
+            trader_state.sub_index
+        };
 
         // Inject each leg into its market_book.
         let now_slot = Clock::get()?.slot;
-        let trader_sub_index = trader_state.sub_index;
         for (i, leg) in legs.iter().enumerate() {
             let book_ai = &remaining[i * 3 + 1];
             inject_leg_into_hypertree_unchecked(
@@ -5464,7 +5502,7 @@ pub mod flash_book {
     pub fn view_portfolio_risk<'info>(
         ctx: Context<'_, '_, 'info, 'info, ViewPortfolioRisk<'info>>,
     ) -> Result<()> {
-        let trader_state = &ctx.accounts.trader_state;
+        let trader_state = ctx.accounts.trader_state.load()?;
         let open = trader_state.open_positions as usize;
         require!(
             ctx.remaining_accounts.len() == open * 2,
@@ -5617,9 +5655,9 @@ pub mod flash_book {
         // for the full rationale.
         verify_trader_state_pda(
             taker_sub_index,
-            ctx.accounts.taker_trader_state.trader,
+            ctx.accounts.taker_trader_state.load()?.trader,
             ctx.accounts.taker_trader_state.key(),
-            ctx.accounts.taker_trader_state.bump,
+            ctx.accounts.taker_trader_state.load()?.bump,
             ctx.program_id,
         )?;
 
@@ -5629,7 +5667,7 @@ pub mod flash_book {
         let current_batch = market.current_batch;
         let taker_side_enum = if taker_side == 0 { Side::Long } else { Side::Short };
         let flp_side_enum = taker_side_enum.opposite();
-        let taker_trader_pk = ctx.accounts.taker_trader_state.trader;
+        let taker_trader_pk = ctx.accounts.taker_trader_state.load()?.trader;
 
         // Fee + rebate accrual (parity with apply_fill).
         // FLP is the maker — rebate accrues to FLP capital instead of a maker
@@ -5650,7 +5688,7 @@ pub mod flash_book {
                     .iter()
                     .map(|t| (t.min_volume_quote_lots, t.maker_rebate_bps, t.taker_fee_bps))
                     .collect();
-                let taker_volume = ctx.accounts.taker_trader_state.volume_30d_quote_lots;
+                let taker_volume = ctx.accounts.taker_trader_state.load()?.volume_30d_quote_lots;
                 let (_unused_maker, tt) = matcher::risk::resolve_fee_tier(
                     market.params.maker_rebate_bps,
                     market.params.taker_fee_bps,
@@ -5663,7 +5701,7 @@ pub mod flash_book {
             };
         let pre_taker_tier_index = tier_index_for_volume(
             &fee_tier_pairs,
-            ctx.accounts.taker_trader_state.volume_30d_quote_lots,
+            ctx.accounts.taker_trader_state.load()?.volume_30d_quote_lots,
         );
 
         let taker_fee_u128 =
@@ -5689,7 +5727,7 @@ pub mod flash_book {
 
         // Deduct fee from taker.
         {
-            let taker_state = &mut ctx.accounts.taker_trader_state;
+            let mut taker_state = ctx.accounts.taker_trader_state.load_mut()?;
             taker_state.collateral_quote_lots = taker_state
                 .collateral_quote_lots
                 .checked_sub(taker_fee)
@@ -5744,9 +5782,9 @@ pub mod flash_book {
             } else {
                 tax_u128 as u64
             };
-            let tax = tax_uncapped.min(ctx.accounts.taker_trader_state.collateral_quote_lots);
+            let tax = tax_uncapped.min(ctx.accounts.taker_trader_state.load()?.collateral_quote_lots);
             if tax > 0 {
-                ctx.accounts.taker_trader_state.collateral_quote_lots -= tax;
+                ctx.accounts.taker_trader_state.load_mut()?.collateral_quote_lots -= tax;
                 let to_insurance = (tax as u128)
                     .saturating_mul(ctx.accounts.insurance_fund.toxicity_tax_contribution_bps as u128)
                     .checked_div(constants::BPS_DENOM as u128)
@@ -5842,11 +5880,13 @@ pub mod flash_book {
 
         // Update open_positions on TraderState.
         let taker_is_open = taker_pos.size_lots > 0;
-        let taker_state = &mut ctx.accounts.taker_trader_state;
-        if !taker_was_open && taker_is_open {
-            taker_state.open_positions = taker_state.open_positions.saturating_add(1);
-        } else if taker_was_open && !taker_is_open {
-            taker_state.open_positions = taker_state.open_positions.saturating_sub(1);
+        {
+            let mut taker_state = ctx.accounts.taker_trader_state.load_mut()?;
+            if !taker_was_open && taker_is_open {
+                taker_state.open_positions = taker_state.open_positions.saturating_add(1);
+            } else if taker_was_open && !taker_is_open {
+                taker_state.open_positions = taker_state.open_positions.saturating_sub(1);
+            }
         }
 
         emit!(FlpFillAppliedEvent {
@@ -5874,21 +5914,19 @@ pub mod flash_book {
                 &mut ctx.accounts.taker_trader_state,
                 notional_quote_lots,
                 now_slot,
-            );
+            )?;
             if !fee_tier_pairs.is_empty() {
+                let taker_post_volume = ctx.accounts.taker_trader_state.load()?.volume_30d_quote_lots;
                 let post_taker_tier_index = tier_index_for_volume(
                     &fee_tier_pairs,
-                    ctx.accounts.taker_trader_state.volume_30d_quote_lots,
+                    taker_post_volume,
                 );
                 if post_taker_tier_index != pre_taker_tier_index {
                     emit!(TraderTierUpgradedEvent {
                         trader: taker_trader_pk,
                         previous_tier_index: pre_taker_tier_index,
                         new_tier_index: post_taker_tier_index,
-                        volume_quote_lots: ctx
-                            .accounts
-                            .taker_trader_state
-                            .volume_30d_quote_lots,
+                        volume_quote_lots: taker_post_volume,
                     });
                 }
             }
@@ -5913,11 +5951,14 @@ pub mod flash_book {
     ) -> Result<()> {
         let market = &ctx.accounts.market;
         let position = &ctx.accounts.position;
-        let trader_state_pre = ctx.accounts.trader_state.clone();
+        let (trader_state_pre_trader, trader_state_pre_collateral) = {
+            let ts = ctx.accounts.trader_state.load()?;
+            (ts.trader, ts.collateral_quote_lots)
+        };
 
         require!(position.size_lots > 0, FlashBookError::LiquidationStale);
         require!(
-            position.trader == trader_state_pre.trader,
+            position.trader == trader_state_pre_trader,
             FlashBookError::WrongTrader
         );
         require!(
@@ -6026,7 +6067,7 @@ pub mod flash_book {
             &[pos_snap],
             &[market_snap],
             &scenarios,
-            trader_state_pre.collateral_quote_lots,
+            trader_state_pre_collateral,
         )?;
         require!(!assessment.is_healthy, FlashBookError::NotLiquidatable);
 
@@ -6034,7 +6075,7 @@ pub mod flash_book {
         // "liquidated by oracle move" vs "liquidated by mark drift".
         emit!(HealthGateSourceEvent {
             market: market.key(),
-            trader: trader_state_pre.trader,
+            trader: trader_state_pre_trader,
             mark_ticks: mark_t,
             oracle_ticks: oracle_t,
             health_price_ticks,
@@ -6119,7 +6160,7 @@ pub mod flash_book {
             }
             // target_trader filter — match this trader or wildcard.
             if parsed.target_trader != Pubkey::default()
-                && parsed.target_trader != trader_state_pre.trader
+                && parsed.target_trader != trader_state_pre_trader
             {
                 continue;
             }
@@ -6200,10 +6241,12 @@ pub mod flash_book {
 
         // Lazy-init caller_trader_state (parity-port).
         {
-            let cts = &mut ctx.accounts.caller_trader_state;
+            let caller_key = ctx.accounts.caller.key();
+            let caller_bump = ctx.bumps.caller_trader_state;
+            let mut cts = ctx.accounts.caller_trader_state.load_mut()?;
             if cts.trader == Pubkey::default() {
-                cts.trader = ctx.accounts.caller.key();
-                cts.bump = ctx.bumps.caller_trader_state;
+                cts.trader = caller_key;
+                cts.bump = caller_bump;
             }
         }
 
@@ -6257,17 +6300,18 @@ pub mod flash_book {
                 reward_paid = reward_u64.min(pos.collateral_quote_lots);
                 if reward_paid > 0 {
                     pos.collateral_quote_lots -= reward_paid;
-                    let caller_ts = &mut ctx.accounts.caller_trader_state;
+                    let mut caller_ts = ctx.accounts.caller_trader_state.load_mut()?;
                     caller_ts.collateral_quote_lots = caller_ts
                         .collateral_quote_lots
                         .checked_add(reward_paid)
                         .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
                 }
             } else {
-                reward_paid = reward_u64.min(ctx.accounts.trader_state.collateral_quote_lots);
+                reward_paid =
+                    reward_u64.min(ctx.accounts.trader_state.load()?.collateral_quote_lots);
                 if reward_paid > 0 {
-                    ctx.accounts.trader_state.collateral_quote_lots -= reward_paid;
-                    let caller_ts = &mut ctx.accounts.caller_trader_state;
+                    ctx.accounts.trader_state.load_mut()?.collateral_quote_lots -= reward_paid;
+                    let mut caller_ts = ctx.accounts.caller_trader_state.load_mut()?;
                     caller_ts.collateral_quote_lots = caller_ts
                         .collateral_quote_lots
                         .checked_add(reward_paid)
@@ -6311,7 +6355,7 @@ pub mod flash_book {
                 // Phase 2f — carry the liquidatee's sub_index so ApplyFill
                 // routes the close fill back to the same TraderState
                 // that's being liquidated (main vs sub).
-                sub_index: ctx.accounts.trader_state.sub_index,
+                sub_index: ctx.accounts.trader_state.load()?.sub_index,
             };
             inserted_idx = if side_is_bid {
                 handle.insert_bid(order)?
@@ -6449,11 +6493,11 @@ pub mod flash_book {
 
         // Trader-state alignment.
         require!(
-            ctx.accounts.underwater_trader_state.trader == underwater.trader,
+            ctx.accounts.underwater_trader_state.load()?.trader == underwater.trader,
             FlashBookError::WrongTrader
         );
         require!(
-            ctx.accounts.counter_trader_state.trader == counter.trader,
+            ctx.accounts.counter_trader_state.load()?.trader == counter.trader,
             FlashBookError::WrongTrader
         );
         // Cannot ADL yourself.
@@ -6497,7 +6541,7 @@ pub mod flash_book {
             &[pos_snap],
             &[market_snap],
             &scenarios,
-            ctx.accounts.underwater_trader_state.collateral_quote_lots,
+            ctx.accounts.underwater_trader_state.load()?.collateral_quote_lots,
         )?;
         require!(!assessment.is_healthy, FlashBookError::NotLiquidatable);
 
@@ -6521,7 +6565,7 @@ pub mod flash_book {
         let collateral: u128 = if underwater_isolated {
             underwater.collateral_quote_lots as u128
         } else {
-            ctx.accounts.underwater_trader_state.collateral_quote_lots as u128
+            ctx.accounts.underwater_trader_state.load()?.collateral_quote_lots as u128
         };
         let entry = underwater.entry_price_ticks as u128;
         let size = underwater.size_lots as u128;
@@ -6607,13 +6651,13 @@ pub mod flash_book {
                 underwater_isolated,
                 loss_quote_lots,
                 ctx.accounts.underwater_position.collateral_quote_lots,
-                ctx.accounts.underwater_trader_state.collateral_quote_lots,
+                ctx.accounts.underwater_trader_state.load()?.collateral_quote_lots,
             );
             ctx.accounts.underwater_position.collateral_quote_lots = new_pos_collat;
-            ctx.accounts.underwater_trader_state.collateral_quote_lots = new_ts_collat;
+            ctx.accounts.underwater_trader_state.load_mut()?.collateral_quote_lots = new_ts_collat;
         }
         {
-            let uts = &mut ctx.accounts.underwater_trader_state;
+            let mut uts = ctx.accounts.underwater_trader_state.load_mut()?;
             uts.realized_pnl_quote_lots = uts
                 .realized_pnl_quote_lots
                 .saturating_sub(loss_quote_lots as i64);
@@ -6627,13 +6671,13 @@ pub mod flash_book {
                 counter_isolated,
                 counter_gain,
                 ctx.accounts.counter_position.collateral_quote_lots,
-                ctx.accounts.counter_trader_state.collateral_quote_lots,
+                ctx.accounts.counter_trader_state.load()?.collateral_quote_lots,
             )?;
             ctx.accounts.counter_position.collateral_quote_lots = new_pos_collat;
-            ctx.accounts.counter_trader_state.collateral_quote_lots = new_ts_collat;
+            ctx.accounts.counter_trader_state.load_mut()?.collateral_quote_lots = new_ts_collat;
         }
         {
-            let cts = &mut ctx.accounts.counter_trader_state;
+            let mut cts = ctx.accounts.counter_trader_state.load_mut()?;
             cts.realized_pnl_quote_lots = cts
                 .realized_pnl_quote_lots
                 .saturating_add(counter_gain as i64);
@@ -6671,11 +6715,11 @@ pub mod flash_book {
 
         // open_positions transitions on TraderStates.
         if uw_was_open && uw_post_size == 0 {
-            let uts = &mut ctx.accounts.underwater_trader_state;
+            let mut uts = ctx.accounts.underwater_trader_state.load_mut()?;
             uts.open_positions = uts.open_positions.saturating_sub(1);
         }
         if ct_was_open && ct_post_size == 0 {
-            let cts = &mut ctx.accounts.counter_trader_state;
+            let mut cts = ctx.accounts.counter_trader_state.load_mut()?;
             cts.open_positions = cts.open_positions.saturating_sub(1);
         }
         // Bookkeeping for monitoring.
@@ -6709,7 +6753,7 @@ pub mod flash_book {
     ) -> Result<()> {
         let exec_market = &ctx.accounts.execution_market;
         let exec_position = &ctx.accounts.execution_position;
-        let trader_state = &ctx.accounts.trader_state;
+        let trader_state = ctx.accounts.trader_state.load()?;
 
         require!(
             exec_position.size_lots > 0,
@@ -7811,26 +7855,31 @@ pub mod flash_book {
             FlashBookError::Unauthorized
         );
 
-        let s = &mut ctx.accounts.vault_trader_state;
-        s.trader = ctx.accounts.vault.key();
-        s.bump = ctx.bumps.vault_trader_state;
-        s.collateral_quote_lots = 0;
-        s.realized_pnl_quote_lots = 0;
-        s.open_positions = 0;
-        s.toxicity_score_bps = 0;
-        s.orders_this_batch = 0;
-        s.last_batch_seen = 0;
-        s.fee_discount_bps = 0;
-        s.delegate = Pubkey::default();
-        s.referrer = Pubkey::default();
-        s.builder = Pubkey::default();
-        s.builder_max_fee_share_bps = 0;
-        s.volume_30d_quote_lots = 0;
-        s.volume_window_start_slot = Clock::get()?.slot;
+        let vault_key = ctx.accounts.vault.key();
+        let bump = ctx.bumps.vault_trader_state;
+        let slot = Clock::get()?.slot;
+        {
+            let mut s = ctx.accounts.vault_trader_state.load_init()?;
+            s.trader = vault_key;
+            s.bump = bump;
+            s.collateral_quote_lots = 0;
+            s.realized_pnl_quote_lots = 0;
+            s.open_positions = 0;
+            s.toxicity_score_bps = 0;
+            s.orders_this_batch = 0;
+            s.last_batch_seen = 0;
+            s.fee_discount_bps = 0;
+            s.delegate = Pubkey::default();
+            s.referrer = Pubkey::default();
+            s.builder = Pubkey::default();
+            s.builder_max_fee_share_bps = 0;
+            s.volume_30d_quote_lots = 0;
+            s.volume_window_start_slot = slot;
+        }
 
         emit!(VaultTraderStateOpenedV3Event {
-            vault: ctx.accounts.vault.key(),
-            vault_trader_state: s.key(),
+            vault: vault_key,
+            vault_trader_state: ctx.accounts.vault_trader_state.key(),
         });
         Ok(())
     }
@@ -7860,14 +7909,16 @@ pub mod flash_book {
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
         // Credit vault's TraderState collateral.
-        let ts = &mut ctx.accounts.vault_trader_state;
-        ts.collateral_quote_lots = ts
-            .collateral_quote_lots
-            .checked_add(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let post_deposit_collateral = {
+            let mut ts = ctx.accounts.vault_trader_state.load_mut()?;
+            ts.collateral_quote_lots = ts
+                .collateral_quote_lots
+                .checked_add(amount_quote_lots)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            ts.collateral_quote_lots
+        };
 
         // Share-mint math: NAV-from-collateral (pre-deposit) for accuracy.
-        let post_deposit_collateral = ts.collateral_quote_lots;
         let pre_deposit_nav = post_deposit_collateral.saturating_sub(amount_quote_lots);
 
         let vault = &mut ctx.accounts.vault;
@@ -7937,7 +7988,7 @@ pub mod flash_book {
         require!(total_shares >= shares_to_burn, FlashBookError::OutOfRange);
         require!(total_shares > 0, FlashBookError::OutOfRange);
 
-        let live_nav = ctx.accounts.vault_trader_state.collateral_quote_lots as u128;
+        let live_nav = ctx.accounts.vault_trader_state.load()?.collateral_quote_lots as u128;
         require!(live_nav > 0, FlashBookError::InsufficientCollateral);
 
         let amount_u128 = (shares_to_burn as u128)
@@ -7966,11 +8017,13 @@ pub mod flash_book {
         }
 
         // Debit core TraderState collateral.
-        let ts = &mut ctx.accounts.vault_trader_state;
-        ts.collateral_quote_lots = ts
-            .collateral_quote_lots
-            .checked_sub(amount)
-            .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+        {
+            let mut ts = ctx.accounts.vault_trader_state.load_mut()?;
+            ts.collateral_quote_lots = ts
+                .collateral_quote_lots
+                .checked_sub(amount)
+                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+        }
 
         // SPL release from quote_vault → depositor's ATA, signed by InsuranceFund PDA.
         let bump = ctx.accounts.insurance_fund.bump;
@@ -8161,7 +8214,7 @@ pub mod flash_book {
             return Ok(());
         }
 
-        let nav = ctx.accounts.vault_trader_state.collateral_quote_lots as u128;
+        let nav = ctx.accounts.vault_trader_state.load()?.collateral_quote_lots as u128;
         require!(nav > 0, FlashBookError::InsufficientCollateral);
 
         let nav_per_share_x6 =
@@ -9047,7 +9100,6 @@ pub mod flash_book {
         );
 
         let position = &mut ctx.accounts.position;
-        let trader_state = &mut ctx.accounts.trader_state;
         let pos_haircut = &mut ctx.accounts.position_haircut;
         let market_haircut = &mut ctx.accounts.haircut_state;
 
@@ -9059,6 +9111,7 @@ pub mod flash_book {
                 .checked_sub(gain_quote_lots)
                 .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
         } else {
+            let mut trader_state = ctx.accounts.trader_state.load_mut()?;
             trader_state.collateral_quote_lots = trader_state
                 .collateral_quote_lots
                 .checked_sub(gain_quote_lots)
@@ -9707,10 +9760,10 @@ pub struct ReleaseGainToHaircut<'info> {
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, position.trader.as_ref()],
-        bump = trader_state.bump,
-        constraint = trader_state.trader == position.trader @ FlashBookError::WrongTrader,
+        bump = trader_state.load()?.bump,
+        constraint = trader_state.load()?.trader == position.trader @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         mut,
@@ -10395,7 +10448,7 @@ pub struct OpenTraderState<'info> {
         seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
         bump,
     )]
-    pub trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
     pub system_program: Program<'info, System>,
 }
 
@@ -10415,7 +10468,7 @@ pub struct OpenTraderSubAccount<'info> {
         seeds = [TraderStateAccount::SEED, trader.key().as_ref(), &[sub_index]],
         bump,
     )]
-    pub trader_sub_account: Box<Account<'info, TraderStateAccount>>,
+    pub trader_sub_account: AccountLoader<'info, TraderStateAccount>,
     pub system_program: Program<'info, System>,
 }
 
@@ -10430,17 +10483,17 @@ pub struct TransferBetweenSubAccounts<'info> {
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = main_trader_state.bump,
-        constraint = main_trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        bump = main_trader_state.load()?.bump,
+        constraint = main_trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub main_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub main_trader_state: AccountLoader<'info, TraderStateAccount>,
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, trader.key().as_ref(), &[sub_index]],
-        bump = sub_trader_state.bump,
-        constraint = sub_trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        bump = sub_trader_state.load()?.bump,
+        constraint = sub_trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub sub_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub sub_trader_state: AccountLoader<'info, TraderStateAccount>,
 }
 
 #[derive(Accounts)]
@@ -10452,9 +10505,9 @@ pub struct SetTraderReferrer<'info> {
     /// Phase 2d: relaxed seed — accepts main or sub-account TraderState.
     #[account(
         mut,
-        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 }
 
 #[derive(Accounts)]
@@ -10466,9 +10519,9 @@ pub struct SetTraderDelegate<'info> {
     /// Phase 2d: relaxed seed — accepts main or sub-account TraderState.
     #[account(
         mut,
-        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 }
 
 #[derive(Accounts)]
@@ -10491,7 +10544,7 @@ pub struct SetTraderFeeTier<'info> {
     /// the `authority` Signer is gated by `insurance_fund.authority`
     /// above, so only the protocol authority can call this ix.
     #[account(mut)]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 }
 
 #[derive(Accounts)]
@@ -10509,10 +10562,10 @@ pub struct SetPositionLeverage<'info> {
     pub market: Account<'info, MarketAccount>,
 
     #[account(
-        constraint = trader_state.trader == position.trader @ FlashBookError::WrongTrader,
-        constraint = trader_state.is_authorized(&authority.key()) @ FlashBookError::Unauthorized,
+        constraint = trader_state.load()?.trader == position.trader @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.is_authorized(&authority.key()) @ FlashBookError::Unauthorized,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         mut,
@@ -10535,10 +10588,10 @@ pub struct SweepCollateral<'info> {
     /// gate on each side ensures the signer owns/delegates BOTH
     /// endpoints.
     #[account(mut)]
-    pub from_state: Account<'info, TraderStateAccount>,
+    pub from_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(mut)]
-    pub to_state: Account<'info, TraderStateAccount>,
+    pub to_state: AccountLoader<'info, TraderStateAccount>,
 }
 
 #[derive(Accounts)]
@@ -10560,10 +10613,10 @@ pub struct SettleVaultPerfFee<'info> {
 
     #[account(
         seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
-        bump = vault_trader_state.bump,
+        bump = vault_trader_state.load()?.bump,
         constraint = vault_trader_state.key() == vault.trader_state @ FlashBookError::OutOfRange,
     )]
-    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub vault_trader_state: AccountLoader<'info, TraderStateAccount>,
 
     /// Strategist's vault_position — minted into on settle. Created
     /// lazily on first non-zero settlement.
@@ -10594,9 +10647,9 @@ pub struct SetTraderBuilder<'info> {
     /// Phase 2d: relaxed seed — accepts main or sub-account TraderState.
     #[account(
         mut,
-        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 }
 
 #[derive(Accounts)]
@@ -10814,9 +10867,9 @@ pub struct ViewTraderEffectiveTier<'info> {
 
     #[account(
         seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
+        bump = trader_state.load()?.bump,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         seeds = [state::FeeTiersAccount::SEED],
@@ -10834,13 +10887,13 @@ pub struct DepositCollateral<'info> {
     /// account TraderState PDA. The `.trader == trader.key()`
     /// constraint proves the signer owns the trader_state passed in
     /// (sub PDAs are created with `.trader = parent_wallet.key()`).
-    /// Anchor's `Account<'info, TraderStateAccount>` still enforces
+    /// Anchor's `AccountLoader<'info, TraderStateAccount>` still enforces
     /// program ownership + discriminator match.
     #[account(
         mut,
-        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         seeds = [InsuranceFundAccount::SEED],
@@ -10879,9 +10932,9 @@ pub struct WithdrawCollateral<'info> {
     /// Phase 2d: relaxed seed — see DepositCollateral above.
     #[account(
         mut,
-        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     /// Insurance fund PDA — authority over the vault. The program signs
     /// transfers out using its seeds.
@@ -10917,9 +10970,9 @@ pub struct PartialWithdrawCollateral<'info> {
     /// Phase 2d: relaxed seed — see DepositCollateral above.
     #[account(
         mut,
-        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         seeds = [InsuranceFundAccount::SEED],
@@ -10972,10 +11025,10 @@ pub struct MigratePositionToTraderStateKey<'info> {
 
     #[account(
         seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.bump,
-        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        bump = trader_state.load()?.bump,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     /// LEGACY position at `[POS_SEED, market, wallet]`. Closed by this
     /// ix; rent refunded to `trader`.
@@ -11018,9 +11071,9 @@ pub struct SetPositionMarginMode<'info> {
     /// scoped to whichever TraderState transitioned.
     #[account(
         mut,
-        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         seeds = [MarketAccount::SEED, target_market.base_mint.as_ref(), target_market.quote_mint.as_ref()],
@@ -11065,9 +11118,9 @@ pub struct SettleFunding<'info> {
     /// pair via Phase 2c trader_state.key()-based seeds.
     #[account(
         mut,
-        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         mut,
@@ -11119,10 +11172,10 @@ pub struct ApplyFill<'info> {
     /// but only the main TraderState is reachable via the current
     /// matcher fill-routing logic.
     #[account(mut)]
-    pub taker_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub taker_trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(mut)]
-    pub maker_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub maker_trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         init_if_needed,
@@ -11206,9 +11259,9 @@ pub struct PlaceBasketOrderV2<'info> {
     /// Phase 2d: relaxed seed — accepts main or sub-account TraderState.
     #[account(
         mut,
-        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         seeds = [FlpExposureAccount::SEED],
@@ -11274,9 +11327,9 @@ pub struct PlaceBasketOrderNV2<'info> {
     /// Phase 2d: relaxed seed — accepts main or sub-account TraderState.
     #[account(
         mut,
-        constraint = trader_state.trader == trader.key() @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         seeds = [FlpExposureAccount::SEED],
@@ -11505,7 +11558,7 @@ pub struct CancelIcebergV2<'info> {
 #[derive(Accounts)]
 pub struct ViewPortfolioRisk<'info> {
     /// Phase 2d: view-only ix; relaxed seed accepts any TraderState.
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 }
 
 #[derive(Accounts)]
@@ -11544,7 +11597,7 @@ pub struct ApplyFlpFill<'info> {
 
     /// Phase 2d: dropped strict seed — see ApplyFill above.
     #[account(mut)]
-    pub taker_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub taker_trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         init_if_needed,
@@ -11624,7 +11677,7 @@ pub struct LiquidatePortfolioV2<'info> {
     /// Identity is enforced by the `execution_position` PDA below,
     /// which is keyed on `trader_state.key()` (Phase 2c). The matched
     /// pair is what binds the liquidatee.
-    pub trader_state: Account<'info, TraderStateAccount>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         seeds = [state::PositionAccount::SEED, execution_market.key().as_ref(), trader_state.key().as_ref()],
@@ -11660,7 +11713,7 @@ pub struct LiquidatePositionV2<'info> {
     /// The `position` PDA below binds liquidatee identity via Phase 2c
     /// trader_state.key()-based derivation.
     #[account(mut)]
-    pub trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         init_if_needed,
@@ -11669,7 +11722,7 @@ pub struct LiquidatePositionV2<'info> {
         seeds = [TraderStateAccount::SEED, caller.key().as_ref()],
         bump,
     )]
-    pub caller_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub caller_trader_state: AccountLoader<'info, TraderStateAccount>,
 
     /// MUT — wave 19e fixes a v1 latent bug: v1's LiquidatePosition has
     /// this WITHOUT `mut`, so writes to `unhealthy_since_slot` /
@@ -11708,7 +11761,7 @@ pub struct AutoDeleverage<'info> {
 
     /// Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above.
     #[account(mut)]
-    pub underwater_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub underwater_trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         mut,
@@ -11723,7 +11776,7 @@ pub struct AutoDeleverage<'info> {
 
     /// Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above.
     #[account(mut)]
-    pub counter_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub counter_trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         mut,
@@ -13053,7 +13106,12 @@ fn tier_index_for_volume(pairs: &[(u64, i32, u32)], volume: u64) -> u8 {
 /// window" pattern. `view_trader_effective_tier` mirrors this — for
 /// reads it honors the authority-configured window from FeeTiersAccount
 /// (which can be tighter or wider than the default).
-fn credit_volume_for_tier(state: &mut TraderStateAccount, notional_quote_lots: u64, now_slot: u64) {
+fn credit_volume_for_tier<'info>(
+    state: &mut AccountLoader<'info, TraderStateAccount>,
+    notional_quote_lots: u64,
+    now_slot: u64,
+) -> Result<()> {
+    let mut state = state.load_mut()?;
     let elapsed = now_slot.saturating_sub(state.volume_window_start_slot);
     if state.volume_window_start_slot == 0 || elapsed > constants::DEFAULT_VOLUME_WINDOW_SLOTS {
         state.volume_30d_quote_lots = 0;
@@ -13062,6 +13120,7 @@ fn credit_volume_for_tier(state: &mut TraderStateAccount, notional_quote_lots: u
     state.volume_30d_quote_lots = state
         .volume_30d_quote_lots
         .saturating_add(notional_quote_lots);
+    Ok(())
 }
 
 pub fn order_type_byte_to_matcher(b: u8) -> matcher::order::OrderType {
@@ -13467,16 +13526,17 @@ fn apply_realized_pnl_delta<'info>(
     delta: i128,
     isolated: bool,
     position: &mut Account<'info, state::PositionAccount>,
-    trader_state: &mut Box<Account<'info, TraderStateAccount>>,
+    trader_state: &mut AccountLoader<'info, TraderStateAccount>,
 ) -> Result<()> {
+    let cross_collateral = trader_state.load()?.collateral_quote_lots;
     let (new_iso, new_cross) = compute_realized_pnl_routing(
         delta,
         isolated,
         position.collateral_quote_lots,
-        trader_state.collateral_quote_lots,
+        cross_collateral,
     )?;
     position.collateral_quote_lots = new_iso;
-    trader_state.collateral_quote_lots = new_cross;
+    trader_state.load_mut()?.collateral_quote_lots = new_cross;
     Ok(())
 }
 
@@ -13501,7 +13561,7 @@ fn apply_realized_pnl_delta_v2<'info>(
     delta: i128,
     isolated: bool,
     position: &mut Account<'info, state::PositionAccount>,
-    trader_state: &mut Box<Account<'info, TraderStateAccount>>,
+    trader_state: &mut AccountLoader<'info, TraderStateAccount>,
     position_haircut: Option<&mut Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
     now_slot: u64,
 ) -> Result<()> {
@@ -14396,7 +14456,7 @@ pub struct VaultOpenTraderStateV3<'info> {
         seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
         bump,
     )]
-    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub vault_trader_state: AccountLoader<'info, TraderStateAccount>,
 
     pub system_program: Program<'info, System>,
 }
@@ -14438,9 +14498,9 @@ pub struct VaultDepositV3<'info> {
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
-        bump = vault_trader_state.bump,
+        bump = vault_trader_state.load()?.bump,
     )]
-    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub vault_trader_state: AccountLoader<'info, TraderStateAccount>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -14488,9 +14548,9 @@ pub struct VaultWithdrawV3<'info> {
     #[account(
         mut,
         seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
-        bump = vault_trader_state.bump,
+        bump = vault_trader_state.load()?.bump,
     )]
-    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub vault_trader_state: AccountLoader<'info, TraderStateAccount>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -14575,9 +14635,9 @@ pub struct SettleVaultPerfFeeV3<'info> {
     /// Vault's TraderState — read-only; NAV source.
     #[account(
         seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
-        bump = vault_trader_state.bump,
+        bump = vault_trader_state.load()?.bump,
     )]
-    pub vault_trader_state: Box<Account<'info, TraderStateAccount>>,
+    pub vault_trader_state: AccountLoader<'info, TraderStateAccount>,
 
     pub system_program: Program<'info, System>,
 }
