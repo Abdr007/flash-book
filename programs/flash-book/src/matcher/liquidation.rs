@@ -127,10 +127,19 @@ pub fn compute_shortfall(
     liq_penalty_bps: u32,
 ) -> Result<ShortfallResult> {
     let sign: i128 = if pos.side == Side::Long { 1 } else { -1 };
-    let pnl = sign
-        * (pos.size_lots as i128)
-        * ((fill_price.0 as i128) - (pos.entry_price.0 as i128))
-        * (market_snapshot.tick_size as i128);
+    // RISK-H3: checked, matching the `penalty` path below. The old raw `*`
+    // chain could panic (debug) / wrap (release) on a numerically extreme
+    // position, producing a garbage shortfall → wrong insurance draw.
+    let price_diff = (fill_price.0 as i128)
+        .checked_sub(pos.entry_price.0 as i128)
+        .or_underflow()?;
+    let pnl = (pos.size_lots as i128)
+        .checked_mul(price_diff)
+        .or_overflow()?
+        .checked_mul(market_snapshot.tick_size as i128)
+        .or_overflow()?
+        .checked_mul(sign)
+        .or_overflow()?;
     let penalty = (pos.size_lots as i128)
         .checked_mul(fill_price.0 as i128)
         .or_overflow()?

@@ -16,7 +16,6 @@ pub mod order;
 pub mod cancel_on_disconnect;
 pub mod concentration;
 pub mod conditional_cancel;
-pub mod cross_margin_weights;
 pub mod daily_loss_limit;
 pub mod jit_lp_defense;
 pub mod min_fill_size;

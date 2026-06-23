@@ -184,14 +184,43 @@ impl std::fmt::Display for RestingOrderV2 {
 }
 impl Get for RestingOrderV2 {}
 
+/// Bit layout of the side-encoded `order_id`: high `ORDER_ID_PRICE_BITS`
+/// bits hold the price (in ticks), low `ORDER_ID_SEQ_BITS` bits hold the
+/// FIFO sequence. 40 + 24 = 64.
+pub const ORDER_ID_PRICE_BITS: u32 = 40;
+pub const ORDER_ID_SEQ_BITS: u32 = 24;
+/// Largest price (ticks) and largest seq that fit the `order_id` layout.
+/// Callers must keep `price_ticks <= MAX_PRICE_TICKS_ENCODABLE` and enforce
+/// the per-market `seq <= MAX_SEQ_ENCODABLE` ceiling at placement (fail-loud)
+/// so two live orders can never collide on `order_id`.
+pub const MAX_PRICE_TICKS_ENCODABLE: u64 = (1u64 << ORDER_ID_PRICE_BITS) - 1;
+pub const MAX_SEQ_ENCODABLE: u64 = (1u64 << ORDER_ID_SEQ_BITS) - 1;
+
 /// Compose the side-encoded `order_id` from (price_ticks, seq, side).
-/// Bids invert so a single-direction sort works for both books.
+///
+/// For BIDS we invert ONLY the price field — not the whole word — so a
+/// single ascending `order_id` walk yields correct price-TIME priority on
+/// both books:
+///   * higher price => better => smaller key   (price inverted for bids)
+///   * older seq     => better => smaller key   (seq ascending for BOTH sides)
+///
+/// The previous implementation inverted the entire word for bids, which
+/// also inverted the seq tiebreak and made bids fill **LIFO** at each price
+/// level (a price-time-priority violation). Asks were unaffected.
+///
+/// Price is **saturated** to `MAX_PRICE_TICKS_ENCODABLE` (clamp keeps the
+/// ordering monotonic; the old code masked, which would wrap an out-of-range
+/// price to a tiny key and mis-order the book). Seq is masked to 24 bits;
+/// placement enforces the 24-bit ceiling so masking can never alias a live id.
 pub fn encode_order_id(price_ticks: u64, seq: u64, side_is_bid: bool) -> u64 {
-    // Layout: high 48 bits = price (capped), low 16 bits = seq mod 2^16
-    let price = price_ticks & ((1u64 << 48) - 1);
-    let seq_low = seq & ((1u64 << 16) - 1);
-    let raw = (price << 16) | seq_low;
-    if side_is_bid { !raw } else { raw }
+    let price = price_ticks.min(MAX_PRICE_TICKS_ENCODABLE);
+    let seq_low = seq & MAX_SEQ_ENCODABLE;
+    let price_key = if side_is_bid {
+        (!price) & MAX_PRICE_TICKS_ENCODABLE
+    } else {
+        price
+    };
+    (price_key << ORDER_ID_SEQ_BITS) | seq_low
 }
 
 /// Build a probe `RestingOrderV2` whose only meaningful field is `order_id`,
@@ -511,14 +540,20 @@ impl<'a> MarketBookHandle<'a> {
     /// RBT. Returns the new size_lots. Used by the matcher to apply partial
     /// fills without removing the order from the book.
     ///
-    /// Saturating sub: a delta larger than current size lands at zero (caller
-    /// should then remove the node).
-    pub fn decrement_size_at(&mut self, idx: DataIndex, delta: u64) -> u64 {
+    /// MATCH-H3: **checked** sub. A `delta` larger than the resting size is an
+    /// over-fill accounting bug (base/quote would stop conserving) — it is now
+    /// rejected instead of being silently saturated to zero, which masked the
+    /// bug while the taker still recorded the full fill. Returns the new size.
+    pub fn decrement_size_at(&mut self, idx: DataIndex, delta: u64) -> Result<u64> {
         let node: &mut RBNode<RestingOrderV2> =
             get_mut_helper::<RBNode<RestingOrderV2>>(self.data, idx);
-        let new_size = node.get_value().size_lots.saturating_sub(delta);
+        let new_size = node
+            .get_value()
+            .size_lots
+            .checked_sub(delta)
+            .ok_or_else(|| error!(crate::errors::FlashBookError::ArithmeticOverflow))?;
         node.get_mut_value().size_lots = new_size;
-        new_size
+        Ok(new_size)
     }
 
     /// Read-only access to the `RestingOrderV2` at `idx`. Caller must
@@ -650,17 +685,24 @@ impl<'a> MarketBookHandle<'a> {
     }
 }
 
-/// 80-byte payload for the FreeList — pure padding. Manifest's pattern.
+/// 92-byte payload for the FreeList — pure padding. Sized so that
+/// `FreeListNode<FreeListPadding>` (next_index 4B + payload 92B) is exactly
+/// `NODE_TOTAL_BYTES` (96), which means `FreeList::add` scrubs the **entire**
+/// freed slab slot rather than the first 84 bytes — closing HYP-C2/H-2 (a
+/// freed slot used to retain 12 stale RBNode bytes: stale parent/color/high
+/// value bytes that were a latent dangling-index footgun under refactor /
+/// formal verification). Manifest's pattern, full-slot variant.
 #[zero_copy]
 pub struct FreeListPadding {
     pub _padding_a: [u8; 32],
     pub _padding_b: [u8; 32],
-    pub _padding_c: [u8; 16],
+    pub _padding_c: [u8; 28],
 }
 impl Get for FreeListPadding {}
 
-const _: () = assert!(std::mem::size_of::<FreeListPadding>() == 80);
-const _: () = assert!(std::mem::size_of::<FreeListNode<FreeListPadding>>() == 84);
+const _: () = assert!(std::mem::size_of::<FreeListPadding>() == 92);
+// Must equal NODE_TOTAL_BYTES so a freed slot is fully zeroed by `add`.
+const _: () = assert!(std::mem::size_of::<FreeListNode<FreeListPadding>>() == NODE_TOTAL_BYTES);
 
 /// FreeList sentinel — Manifest uses `u32::MAX` to mean "no more free
 /// nodes". When `FreeList::remove()` returns this, the bump-alloc
@@ -931,18 +973,63 @@ mod tests {
     }
 
     #[test]
+    fn same_price_bids_fill_fifo_not_lifo() {
+        // Regression for the bid LIFO bug: at one price level the OLDER
+        // order (smaller seq) must be the best / fill first. The old
+        // encode_order_id inverted the whole word, flipping the seq
+        // tiebreak so the NEWEST bid filled first.
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        let _older = handle.insert_bid(make_order(100, 1, true)).unwrap();
+        let _newer = handle.insert_bid(make_order(100, 2, true)).unwrap();
+        let best = handle.header.bids_best_index;
+        assert_ne!(best, NIL);
+        assert_eq!(
+            handle.order_at(best).seq,
+            1,
+            "older bid (seq=1) must fill first at the same price (FIFO)"
+        );
+    }
+
+    #[test]
+    fn same_price_asks_fill_fifo() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        let _o1 = handle.insert_ask(make_order(100, 1, false)).unwrap();
+        let _o2 = handle.insert_ask(make_order(100, 2, false)).unwrap();
+        let best = handle.header.asks_best_index;
+        assert_ne!(best, NIL);
+        assert_eq!(
+            handle.order_at(best).seq,
+            1,
+            "older ask (seq=1) must fill first at the same price (FIFO)"
+        );
+    }
+
+    #[test]
+    fn bid_price_priority_preserved_after_fifo_fix() {
+        // Higher-priced bid still beats lower-priced regardless of seq.
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        handle.insert_bid(make_order(100, 1, true)).unwrap(); // older, cheaper
+        handle.insert_bid(make_order(101, 2, true)).unwrap(); // newer, pricier
+        let best = handle.header.bids_best_index;
+        assert_eq!(handle.order_at(best).price_ticks, 101, "highest bid is best");
+    }
+
+    #[test]
     fn decrement_size_at_partial_fill() {
         let mut data = make_book();
         let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
         let idx = handle.insert_bid(make_order(100, 1, true)).unwrap();
         assert_eq!(handle.order_at(idx).size_lots, 100);
-        let new_size = handle.decrement_size_at(idx, 30);
+        let new_size = handle.decrement_size_at(idx, 30).unwrap();
         assert_eq!(new_size, 70);
         assert_eq!(handle.order_at(idx).size_lots, 70);
-        // Saturating sub: delta > size lands at zero.
-        let zeroed = handle.decrement_size_at(idx, 999);
-        assert_eq!(zeroed, 0);
-        assert_eq!(handle.order_at(idx).size_lots, 0);
+        // MATCH-H3: over-decrement (delta > size) is now REJECTED, not
+        // silently saturated to zero. The size is left unchanged.
+        assert!(handle.decrement_size_at(idx, 999).is_err());
+        assert_eq!(handle.order_at(idx).size_lots, 70);
     }
 
     #[test]
