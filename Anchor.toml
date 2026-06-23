@@ -13,7 +13,7 @@ cluster = "devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "bun test programs/flash-book/tests"
+test = "cargo test -p flash-book"
 
 [workspace]
 members = [

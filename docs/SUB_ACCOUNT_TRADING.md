@@ -182,8 +182,8 @@ Sub-account positions are new and don't need migration.
 ### 3.3 Off-chain reads
 
 Every indexer / UI / keeper that derives a Position PDA needs to
-update its derivation. The PDA helper in `sdk-ts/src/pdas.ts`
-(`positionPda`) gets a new signature:
+update its derivation. The Position PDA derivation
+(`[POS_SEED, market, trader_state]`) is:
 
 ```ts
 export function positionPda(

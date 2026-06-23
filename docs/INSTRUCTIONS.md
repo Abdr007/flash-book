@@ -296,5 +296,4 @@ Emits: `MarketAuthorityTransferredEvent`.
 | 1600–1699 | commit-reveal | CommitMismatch, CommitExpired |
 | 1700–1799 | delegation (ER) | NotDelegated, DelegationExpired |
 
-The full enum is in `programs/flash-book/src/errors.rs` and mirrored in
-`sdk-ts/src/errors.ts` (`FlashBookErrorCode`).
+The full enum is in `programs/flash-book/src/errors.rs`.

@@ -2034,7 +2034,7 @@
             "account TraderState PDA. The `.trader == trader.key()`",
             "constraint proves the signer owns the trader_state passed in",
             "(sub PDAs are created with `.trader = parent_wallet.key()`).",
-            "Anchor's `Account<'info, TraderStateAccount>` still enforces",
+            "Anchor's `AccountLoader<'info, TraderStateAccount>` still enforces",
             "program ownership + discriminator match."
           ],
           "writable": true
@@ -18467,6 +18467,10 @@
         "position-list pointers (Position PDAs are separate accounts; this is",
         "a lightweight index)."
       ],
+      "serialization": "bytemuck",
+      "repr": {
+        "kind": "c"
+      },
       "type": {
         "kind": "struct",
         "fields": [
@@ -18475,8 +18479,30 @@
             "type": "pubkey"
           },
           {
-            "name": "bump",
-            "type": "u8"
+            "name": "delegate",
+            "docs": [
+              "Delegate authority. When non-default, the delegate may sign",
+              "trader-bound instructions on the trader's behalf (subaccount /",
+              "portfolio-margin patterns). Cleared via Pubkey::default(). The",
+              "trader ALWAYS retains authority — delegate is additive."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "referrer",
+            "docs": [
+              "Referrer pubkey (Hyperliquid affiliate model). Set once via",
+              "`set_trader_referrer` — immutable after first set."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "builder",
+            "docs": [
+              "Approved builder pubkey (Hyperliquid builder-codes). Set/rotated via",
+              "`set_trader_builder`; the trader's CAP keeps builders bounded."
+            ],
+            "type": "pubkey"
           },
           {
             "name": "collateral_quote_lots",
@@ -18487,11 +18513,23 @@
             "type": "i64"
           },
           {
-            "name": "open_positions",
+            "name": "last_batch_seen",
+            "type": "u64"
+          },
+          {
+            "name": "volume_30d_quote_lots",
             "docs": [
-              "Number of open positions (each in its own Position PDA)."
+              "Wave 22: rolling notional in the current volume window (quote lots,",
+              "maker + taker). Reset on window expiry; drives `resolve_fee_tier`."
             ],
-            "type": "u8"
+            "type": "u64"
+          },
+          {
+            "name": "volume_window_start_slot",
+            "docs": [
+              "Wave 22: slot the current volume window opened."
+            ],
+            "type": "u64"
           },
           {
             "name": "toxicity_score_bps",
@@ -18508,108 +18546,48 @@
             "type": "u32"
           },
           {
-            "name": "last_batch_seen",
-            "type": "u64"
-          },
-          {
             "name": "fee_discount_bps",
             "docs": [
-              "Fee tier discount in bps off the base taker fee. 0 = standard",
-              "fees; e.g. 1000 = 10% discount. Set by `set_trader_fee_tier`",
-              "(authority-only) based on off-chain 30-day rolling volume —",
-              "universal pattern at every CEX (Binance, OKX, Bybit, Hyperliquid)."
+              "Fee tier discount in bps off the base taker fee (set by",
+              "`set_trader_fee_tier`, authority-only)."
             ],
             "type": "u32"
-          },
-          {
-            "name": "delegate",
-            "docs": [
-              "Delegate authority. When non-default, the delegate may sign",
-              "trader-bound instructions (place_limit_order, cancel_order,",
-              "settle_funding, etc.) on the trader's behalf. Foundation for",
-              "subaccount / portfolio-margin patterns:",
-              "• Master keypair holds funds, delegates trading authority to a",
-              "hot key (Hyperliquid / dYdX standard).",
-              "• Multi-sig \"subaccount manager\" can act on behalf of the",
-              "trader without holding their funds.",
-              "Cleared by setting back to Pubkey::default(). The trader pubkey",
-              "itself ALWAYS retains authority — delegate is additive, not",
-              "exclusive (the trader can revoke at any time)."
-            ],
-            "type": "pubkey"
-          },
-          {
-            "name": "referrer",
-            "docs": [
-              "Referrer pubkey. When non-default, on every fill where this trader",
-              "is the taker, `market.params.referrer_share_bps` of the protocol's",
-              "net fee revenue is credited to the referrer's TraderState",
-              "collateral. Hyperliquid affiliate model. Pubkey::default() = no",
-              "referrer (default for all new trader_state). Set once via",
-              "`set_trader_referrer` — immutable after first set (anti-rotation",
-              "griefing)."
-            ],
-            "type": "pubkey"
-          },
-          {
-            "name": "builder",
-            "docs": [
-              "Approved builder pubkey. When non-default, on every fill where this",
-              "trader is the taker, `min(market.params.builder_share_bps,",
-              "builder_max_fee_share_bps)` of the protocol's net fee revenue is",
-              "credited to the builder via `BuilderFeeOwedEvent` (off-chain",
-              "pull-based). Hyperliquid builder-codes model: a third-party UI/",
-              "wallet/aggregator that routes flow earns a share of the fee from",
-              "the user's trades. Set/rotated/revoked freely via",
-              "`set_trader_builder`; the trader's CAP on the share keeps builders",
-              "from extracting more than the user agreed to."
-            ],
-            "type": "pubkey"
           },
           {
             "name": "builder_max_fee_share_bps",
             "docs": [
-              "Maximum fee share (in bps of net fee) the trader has authorized",
-              "the builder to take. The on-chain emit clamps the protocol-side",
-              "builder_share_bps by this. 0 = builder set but no share approved",
-              "(functionally the same as no builder). Allows the trader to set a",
-              "conservative cap below whatever the protocol rate is."
+              "Max fee share (bps of net fee) the trader authorized the builder",
+              "to take; the on-chain emit clamps builder_share_bps by this."
             ],
             "type": "u32"
           },
           {
-            "name": "volume_30d_quote_lots",
-            "docs": [
-              "Wave 22: rolling notional traded in the current volume window",
-              "(quote lots, summed across maker + taker fills). Reset when the",
-              "window expires. Used by `resolve_fee_tier` to pick the trader's",
-              "effective maker / taker bps from `FeeTiersAccount`."
-            ],
-            "type": "u64"
+            "name": "bump",
+            "type": "u8"
           },
           {
-            "name": "volume_window_start_slot",
+            "name": "open_positions",
             "docs": [
-              "Wave 22: slot at which the current volume window opened. When",
-              "`Clock::slot - this > FeeTiersAccount.volume_window_slots`, the",
-              "next apply_fill resets `volume_30d_quote_lots` and re-anchors",
-              "this. HL pattern (14-day rolling tier window)."
+              "Number of open positions (each in its own Position PDA)."
             ],
-            "type": "u64"
+            "type": "u8"
           },
           {
             "name": "sub_index",
             "docs": [
-              "Phase 2f — TraderState sub-account index. `0` = main; `1..=255`",
-              "= sub. Written at `open_trader_state` (= 0) and",
-              "`open_trader_sub_account` (= the sub_index). The liquidation",
-              "synthetic-close path reads this to set the",
-              "RestingOrderV2.sub_index of the close order, so when the",
-              "underwater's position closes via ApplyFill the fill routes back",
-              "to the same TraderState that's being liquidated. Layout-",
-              "compatible (trailing zeros in allocated `space()` = 0 = main)."
+              "Phase 2f — sub-account index. `0` = main; `1..=255` = sub. Set at",
+              "`open_trader_state` (0) / `open_trader_sub_account` (sub_index)."
             ],
             "type": "u8"
+          },
+          {
+            "name": "_pad",
+            "type": {
+              "array": [
+                "u8",
+                5
+              ]
+            }
           }
         ]
       }

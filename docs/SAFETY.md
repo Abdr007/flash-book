@@ -148,10 +148,8 @@ Honest about open problems and what's outside the protocol's scope:
    genuine fat-tail shocks, ADL is the backstop, and beyond ADL, socialized
    loss to LPs is the residual exposure.
 
-4. **Smart-contract-level bugs in the deployed program.** This repository
-   is a TypeScript reference simulator. The production Rust program will
-   require independent audit before mainnet deployment. The reference
-   matcher is a behavioural specification for the audited program.
+4. **Smart-contract-level bugs in the deployed program.** The on-chain
+   Rust program requires an independent audit before mainnet deployment.
 
 ## Audit checklist (for the eventual production deployment)
 

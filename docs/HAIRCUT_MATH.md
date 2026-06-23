@@ -263,7 +263,7 @@ each property over 2000 random cases.
 - Percolator `spec.md` v12.20.6 §3 — `aeyakovenko/percolator/blob/master/spec.md`.
 - Percolator `percolator.rs::convert_released_pnl_not_atomic` — reference implementation.
 - Tarun Chitra, *Autodeleveraging: Impossibilities and Optimization*, arXiv:2512.01112 — motivation for the junior-claim design (Hyperliquid Oct 10 2025 ADL overshoot).
-- flash-book `docs/COMPARISON.md` TL;DR — the "realized PnL doesn't materialise to collateral on close" bug this primitive structurally resolves.
+- The "realized PnL doesn't materialise to collateral on close" failure mode this primitive structurally resolves (see `docs/MARGIN_MATH.md`).
 
 ## 12. Wire-in plan (Wave 24b)
 
