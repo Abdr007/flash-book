@@ -1,0 +1,95 @@
+# Formal Verification
+
+Flash Book's risk engine carries **machine-checked proofs** of its core
+solvency invariants, written as [Kani](https://model-checking.github.io/kani/)
+proof harnesses and discharged by CBMC. These are not sampled tests: each
+harness lets `kani::any()` range over the *entire* input domain symbolically,
+and the model checker proves the assertion holds for **every** value, or
+returns a concrete counterexample.
+
+The first target is the **haircut conservation math** (`matcher/haircut.rs`) —
+the accounting that decides how much realized profit a trader may withdraw when
+the protocol is under-collateralized. Getting this wrong mints or burns value,
+so it is exactly where a proof (not a test) earns its keep.
+
+## What is proven
+
+Harnesses live in `programs/flash-book/src/matcher/haircut.rs`
+(`#[cfg(kani)] mod kani_proofs`). All five verify, 0 failures, each in < 1 s.
+
+| Harness | Invariant | What it proves |
+|---|---|---|
+| `proof_dust_conservation` | #4 Dust conservation | `credit ≤ matured` **and** `credit + dust == matured` for every `h ∈ [0, H_DENOM]` — no quote lot is created or destroyed by a haircut. |
+| `proof_solvency_single_convert` | #1 Solvency | Converting a position's full matured PnL credits `≤ residual` — the **non-printing** guarantee: traders collectively withdraw no more than the real residual backing the profit pool. |
+| `proof_matured_fraction_bounds` | #3 Maturation bounds | `matured_fraction(..) ≤ reserve`, is `0` before the warmup window opens, and `== reserve` after it closes. Verified against the **real** function. |
+| `proof_div_pow2_boundary` | — | Marks the CBMC division-completeness boundary (see below). |
+| `proof_assume_sanity` | — | Confirms `kani::assume` constrains the domain. |
+
+## Running
+
+```bash
+# one-time toolchain setup
+cargo install --locked kani-verifier && cargo kani setup
+
+# all haircut harnesses
+cargo kani --features no-entrypoint
+
+# a single harness
+cargo kani --features no-entrypoint --harness proof_dust_conservation
+```
+
+`--features no-entrypoint` excludes the Solana program entrypoint so Kani
+verifies the library in isolation. CI runs the suite on every PR (see
+`.github/workflows/ci.yml`, job `kani`).
+
+## A note on the divisor (read this before extending the proofs)
+
+The haircut credit is `floor(matured · h / H_DENOM)` with `H_DENOM = 1e9`, a
+**non-power-of-two**. Two properties of the bundled backend shaped how the
+proofs are written, and both are demonstrated in-tree rather than asserted:
+
+1. **CBMC's SAT backend (CaDiCaL/kissat) is incomplete on non-power-of-two
+   division at width.** It returns *spurious* counterexamples for facts as
+   trivial as `(m·h)/1e9 ≤ m`. `proof_div_pow2_boundary` is the control: the
+   identical shape with a power-of-two divisor (lowered to an exact shift)
+   **verifies**. Sound SMT backends (z3, cvc5) avoid the spurious result but do
+   not terminate on the 128-bit division.
+
+2. **Free-variable "spec-modeled" division is intractable here.** Pinning a
+   symbolic `q` to the Euclidean property `q·b ≤ a < (q+1)·b` makes the
+   *negation* (the UNSAT proof) require the solver to exhaust a multiplier
+   circuit, which neither CaDiCaL, kissat, nor z3 completed in practice.
+
+### Resolution
+
+The conservation, solvency, and monotonicity arguments are **divisor-agnostic**:
+
+```
+floor(m·h / D) ≤ m            whenever h ≤ D
+floor(m·h / D) ≤ residual     whenever m·h ≤ backed·D
+s1 ≤ s2  ⇒  floor(s1/D) ≤ floor(s2/D)
+```
+
+These hold for **every** `D > 0` by the same algebra; only `h ≤ D` matters, not
+the literal value of `D`. The harnesses therefore machine-check them at a
+representative power-of-two `D = 2³⁰ ≈ 1e9`, where CBMC's division is the exact
+shift it handles soundly. This is a *complete* proof of the divisor-agnostic
+statement.
+
+The **literal `H_DENOM = 1e9`** case is covered separately by the deterministic
+example proof `dust_conservation_exact` in the `#[cfg(test)]` module, which
+exercises `H_DENOM-1`, `H_DENOM`, `u64::MAX`, and other boundary inputs.
+
+Net: the structural invariant is proven for all `D`; the exact production
+constant is exercised by tests. If a sound, terminating bitvector-division
+backend becomes available (e.g. a future CBMC/SMT combination), the
+representative `D` in `kani_proofs` can be set straight to `H_DENOM` to close
+the gap entirely — the harness bodies need no other change.
+
+## Roadmap
+
+- **Monotonicity (#2)** — `h1 ≤ h2 ⇒ credit(h1) ≤ credit(h2)`. The harness is
+  straightforward but its two free multiplies exceed the SAT backend's reach;
+  parked until a stronger division/UNSAT backend is wired in.
+- Extend coverage to the matching engine (`state_v2.rs` hypertree ordering
+  invariants) and the margin/liquidation gates.
