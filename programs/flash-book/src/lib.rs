@@ -3055,12 +3055,14 @@ pub mod flash_book {
             taker_sub_index,
             ctx.accounts.taker_trader_state.trader,
             ctx.accounts.taker_trader_state.key(),
+            ctx.accounts.taker_trader_state.bump,
             ctx.program_id,
         )?;
         verify_trader_state_pda(
             maker_sub_index,
             ctx.accounts.maker_trader_state.trader,
             ctx.accounts.maker_trader_state.key(),
+            ctx.accounts.maker_trader_state.bump,
             ctx.program_id,
         )?;
 
@@ -5617,6 +5619,7 @@ pub mod flash_book {
             taker_sub_index,
             ctx.accounts.taker_trader_state.trader,
             ctx.accounts.taker_trader_state.key(),
+            ctx.accounts.taker_trader_state.bump,
             ctx.program_id,
         )?;
 
@@ -13605,25 +13608,32 @@ fn compute_realized_pnl_routing(
 ///
 ///   sub_index == 0 → `[TraderStateAccount::SEED, trader.as_ref()]`        (main)
 ///   sub_index >  0 → `[TraderStateAccount::SEED, trader.as_ref(), &[sub_index]]` (sub)
+///
+/// CU: uses the account's stored canonical `bump` + `create_program_address`
+/// (one hash) instead of `find_program_address` (a descending bump search,
+/// ~1.5k CU). Same security: `open_trader_state` / `open_trader_sub_account`
+/// store the canonical bump at init via Anchor's `init`+`bump`, and a
+/// non-canonical-bump TraderState cannot be program-initialized — so the
+/// stored bump IS the canonical one. This mirrors `verify_position_pda`.
 fn verify_trader_state_pda(
     sub_index: u8,
     trader: Pubkey,
     actual: Pubkey,
+    bump: u8,
     program_id: &Pubkey,
 ) -> Result<()> {
     let expected = if sub_index == 0 {
-        Pubkey::find_program_address(
-            &[TraderStateAccount::SEED, trader.as_ref()],
+        Pubkey::create_program_address(
+            &[TraderStateAccount::SEED, trader.as_ref(), &[bump]],
             program_id,
         )
-        .0
     } else {
-        Pubkey::find_program_address(
-            &[TraderStateAccount::SEED, trader.as_ref(), &[sub_index]],
+        Pubkey::create_program_address(
+            &[TraderStateAccount::SEED, trader.as_ref(), &[sub_index], &[bump]],
             program_id,
         )
-        .0
-    };
+    }
+    .map_err(|_| error!(FlashBookError::WrongTrader))?;
     require_keys_eq!(expected, actual, FlashBookError::WrongTrader);
     Ok(())
 }
