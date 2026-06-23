@@ -34,8 +34,8 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
     instruction::{AccountMeta, Instruction},
-    program::invoke_signed,
-    pubkey,
+    program::{invoke, invoke_signed},
+    pubkey, system_instruction,
 };
 
 /// MagicBlock Delegation Program ID. Mainnet + devnet share this address.
@@ -213,6 +213,192 @@ pub fn cpi_undelegate(
     Ok(())
 }
 
+// ─── MagicBlock Magic program (ER-side commit) + undelegation callback ───
+//
+// The pieces below complete the settlement loop the bare Delegate/Undelegate
+// CPIs above cannot do on their own (audit finding ER-2 / C-2):
+//
+//   * `cpi_commit` — an ON-THE-ER Magic Action (CPI to the Magic program) that
+//     either snapshots delegated state back to L1 (`ScheduleCommit`) or
+//     snapshots + queues undelegation (`ScheduleCommitAndUndelegate`).
+//   * `process_external_undelegate` — the BASE-LAYER callback the delegation
+//     program invokes (prefixed with EXTERNAL_UNDELEGATE_DISCRIMINATOR) to
+//     re-open the PDA under this program and copy the committed buffer back.
+//
+// Wire format hand-rolled (we can't depend on `ephemeral-rollups-sdk`, see the
+// module header) but byte-verified against the SDK source + its bincode tests:
+//   ScheduleCommit               -> u32 LE enum tag [1,0,0,0]
+//   ScheduleCommitAndUndelegate  -> u32 LE enum tag [2,0,0,0]
+
+/// MagicBlock Magic (validator) program — runs ON the ER. `declare_id!` in
+/// `magicblock-magic-program-api`.
+pub const MAGIC_PROGRAM_ID: Pubkey = pubkey!("Magic11111111111111111111111111111111111111");
+/// MagicBlock Magic context account (writable; collects scheduled commits).
+pub const MAGIC_CONTEXT_ID: Pubkey = pubkey!("MagicContext1111111111111111111111111111111");
+/// 8-byte prefix the delegation program uses when it CPIs BACK into this
+/// program to finalize an undelegation. Dispatched in the program `fallback`.
+pub const EXTERNAL_UNDELEGATE_DISCRIMINATOR: [u8; 8] = [196, 28, 41, 206, 48, 37, 51, 167];
+
+/// `MagicBlockInstruction::ScheduleCommit` (bincode u32 LE enum tag).
+const SCHEDULE_COMMIT: [u8; 4] = [1, 0, 0, 0];
+/// `MagicBlockInstruction::ScheduleCommitAndUndelegate`.
+const SCHEDULE_COMMIT_AND_UNDELEGATE: [u8; 4] = [2, 0, 0, 0];
+
+/// ON-THE-ER Magic Action: schedule a commit of `committed` accounts back to
+/// the base layer. If `allow_undelegation`, also queues undelegation (after
+/// which the delegation program will CPI `process_external_undelegate` on base).
+///
+/// Account order MUST be `[payer(signer,w), magic_context(w), ...committed]`
+/// — the Magic program appends committed accounts after the context. Plain
+/// `invoke` (the payer signs; no PDA seeds required for the commit itself).
+pub fn cpi_commit<'info>(
+    payer: &AccountInfo<'info>,
+    magic_context: &AccountInfo<'info>,
+    magic_program: &AccountInfo<'info>,
+    committed: &[AccountInfo<'info>],
+    allow_undelegation: bool,
+) -> Result<()> {
+    require_keys_eq!(
+        *magic_program.key,
+        MAGIC_PROGRAM_ID,
+        crate::FlashBookError::Unauthorized
+    );
+    require_keys_eq!(
+        *magic_context.key,
+        MAGIC_CONTEXT_ID,
+        crate::FlashBookError::Unauthorized
+    );
+
+    let data: &[u8] = if allow_undelegation {
+        &SCHEDULE_COMMIT_AND_UNDELEGATE
+    } else {
+        &SCHEDULE_COMMIT
+    };
+
+    let mut metas = Vec::with_capacity(2 + committed.len());
+    metas.push(AccountMeta::new(*payer.key, true));
+    metas.push(AccountMeta::new(*magic_context.key, false)); // writable, not signer
+    for a in committed {
+        metas.push(AccountMeta {
+            pubkey: *a.key,
+            is_signer: a.is_signer,
+            is_writable: a.is_writable,
+        });
+    }
+
+    let ix = Instruction {
+        program_id: MAGIC_PROGRAM_ID,
+        accounts: metas,
+        data: data.to_vec(),
+    };
+
+    let mut infos = Vec::with_capacity(3 + committed.len());
+    infos.push(payer.clone());
+    infos.push(magic_context.clone());
+    infos.extend(committed.iter().cloned());
+    infos.push(magic_program.clone());
+
+    invoke(&ix, &infos)?;
+    Ok(())
+}
+
+/// Re-create / re-own a PDA under `owner` with `space` bytes, signed by its
+/// seeds. Mirrors the SDK `create_pda`: fresh account -> `create_account`;
+/// pre-existing (lamport-carrying) account -> top up rent + `allocate` +
+/// `assign`. 2.1-clean (no SDK dependency).
+fn create_pda<'info>(
+    payer: &AccountInfo<'info>,
+    pda: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    owner: &Pubkey,
+    space: usize,
+    signer_seeds: &[&[&[u8]]],
+) -> Result<()> {
+    let rent = Rent::get()?;
+    let required = rent.minimum_balance(space);
+    let current = pda.lamports();
+
+    if current == 0 {
+        let ix =
+            system_instruction::create_account(payer.key, pda.key, required, space as u64, owner);
+        invoke_signed(
+            &ix,
+            &[payer.clone(), pda.clone(), system_program.clone()],
+            signer_seeds,
+        )?;
+    } else {
+        if current < required {
+            let ix = system_instruction::transfer(payer.key, pda.key, required - current);
+            invoke(&ix, &[payer.clone(), pda.clone(), system_program.clone()])?;
+        }
+        let alloc = system_instruction::allocate(pda.key, space as u64);
+        invoke_signed(&alloc, &[pda.clone(), system_program.clone()], signer_seeds)?;
+        let assign = system_instruction::assign(pda.key, owner);
+        invoke_signed(&assign, &[pda.clone(), system_program.clone()], signer_seeds)?;
+    }
+    Ok(())
+}
+
+/// BASE-LAYER callback the delegation program invokes (after the ER processed
+/// `commit_and_undelegate`) to finalize undelegation.
+///
+/// IMPORTANT: `EXTERNAL_UNDELEGATE_DISCRIMINATOR` is **exactly**
+/// `sha256("global:process_undelegation")[..8]` — i.e. the delegation program
+/// calls back via the *normal Anchor instruction* `process_undelegation`, not a
+/// raw/non-Anchor discriminator. So the wiring is an ordinary `#[program]` ix
+/// (see `process_undelegation` in `lib.rs`), and Anchor deserializes the
+/// `account_seeds: Vec<Vec<u8>>` arg for us — no entrypoint fallback needed.
+///
+/// This mirrors `ephemeral_rollups_sdk::cpi::undelegate_account`. Accounts:
+/// `delegated`(w), `buffer`(signer, owned by the delegation program), `payer`(w),
+/// `system_program`. The buffer (filled by the validator with the committed ER
+/// state) is copied byte-for-byte into the re-opened PDA.
+pub fn process_external_undelegate<'info>(
+    delegated: &AccountInfo<'info>,
+    buffer: &AccountInfo<'info>,
+    payer: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    seeds: Vec<Vec<u8>>,
+) -> Result<()> {
+    // Only the delegation program's signed buffer may drive this callback.
+    require!(buffer.is_signer, crate::FlashBookError::Unauthorized);
+    require_keys_eq!(
+        *buffer.owner,
+        DELEGATION_PROGRAM_ID,
+        crate::FlashBookError::Unauthorized
+    );
+
+    // Re-derive the canonical bump and verify the target PDA matches the seeds.
+    let seed_slices: Vec<&[u8]> = seeds.iter().map(|s| s.as_slice()).collect();
+    let (derived, bump) = Pubkey::find_program_address(&seed_slices, &crate::ID);
+    require_keys_eq!(*delegated.key, derived, crate::FlashBookError::WrongMarket);
+
+    let bump_arr = [bump];
+    let mut signer: Vec<&[u8]> = seed_slices.clone();
+    signer.push(&bump_arr);
+
+    // Re-open the PDA under THIS program, sized to the committed buffer.
+    create_pda(
+        payer,
+        delegated,
+        system_program,
+        &crate::ID,
+        buffer.data_len(),
+        &[&signer],
+    )?;
+
+    // Copy committed state back. Sizes match by construction (PDA created with
+    // buffer.data_len()); guard anyway — Solana programs must not panic.
+    let src = buffer.try_borrow_data()?;
+    let mut dst = delegated.try_borrow_mut_data()?;
+    require!(
+        dst.len() == src.len(),
+        crate::FlashBookError::OutOfRange
+    );
+    dst.copy_from_slice(&src);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +455,43 @@ mod tests {
         let other = Pubkey::new_unique();
         let (buf_other, _) = delegate_buffer_pda(&other, &owner);
         assert_ne!(buf1, buf_other);
+    }
+
+    #[test]
+    fn magic_program_and_context_ids_are_canonical() {
+        assert_eq!(
+            MAGIC_PROGRAM_ID.to_string(),
+            "Magic11111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            MAGIC_CONTEXT_ID.to_string(),
+            "MagicContext1111111111111111111111111111111"
+        );
+    }
+
+    #[test]
+    fn commit_enum_tags_match_magicblock_abi() {
+        // bincode(MagicBlockInstruction) — u32 LE enum discriminant.
+        assert_eq!(SCHEDULE_COMMIT, [1, 0, 0, 0]);
+        assert_eq!(SCHEDULE_COMMIT_AND_UNDELEGATE, [2, 0, 0, 0]);
+    }
+
+    #[test]
+    fn external_undelegate_discriminator_is_canonical() {
+        assert_eq!(
+            EXTERNAL_UNDELEGATE_DISCRIMINATOR,
+            [196, 28, 41, 206, 48, 37, 51, 167]
+        );
+    }
+
+    #[test]
+    fn undelegate_callback_seeds_borsh_roundtrip() {
+        // The delegation program sends EXTERNAL_UNDELEGATE_DISCRIMINATOR ++
+        // borsh(Vec<Vec<u8>>); process_external_undelegate decodes the tail.
+        let seeds: Vec<Vec<u8>> = vec![b"market_book".to_vec(), Pubkey::new_unique().to_bytes().to_vec()];
+        let mut buf = Vec::new();
+        seeds.serialize(&mut buf).unwrap();
+        let decoded = Vec::<Vec<u8>>::try_from_slice(&buf).unwrap();
+        assert_eq!(decoded, seeds);
     }
 }

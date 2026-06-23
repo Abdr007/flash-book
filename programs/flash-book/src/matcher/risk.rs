@@ -86,6 +86,18 @@ impl MarketSnapshot {
     ///   3. Wave 28b OI-scaled crowded-trade extra (heavy-side OI)
     ///
     /// All terms are additive; total saturates on u32 overflow.
+    ///
+    /// ⚠️ RISK-H1 — term (3) is **INACTIVE in production**. Every on-chain
+    /// `RiskMarketSnap` constructs this snapshot with `side_oi_lots = 0` and
+    /// `oi_mmr_slope_bps_per_million_lots = 0`, and there is **no MarketParams
+    /// field** to configure them — so `oi_extra` is always 0 and the
+    /// crowded-trade penalty does nothing. This is documented (not silently
+    /// dead) to avoid false assurance. To activate it: add
+    /// `oi_mmr_slope_bps_per_million_lots` + `oi_mmr_max_extra_bps` to
+    /// `MarketParams` (a state migration) and thread real per-side OI
+    /// (`market.oi_long_lots` / `oi_short_lots`) into the snapshots at the
+    /// call sites. Omitting the penalty is conservative-safe (never
+    /// under-margins), so this is a missing feature, not a solvency bug.
     pub fn effective_mmr_bps(&self, size_lots: u64) -> u32 {
         let base_with_conc = if self.concentration_threshold_lots > 0
             && size_lots >= self.concentration_threshold_lots

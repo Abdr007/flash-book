@@ -303,6 +303,21 @@ pub struct MarketAccount {
     /// Used to enforce `params.mark_settle_min_slots` rate-limit.
     pub last_mark_settle_slot: u64,
     pub params: MarketParams,
+    /// Authorized fill-settlement signer for `apply_fill` / `apply_flp_fill`.
+    ///
+    /// SECURITY (C-1): this is DELIBERATELY decoupled from `authority`.
+    /// `authority` is zeroed by the authority-burn ladder
+    /// (`renounce_market_authority`), but settlement must keep working
+    /// after decentralization — so the writer that can post fills is
+    /// gated by this dedicated, separately-rotatable key instead.
+    ///
+    /// Set to `authority` at init; rotate via `set_market_sequencer`
+    /// (authority-gated, so do it BEFORE burning authority). Markets
+    /// created before this field existed read it back as the zero pubkey
+    /// (additive-migration trailing-zero convention) — which is
+    /// UNSIGNABLE, so `apply_fill` safely halts (refuses forgery) until
+    /// the authority calls `set_market_sequencer`. Fail-closed by design.
+    pub sequencer: Pubkey,
 }
 
 impl MarketAccount {

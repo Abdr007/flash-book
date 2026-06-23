@@ -65,6 +65,16 @@ fn make_program_test() -> ProgramTest {
     )
 }
 
+/// Like `make_program_test`, but loads the compiled SBF `.so`
+/// (target/deploy/flash_book.so) and runs it in the BPF VM so that
+/// `compute_units_consumed` reflects REAL on-chain CU metering. The
+/// native `processor!` harness above is fine for functional assertions
+/// but reports meaningless CU. Requires `cargo build-sbf` to have been
+/// run first. Used only by the CU benchmark.
+fn make_program_test_sbf() -> ProgramTest {
+    ProgramTest::new("flash_book", program_id(), None)
+}
+
 async fn fetch<T: AccountDeserialize>(client: &mut BanksClient, address: Pubkey) -> T {
     let data = client
         .get_account(address)
@@ -2935,6 +2945,397 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(market.oi_long_lots, 1);
     assert_eq!(market.oi_short_lots, 1);
+}
+
+/// C-1 regression: a signer that is NOT the market's configured
+/// `sequencer` cannot settle a fill — even when fully funded so the
+/// `init_if_needed` position rent is payable. Before the C-1 gate any
+/// signer could fabricate fills against arbitrary positions and drain
+/// the quote vault. The market's sequencer is `payer` (set at init);
+/// here a funded `rogue` attempts the same fill and must be rejected,
+/// with the would-be positions rolled back (never created).
+#[tokio::test]
+async fn apply_fill_rejects_unauthorized_sequencer() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // Fund a rogue signer so the ONLY possible failure is the auth gate
+    // (not insufficient lamports for the init_if_needed positions).
+    let rogue = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &rogue.pubkey(),
+                1_000_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(rogue.pubkey(), true), // rogue, NOT market.sequencer
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&rogue.pubkey()),
+            &[&rogue],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "unauthorized sequencer must not be able to apply fills (C-1)"
+    );
+
+    // The rejected tx must roll back — no taker position created.
+    let taker_acct = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(
+        taker_acct.is_none(),
+        "no taker position should exist after a rejected apply_fill (C-1)"
+    );
+}
+
+/// C-2 regression: `partial_withdraw_collateral` must reject a caller who
+/// omits an open position from `remaining_accounts`. Before the fix the
+/// handler only checked `remaining.len() % 2 == 0`, so a trader could
+/// pass ZERO positions, have the margin requirement computed over an
+/// empty set, and withdraw collateral that should have been locked
+/// against their open risk. The fix requires
+/// `remaining.len() == open_positions * 2`.
+///
+/// Two assertions: (1) omitting the position is rejected and the balance
+/// is unchanged; (2) supplying the correct (market, position) pair lets a
+/// safe, small withdrawal through — proving the fix blocks omission
+/// specifically, not the instruction wholesale.
+#[tokio::test]
+async fn partial_withdraw_rejects_omitted_position() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // Open a real position for the taker (size 1 @ 100k → ~1x leverage),
+    // so `taker_state.open_positions == 1`.
+    let fill_ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // payer IS market.sequencer
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[fill_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let before: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    assert_eq!(before.open_positions, 1, "taker should have one open position");
+    let collateral_before = before.collateral_quote_lots;
+    let taker_ata = ata_for(&taker.pubkey(), &protocol.quote_mint);
+
+    // The PartialWithdrawCollateral named-account layout, reused below.
+    let pw_accounts = || {
+        vec![
+            AccountMeta::new_readonly(taker.pubkey(), true),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(taker_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ]
+    };
+
+    // (1) ATTACK: omit the open position (empty remaining_accounts).
+    let mut attack_metas = pw_accounts();
+    // no remaining (market, position) pair appended → the bug path
+    let attack_ix = build_ix(
+        flash_book::instruction::PartialWithdrawCollateral {
+            amount_quote_lots: 1_000,
+        },
+        std::mem::take(&mut attack_metas),
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let attack_result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[attack_ix],
+            Some(&taker.pubkey()),
+            &[&taker],
+            bh,
+        ))
+        .await;
+    assert!(
+        attack_result.is_err(),
+        "omitting an open position must be rejected (C-2)"
+    );
+    let after_attack: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    assert_eq!(
+        after_attack.collateral_quote_lots, collateral_before,
+        "balance must be unchanged after a rejected partial_withdraw (C-2)"
+    );
+
+    // (2) CONTROL: supply the correct (market, position) pair → a small,
+    // margin-safe withdrawal succeeds.
+    let mut ok_metas = pw_accounts();
+    ok_metas.push(AccountMeta::new_readonly(market_pda, false));
+    ok_metas.push(AccountMeta::new_readonly(taker_pos, false));
+    let ok_ix = build_ix(
+        flash_book::instruction::PartialWithdrawCollateral {
+            amount_quote_lots: 1_000,
+        },
+        ok_metas,
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ok_ix],
+            Some(&taker.pubkey()),
+            &[&taker],
+            bh,
+        ))
+        .await
+        .expect("supplying the full position set should allow a safe withdrawal");
+    let after_ok: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    assert_eq!(
+        after_ok.collateral_quote_lots,
+        collateral_before - 1_000,
+        "correct full-coverage withdrawal should debit exactly the amount"
+    );
+}
+
+/// Process one ix and return the compute units it consumed. Reproducible
+/// CU measurement via program-test metadata (no external validator).
+async fn cu_of(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    ix: Instruction,
+    fee_payer: &Pubkey,
+    signers: &[&Keypair],
+) -> u64 {
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(fee_payer), signers, bh);
+    let r = ctx
+        .banks_client
+        .process_transaction_with_metadata(tx)
+        .await
+        .unwrap();
+    assert!(r.result.is_ok(), "benchmark tx failed: {:?}", r.result);
+    r.metadata
+        .expect("metadata present")
+        .compute_units_consumed
+}
+
+/// CU benchmark for the settlement + risk instructions that
+/// `scripts/benchmark.ts` does NOT cover (it measures only place/take/
+/// cancel/modify). These are the heavy paths and the ones the C-1/C-2
+/// hardening touched:
+///   - `apply_fill` runs fee + funding + realized-PnL routing + (open)
+///     init_if_needed of both position PDAs, behind the C-1 sequencer gate.
+///   - `partial_withdraw` runs the full stress-lattice margin assessment
+///     over the trader's positions, behind the C-2 coverage check.
+///
+/// `#[ignore]` because it needs the compiled SBF `.so` (real CU metering);
+/// excluded from the default `cargo test` run so the functional suite
+/// stays fast and validator-free. Run with:
+///   cargo build-sbf
+///   BPF_OUT_DIR="$PWD/target/deploy" \
+///     cargo test -p flash-book --test integration cu_benchmark -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "CU benchmark; requires BPF_OUT_DIR + cargo build-sbf"]
+async fn cu_benchmark_settlement_and_risk_paths() {
+    if std::env::var("BPF_OUT_DIR").is_err() && std::env::var("SBF_OUT_DIR").is_err() {
+        eprintln!(
+            "skipping cu_benchmark: set BPF_OUT_DIR=$PWD/target/deploy (after cargo build-sbf)"
+        );
+        return;
+    }
+    let pt = make_program_test_sbf();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    // Generous collateral so the small benchmark withdrawal clears margin.
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 1_000_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 1_000_000, &protocol).await;
+
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    let fill_metas = || {
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // payer == market.sequencer
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ]
+    };
+
+    // (1) apply_fill — OPEN (creates both position PDAs, moves OI).
+    let open_ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+        },
+        fill_metas(),
+    );
+    let cu_apply_fill_open = cu_of(&mut ctx, open_ix, &payer.pubkey(), &[&payer]).await;
+
+    // (2) partial_withdraw — full coverage, stress-lattice over 1 position.
+    let taker_ata = ata_for(&taker.pubkey(), &protocol.quote_mint);
+    let mut pw_metas = vec![
+        AccountMeta::new_readonly(taker.pubkey(), true),
+        AccountMeta::new(taker_state, false),
+        AccountMeta::new(protocol.insurance_fund, false),
+        AccountMeta::new_readonly(protocol.quote_mint, false),
+        AccountMeta::new(taker_ata, false),
+        AccountMeta::new(protocol.quote_vault, false),
+        AccountMeta::new_readonly(spl_token::id(), false),
+    ];
+    pw_metas.push(AccountMeta::new_readonly(market_pda, false));
+    pw_metas.push(AccountMeta::new_readonly(taker_pos, false));
+    let pw_ix = build_ix(
+        flash_book::instruction::PartialWithdrawCollateral {
+            amount_quote_lots: 1_000,
+        },
+        pw_metas,
+    );
+    let cu_partial_withdraw = cu_of(&mut ctx, pw_ix, &taker.pubkey(), &[&taker]).await;
+
+    // (3) apply_fill — CLOSE (taker sells 1, realizes PnL → materialise).
+    let close_ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 1,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+        },
+        fill_metas(),
+    );
+    let cu_apply_fill_close = cu_of(&mut ctx, close_ix, &payer.pubkey(), &[&payer]).await;
+
+    println!("\n=== Flash Book CU benchmark (settlement + risk paths) ===");
+    println!("apply_fill (open, both positions) : {cu_apply_fill_open:>7} CU");
+    println!("apply_fill (close, realize PnL)   : {cu_apply_fill_close:>7} CU");
+    println!("partial_withdraw (1 pos, lattice) : {cu_partial_withdraw:>7} CU");
+    println!("(200k default per-ix budget; 1.4M max/tx)\n");
+
+    // Guardrail: these must comfortably fit the default per-ix budget.
+    assert!(cu_apply_fill_open < 200_000, "apply_fill open exceeds 200k CU");
+    assert!(cu_apply_fill_close < 200_000, "apply_fill close exceeds 200k CU");
+    assert!(cu_partial_withdraw < 200_000, "partial_withdraw exceeds 200k CU");
 }
 
 /// Phase 2g coverage end-to-end: open a winning position then close
