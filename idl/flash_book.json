@@ -1492,6 +1492,92 @@
       "args": []
     },
     {
+      "name": "commit_and_undelegate_market_book",
+      "docs": [
+        "ON THE ER: snapshot final state AND queue undelegation",
+        "(`ScheduleCommitAndUndelegate`). After this lands, the delegation",
+        "program calls back into `process_undelegation` on base to finalize."
+      ],
+      "discriminator": [
+        212,
+        2,
+        212,
+        38,
+        203,
+        247,
+        53,
+        191
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "owner is the delegation program; `cpi_commit` (→ Magic program) fails",
+            "loudly if this is not actually a delegated account."
+          ],
+          "writable": true
+        },
+        {
+          "name": "magic_context",
+          "writable": true,
+          "address": "MagicContext1111111111111111111111111111111"
+        },
+        {
+          "name": "magic_program",
+          "address": "Magic11111111111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "commit_market_book",
+      "docs": [
+        "ON THE ER: snapshot the delegated `market_book` back to L1 while staying",
+        "delegated (`ScheduleCommit` Magic Action). Keeper-driven (permissionless,",
+        "like Phoenix-ER — the validator/magic program enforce commit semantics)."
+      ],
+      "discriminator": [
+        22,
+        66,
+        186,
+        206,
+        205,
+        124,
+        197,
+        196
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "owner is the delegation program; `cpi_commit` (→ Magic program) fails",
+            "loudly if this is not actually a delegated account."
+          ],
+          "writable": true
+        },
+        {
+          "name": "magic_context",
+          "writable": true,
+          "address": "MagicContext1111111111111111111111111111111"
+        },
+        {
+          "name": "magic_program",
+          "address": "Magic11111111111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "convert_position",
       "docs": [
         "Permissionless: convert a position's `matured_pos` into a",
@@ -6446,6 +6532,57 @@
       ]
     },
     {
+      "name": "process_undelegation",
+      "docs": [
+        "BASE-LAYER callback invoked by the MagicBlock delegation program to",
+        "finalize undelegation. Its Anchor discriminator is EXACTLY",
+        "`sha256(\"global:process_undelegation\")[..8]` = the bytes the delegation",
+        "program sends, so this is an ordinary Anchor ix (no entrypoint fallback).",
+        "Re-creates the delegated PDA program-owned and copies the committed",
+        "buffer back (`er::process_external_undelegate`)."
+      ],
+      "discriminator": [
+        196,
+        28,
+        41,
+        206,
+        48,
+        37,
+        51,
+        167
+      ],
+      "accounts": [
+        {
+          "name": "delegated_account",
+          "docs": [
+            "filled from `buffer` by the handler."
+          ],
+          "writable": true
+        },
+        {
+          "name": "buffer",
+          "docs": [
+            "== DELEGATION_PROGRAM_ID — both verified in the handler)."
+          ]
+        },
+        {
+          "name": "payer",
+          "writable": true
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "account_seeds",
+          "type": {
+            "vec": "bytes"
+          }
+        }
+      ]
+    },
+    {
       "name": "record_flp_fill_v3",
       "docs": [
         "Record a fill on this per-market FLP exposure."
@@ -7923,6 +8060,37 @@
               {
                 "kind": "account",
                 "path": "trader_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "haircut_state",
+          "docs": [
+            "RISK-1: funding is a money-moving ix and MUST delta-track the",
+            "solvency residual (`V − C_tot − I`), exactly like deposit/withdraw/",
+            "fee/liquidation. Without it, lazy/entry-priced funding silently",
+            "mints or burns protocol collateral and the haircut/kill-switch",
+            "baseline drifts. Bound to this market's haircut PDA."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  104,
+                  97,
+                  105,
+                  114,
+                  99,
+                  117,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
               }
             ]
           }
