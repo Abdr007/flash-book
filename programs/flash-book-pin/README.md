@@ -81,8 +81,13 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   (**307 host tests**). Remaining `matcher/` modules (risk, liquidation, vpin,
   order, lot, funding, insurance, flp_quoter) are account-coupled — they need
   the Pod layer first.
-- ⬜ Pod layer (~24 account structs → `bytemuck` Pod, `[u8;16]` for i128) +
-  the account-coupled `matcher/` modules.
+- 🟡 **Pod layer started** (`state.rs`): `Position`, `Market`, `TraderState`,
+  `Insurance`, plus `FeeTiers` (216 B) + `FlpExposure` (968 B) with nested
+  `FeeTier` / `FlpMarketExposure`. All `#[repr(C)]`, 8-aligned, zero implicit
+  padding (compile-time `size_of` asserts), `[u8;16]` for every i128. ~18
+  account structs remain.
+- ⬜ Account-coupled `matcher/` modules (risk, liquidation, vpin, order, lot,
+  funding, insurance, flp_quoter) on top of the Pod layer.
 - ⬜ Remaining 105 instructions; events; CPI (token, ER); IDL/client.
 - ⬜ Re-pass the full functional suite (569 tests) + 5 Kani proofs against the port.
 

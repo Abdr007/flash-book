@@ -59,8 +59,75 @@ pub struct Insurance {
     pub _reserved: [u8; 184],
 }
 
+pub const FEE_TIERS_DISC: [u8; 8] = [0xFE, 0xE7, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01];
+
+/// One rung of the fee-tier table. Signed `maker_rebate_bps`: positive = rebate
+/// to maker, negative = fee from maker. 16 B, 8-aligned.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FeeTier {
+    pub min_volume_quote_lots: u64,
+    pub maker_rebate_bps: i32,
+    pub taker_fee_bps: u32,
+}
+
+pub const MAX_FEE_TIERS: usize = 10;
+
+/// Volume-based fee-tier table. Pod mirror of `FeeTiersAccount` — feeds
+/// `fees::resolve_fee_tier`. `tiers` is sorted ascending by `min_volume`.
+#[repr(C)]
+pub struct FeeTiers {
+    pub disc: [u8; 8],
+    pub authority: Pubkey,
+    pub bump: u8,
+    pub tier_count: u8,
+    pub _pad0: [u8; 6],
+    pub volume_window_slots: u64,
+    pub tiers: [FeeTier; MAX_FEE_TIERS],
+}
+
+pub const FLP_EXPOSURE_DISC: [u8; 8] = [0xF1, 0x9E, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01];
+
+/// Per-market FLP exposure entry. Fields reordered vs the Anchor struct so the
+/// `repr(C)` layout has no implicit padding. `side`: 0 = long, 1 = short,
+/// 255 = empty. 56 B, 8-aligned.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FlpMarketExposure {
+    pub market: Pubkey,
+    pub size_lots: u64,
+    pub entry_price_ticks: u64,
+    pub side: u8,
+    pub _pad: [u8; 7],
+}
+
+/// FLP pool exposure / NAV terms. Pod mirror of `FlpExposureAccount`.
+#[repr(C)]
+pub struct FlpExposure {
+    pub disc: [u8; 8],
+    pub authority: Pubkey,
+    pub total_capital_quote_lots: u64,
+    pub realized_pnl: i64,
+    pub lp_shares_outstanding: u64,
+    pub bump: u8,
+    pub markets_count: u8,
+    pub _pad0: [u8; 6],
+    pub per_market: [FlpMarketExposure; 16],
+}
+impl FlpExposure {
+    /// Net Asset Value in quote lots (capital + realized PnL; may go negative).
+    #[inline]
+    pub fn nav(&self) -> i128 {
+        (self.total_capital_quote_lots as i128) + (self.realized_pnl as i128)
+    }
+}
+
 // Compile-time size checks (8-aligned, sized to the real accounts).
 const _: () = assert!(core::mem::size_of::<Position>() == 128);
 const _: () = assert!(core::mem::size_of::<Market>() == 1152);
 const _: () = assert!(core::mem::size_of::<TraderState>() == 200);
 const _: () = assert!(core::mem::size_of::<Insurance>() == 200);
+const _: () = assert!(core::mem::size_of::<FeeTier>() == 16);
+const _: () = assert!(core::mem::size_of::<FeeTiers>() == 216);
+const _: () = assert!(core::mem::size_of::<FlpMarketExposure>() == 56);
+const _: () = assert!(core::mem::size_of::<FlpExposure>() == 968);
