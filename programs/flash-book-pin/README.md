@@ -91,10 +91,11 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   `FlpPositionV3` (104 B) / `LpPosition` (104 B). **15 Pods covering the entire
   current (v3) account surface.** Remaining: legacy v2 order/vault accounts +
   `JitLiquidationOffer` (needed for the liquidation ix).
-- 🟡 Account-coupled `matcher/` modules de-anchored: `vpin.rs` (VPIN / toxicity
-  Q32.32 EMA — `record_fill` + `as_bps`, self-contained `Side`/error helper,
-  6 host tests). Remaining: risk, liquidation, order, lot, funding, insurance,
-  flp_quoter.
+- 🟡 Account-coupled `matcher/` modules de-anchored: `vpin.rs` (VPIN/toxicity
+  Q32.32 EMA), `lot.rs` (BaseLots/QuoteLots/Ticks/Bps checked arithmetic +
+  notional), `order.rs` (Side/OrderType/StpMode + Order), backed by a shared
+  `error.rs` (`FlashBookError` + `OrOverflow`). Remaining: risk, liquidation,
+  funding, insurance, flp_quoter.
 - ⬜ Remaining 105 instructions; events; CPI (token, ER); IDL/client.
 - ⬜ Re-pass the full functional suite (569 tests) + 5 Kani proofs against the port.
 
