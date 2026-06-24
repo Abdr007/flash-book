@@ -25,6 +25,14 @@
 /// by the caller. Opaque to this module (compared for equality only).
 pub type FillCommit = [u8; 32];
 
+/// PDA seed for the per-market `FillCommitmentAccount`: `[FILL_COMMIT_SEED, market]`.
+pub const FILL_COMMIT_SEED: &[u8] = b"fill_commit";
+
+/// Default ring capacity (pending unsettled fills a market may hold before the
+/// matcher applies backpressure). 64 covers a deep taker sweep; settlement drains
+/// it. Sized into the account at init; the account is realloc-expandable later.
+pub const FILL_RING_CAP: u32 = 64;
+
 /// Canonical fill-commitment preimage length (see `fill_preimage`).
 pub const FILL_PREIMAGE_LEN: usize = 136;
 
@@ -146,6 +154,131 @@ pub fn ring_settle(
     }
     slots[idx] = [0u8; 32]; // consume-and-clear
     *settled = settled.checked_add(1).ok_or(FillRingError::Corrupt)?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Account-buffer layer: the on-chain FillCommitmentAccount is a raw PDA (like
+// MarketBookAccount) parsed by these functions — disc + fixed header + a flat
+// trailing region of `cap` 32-byte slots. Keeping the layout here makes it
+// host-unit-testable; the handler only does PDA validation + keccak. The slot
+// region is viewed as `&mut [FillCommit]` via bytemuck (len always a multiple of
+// 32), so the proven `ring_push` / `ring_settle` operate on it directly.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 8-byte discriminator marking a raw account as a FillCommitmentAccount.
+pub const FILL_COMMIT_DISC: [u8; 8] = *b"FBfcq\x00\x01\x00";
+
+/// Fixed header length (disc + counters + cap + bump + pad + market pubkey).
+pub const FILL_COMMIT_HEADER_LEN: usize = 64;
+
+// Byte offsets within the account data.
+const OFF_PRODUCED: usize = 8; // u64 LE
+const OFF_SETTLED: usize = 16; // u64 LE
+const OFF_CAP: usize = 24; // u32 LE
+const OFF_BUMP: usize = 28; // u8
+const OFF_MARKET: usize = 32; // [u8; 32]
+
+/// Total account size for a given ring capacity.
+pub const fn fill_commit_account_len(cap: usize) -> usize {
+    FILL_COMMIT_HEADER_LEN + cap * 32
+}
+
+#[inline]
+fn rd_u64(data: &[u8], off: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&data[off..off + 8]);
+    u64::from_le_bytes(b)
+}
+#[inline]
+fn wr_u64(data: &mut [u8], off: usize, v: u64) {
+    data[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// One-time initialize a freshly-allocated account buffer: stamp disc, market,
+/// cap, bump; zero the counters and slots. `data.len()` must equal
+/// `fill_commit_account_len(cap)`.
+pub fn buffer_init(
+    data: &mut [u8],
+    market: &[u8; 32],
+    cap: u32,
+    bump: u8,
+) -> Result<(), FillRingError> {
+    if cap == 0 || data.len() != fill_commit_account_len(cap as usize) {
+        return Err(FillRingError::Corrupt);
+    }
+    for b in data.iter_mut() {
+        *b = 0;
+    }
+    data[0..8].copy_from_slice(&FILL_COMMIT_DISC);
+    data[OFF_CAP..OFF_CAP + 4].copy_from_slice(&cap.to_le_bytes());
+    data[OFF_BUMP] = bump;
+    data[OFF_MARKET..OFF_MARKET + 32].copy_from_slice(market);
+    Ok(())
+}
+
+/// Validate the discriminator, market binding, and self-consistent length.
+pub fn buffer_check(data: &[u8], expected_market: &[u8; 32]) -> Result<u32, FillRingError> {
+    if data.len() < FILL_COMMIT_HEADER_LEN || data[0..8] != FILL_COMMIT_DISC {
+        return Err(FillRingError::Corrupt);
+    }
+    let mut capb = [0u8; 4];
+    capb.copy_from_slice(&data[OFF_CAP..OFF_CAP + 4]);
+    let cap = u32::from_le_bytes(capb);
+    if cap == 0
+        || data.len() != fill_commit_account_len(cap as usize)
+        || &data[OFF_MARKET..OFF_MARKET + 32] != expected_market
+    {
+        return Err(FillRingError::Corrupt);
+    }
+    Ok(cap)
+}
+
+/// Current produced cursor = the index the NEXT pushed fill will carry (the
+/// matcher must bind this into the preimage before hashing).
+pub fn buffer_next_index(data: &[u8]) -> u64 {
+    rd_u64(data, OFF_PRODUCED)
+}
+
+/// Current settled cursor = the index the NEXT settled fill must carry.
+pub fn buffer_settle_index(data: &[u8]) -> u64 {
+    rd_u64(data, OFF_SETTLED)
+}
+
+fn slot_view(data: &mut [u8], cap: usize) -> &mut [FillCommit] {
+    let region = &mut data[FILL_COMMIT_HEADER_LEN..FILL_COMMIT_HEADER_LEN + cap * 32];
+    bytemuck::cast_slice_mut::<u8, FillCommit>(region)
+}
+
+/// Producer: push a fill commitment (matcher). Reads/advances the produced
+/// cursor in the header and writes the slot via the proven `ring_push`.
+pub fn buffer_push(data: &mut [u8], market: &[u8; 32], commit: FillCommit) -> Result<(), FillRingError> {
+    let cap = buffer_check(data, market)?;
+    let mut produced = rd_u64(data, OFF_PRODUCED);
+    let settled = rd_u64(data, OFF_SETTLED);
+    {
+        let slots = slot_view(data, cap as usize);
+        ring_push(&mut produced, settled, slots, commit)?;
+    }
+    wr_u64(data, OFF_PRODUCED, produced);
+    Ok(())
+}
+
+/// Consumer: settle (consume-and-clear) the oldest pending commitment
+/// (settlement). `recomputed` is the handler's keccak of the fill it is settling.
+pub fn buffer_settle(
+    data: &mut [u8],
+    market: &[u8; 32],
+    recomputed: FillCommit,
+) -> Result<(), FillRingError> {
+    let cap = buffer_check(data, market)?;
+    let produced = rd_u64(data, OFF_PRODUCED);
+    let mut settled = rd_u64(data, OFF_SETTLED);
+    {
+        let slots = slot_view(data, cap as usize);
+        ring_settle(produced, &mut settled, slots, recomputed)?;
+    }
+    wr_u64(data, OFF_SETTLED, settled);
     Ok(())
 }
 
@@ -355,5 +488,75 @@ mod tests {
             ring_settle(produced, &mut settled, &mut slots, c(1)),
             Err(FillRingError::Empty)
         );
+    }
+
+    // ── account-buffer layer ─────────────────────────────────────────────
+    const TEST_CAP: u32 = 8;
+    fn fresh_buffer(market: &[u8; 32]) -> Vec<u8> {
+        let mut data = vec![0u8; fill_commit_account_len(TEST_CAP as usize)];
+        buffer_init(&mut data, market, TEST_CAP, 254).unwrap();
+        data
+    }
+
+    #[test]
+    fn buffer_init_and_check() {
+        let market = [7u8; 32];
+        let data = fresh_buffer(&market);
+        assert_eq!(&data[0..8], &FILL_COMMIT_DISC);
+        assert_eq!(buffer_check(&data, &market).unwrap(), TEST_CAP);
+        assert_eq!(buffer_next_index(&data), 0);
+        assert_eq!(buffer_settle_index(&data), 0);
+        // wrong market is rejected
+        assert_eq!(buffer_check(&data, &[9u8; 32]), Err(FillRingError::Corrupt));
+    }
+
+    #[test]
+    fn buffer_produce_then_settle_roundtrip() {
+        let market = [3u8; 32];
+        let mut data = fresh_buffer(&market);
+        // produce three; cursor advances
+        buffer_push(&mut data, &market, c(11)).unwrap();
+        buffer_push(&mut data, &market, c(12)).unwrap();
+        buffer_push(&mut data, &market, c(13)).unwrap();
+        assert_eq!(buffer_next_index(&data), 3);
+        assert_eq!(buffer_settle_index(&data), 0);
+        // settle FIFO
+        buffer_settle(&mut data, &market, c(11)).unwrap();
+        buffer_settle(&mut data, &market, c(12)).unwrap();
+        assert_eq!(buffer_settle_index(&data), 2);
+        // a fabricated fill is rejected, cursor unmoved
+        assert_eq!(
+            buffer_settle(&mut data, &market, c(99)),
+            Err(FillRingError::NotCommitted)
+        );
+        assert_eq!(buffer_settle_index(&data), 2);
+        buffer_settle(&mut data, &market, c(13)).unwrap();
+        assert_eq!(buffer_settle_index(&data), 3);
+        // fully drained
+        assert_eq!(buffer_settle(&mut data, &market, c(13)), Err(FillRingError::Empty));
+    }
+
+    #[test]
+    fn buffer_backpressure_at_cap() {
+        let market = [5u8; 32];
+        let mut data = fresh_buffer(&market);
+        for i in 0..TEST_CAP as u8 {
+            buffer_push(&mut data, &market, c(i + 1)).unwrap();
+        }
+        assert_eq!(buffer_next_index(&data), TEST_CAP as u64);
+        assert_eq!(buffer_push(&mut data, &market, c(200)), Err(FillRingError::Full));
+    }
+
+    #[test]
+    fn buffer_wraps_around() {
+        let market = [1u8; 32];
+        let mut data = fresh_buffer(&market);
+        // produce + settle 20 fills through an 8-slot ring (forces wrap)
+        for i in 0..20u8 {
+            buffer_push(&mut data, &market, c(i + 1)).unwrap();
+            buffer_settle(&mut data, &market, c(i + 1)).unwrap();
+        }
+        assert_eq!(buffer_next_index(&data), 20);
+        assert_eq!(buffer_settle_index(&data), 20);
     }
 }

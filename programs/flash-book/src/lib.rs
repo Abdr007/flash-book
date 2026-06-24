@@ -141,6 +141,53 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Allocate the per-market `FillCommitmentAccount` (#35 / H1 part B). A raw
+    /// PDA at `[fill_commit, market]` holding the consume-and-clear fill ring:
+    /// the matcher pushes a keccak commitment for every fill it crosses on-chain,
+    /// and settlement may only consume a matching, oldest-pending entry — so a
+    /// compromised sequencer cannot fabricate fills. `UncheckedAccount` for the
+    /// same reason as `market_book` (flat byte region, sized in the handler).
+    /// Permissioned to the market authority. Co-delegatable with the book.
+    pub fn init_fill_commitment(ctx: Context<InitFillCommitment>) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.fill_commitment;
+        let cap = fc::FILL_RING_CAP;
+
+        let space = fc::fill_commit_account_len(cap as usize);
+        let rent = Rent::get()?;
+        let lamports = rent.minimum_balance(space);
+
+        let signer_seeds: &[&[u8]] = &[fc::FILL_COMMIT_SEED, market_key.as_ref(), &[bump]];
+        anchor_lang::solana_program::program::invoke_signed(
+            &anchor_lang::solana_program::system_instruction::create_account(
+                &ctx.accounts.authority.key(),
+                &ctx.accounts.fill_commitment.key(),
+                lamports,
+                space as u64,
+                ctx.program_id,
+            ),
+            &[
+                ctx.accounts.authority.to_account_info(),
+                ctx.accounts.fill_commitment.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            &[signer_seeds],
+        )?;
+
+        let mut data = ctx.accounts.fill_commitment.try_borrow_mut_data()?;
+        fc::buffer_init(&mut data, &market_key.to_bytes(), cap, bump)
+            .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+
+        emit!(FillCommitmentInitializedEvent {
+            market: market_key,
+            fill_commitment: ctx.accounts.fill_commitment.key(),
+            cap,
+            total_bytes: space as u32,
+        });
+        Ok(())
+    }
+
     /// Grow an existing v2 `market_book` PDA in place by `additional_nodes`
     /// hypertree slots — this is what breaks the 100-node init cap. Only the
     /// market authority may call it (same gate as `init_market_book`).
@@ -10591,6 +10638,34 @@ pub struct InitMarketBook<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Allocate the per-market `FillCommitmentAccount` (`init_fill_commitment`,
+/// #35 / H1 part B). Same authority gate + raw-PDA pattern as `InitMarketBook`;
+/// sized + stamped in the handler.
+#[derive(Accounts)]
+pub struct InitFillCommitment<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; allocated via SystemProgram CPI in the handler (flat
+    /// byte region, sized in-handler — same reason as `market_book`). Bound by
+    /// the seed derivation below.
+    #[account(
+        mut,
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 /// Grow a market_book PDA in place (`expand_market_book`). Same authority
 /// gate and seed binding as `InitMarketBook`; the book is reallocated in the
 /// handler so it's `UncheckedAccount` (Anchor can't size a variable account).
@@ -12215,6 +12290,14 @@ pub struct MarketBookInitializedEvent {
     pub market_book: Pubkey,
     pub total_bytes: u32,
     pub data_bytes: u32,
+}
+
+#[event]
+pub struct FillCommitmentInitializedEvent {
+    pub market: Pubkey,
+    pub fill_commitment: Pubkey,
+    pub cap: u32,
+    pub total_bytes: u32,
 }
 
 #[event]
