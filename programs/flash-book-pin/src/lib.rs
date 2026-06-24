@@ -41,6 +41,8 @@ pub mod stable_collateral;
 pub mod conditional_cancel;
 pub mod cancel_on_disconnect;
 pub mod arg;
+pub mod haircut;
+pub mod pro_rata;
 
 #[cfg(target_os = "solana")]
 mod program {
