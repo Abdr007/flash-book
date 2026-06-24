@@ -39,6 +39,8 @@ mod program {
     pub enum Ix {
         ApplyFill = 0,
         SettleFunding = 1,
+        PlaceLimitOrder = 2,
+        CancelOrder = 3,
     }
 
     #[inline(always)]
@@ -47,6 +49,8 @@ mod program {
         match tag {
             x if x == Ix::ApplyFill as u8 => instructions::apply_fill::process(program_id, accounts, rest),
             x if x == Ix::SettleFunding as u8 => instructions::settle_funding::process(program_id, accounts, rest),
+            x if x == Ix::PlaceLimitOrder as u8 => instructions::place_order::process(program_id, accounts, rest),
+            x if x == Ix::CancelOrder as u8 => instructions::cancel_order::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
