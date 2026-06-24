@@ -309,3 +309,52 @@ completeness, and vault-solvency invariants remain `[PROPOSED]`.
 *All findings cite real source. The four CRITICALs were hand-verified by re-opening the code;
 all other findings survived a 2-of-3 adversarial-refutation panel. False-positives were dropped,
 not reported. No individual is named anywhere in this document.*
+
+---
+
+## 11. Remediation status & verification ledger (as of 2026-06-25)
+
+Branch `fix-security-c1-c2` (off `main`). 573 tests + `build-sbf` green at every step.
+
+### Fixed (committed + pushed)
+| Finding | Severity | Fix summary | Commit |
+|---|---|---|---|
+| **C1** | CRITICAL | v3 deposit (`vault_deposit_v3`/`flp_deposit_v3`) `quote_vault`+ATA bound to `insurance_fund.quote_vault`/`quote_mint` | `24f1426` |
+| **C2** | CRITICAL | `sweep_collateral` walk: `verify_position_pda`+dedupe+`size>0` | `24f1426` |
+| **H2** | HIGH | `liquidate_portfolio_v2` exact-count + PDA-bind + dedupe complete-portfolio | `2580fdf` |
+| **H4** | HIGH | `reduce_only` (bit1) fail-loud reject on all 4 v2-book entry points | `a405515`,`e3e6f7c` |
+| **H6** | HIGH | bad-debt waterfall → insurance (`cover_bad_debt`); no revert/strand | `c82163f` |
+| **H3** | HIGH | duplicate-liquidation block in `liquidate_position_v2` … | `5336605` |
+| **H3 (portfolio)** | HIGH | …and ported to `liquidate_portfolio_v2` (holistic re-verify found the gap) | `be3aec9` |
+| **H9** | HIGH | `convert_position` credits collateral + trader-gated (no PnL burn / griefing) | `b5b398a` |
+| **H5** | HIGH | EMA-mark clamped into the oracle band (band-then-maxchange) | `260d380` |
+| **H7** | HIGH | realized losses credit haircut Residual (≤ loss; no over-credit) | `7685b6a` |
+| **H8** | HIGH | FLP minimum-hold (`deposited_at_slot` + `jit_lp_defense`) | `c280516` |
+| **H1 (part A)** | HIGH | monotonic settlement replay guard (`fill_seq`/`last_settlement_seq`) | `8a41078` |
+
+**Closed: 2 CRITICAL + 10 HIGH** (+ the uniformity gaps the re-verify caught).
+
+### Formal verification added (machine-checked)
+- **Kani** (`lib.rs #[cfg(kani)] mod h6_h7_solvency_proofs`, `VERIFICATION: SUCCESSFUL`):
+  `cross_loss_shortfall` conservation + **no over-credit** (`removed ≤ loss` → `h`
+  never inflated → no value mint); `compute_realized_pnl_routing` gain/loss exact +
+  one-sided. Commits `7f0dbc7`, `34af992`. Runs in the CI Kani job.
+- Pre-existing: haircut bound in **Lean** (real 1e9 divisor) + **5 Kani** proofs.
+
+### Adversarial verification
+Every fix re-attacked + cross-checked (workflows `wv774res1`, `wvc3kk3be`,
+`wxc04gk3p`); the holistic combined-vector pass caught the H3-portfolio gap (now
+fixed). 156+ distinct attacks attempted and survived across all passes.
+
+### Open (remaining work)
+- **H1 part B** (HIGH, architectural): fill-authenticity match-commitment — the
+  sequencer-SPOF removal (§3.2). Replay is closed (part A); authenticity is the redesign.
+- **Book-stuffing DoS** (MEDIUM, economic pass): `place_limit_order_v2` has no
+  per-trader resting-order cap / resting price-band / permissionless expiry-reaper —
+  ~100 free far-from-market orders can wedge a market's node arena. Bounded, no fund
+  theft, attacker pubkey on-chain.
+- Mediums M1–M13, lows L1–L5, info cleanup; H3 deeper "reward on realized close".
+- **FV sweep** (in progress): margin-completeness, funding conservation; extend Lean
+  to H6/H7; author Certora CVL specs.
+- **Process**: IDL regen (C1/H9/H1 changed accounts/args); open the PR; **external
+  audit** (the mainnet gate — third-party, not self-certifiable).
