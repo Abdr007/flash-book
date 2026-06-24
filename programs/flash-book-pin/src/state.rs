@@ -192,6 +192,67 @@ pub struct IcebergOrderV3 {
     pub _reserved: [u8; 3],
 }
 
+pub const VAULT_V3_DISC: [u8; 8] = [0x7A, 0x17, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// V3 strategist vault. Pod mirror of `VaultAccountV3` (152 B).
+#[repr(C)]
+pub struct VaultV3 {
+    pub disc: [u8; 8],
+    pub strategist: Pubkey,
+    pub name: [u8; 32],
+    pub shares_outstanding: u64,
+    pub total_capital_quote_lots: u64,
+    pub hwm_nav_per_share_u64x6: u64,
+    pub last_perf_settlement_unix: u64,
+    pub total_perf_shares_minted: u64,
+    pub perf_fee_bps: u32,
+    pub bump: u8,
+    pub vault_id: u8,
+    pub accept_deposits: u8,
+    pub _pad0: u8,
+    pub _reserved: [u8; 32],
+}
+
+pub const VAULT_POSITION_V3_DISC: [u8; 8] = [0x7A, 0x18, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// V3 vault depositor position. Pod mirror of `VaultPositionAccountV3` (120 B).
+#[repr(C)]
+pub struct VaultPositionV3 {
+    pub disc: [u8; 8],
+    pub vault: Pubkey,
+    pub depositor: Pubkey,
+    pub shares: u64,
+    pub total_deposited_quote_lots: u64,
+    pub total_withdrawn_quote_lots: u64,
+    pub bump: u8,
+    pub _reserved: [u8; 23],
+}
+
+pub const LEVERAGE_TIERS_DISC: [u8; 8] = [0x1E, 0x5E, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01];
+
+/// One rung of the leverage tier table. 16 B, 8-aligned.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LeverageTier {
+    pub min_notional_quote_lots: u64,
+    pub mmr_bps: u32,
+    pub _pad: [u8; 4],
+}
+
+pub const MAX_LEVERAGE_TIERS: usize = 8;
+
+/// Per-market leverage / maintenance-margin tier table. Pod mirror of
+/// `MarketLeverageTiersAccount` (176 B). `tiers` sorted ascending by notional.
+#[repr(C)]
+pub struct MarketLeverageTiers {
+    pub disc: [u8; 8],
+    pub market: Pubkey,
+    pub bump: u8,
+    pub tier_count: u8,
+    pub _pad0: [u8; 6],
+    pub tiers: [LeverageTier; MAX_LEVERAGE_TIERS],
+}
+
 // Compile-time size checks (8-aligned, sized to the real accounts).
 const _: () = assert!(core::mem::size_of::<Position>() == 128);
 const _: () = assert!(core::mem::size_of::<Market>() == 1152);
@@ -204,3 +265,7 @@ const _: () = assert!(core::mem::size_of::<FlpExposure>() == 968);
 const _: () = assert!(core::mem::size_of::<TriggerOrderV3>() == 136);
 const _: () = assert!(core::mem::size_of::<TwapOrderV3>() == 152);
 const _: () = assert!(core::mem::size_of::<IcebergOrderV3>() == 136);
+const _: () = assert!(core::mem::size_of::<VaultV3>() == 152);
+const _: () = assert!(core::mem::size_of::<VaultPositionV3>() == 120);
+const _: () = assert!(core::mem::size_of::<LeverageTier>() == 16);
+const _: () = assert!(core::mem::size_of::<MarketLeverageTiers>() == 176);
