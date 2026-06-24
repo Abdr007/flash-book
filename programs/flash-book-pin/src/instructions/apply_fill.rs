@@ -22,46 +22,6 @@ unsafe fn ensure_pos_disc(ai: &AccountInfo) {
     if d[..8] == [0u8; 8] { d[..8].copy_from_slice(&POSITION_DISC); }
 }
 
-/// Identical math to the Anchor `apply_fill_to_position`.
-fn apply_to_position(pos: &mut Position, fill_side: u8, fill_size: u64, fill_price: u64, fidx: i128) -> Result<(), ProgramError> {
-    if pos.size_lots == 0 {
-        pos.side = fill_side;
-        pos.size_lots = fill_size;
-        pos.entry_price_ticks = fill_price;
-        pos.set_cum_funding(fidx);
-        return Ok(());
-    }
-    if pos.side == fill_side {
-        let new_size = pos.size_lots.checked_add(fill_size).ok_or(ProgramError::ArithmeticOverflow)?;
-        let weighted = (pos.entry_price_ticks as u128)
-            .checked_mul(pos.size_lots as u128).ok_or(ProgramError::ArithmeticOverflow)?
-            .checked_add((fill_price as u128).checked_mul(fill_size as u128).ok_or(ProgramError::ArithmeticOverflow)?)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            / new_size as u128;
-        pos.entry_price_ticks = weighted as u64;
-        pos.size_lots = new_size;
-        return Ok(());
-    }
-    // Opposite side: realize PnL on the closed portion.
-    let close = fill_size.min(pos.size_lots);
-    let sign: i128 = if pos.side == 0 { 1 } else { -1 };
-    let pnl = sign
-        .checked_mul(close as i128).ok_or(ProgramError::ArithmeticOverflow)?
-        .checked_mul((fill_price as i128) - (pos.entry_price_ticks as i128)).ok_or(ProgramError::ArithmeticOverflow)?;
-    let pnl_c = if pnl > i64::MAX as i128 { i64::MAX } else if pnl < i64::MIN as i128 { i64::MIN } else { pnl as i64 };
-    pos.realized_pnl_quote_lots = pos.realized_pnl_quote_lots.checked_add(pnl_c).ok_or(ProgramError::ArithmeticOverflow)?;
-    if fill_size <= pos.size_lots {
-        pos.size_lots -= fill_size;
-        if pos.size_lots == 0 { pos.entry_price_ticks = 0; pos.set_cum_funding(fidx); }
-    } else {
-        pos.side = fill_side;
-        pos.size_lots = fill_size - pos.size_lots;
-        pos.entry_price_ticks = fill_price;
-        pos.set_cum_funding(fidx);
-    }
-    Ok(())
-}
-
 /// data: [size_lots u64][price_ticks u64][taker_side u8]
 /// accounts: [sequencer(signer), market, insurance, taker_ts, maker_ts, taker_pos, maker_pos]
 pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -88,8 +48,8 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
 
         let fidx = market.cum_funding();
         // Fills update both legs with identical matcher math.
-        apply_to_position(taker_pos, taker_side, size, price, fidx)?;
-        apply_to_position(maker_pos, maker_side, size, price, fidx)?;
+        crate::fill_math::apply_to_position(taker_pos, taker_side, size, price, fidx).map_err(|_| ProgramError::ArithmeticOverflow)?;
+        crate::fill_math::apply_to_position(maker_pos, maker_side, size, price, fidx).map_err(|_| ProgramError::ArithmeticOverflow)?;
 
         // Open interest.
         if taker_side == 0 { market.long_oi_lots = market.long_oi_lots.saturating_add(size); }

@@ -1,7 +1,9 @@
 //! Pod account layouts for the Pinocchio port. `#[repr(C)]`, 8-byte aligned,
 //! NO native u128/i128 (stored as `[u8;16]` — a 16-byte-aligned field is
 //! incompatible with the disc+8 data offset; see docs/CU_OPTIMIZATION.md).
-use pinocchio::pubkey::Pubkey;
+// Pubkey is [u8;32] (matches pinocchio::pubkey::Pubkey) — kept local so the
+// pure account math is host-testable without pulling Solana syscalls.
+pub type Pubkey = [u8; 32];
 
 pub const POSITION_DISC: [u8; 8] = [0xF1, 0x05, 0xB0, 0x0C, 0x50, 0x53, 0x00, 0x02];
 
