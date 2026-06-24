@@ -20,6 +20,10 @@ pub mod fees;
 pub mod borrow_fee;
 pub mod concentration;
 pub mod position_cap;
+pub mod daily_loss_limit;
+pub mod min_fill_size;
+pub mod reduce_only;
+pub mod funding_velocity;
 
 #[cfg(target_os = "solana")]
 mod program {
