@@ -86,6 +86,27 @@ backend becomes available (e.g. a future CBMC/SMT combination), the
 representative `D` in `kani_proofs` can be set straight to `H_DENOM` to close
 the gap entirely — the harness bodies need no other change.
 
+## Lean: closing the `1e9` divisor gap
+
+A theorem prover does not share CBMC's bitvector-division limitation, so the
+gap above is closed directly in Lean 4 (+ Mathlib) over unbounded `Nat`, with
+the **actual** `H_DENOM = 1_000_000_000`:
+
+| Lean theorem (`formal_verification/lean/Haircut.lean`) | Statement | Kani counterpart |
+|---|---|---|
+| `convert_ensures_0` | `(matured · h) / 1e9 ≤ matured`, given `h ≤ 1e9` | `proof_dust_conservation` |
+| `solvency_single_convert` | `(matured · h) / 1e9 ≤ residual`, given `matured·h ≤ backed·1e9`, `backed = min residual matured` | `proof_solvency_single_convert` |
+
+Both are `#print axioms`-clean — they depend only on `propext`,
+`Classical.choice`, `Quot.sound` (no `sorry`). Build + reproduction steps are in
+[`formal_verification/lean/README.md`](../formal_verification/lean/README.md).
+The `convert` state-machine shape was scaffolded by QEDGen
+(`qedgen codegen` from a `.qedspec`); the proof bodies are hand-written.
+
+So the two solvency-critical haircut bounds now hold **both** ways: Kani proves
+the divisor-agnostic structural statement (fast, in CI), and Lean proves the
+exact production-constant statement.
+
 ## Roadmap
 
 - **Monotonicity (#2)** — `h1 ≤ h2 ⇒ credit(h1) ≤ credit(h2)`. The harness is
