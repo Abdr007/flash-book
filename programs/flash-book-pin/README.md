@@ -32,8 +32,9 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   field is incompatible with the disc+8 data offset).
 - ✅ `apply_fill` + `settle_funding` (2 of 112), builds clean, measured above,
   and the ported math is host-equivalence-tested (11 tests).
-- ✅ **Hypertree ported** (the matching-engine red-black-tree core, 4,138 lines)
-  — no_std, builds for SBF, its 38 RBT/LLRB/free-list correctness tests pass.
+- ✅ **Hypertree ported** (matching-engine RB-tree core, 4,138 lines) — 38 tests pass.
+- ✅ **MarketBookHandle ported** (book account wrapper + zero-copy book types,
+  de-anchored via a compat shim) — 17 RBT/best-bid-ask/expand tests pass.
 - ⬜ De-anchor the 36 `matcher/` modules into a shared `no_std` core (9 currently
   pull `anchor_lang` for `Pubkey`).
 - ⬜ Remaining 111 instructions; events; CPI (token, ER); IDL/client.
