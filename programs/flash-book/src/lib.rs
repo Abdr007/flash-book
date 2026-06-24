@@ -1776,9 +1776,12 @@ pub mod flash_book {
     pub fn migrate_position_to_trader_state_key(
         ctx: Context<MigratePositionToTraderStateKey>,
     ) -> Result<()> {
-        let legacy = &ctx.accounts.legacy_position;
         let new_bump = ctx.bumps.new_position;
         let market_key = ctx.accounts.market.key();
+
+        // Snapshot the legacy position's state, then drop the read guard
+        // before initializing the new (zero-copy) position account.
+        let legacy = *ctx.accounts.legacy_position.load()?;
 
         require!(
             legacy.trader == ctx.accounts.trader.key(),
@@ -1788,20 +1791,22 @@ pub mod flash_book {
         // Note: legacy.collateral_quote_lots can be > 0 post Phase 2 if
         // the position was isolated — that value is preserved.
 
-        let new_pos = &mut ctx.accounts.new_position;
-        new_pos.market = legacy.market;
-        new_pos.trader = legacy.trader;
-        new_pos.side = legacy.side;
-        new_pos.size_lots = legacy.size_lots;
-        new_pos.entry_price_ticks = legacy.entry_price_ticks;
-        new_pos.cum_funding_index_at_entry = legacy.cum_funding_index_at_entry;
-        new_pos.realized_pnl_quote_lots = legacy.realized_pnl_quote_lots;
-        new_pos.funding_paid_quote_lots = legacy.funding_paid_quote_lots;
-        new_pos.last_settlement_batch = legacy.last_settlement_batch;
-        new_pos.unhealthy_since_slot = legacy.unhealthy_since_slot;
-        new_pos.last_liquidated_at_slot = legacy.last_liquidated_at_slot;
-        new_pos.collateral_quote_lots = legacy.collateral_quote_lots;
-        new_pos.bump = new_bump;
+        {
+            let mut new_pos = ctx.accounts.new_position.load_init()?;
+            new_pos.market = legacy.market;
+            new_pos.trader = legacy.trader;
+            new_pos.side = legacy.side;
+            new_pos.size_lots = legacy.size_lots;
+            new_pos.entry_price_ticks = legacy.entry_price_ticks;
+            new_pos.cum_funding_index_at_entry = legacy.cum_funding_index_at_entry;
+            new_pos.realized_pnl_quote_lots = legacy.realized_pnl_quote_lots;
+            new_pos.funding_paid_quote_lots = legacy.funding_paid_quote_lots;
+            new_pos.last_settlement_batch = legacy.last_settlement_batch;
+            new_pos.unhealthy_since_slot = legacy.unhealthy_since_slot;
+            new_pos.last_liquidated_at_slot = legacy.last_liquidated_at_slot;
+            new_pos.collateral_quote_lots = legacy.collateral_quote_lots;
+            new_pos.bump = new_bump;
+        }
 
         emit!(PositionMigratedEvent {
             trader: legacy.trader,
@@ -1916,12 +1921,15 @@ pub mod flash_book {
                 FlashBookError::LeverageExceeded
             );
         }
-        let position = &mut ctx.accounts.position;
-        let prev = position.leverage_cap;
-        position.leverage_cap = cap;
+        let (prev, trader) = {
+            let mut position = ctx.accounts.position.load_mut()?;
+            let prev = position.leverage_cap;
+            position.leverage_cap = cap;
+            (prev, position.trader)
+        };
         emit!(PositionLeverageUpdatedEvent {
             market: market.key(),
-            trader: position.trader,
+            trader,
             previous_cap: prev,
             new_cap: cap,
         });
@@ -1996,7 +2004,7 @@ pub mod flash_book {
                     side: if position.side == 0 { Side::Long } else { Side::Short },
                     size_lots: position.size_lots,
                     entry_price: Ticks(position.entry_price_ticks),
-                    cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                    cum_funding_index_at_entry: position.cum_funding_index(),
                     collateral_quote_lots: position.collateral_quote_lots,
                 });
                 market_snaps.push(RiskMarketSnap {
@@ -2442,7 +2450,7 @@ pub mod flash_book {
                 side: if position.side == 0 { Side::Long } else { Side::Short },
                 size_lots: position.size_lots,
                 entry_price: Ticks(position.entry_price_ticks),
-                cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                cum_funding_index_at_entry: position.cum_funding_index(),
                 collateral_quote_lots: position.collateral_quote_lots,
             });
             market_snaps.push(RiskMarketSnap {
@@ -2557,20 +2565,41 @@ pub mod flash_book {
             let ts = ctx.accounts.trader_state.load()?;
             (ts.trader, ts.open_positions as usize, ts.collateral_quote_lots)
         };
+        // Snapshot target position scalars (read guard dropped immediately).
+        let (
+            tp_trader,
+            tp_market,
+            tp_side,
+            tp_size_lots,
+            tp_entry_price_ticks,
+            tp_cum_funding_index_at_entry,
+            tp_collateral_quote_lots,
+        ) = {
+            let p = ctx.accounts.target_position.load()?;
+            (
+                p.trader,
+                p.market,
+                p.side,
+                p.size_lots,
+                p.entry_price_ticks,
+                p.cum_funding_index(),
+                p.collateral_quote_lots,
+            )
+        };
         require!(
-            ctx.accounts.target_position.trader == trader_pk,
+            tp_trader == trader_pk,
             FlashBookError::WrongTrader
         );
         require!(
-            ctx.accounts.target_position.market == ctx.accounts.target_market.key(),
+            tp_market == ctx.accounts.target_market.key(),
             FlashBookError::WrongMarket
         );
         require!(
-            ctx.accounts.target_position.size_lots > 0,
+            tp_size_lots > 0,
             FlashBookError::ZeroSize
         );
         require!(
-            ctx.accounts.target_position.collateral_quote_lots == 0,
+            tp_collateral_quote_lots == 0,
             FlashBookError::OutOfRange
         );
         require!(
@@ -2638,7 +2667,7 @@ pub mod flash_book {
                 side: if position.side == 0 { Side::Long } else { Side::Short },
                 size_lots: position.size_lots,
                 entry_price: Ticks(position.entry_price_ticks),
-                cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                cum_funding_index_at_entry: position.cum_funding_index(),
                 collateral_quote_lots: position.collateral_quote_lots,
             });
             market_snaps.push(RiskMarketSnap {
@@ -2659,14 +2688,13 @@ pub mod flash_book {
 
         // Add the target position too (will be in the isolated bucket).
         let target_market = &ctx.accounts.target_market;
-        let target_pos = &ctx.accounts.target_position;
         let target_market_key = target_market.key();
         snaps.push(RiskPosSnap {
-            market: target_pos.market,
-            side: if target_pos.side == 0 { Side::Long } else { Side::Short },
-            size_lots: target_pos.size_lots,
-            entry_price: Ticks(target_pos.entry_price_ticks),
-            cum_funding_index_at_entry: target_pos.cum_funding_index_at_entry,
+            market: tp_market,
+            side: if tp_side == 0 { Side::Long } else { Side::Short },
+            size_lots: tp_size_lots,
+            entry_price: Ticks(tp_entry_price_ticks),
+            cum_funding_index_at_entry: tp_cum_funding_index_at_entry,
             // Post-transition: target gets `amount_quote_lots` reserved as
             // its isolated collateral. The split assessment derives the
             // bucket assignment from `isolated_map` below, but we keep
@@ -2709,7 +2737,7 @@ pub mod flash_book {
 
         // Apply the transfer.
         ctx.accounts.trader_state.load_mut()?.collateral_quote_lots = post_cross_collateral;
-        ctx.accounts.target_position.collateral_quote_lots = post_isolated_collateral;
+        ctx.accounts.target_position.load_mut()?.collateral_quote_lots = post_isolated_collateral;
 
         emit!(PositionMarginModeChangedEvent {
             trader: trader_pk,
@@ -2737,15 +2765,36 @@ pub mod flash_book {
             let ts = ctx.accounts.trader_state.load()?;
             (ts.trader, ts.open_positions as usize, ts.collateral_quote_lots)
         };
+        // Snapshot target position scalars (read guard dropped immediately).
+        let (
+            tp_trader,
+            tp_market,
+            tp_side,
+            tp_size_lots,
+            tp_entry_price_ticks,
+            tp_cum_funding_index_at_entry,
+            tp_collateral_quote_lots,
+        ) = {
+            let p = ctx.accounts.target_position.load()?;
+            (
+                p.trader,
+                p.market,
+                p.side,
+                p.size_lots,
+                p.entry_price_ticks,
+                p.cum_funding_index(),
+                p.collateral_quote_lots,
+            )
+        };
         require!(
-            ctx.accounts.target_position.trader == trader_pk,
+            tp_trader == trader_pk,
             FlashBookError::WrongTrader
         );
         require!(
-            ctx.accounts.target_position.market == ctx.accounts.target_market.key(),
+            tp_market == ctx.accounts.target_market.key(),
             FlashBookError::WrongMarket
         );
-        let returned = ctx.accounts.target_position.collateral_quote_lots;
+        let returned = tp_collateral_quote_lots;
         require!(returned > 0, FlashBookError::OutOfRange);
 
         let program_id = ctx.program_id;
@@ -2803,7 +2852,7 @@ pub mod flash_book {
                 side: if position.side == 0 { Side::Long } else { Side::Short },
                 size_lots: position.size_lots,
                 entry_price: Ticks(position.entry_price_ticks),
-                cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                cum_funding_index_at_entry: position.cum_funding_index(),
                 collateral_quote_lots: position.collateral_quote_lots,
             });
             market_snaps.push(RiskMarketSnap {
@@ -2824,15 +2873,14 @@ pub mod flash_book {
 
         // Add the target position into the cross set (post-transition).
         let target_market = &ctx.accounts.target_market;
-        let target_pos = &ctx.accounts.target_position;
         let target_market_key = target_market.key();
-        if target_pos.size_lots > 0 {
+        if tp_size_lots > 0 {
             snaps.push(RiskPosSnap {
-                market: target_pos.market,
-                side: if target_pos.side == 0 { Side::Long } else { Side::Short },
-                size_lots: target_pos.size_lots,
-                entry_price: Ticks(target_pos.entry_price_ticks),
-                cum_funding_index_at_entry: target_pos.cum_funding_index_at_entry,
+                market: tp_market,
+                side: if tp_side == 0 { Side::Long } else { Side::Short },
+                size_lots: tp_size_lots,
+                entry_price: Ticks(tp_entry_price_ticks),
+                cum_funding_index_at_entry: tp_cum_funding_index_at_entry,
                 // Post-transition: target is cross-margined.
                 collateral_quote_lots: 0,
             });
@@ -2872,7 +2920,7 @@ pub mod flash_book {
 
         // Apply the transfer.
         ctx.accounts.trader_state.load_mut()?.collateral_quote_lots = post_cross_collateral;
-        ctx.accounts.target_position.collateral_quote_lots = 0;
+        ctx.accounts.target_position.load_mut()?.collateral_quote_lots = 0;
 
         emit!(PositionMarginModeChangedEvent {
             trader: trader_pk,
@@ -2902,12 +2950,12 @@ pub mod flash_book {
     /// underwater positions block keepers from settling them.
     pub fn settle_funding(ctx: Context<SettleFunding>) -> Result<()> {
         let market = &ctx.accounts.market;
-        let position = &mut ctx.accounts.position;
+        let mut position = ctx.accounts.position.load_mut()?;
         let mut trader_state = ctx.accounts.trader_state.load_mut()?;
 
         // No-op for empty positions.
         if position.size_lots == 0 {
-            position.cum_funding_index_at_entry = market.cum_funding_index;
+            position.set_cum_funding_index(market.cum_funding_index);
             return Ok(());
         }
 
@@ -2933,7 +2981,7 @@ pub mod flash_book {
             is_long,
             notional,
             market.cum_funding_index,
-            position.cum_funding_index_at_entry,
+            position.cum_funding_index(),
         )?;
 
         // Apply settlement: positive owed → trader pays, negative → receives.
@@ -3016,7 +3064,7 @@ pub mod flash_book {
             .funding_paid_quote_lots
             .checked_add(owed_i64)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        position.cum_funding_index_at_entry = market.cum_funding_index;
+        position.set_cum_funding_index(market.cum_funding_index);
 
         emit!(FundingSettledEvent {
             market: market.key(),
@@ -3094,6 +3142,25 @@ pub mod flash_book {
             ctx.accounts.maker_trader_state.key(),
             ctx.accounts.maker_trader_state.load()?.bump,
             ctx.program_id,
+        )?;
+
+        // init_if_needed zero-copy: a freshly-created PositionAccount has a
+        // zeroed discriminator until `load_init()` writes it — without this,
+        // the first load()/load_mut() below fails AccountDiscriminatorMismatch.
+        // On an already-existing position load_init() returns Err with NO side
+        // effect, so this is a safe one-time discriminator stamp.
+        // init_if_needed zero-copy: Anchor's AccountLoader writes the
+        // discriminator only in exit() (instruction end), so a freshly
+        // created position's disc is still zero during this handler and the
+        // load()/load_mut() calls below would fail AccountDiscriminatorMismatch.
+        // Stamp it now; no-op for an already-initialized position.
+        stamp_zc_discriminator(
+            &ctx.accounts.taker_position.to_account_info(),
+            <state::PositionAccount as anchor_lang::Discriminator>::DISCRIMINATOR,
+        )?;
+        stamp_zc_discriminator(
+            &ctx.accounts.maker_position.to_account_info(),
+            <state::PositionAccount as anchor_lang::Discriminator>::DISCRIMINATOR,
         )?;
 
         let market = &mut ctx.accounts.market;
@@ -3259,12 +3326,12 @@ pub mod flash_book {
         // bucket" (>0) or "fee against the cross pool" (0). For a brand-
         // new position freshly init'd by this ix the value is 0 (cross
         // by default), matching the intent.
-        let taker_pos_isolated = ctx.accounts.taker_position.collateral_quote_lots > 0;
-        let maker_pos_isolated = ctx.accounts.maker_position.collateral_quote_lots > 0;
+        let taker_pos_isolated = ctx.accounts.taker_position.load()?.collateral_quote_lots > 0;
+        let maker_pos_isolated = ctx.accounts.maker_position.load()?.collateral_quote_lots > 0;
         {
             if taker_fee > 0 {
                 if taker_pos_isolated {
-                    let p = &mut ctx.accounts.taker_position;
+                    let mut p = ctx.accounts.taker_position.load_mut()?;
                     p.collateral_quote_lots = p
                         .collateral_quote_lots
                         .checked_sub(taker_fee)
@@ -3284,7 +3351,7 @@ pub mod flash_book {
                     taker_negative_rebate_u128 as u64
                 };
                 if taker_pos_isolated {
-                    let p = &mut ctx.accounts.taker_position;
+                    let mut p = ctx.accounts.taker_position.load_mut()?;
                     p.collateral_quote_lots = p
                         .collateral_quote_lots
                         .checked_add(neg_rebate_u64)
@@ -3305,7 +3372,7 @@ pub mod flash_book {
         {
             if maker_rebate > 0 {
                 if maker_pos_isolated {
-                    let p = &mut ctx.accounts.maker_position;
+                    let mut p = ctx.accounts.maker_position.load_mut()?;
                     p.collateral_quote_lots = p
                         .collateral_quote_lots
                         .checked_add(maker_rebate)
@@ -3320,7 +3387,7 @@ pub mod flash_book {
             }
             if maker_fee > 0 {
                 if maker_pos_isolated {
-                    let p = &mut ctx.accounts.maker_position;
+                    let mut p = ctx.accounts.maker_position.load_mut()?;
                     p.collateral_quote_lots = p
                         .collateral_quote_lots
                         .checked_sub(maker_fee)
@@ -3565,42 +3632,69 @@ pub mod flash_book {
             }
         }
 
-        let taker_pos = &mut ctx.accounts.taker_position;
-        let maker_pos = &mut ctx.accounts.maker_position;
+        // Scope the position write-guards: they MUST drop before the
+        // realized-PnL helpers below re-`load_mut()` the same accounts.
+        let (
+            taker_was_open,
+            maker_was_open,
+            taker_pre_side,
+            maker_pre_side,
+            taker_pre_size,
+            maker_pre_size,
+            taker_pre_realized,
+            maker_pre_realized,
+            taker_pos_isolated_for_pnl,
+            maker_pos_isolated_for_pnl,
+        ) = {
+            let mut taker_pos = ctx.accounts.taker_position.load_mut()?;
+            let mut maker_pos = ctx.accounts.maker_position.load_mut()?;
 
-        // Initialize Position state on first ever fill against this PDA.
-        if taker_pos.market == Pubkey::default() {
-            taker_pos.market = market_key;
-            taker_pos.trader = taker_trader_pk;
-            taker_pos.bump = ctx.bumps.taker_position;
-            taker_pos.cum_funding_index_at_entry = funding_index;
-            taker_pos.last_settlement_batch = current_batch;
-        }
-        if maker_pos.market == Pubkey::default() {
-            maker_pos.market = market_key;
-            maker_pos.trader = maker_trader_pk;
-            maker_pos.bump = ctx.bumps.maker_position;
-            maker_pos.cum_funding_index_at_entry = funding_index;
-            maker_pos.last_settlement_batch = current_batch;
-        }
+            // Initialize Position state on first ever fill against this PDA.
+            if taker_pos.market == Pubkey::default() {
+                taker_pos.market = market_key;
+                taker_pos.trader = taker_trader_pk;
+                taker_pos.bump = ctx.bumps.taker_position;
+                taker_pos.set_cum_funding_index(funding_index);
+                taker_pos.last_settlement_batch = current_batch;
+            }
+            if maker_pos.market == Pubkey::default() {
+                maker_pos.market = market_key;
+                maker_pos.trader = maker_trader_pk;
+                maker_pos.bump = ctx.bumps.maker_position;
+                maker_pos.set_cum_funding_index(funding_index);
+                maker_pos.last_settlement_batch = current_batch;
+            }
 
-        // Snapshot pre-state so we can detect open/close transitions
-        // AND compute the realized-PnL delta this fill produced. The
-        // delta is what `apply_fill_to_position` accumulates onto
-        // `pos.realized_pnl_quote_lots` for the closed-portion legs.
-        let taker_was_open = taker_pos.size_lots > 0;
-        let maker_was_open = maker_pos.size_lots > 0;
-        let taker_pre_side = taker_pos.side;
-        let maker_pre_side = maker_pos.side;
-        let taker_pre_size = taker_pos.size_lots;
-        let maker_pre_size = maker_pos.size_lots;
-        let taker_pre_realized = taker_pos.realized_pnl_quote_lots;
-        let maker_pre_realized = maker_pos.realized_pnl_quote_lots;
-        let taker_pos_isolated_for_pnl = taker_pos.collateral_quote_lots > 0;
-        let maker_pos_isolated_for_pnl = maker_pos.collateral_quote_lots > 0;
+            // Snapshot pre-state so we can detect open/close transitions
+            // AND compute the realized-PnL delta this fill produced. The
+            // delta is what `apply_fill_to_position` accumulates onto
+            // `pos.realized_pnl_quote_lots` for the closed-portion legs.
+            let taker_was_open = taker_pos.size_lots > 0;
+            let maker_was_open = maker_pos.size_lots > 0;
+            let taker_pre_side = taker_pos.side;
+            let maker_pre_side = maker_pos.side;
+            let taker_pre_size = taker_pos.size_lots;
+            let maker_pre_size = maker_pos.size_lots;
+            let taker_pre_realized = taker_pos.realized_pnl_quote_lots;
+            let maker_pre_realized = maker_pos.realized_pnl_quote_lots;
+            let taker_pos_isolated_for_pnl = taker_pos.collateral_quote_lots > 0;
+            let maker_pos_isolated_for_pnl = maker_pos.collateral_quote_lots > 0;
 
-        apply_fill_to_position(taker_pos, taker_side_enum, size_lots, price_ticks, funding_index)?;
-        apply_fill_to_position(maker_pos, maker_side_enum, size_lots, price_ticks, funding_index)?;
+            apply_fill_to_position(&mut taker_pos, taker_side_enum, size_lots, price_ticks, funding_index)?;
+            apply_fill_to_position(&mut maker_pos, maker_side_enum, size_lots, price_ticks, funding_index)?;
+            (
+                taker_was_open,
+                maker_was_open,
+                taker_pre_side,
+                maker_pre_side,
+                taker_pre_size,
+                maker_pre_size,
+                taker_pre_realized,
+                maker_pre_realized,
+                taker_pos_isolated_for_pnl,
+                maker_pos_isolated_for_pnl,
+            )
+        };
 
         // ── Phase 2g realized-PnL materialisation ───────────────────
         // `apply_fill_to_position` writes the realized-PnL delta into
@@ -3623,9 +3717,11 @@ pub mod flash_book {
         // next health check and the position becomes liquidatable. The
         // cross path uses checked_sub and surfaces an error rather
         // than silently going negative.
-        let taker_pnl_delta = (taker_pos.realized_pnl_quote_lots as i128)
+        let taker_post_realized = ctx.accounts.taker_position.load()?.realized_pnl_quote_lots;
+        let maker_post_realized = ctx.accounts.maker_position.load()?.realized_pnl_quote_lots;
+        let taker_pnl_delta = (taker_post_realized as i128)
             .saturating_sub(taker_pre_realized as i128);
-        let maker_pnl_delta = (maker_pos.realized_pnl_quote_lots as i128)
+        let maker_pnl_delta = (maker_post_realized as i128)
             .saturating_sub(maker_pre_realized as i128);
 
         // Wave 24d: route positive deltas through the H-haircut reserve
@@ -3653,16 +3749,23 @@ pub mod flash_book {
             )?;
         }
 
-        let taker_pos = &mut ctx.accounts.taker_position;
-        let maker_pos = &mut ctx.accounts.maker_position;
+        // Post-fill position scalars (read guards dropped immediately).
+        let (taker_post_side, taker_post_size) = {
+            let p = ctx.accounts.taker_position.load()?;
+            (p.side, p.size_lots)
+        };
+        let (maker_post_side, maker_post_size) = {
+            let p = ctx.accounts.maker_position.load()?;
+            (p.side, p.size_lots)
+        };
 
         // Update OI counters: walk pre→post for each side.
-        update_oi(market, taker_pre_side, taker_pre_size, taker_pos.side, taker_pos.size_lots)?;
-        update_oi(market, maker_pre_side, maker_pre_size, maker_pos.side, maker_pos.size_lots)?;
+        update_oi(market, taker_pre_side, taker_pre_size, taker_post_side, taker_post_size)?;
+        update_oi(market, maker_pre_side, maker_pre_size, maker_post_side, maker_post_size)?;
 
         // Update open_positions transitions on TraderState.
-        let taker_is_open = taker_pos.size_lots > 0;
-        let maker_is_open = maker_pos.size_lots > 0;
+        let taker_is_open = taker_post_size > 0;
+        let maker_is_open = maker_post_size > 0;
         {
             let mut taker_state = ctx.accounts.taker_trader_state.load_mut()?;
             if !taker_was_open && taker_is_open {
@@ -3786,30 +3889,36 @@ pub mod flash_book {
         // can push pre-liquidation alerts. Hyperliquid pattern.
         let taker_collateral_now = ctx.accounts.taker_trader_state.load()?.collateral_quote_lots;
         let maker_collateral_now = ctx.accounts.maker_trader_state.load()?.collateral_quote_lots;
-        for (pos, trader_pk, collateral) in [
-            (
-                &*ctx.accounts.taker_position,
-                taker_trader_pk,
-                taker_collateral_now,
-            ),
-            (
-                &*ctx.accounts.maker_position,
-                maker_trader_pk,
-                maker_collateral_now,
-            ),
-        ] {
-            if pos.size_lots == 0 {
-                continue;
+        let mark_ticks = market.mark_price_ticks;
+        let tick_size = market.params.tick_size;
+        let mmr_bps = market.params.maintenance_margin_ratio_bps;
+        {
+            let pos = ctx.accounts.taker_position.load()?;
+            if pos.size_lots > 0 {
+                emit_margin_threshold_if_crossed(
+                    taker_trader_pk,
+                    market_key,
+                    &*pos,
+                    mark_ticks,
+                    tick_size,
+                    mmr_bps,
+                    taker_collateral_now,
+                );
             }
-            emit_margin_threshold_if_crossed(
-                trader_pk,
-                market_key,
-                pos,
-                market.mark_price_ticks,
-                market.params.tick_size,
-                market.params.maintenance_margin_ratio_bps,
-                collateral,
-            );
+        }
+        {
+            let pos = ctx.accounts.maker_position.load()?;
+            if pos.size_lots > 0 {
+                emit_margin_threshold_if_crossed(
+                    maker_trader_pk,
+                    market_key,
+                    &*pos,
+                    mark_ticks,
+                    tick_size,
+                    mmr_bps,
+                    maker_collateral_now,
+                );
+            }
         }
 
         Ok(())
@@ -4506,15 +4615,17 @@ pub mod flash_book {
 
         validate_leg_intake(&ctx.accounts.market_a, &leg_a)?;
         validate_leg_intake(&ctx.accounts.market_b, &leg_b)?;
+        let position_a = ctx.accounts.position_a.load()?;
+        let position_b = ctx.accounts.position_b.load()?;
         check_caps_for_leg(
             &ctx.accounts.market_a,
-            &ctx.accounts.position_a,
+            &position_a,
             &ctx.accounts.flp_exposure,
             &leg_a,
         )?;
         check_caps_for_leg(
             &ctx.accounts.market_b,
-            &ctx.accounts.position_b,
+            &position_b,
             &ctx.accounts.flp_exposure,
             &leg_b,
         )?;
@@ -4523,12 +4634,12 @@ pub mod flash_book {
         let market_b = &ctx.accounts.market_b;
         let market_a_key = mkt_a;
         let market_b_key = mkt_b;
-        let position_a = &ctx.accounts.position_a;
-        let position_b = &ctx.accounts.position_b;
         let trader_key = ctx.accounts.trader.key();
 
-        let proj_a = project_post_leg(position_a, &leg_a, market_a, market_a_key, trader_key)?;
-        let proj_b = project_post_leg(position_b, &leg_b, market_b, market_b_key, trader_key)?;
+        let proj_a = project_post_leg(&position_a, &leg_a, market_a, market_a_key, trader_key)?;
+        let proj_b = project_post_leg(&position_b, &leg_b, market_b, market_b_key, trader_key)?;
+        drop(position_a);
+        drop(position_b);
 
         let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(2);
         let mut markets: Vec<RiskMarketSnap> = Vec::with_capacity(2);
@@ -4792,7 +4903,7 @@ pub mod flash_book {
         require!(fired, FlashBookError::OutOfRange);
 
         if trigger.flags & state::TriggerOrderAccount::FLAG_REDUCE_ONLY != 0 {
-            let position = &ctx.accounts.position;
+            let position = ctx.accounts.position.load()?;
             require!(position.size_lots > 0, FlashBookError::OutOfRange);
             require!(position.side != trigger.side, FlashBookError::OutOfRange);
             require!(
@@ -5563,7 +5674,7 @@ pub mod flash_book {
                 side: if position.side == 0 { Side::Long } else { Side::Short },
                 size_lots: position.size_lots,
                 entry_price: Ticks(position.entry_price_ticks),
-                cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                cum_funding_index_at_entry: position.cum_funding_index(),
                 collateral_quote_lots: position.collateral_quote_lots,
             });
             market_snaps.push(RiskMarketSnap {
@@ -5659,6 +5770,13 @@ pub mod flash_book {
             ctx.accounts.taker_trader_state.key(),
             ctx.accounts.taker_trader_state.load()?.bump,
             ctx.program_id,
+        )?;
+
+        // init_if_needed zero-copy: stamp the discriminator on a freshly
+        // created taker position (see apply_fill for the full rationale).
+        stamp_zc_discriminator(
+            &ctx.accounts.taker_position.to_account_info(),
+            <state::PositionAccount as anchor_lang::Discriminator>::DISCRIMINATOR,
         )?;
 
         let market = &mut ctx.accounts.market;
@@ -5826,22 +5944,39 @@ pub mod flash_book {
             }
         }
 
-        let taker_pos = &mut ctx.accounts.taker_position;
-        if taker_pos.market == Pubkey::default() {
-            taker_pos.market = market_key;
-            taker_pos.trader = taker_trader_pk;
-            taker_pos.bump = ctx.bumps.taker_position;
-            taker_pos.cum_funding_index_at_entry = funding_index;
-            taker_pos.last_settlement_batch = current_batch;
-        }
+        // Scope the position write-guard so it drops before the realized-
+        // PnL helper below re-`load_mut()`s the same account.
+        let (
+            taker_was_open,
+            taker_pre_side,
+            taker_pre_size,
+            taker_pre_realized,
+            taker_pos_isolated_for_pnl,
+        ) = {
+            let mut taker_pos = ctx.accounts.taker_position.load_mut()?;
+            if taker_pos.market == Pubkey::default() {
+                taker_pos.market = market_key;
+                taker_pos.trader = taker_trader_pk;
+                taker_pos.bump = ctx.bumps.taker_position;
+                taker_pos.set_cum_funding_index(funding_index);
+                taker_pos.last_settlement_batch = current_batch;
+            }
 
-        let taker_was_open = taker_pos.size_lots > 0;
-        let taker_pre_side = taker_pos.side;
-        let taker_pre_size = taker_pos.size_lots;
-        let taker_pre_realized = taker_pos.realized_pnl_quote_lots;
-        let taker_pos_isolated_for_pnl = taker_pos.collateral_quote_lots > 0;
+            let taker_was_open = taker_pos.size_lots > 0;
+            let taker_pre_side = taker_pos.side;
+            let taker_pre_size = taker_pos.size_lots;
+            let taker_pre_realized = taker_pos.realized_pnl_quote_lots;
+            let taker_pos_isolated_for_pnl = taker_pos.collateral_quote_lots > 0;
 
-        apply_fill_to_position(taker_pos, taker_side_enum, size_lots, price_ticks, funding_index)?;
+            apply_fill_to_position(&mut taker_pos, taker_side_enum, size_lots, price_ticks, funding_index)?;
+            (
+                taker_was_open,
+                taker_pre_side,
+                taker_pre_size,
+                taker_pre_realized,
+                taker_pos_isolated_for_pnl,
+            )
+        };
 
         // Phase 2g — materialise realized-PnL delta on the FLP fill
         // path. Same routing rule as `apply_fill`: isolated → per-
@@ -5850,7 +5985,8 @@ pub mod flash_book {
         // below) and the LP-share NAV walks that to compute LP value;
         // it doesn't accumulate on `pos.realized_pnl_quote_lots` so
         // there's nothing to settle on the FLP maker side.
-        let taker_pnl_delta = (taker_pos.realized_pnl_quote_lots as i128)
+        let taker_post_realized = ctx.accounts.taker_position.load()?.realized_pnl_quote_lots;
+        let taker_pnl_delta = (taker_post_realized as i128)
             .saturating_sub(taker_pre_realized as i128);
         // Wave 24d: route positive deltas through H-haircut reserve when
         // the per-position haircut state is provided. Losses always
@@ -5867,9 +6003,12 @@ pub mod flash_book {
             )?;
         }
 
-        let taker_pos = &mut ctx.accounts.taker_position;
+        let (taker_post_side, taker_post_size) = {
+            let p = ctx.accounts.taker_position.load()?;
+            (p.side, p.size_lots)
+        };
 
-        update_oi(market, taker_pre_side, taker_pre_size, taker_pos.side, taker_pos.size_lots)?;
+        update_oi(market, taker_pre_side, taker_pre_size, taker_post_side, taker_post_size)?;
 
         // Update FLP per-market entry on the OPPOSITE side.
         let flp = &mut ctx.accounts.flp_exposure;
@@ -5879,7 +6018,7 @@ pub mod flash_book {
         update_oi(market, flp_pre.0, flp_pre.1, flp_post.0, flp_post.1)?;
 
         // Update open_positions on TraderState.
-        let taker_is_open = taker_pos.size_lots > 0;
+        let taker_is_open = taker_post_size > 0;
         {
             let mut taker_state = ctx.accounts.taker_trader_state.load_mut()?;
             if !taker_was_open && taker_is_open {
@@ -5950,7 +6089,9 @@ pub mod flash_book {
         requested_close_lots: u64,
     ) -> Result<()> {
         let market = &ctx.accounts.market;
-        let position = &ctx.accounts.position;
+        // Snapshot the position (Copy) so reads don't hold a borrow that
+        // would collide with the later `load_mut()` write-back.
+        let position = *ctx.accounts.position.load()?;
         let (trader_state_pre_trader, trader_state_pre_collateral) = {
             let ts = ctx.accounts.trader_state.load()?;
             (ts.trader, ts.collateral_quote_lots)
@@ -6044,7 +6185,7 @@ pub mod flash_book {
             side: pos_side,
             size_lots: position.size_lots,
             entry_price: Ticks(position.entry_price_ticks),
-            cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+            cum_funding_index_at_entry: position.cum_funding_index(),
             collateral_quote_lots: position.collateral_quote_lots,
         };
         let market_snap = RiskMarketSnap {
@@ -6265,9 +6406,9 @@ pub mod flash_book {
             let mut reward_bps_eff = market.params.liquidator_reward_bps as u128;
             let auction_duration =
                 market.params.liquidation_auction_duration_slots as u64;
-            if auction_duration > 0 && ctx.accounts.position.unhealthy_since_slot > 0 {
+            if auction_duration > 0 && position.unhealthy_since_slot > 0 {
                 let elapsed = current_slot
-                    .saturating_sub(ctx.accounts.position.unhealthy_since_slot);
+                    .saturating_sub(position.unhealthy_since_slot);
                 let scale = (elapsed.min(auction_duration) as u128)
                     .saturating_mul(constants::BPS_DENOM as u128)
                     / (auction_duration as u128);
@@ -6294,9 +6435,9 @@ pub mod flash_book {
             // close-order + insurance fund settle the remaining loss).
             // For a cross position, behavior is unchanged: reward debits
             // the pooled trader_state.collateral_quote_lots.
-            let is_isolated = ctx.accounts.position.collateral_quote_lots > 0;
+            let is_isolated = position.collateral_quote_lots > 0;
             if is_isolated {
-                let pos = &mut ctx.accounts.position;
+                let mut pos = ctx.accounts.position.load_mut()?;
                 reward_paid = reward_u64.min(pos.collateral_quote_lots);
                 if reward_paid > 0 {
                     pos.collateral_quote_lots -= reward_paid;
@@ -6364,11 +6505,13 @@ pub mod flash_book {
             };
         }
 
-        let position = &mut ctx.accounts.position;
-        if position.unhealthy_since_slot == 0 {
-            position.unhealthy_since_slot = current_slot;
+        {
+            let mut position = ctx.accounts.position.load_mut()?;
+            if position.unhealthy_since_slot == 0 {
+                position.unhealthy_since_slot = current_slot;
+            }
+            position.last_liquidated_at_slot = current_slot;
         }
-        position.last_liquidated_at_slot = current_slot;
 
         emit!(LiquidationInjectedV2Event {
             market: market_key,
@@ -6473,8 +6616,11 @@ pub mod flash_book {
         require!(close_size_lots > 0, FlashBookError::ZeroSize);
 
         let market = &ctx.accounts.market;
-        let underwater = &ctx.accounts.underwater_position;
-        let counter = &ctx.accounts.counter_position;
+        // Snapshot both positions (Copy) so reads don't hold borrows that
+        // collide with the later `load_mut()` write-backs. These are
+        // DIFFERENT accounts, but the snapshot keeps each read clean.
+        let underwater = *ctx.accounts.underwater_position.load()?;
+        let counter = *ctx.accounts.counter_position.load()?;
 
         // Sanity: positions on this market, opposite sides, both have size.
         require!(underwater.market == market.key(), FlashBookError::WrongMarket);
@@ -6521,7 +6667,7 @@ pub mod flash_book {
             side: if underwater.side == 0 { Side::Long } else { Side::Short },
             size_lots: underwater.size_lots,
             entry_price: Ticks(underwater.entry_price_ticks),
-            cum_funding_index_at_entry: underwater.cum_funding_index_at_entry,
+            cum_funding_index_at_entry: underwater.cum_funding_index(),
             collateral_quote_lots: underwater.collateral_quote_lots,
         };
         let market_snap = RiskMarketSnap {
@@ -6650,10 +6796,10 @@ pub mod flash_book {
             let (new_pos_collat, new_ts_collat) = route_adl_loss(
                 underwater_isolated,
                 loss_quote_lots,
-                ctx.accounts.underwater_position.collateral_quote_lots,
+                underwater.collateral_quote_lots,
                 ctx.accounts.underwater_trader_state.load()?.collateral_quote_lots,
             );
-            ctx.accounts.underwater_position.collateral_quote_lots = new_pos_collat;
+            ctx.accounts.underwater_position.load_mut()?.collateral_quote_lots = new_pos_collat;
             ctx.accounts.underwater_trader_state.load_mut()?.collateral_quote_lots = new_ts_collat;
         }
         {
@@ -6670,10 +6816,10 @@ pub mod flash_book {
             let (new_pos_collat, new_ts_collat) = route_adl_gain(
                 counter_isolated,
                 counter_gain,
-                ctx.accounts.counter_position.collateral_quote_lots,
+                counter.collateral_quote_lots,
                 ctx.accounts.counter_trader_state.load()?.collateral_quote_lots,
             )?;
-            ctx.accounts.counter_position.collateral_quote_lots = new_pos_collat;
+            ctx.accounts.counter_position.load_mut()?.collateral_quote_lots = new_pos_collat;
             ctx.accounts.counter_trader_state.load_mut()?.collateral_quote_lots = new_ts_collat;
         }
         {
@@ -6686,8 +6832,8 @@ pub mod flash_book {
         // Reduce both positions by close_size. If a side closes to zero,
         // decrement open_positions on that trader_state. (Snapshot
         // values were hoisted above the settlement block.)
-        {
-            let uw = &mut ctx.accounts.underwater_position;
+        let (uw_post_side, uw_post_size) = {
+            let mut uw = ctx.accounts.underwater_position.load_mut()?;
             uw.size_lots = uw.size_lots.saturating_sub(close_size_lots);
             if uw.size_lots == 0 {
                 // Reset settlement anchors on close.
@@ -6695,20 +6841,18 @@ pub mod flash_book {
                 uw.unhealthy_since_slot = 0;
                 uw.last_liquidated_at_slot = 0;
             }
-        }
-        {
-            let ct = &mut ctx.accounts.counter_position;
+            (uw.side, uw.size_lots)
+        };
+        let (ct_post_side, ct_post_size) = {
+            let mut ct = ctx.accounts.counter_position.load_mut()?;
             ct.size_lots = ct.size_lots.saturating_sub(close_size_lots);
             if ct.size_lots == 0 {
                 ct.entry_price_ticks = 0;
             }
-        }
+            (ct.side, ct.size_lots)
+        };
 
         // OI updates: walk pre→post for each side.
-        let uw_post_side = ctx.accounts.underwater_position.side;
-        let uw_post_size = ctx.accounts.underwater_position.size_lots;
-        let ct_post_side = ctx.accounts.counter_position.side;
-        let ct_post_size = ctx.accounts.counter_position.size_lots;
         let market = &mut ctx.accounts.market;
         update_oi(market, uw_pre_side, uw_pre_size, uw_post_side, uw_post_size)?;
         update_oi(market, ct_pre_side, ct_pre_size, ct_post_side, ct_post_size)?;
@@ -6752,7 +6896,7 @@ pub mod flash_book {
         ctx: Context<'_, '_, '_, 'info, LiquidatePortfolioV2<'info>>,
     ) -> Result<()> {
         let exec_market = &ctx.accounts.execution_market;
-        let exec_position = &ctx.accounts.execution_position;
+        let exec_position = *ctx.accounts.execution_position.load()?;
         let trader_state = ctx.accounts.trader_state.load()?;
 
         require!(
@@ -6788,7 +6932,7 @@ pub mod flash_book {
             side: if exec_position.side == 0 { Side::Long } else { Side::Short },
             size_lots: exec_position.size_lots,
             entry_price: Ticks(exec_position.entry_price_ticks),
-            cum_funding_index_at_entry: exec_position.cum_funding_index_at_entry,
+            cum_funding_index_at_entry: exec_position.cum_funding_index(),
             collateral_quote_lots: exec_position.collateral_quote_lots,
         });
 
@@ -6835,7 +6979,7 @@ pub mod flash_book {
                     side: if position.side == 0 { Side::Long } else { Side::Short },
                     size_lots: position.size_lots,
                     entry_price: Ticks(position.entry_price_ticks),
-                    cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+                    cum_funding_index_at_entry: position.cum_funding_index(),
                     collateral_quote_lots: position.collateral_quote_lots,
                 });
             }
@@ -7108,7 +7252,7 @@ pub mod flash_book {
         }
 
         if trigger.flags & state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY != 0 {
-            let position = &ctx.accounts.position;
+            let position = ctx.accounts.position.load()?;
             require!(position.size_lots > 0, FlashBookError::OutOfRange);
             require!(position.side != trigger.side, FlashBookError::OutOfRange);
             require!(
@@ -9052,9 +9196,11 @@ pub mod flash_book {
     /// `release_gain_to_haircut` against it. Wave 24d/e will replace
     /// this with `init_if_needed` inside `apply_fill`'s gain path.
     pub fn init_position_haircut_state(ctx: Context<InitPositionHaircutState>) -> Result<()> {
+        let position_market = ctx.accounts.position.load()?.market;
+        let position_key = ctx.accounts.position.key();
         let st = &mut ctx.accounts.position_haircut;
-        st.market = ctx.accounts.position.market;
-        st.position = ctx.accounts.position.key();
+        st.market = position_market;
+        st.position = position_key;
         st.bump = ctx.bumps.position_haircut;
         st._pad0 = [0; 7];
         st.released_reserve_quote_lots = 0;
@@ -9099,13 +9245,10 @@ pub mod flash_book {
             FlashBookError::Unauthorized
         );
 
-        let position = &mut ctx.accounts.position;
-        let pos_haircut = &mut ctx.accounts.position_haircut;
-        let market_haircut = &mut ctx.accounts.haircut_state;
-
         // Same bucket-selection rule as `compute_realized_pnl_routing`.
-        let isolated = position.collateral_quote_lots > 0;
+        let isolated = ctx.accounts.position.load()?.collateral_quote_lots > 0;
         if isolated {
+            let mut position = ctx.accounts.position.load_mut()?;
             position.collateral_quote_lots = position
                 .collateral_quote_lots
                 .checked_sub(gain_quote_lots)
@@ -9117,6 +9260,9 @@ pub mod flash_book {
                 .checked_sub(gain_quote_lots)
                 .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
         }
+
+        let pos_haircut = &mut ctx.accounts.position_haircut;
+        let market_haircut = &mut ctx.accounts.haircut_state;
 
         // Push the moved amount into the position's reserve via the
         // pure module — same path apply_fill will use in Wave 24d.
@@ -9631,17 +9777,17 @@ pub struct MaturePosition<'info> {
     /// Re-derive its PDA via the account's stored fields so we don't
     /// have to thread market/trader through ix args.
     #[account(
-        seeds = [state::PositionAccount::SEED, position.market.as_ref(), position.trader.as_ref()],
-        bump = position.bump,
-        constraint = position.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
+        bump = position.load()?.bump,
+        constraint = position.load()?.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
     )]
-    pub position: Box<Account<'info, state::PositionAccount>>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         mut,
         seeds = [
             state_v3::PositionHaircutStateAccount::SEED,
-            position.market.as_ref(),
+            position.load()?.market.as_ref(),
             position.key().as_ref(),
         ],
         bump = position_haircut.bump,
@@ -9664,17 +9810,17 @@ pub struct ConvertPosition<'info> {
     pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
 
     #[account(
-        seeds = [state::PositionAccount::SEED, position.market.as_ref(), position.trader.as_ref()],
-        bump = position.bump,
-        constraint = position.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
+        bump = position.load()?.bump,
+        constraint = position.load()?.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
     )]
-    pub position: Box<Account<'info, state::PositionAccount>>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         mut,
         seeds = [
             state_v3::PositionHaircutStateAccount::SEED,
-            position.market.as_ref(),
+            position.load()?.market.as_ref(),
             position.key().as_ref(),
         ],
         bump = position_haircut.bump,
@@ -9711,14 +9857,14 @@ pub struct InitPositionHaircutState<'info> {
     pub payer: Signer<'info>,
 
     #[account(
-        seeds = [state::PositionAccount::SEED, position.market.as_ref(), position.trader.as_ref()],
-        bump = position.bump,
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
+        bump = position.load()?.bump,
     )]
-    pub position: Box<Account<'info, state::PositionAccount>>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     /// Market haircut state — verifies the market is opted in.
     #[account(
-        seeds = [state_v3::MarketHaircutStateAccount::SEED, position.market.as_ref()],
+        seeds = [state_v3::MarketHaircutStateAccount::SEED, position.load()?.market.as_ref()],
         bump = haircut_state.bump,
     )]
     pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
@@ -9729,7 +9875,7 @@ pub struct InitPositionHaircutState<'info> {
         space = state_v3::PositionHaircutStateAccount::space(),
         seeds = [
             state_v3::PositionHaircutStateAccount::SEED,
-            position.market.as_ref(),
+            position.load()?.market.as_ref(),
             position.key().as_ref(),
         ],
         bump,
@@ -9751,17 +9897,17 @@ pub struct ReleaseGainToHaircut<'info> {
 
     #[account(
         mut,
-        seeds = [state::PositionAccount::SEED, position.market.as_ref(), position.trader.as_ref()],
-        bump = position.bump,
-        constraint = position.market == market.key() @ FlashBookError::HaircutStateMismatch,
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
+        bump = position.load()?.bump,
+        constraint = position.load()?.market == market.key() @ FlashBookError::HaircutStateMismatch,
     )]
-    pub position: Box<Account<'info, state::PositionAccount>>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, position.trader.as_ref()],
+        seeds = [TraderStateAccount::SEED, position.load()?.trader.as_ref()],
         bump = trader_state.load()?.bump,
-        constraint = trader_state.load()?.trader == position.trader @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == position.load()?.trader @ FlashBookError::WrongTrader,
     )]
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
@@ -9776,7 +9922,7 @@ pub struct ReleaseGainToHaircut<'info> {
         mut,
         seeds = [
             state_v3::PositionHaircutStateAccount::SEED,
-            position.market.as_ref(),
+            position.load()?.market.as_ref(),
             position.key().as_ref(),
         ],
         bump = position_haircut.bump,
@@ -10562,7 +10708,7 @@ pub struct SetPositionLeverage<'info> {
     pub market: Account<'info, MarketAccount>,
 
     #[account(
-        constraint = trader_state.load()?.trader == position.trader @ FlashBookError::WrongTrader,
+        constraint = trader_state.load()?.trader == position.load()?.trader @ FlashBookError::WrongTrader,
         constraint = trader_state.load()?.is_authorized(&authority.key()) @ FlashBookError::Unauthorized,
     )]
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
@@ -10570,9 +10716,9 @@ pub struct SetPositionLeverage<'info> {
     #[account(
         mut,
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
-        bump = position.bump,
+        bump = position.load()?.bump,
     )]
-    pub position: Account<'info, state::PositionAccount>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 }
 
 #[derive(Accounts)]
@@ -11036,9 +11182,9 @@ pub struct MigratePositionToTraderStateKey<'info> {
         mut,
         close = trader,
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader.key().as_ref()],
-        bump = legacy_position.bump,
+        bump = legacy_position.load()?.bump,
     )]
-    pub legacy_position: Box<Account<'info, state::PositionAccount>>,
+    pub legacy_position: AccountLoader<'info, state::PositionAccount>,
 
     /// NEW position at the Phase 2c PDA. `init` (not init_if_needed) so
     /// migration can only run when the new slot is empty — protects
@@ -11050,7 +11196,7 @@ pub struct MigratePositionToTraderStateKey<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
         bump,
     )]
-    pub new_position: Box<Account<'info, state::PositionAccount>>,
+    pub new_position: AccountLoader<'info, state::PositionAccount>,
 
     pub system_program: Program<'info, System>,
 }
@@ -11084,9 +11230,9 @@ pub struct SetPositionMarginMode<'info> {
     #[account(
         mut,
         seeds = [state::PositionAccount::SEED, target_market.key().as_ref(), trader_state.key().as_ref()],
-        bump = target_position.bump,
+        bump = target_position.load()?.bump,
     )]
-    pub target_position: Account<'info, state::PositionAccount>,
+    pub target_position: AccountLoader<'info, state::PositionAccount>,
     // remaining_accounts: alternating (market, position) pairs for OTHER
     // open positions the trader holds (NOT the target). Each pair is
     // validated by the handler — owner==program_id, trader matches, etc.
@@ -11127,7 +11273,7 @@ pub struct SettleFunding<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
         bump,
     )]
-    pub position: Account<'info, state::PositionAccount>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     /// RISK-1: funding is a money-moving ix and MUST delta-track the
     /// solvency residual (`V − C_tot − I`), exactly like deposit/withdraw/
@@ -11184,7 +11330,7 @@ pub struct ApplyFill<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.key().as_ref()],
         bump,
     )]
-    pub taker_position: Box<Account<'info, state::PositionAccount>>,
+    pub taker_position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         init_if_needed,
@@ -11193,7 +11339,7 @@ pub struct ApplyFill<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), maker_trader_state.key().as_ref()],
         bump,
     )]
-    pub maker_position: Box<Account<'info, state::PositionAccount>>,
+    pub maker_position: AccountLoader<'info, state::PositionAccount>,
 
     /// WAVE 22 phase 2: optional global fee-tier table. When supplied,
     /// per-trader maker rebate / taker fee bps are resolved from this
@@ -11291,7 +11437,7 @@ pub struct PlaceBasketOrderV2<'info> {
         seeds = [state::PositionAccount::SEED, market_a.key().as_ref(), trader_state.key().as_ref()],
         bump,
     )]
-    pub position_a: Box<Account<'info, state::PositionAccount>>,
+    pub position_a: AccountLoader<'info, state::PositionAccount>,
 
     // ── Leg B ──
     #[account(
@@ -11315,7 +11461,7 @@ pub struct PlaceBasketOrderV2<'info> {
         seeds = [state::PositionAccount::SEED, market_b.key().as_ref(), trader_state.key().as_ref()],
         bump,
     )]
-    pub position_b: Box<Account<'info, state::PositionAccount>>,
+    pub position_b: AccountLoader<'info, state::PositionAccount>,
 
     pub system_program: Program<'info, System>,
 }
@@ -11388,10 +11534,10 @@ pub struct ExecuteTriggerOrderV2<'info> {
     /// Sub-account triggers will require a TriggerOrderAccount
     /// schema update (add `sub_index`) before they're enableable.
     #[account(
-        constraint = position.market == market.key() @ FlashBookError::WrongMarket,
-        constraint = position.trader == trigger_order.trader @ FlashBookError::WrongTrader,
+        constraint = position.load()?.market == market.key() @ FlashBookError::WrongMarket,
+        constraint = position.load()?.trader == trigger_order.trader @ FlashBookError::WrongTrader,
     )]
-    pub position: Account<'info, state::PositionAccount>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 }
 
 #[derive(Accounts)]
@@ -11606,7 +11752,7 @@ pub struct ApplyFlpFill<'info> {
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), taker_trader_state.key().as_ref()],
         bump,
     )]
-    pub taker_position: Box<Account<'info, state::PositionAccount>>,
+    pub taker_position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         mut,
@@ -11681,9 +11827,9 @@ pub struct LiquidatePortfolioV2<'info> {
 
     #[account(
         seeds = [state::PositionAccount::SEED, execution_market.key().as_ref(), trader_state.key().as_ref()],
-        bump = execution_position.bump,
+        bump = execution_position.load()?.bump,
     )]
-    pub execution_position: Account<'info, state::PositionAccount>,
+    pub execution_position: AccountLoader<'info, state::PositionAccount>,
     // remaining_accounts: alternating [Market, Position] pairs for the
     // trader's other markets (cross-margin assessment).
 }
@@ -11731,9 +11877,9 @@ pub struct LiquidatePositionV2<'info> {
     #[account(
         mut,
         seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
-        bump = position.bump,
+        bump = position.load()?.bump,
     )]
-    pub position: Box<Account<'info, state::PositionAccount>>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     pub system_program: Program<'info, System>,
 }
@@ -11770,9 +11916,9 @@ pub struct AutoDeleverage<'info> {
             market.key().as_ref(),
             underwater_trader_state.key().as_ref(),
         ],
-        bump = underwater_position.bump,
+        bump = underwater_position.load()?.bump,
     )]
-    pub underwater_position: Box<Account<'info, state::PositionAccount>>,
+    pub underwater_position: AccountLoader<'info, state::PositionAccount>,
 
     /// Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above.
     #[account(mut)]
@@ -11785,9 +11931,9 @@ pub struct AutoDeleverage<'info> {
             market.key().as_ref(),
             counter_trader_state.key().as_ref(),
         ],
-        bump = counter_position.bump,
+        bump = counter_position.load()?.bump,
     )]
-    pub counter_position: Box<Account<'info, state::PositionAccount>>,
+    pub counter_position: AccountLoader<'info, state::PositionAccount>,
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────
@@ -12870,7 +13016,7 @@ fn project_post_leg(
         side: if projected_side == 0 { Side::Long } else { Side::Short },
         size_lots: projected_size,
         entry_price: Ticks(position.entry_price_ticks),
-        cum_funding_index_at_entry: position.cum_funding_index_at_entry,
+        cum_funding_index_at_entry: position.cum_funding_index(),
         collateral_quote_lots: position.collateral_quote_lots,
     }))
 }
@@ -13414,7 +13560,7 @@ fn apply_fill_to_position(
         pos.side = fill_side as u8;
         pos.size_lots = fill_size_lots;
         pos.entry_price_ticks = fill_price_ticks;
-        pos.cum_funding_index_at_entry = funding_index_now;
+        pos.set_cum_funding_index(funding_index_now);
         return Ok(());
     }
 
@@ -13470,7 +13616,7 @@ fn apply_fill_to_position(
             .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
         if pos.size_lots == 0 {
             pos.entry_price_ticks = 0;
-            pos.cum_funding_index_at_entry = funding_index_now;
+            pos.set_cum_funding_index(funding_index_now);
         }
     } else {
         // Flip side. Remaining = fill - existing.
@@ -13480,7 +13626,7 @@ fn apply_fill_to_position(
         pos.side = fill_side as u8;
         pos.size_lots = remaining;
         pos.entry_price_ticks = fill_price_ticks;
-        pos.cum_funding_index_at_entry = funding_index_now;
+        pos.set_cum_funding_index(funding_index_now);
     }
     Ok(())
 }
@@ -13525,17 +13671,18 @@ fn clamp_i128_to_i64(v: i128) -> i64 {
 fn apply_realized_pnl_delta<'info>(
     delta: i128,
     isolated: bool,
-    position: &mut Account<'info, state::PositionAccount>,
+    position: &mut AccountLoader<'info, state::PositionAccount>,
     trader_state: &mut AccountLoader<'info, TraderStateAccount>,
 ) -> Result<()> {
     let cross_collateral = trader_state.load()?.collateral_quote_lots;
+    let iso_collateral = position.load()?.collateral_quote_lots;
     let (new_iso, new_cross) = compute_realized_pnl_routing(
         delta,
         isolated,
-        position.collateral_quote_lots,
+        iso_collateral,
         cross_collateral,
     )?;
-    position.collateral_quote_lots = new_iso;
+    position.load_mut()?.collateral_quote_lots = new_iso;
     trader_state.load_mut()?.collateral_quote_lots = new_cross;
     Ok(())
 }
@@ -13560,7 +13707,7 @@ fn apply_realized_pnl_delta<'info>(
 fn apply_realized_pnl_delta_v2<'info>(
     delta: i128,
     isolated: bool,
-    position: &mut Account<'info, state::PositionAccount>,
+    position: &mut AccountLoader<'info, state::PositionAccount>,
     trader_state: &mut AccountLoader<'info, TraderStateAccount>,
     position_haircut: Option<&mut Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
     now_slot: u64,
@@ -13675,6 +13822,20 @@ fn compute_realized_pnl_routing(
 /// store the canonical bump at init via Anchor's `init`+`bump`, and a
 /// non-canonical-bump TraderState cannot be program-initialized — so the
 /// stored bump IS the canonical one. This mirrors `verify_position_pda`.
+/// init_if_needed zero-copy helper: Anchor's `AccountLoader` writes the 8-byte
+/// discriminator only in `exit()` (end of instruction), so a freshly-created
+/// account has a zeroed discriminator *during* the handler and any
+/// `load()`/`load_mut()` fails `AccountDiscriminatorMismatch`. This stamps the
+/// discriminator immediately if absent; it is a no-op for an account that is
+/// already initialized.
+fn stamp_zc_discriminator(ai: &AccountInfo<'_>, disc: &[u8]) -> Result<()> {
+    let is_fresh = ai.try_borrow_data()?[..8].iter().all(|&b| b == 0);
+    if is_fresh {
+        ai.try_borrow_mut_data()?[..disc.len()].copy_from_slice(disc);
+    }
+    Ok(())
+}
+
 fn verify_trader_state_pda(
     sub_index: u8,
     trader: Pubkey,
@@ -14050,10 +14211,10 @@ pub struct ExecuteTriggerOrderV3<'info> {
     /// Sub-account triggers require a TriggerOrderAccountV3 schema
     /// addition for sub_index before they become useful.
     #[account(
-        constraint = position.market == market.key() @ FlashBookError::WrongMarket,
-        constraint = position.trader == trigger_order.trader @ FlashBookError::WrongTrader,
+        constraint = position.load()?.market == market.key() @ FlashBookError::WrongMarket,
+        constraint = position.load()?.trader == trigger_order.trader @ FlashBookError::WrongTrader,
     )]
-    pub position: Account<'info, state::PositionAccount>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 }
 
 #[derive(Accounts)]

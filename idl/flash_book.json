@@ -1653,13 +1653,11 @@
               },
               {
                 "kind": "account",
-                "path": "position.market",
-                "account": "PositionAccount"
+                "path": "position"
               },
               {
                 "kind": "account",
-                "path": "position.trader",
-                "account": "PositionAccount"
+                "path": "position"
               }
             ]
           }
@@ -1692,8 +1690,7 @@
               },
               {
                 "kind": "account",
-                "path": "position.market",
-                "account": "PositionAccount"
+                "path": "position"
               },
               {
                 "kind": "account",
@@ -3761,13 +3758,11 @@
               },
               {
                 "kind": "account",
-                "path": "position.market",
-                "account": "PositionAccount"
+                "path": "position"
               },
               {
                 "kind": "account",
-                "path": "position.trader",
-                "account": "PositionAccount"
+                "path": "position"
               }
             ]
           }
@@ -3793,8 +3788,7 @@
               },
               {
                 "kind": "account",
-                "path": "position.market",
-                "account": "PositionAccount"
+                "path": "position"
               }
             ]
           }
@@ -3827,8 +3821,7 @@
               },
               {
                 "kind": "account",
-                "path": "position.market",
-                "account": "PositionAccount"
+                "path": "position"
               },
               {
                 "kind": "account",
@@ -4934,13 +4927,11 @@
               },
               {
                 "kind": "account",
-                "path": "position.market",
-                "account": "PositionAccount"
+                "path": "position"
               },
               {
                 "kind": "account",
-                "path": "position.trader",
-                "account": "PositionAccount"
+                "path": "position"
               }
             ]
           }
@@ -4973,8 +4964,7 @@
               },
               {
                 "kind": "account",
-                "path": "position.market",
-                "account": "PositionAccount"
+                "path": "position"
               },
               {
                 "kind": "account",
@@ -6844,13 +6834,11 @@
               },
               {
                 "kind": "account",
-                "path": "position.market",
-                "account": "PositionAccount"
+                "path": "position"
               },
               {
                 "kind": "account",
-                "path": "position.trader",
-                "account": "PositionAccount"
+                "path": "position"
               }
             ]
           }
@@ -6879,8 +6867,7 @@
               },
               {
                 "kind": "account",
-                "path": "position.trader",
-                "account": "PositionAccount"
+                "path": "position"
               }
             ]
           }
@@ -6937,8 +6924,7 @@
               },
               {
                 "kind": "account",
-                "path": "position.market",
-                "account": "PositionAccount"
+                "path": "position"
               },
               {
                 "kind": "account",
@@ -17548,9 +17534,29 @@
         "this field. Off-chain code may rely on this field staying 0 for",
         "every existing position."
       ],
+      "serialization": "bytemuck",
+      "repr": {
+        "kind": "c"
+      },
       "type": {
         "kind": "struct",
         "fields": [
+          {
+            "name": "cum_funding_index_at_entry",
+            "docs": [
+              "i128 cumulative funding index at entry, stored as little-endian",
+              "bytes. A native i128 would give the struct 16-byte alignment, but",
+              "Anchor zero-copy data begins at disc offset +8 (8-aligned only), so",
+              "`bytemuck::from_bytes` would panic. Access via `cum_funding_index()` /",
+              "`set_cum_funding_index()`."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          },
           {
             "name": "trader",
             "type": "pubkey"
@@ -17558,14 +17564,6 @@
           {
             "name": "market",
             "type": "pubkey"
-          },
-          {
-            "name": "bump",
-            "type": "u8"
-          },
-          {
-            "name": "side",
-            "type": "u8"
           },
           {
             "name": "size_lots",
@@ -17578,10 +17576,6 @@
           {
             "name": "collateral_quote_lots",
             "type": "u64"
-          },
-          {
-            "name": "cum_funding_index_at_entry",
-            "type": "i128"
           },
           {
             "name": "realized_pnl_quote_lots",
@@ -17626,6 +17620,23 @@
               "Validated at set time: cap ∈ [1, market.max_leverage]."
             ],
             "type": "u32"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "_pad",
+            "type": {
+              "array": [
+                "u8",
+                2
+              ]
+            }
           }
         ]
       }
