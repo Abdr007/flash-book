@@ -531,6 +531,122 @@ pub mod flash_book {
         )
     }
 
+    // ── #35 / H1 part B: ER delegation of the FillCommitmentAccount ──────────
+    // The matcher writes fill commitments on the ER, so the ring must travel with
+    // the book: delegate it alongside `market_book`, commit/undelegate it in the
+    // same keeper flow. Base-layer undelegation finalizes through the SAME generic
+    // `process_undelegation` callback (it is account-agnostic).
+
+    /// Delegate the per-market `FillCommitmentAccount` to the ER. Mirrors
+    /// `delegate_market_book`; pair the two so the matcher can push commitments on
+    /// the ER without forking ring state between layers. Authority-gated.
+    pub fn delegate_fill_commitment(
+        ctx: Context<DelegateFillCommitment>,
+        commit_frequency_ms: u32,
+        validator: Option<Pubkey>,
+    ) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.fill_commitment;
+
+        // Defence-in-depth (er.rs SECURITY note): must be ours before we sign a
+        // delegate over it.
+        require_keys_eq!(
+            *ctx.accounts.fill_commitment.owner,
+            *ctx.program_id,
+            FlashBookError::Unauthorized
+        );
+
+        let seeds_for_args: Vec<Vec<u8>> = vec![
+            fc::FILL_COMMIT_SEED.to_vec(),
+            market_key.as_ref().to_vec(),
+            vec![bump],
+        ];
+        let signer_seeds: &[&[u8]] = &[fc::FILL_COMMIT_SEED, market_key.as_ref(), &[bump]];
+
+        er::cpi_delegate(
+            er::DelegateAccounts {
+                payer: ctx.accounts.authority.to_account_info(),
+                delegated_account: ctx.accounts.fill_commitment.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                delegate_buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                delegation_record: ctx.accounts.delegation_record.to_account_info(),
+                delegation_metadata: ctx.accounts.delegation_metadata.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            er::DelegateArgs {
+                commit_frequency_ms,
+                seeds: seeds_for_args,
+                validator,
+            },
+            signer_seeds,
+        )?;
+
+        emit!(FillCommitmentDelegatedEvent {
+            market: market_key,
+            fill_commitment: ctx.accounts.fill_commitment.key(),
+            commit_frequency_ms,
+            validator: validator.unwrap_or_default(),
+        });
+        Ok(())
+    }
+
+    /// ON THE ER: snapshot the delegated `fill_commitment` back to L1 while staying
+    /// delegated (`ScheduleCommit`). Keeper-driven; pair with `commit_market_book`.
+    pub fn commit_fill_commitment(ctx: Context<CommitFillCommitment>) -> Result<()> {
+        er::cpi_commit(
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.magic_context,
+            &ctx.accounts.magic_program,
+            &[ctx.accounts.fill_commitment.to_account_info()],
+            false,
+        )
+    }
+
+    /// ON THE ER: snapshot final state AND queue undelegation
+    /// (`ScheduleCommitAndUndelegate`). The delegation program then calls back into
+    /// `process_undelegation` on base to finalize.
+    pub fn commit_and_undelegate_fill_commitment(
+        ctx: Context<CommitFillCommitment>,
+    ) -> Result<()> {
+        er::cpi_commit(
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.magic_context,
+            &ctx.accounts.magic_program,
+            &[ctx.accounts.fill_commitment.to_account_info()],
+            true,
+        )
+    }
+
+    /// Undelegate the `fill_commitment` PDA from the ER back to mainnet. Mirrors
+    /// `undelegate_market_book`; use during planned ER downtime / validator
+    /// rotation, paired with the book's undelegate.
+    pub fn undelegate_fill_commitment(ctx: Context<UndelegateFillCommitment>) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.fill_commitment;
+        let signer_seeds: &[&[u8]] = &[fc::FILL_COMMIT_SEED, market_key.as_ref(), &[bump]];
+
+        er::cpi_undelegate(
+            er::UndelegateAccounts {
+                payer: ctx.accounts.authority.to_account_info(),
+                delegated_account: ctx.accounts.fill_commitment.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            signer_seeds,
+        )?;
+
+        emit!(FillCommitmentUndelegatedEvent {
+            market: market_key,
+            fill_commitment: ctx.accounts.fill_commitment.key(),
+        });
+        Ok(())
+    }
+
     /// V2 limit-order placement against the hypertree-backed orderbook.
     /// Runs ALONGSIDE the legacy `place_limit_order` for now — operators
     /// pick which book each market uses by calling `init_market_book`
@@ -10801,6 +10917,112 @@ pub struct CommitMarketBook<'info> {
     pub magic_program: UncheckedAccount<'info>,
 }
 
+/// #35 / H1 part B: delegate the FillCommitmentAccount to the ER. Mirrors
+/// `DelegateMarketBook` with the `fill_commit` seed.
+#[derive(Accounts)]
+pub struct DelegateFillCommitment<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; signed via seeds for the delegate CPI. Anchor verifies
+    /// seeds + bump; handler rechecks .owner == this program.
+    #[account(
+        mut,
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
+
+    /// CHECK: this program's account info (owner_program for the delegation CPI).
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under owner_program at [b"buffer", fill_commitment]. Initialised
+    /// by the delegation program.
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID at [b"delegation", fill_commitment].
+    #[account(mut)]
+    pub delegation_record: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID at [b"delegation-metadata", fill_commitment].
+    #[account(mut)]
+    pub delegation_metadata: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program. Address-pinned; cpi_delegate rechecks.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
+}
+
+/// #35 / H1 part B: ON-THE-ER commit (± undelegate) of the FillCommitmentAccount.
+/// Mirrors `CommitMarketBook`.
+#[derive(Accounts)]
+pub struct CommitFillCommitment<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: the delegated fill_commitment PDA being committed. On the ER its
+    /// owner is the delegation program; `cpi_commit` fails loudly if this is not
+    /// actually a delegated account.
+    #[account(mut)]
+    pub fill_commitment: UncheckedAccount<'info>,
+
+    /// CHECK: MagicBlock magic context (writable). Address-pinned to MAGIC_CONTEXT_ID.
+    #[account(mut, address = er::MAGIC_CONTEXT_ID)]
+    pub magic_context: UncheckedAccount<'info>,
+
+    /// CHECK: MagicBlock magic program. Address-pinned to MAGIC_PROGRAM_ID.
+    #[account(address = er::MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
+/// #35 / H1 part B: base-layer undelegate of the FillCommitmentAccount. Mirrors
+/// `UndelegateMarketBook` with the `fill_commit` seed.
+#[derive(Accounts)]
+pub struct UndelegateFillCommitment<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; signed via seeds for the undelegate CPI.
+    #[account(
+        mut,
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
+
+    /// CHECK: this program's account info.
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: same buffer PDA from delegate (carries the committed state).
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
+}
+
 /// Base-layer undelegation callback (audit ER-2). Mirrors the
 /// `ephemeral-rollups-sdk` `InitializeAfterUndelegation` account contract
 /// exactly: `[delegated_account, buffer, payer, system_program]`, all
@@ -12409,6 +12631,21 @@ pub struct MarketBookDelegatedEvent {
 pub struct MarketBookUndelegatedEvent {
     pub market: Pubkey,
     pub market_book: Pubkey,
+}
+
+#[event]
+pub struct FillCommitmentDelegatedEvent {
+    pub market: Pubkey,
+    pub fill_commitment: Pubkey,
+    pub commit_frequency_ms: u32,
+    /// Pinned ER validator pubkey, or default Pubkey if permissionless.
+    pub validator: Pubkey,
+}
+
+#[event]
+pub struct FillCommitmentUndelegatedEvent {
+    pub market: Pubkey,
+    pub fill_commitment: Pubkey,
 }
 
 #[event]
