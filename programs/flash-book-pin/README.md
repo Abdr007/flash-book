@@ -100,9 +100,11 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   notional), `order.rs` (Side/OrderType/StpMode + Order), `risk.rs` (MMR core +
   **`assess_margin`** stress-lattice health check: snapshot structs,
   unrealized-PnL / funding / worst-scenario loop; `Scenario` = `&[StressShock]`
-  slice, `FundingIndex` = i128 — 19 tests), backed by a shared `error.rs`.
-  Remaining: risk's `assess_margin_split` / `default_scenarios` (Vec→buffer),
-  liquidation, insurance, flp_quoter.
+  slice, `FundingIndex` = i128 — 19 tests), `liquidation.rs` (`compute_shortfall`:
+  penalty / recovered / insurance-shortfall settlement math, 5 tests), backed by
+  a shared `error.rs`. Remaining: risk's `assess_margin_split` /
+  `default_scenarios` + liquidation's `detect_liquidations` (Vec→buffer),
+  insurance, flp_quoter — then the `liquidate_position_v2` instruction itself.
 - ⬜ Remaining 105 instructions; events; CPI (token, ER); IDL/client.
 - ⬜ Re-pass the full functional suite (569 tests) + 5 Kani proofs against the port.
 

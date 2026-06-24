@@ -48,6 +48,7 @@ pub mod haircut;
 pub mod pro_rata;
 pub mod vpin;
 pub mod risk;
+pub mod liquidation;
 
 #[cfg(target_os = "solana")]
 mod program {
