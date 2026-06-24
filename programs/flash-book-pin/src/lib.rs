@@ -19,7 +19,14 @@ pub mod state;
 pub mod instructions;
 
 entrypoint!(process);
-pinocchio::nostd_panic_handler!();
+
+// Manual panic handler (version-robust across SBF rustc toolchains — the
+// pinocchio 0.8.4 `nostd_panic_handler!` macro uses #[no_mangle], rejected by
+// newer rustc on the panic lang-item).
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
 
 /// Instruction discriminator (1 byte; the Anchor 8-byte sighash is replaced by
 /// a compact tag in the V2 wire format). Extend as instructions are ported.
