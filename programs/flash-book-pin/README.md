@@ -51,11 +51,15 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
 - ✅ **Hypertree ported** (matching-engine RB-tree core, 4,138 lines) — 38 tests pass.
 - ✅ **MarketBookHandle ported** (book account wrapper + zero-copy book types,
   de-anchored via a compat shim) — 17 RBT/best-bid-ask/expand tests pass.
-- ✅ **Fee-tier core ported** (`fees.rs`: `resolve_fee_tier` +
-  `tier_index_for_volume`) — pure math, 6 host-equivalence tests. The first
-  `matcher/` module de-anchored; unblocks the fee path in `apply_fill` /
-  `apply_flp_fill`.
-- ⬜ De-anchor the rest of the 36 `matcher/` modules into the shared `no_std`
+- ✅ **Pure `matcher/` modules de-anchored** into the shared `no_std` core,
+  ported verbatim with their full test vectors:
+  - `fees.rs` — `resolve_fee_tier` + `tier_index_for_volume` (6 tests)
+  - `borrow_fee.rs` — utilization borrow-rate / cum-index / settle (9 tests)
+  - `concentration.rs` — per-trader OI share cap (5 tests)
+  - `position_cap.rs` — per-trader notional cap + max-incremental (8 tests)
+  - `constants.rs` — `BPS_DENOM`
+  These unblock the fee/risk paths in `apply_fill` / `apply_flp_fill` / intake.
+- ⬜ De-anchor the remaining `matcher/` modules into the shared `no_std`
   core (several still pull `anchor_lang` for `Pubkey`).
 - ⬜ Remaining 105 instructions; events; CPI (token, ER); IDL/client.
 - ⬜ Re-pass the full functional suite (569 tests) + 5 Kani proofs against the port.

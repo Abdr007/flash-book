@@ -13,9 +13,13 @@
 pub mod hypertree;
 pub mod book;
 pub mod state;
+pub mod constants;
 pub mod fill_math;
 pub mod funding;
 pub mod fees;
+pub mod borrow_fee;
+pub mod concentration;
+pub mod position_cap;
 
 #[cfg(target_os = "solana")]
 mod program {
