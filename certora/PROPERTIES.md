@@ -8,8 +8,8 @@ Manifest and Kamino).
 **Status legend.**
 - `[KANI]` — machine-proven exhaustively today (`cargo kani --package flash-book
   --features no-entrypoint`), see `programs/flash-book/src/**/*.rs` `#[cfg(kani)]`.
-- `[LEAN]` — machine-proven over unbounded `Nat` at the real divisor
-  (`formal_verification/lean/`).
+- `[LEAN]` — machine-proven over unbounded `Nat`/`Int` at the real divisor
+  (`formal_verification/lean/`), `#print axioms`-clean.
 - `[CERTORA-TARGET]` — stated here; to be discharged by the Certora Prover
   (requires a Certora license — not run in this environment).
 - `[REQUIRE]` — currently enforced by an on-chain `require!`/constraint (runtime,
@@ -60,10 +60,13 @@ matches the recomputed identity across all paths.
 **P-FUND-1 — Funding is zero-sum.** For equal notional and index pair, a long
 owes exactly what a short receives: `funding_owed(long) + funding_owed(short) ==
 0`. Funding moves value between sides; it cannot mint or burn it.
-→ **`[KANI]`** `funding_is_zero_sum_long_vs_short` (in progress).
+→ **`[LEAN]`** `Funding.funding_zero_sum`. (Proven over unbounded `Int`, not
+Kani: CBMC must bit-blast the 128-bit `notional · delta` multiply and does not
+terminate — the same SAT limit as the haircut. The result holds independently of
+the `>> 64` rounding, by exact sign cancellation.)
 
 **P-FUND-2 — No accrual from a static index.** `cum_now == cum_entry ⇒ owed == 0`.
-→ **`[KANI]`** `funding_zero_when_index_unchanged`.
+→ **`[LEAN]`** `Funding.funding_zero_when_no_index_move`.
 
 ---
 
