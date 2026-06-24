@@ -3514,6 +3514,100 @@
       ]
     },
     {
+      "name": "init_fill_commitment",
+      "docs": [
+        "Allocate the per-market `FillCommitmentAccount` (#35 / H1 part B). A raw",
+        "PDA at `[fill_commit, market]` holding the consume-and-clear fill ring:",
+        "the matcher pushes a keccak commitment for every fill it crosses on-chain,",
+        "and settlement may only consume a matching, oldest-pending entry \u2014 so a",
+        "compromised sequencer cannot fabricate fills. `UncheckedAccount` for the",
+        "same reason as `market_book` (flat byte region, sized in the handler).",
+        "Permissioned to the market authority. Co-delegatable with the book."
+      ],
+      "discriminator": [
+        158,
+        184,
+        38,
+        78,
+        99,
+        197,
+        22,
+        50
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fill_commitment",
+          "docs": [
+            "byte region, sized in-handler \u2014 same reason as `market_book`). Bound by",
+            "the seed derivation below."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  105,
+                  108,
+                  108,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "init_flp_per_market_v3",
       "docs": [
         "Initialize a per-market FLP exposure account. Authority-only."
@@ -12185,6 +12279,19 @@
       ]
     },
     {
+      "name": "FillCommitmentInitializedEvent",
+      "discriminator": [
+        21,
+        102,
+        242,
+        94,
+        19,
+        0,
+        83,
+        9
+      ]
+    },
+    {
       "name": "FlpCapitalUpdatedEvent",
       "discriminator": [
         156,
@@ -13816,6 +13923,26 @@
       "code": 8200,
       "name": "FillSeqReplay",
       "msg": "Fill sequence not strictly increasing \u2014 replayed or out-of-order settlement"
+    },
+    {
+      "code": 8201,
+      "name": "FillNotCommitted",
+      "msg": "Settled fill does not match the matcher's committed fill \u2014 fabricated or out-of-order"
+    },
+    {
+      "code": 8202,
+      "name": "FillRingFull",
+      "msg": "Fill commitment ring is full \u2014 settlement must drain pending fills before more match"
+    },
+    {
+      "code": 8203,
+      "name": "FillRingEmpty",
+      "msg": "No pending committed fill to settle"
+    },
+    {
+      "code": 8204,
+      "name": "FillRingCorrupt",
+      "msg": "Fill commitment ring counters corrupt \u2014 settled exceeds produced"
     }
   ],
   "types": [
@@ -14518,6 +14645,30 @@
               "as `FillEntry.maker_sub_index`, but for the taker side."
             ],
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FillCommitmentInitializedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "fill_commitment",
+            "type": "pubkey"
+          },
+          {
+            "name": "cap",
+            "type": "u32"
+          },
+          {
+            "name": "total_bytes",
+            "type": "u32"
           }
         ]
       }
