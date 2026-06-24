@@ -122,6 +122,76 @@ impl FlpExposure {
     }
 }
 
+pub const TRIGGER_ORDER_V3_DISC: [u8; 8] = [0x71, 0x67, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+pub const TWAP_ORDER_V3_DISC: [u8; 8] = [0x77, 0xA9, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+pub const ICEBERG_ORDER_V3_DISC: [u8; 8] = [0x1C, 0xEB, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// V3 native trigger order. Pod mirror of `TriggerOrderAccountV3` (136 B).
+/// Fields reordered so the `repr(C)` layout has no implicit padding.
+#[repr(C)]
+pub struct TriggerOrderV3 {
+    pub disc: [u8; 8],
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub size_lots: u64,
+    pub trigger_price_ticks: u64,
+    pub limit_price_ticks: u64,
+    pub created_at_slot: u64,
+    pub expires_at_slot: u64,
+    pub acceptable_price_ticks: u64,
+    pub bump: u8,
+    pub trigger_id: u8,
+    pub side: u8,
+    pub kind: u8,
+    pub flags: u8,
+    pub sub_index: u8,
+    pub _reserved: [u8; 10],
+}
+
+/// V3 TWAP order. Pod mirror of `TwapOrderAccountV3` (152 B).
+#[repr(C)]
+pub struct TwapOrderV3 {
+    pub disc: [u8; 8],
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub slice_size_lots: u64,
+    pub total_size_lots: u64,
+    pub size_executed_lots: u64,
+    pub limit_price_ticks: u64,
+    pub start_slot: u64,
+    pub slot_interval: u64,
+    pub end_slot: u64,
+    pub last_slice_at_slot: u64,
+    pub acceptable_price_ticks: u64,
+    pub bump: u8,
+    pub twap_id: u8,
+    pub side: u8,
+    pub flags: u8,
+    pub sub_index: u8,
+    pub _reserved: [u8; 3],
+}
+
+/// V3 iceberg order. Pod mirror of `IcebergOrderAccountV3` (136 B).
+#[repr(C)]
+pub struct IcebergOrderV3 {
+    pub disc: [u8; 8],
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub limit_ticks: u64,
+    pub total_size_lots: u64,
+    pub remaining_lots: u64,
+    pub displayed_size_lots: u64,
+    pub child_order_seq: u64,
+    pub created_at_slot: u64,
+    pub expires_at_slot: u64,
+    pub bump: u8,
+    pub iceberg_id: u8,
+    pub side: u8,
+    pub flags: u8,
+    pub sub_index: u8,
+    pub _reserved: [u8; 3],
+}
+
 // Compile-time size checks (8-aligned, sized to the real accounts).
 const _: () = assert!(core::mem::size_of::<Position>() == 128);
 const _: () = assert!(core::mem::size_of::<Market>() == 1152);
@@ -131,3 +201,6 @@ const _: () = assert!(core::mem::size_of::<FeeTier>() == 16);
 const _: () = assert!(core::mem::size_of::<FeeTiers>() == 216);
 const _: () = assert!(core::mem::size_of::<FlpMarketExposure>() == 56);
 const _: () = assert!(core::mem::size_of::<FlpExposure>() == 968);
+const _: () = assert!(core::mem::size_of::<TriggerOrderV3>() == 136);
+const _: () = assert!(core::mem::size_of::<TwapOrderV3>() == 152);
+const _: () = assert!(core::mem::size_of::<IcebergOrderV3>() == 136);
