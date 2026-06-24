@@ -8289,6 +8289,11 @@ pub mod flash_book {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(limit_ticks > 0, FlashBookError::ZeroPrice);
         require!(flags & !0b0111_1111 == 0, FlashBookError::OutOfRange);
+        // H4: reduce_only (bit1) is unenforced on the v2 CLOB — reject it loudly
+        // here too. vault_place_order_v3 inserts a RestingOrderV2 into the SAME
+        // MarketBookHandle as place_limit/place_taker/modify_order_v2, so it needs
+        // the identical guard or a vault strategist could store an unenforced flag.
+        require!(flags & 0b0000_0010 == 0, FlashBookError::OutOfRange);
         let now_slot = Clock::get()?.slot;
         if expires_at_slot > 0 {
             require!(expires_at_slot > now_slot, FlashBookError::OutOfRange);

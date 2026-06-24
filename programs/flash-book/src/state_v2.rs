@@ -151,7 +151,9 @@ pub struct RestingOrderV2 {
 
     pub side: u8,        // 0 = long/buy/bid, 1 = short/sell/ask
     pub order_type: u8,  // 0 = limit, 1 = ioc, 2 = post_only, 3 = jit
-    /// Bitfield: bit0 reduce_only, bit1 post_only-shortcut, bits 2-3 STP mode.
+    /// Bitfield (authoritative layout — see lib.rs place_limit_order_v2 docs +
+    /// the matcher reads): bit0 post_only, bit1 reduce_only (UNSUPPORTED on v2 —
+    /// rejected at intake, H4), bit2 ioc, bit3 jit, bits 4-5 stp_mode, bit6 fok.
     pub flags: u8,
     /// Phase 2e — sub-account index this order belongs to.
     /// `0` (default) = main TraderState `[STATE_SEED, trader.as_ref()]`.
