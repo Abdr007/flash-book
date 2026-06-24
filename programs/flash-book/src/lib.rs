@@ -901,9 +901,12 @@ pub mod flash_book {
             // with a FillCommitmentAccount keeps legacy behaviour. The account is
             // a different PDA than `market_book`, so this borrow does not alias
             // the live book handle.
-            if let Some(fc_acct) = ctx.accounts.fill_commitment.as_ref() {
+            let fc_market_bytes = market_key.to_bytes();
+            if let Some(fc_acct) =
+                find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes)
+            {
                 use matcher::fill_commitment as fc;
-                let market_bytes = market_key.to_bytes();
+                let market_bytes = fc_market_bytes;
                 let taker_bytes = trader_pk.to_bytes();
                 let mut fc_data = fc_acct.try_borrow_mut_data()?;
                 for f in &fills {
@@ -3293,6 +3296,46 @@ pub mod flash_book {
             ctx.accounts.maker_trader_state.load()?.bump,
             ctx.program_id,
         )?;
+
+        // ── H1 part B (#35): verify-and-pop the fill commitment ──────────
+        // If the market is armed with a FillCommitmentAccount, this fill MUST
+        // match the oldest pending commitment the matcher pushed when it crossed
+        // the book on-chain (`place_taker_order_v2`). Recompute the commitment
+        // from this fill's authenticated content and consume-and-clear the tail;
+        // a fabricated or out-of-order fill (a compromised sequencer inventing a
+        // trade) fails to match → `FillNotCommitted` → the whole tx reverts
+        // before any position is touched. Placed early to reject cheaply. The
+        // index bound into the preimage is the FIFO position, so production order
+        // and settlement order must agree. Composes with the H1-A `fill_seq`
+        // replay guard above.
+        let fc_market_bytes = ctx.accounts.market.key().to_bytes();
+        if let Some(fc_acct) =
+            find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes)
+        {
+            use matcher::fill_commitment as fc;
+            let market_bytes = fc_market_bytes;
+            let taker_bytes = ctx.accounts.taker_trader_state.load()?.trader.to_bytes();
+            let maker_bytes = ctx.accounts.maker_trader_state.load()?.trader.to_bytes();
+            let mut fc_data = fc_acct.try_borrow_mut_data()?;
+            let idx = fc::buffer_settle_index(&fc_data);
+            let pre = fc::fill_preimage(
+                &market_bytes,
+                &taker_bytes,
+                &maker_bytes,
+                taker_side,
+                size_lots,
+                price_ticks,
+                taker_sub_index,
+                maker_sub_index,
+                idx,
+            );
+            let recomputed = anchor_lang::solana_program::keccak::hashv(&[&pre[..]]).0;
+            fc::buffer_settle(&mut fc_data, &market_bytes, recomputed).map_err(|e| match e {
+                fc::FillRingError::NotCommitted => error!(FlashBookError::FillNotCommitted),
+                fc::FillRingError::Empty => error!(FlashBookError::FillRingEmpty),
+                _ => error!(FlashBookError::FillRingCorrupt),
+            })?;
+        }
 
         // init_if_needed zero-copy: a freshly-created PositionAccount has a
         // zeroed discriminator until `load_init()` writes it — without this,
@@ -10038,18 +10081,10 @@ pub struct PlaceLimitOrderV2<'info> {
         bump,
     )]
     pub market_book: UncheckedAccount<'info>,
-
-    /// CHECK: optional per-market FillCommitmentAccount (#35 / H1 part B). When
-    /// supplied, the taker walk pushes a keccak commitment for each fill it
-    /// crosses, so settlement can prove authenticity. Optional + seed-bound for
-    /// backward compatibility — a caller that omits it keeps legacy behaviour
-    /// (until the market is armed). Disc + market binding re-checked in-handler.
-    #[account(
-        mut,
-        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub fill_commitment: Option<UncheckedAccount<'info>>,
+    // #35 / H1 part B: the optional per-market FillCommitmentAccount is passed
+    // via `remaining_accounts` (truly optional — existing callers pass nothing
+    // and keep legacy behaviour; an armed market appends the account). Located +
+    // validated in-handler by `find_fill_commitment`.
 }
 
 #[derive(Accounts)]
@@ -11789,6 +11824,9 @@ pub struct ApplyFill<'info> {
     pub maker_position_haircut: Option<Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
 
     pub system_program: Program<'info, System>,
+    // #35 / H1 part B: the optional per-market FillCommitmentAccount is passed
+    // via `remaining_accounts` (truly optional — existing callers pass nothing;
+    // an armed market appends it). Located + validated by `find_fill_commitment`.
 }
 
 #[derive(Accounts)]
@@ -14451,6 +14489,30 @@ fn stamp_zc_discriminator(ai: &AccountInfo<'_>, disc: &[u8]) -> Result<()> {
         ai.try_borrow_mut_data()?[..disc.len()].copy_from_slice(disc);
     }
     Ok(())
+}
+
+/// #35 / H1 part B: locate the per-market FillCommitmentAccount in
+/// `remaining_accounts`, if armed. Truly optional — returns `None` when no
+/// matching account is passed (legacy behaviour). An account qualifies iff it is
+/// owned by THIS program (so only `init_fill_commitment` at the canonical PDA
+/// could have created it) AND its disc + market binding + length check out
+/// (`buffer_check`). That pair uniquely identifies the real account without a
+/// `find_program_address` on the hot path.
+fn find_fill_commitment<'a, 'info>(
+    remaining: &'a [AccountInfo<'info>],
+    program_id: &Pubkey,
+    market_bytes: &[u8; 32],
+) -> Option<&'a AccountInfo<'info>> {
+    for ai in remaining {
+        if ai.owner == program_id {
+            if let Ok(data) = ai.try_borrow_data() {
+                if matcher::fill_commitment::buffer_check(&data, market_bytes).is_ok() {
+                    return Some(ai);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn verify_trader_state_pda(
