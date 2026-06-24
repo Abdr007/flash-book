@@ -6444,6 +6444,40 @@ pub mod flash_book {
         // account on the isolated-margin path.
         let trader = position.trader;
 
+        // H3: refuse to inject/reward a DUPLICATE liquidation. If a synthetic
+        // close order for this position (order_type == 3 = Liquidation, same
+        // trader) already rests on the close side, the position is already being
+        // liquidated — re-calling would pay the Dutch-auction reward AGAIN
+        // (draining the liquidatee's collateral) and stack duplicate full-size
+        // close orders (OI corruption) while the original rests unfilled in a
+        // thin book. Reject until the resting liquidation fills or is cancelled.
+        // (Scan happens BEFORE the reward block so no reward is paid on a no-op.)
+        {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            let mut already_resting = false;
+            if (close_side as u8) == 0 {
+                handle.for_each_bid_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.order_type == 3 && o.trader == trader {
+                        already_resting = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            } else {
+                handle.for_each_ask_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.order_type == 3 && o.trader == trader {
+                        already_resting = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            require!(!already_resting, FlashBookError::RateLimited);
+        }
+
         // Dutch-auction reward (parity-port from v1).
         let mut reward_paid: u64 = 0;
         if market.params.liquidator_reward_bps > 0 {
