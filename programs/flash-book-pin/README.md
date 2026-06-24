@@ -14,9 +14,14 @@ framework overhead that dominates the hot path.
 |---|---|---|---|
 | `apply_fill` | 37,779 | **1,469** | **−96%** |
 | `settle_funding` | ~5,050 | **676** | **−87%** |
+| `place_limit_order` | ~12,500 | **411** | **−97%** |
+| `cancel_order` | ~12,500 | **550** | **−96%** |
 
 (Measured on the same `solana-program-test` harness, real account sizes. The
-matcher math is host-unit-tested for exact equivalence with the Anchor version.)
+matcher math is host-unit-tested for exact equivalence with the Anchor version.
+`place`/`cancel` are the **floor** cases — insert into an empty book / remove a
+single resting order; a deep book adds RB-tree traversal CU, but the framework
+overhead Pinocchio eliminates is the dominant, constant term either way.)
 
 ~28k of the difference is pure Anchor framework (Borsh deser + reserialize +
 entrypoint). The core matcher math is identical (ported from
@@ -30,14 +35,16 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
 - ✅ Foundation: `no_std` entrypoint, 1-byte instruction dispatch, Pod account
   layouts (8-aligned, `[u8;16]` for the i128 funding index — a native 128-bit
   field is incompatible with the disc+8 data offset).
-- ✅ `apply_fill` + `settle_funding` (2 of 112), builds clean, measured above,
-  and the ported math is host-equivalence-tested (11 tests).
+- ✅ `apply_fill` + `settle_funding` + `place_limit_order` + `cancel_order`
+  (**4 of 112**), build clean, measured above; the ported math is
+  host-equivalence-tested.
 - ✅ **Hypertree ported** (matching-engine RB-tree core, 4,138 lines) — 38 tests pass.
 - ✅ **MarketBookHandle ported** (book account wrapper + zero-copy book types,
   de-anchored via a compat shim) — 17 RBT/best-bid-ask/expand tests pass.
+- ⬜ Port `place_taker_order_v2` (the taker walk — the matching crossing path).
 - ⬜ De-anchor the 36 `matcher/` modules into a shared `no_std` core (9 currently
   pull `anchor_lang` for `Pubkey`).
-- ⬜ Remaining 111 instructions; events; CPI (token, ER); IDL/client.
+- ⬜ Remaining 108 instructions; events; CPI (token, ER); IDL/client.
 - ⬜ Re-pass the full functional suite (569 tests) + 5 Kani proofs against the port.
 
 ## Build
