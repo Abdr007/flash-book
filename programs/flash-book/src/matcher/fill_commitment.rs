@@ -1,0 +1,359 @@
+//! Settlement-authenticity Fill Commitment Queue (H1 part B / issue #35).
+//!
+//! The on-chain matcher (`place_taker_order_v2`) already crosses takers against
+//! real resting orders and mutates the hypertree book — so the *authentic* fills
+//! exist on-chain the moment they are produced. Settlement (`apply_fill`),
+//! however, trusts the sequencer's fill data at face value. This module binds the
+//! two: the matcher PUSHES a commitment for every fill it produces; settlement
+//! RECOMPUTES the commitment from its arguments and may only CONSUME a matching,
+//! oldest-pending entry. A compromised sequencer therefore cannot fabricate a
+//! fill — it cannot produce a commitment the honest matcher never wrote.
+//!
+//! Design split for verifiability:
+//!   * This module owns the **canonical preimage** (`fill_preimage`) and the
+//!     **ring state machine** (`ring_push` / `ring_settle`). Both are pure and
+//!     Kani-checkable — no syscalls, no account types.
+//!   * The handler owns the **hash**: it keccak-hashes `fill_preimage(..)` via the
+//!     Solana syscall to obtain the 32-byte `FillCommit`. Keeping the hash out of
+//!     here keeps the state-machine proofs tractable; collision-resistance of
+//!     keccak is the (stated) cryptographic assumption, not a Kani obligation.
+//!
+//! Composes with the H1 part-A monotonic `fill_seq` replay guard: part A stops a
+//! *replayed* settlement, this stops a *fabricated* one.
+
+/// 32-byte commitment to a single fill — `keccak256(fill_preimage(..))`, computed
+/// by the caller. Opaque to this module (compared for equality only).
+pub type FillCommit = [u8; 32];
+
+/// Canonical fill-commitment preimage length (see `fill_preimage`).
+pub const FILL_PREIMAGE_LEN: usize = 136;
+
+/// Domain-separation tag so a fill commitment can never collide with any other
+/// keccak preimage the program hashes.
+pub const FILL_COMMIT_DOMAIN: [u8; 8] = *b"FBfillC1";
+
+/// Pure ring-state-machine errors. The handler maps these onto `FlashBookError`
+/// (`FillRingFull`/`FillRingEmpty`/`FillNotCommitted`/`FillRingCorrupt`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FillRingError {
+    /// Ring is at capacity — settlement must drain before the matcher pushes more.
+    Full,
+    /// No pending committed fill to settle.
+    Empty,
+    /// Counters are inconsistent (`settled > produced`) — corruption / tamper.
+    Corrupt,
+    /// Recomputed commitment does not match the oldest pending entry — the fill
+    /// was fabricated or presented out of order.
+    NotCommitted,
+}
+
+/// Canonical, byte-stable serialization of a fill's full economic content, bound
+/// to its production index. The matcher and settlement build this identically;
+/// hashing it yields the `FillCommit`. Layout (little-endian integers):
+///
+/// | off | len | field             |
+/// |-----|-----|-------------------|
+/// |   0 |   8 | domain tag        |
+/// |   8 |  32 | market            |
+/// |  40 |  32 | taker             |
+/// |  72 |  32 | maker             |
+/// | 104 |   1 | taker_side        |
+/// | 105 |   1 | taker_sub_index   |
+/// | 106 |   1 | maker_sub_index   |
+/// | 107 |   8 | size_lots         |
+/// | 115 |   8 | price_ticks       |
+/// | 123 |   8 | produced_index    |
+/// | 131 |   5 | zero pad          |
+#[allow(clippy::too_many_arguments)]
+pub fn fill_preimage(
+    market: &[u8; 32],
+    taker: &[u8; 32],
+    maker: &[u8; 32],
+    taker_side: u8,
+    size_lots: u64,
+    price_ticks: u64,
+    taker_sub_index: u8,
+    maker_sub_index: u8,
+    produced_index: u64,
+) -> [u8; FILL_PREIMAGE_LEN] {
+    let mut p = [0u8; FILL_PREIMAGE_LEN];
+    p[0..8].copy_from_slice(&FILL_COMMIT_DOMAIN);
+    p[8..40].copy_from_slice(market);
+    p[40..72].copy_from_slice(taker);
+    p[72..104].copy_from_slice(maker);
+    p[104] = taker_side;
+    p[105] = taker_sub_index;
+    p[106] = maker_sub_index;
+    p[107..115].copy_from_slice(&size_lots.to_le_bytes());
+    p[115..123].copy_from_slice(&price_ticks.to_le_bytes());
+    p[123..131].copy_from_slice(&produced_index.to_le_bytes());
+    // bytes 131..136 stay zero
+    p
+}
+
+/// Number of pending (produced-but-unsettled) commitments. `Corrupt` if the
+/// settled cursor has somehow passed the produced cursor.
+#[inline]
+pub fn ring_depth(produced: u64, settled: u64) -> Result<u64, FillRingError> {
+    produced.checked_sub(settled).ok_or(FillRingError::Corrupt)
+}
+
+/// Producer side (matcher): append `commit` for a fill just crossed on-chain.
+/// FIFO; fails `Full` at capacity (backpressure — never overwrites a pending,
+/// unsettled commitment). `produced` advances iff the push succeeds.
+pub fn ring_push(
+    produced: &mut u64,
+    settled: u64,
+    slots: &mut [FillCommit],
+    commit: FillCommit,
+) -> Result<(), FillRingError> {
+    let cap = slots.len() as u64;
+    if cap == 0 {
+        return Err(FillRingError::Corrupt);
+    }
+    let depth = ring_depth(*produced, settled)?;
+    if depth >= cap {
+        return Err(FillRingError::Full);
+    }
+    let idx = (*produced % cap) as usize;
+    slots[idx] = commit;
+    *produced = produced.checked_add(1).ok_or(FillRingError::Corrupt)?;
+    Ok(())
+}
+
+/// Consumer side (settlement): the caller passes `recomputed = keccak(preimage)`
+/// built from the fill it is about to settle. It must equal the oldest pending
+/// entry (authenticity + FIFO). On success the slot is zeroed (consume-and-clear)
+/// and `settled` advances — so the same physical entry can never settle twice.
+/// `recomputed` not matching ⇒ `NotCommitted`, and `settled` is left untouched.
+pub fn ring_settle(
+    produced: u64,
+    settled: &mut u64,
+    slots: &mut [FillCommit],
+    recomputed: FillCommit,
+) -> Result<(), FillRingError> {
+    let cap = slots.len() as u64;
+    if cap == 0 {
+        return Err(FillRingError::Corrupt);
+    }
+    let depth = ring_depth(produced, *settled)?;
+    if depth == 0 {
+        return Err(FillRingError::Empty);
+    }
+    let idx = (*settled % cap) as usize;
+    if slots[idx] != recomputed {
+        return Err(FillRingError::NotCommitted);
+    }
+    slots[idx] = [0u8; 32]; // consume-and-clear
+    *settled = settled.checked_add(1).ok_or(FillRingError::Corrupt)?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FV: machine-checked invariants for the consume-and-clear ring (Kani). These
+// prove the STATE MACHINE (INV-S1/S2): settlement can never outrun production,
+// the ring is depth-bounded, a fabricated/out-of-order fill is rejected, and a
+// settled fill cannot settle again. Cryptographic authenticity (a forged
+// `recomputed` matching a real entry) reduces to keccak collision-resistance,
+// which is assumed, not proven here. Runs in the CI Kani job.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(kani)]
+mod fill_commitment_kani_proofs {
+    use super::*;
+
+    /// Inductive: from ANY valid ring state, neither operation lets `settled`
+    /// exceed `produced` (settlement never outruns matching — no settling a fill
+    /// that was never produced). `ring_settle` on an empty ring returns `Empty`
+    /// and leaves `settled` unchanged.
+    #[kani::proof]
+    fn ring_never_over_settles() {
+        const CAP: usize = 3;
+        let mut produced: u64 = kani::any();
+        let mut settled: u64 = kani::any();
+        // Bound the counters far below u64::MAX so the *harness's own* arithmetic
+        // (settled + CAP, before + 1) cannot overflow; 2^40 fills exceeds any real
+        // market lifetime. The ring code itself uses checked_add regardless.
+        kani::assume(settled < (1u64 << 40));
+        kani::assume(produced < (1u64 << 40));
+        // valid starting state: settled ≤ produced ≤ settled + CAP
+        kani::assume(settled <= produced);
+        kani::assume(produced <= settled + CAP as u64);
+        let mut slots: [FillCommit; CAP] = kani::any();
+        let c: FillCommit = kani::any();
+
+        if kani::any() {
+            let before = settled;
+            let _ = ring_push(&mut produced, settled, &mut slots, c);
+            // push never touches `settled`
+            assert!(settled == before);
+            assert!(settled <= produced);
+        } else {
+            let before = settled;
+            let r = ring_settle(produced, &mut settled, &mut slots, c);
+            assert!(settled <= produced);
+            if r.is_err() {
+                assert!(settled == before); // a rejected settle advances nothing
+            } else {
+                assert!(settled == before + 1);
+            }
+        }
+    }
+
+    /// Inductive: the pending depth never exceeds capacity — `ring_push` at
+    /// capacity returns `Full` and does NOT advance `produced` (no overwrite of a
+    /// live, unsettled commitment, no wrap-aliasing).
+    #[kani::proof]
+    fn ring_depth_bounded() {
+        const CAP: usize = 3;
+        let mut produced: u64 = kani::any();
+        let settled: u64 = kani::any();
+        kani::assume(settled < (1u64 << 40));
+        kani::assume(produced < (1u64 << 40));
+        kani::assume(settled <= produced);
+        kani::assume(produced <= settled + CAP as u64); // depth ≤ CAP precondition
+        let mut slots: [FillCommit; CAP] = kani::any();
+        let c: FillCommit = kani::any();
+
+        let before = produced;
+        let r = ring_push(&mut produced, settled, &mut slots, c);
+        // depth stays within [0, CAP]
+        assert!(produced >= settled);
+        assert!(produced <= settled + CAP as u64);
+        if r.is_err() {
+            assert!(produced == before); // Full ⇒ no advance
+        } else {
+            assert!(produced == before + 1);
+        }
+    }
+
+    /// A fill whose recomputed commitment does NOT equal the oldest pending entry
+    /// is REJECTED, and `settled` is untouched. This is the anti-fabrication core:
+    /// a sequencer cannot settle anything the matcher did not commit.
+    #[kani::proof]
+    fn settle_rejects_uncommitted() {
+        const CAP: usize = 3;
+        let produced: u64 = kani::any();
+        let mut settled: u64 = kani::any();
+        kani::assume(settled < (1u64 << 40));
+        kani::assume(produced < (1u64 << 40));
+        kani::assume(settled < produced); // depth ≥ 1 (something pending)
+        kani::assume(produced <= settled + CAP as u64);
+        let mut slots: [FillCommit; CAP] = kani::any();
+        let recomputed: FillCommit = kani::any();
+        let idx = (settled % CAP as u64) as usize;
+        kani::assume(slots[idx] != recomputed); // does not match the tail
+
+        let before = settled;
+        let r = ring_settle(produced, &mut settled, &mut slots, recomputed);
+        assert!(r == Err(FillRingError::NotCommitted));
+        assert!(settled == before);
+    }
+
+    /// Consume-and-clear: a successful settle advances `settled` by exactly one
+    /// AND zeroes the consumed physical slot — so that entry can never settle
+    /// again (no double-spend of one matcher fill).
+    #[kani::proof]
+    fn no_double_settle() {
+        const CAP: usize = 3;
+        let produced: u64 = kani::any();
+        let mut settled: u64 = kani::any();
+        kani::assume(settled < (1u64 << 40));
+        kani::assume(produced < (1u64 << 40));
+        kani::assume(settled < produced);
+        kani::assume(produced <= settled + CAP as u64);
+        let mut slots: [FillCommit; CAP] = kani::any();
+        let idx = (settled % CAP as u64) as usize;
+        let tail = slots[idx];
+
+        let before = settled;
+        let r = ring_settle(produced, &mut settled, &mut slots, tail);
+        assert!(r.is_ok());
+        assert!(settled == before + 1);
+        assert!(slots[idx] == [0u8; 32]); // consumed slot cleared
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn c(n: u8) -> FillCommit {
+        let mut a = [0u8; 32];
+        a[0] = n;
+        a
+    }
+
+    #[test]
+    fn fifo_push_then_settle_in_order() {
+        let mut produced = 0u64;
+        let mut settled = 0u64;
+        let mut slots = [[0u8; 32]; 4];
+        // matcher produces three fills
+        ring_push(&mut produced, settled, &mut slots, c(1)).unwrap();
+        ring_push(&mut produced, settled, &mut slots, c(2)).unwrap();
+        ring_push(&mut produced, settled, &mut slots, c(3)).unwrap();
+        assert_eq!(ring_depth(produced, settled).unwrap(), 3);
+        // settlement drains them FIFO
+        ring_settle(produced, &mut settled, &mut slots, c(1)).unwrap();
+        ring_settle(produced, &mut settled, &mut slots, c(2)).unwrap();
+        ring_settle(produced, &mut settled, &mut slots, c(3)).unwrap();
+        assert_eq!(ring_depth(produced, settled).unwrap(), 0);
+    }
+
+    #[test]
+    fn fabricated_fill_rejected() {
+        let mut produced = 0u64;
+        let mut settled = 0u64;
+        let mut slots = [[0u8; 32]; 4];
+        ring_push(&mut produced, settled, &mut slots, c(1)).unwrap();
+        // sequencer tries to settle a fill the matcher never produced
+        assert_eq!(
+            ring_settle(produced, &mut settled, &mut slots, c(99)),
+            Err(FillRingError::NotCommitted)
+        );
+        // the real one still settles
+        ring_settle(produced, &mut settled, &mut slots, c(1)).unwrap();
+    }
+
+    #[test]
+    fn out_of_order_rejected() {
+        let mut produced = 0u64;
+        let mut settled = 0u64;
+        let mut slots = [[0u8; 32]; 4];
+        ring_push(&mut produced, settled, &mut slots, c(1)).unwrap();
+        ring_push(&mut produced, settled, &mut slots, c(2)).unwrap();
+        // try to settle #2 before #1 — FIFO rejects
+        assert_eq!(
+            ring_settle(produced, &mut settled, &mut slots, c(2)),
+            Err(FillRingError::NotCommitted)
+        );
+    }
+
+    #[test]
+    fn backpressure_when_full() {
+        let mut produced = 0u64;
+        let settled = 0u64;
+        let mut slots = [[0u8; 32]; 2];
+        ring_push(&mut produced, settled, &mut slots, c(1)).unwrap();
+        ring_push(&mut produced, settled, &mut slots, c(2)).unwrap();
+        assert_eq!(
+            ring_push(&mut produced, settled, &mut slots, c(3)),
+            Err(FillRingError::Full)
+        );
+    }
+
+    #[test]
+    fn double_settle_impossible() {
+        let mut produced = 0u64;
+        let mut settled = 0u64;
+        let mut slots = [[0u8; 32]; 4];
+        ring_push(&mut produced, settled, &mut slots, c(1)).unwrap();
+        ring_settle(produced, &mut settled, &mut slots, c(1)).unwrap();
+        // the consumed slot is cleared and settled advanced — re-presenting c(1)
+        // finds nothing pending
+        assert_eq!(
+            ring_settle(produced, &mut settled, &mut slots, c(1)),
+            Err(FillRingError::Empty)
+        );
+    }
+}

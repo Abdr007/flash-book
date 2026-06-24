@@ -188,6 +188,15 @@ pub enum FlashBookError {
     // ── 2200-2299 settlement integrity (H1) ─────────────────────────
     #[msg("Fill sequence not strictly increasing — replayed or out-of-order settlement")]
     FillSeqReplay = 2200,
+    // ── H1 part B: settlement-authenticity fill-commitment queue (#35) ──
+    #[msg("Settled fill does not match the matcher's committed fill — fabricated or out-of-order")]
+    FillNotCommitted = 2201,
+    #[msg("Fill commitment ring is full — settlement must drain pending fills before more match")]
+    FillRingFull = 2202,
+    #[msg("No pending committed fill to settle")]
+    FillRingEmpty = 2203,
+    #[msg("Fill commitment ring counters corrupt — settled exceeds produced")]
+    FillRingCorrupt = 2204,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
