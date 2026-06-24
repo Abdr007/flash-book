@@ -10,6 +10,7 @@
 //! (`instructions`, entrypoint) compiles only for the Solana target.
 #![cfg_attr(target_os = "solana", no_std)]
 
+pub mod hypertree;
 pub mod state;
 pub mod fill_math;
 pub mod funding;
