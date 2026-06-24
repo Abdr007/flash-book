@@ -1998,6 +1998,26 @@ pub mod flash_book {
                     state::PositionAccount::try_deserialize(&mut &position_data[..])?;
                 require!(position.trader == from_trader, FlashBookError::WrongTrader);
                 require!(position.market == market_ai.key(), FlashBookError::WrongMarket);
+                // C-2: bind each position to THIS trader_state (positions are
+                // PDA-keyed on trader_state.key(), but `.trader` is only the
+                // WALLET — without this a different sub-account's / stale
+                // position of the same wallet could be substituted to
+                // under-state risk), require liveness, and reject duplicate
+                // markets (so the exact-count check can't be padded with a
+                // duplicate while a real position is omitted). Mirrors the
+                // partial_withdraw_collateral guard set (the 2026-06-21 fix).
+                verify_position_pda(
+                    &market_ai.key(),
+                    &ctx.accounts.from_state.key(),
+                    position.bump,
+                    &position_ai.key(),
+                    ctx.program_id,
+                )?;
+                require!(position.size_lots > 0, FlashBookError::ZeroSize);
+                require!(
+                    !market_keys.contains(&market_ai.key()),
+                    FlashBookError::OutOfRange
+                );
 
                 snaps.push(RiskPosSnap {
                     market: position.market,
@@ -14647,12 +14667,30 @@ pub struct VaultDepositV3<'info> {
     )]
     pub position: Account<'info, state_v3::VaultPositionAccountV3>,
 
-    /// Depositor's USDC ATA — debited.
-    #[account(mut)]
+    /// Insurance fund PDA — owns the protocol vault (binds quote_vault + mint).
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// Depositor's USDC ATA — debited. C1: bound to the protocol quote mint +
+    /// the depositor so a foreign/worthless-mint source cannot be substituted.
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = depositor,
+    )]
     pub depositor_quote_ata: Account<'info, TokenAccount>,
 
-    /// Protocol vault — credited.
-    #[account(mut)]
+    /// Protocol vault — credited. C1: MUST be the canonical insurance-fund vault.
+    /// Previously unbound `#[account(mut)]`, which let an attacker pass a
+    /// self-owned destination and still be credited collateral + minted shares
+    /// redeemable against the real vault (Cashio-class drain).
+    #[account(mut, address = insurance_fund.quote_vault)]
     pub quote_vault: Account<'info, TokenAccount>,
 
     /// Vault's TraderState — credited (collateral_quote_lots).
@@ -14856,12 +14894,30 @@ pub struct FlpDepositV3<'info> {
     )]
     pub position: Account<'info, state_v3::FlpPositionAccountV3>,
 
-    /// LP's USDC ATA — debited.
-    #[account(mut)]
+    /// Insurance fund PDA — owns the protocol vault (binds quote_vault + mint).
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// LP's USDC ATA — debited. C1: bound to the protocol quote mint + the LP
+    /// so a foreign/worthless-mint source cannot be substituted.
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = lp,
+    )]
     pub lp_quote_ata: Account<'info, TokenAccount>,
 
-    /// Protocol vault — credited.
-    #[account(mut)]
+    /// Protocol vault — credited. C1: MUST be the canonical insurance-fund vault.
+    /// Previously unbound `#[account(mut)]`, which let an attacker pass a
+    /// self-owned destination and still be minted FLP shares redeemable against
+    /// the real vault (Cashio-class drain).
+    #[account(mut, address = insurance_fund.quote_vault)]
     pub quote_vault: Account<'info, TokenAccount>,
 
     pub token_program: Program<'info, Token>,
