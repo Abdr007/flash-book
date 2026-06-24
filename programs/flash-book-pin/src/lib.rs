@@ -24,6 +24,9 @@ pub mod daily_loss_limit;
 pub mod min_fill_size;
 pub mod reduce_only;
 pub mod funding_velocity;
+pub mod self_trade;
+pub mod volume_rate_limit;
+pub mod peg_pricing;
 
 #[cfg(target_os = "solana")]
 mod program {

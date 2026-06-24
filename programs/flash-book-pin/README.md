@@ -61,6 +61,9 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   - `min_fill_size.rs` — minimum-fill-size gate (5 tests)
   - `reduce_only.rs` — reduce-only intake check (6 tests)
   - `funding_velocity.rs` — funding ramp-rate / skew-target (11 tests)
+  - `self_trade.rs` — self-trade-prevention policy decision (6 tests)
+  - `volume_rate_limit.rs` — token-bucket volume rate limiter (8 tests)
+  - `peg_pricing.rs` — oracle-peg price + tick alignment (10 tests)
   - `constants.rs` — `BPS_DENOM`
   These unblock the fee/risk paths in `apply_fill` / `apply_flp_fill` / intake.
 - ⬜ De-anchor the remaining `matcher/` modules into the shared `no_std`
