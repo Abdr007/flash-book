@@ -53,10 +53,14 @@ and **drained by settlement**:
 A dedicated **`FillCommitmentAccount`** raw PDA (`[fill_commit, market]`, mirroring
 the `market_book` UncheckedAccount + manual-handle pattern), holding its own
 64-byte header (`produced` / `settled` / `cap` / `bump` / `market`) followed by a
-flat `cap × 32` slot region. Allocated by `init_fill_commitment`. To be
-**co-delegated to the ER alongside the `MarketBookAccount`** so the matcher writes
-it wherever matching runs and it travels back to L1 through `commit_market_book` /
-`process_undelegation` (`er.rs`) — ER delegation is the remaining sub-task.
+flat `cap × 32` slot region. Allocated by `init_fill_commitment`, and
+**co-delegated to the ER alongside the `MarketBookAccount`** (shipped) via
+`delegate_fill_commitment` / `commit_fill_commitment` /
+`commit_and_undelegate_fill_commitment` / `undelegate_fill_commitment`, reusing
+the generic `process_undelegation` callback — so the matcher writes it wherever
+matching runs and it travels back to L1 with the book. (End-to-end commit/
+undelegate is ER-gated: it needs a live MagicBlock ER, same caveat as the existing
+`market_book` ER instructions.)
 
 **Two implementation choices that differ from the first sketch (recorded for
 honesty):**
