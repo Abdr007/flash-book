@@ -51,6 +51,10 @@ jobs:
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
       - name: Build SBF
         run: cargo build-sbf --manifest-path programs/flash-book/Cargo.toml
+      - name: Build SBF (Pinocchio migration crate, WIP)
+        run: cargo build-sbf --manifest-path programs/flash-book-pin/Cargo.toml
+      - name: Test Pinocchio migration crate (host equivalence tests)
+        run: cargo test --manifest-path programs/flash-book-pin/Cargo.toml
 
   kani:
     name: Formal verification (Kani)

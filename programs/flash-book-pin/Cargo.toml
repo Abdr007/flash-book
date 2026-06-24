@@ -1,0 +1,21 @@
+# Pinocchio migration target (flash-book V2). Isolated workspace so it never
+# affects the Anchor program's build/lockfile. See docs/QUASAR_MIGRATION_SCOPE.md.
+[workspace]
+
+[package]
+name = "flash-book-pin"
+version = "0.0.0"
+edition = "2021"
+description = "Pinocchio (zero-copy, zero-alloc) port of the Flash Book orderbook — WIP migration."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+pinocchio = "=0.8.4"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
