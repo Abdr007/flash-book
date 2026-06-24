@@ -49,17 +49,29 @@ and **drained by settlement**:
 - **Backpressure:** ring full ⇒ the matcher applies backpressure (or the ring is
   sized to the deepest taker sweep); settlement drains it.
 
-### Where it lives
-A dedicated **`FillCommitmentAccount`** PDA (`[FCQ_SEED, market]`), **co-delegated
-to the ER alongside the `MarketBookAccount`** so the matcher writes it wherever
-matching runs and it travels back to L1 through `commit_market_book` /
-`process_undelegation` (`er.rs`). `apply_fill` / `apply_flp_fill` gain this
-account in their context. (Co-location is consistent with the existing flow:
-`apply_fill` already reads ER-mutated `market.current_batch` at `lib.rs:3236`, so
-it already executes against the book's live environment.) The dormant
-`current_batch` / `last_settlement_batch` fields (`state.rs:279,526` — written,
-never read) are repurposed as the ring's `produced` / `settled` counters, so no
-new market-account space is needed.
+### Where it lives  *(as implemented)*
+A dedicated **`FillCommitmentAccount`** raw PDA (`[fill_commit, market]`, mirroring
+the `market_book` UncheckedAccount + manual-handle pattern), holding its own
+64-byte header (`produced` / `settled` / `cap` / `bump` / `market`) followed by a
+flat `cap × 32` slot region. Allocated by `init_fill_commitment`. To be
+**co-delegated to the ER alongside the `MarketBookAccount`** so the matcher writes
+it wherever matching runs and it travels back to L1 through `commit_market_book` /
+`process_undelegation` (`er.rs`) — ER delegation is the remaining sub-task.
+
+**Two implementation choices that differ from the first sketch (recorded for
+honesty):**
+1. *Counters live in the account, not in `MarketAccount`.* The `produced`/`settled`
+   cursors sit in the `FillCommitmentAccount` header — simpler and self-contained
+   than repurposing the dormant `current_batch`/`last_settlement_batch` fields
+   (those remain untouched).
+2. *The account is passed via `remaining_accounts`, not an Anchor `Option` in the
+   context.* An Anchor optional account is not truly omittable — it needs a
+   program-id sentinel slot, which would break every existing caller with
+   `AccountNotEnoughKeys`. `remaining_accounts` is genuinely optional: existing
+   callers pass nothing (legacy behaviour); an armed market appends the account,
+   located in-handler by `find_fill_commitment` (owner == program-id +
+   `buffer_check` disc/market binding — unique without a hot-path
+   `find_program_address`).
 
 ## 3. The FLP path (`apply_flp_fill`)
 
