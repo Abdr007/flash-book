@@ -57,6 +57,10 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   - `borrow_fee.rs` — utilization borrow-rate / cum-index / settle (9 tests)
   - `concentration.rs` — per-trader OI share cap (5 tests)
   - `position_cap.rs` — per-trader notional cap + max-incremental (8 tests)
+  - `daily_loss_limit.rs` — session loss-limit halt-opens gate (6 tests)
+  - `min_fill_size.rs` — minimum-fill-size gate (5 tests)
+  - `reduce_only.rs` — reduce-only intake check (6 tests)
+  - `funding_velocity.rs` — funding ramp-rate / skew-target (11 tests)
   - `constants.rs` — `BPS_DENOM`
   These unblock the fee/risk paths in `apply_fill` / `apply_flp_fill` / intake.
 - ⬜ De-anchor the remaining `matcher/` modules into the shared `no_std`
