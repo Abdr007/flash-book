@@ -3864,6 +3864,42 @@ pub mod flash_book {
             } else {
                 blended_u128 as u64
             };
+            // H5: clamp the new mark into the ORACLE band BEFORE the per-fill
+            // change clamp. mark_max_change_bps below is anchored to the PRIOR
+            // mark, not the oracle — so a sequence of adverse fills (each within
+            // max_change of the last) could walk the mark cumulatively far from
+            // the oracle and feed a wrongful worse-of(mark,oracle) liquidation.
+            // `oracle_band_bps` was config-validated but never enforced (invariant
+            // S14). Pulling toward the band here, then applying max_change after,
+            // bounds drift to ~band while preserving the single-fill flash-move
+            // guard. Only when the oracle is not provably stale (when it IS stale,
+            // liquidation is already paused, so no wrongful-liq surface exists).
+            let band_bps = market.params.oracle_band_bps as u128;
+            let oracle_px = market.oracle_price_ticks;
+            if band_bps > 0 && oracle_px > 0 {
+                let max_age = market.params.oracle_staleness_max_seconds as u64;
+                let oracle_fresh = max_age == 0
+                    || market.oracle_published_at_unix_seconds == 0
+                    || (Clock::get()?.unix_timestamp.max(0) as u64)
+                        .saturating_sub(market.oracle_published_at_unix_seconds)
+                        <= max_age;
+                if oracle_fresh {
+                    let band_delta = (oracle_px as u128).saturating_mul(band_bps)
+                        / (constants::BPS_DENOM as u128);
+                    let band_delta_u64 = if band_delta > u64::MAX as u128 {
+                        u64::MAX
+                    } else {
+                        band_delta as u64
+                    };
+                    let band_upper = oracle_px.saturating_add(band_delta_u64);
+                    let band_lower = oracle_px.saturating_sub(band_delta_u64).max(1);
+                    if new_mark > band_upper {
+                        new_mark = band_upper;
+                    } else if new_mark < band_lower {
+                        new_mark = band_lower;
+                    }
+                }
+            }
             // Clamp absolute change to ±mark_max_change_bps.
             let max_change_bps = market.params.mark_max_change_bps as u128;
             if max_change_bps > 0 && old_mark > 0 {
