@@ -15,6 +15,7 @@ pub mod book;
 pub mod state;
 pub mod fill_math;
 pub mod funding;
+pub mod fees;
 
 #[cfg(target_os = "solana")]
 mod program {
