@@ -10,10 +10,13 @@ framework overhead that dominates the hot path.
 `apply_fill` is the matcher settlement hot path. Same account surface, same
 `solana-program-test` CU harness:
 
-| Implementation | `apply_fill` CU |
-|---|---|
-| Anchor (current `programs/flash-book`) | **37,779** |
-| **Pinocchio (this crate, core path)** | **1,520** |
+| Instruction | Anchor CU | Pinocchio CU | Δ |
+|---|---|---|---|
+| `apply_fill` | 37,779 | **1,469** | **−96%** |
+| `settle_funding` | ~5,050 | **676** | **−87%** |
+
+(Measured on the same `solana-program-test` harness, real account sizes. The
+matcher math is host-unit-tested for exact equivalence with the Anchor version.)
 
 ~28k of the difference is pure Anchor framework (Borsh deser + reserialize +
 entrypoint). The core matcher math is identical (ported from
@@ -27,7 +30,8 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
 - ✅ Foundation: `no_std` entrypoint, 1-byte instruction dispatch, Pod account
   layouts (8-aligned, `[u8;16]` for the i128 funding index — a native 128-bit
   field is incompatible with the disc+8 data offset).
-- ✅ `apply_fill` core (1 of 112 instructions), builds clean + measured above.
+- ✅ `apply_fill` + `settle_funding` (2 of 112), builds clean, measured above,
+  and the ported math is host-equivalence-tested (11 tests).
 - ⬜ De-anchor the 36 `matcher/` modules into a shared `no_std` core (9 currently
   pull `anchor_lang` for `Pubkey`).
 - ⬜ Remaining 111 instructions; events; CPI (token, ER); IDL/client.

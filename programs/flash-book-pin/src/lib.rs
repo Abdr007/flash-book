@@ -12,6 +12,7 @@
 
 pub mod state;
 pub mod fill_math;
+pub mod funding;
 
 #[cfg(target_os = "solana")]
 mod program {
@@ -35,6 +36,7 @@ mod program {
     #[repr(u8)]
     pub enum Ix {
         ApplyFill = 0,
+        SettleFunding = 1,
     }
 
     #[inline(always)]
@@ -42,6 +44,7 @@ mod program {
         let (&tag, rest) = data.split_first().ok_or(ProgramError::InvalidInstructionData)?;
         match tag {
             x if x == Ix::ApplyFill as u8 => instructions::apply_fill::process(program_id, accounts, rest),
+            x if x == Ix::SettleFunding as u8 => instructions::settle_funding::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

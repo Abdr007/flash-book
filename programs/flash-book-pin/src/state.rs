@@ -35,7 +35,8 @@ pub struct Market {
     pub tick_size: u64,
     pub taker_fee_bps: u32,
     pub maker_rebate_bps: i32,
-    pub _reserved: [u8; 1064],
+    pub mark_price_ticks: u64,
+    pub _reserved: [u8; 1056],
 }
 impl Market {
     #[inline] pub fn cum_funding(&self) -> i128 { i128::from_le_bytes(self.cum_funding_index) }
