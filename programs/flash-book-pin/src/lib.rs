@@ -11,6 +11,7 @@
 #![cfg_attr(target_os = "solana", no_std)]
 
 pub mod hypertree;
+pub mod book;
 pub mod state;
 pub mod fill_math;
 pub mod funding;
