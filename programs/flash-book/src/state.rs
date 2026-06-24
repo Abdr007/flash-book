@@ -494,7 +494,12 @@ pub struct PositionAccount {
     // 16-byte-aligned offset so the byte layout is identical on host
     // (i128 align 16) and SBF (align 8): no implicit padding on either,
     // which bytemuck `Pod` requires. Tail padded to a 16-byte multiple.
-    pub cum_funding_index_at_entry: i128,
+    /// i128 cumulative funding index at entry, stored as little-endian
+    /// bytes. A native i128 would give the struct 16-byte alignment, but
+    /// Anchor zero-copy data begins at disc offset +8 (8-aligned only), so
+    /// `bytemuck::from_bytes` would panic. Access via `cum_funding_index()` /
+    /// `set_cum_funding_index()`.
+    pub cum_funding_index_at_entry: [u8; 16],
     pub trader: Pubkey,
     pub market: Pubkey,
     pub size_lots: u64,
@@ -522,13 +527,24 @@ pub struct PositionAccount {
     pub leverage_cap: u32,
     pub bump: u8,
     pub side: u8,
-    pub _pad: [u8; 10],
+    pub _pad: [u8; 2],
 }
 
 impl PositionAccount {
     pub const SEED: &'static [u8] = b"position";
     pub fn space() -> usize {
         8 + std::mem::size_of::<Self>()
+    }
+
+    /// Cumulative funding index at entry as `i128` (stored LE-bytes to keep
+    /// the account 8-aligned for Anchor zero-copy).
+    #[inline]
+    pub fn cum_funding_index(&self) -> i128 {
+        i128::from_le_bytes(self.cum_funding_index_at_entry)
+    }
+    #[inline]
+    pub fn set_cum_funding_index(&mut self, v: i128) {
+        self.cum_funding_index_at_entry = v.to_le_bytes();
     }
     pub fn side_enum(&self) -> Side {
         if self.side == 0 { Side::Long } else { Side::Short }

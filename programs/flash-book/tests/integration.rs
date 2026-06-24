@@ -2761,11 +2761,11 @@ async fn migrate_position_to_trader_state_key_moves_state() {
         let disc =
             <flash_book::state::PositionAccount as anchor_lang::Discriminator>::DISCRIMINATOR;
         buf[..8].copy_from_slice(&disc);
-        // Hand-pack the borsh body for an open position. The layout is
-        // controlled by the #[derive(AnchorSerialize)] order in
-        // PositionAccount; reach for the borsh writer instead of
-        // bit-twiddling so a future field reorder doesn't quietly
-        // break this test.
+        // CU Phase 1: PositionAccount is now `#[account(zero_copy)]` (Pod),
+        // so it no longer implements AnchorSerialize. Write the Pod bytes
+        // directly after the discriminator via bytemuck. Field order is
+        // irrelevant here (named-field literal) and bytemuck preserves the
+        // exact in-memory layout the on-chain `load()` expects.
         let pos = flash_book::state::PositionAccount {
             market: market_pda,
             trader: trader.pubkey(),
@@ -2774,16 +2774,17 @@ async fn migrate_position_to_trader_state_key_moves_state() {
             size_lots: 7,
             entry_price_ticks: 12_345,
             collateral_quote_lots: 0,
-            cum_funding_index_at_entry: 0,
+            cum_funding_index_at_entry: [0u8; 16],
             realized_pnl_quote_lots: 0,
             funding_paid_quote_lots: 0,
             last_settlement_batch: 0,
             unhealthy_since_slot: 0,
             last_liquidated_at_slot: 0,
             leverage_cap: 0,
+            _pad: [0u8; 2],
         };
-        let serialized = anchor_lang::AnchorSerialize::try_to_vec(&pos).unwrap();
-        buf[8..8 + serialized.len()].copy_from_slice(&serialized);
+        let serialized = bytemuck::bytes_of(&pos);
+        buf[8..8 + serialized.len()].copy_from_slice(serialized);
         buf
     };
     ctx_setup.set_account(
