@@ -14001,6 +14001,59 @@ mod h6_h7_solvency_proofs {
             assert!(shortfall == 0);
         }
     }
+
+    /// A realized LOSS only ever DECREASES the debited bucket, never the other,
+    /// and never debits MORE than the loss (no collateral destroyed beyond it).
+    /// Cross losses are constrained to the covered case (the bankrupt case is
+    /// intercepted upstream by `cross_loss_shortfall`); isolated losses saturate.
+    #[kani::proof]
+    fn realized_pnl_routing_loss_bounded_and_one_sided() {
+        let mag: u64 = kani::any();
+        let isolated: bool = kani::any();
+        let iso: u64 = kani::any();
+        let cross: u64 = kani::any();
+        if !isolated {
+            kani::assume(mag <= cross); // covered cross loss (no underflow / error)
+        }
+        let delta = -(mag as i128);
+        let (new_iso, new_cross) =
+            super::compute_realized_pnl_routing(delta, isolated, iso, cross).unwrap();
+        if isolated {
+            assert!(new_iso <= iso); // bucket only shrinks
+            assert!(new_cross == cross); // cross pool untouched on the isolated path
+            assert!(iso - new_iso <= mag); // never debits more than the loss
+        } else {
+            assert!(new_iso == iso); // isolated bucket untouched on the cross path
+            assert!(new_cross <= cross);
+            assert!(cross - new_cross == mag); // exact debit, no more, no less
+        }
+    }
+
+    /// A realized GAIN credits EXACTLY the routed bucket by exactly the gain, and
+    /// leaves the other bucket untouched (proved for the non-overflow case — the
+    /// function returns Err on overflow rather than wrapping).
+    #[kani::proof]
+    fn realized_pnl_routing_gain_credits_exactly_one_bucket() {
+        let mag: u64 = kani::any();
+        let isolated: bool = kani::any();
+        let iso: u64 = kani::any();
+        let cross: u64 = kani::any();
+        if isolated {
+            kani::assume(iso.checked_add(mag).is_some());
+        } else {
+            kani::assume(cross.checked_add(mag).is_some());
+        }
+        let delta = mag as i128;
+        let (new_iso, new_cross) =
+            super::compute_realized_pnl_routing(delta, isolated, iso, cross).unwrap();
+        if isolated {
+            assert!(new_iso == iso + mag);
+            assert!(new_cross == cross);
+        } else {
+            assert!(new_cross == cross + mag);
+            assert!(new_iso == iso);
+        }
+    }
 }
 
 /// H6 — cover a realized-loss shortfall (bad debt) from the insurance fund,
