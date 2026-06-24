@@ -41,6 +41,7 @@ mod program {
         SettleFunding = 1,
         PlaceLimitOrder = 2,
         CancelOrder = 3,
+        PlaceTakerOrder = 4,
     }
 
     #[inline(always)]
@@ -51,6 +52,7 @@ mod program {
             x if x == Ix::SettleFunding as u8 => instructions::settle_funding::process(program_id, accounts, rest),
             x if x == Ix::PlaceLimitOrder as u8 => instructions::place_order::process(program_id, accounts, rest),
             x if x == Ix::CancelOrder as u8 => instructions::cancel_order::process(program_id, accounts, rest),
+            x if x == Ix::PlaceTakerOrder as u8 => instructions::place_taker_order::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
