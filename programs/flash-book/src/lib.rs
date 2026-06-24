@@ -3762,8 +3762,9 @@ pub mod flash_book {
         // debit collateral directly (loss seniority).
         let now_slot = Clock::get()?.slot;
         if taker_pnl_delta != 0 {
+            let taker_opted = ctx.accounts.taker_position_haircut.is_some();
             // H6: cover any bankrupt-close shortfall from insurance (was a revert).
-            let shortfall = apply_realized_pnl_delta_v2(
+            let (shortfall, removed) = apply_realized_pnl_delta_v2(
                 taker_pnl_delta,
                 taker_pos_isolated_for_pnl,
                 &mut ctx.accounts.taker_position,
@@ -3775,9 +3776,12 @@ pub mod flash_book {
                 let trader = ctx.accounts.taker_position.load()?.trader;
                 cover_bad_debt(&mut ctx.accounts.insurance_fund, market_key, trader, shortfall);
             }
+            // H7: an opted position's realized loss credits the haircut Residual.
+            accrue_haircut_loss(ctx.accounts.market_haircut.as_mut(), taker_opted, removed)?;
         }
         if maker_pnl_delta != 0 {
-            let shortfall = apply_realized_pnl_delta_v2(
+            let maker_opted = ctx.accounts.maker_position_haircut.is_some();
+            let (shortfall, removed) = apply_realized_pnl_delta_v2(
                 maker_pnl_delta,
                 maker_pos_isolated_for_pnl,
                 &mut ctx.accounts.maker_position,
@@ -3789,6 +3793,8 @@ pub mod flash_book {
                 let trader = ctx.accounts.maker_position.load()?.trader;
                 cover_bad_debt(&mut ctx.accounts.insurance_fund, market_key, trader, shortfall);
             }
+            // H7: an opted position's realized loss credits the haircut Residual.
+            accrue_haircut_loss(ctx.accounts.market_haircut.as_mut(), maker_opted, removed)?;
         }
 
         // Post-fill position scalars (read guards dropped immediately).
@@ -6071,8 +6077,9 @@ pub mod flash_book {
         // debit collateral directly.
         let now_slot_flp = Clock::get()?.slot;
         if taker_pnl_delta != 0 {
+            let taker_opted = ctx.accounts.taker_position_haircut.is_some();
             // H6: cover any bankrupt-close shortfall from insurance (was a revert).
-            let shortfall = apply_realized_pnl_delta_v2(
+            let (shortfall, removed) = apply_realized_pnl_delta_v2(
                 taker_pnl_delta,
                 taker_pos_isolated_for_pnl,
                 &mut ctx.accounts.taker_position,
@@ -6084,6 +6091,8 @@ pub mod flash_book {
                 let trader = ctx.accounts.taker_position.load()?.trader;
                 cover_bad_debt(&mut ctx.accounts.insurance_fund, market_key, trader, shortfall);
             }
+            // H7: an opted position's realized loss credits the haircut Residual.
+            accrue_haircut_loss(ctx.accounts.market_haircut.as_mut(), taker_opted, removed)?;
         }
 
         let (taker_post_side, taker_post_size) = {
@@ -13909,16 +13918,54 @@ fn cover_bad_debt<'info>(
     });
 }
 
-/// Returns the uncovered cross-pool shortfall (0 except when a cross position
-/// closes bankrupt — loss exceeds the pool). The caller covers it via
-/// `cover_bad_debt`. Gains, isolated losses, and fully-covered cross losses are
-/// byte-identical to the previous behaviour (they return 0).
+/// H7 — accrue an opted-in position's realized LOSS to the market haircut
+/// Residual. When a position closes at a loss its collateral is removed (C_tot
+/// ↓), so the solvency residual `V − C_tot − I` rises by the SAME amount — the
+/// lost collateral becomes backing for others' released gains. Without this the
+/// Residual only ever FELL (opted gains park in the reserve and later debit
+/// Residual at `convert_position`), so it ratcheted toward 0 and `h → 0` for
+/// every trader, breaking the conservation identity. Scoped to OPTED positions
+/// (`position_haircut` present): non-opted positions never participate in the
+/// Residual on either leg. `collateral_removed` is ALWAYS ≤ |loss| (the amount
+/// actually debited, not the full delta on a saturated/bankrupt close), so the
+/// Residual can never be OVER-credited — `h` cannot be inflated (no mint).
+fn accrue_haircut_loss<'info>(
+    market_haircut: Option<&mut Box<Account<'info, state_v3::MarketHaircutStateAccount>>>,
+    position_opted: bool,
+    collateral_removed: u64,
+) -> Result<()> {
+    if collateral_removed == 0 || !position_opted {
+        return Ok(());
+    }
+    if let Some(mh) = market_haircut {
+        mh.residual_quote_lots = mh
+            .residual_quote_lots
+            .checked_add(collateral_removed as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        mh.realized_loss_total_quote_lots = mh
+            .realized_loss_total_quote_lots
+            .checked_add(collateral_removed as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    }
+    Ok(())
+}
+
+/// Returns `(shortfall, collateral_removed)`:
+///   * `shortfall` — uncovered cross-pool deficit (0 except a bankrupt cross
+///     close); the caller covers it via `cover_bad_debt` (H6).
+///   * `collateral_removed` — collateral actually DEBITED by a loss (0 for gains
+///     / no-op). H7: the caller accrues this to the haircut Residual for opted
+///     positions so the `V−C_tot−I` identity stays conserved. It is ALWAYS
+///     ≤ |loss| (the removed amount, never the full delta on a bankrupt/saturated
+///     close), so Residual can never be OVER-credited — `h` cannot be inflated.
+/// Gains, isolated losses, and fully-covered cross losses are otherwise
+/// byte-identical to the previous behaviour.
 fn apply_realized_pnl_delta<'info>(
     delta: i128,
     isolated: bool,
     position: &mut AccountLoader<'info, state::PositionAccount>,
     trader_state: &mut AccountLoader<'info, TraderStateAccount>,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     let cross_collateral = trader_state.load()?.collateral_quote_lots;
     let iso_collateral = position.load()?.collateral_quote_lots;
     // H6: a cross-pool loss that EXCEEDS the pool is a bankrupt position. Rather
@@ -13931,7 +13978,8 @@ fn apply_realized_pnl_delta<'info>(
         if debit > cross_collateral {
             let (new_cross, shortfall) = cross_loss_shortfall(debit, cross_collateral);
             trader_state.load_mut()?.collateral_quote_lots = new_cross; // == 0
-            return Ok(shortfall);
+            // removed = the whole pool; the uncovered remainder is `shortfall`.
+            return Ok((shortfall, cross_collateral));
         }
     }
     let (new_iso, new_cross) = compute_realized_pnl_routing(
@@ -13942,7 +13990,17 @@ fn apply_realized_pnl_delta<'info>(
     )?;
     position.load_mut()?.collateral_quote_lots = new_iso;
     trader_state.load_mut()?.collateral_quote_lots = new_cross;
-    Ok(0)
+    // collateral_removed: the debited bucket's decrease (loss only; gains = 0).
+    let removed = if delta < 0 {
+        if isolated {
+            iso_collateral.saturating_sub(new_iso)
+        } else {
+            cross_collateral.saturating_sub(new_cross)
+        }
+    } else {
+        0
+    };
+    Ok((0, removed))
 }
 
 /// Wave 24d — apply_realized_pnl_delta with optional H-haircut routing.
@@ -13969,7 +14027,7 @@ fn apply_realized_pnl_delta_v2<'info>(
     trader_state: &mut AccountLoader<'info, TraderStateAccount>,
     position_haircut: Option<&mut Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
     now_slot: u64,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     if delta > 0 {
         if let Some(ph) = position_haircut {
             // Haircut path: route to reserve, no collateral mutation.
@@ -13990,12 +14048,13 @@ fn apply_realized_pnl_delta_v2<'info>(
             ph.released_attached_at_slot = post.released_attached_at_slot;
             ph.matured_pos_quote_lots = post.matured_pos_quote_lots;
             ph.original_reserve_at_attach = post.original_reserve_at_attach;
-            // Gains routed to the haircut reserve never touch collateral → no shortfall.
-            return Ok(0);
+            // Gains routed to the haircut reserve never touch collateral → no
+            // shortfall and no collateral removed.
+            return Ok((0, 0));
         }
     }
     // Loss path AND legacy non-haircut gain path both fall through to v1, which
-    // returns any uncovered cross-loss shortfall (H6).
+    // returns (uncovered cross-loss shortfall [H6], collateral removed [H7]).
     apply_realized_pnl_delta(delta, isolated, position, trader_state)
 }
 
