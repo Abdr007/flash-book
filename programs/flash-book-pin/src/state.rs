@@ -253,6 +253,61 @@ pub struct MarketLeverageTiers {
     pub tiers: [LeverageTier; MAX_LEVERAGE_TIERS],
 }
 
+pub const FLP_PER_MARKET_V3_DISC: [u8; 8] = [0xF1, 0x9D, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// Per-market FLP exposure (v3, independent ER-delegation per market). Pod
+/// mirror of `FlpExposurePerMarketAccountV3` (136 B). `side`: 0=long, 1=short,
+/// 255=empty.
+#[repr(C)]
+pub struct FlpExposurePerMarketV3 {
+    pub disc: [u8; 8],
+    pub market: Pubkey,
+    pub authority: Pubkey,
+    pub size_lots: u64,
+    pub entry_price_ticks: u64,
+    pub total_capital_quote_lots: u64,
+    pub realized_pnl: i64,
+    pub lp_shares_outstanding: u64,
+    pub bump: u8,
+    pub side: u8,
+    pub _reserved: [u8; 22],
+}
+impl FlpExposurePerMarketV3 {
+    /// NAV in quote lots (capital + realized PnL; may go negative).
+    #[inline]
+    pub fn nav(&self) -> i128 {
+        (self.total_capital_quote_lots as i128) + (self.realized_pnl as i128)
+    }
+}
+
+pub const FLP_POSITION_V3_DISC: [u8; 8] = [0xF1, 0x90, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// Per-LP, per-market FLP shares balance (v3). Pod mirror of
+/// `FlpPositionAccountV3` (104 B).
+#[repr(C)]
+pub struct FlpPositionV3 {
+    pub disc: [u8; 8],
+    pub market: Pubkey,
+    pub lp: Pubkey,
+    pub shares: u64,
+    pub bump: u8,
+    pub _reserved: [u8; 23],
+}
+
+pub const LP_POSITION_DISC: [u8; 8] = [0x1B, 0x90, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01];
+
+/// Singleton-pool LP shares balance. Pod mirror of `LpPositionAccount` (104 B).
+#[repr(C)]
+pub struct LpPosition {
+    pub disc: [u8; 8],
+    pub lp: Pubkey,
+    pub shares: u64,
+    pub total_deposited_quote_lots: u64,
+    pub total_withdrawn_quote_lots: u64,
+    pub bump: u8,
+    pub _reserved: [u8; 39],
+}
+
 // Compile-time size checks (8-aligned, sized to the real accounts).
 const _: () = assert!(core::mem::size_of::<Position>() == 128);
 const _: () = assert!(core::mem::size_of::<Market>() == 1152);
@@ -269,3 +324,6 @@ const _: () = assert!(core::mem::size_of::<VaultV3>() == 152);
 const _: () = assert!(core::mem::size_of::<VaultPositionV3>() == 120);
 const _: () = assert!(core::mem::size_of::<LeverageTier>() == 16);
 const _: () = assert!(core::mem::size_of::<MarketLeverageTiers>() == 176);
+const _: () = assert!(core::mem::size_of::<FlpExposurePerMarketV3>() == 136);
+const _: () = assert!(core::mem::size_of::<FlpPositionV3>() == 104);
+const _: () = assert!(core::mem::size_of::<LpPosition>() == 104);
