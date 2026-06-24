@@ -893,6 +893,42 @@ pub mod flash_book {
             });
         }
         if !fills.is_empty() {
+            // ── H1 part B (#35): commit produced fills to the on-chain ring ──
+            // For each fill the matcher just crossed on-chain, push a keccak
+            // commitment so settlement (`apply_fill`) can prove the fill is
+            // authentic and not fabricated by a compromised sequencer. Done
+            // BEFORE the emit moves `fills`. Optional: a market not yet wired
+            // with a FillCommitmentAccount keeps legacy behaviour. The account is
+            // a different PDA than `market_book`, so this borrow does not alias
+            // the live book handle.
+            if let Some(fc_acct) = ctx.accounts.fill_commitment.as_ref() {
+                use matcher::fill_commitment as fc;
+                let market_bytes = market_key.to_bytes();
+                let taker_bytes = trader_pk.to_bytes();
+                let mut fc_data = fc_acct.try_borrow_mut_data()?;
+                for f in &fills {
+                    let idx = fc::buffer_next_index(&fc_data);
+                    let pre = fc::fill_preimage(
+                        &market_bytes,
+                        &taker_bytes,
+                        &f.maker.to_bytes(),
+                        side,
+                        f.size_lots,
+                        f.price_ticks,
+                        sub_index,
+                        f.maker_sub_index,
+                        idx,
+                    );
+                    let commit =
+                        anchor_lang::solana_program::keccak::hashv(&[&pre[..]]).0;
+                    fc::buffer_push(&mut fc_data, &market_bytes, commit).map_err(|e| {
+                        match e {
+                            fc::FillRingError::Full => error!(FlashBookError::FillRingFull),
+                            _ => error!(FlashBookError::FillRingCorrupt),
+                        }
+                    })?;
+                }
+            }
             emit!(FillBatchEvent {
                 market: market_key,
                 taker: trader_pk,
@@ -10002,6 +10038,18 @@ pub struct PlaceLimitOrderV2<'info> {
         bump,
     )]
     pub market_book: UncheckedAccount<'info>,
+
+    /// CHECK: optional per-market FillCommitmentAccount (#35 / H1 part B). When
+    /// supplied, the taker walk pushes a keccak commitment for each fill it
+    /// crosses, so settlement can prove authenticity. Optional + seed-bound for
+    /// backward compatibility — a caller that omits it keeps legacy behaviour
+    /// (until the market is armed). Disc + market binding re-checked in-handler.
+    #[account(
+        mut,
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: Option<UncheckedAccount<'info>>,
 }
 
 #[derive(Accounts)]
