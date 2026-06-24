@@ -97,11 +97,12 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   `JitLiquidationOffer` (needed for the liquidation ix).
 - 🟡 Account-coupled `matcher/` modules de-anchored: `vpin.rs` (VPIN/toxicity
   Q32.32 EMA), `lot.rs` (BaseLots/QuoteLots/Ticks/Bps checked arithmetic +
-  notional), `order.rs` (Side/OrderType/StpMode + Order), `risk.rs` (MMR core:
-  tiered + OI-scaled maintenance-margin composition, 13 tests), backed by a
-  shared `error.rs` (`FlashBookError` + `OrOverflow`). Remaining: risk's
-  `assess_margin`/stress-scenario machinery (needs no_std scenario buffers),
-  liquidation, funding, insurance, flp_quoter.
+  notional), `order.rs` (Side/OrderType/StpMode + Order), `risk.rs` (MMR core +
+  **`assess_margin`** stress-lattice health check: snapshot structs,
+  unrealized-PnL / funding / worst-scenario loop; `Scenario` = `&[StressShock]`
+  slice, `FundingIndex` = i128 — 19 tests), backed by a shared `error.rs`.
+  Remaining: risk's `assess_margin_split` / `default_scenarios` (Vec→buffer),
+  liquidation, insurance, flp_quoter.
 - ⬜ Remaining 105 instructions; events; CPI (token, ER); IDL/client.
 - ⬜ Re-pass the full functional suite (569 tests) + 5 Kani proofs against the port.
 
