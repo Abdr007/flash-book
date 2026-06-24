@@ -67,6 +67,8 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   - `stop_limit.rs` — stop/limit trigger decision (10 tests)
   - `trailing_stop.rs` — trailing-stop peak tracking + trigger (7 tests)
   - `mit_order.rs` — market-if-touched trigger (7 tests)
+  - `side_accrual.rs` — per-side funding accrual / cum-index (19 tests)
+  - `envelope.rs` — price-envelope / accrual-rate clamp (13 tests)
   - `constants.rs` — `BPS_DENOM`
   These unblock the fee/risk paths in `apply_fill` / `apply_flp_fill` / intake.
 - ⬜ De-anchor the remaining `matcher/` modules into the shared `no_std`
