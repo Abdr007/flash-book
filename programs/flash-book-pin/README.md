@@ -67,10 +67,22 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   - `stop_limit.rs` — stop/limit trigger decision (10 tests)
   - `trailing_stop.rs` — trailing-stop peak tracking + trigger (7 tests)
   - `mit_order.rs` — market-if-touched trigger (7 tests)
-  - `constants.rs` — `BPS_DENOM`
-  These unblock the fee/risk paths in `apply_fill` / `apply_flp_fill` / intake.
-- ⬜ De-anchor the remaining `matcher/` modules into the shared `no_std`
-  core (several still pull `anchor_lang` for `Pubkey`).
+  - `side_accrual.rs` — per-side funding accrual / cum-index (19 tests)
+  - `envelope.rs` — price-envelope / accrual-rate clamp (13 tests)
+  - `insurance_replenish.rs`, `jit_lp_defense.rs`, `tiered_lp_rewards.rs`,
+    `v2_bookkeeping.rs`, `pending_claim.rs`, `stable_collateral.rs`,
+    `conditional_cancel.rs`, `cancel_on_disconnect.rs`, `arg.rs` (60 tests)
+  - `haircut.rs` — haircut conservation/solvency math (37 tests; Lean + Kani
+    proven, see `docs/FORMAL_VERIFICATION.md`)
+  - `pro_rata.rs` — pro-rata fill split, `Vec`→caller-buffer for `no_std` (8 tests)
+  - `constants.rs` — `BPS_DENOM`, `USD_UNIT`
+- ✅ **Tier A complete: every pure `matcher/` module is de-anchored** — the
+  full risk/fee/trigger/accrual math now lives in the shared `no_std` core
+  (**307 host tests**). Remaining `matcher/` modules (risk, liquidation, vpin,
+  order, lot, funding, insurance, flp_quoter) are account-coupled — they need
+  the Pod layer first.
+- ⬜ Pod layer (~24 account structs → `bytemuck` Pod, `[u8;16]` for i128) +
+  the account-coupled `matcher/` modules.
 - ⬜ Remaining 105 instructions; events; CPI (token, ER); IDL/client.
 - ⬜ Re-pass the full functional suite (569 tests) + 5 Kani proofs against the port.
 
