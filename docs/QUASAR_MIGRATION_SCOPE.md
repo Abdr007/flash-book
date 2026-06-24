@@ -82,6 +82,39 @@ Accounts structs + 121 emits + 32 CPIs is a large mechanical+careful rewrite.
 - Full migration (A or B): **multi-week** (112 ix, 100 Accounts structs, 121
   emits, 32 CPIs, re-validate 569 tests + 5 proofs + integration harness).
 
+## Pilot result (measured) — the lever is real and large
+
+A throwaway Pinocchio program (built `no_std`, `pinocchio` only) was run through
+the same `solana-program-test` CU harness that measures `apply_fill`. It
+**pointer-casts the same 6 accounts** `apply_fill` touches (Market 1160 B,
+Insurance 200 B, 2× TraderState 208 B, 2× Position 168 B — identical sizes, so
+the runtime account-load cost is identical) and applies the core fill mutations
+(position size/entry, collateral fee split, insurance credit):
+
+| | CU |
+|---|---|
+| **Pinocchio framework floor** (entrypoint + pointer-cast 6 accts + core fill) | **444** |
+| Anchor `apply_fill` (full handler) | 37,779 |
+| Anchor framework overhead (deser + reserialize + emit + entrypoint) | ~34,000 |
+
+**Interpretation (honest).** 444 CU is the *floor* — it excludes the real
+settlement logic, the `init_if_needed` position-creation CPI (a runtime cost
+both frameworks pay, ~8k on open), and the event emit. A *faithful* Pinocchio
+`apply_fill` would be roughly:
+
+- **close fill:** ~444 (floor) + ~3.8k (the real settlement logic, which is
+  framework-agnostic and measured as the Anchor "handler body") ≈ **~4k CU** vs
+  Anchor **31k** → **~−87%**.
+- **open fill:** + ~8k unavoidable position-init CPI ≈ **~12k CU** vs Anchor
+  **38k** → **~−68%**.
+
+This matches the published Pinocchio/SPL-token result (88–95%, ~70% from the
+entrypoint + zero-copy) and **confirms ~30k of `apply_fill`'s CU is pure Anchor
+framework** that Pinocchio eliminates. The lever is the largest remaining by far.
+
+Caveat: a real conversion must still re-implement settlement faithfully and pass
+all 569 tests + 5 Kani proofs; the pilot proves the ceiling, not the product.
+
 ## Recommendation
 
 1. **Do the pilot (C) first.** It's cheap and turns the "~70%" hypothesis into a
