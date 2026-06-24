@@ -3146,6 +3146,7 @@ pub mod flash_book {
         taker_was_jit: bool,
         taker_sub_index: u8,
         maker_sub_index: u8,
+        fill_seq: u64,
     ) -> Result<()> {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(price_ticks > 0, FlashBookError::ZeroPrice);
@@ -3165,6 +3166,23 @@ pub mod flash_book {
             ctx.accounts.market.sequencer,
             FlashBookError::Unauthorized
         );
+
+        // ── H1 monotonic replay guard ───────────────────────────────
+        // `fill_seq` must STRICTLY exceed the market's settlement nonce. A
+        // replayed / out-of-order settlement — a crashed/restarting sequencer
+        // re-emitting an already-applied batch, or a compromised key
+        // resubmitting one — carries a non-increasing seq and is rejected. The
+        // whole tx reverts on any later error, so advancing the nonce here is
+        // atomic with the fill. Pre-field markets have last_settlement_seq == 0,
+        // so the first real fill (seq ≥ 1) passes. NOTE: this closes the
+        // replay/restart vector; it does NOT defend against a malicious
+        // sequencer FABRICATING a fresh-seq fill — that is the fill-authenticity
+        // commitment (the §3.2 settlement redesign), tracked separately.
+        require!(
+            fill_seq > ctx.accounts.market.last_settlement_seq,
+            FlashBookError::FillSeqReplay
+        );
+        ctx.accounts.market.last_settlement_seq = fill_seq;
 
         // ── Phase 2i sub-account PDA verification ───────────────────
         // Closes the 1-byte routing-attack surface left open by Phase 2d.
@@ -5849,6 +5867,7 @@ pub mod flash_book {
         price_ticks: u64,
         taker_side: u8,
         taker_sub_index: u8,
+        fill_seq: u64,
     ) -> Result<()> {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(price_ticks > 0, FlashBookError::ZeroPrice);
@@ -5860,6 +5879,16 @@ pub mod flash_book {
             ctx.accounts.market.sequencer,
             FlashBookError::Unauthorized
         );
+
+        // ── H1 monotonic replay guard (see apply_fill) ──────────────
+        // The FLP settlement nonce shares the SAME market counter as apply_fill,
+        // so a replay of either path is rejected and the two interleave under a
+        // single strictly-increasing sequence.
+        require!(
+            fill_seq > ctx.accounts.market.last_settlement_seq,
+            FlashBookError::FillSeqReplay
+        );
+        ctx.accounts.market.last_settlement_seq = fill_seq;
 
         // Phase 2i — verify the trader_state PDA matches
         // (taker_trader_state.trader, taker_sub_index). See apply_fill

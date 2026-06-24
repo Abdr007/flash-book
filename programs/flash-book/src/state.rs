@@ -318,7 +318,23 @@ pub struct MarketAccount {
     /// UNSIGNABLE, so `apply_fill` safely halts (refuses forgery) until
     /// the authority calls `set_market_sequencer`. Fail-closed by design.
     pub sequencer: Pubkey,
+    /// H1: monotonic settlement nonce. Every `apply_fill` / `apply_flp_fill`
+    /// must carry a `fill_seq` STRICTLY GREATER than this, after which it is
+    /// stored here — so a replayed or out-of-order settlement (a crashed /
+    /// restarting sequencer re-emitting an already-applied batch, or a
+    /// compromised key resubmitting one) is rejected on-chain. Carved from the
+    /// existing `space()` headroom (no size change); pre-existing markets read
+    /// back 0 (Borsh zero-slack), so the first real fill (`fill_seq` ≥ 1) passes.
+    pub last_settlement_seq: u64,
 }
+
+// H1: build-time guard — the struct (incl. the new nonce) must still fit the
+// allocated `space()` (8 disc + 1152). If a future field overflows it, this
+// fails the build instead of silently corrupting account (de)serialization.
+const _: () = assert!(
+    ::core::mem::size_of::<MarketAccount>() <= 1152,
+    "MarketAccount exceeds its allocated space() — bump space() before adding fields"
+);
 
 impl MarketAccount {
     pub const SEED: &'static [u8] = b"market";

@@ -2265,6 +2265,7 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
             price_ticks: 100_000,
             taker_side: 0, // long
             taker_sub_index: 0, // main account
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer
@@ -2905,6 +2906,7 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 2,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer
@@ -2927,7 +2929,8 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[ix],
+            // H1: clone so the original `ix` survives for the replay assertion below.
+            &[ix.clone()],
             Some(&payer.pubkey()),
             &[&payer],
             bh,
@@ -2953,6 +2956,36 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(market.oi_long_lots, 1);
     assert_eq!(market.oi_short_lots, 1);
+    // H1: the settlement nonce advanced to the applied fill_seq.
+    assert_eq!(market.last_settlement_seq, 2);
+
+    // ── H1 replay guard ─────────────────────────────────────────────────
+    // Re-submitting the IDENTICAL fill (same fill_seq = 2 ≤ last_settlement_seq)
+    // must be rejected on-chain — this is the crashed/restarting-sequencer
+    // re-emit case. A fresh blockhash (via a slot warp) makes it a DISTINCT
+    // transaction so it actually reaches the program (not deduped by the
+    // runtime), proving the on-chain guard — not tx-dedup — is what rejects it.
+    ctx.warp_to_slot(100).unwrap();
+    let bh2 = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let replay = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh2,
+        ))
+        .await;
+    assert!(
+        replay.is_err(),
+        "replayed fill (fill_seq <= last_settlement_seq) must be rejected"
+    );
+
+    // The replay had NO effect: OI is unchanged and the nonce is still 2.
+    let market_after: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market_after.oi_long_lots, 1, "replay must not double OI");
+    assert_eq!(market_after.oi_short_lots, 1, "replay must not double OI");
+    assert_eq!(market_after.last_settlement_seq, 2);
 }
 
 /// C-1 regression: a signer that is NOT the market's configured
@@ -3012,6 +3045,7 @@ async fn apply_fill_rejects_unauthorized_sequencer() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 3,
         },
         vec![
             AccountMeta::new(rogue.pubkey(), true), // rogue, NOT market.sequencer
@@ -3097,6 +3131,7 @@ async fn partial_withdraw_rejects_omitted_position() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 4,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // payer IS market.sequencer
@@ -3294,6 +3329,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 5,
         },
         fill_metas(),
     );
@@ -3329,6 +3365,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 6,
         },
         fill_metas(),
     );
@@ -3387,6 +3424,7 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 7,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -3440,6 +3478,7 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 8,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -3564,6 +3603,7 @@ async fn apply_fill_rejects_wrong_sub_index_trader_state() {
             taker_was_jit: false,
             taker_sub_index: 0,  // ← lying: actually passing sub_state
             maker_sub_index: 0,
+            fill_seq: 9,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),

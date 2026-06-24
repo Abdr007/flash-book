@@ -184,6 +184,10 @@ pub enum FlashBookError {
     // ── 2100-2199 trigger orders (Wave 27) ──────────────────────────
     #[msg("Trigger slippage cap breached — oracle moved past acceptable_price")]
     TriggerSlippageExceeded = 2100,
+
+    // ── 2200-2299 settlement integrity (H1) ─────────────────────────
+    #[msg("Fill sequence not strictly increasing — replayed or out-of-order settlement")]
+    FillSeqReplay = 2200,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
