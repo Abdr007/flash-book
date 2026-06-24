@@ -3194,6 +3194,219 @@ async fn apply_fill_rejects_fabricated_fill_when_armed() {
     );
 }
 
+/// #35 / H1 part B — HONEST PATH, end-to-end on the v2 hypertree book:
+/// init book + arm fill_commitment → maker rests an ask → taker crosses it
+/// (`place_taker_order_v2` pushes a keccak commitment for the real fill) →
+/// `apply_fill` recomputes the SAME commitment and consume-and-clears it, opening
+/// the taker's position. Proves the producer (matcher) and consumer (settlement)
+/// preimages AGREE across the two handlers — the one thing the buffer/Kani layers
+/// can't verify. Also the first end-to-end coverage of `place_taker_order_v2`.
+#[tokio::test]
+async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Same keypairs serve as place-order signers AND trader_state owners, so the
+    // producer's (taker/maker pubkeys) and consumer's (trader_state.trader)
+    // preimages match.
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[
+        flash_book::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market_pda.as_ref(),
+    ]);
+
+    // helper: process a tx with the given ix + signers
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    // 1) init the v2 book + arm the fill-commitment ring.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitFillCommitment {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // 2) maker rests an ask: side=1, 5 lots @ 100_000.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side: 1,
+                size_lots: 5,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+            ],
+        ),
+        &[&payer, &maker],
+    )
+    .await
+    .unwrap();
+
+    // 3) taker crosses: side=0 bid, 1 lot @ limit 100_000 -> fills 1 @ 100_000.
+    //    The fill_commitment account rides in remaining_accounts -> a commitment
+    //    is pushed for the crossed fill.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceTakerOrderV2 {
+                side: 0,
+                size_lots: 1,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new(fc_pda, false), // remaining_accounts
+            ],
+        ),
+        &[&payer, &taker],
+    )
+    .await
+    .unwrap();
+
+    // The ring now holds exactly one produced, zero settled.
+    let read_counters = |data: &[u8]| -> (u64, u64) {
+        let mut p = [0u8; 8];
+        p.copy_from_slice(&data[8..16]);
+        let mut s = [0u8; 8];
+        s.copy_from_slice(&data[16..24]);
+        (u64::from_le_bytes(p), u64::from_le_bytes(s))
+    };
+    let fc_data = ctx
+        .banks_client
+        .get_account(fc_pda)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(
+        read_counters(&fc_data),
+        (1, 0),
+        "matcher must have pushed exactly one commitment"
+    );
+
+    // 4) sequencer settles the SAME fill -> consumer recomputes the matching
+    //    commitment and consume-and-clears it. Honest path SUCCEEDS.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ApplyFill {
+                size_lots: 1,
+                price_ticks: 100_000,
+                taker_side: 0,
+                taker_was_jit: false,
+                taker_sub_index: 0,
+                maker_sub_index: 0,
+                fill_seq: 1,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(insurance_fund_pda, false),
+                AccountMeta::new(taker_state, false),
+                AccountMeta::new(maker_state, false),
+                AccountMeta::new(taker_pos, false),
+                AccountMeta::new(maker_pos, false),
+                AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
+                AccountMeta::new_readonly(flash_book::ID, false), // haircut None x3
+                AccountMeta::new_readonly(flash_book::ID, false),
+                AccountMeta::new_readonly(flash_book::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(fc_pda, false), // remaining_accounts
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .expect("honest committed fill must settle");
+
+    // Ring fully drained: produced == settled == 1.
+    let fc_data = ctx
+        .banks_client
+        .get_account(fc_pda)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(
+        read_counters(&fc_data),
+        (1, 1),
+        "the committed fill must be consumed exactly once"
+    );
+
+    // The taker position now exists, long 1 @ 100_000.
+    let taker_p: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(taker_p.side, 0, "taker is long after the honest fill");
+    assert_eq!(taker_p.size_lots, 1, "taker size 1 lot");
+}
+
 /// C-2 regression: `partial_withdraw_collateral` must reject a caller who
 /// omits an open position from `remaining_accounts`. Before the fix the
 /// handler only checked `remaining.len() % 2 == 0`, so a trader could
