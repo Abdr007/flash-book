@@ -3085,6 +3085,115 @@ async fn apply_fill_rejects_unauthorized_sequencer() {
     );
 }
 
+/// #35 / H1 part B: an `apply_fill` on a market ARMED with a FillCommitmentAccount
+/// must REJECT a fill the matcher never committed. A compromised sequencer cannot
+/// fabricate trades: with the commitment ring present but EMPTY, posting a fill
+/// finds no matching commitment and the whole tx rolls back — no position is
+/// created. This is the consumer-side verify-and-pop, proven on-chain.
+///
+/// Contrast with `apply_fill_opens_both_positions_and_moves_oi`, which posts the
+/// SAME fill UNARMED (no commitment account) and succeeds — so the rejection here
+/// is specifically the commitment gate, not a malformed fill.
+#[tokio::test]
+async fn apply_fill_rejects_fabricated_fill_when_armed() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // Arm the market: allocate the FillCommitmentAccount (its ring starts EMPTY).
+    let (fc_pda, _) = pda(&[
+        flash_book::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market_pda.as_ref(),
+    ]);
+    let init_ix = build_ix(
+        flash_book::instruction::InitFillCommitment {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // authority (== market.authority)
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(fc_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Sequencer posts a fill on the armed market with NOTHING committed -> reject.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // sequencer (== market.sequencer)
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
+            AccountMeta::new_readonly(flash_book::ID, false), // haircut None x3
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            // remaining_accounts: the armed (empty) FillCommitmentAccount
+            AccountMeta::new(fc_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "armed apply_fill must reject a fill with no matching commitment (#35)"
+    );
+
+    // Rolled back: no taker position created by the fabricated fill.
+    let taker_acct = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(
+        taker_acct.is_none(),
+        "no taker position after a rejected fabricated apply_fill (#35)"
+    );
+}
+
 /// C-2 regression: `partial_withdraw_collateral` must reject a caller who
 /// omits an open position from `remaining_accounts`. Before the fix the
 /// handler only checked `remaining.len() % 2 == 0`, so a trader could
