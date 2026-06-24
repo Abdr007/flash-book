@@ -32,6 +32,15 @@ pub mod trailing_stop;
 pub mod mit_order;
 pub mod side_accrual;
 pub mod envelope;
+pub mod insurance_replenish;
+pub mod jit_lp_defense;
+pub mod tiered_lp_rewards;
+pub mod v2_bookkeeping;
+pub mod pending_claim;
+pub mod stable_collateral;
+pub mod conditional_cancel;
+pub mod cancel_on_disconnect;
+pub mod arg;
 
 #[cfg(target_os = "solana")]
 mod program {
