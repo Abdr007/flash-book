@@ -13963,6 +13963,46 @@ fn cross_loss_shortfall(debit: u64, cross_collateral: u64) -> (u64, u64) {
     (cross_collateral - covered, debit - covered)
 }
 
+/// H6 / H7 — machine-checked solvency invariants for the realized-loss money
+/// path, proved EXHAUSTIVELY over all u64 inputs by Kani (CBMC bounded model
+/// checking). Together the bad-debt waterfall (H6) and the haircut-Residual
+/// credit (H7) depend on these properties; they prove value can be neither
+/// minted nor destroyed on a loss settlement. Runs in the CI Kani job
+/// (`cargo kani --package flash-book --features no-entrypoint`).
+#[cfg(kani)]
+mod h6_h7_solvency_proofs {
+    use super::cross_loss_shortfall;
+
+    /// The loss is split with EXACT conservation, and the collateral reported as
+    /// removed — which H7 credits to the haircut Residual — NEVER exceeds the
+    /// loss, so the Residual can never be over-credited and `h` can never be
+    /// inflated (no value mint). The pool never underflows.
+    #[kani::proof]
+    fn cross_loss_shortfall_conserves_and_never_overcredits() {
+        let debit: u64 = kani::any();
+        let cross: u64 = kani::any();
+        let (new_cross, shortfall) = cross_loss_shortfall(debit, cross);
+        let removed = cross - new_cross; // collateral consumed (no underflow: new_cross ≤ cross)
+
+        // (1) Pool conservation: nothing created/destroyed in the cross pool.
+        assert!(new_cross + removed == cross);
+        // (2) Loss split: covered (removed) + uncovered (shortfall) == the loss.
+        assert!(removed + shortfall == debit);
+        // (3) NO OVER-CREDIT (the H7 solvency invariant): Residual is credited by
+        //     `removed`, which can NEVER exceed the loss → `h` is never inflated.
+        assert!(removed <= debit);
+        // (4) Pool never negative; drained to exactly 0 iff the loss covers it.
+        assert!(new_cross <= cross);
+        if debit >= cross {
+            assert!(new_cross == 0);
+        }
+        // (5) No insurance draw (shortfall) when the pool fully covers the loss.
+        if debit <= cross {
+            assert!(shortfall == 0);
+        }
+    }
+}
+
 /// H6 — cover a realized-loss shortfall (bad debt) from the insurance fund,
 /// saturating at the fund balance. This is PURE ACCOUNTING — no token transfer:
 /// the shared `quote_vault` already physically holds the funds; the counterparty
