@@ -42,6 +42,8 @@ mod program {
         PlaceLimitOrder = 2,
         CancelOrder = 3,
         PlaceTakerOrder = 4,
+        ModifyOrder = 5,
+        CancelAll = 6,
     }
 
     #[inline(always)]
@@ -53,6 +55,8 @@ mod program {
             x if x == Ix::PlaceLimitOrder as u8 => instructions::place_order::process(program_id, accounts, rest),
             x if x == Ix::CancelOrder as u8 => instructions::cancel_order::process(program_id, accounts, rest),
             x if x == Ix::PlaceTakerOrder as u8 => instructions::place_taker_order::process(program_id, accounts, rest),
+            x if x == Ix::ModifyOrder as u8 => instructions::modify_order::process(program_id, accounts, rest),
+            x if x == Ix::CancelAll as u8 => instructions::cancel_all::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

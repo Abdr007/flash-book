@@ -18,6 +18,8 @@ framework overhead that dominates the hot path.
 | `cancel_order` | ~12,500 | **550** | **−96%** |
 | `place_taker_order` (crosses 3 resting) | ~12,500+ | **1,166** | **≈−90%** |
 | `place_taker_order` (rests, empty book) | ~12,500 | **899** | **≈−93%** |
+| `modify_order` (cancel + replace) | ~12,500 | **931** | **≈−93%** |
+| `cancel_all` (3 orders, both sides) | ~12,500 | **1,315** | **≈−90%** |
 
 (Measured on the same `solana-program-test` harness, real account sizes. The
 matcher math is host-unit-tested for exact equivalence with the Anchor version.
@@ -40,8 +42,8 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   layouts (8-aligned, `[u8;16]` for the i128 funding index — a native 128-bit
   field is incompatible with the disc+8 data offset).
 - ✅ `apply_fill` + `settle_funding` + `place_limit_order` + `cancel_order`
-  + `place_taker_order` (**5 of 112**), build clean, measured above; the ported
-  math is host-equivalence-tested.
+  + `place_taker_order` + `modify_order` + `cancel_all` (**7 of 112**), build
+  clean, measured above; the ported math is host-equivalence-tested.
 - ✅ **Taker matching walk ported** — best-first cross, self-trade prevention
   (skip / cancel-oldest / cancel-both), expiry skip, post-only/IOC/FOK,
   residual-rest-as-limit; matches collected in fixed-size stack buffers (no
@@ -51,7 +53,7 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   de-anchored via a compat shim) — 17 RBT/best-bid-ask/expand tests pass.
 - ⬜ De-anchor the 36 `matcher/` modules into a shared `no_std` core (9 currently
   pull `anchor_lang` for `Pubkey`).
-- ⬜ Remaining 107 instructions; events; CPI (token, ER); IDL/client.
+- ⬜ Remaining 105 instructions; events; CPI (token, ER); IDL/client.
 - ⬜ Re-pass the full functional suite (569 tests) + 5 Kani proofs against the port.
 
 ## Build
