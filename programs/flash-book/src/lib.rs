@@ -6958,6 +6958,20 @@ pub mod flash_book {
 
         let remaining = ctx.remaining_accounts;
         require!(remaining.len() % 2 == 0, FlashBookError::OutOfRange);
+        // H2: the cross-margin walk MUST cover the trader's COMPLETE position
+        // set — otherwise a liquidator can OMIT a risk-reducing (hedge) leg so
+        // the lattice sees a more-adverse partial portfolio and force a wrongful
+        // liquidation. exec_position is one of the open positions; the remaining
+        // accounts must be EXACTLY the other (open_positions - 1) pairs.
+        require!(
+            remaining.len() == (trader_state.open_positions as usize).saturating_sub(1) * 2,
+            FlashBookError::OutOfRange
+        );
+        let trader_state_key = ctx.accounts.trader_state.key();
+        // Dedupe set seeded with the execution market (so it can't be re-supplied
+        // in remaining_accounts to pad the exact-count while a real leg is omitted).
+        let mut market_keys: Vec<Pubkey> = Vec::with_capacity(remaining.len() / 2 + 1);
+        market_keys.push(exec_market.key());
         let program_id = ctx.program_id;
         let mut i = 0usize;
         while i + 1 < remaining.len() {
@@ -6980,33 +6994,49 @@ pub mod flash_book {
                 position.market == market_ai.key(),
                 FlashBookError::WrongMarket
             );
-
-            if position.size_lots > 0 {
-                market_snaps.push(RiskMarketSnap {
-                    market: market_ai.key(),
-                    mark_price: Ticks(market.mark_price_ticks),
-                    cum_funding_index: market.cum_funding_index,
-                    maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
-                    tick_size: market.params.tick_size,
-                    concentration_threshold_lots: market.params.concentration_threshold_lots,
-                    concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
-                    side_oi_lots: 0,
-                    oi_mmr_slope_bps_per_million_lots: 0,
-                    oi_mmr_max_extra_bps: 0,
-                });
-                position_snaps.push(RiskPosSnap {
-                    market: position.market,
-                    side: if position.side == 0 { Side::Long } else { Side::Short },
-                    size_lots: position.size_lots,
-                    entry_price: Ticks(position.entry_price_ticks),
-                    cum_funding_index_at_entry: position.cum_funding_index(),
-                    collateral_quote_lots: position.collateral_quote_lots,
-                });
-            }
+            // H2: bind each position to THIS trader_state (positions are
+            // PDA-keyed on trader_state.key(), but `.trader` is only the WALLET
+            // — without this a different sub-account's / stale position of the
+            // same wallet could be substituted), require liveness, and reject
+            // duplicate markets (incl. the execution market) so the exact-count
+            // check cannot be padded with a duplicate while a real leg is omitted.
+            verify_position_pda(
+                &market_ai.key(),
+                &trader_state_key,
+                position.bump,
+                &position_ai.key(),
+                program_id,
+            )?;
+            require!(position.size_lots > 0, FlashBookError::ZeroSize);
+            require!(
+                !market_keys.contains(&market_ai.key()),
+                FlashBookError::OutOfRange
+            );
+            market_keys.push(market_ai.key());
+            market_snaps.push(RiskMarketSnap {
+                market: market_ai.key(),
+                mark_price: Ticks(market.mark_price_ticks),
+                cum_funding_index: market.cum_funding_index,
+                maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+                tick_size: market.params.tick_size,
+                concentration_threshold_lots: market.params.concentration_threshold_lots,
+                concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                side_oi_lots: 0,
+                oi_mmr_slope_bps_per_million_lots: 0,
+                oi_mmr_max_extra_bps: 0,
+            });
+            position_snaps.push(RiskPosSnap {
+                market: position.market,
+                side: if position.side == 0 { Side::Long } else { Side::Short },
+                size_lots: position.size_lots,
+                entry_price: Ticks(position.entry_price_ticks),
+                cum_funding_index_at_entry: position.cum_funding_index(),
+                collateral_quote_lots: position.collateral_quote_lots,
+            });
             i += 2;
         }
 
-        let market_keys: Vec<Pubkey> = market_snaps.iter().map(|m| m.market).collect();
+        // market_keys was built incrementally in the walk (H2: deduped, exec-seeded).
         let scenarios = default_scenarios_fn(&market_keys);
         let assessment = assess_margin_unified_fn(
             &position_snaps,
