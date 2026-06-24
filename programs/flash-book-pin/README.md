@@ -85,8 +85,10 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   `Insurance`, `FeeTiers` (216 B), `FlpExposure` (968 B), and the v3 order
   accounts `TriggerOrderV3` (136 B) / `TwapOrderV3` (152 B) / `IcebergOrderV3`
   (136 B). All `#[repr(C)]`, 8-aligned, zero implicit padding (compile-time
-  `size_of` asserts), `[u8;16]` for every i128. ~15 account structs remain
-  (vaults, leverage-tiers, LP-position, v2 order accounts).
+  `size_of` asserts), `[u8;16]` for every i128. Plus `VaultV3` (152 B),
+  `VaultPositionV3` (120 B), and `MarketLeverageTiers` (176 B, nested
+  `LeverageTier`). ~11 account structs remain (LP-position, per-market FLP v3,
+  v2 order accounts, leverage-tier-v3 variants).
 - ⬜ Account-coupled `matcher/` modules (risk, liquidation, vpin, order, lot,
   funding, insurance, flp_quoter) on top of the Pod layer.
 - ⬜ Remaining 105 instructions; events; CPI (token, ER); IDL/client.
