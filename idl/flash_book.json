@@ -1500,6 +1500,49 @@
       "args": []
     },
     {
+      "name": "commit_and_undelegate_fill_commitment",
+      "docs": [
+        "ON THE ER: snapshot final state AND queue undelegation",
+        "(`ScheduleCommitAndUndelegate`). The delegation program then calls back into",
+        "`process_undelegation` on base to finalize."
+      ],
+      "discriminator": [
+        219,
+        232,
+        55,
+        157,
+        130,
+        82,
+        102,
+        7
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "fill_commitment",
+          "docs": [
+            "owner is the delegation program; `cpi_commit` fails loudly if this is not",
+            "actually a delegated account."
+          ],
+          "writable": true
+        },
+        {
+          "name": "magic_context",
+          "writable": true,
+          "address": "MagicContext1111111111111111111111111111111"
+        },
+        {
+          "name": "magic_program",
+          "address": "Magic11111111111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "commit_and_undelegate_market_book",
       "docs": [
         "ON THE ER: snapshot final state AND queue undelegation",
@@ -1527,6 +1570,48 @@
           "docs": [
             "owner is the delegation program; `cpi_commit` (\u2192 Magic program) fails",
             "loudly if this is not actually a delegated account."
+          ],
+          "writable": true
+        },
+        {
+          "name": "magic_context",
+          "writable": true,
+          "address": "MagicContext1111111111111111111111111111111"
+        },
+        {
+          "name": "magic_program",
+          "address": "Magic11111111111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "commit_fill_commitment",
+      "docs": [
+        "ON THE ER: snapshot the delegated `fill_commitment` back to L1 while staying",
+        "delegated (`ScheduleCommit`). Keeper-driven; pair with `commit_market_book`."
+      ],
+      "discriminator": [
+        228,
+        237,
+        200,
+        105,
+        5,
+        12,
+        148,
+        183
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "fill_commitment",
+          "docs": [
+            "owner is the delegation program; `cpi_commit` fails loudly if this is not",
+            "actually a delegated account."
           ],
           "writable": true
         },
@@ -1792,6 +1877,129 @@
         {
           "name": "perf_fee_bps",
           "type": "u32"
+        }
+      ]
+    },
+    {
+      "name": "delegate_fill_commitment",
+      "docs": [
+        "Delegate the per-market `FillCommitmentAccount` to the ER. Mirrors",
+        "`delegate_market_book`; pair the two so the matcher can push commitments on",
+        "the ER without forking ring state between layers. Authority-gated."
+      ],
+      "discriminator": [
+        83,
+        120,
+        210,
+        70,
+        12,
+        68,
+        251,
+        83
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fill_commitment",
+          "docs": [
+            "seeds + bump; handler rechecks .owner == this program."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  105,
+                  108,
+                  108,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner_program",
+          "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
+        },
+        {
+          "name": "delegate_buffer",
+          "docs": [
+            "by the delegation program."
+          ],
+          "writable": true
+        },
+        {
+          "name": "delegation_record",
+          "writable": true
+        },
+        {
+          "name": "delegation_metadata",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "delegation_program",
+          "address": "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
+        }
+      ],
+      "args": [
+        {
+          "name": "commit_frequency_ms",
+          "type": "u32"
+        },
+        {
+          "name": "validator",
+          "type": {
+            "option": "pubkey"
+          }
         }
       ]
     },
@@ -8989,6 +9197,104 @@
       ]
     },
     {
+      "name": "undelegate_fill_commitment",
+      "docs": [
+        "Undelegate the `fill_commitment` PDA from the ER back to mainnet. Mirrors",
+        "`undelegate_market_book`; use during planned ER downtime / validator",
+        "rotation, paired with the book's undelegate."
+      ],
+      "discriminator": [
+        74,
+        163,
+        190,
+        207,
+        184,
+        179,
+        42,
+        101
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fill_commitment",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  105,
+                  108,
+                  108,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner_program",
+          "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
+        },
+        {
+          "name": "delegate_buffer",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "delegation_program",
+          "address": "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "undelegate_market",
       "docs": [
         "Undelegate the MarketAccount from the ER back to mainnet."
@@ -12279,6 +12585,19 @@
       ]
     },
     {
+      "name": "FillCommitmentDelegatedEvent",
+      "discriminator": [
+        164,
+        103,
+        28,
+        246,
+        160,
+        12,
+        174,
+        55
+      ]
+    },
+    {
       "name": "FillCommitmentInitializedEvent",
       "discriminator": [
         21,
@@ -12289,6 +12608,19 @@
         0,
         83,
         9
+      ]
+    },
+    {
+      "name": "FillCommitmentUndelegatedEvent",
+      "discriminator": [
+        4,
+        249,
+        212,
+        127,
+        40,
+        141,
+        74,
+        129
       ]
     },
     {
@@ -14650,6 +14982,33 @@
       }
     },
     {
+      "name": "FillCommitmentDelegatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "fill_commitment",
+            "type": "pubkey"
+          },
+          {
+            "name": "commit_frequency_ms",
+            "type": "u32"
+          },
+          {
+            "name": "validator",
+            "docs": [
+              "Pinned ER validator pubkey, or default Pubkey if permissionless."
+            ],
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
       "name": "FillCommitmentInitializedEvent",
       "type": {
         "kind": "struct",
@@ -14669,6 +15028,22 @@
           {
             "name": "total_bytes",
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FillCommitmentUndelegatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "fill_commitment",
+            "type": "pubkey"
           }
         ]
       }
