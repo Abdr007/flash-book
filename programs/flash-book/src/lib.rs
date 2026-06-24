@@ -3762,7 +3762,8 @@ pub mod flash_book {
         // debit collateral directly (loss seniority).
         let now_slot = Clock::get()?.slot;
         if taker_pnl_delta != 0 {
-            apply_realized_pnl_delta_v2(
+            // H6: cover any bankrupt-close shortfall from insurance (was a revert).
+            let shortfall = apply_realized_pnl_delta_v2(
                 taker_pnl_delta,
                 taker_pos_isolated_for_pnl,
                 &mut ctx.accounts.taker_position,
@@ -3770,9 +3771,13 @@ pub mod flash_book {
                 ctx.accounts.taker_position_haircut.as_mut(),
                 now_slot,
             )?;
+            if shortfall > 0 {
+                let trader = ctx.accounts.taker_position.load()?.trader;
+                cover_bad_debt(&mut ctx.accounts.insurance_fund, market_key, trader, shortfall);
+            }
         }
         if maker_pnl_delta != 0 {
-            apply_realized_pnl_delta_v2(
+            let shortfall = apply_realized_pnl_delta_v2(
                 maker_pnl_delta,
                 maker_pos_isolated_for_pnl,
                 &mut ctx.accounts.maker_position,
@@ -3780,6 +3785,10 @@ pub mod flash_book {
                 ctx.accounts.maker_position_haircut.as_mut(),
                 now_slot,
             )?;
+            if shortfall > 0 {
+                let trader = ctx.accounts.maker_position.load()?.trader;
+                cover_bad_debt(&mut ctx.accounts.insurance_fund, market_key, trader, shortfall);
+            }
         }
 
         // Post-fill position scalars (read guards dropped immediately).
@@ -6026,7 +6035,8 @@ pub mod flash_book {
         // debit collateral directly.
         let now_slot_flp = Clock::get()?.slot;
         if taker_pnl_delta != 0 {
-            apply_realized_pnl_delta_v2(
+            // H6: cover any bankrupt-close shortfall from insurance (was a revert).
+            let shortfall = apply_realized_pnl_delta_v2(
                 taker_pnl_delta,
                 taker_pos_isolated_for_pnl,
                 &mut ctx.accounts.taker_position,
@@ -6034,6 +6044,10 @@ pub mod flash_book {
                 ctx.accounts.taker_position_haircut.as_mut(),
                 now_slot_flp,
             )?;
+            if shortfall > 0 {
+                let trader = ctx.accounts.taker_position.load()?.trader;
+                cover_bad_debt(&mut ctx.accounts.insurance_fund, market_key, trader, shortfall);
+            }
         }
 
         let (taker_post_side, taker_post_size) = {
@@ -12880,6 +12894,19 @@ pub struct InsurancePauseThresholdUpdatedEvent {
     pub current_balance_quote_lots: u64,
 }
 
+/// H6 — emitted when a realized loss exceeds the position's backing (a bankrupt
+/// close) and the deficit is absorbed by the insurance fund instead of reverting
+/// settlement. `uncovered_quote_lots > 0` means the fund itself was insufficient
+/// — true socialized bad debt that an ADL/backstop must resolve.
+#[event]
+pub struct BadDebtSocializedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub shortfall_quote_lots: u64,
+    pub covered_by_insurance_quote_lots: u64,
+    pub uncovered_quote_lots: u64,
+}
+
 #[event]
 pub struct LiquidatorRewardedEvent {
     pub market: Pubkey,
@@ -13731,14 +13758,71 @@ fn clamp_i128_to_i64(v: i128) -> i64 {
 ///
 /// `delta` is signed: positive = trader gained (credit), negative =
 /// trader lost (debit).
+/// H6 (bad-debt socialization) — pure math for the cross-pool loss case.
+/// Returns `(new_cross_collateral, shortfall)`: the pool is drawn down to cover
+/// as much of the loss as it can, and any remainder (the position was bankrupt —
+/// its loss exceeds its backing) is surfaced as `shortfall` for the caller to
+/// cover from the insurance fund. Pure → host-testable.
+#[inline]
+fn cross_loss_shortfall(debit: u64, cross_collateral: u64) -> (u64, u64) {
+    let covered = debit.min(cross_collateral);
+    (cross_collateral - covered, debit - covered)
+}
+
+/// H6 — cover a realized-loss shortfall (bad debt) from the insurance fund,
+/// saturating at the fund balance. This is PURE ACCOUNTING — no token transfer:
+/// the shared `quote_vault` already physically holds the funds; the counterparty
+/// was already credited their gain, and this reconciles the internal ledger so
+/// the deficit is absorbed by the fund rather than reverting settlement (which
+/// would strand a bankrupt position AND diverge the book from settlement, since
+/// the maker order was already consumed in `place_taker_order_v2`). Any
+/// remainder the fund cannot cover is surfaced via the event (awaiting ADL).
+fn cover_bad_debt<'info>(
+    insurance_fund: &mut Box<Account<'info, InsuranceFundAccount>>,
+    market: Pubkey,
+    trader: Pubkey,
+    shortfall: u64,
+) {
+    if shortfall == 0 {
+        return;
+    }
+    let covered = shortfall.min(insurance_fund.balance_quote_lots);
+    insurance_fund.balance_quote_lots -= covered;
+    insurance_fund.total_payouts = insurance_fund.total_payouts.saturating_add(covered);
+    emit!(BadDebtSocializedEvent {
+        market,
+        trader,
+        shortfall_quote_lots: shortfall,
+        covered_by_insurance_quote_lots: covered,
+        uncovered_quote_lots: shortfall - covered,
+    });
+}
+
+/// Returns the uncovered cross-pool shortfall (0 except when a cross position
+/// closes bankrupt — loss exceeds the pool). The caller covers it via
+/// `cover_bad_debt`. Gains, isolated losses, and fully-covered cross losses are
+/// byte-identical to the previous behaviour (they return 0).
 fn apply_realized_pnl_delta<'info>(
     delta: i128,
     isolated: bool,
     position: &mut AccountLoader<'info, state::PositionAccount>,
     trader_state: &mut AccountLoader<'info, TraderStateAccount>,
-) -> Result<()> {
+) -> Result<u64> {
     let cross_collateral = trader_state.load()?.collateral_quote_lots;
     let iso_collateral = position.load()?.collateral_quote_lots;
+    // H6: a cross-pool loss that EXCEEDS the pool is a bankrupt position. Rather
+    // than reverting (the old `checked_sub` → InsufficientCollateral inside
+    // compute_realized_pnl_routing), saturate the pool to 0 and surface the
+    // shortfall so the caller draws it from insurance. Isolated losses keep
+    // their existing saturate-to-0 semantics (bucket-only risk by design).
+    if delta < 0 && !isolated {
+        let debit = if delta < -(u64::MAX as i128) { u64::MAX } else { (-delta) as u64 };
+        if debit > cross_collateral {
+            let (new_cross, shortfall) = cross_loss_shortfall(debit, cross_collateral);
+            trader_state.load_mut()?.collateral_quote_lots = new_cross; // == 0
+            return Ok(shortfall);
+        }
+    }
     let (new_iso, new_cross) = compute_realized_pnl_routing(
         delta,
         isolated,
@@ -13747,7 +13831,7 @@ fn apply_realized_pnl_delta<'info>(
     )?;
     position.load_mut()?.collateral_quote_lots = new_iso;
     trader_state.load_mut()?.collateral_quote_lots = new_cross;
-    Ok(())
+    Ok(0)
 }
 
 /// Wave 24d — apply_realized_pnl_delta with optional H-haircut routing.
@@ -13774,7 +13858,7 @@ fn apply_realized_pnl_delta_v2<'info>(
     trader_state: &mut AccountLoader<'info, TraderStateAccount>,
     position_haircut: Option<&mut Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
     now_slot: u64,
-) -> Result<()> {
+) -> Result<u64> {
     if delta > 0 {
         if let Some(ph) = position_haircut {
             // Haircut path: route to reserve, no collateral mutation.
@@ -13795,10 +13879,12 @@ fn apply_realized_pnl_delta_v2<'info>(
             ph.released_attached_at_slot = post.released_attached_at_slot;
             ph.matured_pos_quote_lots = post.matured_pos_quote_lots;
             ph.original_reserve_at_attach = post.original_reserve_at_attach;
-            return Ok(());
+            // Gains routed to the haircut reserve never touch collateral → no shortfall.
+            return Ok(0);
         }
     }
-    // Loss path AND legacy non-haircut gain path both fall through to v1.
+    // Loss path AND legacy non-haircut gain path both fall through to v1, which
+    // returns any uncovered cross-loss shortfall (H6).
     apply_realized_pnl_delta(delta, isolated, position, trader_state)
 }
 
@@ -14179,6 +14265,39 @@ mod realized_pnl_routing_tests {
     fn loss_exceeding_cross_pool_returns_insufficient_collateral() {
         let result = compute_realized_pnl_routing(-6_000, false, 1_000, 5_000);
         assert!(result.is_err(), "loss > cross pool must error, not go negative");
+    }
+
+    // H6: the bankrupt-close path is intercepted by `apply_realized_pnl_delta`
+    // via `cross_loss_shortfall` BEFORE it reaches `compute_realized_pnl_routing`
+    // (which still errors above — preserving the pure-fn contract).
+    #[test]
+    fn cross_loss_shortfall_covered_by_pool() {
+        // debit fits within the pool → pool drawn down, zero shortfall.
+        let (new_cross, shortfall) = cross_loss_shortfall(250, 5_000);
+        assert_eq!(new_cross, 4_750);
+        assert_eq!(shortfall, 0);
+    }
+
+    #[test]
+    fn cross_loss_shortfall_bankrupt_saturates_and_surfaces_deficit() {
+        // debit exceeds the pool → pool to 0, deficit surfaced for insurance.
+        let (new_cross, shortfall) = cross_loss_shortfall(6_000, 5_000);
+        assert_eq!(new_cross, 0, "pool must never go negative");
+        assert_eq!(shortfall, 1_000, "deficit beyond collateral is the bad debt");
+    }
+
+    #[test]
+    fn cross_loss_shortfall_exact_breakeven_is_zero_shortfall() {
+        let (new_cross, shortfall) = cross_loss_shortfall(5_000, 5_000);
+        assert_eq!(new_cross, 0);
+        assert_eq!(shortfall, 0);
+    }
+
+    #[test]
+    fn cross_loss_shortfall_empty_pool_is_full_deficit() {
+        let (new_cross, shortfall) = cross_loss_shortfall(800, 0);
+        assert_eq!(new_cross, 0);
+        assert_eq!(shortfall, 800);
     }
 
     #[test]
