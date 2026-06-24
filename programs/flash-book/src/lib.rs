@@ -7223,6 +7223,35 @@ pub mod flash_book {
                 handle.header.market_pubkey == market_key,
                 FlashBookError::WrongMarket
             );
+            // H3 (portfolio): refuse to inject/stack a DUPLICATE liquidation —
+            // the SAME guard liquidate_position_v2 carries (the holistic re-verify
+            // found it was applied there but not here). If a synthetic close order
+            // (order_type == 3) for this trader already rests on the close side,
+            // the position is already being liquidated; a second injection would
+            // stack duplicate full-size close orders, corrupting OI and (once both
+            // fill) FLIPPING the victim into a fresh opposite-side position they
+            // never opened, with the keeper able to be the favorable counterparty.
+            let mut already_resting = false;
+            if close_side_u8 == 0 {
+                handle.for_each_bid_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.order_type == 3 && o.trader == trader {
+                        already_resting = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            } else {
+                handle.for_each_ask_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.order_type == 3 && o.trader == trader {
+                        already_resting = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            require!(!already_resting, FlashBookError::RateLimited);
             next_seq = handle
                 .header
                 .order_seq_counter
