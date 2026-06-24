@@ -64,6 +64,9 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
   - `self_trade.rs` — self-trade-prevention policy decision (6 tests)
   - `volume_rate_limit.rs` — token-bucket volume rate limiter (8 tests)
   - `peg_pricing.rs` — oracle-peg price + tick alignment (10 tests)
+  - `stop_limit.rs` — stop/limit trigger decision (10 tests)
+  - `trailing_stop.rs` — trailing-stop peak tracking + trigger (7 tests)
+  - `mit_order.rs` — market-if-touched trigger (7 tests)
   - `constants.rs` — `BPS_DENOM`
   These unblock the fee/risk paths in `apply_fill` / `apply_flp_fill` / intake.
 - ⬜ De-anchor the remaining `matcher/` modules into the shared `no_std`

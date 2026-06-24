@@ -27,6 +27,9 @@ pub mod funding_velocity;
 pub mod self_trade;
 pub mod volume_rate_limit;
 pub mod peg_pricing;
+pub mod stop_limit;
+pub mod trailing_stop;
+pub mod mit_order;
 
 #[cfg(target_os = "solana")]
 mod program {
