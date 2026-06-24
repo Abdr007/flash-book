@@ -105,22 +105,54 @@ work is about the *risk/settlement* accounts. Reference: Manifest
 (hypertree CLOB); Flash Book is already hypertree-lineage, so the data
 structure is right.
 
-### Proposed order (each step measured + must keep 569 tests + Kani green)
+### Results (measured, fresh builds, apples-to-apples)
 
-1. **Pilot:** convert `MarketHaircutStateAccount` + `PositionHaircutStateAccount`
-   to `zero_copy` (already near-Pod; isolated to the haircut path the Kani
-   proofs cover). Proves the pattern end-to-end and de-risks the rest.
-2. `InsuranceFundAccount`, `FeeTiersAccount` → `zero_copy`.
-3. `PositionAccount`, `TraderStateAccount` → `zero_copy` (2 deser each in
-   `apply_fill`; biggest single win).
-4. `MarketAccount` → `zero_copy` (largest; touched program-wide — highest churn,
-   do last).
-5. **Evaluate Quasar** for the entrypoint + remaining copies once accounts are
-   zero-copy — the last ~20–30% toward Pinocchio-tier.
+| Change | `apply_fill` open | Δ | Verdict |
+|---|---|---|---|
+| `find_program_address` fix (PR #4) | 55,502 → 42,093 | **−24%** | real, shipped |
+| `TraderStateAccount` → zero-copy (PR #8) | 42,093 → 42,102 | **~0%** | merged, **no CU benefit** |
+| `PositionAccount` → zero-copy (PR #9) | 42,102 → 37,779 | **−10.3%** | real |
 
-### Targets (rough, to be measured)
+### The key insight: Anchor `AccountLoader` is not free
 
-`apply_fill` open from **42k → ~15–20k CU** after steps 1–4; lower with Quasar.
+Anchor's `AccountLoader::load()`/`load_mut()` does a `RefCell` borrow + discriminator
+check + pointer cast **per call**. So per-account zero-copy only nets a win when
+the **Borsh deser/serialize cost it removes exceeds the `load()` overhead it adds**:
+
+- **PositionAccount won (−10%)** — `init_if_needed` on open avoids a full Borsh
+  *serialize*, and close avoids 2× deser/reserialize, both larger than the load
+  overhead.
+- **TraderStateAccount netted ~0** — it's read/written so many times in
+  `apply_fill` that the load overhead canceled the Borsh savings. (Its PR-#8 CU
+  claim was a stale-`.so` artifact; corrected here.)
+- **`MarketAccount` is therefore a likely *loss*** — it's the most heavily
+  accessed account (`market.params.*` read dozens of times per ix), so an
+  `AccountLoader` conversion would add the most load overhead. **Not pursued.**
+
+**Conclusion: the per-account Anchor-zero-copy lever is largely exhausted.** The
+remaining ~45k of `apply_fill` CU is the Anchor framework (entrypoint + the Borsh
+on the accounts that don't benefit from `AccountLoader`). Capturing it *without*
+per-access `load()` overhead requires the entrypoint + true pointer-cast accounts —
+i.e. **Quasar / Pinocchio**.
+
+### Two zero-copy gotchas (proven in PR #9 — reuse these)
+
+- **No native `u128`/`i128` in a zero-copy account.** It forces 16-byte struct
+  alignment, but Anchor zero-copy data begins at disc offset **+8** (8-aligned
+  only) → `bytemuck::from_bytes` panics at runtime. Store 128-bit fields as
+  `[u8; 16]` with `i128` accessors. (`MarketAccount`'s funding index needs this.)
+- **`init_if_needed` discriminator.** `AccountLoader` writes the discriminator
+  only in `exit()`, so a freshly-created account has a zero disc *during* the
+  handler → `load()` fails `AccountDiscriminatorMismatch`. Stamp it immediately
+  (`stamp_zc_discriminator` in `lib.rs`).
+
+### Recommended next step
+
+**Pivot to the Quasar/Pinocchio track** (custom entrypoint + pointer-cast
+accounts) rather than converting more individual accounts — that is where the
+remaining ~70% lives, and it avoids the `load()`-overhead ceiling. This is a
+multi-session, sign-off-gated effort (new program structure; must re-pass 569
+tests + 5 Kani proofs + build-sbf).
 
 ### Guardrails
 
