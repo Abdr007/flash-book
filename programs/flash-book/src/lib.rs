@@ -517,6 +517,11 @@ pub mod flash_book {
             || size_lots == 0
             || limit_ticks == 0
             || (flags & !0b0111_1111) != 0
+            // H4: reduce_only (bit1) is NOT enforced on the v2 CLOB (there is no
+            // settlement-time reduce-only check; matcher::reduce_only is uncalled).
+            // Reject it LOUDLY so a trader cannot set a "protective close" that
+            // would silently OPEN or FLIP a position. (Full enforcement = separate feature.)
+            || (flags & 0b0000_0010) != 0
         {
             return err!(FlashBookError::OutOfRange);
         }
@@ -637,6 +642,10 @@ pub mod flash_book {
             || size_lots == 0
             || limit_ticks == 0
             || (flags & !0b0111_1111) != 0
+            // H4: reduce_only (bit1) is NOT enforced on the v2 CLOB — reject it
+            // loudly rather than silently no-op a "protective close" (which could
+            // OPEN/FLIP a position if the original is already gone).
+            || (flags & 0b0000_0010) != 0
         {
             return err!(FlashBookError::OutOfRange);
         }
@@ -690,7 +699,8 @@ pub mod flash_book {
 
         // Advanced flags (Phoenix / Manifest / HL parity):
         //   bit 0  POST_ONLY    — reject if any matches (caller wants rest)
-        //   bit 1  REDUCE_ONLY  — enforced upstream by margin ix
+        //   bit 1  REDUCE_ONLY  — UNSUPPORTED on v2: rejected at intake (H4),
+        //                         never enforced here (no settlement-time check)
         //   bit 2  IOC          — cancel residual after walk (no rest)
         //   bit 3  JIT          — Drift-style JIT bonus
         //   bits 4-5 STP_MODE   — self-trade prevention mode
@@ -1051,6 +1061,9 @@ pub mod flash_book {
             || new_size_lots == 0
             || new_limit_ticks == 0
             || (new_flags & !0b0111_1111) != 0
+            // H4: reduce_only (bit1) is unenforced on the v2 CLOB — reject it
+            // loudly (mirrors place_limit_order_v2 / place_taker_order_v2).
+            || (new_flags & 0b0000_0010) != 0
         {
             return err!(FlashBookError::OutOfRange);
         }
