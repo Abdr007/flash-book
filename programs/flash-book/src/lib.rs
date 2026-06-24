@@ -9194,19 +9194,30 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Permissionless: convert a position's `matured_pos` into a
-    /// collateral credit at the current `h`, with the dust accrued to
-    /// the market's haircut state (drains to insurance via
-    /// `flush_haircut_dust`).
+    /// Convert a position's `matured_pos` into a collateral credit at the
+    /// current `h`, with the dust accrued to the market's haircut state (drains
+    /// to insurance via `flush_haircut_dust`).
     ///
-    /// The credit is **NOT** moved into the trader's collateral by this
-    /// ix yet — that's Wave 24c (because the wire-in needs to touch
-    /// `apply_realized_pnl_delta` and pick the isolated/cross routing).
-    /// Wave 24b lands the math + state-only mutation surface so the
-    /// math can be exercised on-chain independently of the credit path.
-    /// `PositionConvertedEvent` carries the credit amount so keepers
-    /// and indexers can see it.
+    /// H9: the credit IS now landed on the trader's collateral via
+    /// `apply_realized_pnl_delta` (isolated→position bucket, else→cross pool),
+    /// conserving value — `residual` is debited by the same `credit`. Previously
+    /// (the never-completed "Wave 24c") the residual was debited but collateral
+    /// was never credited, BURNING the matured PnL and letting anyone
+    /// permissionlessly ratchet `residual` → `h→0` for all traders. Convert is
+    /// now gated to the trader / their delegate. `PositionConvertedEvent` carries
+    /// the credit amount for indexers.
     pub fn convert_position(ctx: Context<ConvertPosition>) -> Result<()> {
+        // H9: convert now MOVES VALUE to the trader, so it must be authorized by
+        // the trader or their delegate — not an arbitrary keeper, which could
+        // otherwise front-run a convert at an unfavorable `h` to grief the trader.
+        require!(
+            ctx.accounts
+                .trader_state
+                .load()?
+                .is_authorized(&ctx.accounts.keeper.key()),
+            FlashBookError::Unauthorized
+        );
+
         let pos_haircut = &mut ctx.accounts.position_haircut;
         let market_haircut = &mut ctx.accounts.haircut_state;
 
@@ -9246,6 +9257,19 @@ pub mod flash_book {
             .residual_quote_lots
             .checked_sub(credit as u128)
             .ok_or_else(|| error!(FlashBookError::HaircutResidualUnderflow))?;
+
+        // H9: land the converted value on the trader (the never-completed
+        // "Wave 24c" wire-in). Residual was debited above by `credit`; credit the
+        // SAME amount to the trader so value is CONSERVED rather than burned. A
+        // gain routes to the isolated bucket if isolated, else the cross pool, and
+        // never produces a shortfall.
+        let isolated = ctx.accounts.position.load()?.collateral_quote_lots > 0;
+        apply_realized_pnl_delta(
+            credit as i128,
+            isolated,
+            &mut ctx.accounts.position,
+            &mut ctx.accounts.trader_state,
+        )?;
 
         // Cache the freshly-computed h for off-chain readers.
         market_haircut.h_scaled_cached = h_scaled.min(u64::MAX as u128) as u64;
@@ -9926,11 +9950,23 @@ pub struct ConvertPosition<'info> {
     pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
 
     #[account(
+        mut,
         seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
         bump = position.load()?.bump,
         constraint = position.load()?.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
     )]
     pub position: AccountLoader<'info, state::PositionAccount>,
+
+    /// H9: the converted matured PnL is credited here — the isolated bucket on
+    /// `position` if isolated, else this cross pool. Bound to the position's
+    /// trader (main account). Previously absent, so the credit was never landed.
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, position.load()?.trader.as_ref()],
+        bump = trader_state.load()?.bump,
+        constraint = trader_state.load()?.trader == position.load()?.trader @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         mut,
