@@ -76,6 +76,7 @@ mod program {
         PlaceTakerOrder = 4,
         ModifyOrder = 5,
         CancelAll = 6,
+        ApplyFlpFill = 7,
     }
 
     #[inline(always)]
@@ -89,6 +90,7 @@ mod program {
             x if x == Ix::PlaceTakerOrder as u8 => instructions::place_taker_order::process(program_id, accounts, rest),
             x if x == Ix::ModifyOrder as u8 => instructions::modify_order::process(program_id, accounts, rest),
             x if x == Ix::CancelAll as u8 => instructions::cancel_all::process(program_id, accounts, rest),
+            x if x == Ix::ApplyFlpFill as u8 => instructions::apply_flp_fill::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
