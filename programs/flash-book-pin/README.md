@@ -13,6 +13,7 @@ framework overhead that dominates the hot path.
 | Instruction | Anchor CU | Pinocchio CU | Δ |
 |---|---|---|---|
 | `apply_fill` | 37,779 | **1,469** | **−96%** |
+| `apply_flp_fill` (core) | ~37,000 | **1,689** | **≈−95%** |
 | `settle_funding` | ~5,050 | **676** | **−87%** |
 | `place_limit_order` | ~12,500 | **411** | **−97%** |
 | `cancel_order` | ~12,500 | **550** | **−96%** |
@@ -41,9 +42,12 @@ still an ~85–90% reduction, matching the published SPL-token Pinocchio result.
 - ✅ Foundation: `no_std` entrypoint, 1-byte instruction dispatch, Pod account
   layouts (8-aligned, `[u8;16]` for the i128 funding index — a native 128-bit
   field is incompatible with the disc+8 data offset).
-- ✅ `apply_fill` + `settle_funding` + `place_limit_order` + `cancel_order`
-  + `place_taker_order` + `modify_order` + `cancel_all` (**7 of 112**), build
-  clean, measured above; the ported math is host-equivalence-tested.
+- ✅ `apply_fill` + `apply_flp_fill` + `settle_funding` + `place_limit_order`
+  + `cancel_order` + `place_taker_order` + `modify_order` + `cancel_all`
+  (**8 of 112**), build clean, measured above; the ported math is
+  host-equivalence-tested. (`apply_flp_fill` is the **core** taker-leg
+  settlement — FLP-as-maker fee/rebate/insurance split; deferred follow-ups:
+  FLP per-market exposure update, toxicity tax, fee tiers, events.)
 - ✅ **Taker matching walk ported** — best-first cross, self-trade prevention
   (skip / cancel-oldest / cancel-both), expiry skip, post-only/IOC/FOK,
   residual-rest-as-limit; matches collected in fixed-size stack buffers (no

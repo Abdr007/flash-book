@@ -38,7 +38,10 @@ pub struct Market {
     pub mark_price_ticks: u64,
     pub min_base_lots: u64,
     pub max_oi_base_lots: u64,
-    pub _reserved: [u8; 1040],
+    /// Cumulative net fees booked to the protocol (gross, before the insurance
+    /// contribution split). Carved from `_reserved`; total layout size unchanged.
+    pub total_fees_collected: u64,
+    pub _reserved: [u8; 1032],
 }
 impl Market {
     #[inline] pub fn cum_funding(&self) -> i128 { i128::from_le_bytes(self.cum_funding_index) }
@@ -56,7 +59,12 @@ pub struct TraderState {
 pub struct Insurance {
     pub disc: [u8; 8],
     pub balance_quote_lots: u64,
-    pub _reserved: [u8; 184],
+    /// Cumulative quote-lots routed into the fund (informational).
+    pub total_contributions: u64,
+    /// Fraction (bps) of each net fee routed to the fund; the remainder is
+    /// protocol revenue. Carved from `_reserved`; total layout size unchanged.
+    pub fee_contribution_bps: u32,
+    pub _reserved: [u8; 172],
 }
 
 pub const FEE_TIERS_DISC: [u8; 8] = [0xFE, 0xE7, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01];
