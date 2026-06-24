@@ -1563,6 +1563,10 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
         .await
         .unwrap();
 
+    // H8: the FLP minimum hold (FLP_MIN_HOLD_SLOTS) now gates withdrawals.
+    // Advance past it so the legitimate withdraw succeeds.
+    ctx.warp_to_slot(1_000).unwrap();
+
     // Burn 1M shares to withdraw 1M USDC (NAV/share = 1.0 since no fills).
     let withdraw_ix = build_ix(
         flash_book::instruction::WithdrawFlpCapital {
@@ -1766,6 +1770,9 @@ async fn lp_units_withdraw_burns_shares_and_distributes_nav() {
         flash_book::state::LpPositionAccount::SEED,
         alice.pubkey().as_ref(),
     ]);
+
+    // H8: advance past the FLP minimum hold before withdrawing.
+    ctx.warp_to_slot(1_000).unwrap();
 
     // Alice burns 1M shares. NAV/share = 7M/7M = 1.0 → returns 1M USDC.
     let withdraw_ix = build_ix(

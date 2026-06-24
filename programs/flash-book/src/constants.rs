@@ -88,3 +88,13 @@ pub const SOLANA_MAX_ACCOUNT_SIZE: usize = 10 * 1024 * 1024;
 /// CLOBs typically size baskets at ≤4 legs (a long-short pair plus a
 /// hedge); larger baskets land via repeated calls.
 pub const MAX_BASKET_LEGS_N: usize = 4;
+
+/// H8: minimum slots an FLP liquidity provider must hold before withdrawing,
+/// enforced by `withdraw_flp_capital` via `matcher::jit_lp_defense::can_withdraw`.
+/// Defeats the flash / short-window attack of depositing right before a fee /
+/// realized-PnL event that lifts FLP NAV and redeeming the windfall without
+/// bearing risk (the `jit_lp_defense` module existed but was never wired). ~1 min
+/// at ~0.4s/slot — negligible for genuine LPs (who hold for days), fatal to the
+/// timed windfall. Security floor; a future governance field can override it once
+/// the FlpExposureAccount layout is versioned (it currently has no reserved space).
+pub const FLP_MIN_HOLD_SLOTS: u64 = 150;

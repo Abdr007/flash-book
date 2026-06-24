@@ -1318,6 +1318,10 @@ pub mod flash_book {
             lp_pos.lp = ctx.accounts.authority.key();
             lp_pos.bump = ctx.bumps.lp_position;
         }
+        // H8: (re)start the min-hold clock on every deposit so a tiny top-up
+        // cannot preserve an older timestamp to dodge the lock.
+        lp_pos.deposited_at_slot =
+            matcher::jit_lp_defense::extend_lock_on_deposit(Clock::get()?.slot);
         lp_pos.shares = lp_pos
             .shares
             .checked_add(shares_to_mint)
@@ -1363,6 +1367,18 @@ pub mod flash_book {
         require!(
             shares_to_burn <= ctx.accounts.lp_position.shares,
             FlashBookError::InsufficientCollateral
+        );
+        // H8: enforce the FLP minimum hold so an LP cannot flash-deposit just
+        // before a fee / realized-PnL event that lifts NAV and redeem the
+        // windfall without bearing risk. deposited_at_slot==0 (legacy accounts)
+        // ⇒ can_withdraw true (no lock retroactively imposed).
+        require!(
+            matcher::jit_lp_defense::can_withdraw(
+                ctx.accounts.lp_position.deposited_at_slot,
+                Clock::get()?.slot,
+                constants::FLP_MIN_HOLD_SLOTS,
+            ),
+            FlashBookError::RateLimited
         );
 
         let flp_ro = &ctx.accounts.flp_exposure;
