@@ -7145,6 +7145,102 @@
       ]
     },
     {
+      "name": "reap_expired_orders",
+      "docs": [
+        "Permissionless expiry-reaper (#36 anti-book-stuffing). Removes GTT orders",
+        "whose `expires_at_slot` has passed, reclaiming node-arena space so a market",
+        "self-heals from stale-order accumulation. ANYONE may call it \u2014 but only a",
+        "GENUINELY-expired GTT order is ever removed: a live order or a GTC order",
+        "(`expires_at_slot == 0`) is skipped, so the reaper can never cancel an",
+        "order out from under a trader. `order_id` is globally unique among live",
+        "orders (proven: `state_v2` `distinct_orders_never_collide`), so each id is",
+        "searched on both books without a side hint. Bounded per call."
+      ],
+      "discriminator": [
+        214,
+        36,
+        206,
+        126,
+        97,
+        173,
+        37,
+        139
+      ],
+      "accounts": [
+        {
+          "name": "cranker",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "because we remove nodes + update header indices + free-list."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "order_ids",
+          "type": {
+            "vec": "u64"
+          }
+        }
+      ]
+    },
+    {
       "name": "record_flp_fill_v3",
       "docs": [
         "Record a fill on this per-market FLP exposure."
@@ -12533,6 +12629,19 @@
       ]
     },
     {
+      "name": "ExpiredOrdersReapedEvent",
+      "discriminator": [
+        118,
+        243,
+        122,
+        17,
+        109,
+        172,
+        84,
+        28
+      ]
+    },
+    {
       "name": "FeeTiersInitializedEvent",
       "discriminator": [
         19,
@@ -14750,6 +14859,29 @@
           {
             "name": "passed",
             "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ExpiredOrdersReapedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "reaped",
+            "docs": [
+              "Number of expired orders actually removed this call."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "total_orders_after",
+            "type": "u32"
           }
         ]
       }
