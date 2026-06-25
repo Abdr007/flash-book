@@ -4314,3 +4314,205 @@ async fn apply_fill_rejects_wrong_sub_index_trader_state() {
         "ApplyFill must reject wrong-sub_index trader_state (Phase 2i)"
     );
 }
+
+/// Instruction-level chaos: random sequences of `place_limit` / `place_taker` /
+/// `cancel` / `reap` against the REAL program (band gate, matching, expiry,
+/// account validation all live), across several seeds. After each run the
+/// on-chain book is PARSED and validated — count consistent, both best-first
+/// walks in strict price-time order, never corrupt. A program panic surfaces as
+/// `ProgramFailedToComplete` (asserted against); graceful `Custom` errors are
+/// expected and fine. Complements `proptest_book` (pure structure) by exercising
+/// the handlers + gates under random interleaving.
+async fn chaos_send(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    ix: Instruction,
+    payer_pk: &Pubkey,
+    signers: &[&Keypair],
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(payer_pk),
+            signers,
+            bh,
+        ))
+        .await
+}
+
+#[tokio::test]
+async fn chaos_instruction_sequences_keep_book_consistent() {
+    fn nxt(s: &mut u64) -> u64 {
+        *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    for seed in 1u64..=4 {
+        let pt = make_program_test();
+        let mut ctx = pt.start_with_context().await;
+        let payer = ctx.payer.insecure_clone();
+        let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+        let (book_pda, _) =
+            pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+        chaos_send(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            ),
+            &payer.pubkey(),
+            &[&payer],
+        )
+        .await
+        .unwrap();
+
+        let traders: Vec<Keypair> = (0..3).map(|_| Keypair::new()).collect();
+        let mut resting: Vec<(usize, u8, u64)> = Vec::new(); // (trader_idx, side, order_id)
+        let mut seq: u64 = 1;
+        let mut warp_slot: u64 = 100;
+        let mut s = seed;
+
+        for _ in 0..35 {
+            let r = nxt(&mut s);
+            let ti = (r % 3) as usize;
+            let kind = (r >> 8) % 5;
+            let side = ((r >> 16) & 1) as u8;
+            let price = 80_000 + (r >> 17) % 40_001; // 80k..120k — inside the 50% band of the 100k oracle
+            let size = 1 + (r >> 40) % 5;
+            // GTT expiry sits AHEAD of the current clock (valid at placement) but
+            // behind a later reap-warp (so it becomes reapable) — exercises the
+            // expiry/reaper path rather than pre-expiring. ~half are GTC (0).
+            let expires = if (r >> 50) & 1 == 1 { warp_slot + 50 } else { 0 };
+
+            let place_metas = |t: &Keypair| {
+                vec![
+                    AccountMeta::new(t.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                ]
+            };
+
+            let res = match kind {
+                0 | 4 => {
+                    let ix = build_ix(
+                        flash_book::instruction::PlaceLimitOrderV2 {
+                            side,
+                            size_lots: size,
+                            limit_ticks: price,
+                            flags: 0,
+                            expires_at_slot: expires,
+                            sub_index: 0,
+                        },
+                        place_metas(&traders[ti]),
+                    );
+                    let res = chaos_send(&mut ctx, ix, &payer.pubkey(), &[&payer, &traders[ti]]).await;
+                    if res.is_ok() {
+                        resting.push((ti, side, flash_book::state_v2::encode_order_id(price, seq, side == 0)));
+                        seq += 1;
+                    }
+                    res
+                }
+                1 => {
+                    let ix = build_ix(
+                        flash_book::instruction::PlaceTakerOrderV2 {
+                            side,
+                            size_lots: size,
+                            limit_ticks: price,
+                            flags: 0,
+                            expires_at_slot: expires,
+                            sub_index: 0,
+                        },
+                        place_metas(&traders[ti]),
+                    );
+                    let res = chaos_send(&mut ctx, ix, &payer.pubkey(), &[&payer, &traders[ti]]).await;
+                    if res.is_ok() {
+                        seq += 1;
+                    }
+                    res
+                }
+                2 => {
+                    if resting.is_empty() {
+                        continue;
+                    }
+                    let i = (r >> 24) as usize % resting.len();
+                    let (oti, oside, oid) = resting[i];
+                    let ix = build_ix(
+                        flash_book::instruction::CancelOrderV2 {
+                            side: oside,
+                            order_id: oid,
+                        },
+                        place_metas(&traders[oti]),
+                    );
+                    chaos_send(&mut ctx, ix, &payer.pubkey(), &[&payer, &traders[oti]]).await
+                }
+                _ => {
+                    ctx.warp_to_slot(warp_slot).unwrap();
+                    warp_slot += 100;
+                    let ids: Vec<u64> = resting.iter().rev().take(10).map(|x| x.2).collect();
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    let ix = build_ix(
+                        flash_book::instruction::ReapExpiredOrders { order_ids: ids },
+                        vec![
+                            AccountMeta::new(payer.pubkey(), true),
+                            AccountMeta::new_readonly(market_pda, false),
+                            AccountMeta::new(book_pda, false),
+                        ],
+                    );
+                    chaos_send(&mut ctx, ix, &payer.pubkey(), &[&payer]).await
+                }
+            };
+
+            if let Err(e) = &res {
+                let dbg = format!("{e:?}");
+                assert!(
+                    !dbg.contains("ProgramFailedToComplete"),
+                    "program aborted under chaos (seed {seed}): {dbg}"
+                );
+            }
+        }
+
+        let acct = ctx
+            .banks_client
+            .get_account(book_pda)
+            .await
+            .unwrap()
+            .expect("book account exists");
+        let mut data = acct.data;
+        let handle = flash_book::state_v2::MarketBookHandle::from_account_data(&mut data)
+            .expect("book still parses after chaos");
+        let mut bids: Vec<(u64, u64)> = Vec::new();
+        handle.for_each_bid_best_first(|_i, o| {
+            bids.push((o.price_ticks, o.seq));
+            true
+        });
+        let mut asks: Vec<(u64, u64)> = Vec::new();
+        handle.for_each_ask_best_first(|_i, o| {
+            asks.push((o.price_ticks, o.seq));
+            true
+        });
+        assert_eq!(
+            bids.len() + asks.len(),
+            handle.header.total_orders_active as usize,
+            "book count corrupt after chaos (seed {seed})"
+        );
+        for w in bids.windows(2) {
+            let ((p0, s0), (p1, s1)) = (w[0], w[1]);
+            assert!(p0 > p1 || (p0 == p1 && s0 < s1), "bid order corrupt (seed {seed})");
+        }
+        for w in asks.windows(2) {
+            let ((p0, s0), (p1, s1)) = (w[0], w[1]);
+            assert!(p0 < p1 || (p0 == p1 && s0 < s1), "ask order corrupt (seed {seed})");
+        }
+    }
+}
