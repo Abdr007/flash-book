@@ -331,9 +331,6 @@ pub struct MarketAccount {
     /// (compromised) sequencer can no longer bypass the anti-fabrication guard by
     /// omitting the optional ring account. Additive migration: pre-existing
     /// markets read back `false` (legacy optional behaviour).
-    /// MERGE NOTE: a parallel branch also adds additive `MarketAccount` fields
-    /// (e.g. `book_delegated_at_slot`); reconcile the field ORDER on merge so the
-    /// Borsh layout is consistent across both.
     pub fill_commitment_required: bool,
     /// H-2 (audit 2026-06): sticky flag — once `initialize_haircut_state` enables
     /// the haircut junior-claim engine for this market, the (optional) haircut
@@ -342,6 +339,26 @@ pub struct MarketAccount {
     /// collateral with NO Residual/solvency gating (then withdraw it). Additive
     /// migration: pre-existing markets read back `false`.
     pub haircut_enabled: bool,
+    /// L1 slot at which the mark price was last actively maintained — written by
+    /// BOTH the fill-EMA path in `apply_fill` (every fill = ER alive) and by
+    /// `settle_mark`. Distinct from `last_mark_settle_slot` (settle-only): this
+    /// tracks mark FRESHNESS across both update paths so a stalled ER is
+    /// detectable. When `current_slot - last_mark_update_slot` exceeds
+    /// `constants::MARK_STALENESS_MAX_SLOTS`, liquidation falls back to
+    /// oracle-only pricing and the market auto-pauses. Additive-migration field:
+    /// pre-existing markets read back 0 (trailing-zero convention) — treated as
+    /// "freshness unknown ⇒ liquidate oracle-only" (fail-safe) until the first
+    /// post-upgrade fill/settle stamps it.
+    pub last_mark_update_slot: u64,
+    /// L1 slot at which the market book was last delegated to the ER (set by
+    /// `delegate_market_book`). Used as the settlement-liveness BASELINE for the
+    /// permissionless `force_undelegate_market_book` escape, so the censorship
+    /// timeout starts ticking from delegation even if the sequencer NEVER posts a
+    /// fill (which would otherwise keep `last_mark_update_slot == 0` and trap
+    /// pre-existing positions forever). The gate uses
+    /// `max(last_mark_update_slot, book_delegated_at_slot)`. Additive-migration
+    /// field: pre-existing markets read back 0.
+    pub book_delegated_at_slot: u64,
 }
 
 // H1: build-time guard — the struct (incl. the new nonce) must still fit the

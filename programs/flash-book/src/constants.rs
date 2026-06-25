@@ -106,6 +106,29 @@ pub const MAX_BASKET_LEGS_N: usize = 4;
 /// the FlpExposureAccount layout is versioned (it currently has no reserved space).
 pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
 
+/// ER-stall safety floor: max L1 slots since the mark price last moved (via the
+/// fill-EMA in `apply_fill` or a hard `settle_mark`) before the mark is treated
+/// as STALE. A stalled MagicBlock ER freezes the fill stream, so the mark stops
+/// updating; past this bound `liquidate_position_v2` drops the (possibly
+/// adverse, frozen) mark and falls back to ORACLE-ONLY health pricing, and
+/// `verify_market_invariants` auto-pauses the market so no new orders land while
+/// the ER is down. ~0.4s/slot ⇒ 150 slots ≈ 60s — comfortably above the normal
+/// fill/`settle_mark` cadence, so healthy markets never trip it. Security floor;
+/// a future governance field can override it once MarketParams is versioned.
+pub const MARK_STALENESS_MAX_SLOTS: u64 = 150;
+
+/// Censorship / ER-stall escape threshold: L1 slots the ER may be silent (no
+/// committed fill advancing `MarketAccount.last_mark_update_slot`) before ANY
+/// caller may permissionlessly undelegate the market book / market back to L1
+/// via `force_undelegate_market_book` / `force_undelegate_market` — freeing
+/// trapped traders to close and withdraw WITHOUT the sequencer's cooperation.
+/// Ties the exit guarantee to settlement liveness, not sequencer goodwill.
+/// ~0.4s/slot ⇒ 750 slots ≈ 5 min, far beyond any healthy commit cadence, so it
+/// never fires in normal operation — only on a genuinely dark / censoring ER.
+/// Deliberately >> MARK_STALENESS_MAX_SLOTS (which only changes liquidation
+/// PRICING): auto-pause/oracle-fallback engage first; forced exit is last resort.
+pub const FORCE_UNDELEGATE_TIMEOUT_SLOTS: u64 = 750;
+
 /// #35 / H1 part B — protocol-level safety cap on how far an `apply_flp_fill`
 /// price may deviate from the FRESH oracle, in bps (symmetric band). The FLP
 /// quoter always prices within its spread of fair value, so a legitimate fill is

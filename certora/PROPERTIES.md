@@ -46,8 +46,20 @@ credit satisfies `credit ≤ Residual` and `credit + dust == matured` at the rea
 → **`[KANI]`** (protocol-owned buckets) `assess_solvency` (`matcher::insurance`) —
 `solvent_iff_vault_covers_buckets` + `surplus_exact_when_solvent` (vault accounts
 exactly to insurance + FLP + surplus; no value invented); `verify_protocol_solvency`
-routes through it. **`[CERTORA-TARGET]`** the broader `vault ≥ Σ trader_collateral
-+ FLP + insurance` *preserved by every instruction* (the Manifest "loss-of-funds" set).
+routes through it.
+→ **`[KANI]`** (FULL invariant, incl. trader collateral) `assess_solvency_full` —
+`full_solvent_iff_vault_covers_all_liabilities` proves `solvent ⇔ vault ≥
+Σ collateral + FLP + insurance` with exact surplus. The runtime check is the
+DRIFT-FREE one-sided sweep `partial_collateral_proves_insolvent` (proven sound by
+`partial_insolvency_detector_is_sound`: it fires only on genuine insolvency, for
+any real total ≥ the summed subset); the permissionless `verify_collateral_solvency`
+instruction sums REAL collateral from deduplicated trader-state / isolated-position
+accounts and routes through it — so it cannot desync from the 47 collateral-mutation
+sites the way a stored aggregate would.
+→ **`[CERTORA-TARGET]`** the broader `vault ≥ Σ trader_collateral + FLP + insurance`
+*preserved by every instruction* (the Manifest "loss-of-funds" set) — the all-paths
+proof the one-sided runtime sweep cannot give. Scaffolded in `certora/specs/solvency.spec`
++ `certora/solana_solvency.conf`; runnable once a Certora Solana license is wired.
 
 **P-SOLV-5 — Residual conservation identity.** `Residual == V − C_tot − I` is
 preserved by every money-moving instruction (funding pay/receive, realized

@@ -218,13 +218,48 @@ pub fn worse_of_health_price(mark_t: u64, oracle_t: u64, is_long: bool) -> (u64,
     }
 }
 
+/// Source tag returned by [`health_price_with_staleness`] when the mark is
+/// stale and the health price is taken from the oracle ALONE (ER-stall
+/// fallback). Distinct from the worse-of source tags (0=mark, 1=oracle, 2=equal)
+/// so keepers/UIs can show "liquidated on oracle-only (ER stalled)".
+pub const HP_SOURCE_ORACLE_ONLY: u8 = 3;
+
+/// Staleness-aware health price (ER-stall defense, P-LIQ-2).
+///
+/// When the mark is FRESH this is exactly the Kani-proven
+/// [`worse_of_health_price`] — the dual-source design is untouched on the happy
+/// path. When the mark is STALE (a stalled MagicBlock ER froze the fill stream,
+/// so `mark_t` no longer tracks the tape), the frozen mark must NOT be allowed
+/// to make a position look adverse and trigger a wrongful liquidation — so the
+/// stale mark is dropped and the health price is taken from the ORACLE alone.
+///
+/// If the mark is stale AND the oracle is unusable (`oracle_t == 0`), there is
+/// no trustworthy price at all: returns `None`, and the caller MUST refuse to
+/// liquidate (fail-safe — keep the position open until a price source recovers).
+#[inline]
+pub fn health_price_with_staleness(
+    mark_t: u64,
+    oracle_t: u64,
+    mark_stale: bool,
+    is_long: bool,
+) -> Option<(u64, u8)> {
+    if !mark_stale {
+        return Some(worse_of_health_price(mark_t, oracle_t, is_long));
+    }
+    if oracle_t > 0 {
+        Some((oracle_t, HP_SOURCE_ORACLE_ONLY))
+    } else {
+        None
+    }
+}
+
 /// FV: machine-checked correctness of the dual-source health price (Kani,
 /// comparison-only → fast). Proves P-LIQ-1's core: the health price is always the
 /// WORSE of the two real sources for the position's side, never under-states risk,
 /// and never invents a price.
 #[cfg(kani)]
 mod health_price_kani_proofs {
-    use super::worse_of_health_price;
+    use super::{health_price_with_staleness, worse_of_health_price, HP_SOURCE_ORACLE_ONLY};
 
     /// LONG: the health price is never HIGHER than the mark, and never higher than
     /// a LIVE oracle — i.e. it is the worse (lower) of the two. So a long is never
@@ -259,5 +294,76 @@ mod health_price_kani_proofs {
         let (hp, src) = worse_of_health_price(mark, oracle, is_long);
         assert!(hp == mark || hp == oracle);
         assert!(src <= 2);
+    }
+
+    /// P-LIQ-2: a STALE mark is NEVER used. When stale with a live oracle the
+    /// health price is the oracle ALONE (the frozen mark can't force a wrongful
+    /// liquidation); when stale with no oracle there is no price at all (None).
+    #[kani::proof]
+    fn stale_mark_falls_back_to_oracle_only() {
+        let mark: u64 = kani::any();
+        let oracle: u64 = kani::any();
+        let is_long: bool = kani::any();
+        match health_price_with_staleness(mark, oracle, true, is_long) {
+            Some((hp, src)) => {
+                // Stale ⇒ oracle must be usable, and the price is the oracle —
+                // never the mark (unless they happen to coincide).
+                assert!(oracle > 0);
+                assert!(hp == oracle);
+                assert!(src == HP_SOURCE_ORACLE_ONLY);
+            }
+            None => assert!(oracle == 0),
+        }
+    }
+
+    /// A FRESH mark leaves the dual-source design untouched: identical to the
+    /// proven worse-of, and always Some.
+    #[kani::proof]
+    fn fresh_mark_equals_worse_of() {
+        let mark: u64 = kani::any();
+        let oracle: u64 = kani::any();
+        let is_long: bool = kani::any();
+        let staleness = health_price_with_staleness(mark, oracle, false, is_long);
+        let worse = worse_of_health_price(mark, oracle, is_long);
+        assert!(staleness == Some(worse));
+    }
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::{health_price_with_staleness, worse_of_health_price, HP_SOURCE_ORACLE_ONLY};
+
+    #[test]
+    fn fresh_mark_uses_worse_of_both_sides() {
+        // Long: worse = lower. Short: worse = higher.
+        assert_eq!(
+            health_price_with_staleness(100, 90, false, true),
+            Some(worse_of_health_price(100, 90, true))
+        );
+        assert_eq!(
+            health_price_with_staleness(100, 110, false, false),
+            Some(worse_of_health_price(100, 110, false))
+        );
+    }
+
+    #[test]
+    fn stale_mark_ignores_adverse_frozen_mark() {
+        // Frozen mark 50 would liquidate a long far below the live oracle 100.
+        // Stale ⇒ we drop the mark and price off the oracle alone.
+        assert_eq!(
+            health_price_with_staleness(50, 100, true, true),
+            Some((100, HP_SOURCE_ORACLE_ONLY))
+        );
+        // Same for a short whose frozen mark 200 is adverse vs live oracle 100.
+        assert_eq!(
+            health_price_with_staleness(200, 100, true, false),
+            Some((100, HP_SOURCE_ORACLE_ONLY))
+        );
+    }
+
+    #[test]
+    fn stale_mark_no_oracle_is_unpriceable() {
+        assert_eq!(health_price_with_staleness(123, 0, true, true), None);
+        assert_eq!(health_price_with_staleness(123, 0, true, false), None);
     }
 }

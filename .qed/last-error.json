@@ -1,0 +1,5 @@
+{
+  "command": "codegen",
+  "stderr": "No .qed/ directory found next to haircut_conservation.qedspec — run `qedgen init` first.",
+  "timestamp": "2026-06-24T13:09:47.970141000Z"
+}

@@ -213,6 +213,57 @@ pub fn cpi_undelegate(
     Ok(())
 }
 
+/// Pure decision for the permissionless force-undelegate timeout gate
+/// (`force_undelegate_market_book`). Returns true iff the ER has been silent for
+/// STRICTLY MORE than `timeout_slots`. The liveness baseline is the more recent
+/// of the last committed fill (`last_mark_update_slot`) and the delegation slot
+/// (`book_delegated_at_slot`); the latter closes the "delegate then never fill"
+/// trap. A 0 baseline (book not delegated via the upgraded path) is never
+/// escapable. Extracted pure so the "never fires while the ER is live" property
+/// is host-tested and Kani-proven, and the handler calls the proven function.
+#[inline]
+pub fn force_undelegate_allowed(
+    current_slot: u64,
+    last_mark_update_slot: u64,
+    book_delegated_at_slot: u64,
+    timeout_slots: u64,
+) -> bool {
+    let baseline = if last_mark_update_slot > book_delegated_at_slot {
+        last_mark_update_slot
+    } else {
+        book_delegated_at_slot
+    };
+    if baseline == 0 {
+        return false;
+    }
+    current_slot.saturating_sub(baseline) > timeout_slots
+}
+
+/// FV: the force-undelegate gate NEVER fires while the ER is live — i.e. it can
+/// only return true when the most recent liveness signal is older than the full
+/// timeout. Guarantees a censoring/stalled ER is a precondition for the escape,
+/// so it cannot be used to grief a healthy venue.
+#[cfg(kani)]
+mod force_undelegate_kani_proofs {
+    use super::force_undelegate_allowed;
+
+    #[kani::proof]
+    fn never_fires_while_live() {
+        let current: u64 = kani::any();
+        let last_fill: u64 = kani::any();
+        let delegated: u64 = kani::any();
+        let timeout: u64 = kani::any();
+        if force_undelegate_allowed(current, last_fill, delegated, timeout) {
+            // Then BOTH liveness signals are older than the full timeout window,
+            // and at least one real baseline exists.
+            let baseline = core::cmp::max(last_fill, delegated);
+            assert!(baseline > 0);
+            assert!(current > baseline);
+            assert!(current - baseline > timeout);
+        }
+    }
+}
+
 // ─── MagicBlock Magic program (ER-side commit) + undelegation callback ───
 //
 // The pieces below complete the settlement loop the bare Delegate/Undelegate
@@ -402,6 +453,30 @@ pub fn process_external_undelegate<'info>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn force_undelegate_blocked_without_baseline() {
+        // No liveness baseline (never delegated via upgraded path) ⇒ never escapable.
+        assert!(!force_undelegate_allowed(1_000_000, 0, 0, 750));
+    }
+
+    #[test]
+    fn force_undelegate_blocked_while_live() {
+        // Last fill 1 slot ago, timeout 750 ⇒ ER is live ⇒ blocked.
+        assert!(!force_undelegate_allowed(1000, 999, 500, 750));
+        // Exactly at the timeout boundary is NOT enough (strictly greater).
+        assert!(!force_undelegate_allowed(1750, 1000, 0, 750));
+    }
+
+    #[test]
+    fn force_undelegate_allowed_after_timeout() {
+        // 751 slots since last fill ⇒ escape opens.
+        assert!(force_undelegate_allowed(1751, 1000, 0, 750));
+        // Sequencer delegated then never filled: baseline = delegation slot.
+        assert!(force_undelegate_allowed(2000, 0, 1000, 750));
+        // The MORE RECENT signal wins (a fresh fill keeps it live even if old delegation).
+        assert!(!force_undelegate_allowed(2000, 1900, 100, 750));
+    }
 
     #[test]
     fn delegation_program_id_is_canonical() {
