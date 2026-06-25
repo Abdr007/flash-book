@@ -4516,3 +4516,101 @@ async fn chaos_instruction_sequences_keep_book_consistent() {
         }
     }
 }
+
+/// ER-layer coverage (honest scope): a faithful delegate→commit→undelegate
+/// round-trip needs a live MagicBlock ER (the handlers CPI into the delegation
+/// program, absent here) and is a devnet lifecycle test. What IS real and
+/// testable in the unit harness is the BASE-LAYER auth gate that runs BEFORE the
+/// CPI: the `market.authority` constraint on the delegation instructions. This
+/// verifies a non-authority is rejected (Unauthorized = Anchor Custom(7100)) by
+/// `delegate_fill_commitment` and `undelegate_fill_commitment` (the #35 ER ix) —
+/// so a rogue can never delegate/undelegate a market's commitment ring.
+#[tokio::test]
+async fn er_delegation_rejects_non_authority() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (fc_pda, _) = pda(&[
+        flash_book::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market_pda.as_ref(),
+    ]);
+
+    // Allocate the commitment account (payer IS the market authority here).
+    chaos_send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitFillCommitment {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    let rogue = Keypair::new();
+    let d1 = Pubkey::new_unique();
+    let d2 = Pubkey::new_unique();
+    let d3 = Pubkey::new_unique();
+
+    // delegate_fill_commitment with a ROGUE authority → rejected at the auth gate.
+    let del = chaos_send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::DelegateFillCommitment {
+                commit_frequency_ms: 1_000,
+                validator: None,
+            },
+            vec![
+                AccountMeta::new(rogue.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(flash_book::ID, false), // owner_program
+                AccountMeta::new(d1, false),                      // delegate_buffer
+                AccountMeta::new(d2, false),                      // delegation_record
+                AccountMeta::new(d3, false),                      // delegation_metadata
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(flash_book::er::DELEGATION_PROGRAM_ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer, &rogue],
+    )
+    .await;
+    let dbg = format!("{del:?}");
+    assert!(
+        dbg.contains("Custom(7100)"),
+        "delegate_fill_commitment must reject a non-authority with Unauthorized, got: {dbg}"
+    );
+
+    // undelegate_fill_commitment with a ROGUE authority → same auth gate.
+    let und = chaos_send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::UndelegateFillCommitment {},
+            vec![
+                AccountMeta::new(rogue.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(flash_book::ID, false),
+                AccountMeta::new(d1, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(flash_book::er::DELEGATION_PROGRAM_ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer, &rogue],
+    )
+    .await;
+    let dbg2 = format!("{und:?}");
+    assert!(
+        dbg2.contains("Custom(7100)"),
+        "undelegate_fill_commitment must reject a non-authority with Unauthorized, got: {dbg2}"
+    );
+}
