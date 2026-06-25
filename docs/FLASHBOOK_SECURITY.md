@@ -349,16 +349,18 @@ fixed). 156+ distinct attacks attempted and survived across all passes.
 ### Open (remaining work)
 - **H1 part B** (HIGH, architectural): fill-authenticity match-commitment — the
   sequencer-SPOF removal (§3.2). Replay is closed (part A); authenticity is the redesign.
-- **Book-stuffing DoS** (MEDIUM, economic pass) — **price-band shipped** (#36,
-  `MAX_RESTING_ORDER_DEVIATION_BPS`): `place_limit_order_v2` (intake) and
-  `place_taker_order_v2` (residual) now reject/drop a resting order priced >50%
-  from the fresh oracle, so the cheap "free far-from-market" stuffing vector is
-  closed — a resting order must be near enough to market to bear fill risk (Kani
-  `price_within_band` + integration test). **Residual:** raises attacker cost but
-  does not alone stop a sybil (N wallets × near-market orders); that is bounded by
-  the expandable arena (`BufferFull`) + future economic cost (per-order
-  fee/rent) or the per-trader cap (needs `ClaimedSeat` lifecycle wiring) /
-  permissionless expiry-reaper.
+- **Book-stuffing DoS** (MEDIUM, economic pass) — **2 of 3 fixes shipped** (#36):
+  (1) **price-band** (`MAX_RESTING_ORDER_DEVIATION_BPS`): `place_limit_order_v2`
+  (intake) + `place_taker_order_v2` (residual) reject/drop a resting order priced
+  >50% from the fresh oracle, so the cheap "free far-from-market" vector is closed
+  — a resting order must be near enough to market to bear fill risk (Kani
+  `price_within_band`). (2) **permissionless expiry-reaper** `reap_expired_orders`:
+  anyone reclaims expired GTT nodes so the arena self-heals; only genuinely-expired
+  orders are touched (no grief). Both have integration tests. **Residual:** raises
+  attacker cost but does not alone stop a sybil (N wallets × near-market orders);
+  bounded by the expandable arena (`BufferFull`) + the remaining optional fix —
+  per-trader cap (needs `ClaimedSeat` lifecycle wiring) or per-order economic cost
+  (fee/rent).
 - Mediums M1–M13, lows L1–L5, info cleanup; H3 deeper "reward on realized close".
 - **FV sweep** (in progress): margin-completeness, funding conservation; extend Lean
   to H6/H7; author Certora CVL specs.
