@@ -931,3 +931,46 @@ mod isolated_margin_tests {
         assert!(a.is_healthy);
     }
 }
+
+/// FV: machine-checked invariants for the OI-scaled / crowded-trade maintenance-
+/// margin surcharge (Kani, exhaustive over the input domain where the property
+/// does not depend on the non-power-of-two `/1_000_000` division value — CBMC is
+/// incomplete on 128-bit non-pow2 division, so we prove the bound/floor/disable
+/// properties that hold for ANY division result). Runs in the CI Kani job.
+#[cfg(kani)]
+mod mmr_kani_proofs {
+    use super::{effective_mmr_bps_full, oi_scaled_mmr_extra_bps};
+
+    /// The OI surcharge NEVER exceeds its configured cap — a crowded book cannot
+    /// be charged more maintenance margin than governance bounded.
+    #[kani::proof]
+    fn oi_scaled_never_exceeds_cap() {
+        let oi: u64 = kani::any();
+        let slope: u32 = kani::any();
+        let max: u32 = kani::any();
+        let extra = oi_scaled_mmr_extra_bps(oi, slope, max);
+        assert!(extra <= max);
+    }
+
+    /// slope == 0 fully DISABLES the surcharge (legacy / opt-in behaviour).
+    #[kani::proof]
+    fn oi_scaled_zero_slope_disables() {
+        let oi: u64 = kani::any();
+        let max: u32 = kani::any();
+        assert!(oi_scaled_mmr_extra_bps(oi, 0, max) == 0);
+    }
+
+    /// INV-M4: with no tier table, the effective maintenance margin is NEVER below
+    /// the base floor — the OI surcharge only ADDS, it can never UNDER-margin a
+    /// position below `base_mmr_bps` (saturating_add of a non-negative extra).
+    #[kani::proof]
+    fn effective_mmr_never_below_base_floor() {
+        let base: u32 = kani::any();
+        let notional: u128 = kani::any();
+        let oi: u64 = kani::any();
+        let slope: u32 = kani::any();
+        let max: u32 = kani::any();
+        let eff = effective_mmr_bps_full(base, &[], notional, oi, slope, max);
+        assert!(eff >= base);
+    }
+}

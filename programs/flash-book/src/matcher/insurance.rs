@@ -91,3 +91,69 @@ impl InsuranceFund {
         self.balance_quote_lots >= self.pause_threshold_quote_lots
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Protocol solvency check (P-SOLV-4, protocol-owned buckets). Pure core of
+// `verify_protocol_solvency`: the quote vault must cover the insurance fund +
+// FLP capital. Returns (solvent, surplus); surplus is exact when solvent, so the
+// vault accounts EXACTLY to insurance + FLP + surplus (no value invented).
+// Overflow-safe — `insurance + flp` via checked_add. NOTE: this is the
+// protocol-owned subset; the broader `vault ≥ Σ trader_collateral + FLP +
+// insurance` is the [CERTORA-TARGET] whole-program invariant.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Assess protocol solvency over the vault / insurance / FLP-capital buckets.
+/// `Err(())` iff `insurance + flp_capital` overflows u64 (unreachable for real
+/// balances — the caller maps it to ArithmeticOverflow).
+#[inline]
+pub fn assess_solvency(
+    vault: u64,
+    insurance: u64,
+    flp_capital: u64,
+) -> core::result::Result<(bool, u64), ()> {
+    let minimum_required = insurance.checked_add(flp_capital).ok_or(())?;
+    let solvent = vault >= minimum_required;
+    let surplus = if solvent {
+        vault - minimum_required
+    } else {
+        0
+    };
+    Ok((solvent, surplus))
+}
+
+/// FV: machine-checked protocol-solvency arithmetic (Kani, add/compare only → fast).
+#[cfg(kani)]
+mod solvency_kani_proofs {
+    use super::assess_solvency;
+
+    /// CORRECTNESS: `solvent` is exactly `vault ≥ insurance + flp_capital`.
+    #[kani::proof]
+    fn solvent_iff_vault_covers_buckets() {
+        let vault: u64 = kani::any();
+        let insurance: u64 = kani::any();
+        let flp: u64 = kani::any();
+        if let Ok((solvent, _)) = assess_solvency(vault, insurance, flp) {
+            // no overflow path: insurance + flp fits u64
+            let req = insurance + flp;
+            assert!(solvent == (vault >= req));
+        }
+    }
+
+    /// CONSERVATION: when solvent, the vault accounts EXACTLY to
+    /// `insurance + flp + surplus` — surplus is never inflated, no value invented.
+    #[kani::proof]
+    fn surplus_exact_when_solvent() {
+        let vault: u64 = kani::any();
+        let insurance: u64 = kani::any();
+        let flp: u64 = kani::any();
+        if let Ok((solvent, surplus)) = assess_solvency(vault, insurance, flp) {
+            if solvent {
+                // insurance + flp + surplus == vault, with no overflow
+                let req = insurance + flp;
+                assert!(req + surplus == vault);
+            } else {
+                assert!(surplus == 0);
+            }
+        }
+    }
+}

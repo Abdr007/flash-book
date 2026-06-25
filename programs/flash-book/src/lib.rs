@@ -141,6 +141,53 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Allocate the per-market `FillCommitmentAccount` (#35 / H1 part B). A raw
+    /// PDA at `[fill_commit, market]` holding the consume-and-clear fill ring:
+    /// the matcher pushes a keccak commitment for every fill it crosses on-chain,
+    /// and settlement may only consume a matching, oldest-pending entry — so a
+    /// compromised sequencer cannot fabricate fills. `UncheckedAccount` for the
+    /// same reason as `market_book` (flat byte region, sized in the handler).
+    /// Permissioned to the market authority. Co-delegatable with the book.
+    pub fn init_fill_commitment(ctx: Context<InitFillCommitment>) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.fill_commitment;
+        let cap = fc::FILL_RING_CAP;
+
+        let space = fc::fill_commit_account_len(cap as usize);
+        let rent = Rent::get()?;
+        let lamports = rent.minimum_balance(space);
+
+        let signer_seeds: &[&[u8]] = &[fc::FILL_COMMIT_SEED, market_key.as_ref(), &[bump]];
+        anchor_lang::solana_program::program::invoke_signed(
+            &anchor_lang::solana_program::system_instruction::create_account(
+                &ctx.accounts.authority.key(),
+                &ctx.accounts.fill_commitment.key(),
+                lamports,
+                space as u64,
+                ctx.program_id,
+            ),
+            &[
+                ctx.accounts.authority.to_account_info(),
+                ctx.accounts.fill_commitment.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            &[signer_seeds],
+        )?;
+
+        let mut data = ctx.accounts.fill_commitment.try_borrow_mut_data()?;
+        fc::buffer_init(&mut data, &market_key.to_bytes(), cap, bump)
+            .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+
+        emit!(FillCommitmentInitializedEvent {
+            market: market_key,
+            fill_commitment: ctx.accounts.fill_commitment.key(),
+            cap,
+            total_bytes: space as u32,
+        });
+        Ok(())
+    }
+
     /// Grow an existing v2 `market_book` PDA in place by `additional_nodes`
     /// hypertree slots — this is what breaks the 100-node init cap. Only the
     /// market authority may call it (same gate as `init_market_book`).
@@ -484,6 +531,122 @@ pub mod flash_book {
         )
     }
 
+    // ── #35 / H1 part B: ER delegation of the FillCommitmentAccount ──────────
+    // The matcher writes fill commitments on the ER, so the ring must travel with
+    // the book: delegate it alongside `market_book`, commit/undelegate it in the
+    // same keeper flow. Base-layer undelegation finalizes through the SAME generic
+    // `process_undelegation` callback (it is account-agnostic).
+
+    /// Delegate the per-market `FillCommitmentAccount` to the ER. Mirrors
+    /// `delegate_market_book`; pair the two so the matcher can push commitments on
+    /// the ER without forking ring state between layers. Authority-gated.
+    pub fn delegate_fill_commitment(
+        ctx: Context<DelegateFillCommitment>,
+        commit_frequency_ms: u32,
+        validator: Option<Pubkey>,
+    ) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.fill_commitment;
+
+        // Defence-in-depth (er.rs SECURITY note): must be ours before we sign a
+        // delegate over it.
+        require_keys_eq!(
+            *ctx.accounts.fill_commitment.owner,
+            *ctx.program_id,
+            FlashBookError::Unauthorized
+        );
+
+        let seeds_for_args: Vec<Vec<u8>> = vec![
+            fc::FILL_COMMIT_SEED.to_vec(),
+            market_key.as_ref().to_vec(),
+            vec![bump],
+        ];
+        let signer_seeds: &[&[u8]] = &[fc::FILL_COMMIT_SEED, market_key.as_ref(), &[bump]];
+
+        er::cpi_delegate(
+            er::DelegateAccounts {
+                payer: ctx.accounts.authority.to_account_info(),
+                delegated_account: ctx.accounts.fill_commitment.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                delegate_buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                delegation_record: ctx.accounts.delegation_record.to_account_info(),
+                delegation_metadata: ctx.accounts.delegation_metadata.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            er::DelegateArgs {
+                commit_frequency_ms,
+                seeds: seeds_for_args,
+                validator,
+            },
+            signer_seeds,
+        )?;
+
+        emit!(FillCommitmentDelegatedEvent {
+            market: market_key,
+            fill_commitment: ctx.accounts.fill_commitment.key(),
+            commit_frequency_ms,
+            validator: validator.unwrap_or_default(),
+        });
+        Ok(())
+    }
+
+    /// ON THE ER: snapshot the delegated `fill_commitment` back to L1 while staying
+    /// delegated (`ScheduleCommit`). Keeper-driven; pair with `commit_market_book`.
+    pub fn commit_fill_commitment(ctx: Context<CommitFillCommitment>) -> Result<()> {
+        er::cpi_commit(
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.magic_context,
+            &ctx.accounts.magic_program,
+            &[ctx.accounts.fill_commitment.to_account_info()],
+            false,
+        )
+    }
+
+    /// ON THE ER: snapshot final state AND queue undelegation
+    /// (`ScheduleCommitAndUndelegate`). The delegation program then calls back into
+    /// `process_undelegation` on base to finalize.
+    pub fn commit_and_undelegate_fill_commitment(
+        ctx: Context<CommitFillCommitment>,
+    ) -> Result<()> {
+        er::cpi_commit(
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.magic_context,
+            &ctx.accounts.magic_program,
+            &[ctx.accounts.fill_commitment.to_account_info()],
+            true,
+        )
+    }
+
+    /// Undelegate the `fill_commitment` PDA from the ER back to mainnet. Mirrors
+    /// `undelegate_market_book`; use during planned ER downtime / validator
+    /// rotation, paired with the book's undelegate.
+    pub fn undelegate_fill_commitment(ctx: Context<UndelegateFillCommitment>) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.fill_commitment;
+        let signer_seeds: &[&[u8]] = &[fc::FILL_COMMIT_SEED, market_key.as_ref(), &[bump]];
+
+        er::cpi_undelegate(
+            er::UndelegateAccounts {
+                payer: ctx.accounts.authority.to_account_info(),
+                delegated_account: ctx.accounts.fill_commitment.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            signer_seeds,
+        )?;
+
+        emit!(FillCommitmentUndelegatedEvent {
+            market: market_key,
+            fill_commitment: ctx.accounts.fill_commitment.key(),
+        });
+        Ok(())
+    }
+
     /// V2 limit-order placement against the hypertree-backed orderbook.
     /// Runs ALONGSIDE the legacy `place_limit_order` for now — operators
     /// pick which book each market uses by calling `init_market_book`
@@ -517,6 +680,11 @@ pub mod flash_book {
             || size_lots == 0
             || limit_ticks == 0
             || (flags & !0b0111_1111) != 0
+            // H4: reduce_only (bit1) is NOT enforced on the v2 CLOB (there is no
+            // settlement-time reduce-only check; matcher::reduce_only is uncalled).
+            // Reject it LOUDLY so a trader cannot set a "protective close" that
+            // would silently OPEN or FLIP a position. (Full enforcement = separate feature.)
+            || (flags & 0b0000_0010) != 0
         {
             return err!(FlashBookError::OutOfRange);
         }
@@ -536,6 +704,19 @@ pub mod flash_book {
         }
         if limit_ticks % p.tick_size != 0 {
             return err!(FlashBookError::PriceNotOnTick);
+        }
+
+        // #36 anti-stuffing: a RESTING limit must sit within the band of the fresh
+        // oracle. Far-from-market orders never fill, so they are cheap to spam and
+        // are the node-arena-exhaustion vector; the band forces a resting order
+        // close enough to market to bear real fill risk. `price_within_band`
+        // returns true when `oracle_price_ticks == 0` (no anchor → skipped).
+        if !matcher::flp_quoter::price_within_band(
+            market.oracle_price_ticks,
+            limit_ticks,
+            crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS,
+        ) {
+            return err!(FlashBookError::RestingOrderTooFarFromOracle);
         }
 
         // Per-market OI hard cap (cold for most markets — oi_cap == 0).
@@ -637,6 +818,10 @@ pub mod flash_book {
             || size_lots == 0
             || limit_ticks == 0
             || (flags & !0b0111_1111) != 0
+            // H4: reduce_only (bit1) is NOT enforced on the v2 CLOB — reject it
+            // loudly rather than silently no-op a "protective close" (which could
+            // OPEN/FLIP a position if the original is already gone).
+            || (flags & 0b0000_0010) != 0
         {
             return err!(FlashBookError::OutOfRange);
         }
@@ -690,7 +875,8 @@ pub mod flash_book {
 
         // Advanced flags (Phoenix / Manifest / HL parity):
         //   bit 0  POST_ONLY    — reject if any matches (caller wants rest)
-        //   bit 1  REDUCE_ONLY  — enforced upstream by margin ix
+        //   bit 1  REDUCE_ONLY  — UNSUPPORTED on v2: rejected at intake (H4),
+        //                         never enforced here (no settlement-time check)
         //   bit 2  IOC          — cancel residual after walk (no rest)
         //   bit 3  JIT          — Drift-style JIT bonus
         //   bits 4-5 STP_MODE   — self-trade prevention mode
@@ -836,6 +1022,45 @@ pub mod flash_book {
             });
         }
         if !fills.is_empty() {
+            // ── H1 part B (#35): commit produced fills to the on-chain ring ──
+            // For each fill the matcher just crossed on-chain, push a keccak
+            // commitment so settlement (`apply_fill`) can prove the fill is
+            // authentic and not fabricated by a compromised sequencer. Done
+            // BEFORE the emit moves `fills`. Optional: a market not yet wired
+            // with a FillCommitmentAccount keeps legacy behaviour. The account is
+            // a different PDA than `market_book`, so this borrow does not alias
+            // the live book handle.
+            let fc_market_bytes = market_key.to_bytes();
+            if let Some(fc_acct) =
+                find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes)
+            {
+                use matcher::fill_commitment as fc;
+                let market_bytes = fc_market_bytes;
+                let taker_bytes = trader_pk.to_bytes();
+                let mut fc_data = fc_acct.try_borrow_mut_data()?;
+                for f in &fills {
+                    let idx = fc::buffer_next_index(&fc_data);
+                    let pre = fc::fill_preimage(
+                        &market_bytes,
+                        &taker_bytes,
+                        &f.maker.to_bytes(),
+                        side,
+                        f.size_lots,
+                        f.price_ticks,
+                        sub_index,
+                        f.maker_sub_index,
+                        idx,
+                    );
+                    let commit =
+                        anchor_lang::solana_program::keccak::hashv(&[&pre[..]]).0;
+                    fc::buffer_push(&mut fc_data, &market_bytes, commit).map_err(|e| {
+                        match e {
+                            fc::FillRingError::Full => error!(FlashBookError::FillRingFull),
+                            _ => error!(FlashBookError::FillRingCorrupt),
+                        }
+                    })?;
+                }
+            }
             emit!(FillBatchEvent {
                 market: market_key,
                 taker: trader_pk,
@@ -855,7 +1080,20 @@ pub mod flash_book {
         // size. A sub-min remainder is dropped (IOC-style, inserted_idx stays
         // NIL) rather than resting as a dust order that violates the
         // `min_base_lots` invariant the rest of the system assumes.
-        if remaining > 0 && !ioc && remaining >= p.min_base_lots {
+        //
+        // #36 anti-stuffing: likewise only rest a residual that sits within the
+        // oracle band. An out-of-band residual is DROPPED, not rested (and not
+        // an error — the cross already settled above; we must never revert it).
+        // `price_within_band` returns true when `oracle_price_ticks == 0`.
+        if remaining > 0
+            && !ioc
+            && remaining >= p.min_base_lots
+            && matcher::flp_quoter::price_within_band(
+                market.oracle_price_ticks,
+                limit_ticks,
+                crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS,
+            )
+        {
             let order = state_v2::RestingOrderV2 {
                 order_id: taker_order_id,
                 seq: taker_seq,
@@ -963,6 +1201,67 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Permissionless expiry-reaper (#36 anti-book-stuffing). Removes GTT orders
+    /// whose `expires_at_slot` has passed, reclaiming node-arena space so a market
+    /// self-heals from stale-order accumulation. ANYONE may call it — but only a
+    /// GENUINELY-expired GTT order is ever removed: a live order or a GTC order
+    /// (`expires_at_slot == 0`) is skipped, so the reaper can never cancel an
+    /// order out from under a trader. `order_id` is globally unique among live
+    /// orders (proven: `state_v2` `distinct_orders_never_collide`), so each id is
+    /// searched on both books without a side hint. Bounded per call.
+    pub fn reap_expired_orders(
+        ctx: Context<ReapExpiredOrders>,
+        order_ids: Vec<u64>,
+    ) -> Result<()> {
+        require!(!order_ids.is_empty(), FlashBookError::EmptyBatch);
+        require!(
+            order_ids.len() <= crate::constants::MAX_REAP_PER_CALL,
+            FlashBookError::OutOfRange
+        );
+        let now_slot = Clock::get()?.slot;
+        let market_key = ctx.accounts.market.key();
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        if handle.header.market_pubkey != market_key {
+            return err!(FlashBookError::WrongMarket);
+        }
+
+        let mut reaped: u32 = 0;
+        for order_id in &order_ids {
+            // Globally-unique id → try the bid book, then the ask book.
+            let b = handle.lookup_bid_by_order_id(*order_id);
+            let (idx, side_is_bid) = if b != crate::hypertree::NIL {
+                (b, true)
+            } else {
+                (handle.lookup_ask_by_order_id(*order_id), false)
+            };
+            if idx == crate::hypertree::NIL {
+                continue; // already gone / not on this book
+            }
+            // Only reap a GENUINELY-expired GTT order. `expires == 0` is GTC
+            // (never expires); `expires > now` is still live. Both are skipped —
+            // the reaper can only reclaim truly-stale nodes, never grief.
+            let expires = handle.order_at(idx).expires_at_slot;
+            if expires == 0 || expires > now_slot {
+                continue;
+            }
+            if side_is_bid {
+                handle.remove_bid_node(idx);
+            } else {
+                handle.remove_ask_node(idx);
+            }
+            reaped = reaped.saturating_add(1);
+        }
+
+        emit!(ExpiredOrdersReapedEvent {
+            market: market_key,
+            reaped,
+            total_orders_after: handle.header.total_orders_active,
+        });
+        Ok(())
+    }
+
     /// V2 cancel-all: remove every resting order owned by the caller in
     /// this market. Walks both bid and ask RBTs, collecting indices of
     /// orders whose `trader == caller`, then removes each in two
@@ -1051,6 +1350,9 @@ pub mod flash_book {
             || new_size_lots == 0
             || new_limit_ticks == 0
             || (new_flags & !0b0111_1111) != 0
+            // H4: reduce_only (bit1) is unenforced on the v2 CLOB — reject it
+            // loudly (mirrors place_limit_order_v2 / place_taker_order_v2).
+            || (new_flags & 0b0000_0010) != 0
         {
             return err!(FlashBookError::OutOfRange);
         }
@@ -1305,6 +1607,10 @@ pub mod flash_book {
             lp_pos.lp = ctx.accounts.authority.key();
             lp_pos.bump = ctx.bumps.lp_position;
         }
+        // H8: (re)start the min-hold clock on every deposit so a tiny top-up
+        // cannot preserve an older timestamp to dodge the lock.
+        lp_pos.deposited_at_slot =
+            matcher::jit_lp_defense::extend_lock_on_deposit(Clock::get()?.slot);
         lp_pos.shares = lp_pos
             .shares
             .checked_add(shares_to_mint)
@@ -1350,6 +1656,18 @@ pub mod flash_book {
         require!(
             shares_to_burn <= ctx.accounts.lp_position.shares,
             FlashBookError::InsufficientCollateral
+        );
+        // H8: enforce the FLP minimum hold so an LP cannot flash-deposit just
+        // before a fee / realized-PnL event that lifts NAV and redeem the
+        // windfall without bearing risk. deposited_at_slot==0 (legacy accounts)
+        // ⇒ can_withdraw true (no lock retroactively imposed).
+        require!(
+            matcher::jit_lp_defense::can_withdraw(
+                ctx.accounts.lp_position.deposited_at_slot,
+                Clock::get()?.slot,
+                constants::FLP_MIN_HOLD_SLOTS,
+            ),
+            FlashBookError::RateLimited
         );
 
         let flp_ro = &ctx.accounts.flp_exposure;
@@ -1998,6 +2316,26 @@ pub mod flash_book {
                     state::PositionAccount::try_deserialize(&mut &position_data[..])?;
                 require!(position.trader == from_trader, FlashBookError::WrongTrader);
                 require!(position.market == market_ai.key(), FlashBookError::WrongMarket);
+                // C-2: bind each position to THIS trader_state (positions are
+                // PDA-keyed on trader_state.key(), but `.trader` is only the
+                // WALLET — without this a different sub-account's / stale
+                // position of the same wallet could be substituted to
+                // under-state risk), require liveness, and reject duplicate
+                // markets (so the exact-count check can't be padded with a
+                // duplicate while a real position is omitted). Mirrors the
+                // partial_withdraw_collateral guard set (the 2026-06-21 fix).
+                verify_position_pda(
+                    &market_ai.key(),
+                    &ctx.accounts.from_state.key(),
+                    position.bump,
+                    &position_ai.key(),
+                    ctx.program_id,
+                )?;
+                require!(position.size_lots > 0, FlashBookError::ZeroSize);
+                require!(
+                    !market_keys.contains(&market_ai.key()),
+                    FlashBookError::OutOfRange
+                );
 
                 snaps.push(RiskPosSnap {
                     market: position.market,
@@ -3097,6 +3435,7 @@ pub mod flash_book {
         taker_was_jit: bool,
         taker_sub_index: u8,
         maker_sub_index: u8,
+        fill_seq: u64,
     ) -> Result<()> {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(price_ticks > 0, FlashBookError::ZeroPrice);
@@ -3116,6 +3455,27 @@ pub mod flash_book {
             ctx.accounts.market.sequencer,
             FlashBookError::Unauthorized
         );
+
+        // ── H1 monotonic replay guard ───────────────────────────────
+        // `fill_seq` must STRICTLY exceed the market's settlement nonce. A
+        // replayed / out-of-order settlement — a crashed/restarting sequencer
+        // re-emitting an already-applied batch, or a compromised key
+        // resubmitting one — carries a non-increasing seq and is rejected. The
+        // whole tx reverts on any later error, so advancing the nonce here is
+        // atomic with the fill. Pre-field markets have last_settlement_seq == 0,
+        // so the first real fill (seq ≥ 1) passes. NOTE: this closes the
+        // replay/restart vector; it does NOT defend against a malicious
+        // sequencer FABRICATING a fresh-seq fill — that is the fill-authenticity
+        // commitment (the §3.2 settlement redesign), tracked separately.
+        // P-SETTLE-1: advance the per-market settlement nonce through the
+        // Kani-proven monotonic helper — strictly-increasing `fill_seq` only;
+        // any replay/reorder is rejected (FillSeqReplay) before state mutates.
+        ctx.accounts.market.last_settlement_seq =
+            matcher::fill_commitment::advance_settlement_seq(
+                ctx.accounts.market.last_settlement_seq,
+                fill_seq,
+            )
+            .map_err(|_| error!(FlashBookError::FillSeqReplay))?;
 
         // ── Phase 2i sub-account PDA verification ───────────────────
         // Closes the 1-byte routing-attack surface left open by Phase 2d.
@@ -3143,6 +3503,46 @@ pub mod flash_book {
             ctx.accounts.maker_trader_state.load()?.bump,
             ctx.program_id,
         )?;
+
+        // ── H1 part B (#35): verify-and-pop the fill commitment ──────────
+        // If the market is armed with a FillCommitmentAccount, this fill MUST
+        // match the oldest pending commitment the matcher pushed when it crossed
+        // the book on-chain (`place_taker_order_v2`). Recompute the commitment
+        // from this fill's authenticated content and consume-and-clear the tail;
+        // a fabricated or out-of-order fill (a compromised sequencer inventing a
+        // trade) fails to match → `FillNotCommitted` → the whole tx reverts
+        // before any position is touched. Placed early to reject cheaply. The
+        // index bound into the preimage is the FIFO position, so production order
+        // and settlement order must agree. Composes with the H1-A `fill_seq`
+        // replay guard above.
+        let fc_market_bytes = ctx.accounts.market.key().to_bytes();
+        if let Some(fc_acct) =
+            find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes)
+        {
+            use matcher::fill_commitment as fc;
+            let market_bytes = fc_market_bytes;
+            let taker_bytes = ctx.accounts.taker_trader_state.load()?.trader.to_bytes();
+            let maker_bytes = ctx.accounts.maker_trader_state.load()?.trader.to_bytes();
+            let mut fc_data = fc_acct.try_borrow_mut_data()?;
+            let idx = fc::buffer_settle_index(&fc_data);
+            let pre = fc::fill_preimage(
+                &market_bytes,
+                &taker_bytes,
+                &maker_bytes,
+                taker_side,
+                size_lots,
+                price_ticks,
+                taker_sub_index,
+                maker_sub_index,
+                idx,
+            );
+            let recomputed = anchor_lang::solana_program::keccak::hashv(&[&pre[..]]).0;
+            fc::buffer_settle(&mut fc_data, &market_bytes, recomputed).map_err(|e| match e {
+                fc::FillRingError::NotCommitted => error!(FlashBookError::FillNotCommitted),
+                fc::FillRingError::Empty => error!(FlashBookError::FillRingEmpty),
+                _ => error!(FlashBookError::FillRingCorrupt),
+            })?;
+        }
 
         // init_if_needed zero-copy: a freshly-created PositionAccount has a
         // zeroed discriminator until `load_init()` writes it — without this,
@@ -3729,7 +4129,9 @@ pub mod flash_book {
         // debit collateral directly (loss seniority).
         let now_slot = Clock::get()?.slot;
         if taker_pnl_delta != 0 {
-            apply_realized_pnl_delta_v2(
+            let taker_opted = ctx.accounts.taker_position_haircut.is_some();
+            // H6: cover any bankrupt-close shortfall from insurance (was a revert).
+            let (shortfall, removed) = apply_realized_pnl_delta_v2(
                 taker_pnl_delta,
                 taker_pos_isolated_for_pnl,
                 &mut ctx.accounts.taker_position,
@@ -3737,9 +4139,16 @@ pub mod flash_book {
                 ctx.accounts.taker_position_haircut.as_mut(),
                 now_slot,
             )?;
+            if shortfall > 0 {
+                let trader = ctx.accounts.taker_position.load()?.trader;
+                cover_bad_debt(&mut ctx.accounts.insurance_fund, market_key, trader, shortfall);
+            }
+            // H7: an opted position's realized loss credits the haircut Residual.
+            accrue_haircut_loss(ctx.accounts.market_haircut.as_mut(), taker_opted, removed)?;
         }
         if maker_pnl_delta != 0 {
-            apply_realized_pnl_delta_v2(
+            let maker_opted = ctx.accounts.maker_position_haircut.is_some();
+            let (shortfall, removed) = apply_realized_pnl_delta_v2(
                 maker_pnl_delta,
                 maker_pos_isolated_for_pnl,
                 &mut ctx.accounts.maker_position,
@@ -3747,6 +4156,12 @@ pub mod flash_book {
                 ctx.accounts.maker_position_haircut.as_mut(),
                 now_slot,
             )?;
+            if shortfall > 0 {
+                let trader = ctx.accounts.maker_position.load()?.trader;
+                cover_bad_debt(&mut ctx.accounts.insurance_fund, market_key, trader, shortfall);
+            }
+            // H7: an opted position's realized loss credits the haircut Residual.
+            accrue_haircut_loss(ctx.accounts.market_haircut.as_mut(), maker_opted, removed)?;
         }
 
         // Post-fill position scalars (read guards dropped immediately).
@@ -3822,6 +4237,42 @@ pub mod flash_book {
             } else {
                 blended_u128 as u64
             };
+            // H5: clamp the new mark into the ORACLE band BEFORE the per-fill
+            // change clamp. mark_max_change_bps below is anchored to the PRIOR
+            // mark, not the oracle — so a sequence of adverse fills (each within
+            // max_change of the last) could walk the mark cumulatively far from
+            // the oracle and feed a wrongful worse-of(mark,oracle) liquidation.
+            // `oracle_band_bps` was config-validated but never enforced (invariant
+            // S14). Pulling toward the band here, then applying max_change after,
+            // bounds drift to ~band while preserving the single-fill flash-move
+            // guard. Only when the oracle is not provably stale (when it IS stale,
+            // liquidation is already paused, so no wrongful-liq surface exists).
+            let band_bps = market.params.oracle_band_bps as u128;
+            let oracle_px = market.oracle_price_ticks;
+            if band_bps > 0 && oracle_px > 0 {
+                let max_age = market.params.oracle_staleness_max_seconds as u64;
+                let oracle_fresh = max_age == 0
+                    || market.oracle_published_at_unix_seconds == 0
+                    || (Clock::get()?.unix_timestamp.max(0) as u64)
+                        .saturating_sub(market.oracle_published_at_unix_seconds)
+                        <= max_age;
+                if oracle_fresh {
+                    let band_delta = (oracle_px as u128).saturating_mul(band_bps)
+                        / (constants::BPS_DENOM as u128);
+                    let band_delta_u64 = if band_delta > u64::MAX as u128 {
+                        u64::MAX
+                    } else {
+                        band_delta as u64
+                    };
+                    let band_upper = oracle_px.saturating_add(band_delta_u64);
+                    let band_lower = oracle_px.saturating_sub(band_delta_u64).max(1);
+                    if new_mark > band_upper {
+                        new_mark = band_upper;
+                    } else if new_mark < band_lower {
+                        new_mark = band_lower;
+                    }
+                }
+            }
             // Clamp absolute change to ±mark_max_change_bps.
             let max_change_bps = market.params.mark_max_change_bps as u128;
             if max_change_bps > 0 && old_mark > 0 {
@@ -5749,6 +6200,7 @@ pub mod flash_book {
         price_ticks: u64,
         taker_side: u8,
         taker_sub_index: u8,
+        fill_seq: u64,
     ) -> Result<()> {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(price_ticks > 0, FlashBookError::ZeroPrice);
@@ -5759,6 +6211,39 @@ pub mod flash_book {
             ctx.accounts.sequencer.key(),
             ctx.accounts.market.sequencer,
             FlashBookError::Unauthorized
+        );
+
+        // ── H1 monotonic replay guard (see apply_fill) ──────────────
+        // The FLP settlement nonce shares the SAME market counter as apply_fill,
+        // so a replay of either path is rejected and the two interleave under a
+        // single strictly-increasing sequence.
+        // P-SETTLE-1: advance the per-market settlement nonce through the
+        // Kani-proven monotonic helper — strictly-increasing `fill_seq` only;
+        // any replay/reorder is rejected (FillSeqReplay) before state mutates.
+        ctx.accounts.market.last_settlement_seq =
+            matcher::fill_commitment::advance_settlement_seq(
+                ctx.accounts.market.last_settlement_seq,
+                fill_seq,
+            )
+            .map_err(|_| error!(FlashBookError::FillSeqReplay))?;
+
+        // ── #35 / H1 part B: FLP fill-price authenticity band ────────────
+        // FLP fills aren't matcher-produced on-chain, so they can't ride the
+        // fill-commitment ring (book path). Instead: an authentic FLP fill is
+        // within the quoter's spread of fair value, so it sits well inside
+        // FLP_MAX_FILL_DEVIATION_BPS of the FRESH oracle. This bound stops a
+        // compromised sequencer settling an FLP fill far enough from the oracle to
+        // drain the pool. It is a BOUND, not exact quote re-derivation (unsound
+        // here: the quoter's inputs drift between ER quote-time and L1 settle-time,
+        // so re-deriving would reject legitimate fills). Enforced only when a live
+        // oracle anchors it (`oracle == 0` returns true → skipped, cannot verify).
+        require!(
+            matcher::flp_quoter::price_within_band(
+                ctx.accounts.market.oracle_price_ticks,
+                price_ticks,
+                crate::constants::FLP_MAX_FILL_DEVIATION_BPS,
+            ),
+            FlashBookError::FlpPriceOutsideBand
         );
 
         // Phase 2i — verify the trader_state PDA matches
@@ -5993,7 +6478,9 @@ pub mod flash_book {
         // debit collateral directly.
         let now_slot_flp = Clock::get()?.slot;
         if taker_pnl_delta != 0 {
-            apply_realized_pnl_delta_v2(
+            let taker_opted = ctx.accounts.taker_position_haircut.is_some();
+            // H6: cover any bankrupt-close shortfall from insurance (was a revert).
+            let (shortfall, removed) = apply_realized_pnl_delta_v2(
                 taker_pnl_delta,
                 taker_pos_isolated_for_pnl,
                 &mut ctx.accounts.taker_position,
@@ -6001,6 +6488,12 @@ pub mod flash_book {
                 ctx.accounts.taker_position_haircut.as_mut(),
                 now_slot_flp,
             )?;
+            if shortfall > 0 {
+                let trader = ctx.accounts.taker_position.load()?.trader;
+                cover_bad_debt(&mut ctx.accounts.insurance_fund, market_key, trader, shortfall);
+            }
+            // H7: an opted position's realized loss credits the haircut Residual.
+            accrue_haircut_loss(ctx.accounts.market_haircut.as_mut(), taker_opted, removed)?;
         }
 
         let (taker_post_side, taker_post_size) = {
@@ -6159,26 +6652,14 @@ pub mod flash_book {
         let pos_side = if position.side == 0 { Side::Long } else { Side::Short };
         let mark_t = market.mark_price_ticks;
         let oracle_t = market.oracle_price_ticks;
-        let (health_price_ticks, hp_source) = match pos_side {
-            Side::Long => {
-                if oracle_t > 0 && oracle_t < mark_t {
-                    (oracle_t, 1u8)
-                } else if oracle_t > 0 && oracle_t == mark_t {
-                    (mark_t, 2u8)
-                } else {
-                    (mark_t, 0u8)
-                }
-            }
-            Side::Short => {
-                if oracle_t > mark_t {
-                    (oracle_t, 1u8)
-                } else if oracle_t == mark_t {
-                    (mark_t, 2u8)
-                } else {
-                    (mark_t, 0u8)
-                }
-            }
-        };
+        // P-LIQ-1: worse-of(mark, oracle) via the Kani-proven pure helper — the
+        // health price is always the worse of the two REAL sources for the
+        // position's side (never under-states risk, never invents a price).
+        let (health_price_ticks, hp_source) = matcher::liquidation::worse_of_health_price(
+            mark_t,
+            oracle_t,
+            matches!(pos_side, Side::Long),
+        );
 
         let pos_snap = RiskPosSnap {
             market: position.market,
@@ -6396,6 +6877,40 @@ pub mod flash_book {
         // the reward block, which needs a mutable borrow of the same
         // account on the isolated-margin path.
         let trader = position.trader;
+
+        // H3: refuse to inject/reward a DUPLICATE liquidation. If a synthetic
+        // close order for this position (order_type == 3 = Liquidation, same
+        // trader) already rests on the close side, the position is already being
+        // liquidated — re-calling would pay the Dutch-auction reward AGAIN
+        // (draining the liquidatee's collateral) and stack duplicate full-size
+        // close orders (OI corruption) while the original rests unfilled in a
+        // thin book. Reject until the resting liquidation fills or is cancelled.
+        // (Scan happens BEFORE the reward block so no reward is paid on a no-op.)
+        {
+            let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+            let mut already_resting = false;
+            if (close_side as u8) == 0 {
+                handle.for_each_bid_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.order_type == 3 && o.trader == trader {
+                        already_resting = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            } else {
+                handle.for_each_ask_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.order_type == 3 && o.trader == trader {
+                        already_resting = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            require!(!already_resting, FlashBookError::RateLimited);
+        }
 
         // Dutch-auction reward (parity-port from v1).
         let mut reward_paid: u64 = 0;
@@ -6938,6 +7453,20 @@ pub mod flash_book {
 
         let remaining = ctx.remaining_accounts;
         require!(remaining.len() % 2 == 0, FlashBookError::OutOfRange);
+        // H2: the cross-margin walk MUST cover the trader's COMPLETE position
+        // set — otherwise a liquidator can OMIT a risk-reducing (hedge) leg so
+        // the lattice sees a more-adverse partial portfolio and force a wrongful
+        // liquidation. exec_position is one of the open positions; the remaining
+        // accounts must be EXACTLY the other (open_positions - 1) pairs.
+        require!(
+            remaining.len() == (trader_state.open_positions as usize).saturating_sub(1) * 2,
+            FlashBookError::OutOfRange
+        );
+        let trader_state_key = ctx.accounts.trader_state.key();
+        // Dedupe set seeded with the execution market (so it can't be re-supplied
+        // in remaining_accounts to pad the exact-count while a real leg is omitted).
+        let mut market_keys: Vec<Pubkey> = Vec::with_capacity(remaining.len() / 2 + 1);
+        market_keys.push(exec_market.key());
         let program_id = ctx.program_id;
         let mut i = 0usize;
         while i + 1 < remaining.len() {
@@ -6960,33 +7489,49 @@ pub mod flash_book {
                 position.market == market_ai.key(),
                 FlashBookError::WrongMarket
             );
-
-            if position.size_lots > 0 {
-                market_snaps.push(RiskMarketSnap {
-                    market: market_ai.key(),
-                    mark_price: Ticks(market.mark_price_ticks),
-                    cum_funding_index: market.cum_funding_index,
-                    maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
-                    tick_size: market.params.tick_size,
-                    concentration_threshold_lots: market.params.concentration_threshold_lots,
-                    concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
-                    side_oi_lots: 0,
-                    oi_mmr_slope_bps_per_million_lots: 0,
-                    oi_mmr_max_extra_bps: 0,
-                });
-                position_snaps.push(RiskPosSnap {
-                    market: position.market,
-                    side: if position.side == 0 { Side::Long } else { Side::Short },
-                    size_lots: position.size_lots,
-                    entry_price: Ticks(position.entry_price_ticks),
-                    cum_funding_index_at_entry: position.cum_funding_index(),
-                    collateral_quote_lots: position.collateral_quote_lots,
-                });
-            }
+            // H2: bind each position to THIS trader_state (positions are
+            // PDA-keyed on trader_state.key(), but `.trader` is only the WALLET
+            // — without this a different sub-account's / stale position of the
+            // same wallet could be substituted), require liveness, and reject
+            // duplicate markets (incl. the execution market) so the exact-count
+            // check cannot be padded with a duplicate while a real leg is omitted.
+            verify_position_pda(
+                &market_ai.key(),
+                &trader_state_key,
+                position.bump,
+                &position_ai.key(),
+                program_id,
+            )?;
+            require!(position.size_lots > 0, FlashBookError::ZeroSize);
+            require!(
+                !market_keys.contains(&market_ai.key()),
+                FlashBookError::OutOfRange
+            );
+            market_keys.push(market_ai.key());
+            market_snaps.push(RiskMarketSnap {
+                market: market_ai.key(),
+                mark_price: Ticks(market.mark_price_ticks),
+                cum_funding_index: market.cum_funding_index,
+                maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+                tick_size: market.params.tick_size,
+                concentration_threshold_lots: market.params.concentration_threshold_lots,
+                concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                side_oi_lots: 0,
+                oi_mmr_slope_bps_per_million_lots: 0,
+                oi_mmr_max_extra_bps: 0,
+            });
+            position_snaps.push(RiskPosSnap {
+                market: position.market,
+                side: if position.side == 0 { Side::Long } else { Side::Short },
+                size_lots: position.size_lots,
+                entry_price: Ticks(position.entry_price_ticks),
+                cum_funding_index_at_entry: position.cum_funding_index(),
+                collateral_quote_lots: position.collateral_quote_lots,
+            });
             i += 2;
         }
 
-        let market_keys: Vec<Pubkey> = market_snaps.iter().map(|m| m.market).collect();
+        // market_keys was built incrementally in the walk (H2: deduped, exec-seeded).
         let scenarios = default_scenarios_fn(&market_keys);
         let assessment = assess_margin_unified_fn(
             &position_snaps,
@@ -7022,6 +7567,35 @@ pub mod flash_book {
                 handle.header.market_pubkey == market_key,
                 FlashBookError::WrongMarket
             );
+            // H3 (portfolio): refuse to inject/stack a DUPLICATE liquidation —
+            // the SAME guard liquidate_position_v2 carries (the holistic re-verify
+            // found it was applied there but not here). If a synthetic close order
+            // (order_type == 3) for this trader already rests on the close side,
+            // the position is already being liquidated; a second injection would
+            // stack duplicate full-size close orders, corrupting OI and (once both
+            // fill) FLIPPING the victim into a fresh opposite-side position they
+            // never opened, with the keeper able to be the favorable counterparty.
+            let mut already_resting = false;
+            if close_side_u8 == 0 {
+                handle.for_each_bid_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.order_type == 3 && o.trader == trader {
+                        already_resting = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            } else {
+                handle.for_each_ask_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.order_type == 3 && o.trader == trader {
+                        already_resting = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            require!(!already_resting, FlashBookError::RateLimited);
             next_seq = handle
                 .header
                 .order_seq_counter
@@ -8212,6 +8786,11 @@ pub mod flash_book {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(limit_ticks > 0, FlashBookError::ZeroPrice);
         require!(flags & !0b0111_1111 == 0, FlashBookError::OutOfRange);
+        // H4: reduce_only (bit1) is unenforced on the v2 CLOB — reject it loudly
+        // here too. vault_place_order_v3 inserts a RestingOrderV2 into the SAME
+        // MarketBookHandle as place_limit/place_taker/modify_order_v2, so it needs
+        // the identical guard or a vault strategist could store an unenforced flag.
+        require!(flags & 0b0000_0010 == 0, FlashBookError::OutOfRange);
         let now_slot = Clock::get()?.slot;
         if expires_at_slot > 0 {
             require!(expires_at_slot > now_slot, FlashBookError::OutOfRange);
@@ -9078,19 +9657,30 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Permissionless: convert a position's `matured_pos` into a
-    /// collateral credit at the current `h`, with the dust accrued to
-    /// the market's haircut state (drains to insurance via
-    /// `flush_haircut_dust`).
+    /// Convert a position's `matured_pos` into a collateral credit at the
+    /// current `h`, with the dust accrued to the market's haircut state (drains
+    /// to insurance via `flush_haircut_dust`).
     ///
-    /// The credit is **NOT** moved into the trader's collateral by this
-    /// ix yet — that's Wave 24c (because the wire-in needs to touch
-    /// `apply_realized_pnl_delta` and pick the isolated/cross routing).
-    /// Wave 24b lands the math + state-only mutation surface so the
-    /// math can be exercised on-chain independently of the credit path.
-    /// `PositionConvertedEvent` carries the credit amount so keepers
-    /// and indexers can see it.
+    /// H9: the credit IS now landed on the trader's collateral via
+    /// `apply_realized_pnl_delta` (isolated→position bucket, else→cross pool),
+    /// conserving value — `residual` is debited by the same `credit`. Previously
+    /// (the never-completed "Wave 24c") the residual was debited but collateral
+    /// was never credited, BURNING the matured PnL and letting anyone
+    /// permissionlessly ratchet `residual` → `h→0` for all traders. Convert is
+    /// now gated to the trader / their delegate. `PositionConvertedEvent` carries
+    /// the credit amount for indexers.
     pub fn convert_position(ctx: Context<ConvertPosition>) -> Result<()> {
+        // H9: convert now MOVES VALUE to the trader, so it must be authorized by
+        // the trader or their delegate — not an arbitrary keeper, which could
+        // otherwise front-run a convert at an unfavorable `h` to grief the trader.
+        require!(
+            ctx.accounts
+                .trader_state
+                .load()?
+                .is_authorized(&ctx.accounts.keeper.key()),
+            FlashBookError::Unauthorized
+        );
+
         let pos_haircut = &mut ctx.accounts.position_haircut;
         let market_haircut = &mut ctx.accounts.haircut_state;
 
@@ -9130,6 +9720,19 @@ pub mod flash_book {
             .residual_quote_lots
             .checked_sub(credit as u128)
             .ok_or_else(|| error!(FlashBookError::HaircutResidualUnderflow))?;
+
+        // H9: land the converted value on the trader (the never-completed
+        // "Wave 24c" wire-in). Residual was debited above by `credit`; credit the
+        // SAME amount to the trader so value is CONSERVED rather than burned. A
+        // gain routes to the isolated bucket if isolated, else the cross pool, and
+        // never produces a shortfall.
+        let isolated = ctx.accounts.position.load()?.collateral_quote_lots > 0;
+        apply_realized_pnl_delta(
+            credit as i128,
+            isolated,
+            &mut ctx.accounts.position,
+            &mut ctx.accounts.trader_state,
+        )?;
 
         // Cache the freshly-computed h for off-chain readers.
         market_haircut.h_scaled_cached = h_scaled.min(u64::MAX as u128) as u64;
@@ -9513,16 +10116,15 @@ pub mod flash_book {
         let insurance_bal = ctx.accounts.insurance_fund.balance_quote_lots;
         let flp_capital = ctx.accounts.flp_exposure.total_capital_quote_lots;
 
+        // P-SOLV-4 (protocol-owned buckets): Kani-proven solvency arithmetic —
+        // `solvent` iff vault covers insurance + FLP capital, and when solvent the
+        // vault accounts exactly to insurance + FLP + surplus (no value invented).
+        let (solvent, surplus) =
+            matcher::insurance::assess_solvency(vault_amount, insurance_bal, flp_capital)
+                .map_err(|_| error!(FlashBookError::ArithmeticOverflow))?;
         let minimum_required = insurance_bal
             .checked_add(flp_capital)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-
-        let solvent = vault_amount >= minimum_required;
-        let surplus = if solvent {
-            vault_amount.saturating_sub(minimum_required)
-        } else {
-            0
-        };
 
         emit!(ProtocolSolvencyCheckedEvent {
             vault_quote_lots: vault_amount,
@@ -9696,6 +10298,10 @@ pub struct PlaceLimitOrderV2<'info> {
         bump,
     )]
     pub market_book: UncheckedAccount<'info>,
+    // #35 / H1 part B: the optional per-market FillCommitmentAccount is passed
+    // via `remaining_accounts` (truly optional — existing callers pass nothing
+    // and keep legacy behaviour; an armed market appends the account). Located +
+    // validated in-handler by `find_fill_commitment`.
 }
 
 #[derive(Accounts)]
@@ -9727,6 +10333,29 @@ pub struct CancelOrderV2<'info> {
 
     /// CHECK: PDA at the market_book seed; disc validated inside handler.
     /// Mut because we remove a node + update header indices + free-list.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
+/// #36 permissionless expiry-reaper. No authority gate — `cranker` is any signer
+/// (pays the tx; the handler only removes genuinely-expired orders, so it cannot
+/// grief). Market is read-only (only the book mutates).
+#[derive(Accounts)]
+pub struct ReapExpiredOrders<'info> {
+    pub cranker: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at the market_book seed; disc validated inside handler. Mut
+    /// because we remove nodes + update header indices + free-list.
     #[account(
         mut,
         seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
@@ -9810,11 +10439,23 @@ pub struct ConvertPosition<'info> {
     pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
 
     #[account(
+        mut,
         seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
         bump = position.load()?.bump,
         constraint = position.load()?.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
     )]
     pub position: AccountLoader<'info, state::PositionAccount>,
+
+    /// H9: the converted matured PnL is credited here — the isolated bucket on
+    /// `position` if isolated, else this cross pool. Bound to the position's
+    /// trader (main account). Previously absent, so the credit was never landed.
+    #[account(
+        mut,
+        seeds = [TraderStateAccount::SEED, position.load()?.trader.as_ref()],
+        bump = trader_state.load()?.bump,
+        constraint = trader_state.load()?.trader == position.load()?.trader @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         mut,
@@ -10320,6 +10961,34 @@ pub struct InitMarketBook<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Allocate the per-market `FillCommitmentAccount` (`init_fill_commitment`,
+/// #35 / H1 part B). Same authority gate + raw-PDA pattern as `InitMarketBook`;
+/// sized + stamped in the handler.
+#[derive(Accounts)]
+pub struct InitFillCommitment<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; allocated via SystemProgram CPI in the handler (flat
+    /// byte region, sized in-handler — same reason as `market_book`). Bound by
+    /// the seed derivation below.
+    #[account(
+        mut,
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 /// Grow a market_book PDA in place (`expand_market_book`). Same authority
 /// gate and seed binding as `InitMarketBook`; the book is reallocated in the
 /// handler so it's `UncheckedAccount` (Anchor can't size a variable account).
@@ -10370,6 +11039,112 @@ pub struct CommitMarketBook<'info> {
     /// CHECK: MagicBlock magic program. Address-pinned to MAGIC_PROGRAM_ID.
     #[account(address = er::MAGIC_PROGRAM_ID)]
     pub magic_program: UncheckedAccount<'info>,
+}
+
+/// #35 / H1 part B: delegate the FillCommitmentAccount to the ER. Mirrors
+/// `DelegateMarketBook` with the `fill_commit` seed.
+#[derive(Accounts)]
+pub struct DelegateFillCommitment<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; signed via seeds for the delegate CPI. Anchor verifies
+    /// seeds + bump; handler rechecks .owner == this program.
+    #[account(
+        mut,
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
+
+    /// CHECK: this program's account info (owner_program for the delegation CPI).
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under owner_program at [b"buffer", fill_commitment]. Initialised
+    /// by the delegation program.
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID at [b"delegation", fill_commitment].
+    #[account(mut)]
+    pub delegation_record: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID at [b"delegation-metadata", fill_commitment].
+    #[account(mut)]
+    pub delegation_metadata: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program. Address-pinned; cpi_delegate rechecks.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
+}
+
+/// #35 / H1 part B: ON-THE-ER commit (± undelegate) of the FillCommitmentAccount.
+/// Mirrors `CommitMarketBook`.
+#[derive(Accounts)]
+pub struct CommitFillCommitment<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: the delegated fill_commitment PDA being committed. On the ER its
+    /// owner is the delegation program; `cpi_commit` fails loudly if this is not
+    /// actually a delegated account.
+    #[account(mut)]
+    pub fill_commitment: UncheckedAccount<'info>,
+
+    /// CHECK: MagicBlock magic context (writable). Address-pinned to MAGIC_CONTEXT_ID.
+    #[account(mut, address = er::MAGIC_CONTEXT_ID)]
+    pub magic_context: UncheckedAccount<'info>,
+
+    /// CHECK: MagicBlock magic program. Address-pinned to MAGIC_PROGRAM_ID.
+    #[account(address = er::MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
+/// #35 / H1 part B: base-layer undelegate of the FillCommitmentAccount. Mirrors
+/// `UndelegateMarketBook` with the `fill_commit` seed.
+#[derive(Accounts)]
+pub struct UndelegateFillCommitment<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; signed via seeds for the undelegate CPI.
+    #[account(
+        mut,
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
+
+    /// CHECK: this program's account info.
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: same buffer PDA from delegate (carries the committed state).
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
 }
 
 /// Base-layer undelegation callback (audit ER-2). Mirrors the
@@ -11395,6 +12170,9 @@ pub struct ApplyFill<'info> {
     pub maker_position_haircut: Option<Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
 
     pub system_program: Program<'info, System>,
+    // #35 / H1 part B: the optional per-market FillCommitmentAccount is passed
+    // via `remaining_accounts` (truly optional — existing callers pass nothing;
+    // an armed market appends it). Located + validated by `find_fill_commitment`.
 }
 
 #[derive(Accounts)]
@@ -11947,6 +12725,14 @@ pub struct MarketBookInitializedEvent {
 }
 
 #[event]
+pub struct FillCommitmentInitializedEvent {
+    pub market: Pubkey,
+    pub fill_commitment: Pubkey,
+    pub cap: u32,
+    pub total_bytes: u32,
+}
+
+#[event]
 pub struct MarketBookExpandedEvent {
     pub market: Pubkey,
     pub market_book: Pubkey,
@@ -11969,6 +12755,21 @@ pub struct MarketBookDelegatedEvent {
 pub struct MarketBookUndelegatedEvent {
     pub market: Pubkey,
     pub market_book: Pubkey,
+}
+
+#[event]
+pub struct FillCommitmentDelegatedEvent {
+    pub market: Pubkey,
+    pub fill_commitment: Pubkey,
+    pub commit_frequency_ms: u32,
+    /// Pinned ER validator pubkey, or default Pubkey if permissionless.
+    pub validator: Pubkey,
+}
+
+#[event]
+pub struct FillCommitmentUndelegatedEvent {
+    pub market: Pubkey,
+    pub fill_commitment: Pubkey,
 }
 
 #[event]
@@ -12082,6 +12883,14 @@ pub struct OrderCancelledV2Event {
     pub order_seq: u64,
     pub side: u8,
     pub node_index: u32,
+    pub total_orders_after: u32,
+}
+
+#[event]
+pub struct ExpiredOrdersReapedEvent {
+    pub market: Pubkey,
+    /// Number of expired orders actually removed this call.
+    pub reaped: u32,
     pub total_orders_after: u32,
 }
 
@@ -12815,6 +13624,19 @@ pub struct InsurancePauseThresholdUpdatedEvent {
     pub previous_threshold_quote_lots: u64,
     pub new_threshold_quote_lots: u64,
     pub current_balance_quote_lots: u64,
+}
+
+/// H6 — emitted when a realized loss exceeds the position's backing (a bankrupt
+/// close) and the deficit is absorbed by the insurance fund instead of reverting
+/// settlement. `uncovered_quote_lots > 0` means the fund itself was insufficient
+/// — true socialized bad debt that an ADL/backstop must resolve.
+#[event]
+pub struct BadDebtSocializedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub shortfall_quote_lots: u64,
+    pub covered_by_insurance_quote_lots: u64,
+    pub uncovered_quote_lots: u64,
 }
 
 #[event]
@@ -13668,14 +14490,203 @@ fn clamp_i128_to_i64(v: i128) -> i64 {
 ///
 /// `delta` is signed: positive = trader gained (credit), negative =
 /// trader lost (debit).
+/// H6 (bad-debt socialization) — pure math for the cross-pool loss case.
+/// Returns `(new_cross_collateral, shortfall)`: the pool is drawn down to cover
+/// as much of the loss as it can, and any remainder (the position was bankrupt —
+/// its loss exceeds its backing) is surfaced as `shortfall` for the caller to
+/// cover from the insurance fund. Pure → host-testable.
+#[inline]
+fn cross_loss_shortfall(debit: u64, cross_collateral: u64) -> (u64, u64) {
+    let covered = debit.min(cross_collateral);
+    (cross_collateral - covered, debit - covered)
+}
+
+/// H6 / H7 — machine-checked solvency invariants for the realized-loss money
+/// path, proved EXHAUSTIVELY over all u64 inputs by Kani (CBMC bounded model
+/// checking). Together the bad-debt waterfall (H6) and the haircut-Residual
+/// credit (H7) depend on these properties; they prove value can be neither
+/// minted nor destroyed on a loss settlement. Runs in the CI Kani job
+/// (`cargo kani --package flash-book --features no-entrypoint`).
+#[cfg(kani)]
+mod h6_h7_solvency_proofs {
+    use super::cross_loss_shortfall;
+
+    /// The loss is split with EXACT conservation, and the collateral reported as
+    /// removed — which H7 credits to the haircut Residual — NEVER exceeds the
+    /// loss, so the Residual can never be over-credited and `h` can never be
+    /// inflated (no value mint). The pool never underflows.
+    #[kani::proof]
+    fn cross_loss_shortfall_conserves_and_never_overcredits() {
+        let debit: u64 = kani::any();
+        let cross: u64 = kani::any();
+        let (new_cross, shortfall) = cross_loss_shortfall(debit, cross);
+        let removed = cross - new_cross; // collateral consumed (no underflow: new_cross ≤ cross)
+
+        // (1) Pool conservation: nothing created/destroyed in the cross pool.
+        assert!(new_cross + removed == cross);
+        // (2) Loss split: covered (removed) + uncovered (shortfall) == the loss.
+        assert!(removed + shortfall == debit);
+        // (3) NO OVER-CREDIT (the H7 solvency invariant): Residual is credited by
+        //     `removed`, which can NEVER exceed the loss → `h` is never inflated.
+        assert!(removed <= debit);
+        // (4) Pool never negative; drained to exactly 0 iff the loss covers it.
+        assert!(new_cross <= cross);
+        if debit >= cross {
+            assert!(new_cross == 0);
+        }
+        // (5) No insurance draw (shortfall) when the pool fully covers the loss.
+        if debit <= cross {
+            assert!(shortfall == 0);
+        }
+    }
+
+    /// A realized LOSS only ever DECREASES the debited bucket, never the other,
+    /// and never debits MORE than the loss (no collateral destroyed beyond it).
+    /// Cross losses are constrained to the covered case (the bankrupt case is
+    /// intercepted upstream by `cross_loss_shortfall`); isolated losses saturate.
+    #[kani::proof]
+    fn realized_pnl_routing_loss_bounded_and_one_sided() {
+        let mag: u64 = kani::any();
+        let isolated: bool = kani::any();
+        let iso: u64 = kani::any();
+        let cross: u64 = kani::any();
+        if !isolated {
+            kani::assume(mag <= cross); // covered cross loss (no underflow / error)
+        }
+        let delta = -(mag as i128);
+        let (new_iso, new_cross) =
+            super::compute_realized_pnl_routing(delta, isolated, iso, cross).unwrap();
+        if isolated {
+            assert!(new_iso <= iso); // bucket only shrinks
+            assert!(new_cross == cross); // cross pool untouched on the isolated path
+            assert!(iso - new_iso <= mag); // never debits more than the loss
+        } else {
+            assert!(new_iso == iso); // isolated bucket untouched on the cross path
+            assert!(new_cross <= cross);
+            assert!(cross - new_cross == mag); // exact debit, no more, no less
+        }
+    }
+
+    /// A realized GAIN credits EXACTLY the routed bucket by exactly the gain, and
+    /// leaves the other bucket untouched (proved for the non-overflow case — the
+    /// function returns Err on overflow rather than wrapping).
+    #[kani::proof]
+    fn realized_pnl_routing_gain_credits_exactly_one_bucket() {
+        let mag: u64 = kani::any();
+        let isolated: bool = kani::any();
+        let iso: u64 = kani::any();
+        let cross: u64 = kani::any();
+        if isolated {
+            kani::assume(iso.checked_add(mag).is_some());
+        } else {
+            kani::assume(cross.checked_add(mag).is_some());
+        }
+        let delta = mag as i128;
+        let (new_iso, new_cross) =
+            super::compute_realized_pnl_routing(delta, isolated, iso, cross).unwrap();
+        if isolated {
+            assert!(new_iso == iso + mag);
+            assert!(new_cross == cross);
+        } else {
+            assert!(new_cross == cross + mag);
+            assert!(new_iso == iso);
+        }
+    }
+}
+
+/// H6 — cover a realized-loss shortfall (bad debt) from the insurance fund,
+/// saturating at the fund balance. This is PURE ACCOUNTING — no token transfer:
+/// the shared `quote_vault` already physically holds the funds; the counterparty
+/// was already credited their gain, and this reconciles the internal ledger so
+/// the deficit is absorbed by the fund rather than reverting settlement (which
+/// would strand a bankrupt position AND diverge the book from settlement, since
+/// the maker order was already consumed in `place_taker_order_v2`). Any
+/// remainder the fund cannot cover is surfaced via the event (awaiting ADL).
+fn cover_bad_debt<'info>(
+    insurance_fund: &mut Box<Account<'info, InsuranceFundAccount>>,
+    market: Pubkey,
+    trader: Pubkey,
+    shortfall: u64,
+) {
+    if shortfall == 0 {
+        return;
+    }
+    let covered = shortfall.min(insurance_fund.balance_quote_lots);
+    insurance_fund.balance_quote_lots -= covered;
+    insurance_fund.total_payouts = insurance_fund.total_payouts.saturating_add(covered);
+    emit!(BadDebtSocializedEvent {
+        market,
+        trader,
+        shortfall_quote_lots: shortfall,
+        covered_by_insurance_quote_lots: covered,
+        uncovered_quote_lots: shortfall - covered,
+    });
+}
+
+/// H7 — accrue an opted-in position's realized LOSS to the market haircut
+/// Residual. When a position closes at a loss its collateral is removed (C_tot
+/// ↓), so the solvency residual `V − C_tot − I` rises by the SAME amount — the
+/// lost collateral becomes backing for others' released gains. Without this the
+/// Residual only ever FELL (opted gains park in the reserve and later debit
+/// Residual at `convert_position`), so it ratcheted toward 0 and `h → 0` for
+/// every trader, breaking the conservation identity. Scoped to OPTED positions
+/// (`position_haircut` present): non-opted positions never participate in the
+/// Residual on either leg. `collateral_removed` is ALWAYS ≤ |loss| (the amount
+/// actually debited, not the full delta on a saturated/bankrupt close), so the
+/// Residual can never be OVER-credited — `h` cannot be inflated (no mint).
+fn accrue_haircut_loss<'info>(
+    market_haircut: Option<&mut Box<Account<'info, state_v3::MarketHaircutStateAccount>>>,
+    position_opted: bool,
+    collateral_removed: u64,
+) -> Result<()> {
+    if collateral_removed == 0 || !position_opted {
+        return Ok(());
+    }
+    if let Some(mh) = market_haircut {
+        mh.residual_quote_lots = mh
+            .residual_quote_lots
+            .checked_add(collateral_removed as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        mh.realized_loss_total_quote_lots = mh
+            .realized_loss_total_quote_lots
+            .checked_add(collateral_removed as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    }
+    Ok(())
+}
+
+/// Returns `(shortfall, collateral_removed)`:
+///   * `shortfall` — uncovered cross-pool deficit (0 except a bankrupt cross
+///     close); the caller covers it via `cover_bad_debt` (H6).
+///   * `collateral_removed` — collateral actually DEBITED by a loss (0 for gains
+///     / no-op). H7: the caller accrues this to the haircut Residual for opted
+///     positions so the `V−C_tot−I` identity stays conserved. It is ALWAYS
+///     ≤ |loss| (the removed amount, never the full delta on a bankrupt/saturated
+///     close), so Residual can never be OVER-credited — `h` cannot be inflated.
+/// Gains, isolated losses, and fully-covered cross losses are otherwise
+/// byte-identical to the previous behaviour.
 fn apply_realized_pnl_delta<'info>(
     delta: i128,
     isolated: bool,
     position: &mut AccountLoader<'info, state::PositionAccount>,
     trader_state: &mut AccountLoader<'info, TraderStateAccount>,
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     let cross_collateral = trader_state.load()?.collateral_quote_lots;
     let iso_collateral = position.load()?.collateral_quote_lots;
+    // H6: a cross-pool loss that EXCEEDS the pool is a bankrupt position. Rather
+    // than reverting (the old `checked_sub` → InsufficientCollateral inside
+    // compute_realized_pnl_routing), saturate the pool to 0 and surface the
+    // shortfall so the caller draws it from insurance. Isolated losses keep
+    // their existing saturate-to-0 semantics (bucket-only risk by design).
+    if delta < 0 && !isolated {
+        let debit = if delta < -(u64::MAX as i128) { u64::MAX } else { (-delta) as u64 };
+        if debit > cross_collateral {
+            let (new_cross, shortfall) = cross_loss_shortfall(debit, cross_collateral);
+            trader_state.load_mut()?.collateral_quote_lots = new_cross; // == 0
+            // removed = the whole pool; the uncovered remainder is `shortfall`.
+            return Ok((shortfall, cross_collateral));
+        }
+    }
     let (new_iso, new_cross) = compute_realized_pnl_routing(
         delta,
         isolated,
@@ -13684,7 +14695,17 @@ fn apply_realized_pnl_delta<'info>(
     )?;
     position.load_mut()?.collateral_quote_lots = new_iso;
     trader_state.load_mut()?.collateral_quote_lots = new_cross;
-    Ok(())
+    // collateral_removed: the debited bucket's decrease (loss only; gains = 0).
+    let removed = if delta < 0 {
+        if isolated {
+            iso_collateral.saturating_sub(new_iso)
+        } else {
+            cross_collateral.saturating_sub(new_cross)
+        }
+    } else {
+        0
+    };
+    Ok((0, removed))
 }
 
 /// Wave 24d — apply_realized_pnl_delta with optional H-haircut routing.
@@ -13711,7 +14732,7 @@ fn apply_realized_pnl_delta_v2<'info>(
     trader_state: &mut AccountLoader<'info, TraderStateAccount>,
     position_haircut: Option<&mut Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
     now_slot: u64,
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     if delta > 0 {
         if let Some(ph) = position_haircut {
             // Haircut path: route to reserve, no collateral mutation.
@@ -13732,10 +14753,13 @@ fn apply_realized_pnl_delta_v2<'info>(
             ph.released_attached_at_slot = post.released_attached_at_slot;
             ph.matured_pos_quote_lots = post.matured_pos_quote_lots;
             ph.original_reserve_at_attach = post.original_reserve_at_attach;
-            return Ok(());
+            // Gains routed to the haircut reserve never touch collateral → no
+            // shortfall and no collateral removed.
+            return Ok((0, 0));
         }
     }
-    // Loss path AND legacy non-haircut gain path both fall through to v1.
+    // Loss path AND legacy non-haircut gain path both fall through to v1, which
+    // returns (uncovered cross-loss shortfall [H6], collateral removed [H7]).
     apply_realized_pnl_delta(delta, isolated, position, trader_state)
 }
 
@@ -13834,6 +14858,30 @@ fn stamp_zc_discriminator(ai: &AccountInfo<'_>, disc: &[u8]) -> Result<()> {
         ai.try_borrow_mut_data()?[..disc.len()].copy_from_slice(disc);
     }
     Ok(())
+}
+
+/// #35 / H1 part B: locate the per-market FillCommitmentAccount in
+/// `remaining_accounts`, if armed. Truly optional — returns `None` when no
+/// matching account is passed (legacy behaviour). An account qualifies iff it is
+/// owned by THIS program (so only `init_fill_commitment` at the canonical PDA
+/// could have created it) AND its disc + market binding + length check out
+/// (`buffer_check`). That pair uniquely identifies the real account without a
+/// `find_program_address` on the hot path.
+fn find_fill_commitment<'a, 'info>(
+    remaining: &'a [AccountInfo<'info>],
+    program_id: &Pubkey,
+    market_bytes: &[u8; 32],
+) -> Option<&'a AccountInfo<'info>> {
+    for ai in remaining {
+        if ai.owner == program_id {
+            if let Ok(data) = ai.try_borrow_data() {
+                if matcher::fill_commitment::buffer_check(&data, market_bytes).is_ok() {
+                    return Some(ai);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn verify_trader_state_pda(
@@ -14116,6 +15164,39 @@ mod realized_pnl_routing_tests {
     fn loss_exceeding_cross_pool_returns_insufficient_collateral() {
         let result = compute_realized_pnl_routing(-6_000, false, 1_000, 5_000);
         assert!(result.is_err(), "loss > cross pool must error, not go negative");
+    }
+
+    // H6: the bankrupt-close path is intercepted by `apply_realized_pnl_delta`
+    // via `cross_loss_shortfall` BEFORE it reaches `compute_realized_pnl_routing`
+    // (which still errors above — preserving the pure-fn contract).
+    #[test]
+    fn cross_loss_shortfall_covered_by_pool() {
+        // debit fits within the pool → pool drawn down, zero shortfall.
+        let (new_cross, shortfall) = cross_loss_shortfall(250, 5_000);
+        assert_eq!(new_cross, 4_750);
+        assert_eq!(shortfall, 0);
+    }
+
+    #[test]
+    fn cross_loss_shortfall_bankrupt_saturates_and_surfaces_deficit() {
+        // debit exceeds the pool → pool to 0, deficit surfaced for insurance.
+        let (new_cross, shortfall) = cross_loss_shortfall(6_000, 5_000);
+        assert_eq!(new_cross, 0, "pool must never go negative");
+        assert_eq!(shortfall, 1_000, "deficit beyond collateral is the bad debt");
+    }
+
+    #[test]
+    fn cross_loss_shortfall_exact_breakeven_is_zero_shortfall() {
+        let (new_cross, shortfall) = cross_loss_shortfall(5_000, 5_000);
+        assert_eq!(new_cross, 0);
+        assert_eq!(shortfall, 0);
+    }
+
+    #[test]
+    fn cross_loss_shortfall_empty_pool_is_full_deficit() {
+        let (new_cross, shortfall) = cross_loss_shortfall(800, 0);
+        assert_eq!(new_cross, 0);
+        assert_eq!(shortfall, 800);
     }
 
     #[test]
@@ -14647,12 +15728,30 @@ pub struct VaultDepositV3<'info> {
     )]
     pub position: Account<'info, state_v3::VaultPositionAccountV3>,
 
-    /// Depositor's USDC ATA — debited.
-    #[account(mut)]
+    /// Insurance fund PDA — owns the protocol vault (binds quote_vault + mint).
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// Depositor's USDC ATA — debited. C1: bound to the protocol quote mint +
+    /// the depositor so a foreign/worthless-mint source cannot be substituted.
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = depositor,
+    )]
     pub depositor_quote_ata: Account<'info, TokenAccount>,
 
-    /// Protocol vault — credited.
-    #[account(mut)]
+    /// Protocol vault — credited. C1: MUST be the canonical insurance-fund vault.
+    /// Previously unbound `#[account(mut)]`, which let an attacker pass a
+    /// self-owned destination and still be credited collateral + minted shares
+    /// redeemable against the real vault (Cashio-class drain).
+    #[account(mut, address = insurance_fund.quote_vault)]
     pub quote_vault: Account<'info, TokenAccount>,
 
     /// Vault's TraderState — credited (collateral_quote_lots).
@@ -14856,12 +15955,30 @@ pub struct FlpDepositV3<'info> {
     )]
     pub position: Account<'info, state_v3::FlpPositionAccountV3>,
 
-    /// LP's USDC ATA — debited.
-    #[account(mut)]
+    /// Insurance fund PDA — owns the protocol vault (binds quote_vault + mint).
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// LP's USDC ATA — debited. C1: bound to the protocol quote mint + the LP
+    /// so a foreign/worthless-mint source cannot be substituted.
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = lp,
+    )]
     pub lp_quote_ata: Account<'info, TokenAccount>,
 
-    /// Protocol vault — credited.
-    #[account(mut)]
+    /// Protocol vault — credited. C1: MUST be the canonical insurance-fund vault.
+    /// Previously unbound `#[account(mut)]`, which let an attacker pass a
+    /// self-owned destination and still be minted FLP shares redeemable against
+    /// the real vault (Cashio-class drain).
+    #[account(mut, address = insurance_fund.quote_vault)]
     pub quote_vault: Account<'info, TokenAccount>,
 
     pub token_program: Program<'info, Token>,

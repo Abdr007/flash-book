@@ -318,7 +318,23 @@ pub struct MarketAccount {
     /// UNSIGNABLE, so `apply_fill` safely halts (refuses forgery) until
     /// the authority calls `set_market_sequencer`. Fail-closed by design.
     pub sequencer: Pubkey,
+    /// H1: monotonic settlement nonce. Every `apply_fill` / `apply_flp_fill`
+    /// must carry a `fill_seq` STRICTLY GREATER than this, after which it is
+    /// stored here — so a replayed or out-of-order settlement (a crashed /
+    /// restarting sequencer re-emitting an already-applied batch, or a
+    /// compromised key resubmitting one) is rejected on-chain. Carved from the
+    /// existing `space()` headroom (no size change); pre-existing markets read
+    /// back 0 (Borsh zero-slack), so the first real fill (`fill_seq` ≥ 1) passes.
+    pub last_settlement_seq: u64,
 }
+
+// H1: build-time guard — the struct (incl. the new nonce) must still fit the
+// allocated `space()` (8 disc + 1152). If a future field overflows it, this
+// fails the build instead of silently corrupting account (de)serialization.
+const _: () = assert!(
+    ::core::mem::size_of::<MarketAccount>() <= 1152,
+    "MarketAccount exceeds its allocated space() — bump space() before adding fields"
+);
 
 impl MarketAccount {
     pub const SEED: &'static [u8] = b"market";
@@ -826,12 +842,22 @@ pub struct LpPositionAccount {
     pub total_deposited_quote_lots: u64,
     /// Cumulative quote-lot withdrawals.
     pub total_withdrawn_quote_lots: u64,
+    /// H8: slot of the most recent deposit. (Re)set on every deposit via
+    /// `jit_lp_defense::extend_lock_on_deposit`; `withdraw_flp_capital` is gated
+    /// on `jit_lp_defense::can_withdraw(deposited_at_slot, now, FLP_MIN_HOLD_SLOTS)`
+    /// to defeat flash / short-window deposit→NAV-windfall→redeem. Carved from
+    /// the account's existing allocation slack (`space()` unchanged); pre-existing
+    /// LP accounts deserialize this as 0 (Borsh zero-slack) ⇒ immediately
+    /// withdrawable, so no migration is required.
+    pub deposited_at_slot: u64,
 }
 
 impl LpPositionAccount {
     pub const SEED: &'static [u8] = b"lp_position";
     pub fn space() -> usize {
-        // 8 disc + 32 + 1 + 8 + 8 + 8 = 65. Round up.
+        // 8 disc + 32 + 1 + 8 + 8 + 8 + 8(deposited_at_slot, H8) = 73. The
+        // `8 + 96` allocation already covers it (39 → 31 bytes of slack), so the
+        // size is unchanged and existing accounts read the new field as 0.
         8 + 96
     }
 }

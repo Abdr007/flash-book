@@ -86,18 +86,36 @@ backend becomes available (e.g. a future CBMC/SMT combination), the
 representative `D` in `kani_proofs` can be set straight to `H_DENOM` to close
 the gap entirely — the harness bodies need no other change.
 
-## Lean: closing the `1e9` divisor gap
+## Lean: closing the divisor / 128-bit-multiply gaps
 
-A theorem prover does not share CBMC's bitvector-division limitation, so the
-gap above is closed directly in Lean 4 (+ Mathlib) over unbounded `Nat`, with
-the **actual** `H_DENOM = 1_000_000_000`:
+A theorem prover does not share CBMC's bitvector limitations (non-power-of-two
+division; bit-blasting a 128-bit multiply), so the gaps CBMC cannot reach are
+closed directly in Lean 4 (+ Mathlib) over unbounded `Nat`/`Int`, at the
+**actual** divisors. Three proof files cover the haircut, the OI-scaled MMR
+surcharge, and funding:
 
-| Lean theorem (`formal_verification/lean/Haircut.lean`) | Statement | Kani counterpart |
+**Haircut** (`formal_verification/lean/Haircut.lean`), at the actual `H_DENOM = 1e9`:
+
+| Lean theorem | Statement | Kani counterpart |
 |---|---|---|
 | `convert_ensures_0` | `(matured · h) / 1e9 ≤ matured`, given `h ≤ 1e9` | `proof_dust_conservation` |
 | `solvency_single_convert` | `(matured · h) / 1e9 ≤ residual`, given `matured·h ≤ backed·1e9`, `backed = min residual matured` | `proof_solvency_single_convert` |
 
-Both are `#print axioms`-clean — they depend only on `propext`,
+**OI-scaled MMR surcharge** (`formal_verification/lean/OiMmr.lean`), at the real `1e6` divisor — Lean proves the value-dependent **monotonicity** that CBMC cannot decide at a non-power-of-two divisor:
+
+| Lean theorem | Statement | Kani counterpart |
+|---|---|---|
+| `oiScaled_le_cap` | `min((oi·slope)/1e6, cap) ≤ cap` (surcharge never exceeds its cap) | `oi_scaled_never_exceeds_cap` |
+| `oiScaled_mono` | `oi₁ ≤ oi₂ ⇒ surcharge(oi₁) ≤ surcharge(oi₂)` (a crowding book is never under-margined) | — (CBMC can't decide at `/1e6`) |
+
+**Funding** (`formal_verification/lean/Funding.lean`), over unbounded `Int` — proven in Lean because CBMC must bit-blast the 128-bit `notional · delta` multiply and does not terminate:
+
+| Lean theorem | Statement | Kani counterpart |
+|---|---|---|
+| `funding_zero_sum` | `owed(long) + owed(short) == 0` (funding moves value between sides; cannot mint/burn) | — (128-bit multiply non-terminating in CBMC) |
+| `funding_zero_when_no_index_move` | `delta == 0 ⇒ owed == 0` (no accrual from a static index) | — |
+
+All six are `#print axioms`-clean — they depend only on `propext`,
 `Classical.choice`, `Quot.sound` (no `sorry`). Build + reproduction steps are in
 [`formal_verification/lean/README.md`](../formal_verification/lean/README.md).
 The `convert` state-machine shape was scaffolded by QEDGen
@@ -114,3 +132,26 @@ exact production-constant statement.
   parked until a stronger division/UNSAT backend is wired in.
 - Extend coverage to the matching engine (`state_v2.rs` hypertree ordering
   invariants) and the margin/liquidation gates.
+
+## Settlement-authenticity & gate proofs (#35/#36/FV-sweep)
+
+Beyond the haircut/MMR/funding core, the settlement and liquidation gates carry
+their own Kani harnesses (all `VERIFICATION: SUCCESSFUL`):
+
+| Harness (module) | Property |
+|---|---|
+| `matcher::fill_commitment` ring ×4 | consume-and-clear ring: settlement never outruns production, depth-bounded, fabricated/out-of-order fill rejected, no double-settle (INV-S1/S2) |
+| `matcher::fill_commitment` nonce ×3 | **P-SETTLE-1** settlement nonce strictly monotone — replay/reorder rejected, advance is strict + exact, chain monotone |
+| `matcher::flp_quoter` band ×2 | **#35 FLP / #36 resting** price band: accepts the oracle price (no false reject), rejects 2×/0× oracle (catastrophe bound), overflow-free |
+| `matcher::liquidation` health ×3 | **P-LIQ-1** worse-of(mark, oracle): always the worse of the two real sources for the side, never a fabricated price |
+| `state_v2` order-id ×4 | **P-MATCH-1/2** price-time priority of the `order_id` encoding: better price first (asks↑/bids↓), FIFO seq tiebreak both sides (rules out the old LIFO-bid bug), id injective on live orders |
+| `matcher::insurance` solvency ×2 | **P-SOLV-4** (protocol buckets) solvent⟺vault≥insurance+FLP; surplus exact (vault accounts to insurance+FLP+surplus) |
+| `matcher::haircut` residual ×2 | **P-SOLV-5** (delta core) residual delta applied exactly + perfectly invertible (tracking never drifts) |
+
+Each handler routes through the proven pure function (e.g. `apply_fill`/
+`apply_flp_fill` → `advance_settlement_seq`; `liquidate_position_v2` →
+`worse_of_health_price`), so the proof binds to the deployed logic, not a copy.
+
+CBMC note (reconfirmed): equality of two free *symbolic* multiplies is the SAT
+backend's limit — band inputs are bounded to a large realistic range, and the
+tautological "predicate == its definition" identity is intentionally not a harness.

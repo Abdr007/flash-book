@@ -88,3 +88,42 @@ pub const SOLANA_MAX_ACCOUNT_SIZE: usize = 10 * 1024 * 1024;
 /// CLOBs typically size baskets at ≤4 legs (a long-short pair plus a
 /// hedge); larger baskets land via repeated calls.
 pub const MAX_BASKET_LEGS_N: usize = 4;
+
+/// H8: minimum slots an FLP liquidity provider must hold before withdrawing,
+/// enforced by `withdraw_flp_capital` via `matcher::jit_lp_defense::can_withdraw`.
+/// Defeats the flash / short-window attack of depositing right before a fee /
+/// realized-PnL event that lifts FLP NAV and redeeming the windfall without
+/// bearing risk (the `jit_lp_defense` module existed but was never wired). ~1 min
+/// at ~0.4s/slot — negligible for genuine LPs (who hold for days), fatal to the
+/// timed windfall. Security floor; a future governance field can override it once
+/// the FlpExposureAccount layout is versioned (it currently has no reserved space).
+pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
+
+/// #35 / H1 part B — protocol-level safety cap on how far an `apply_flp_fill`
+/// price may deviate from the FRESH oracle, in bps (symmetric band). The FLP
+/// quoter always prices within its spread of fair value, so a legitimate fill is
+/// far inside this bound; the cap exists only to stop a compromised sequencer
+/// settling an FLP fill far enough from the oracle to drain the pool. 2000 bps =
+/// 20% — comfortably above any realistic FLP spread (sub-2% even in stress) while
+/// capping per-fill pool value-extraction at 20% of notional. A constant (not a
+/// `MarketParams` field) because `MarketParams` has no reserved slack; a future
+/// governance override can replace it once that layout is versioned.
+pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 2000;
+
+/// #36 — anti-book-stuffing: max deviation (bps, symmetric) a RESTING order's
+/// price may sit from the fresh oracle. Far-from-market orders are the classic
+/// node-arena-exhaustion vector (cheap because they never fill); requiring a
+/// resting order to be within band forces it close enough to market to bear real
+/// fill/position risk, turning "free" stuffing into risky stuffing. 5000 bps =
+/// 50% is generous — it rejects only absurd prices (a bid below half the oracle
+/// or an ask above 1.5×), never a realistic limit (DCA / catch-a-dip orders sit
+/// well inside). Enforced only when a live oracle anchors it (`oracle == 0`
+/// skips). Reuses the Kani-proven `price_within_band` predicate. NOTE: this
+/// raises the attacker's cost; it does not by itself stop a sybil (N wallets ×
+/// orders) — that is bounded by the expandable arena + economic future work.
+pub const MAX_RESTING_ORDER_DEVIATION_BPS: u32 = 5000;
+
+/// #36 — max expired orders a single `reap_expired_orders` call may reclaim.
+/// Bounds CU/transaction size; the permissionless cranker batches more across
+/// calls. 64 comfortably fits a transaction's account/data budget.
+pub const MAX_REAP_PER_CALL: usize = 64;

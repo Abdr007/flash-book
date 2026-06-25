@@ -1563,6 +1563,10 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
         .await
         .unwrap();
 
+    // H8: the FLP minimum hold (FLP_MIN_HOLD_SLOTS) now gates withdrawals.
+    // Advance past it so the legitimate withdraw succeeds.
+    ctx.warp_to_slot(1_000).unwrap();
+
     // Burn 1M shares to withdraw 1M USDC (NAV/share = 1.0 since no fills).
     let withdraw_ix = build_ix(
         flash_book::instruction::WithdrawFlpCapital {
@@ -1766,6 +1770,9 @@ async fn lp_units_withdraw_burns_shares_and_distributes_nav() {
         flash_book::state::LpPositionAccount::SEED,
         alice.pubkey().as_ref(),
     ]);
+
+    // H8: advance past the FLP minimum hold before withdrawing.
+    ctx.warp_to_slot(1_000).unwrap();
 
     // Alice burns 1M shares. NAV/share = 7M/7M = 1.0 → returns 1M USDC.
     let withdraw_ix = build_ix(
@@ -2258,6 +2265,7 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
             price_ticks: 100_000,
             taker_side: 0, // long
             taker_sub_index: 0, // main account
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer
@@ -2310,6 +2318,270 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(market.oi_long_lots, 1);
     assert_eq!(market.oi_short_lots, 1);
+}
+
+/// #35 / H1 part B — FLP authenticity band: an `apply_flp_fill` priced far from
+/// the FRESH oracle (a compromised sequencer pricing the pool fill to extract
+/// value) is REJECTED. Oracle = 100_000; posting 300_000 (200% deviation, far
+/// beyond the 20% cap) fails and creates no position. Contrast with
+/// `apply_flp_fill_creates_taker_position_and_flp_entry` (the SAME fill AT the
+/// oracle succeeds) isolates the rejection to the band gate.
+#[tokio::test]
+async fn apply_flp_fill_rejects_price_far_from_oracle() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // oracle == 100_000 (setup_market). 300_000 is a 200% deviation >> 20% cap.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFlpFill {
+            size_lots: 1,
+            price_ticks: 300_000,
+            taker_side: 0,
+            taker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "FLP fill far from the oracle must be rejected (#35 band gate)"
+    );
+    let taker_acct = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(
+        taker_acct.is_none(),
+        "no taker position after a rejected out-of-band FLP fill (#35)"
+    );
+}
+
+/// #36 anti-book-stuffing: a RESTING limit order priced far from the oracle is
+/// rejected (the node-arena-exhaustion vector), while an in-band order is
+/// accepted. Oracle = 100_000; an ask @ 200_000 (100% deviation, beyond the 50%
+/// band) fails with RestingOrderTooFarFromOracle; an ask @ 140_000 (40%, inside)
+/// succeeds.
+#[tokio::test]
+async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    // init the v2 book.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let maker = Keypair::new();
+    let place = |price: u64| {
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side: 1, // ask
+                size_lots: 1,
+                limit_ticks: price,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+            ],
+        )
+    };
+
+    // 200_000 = 100% above the 100_000 oracle, beyond the 50% band -> rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let far = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(200_000)],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await;
+    assert!(
+        far.is_err(),
+        "a resting limit far from the oracle must be rejected (#36)"
+    );
+
+    // 140_000 = 40% above oracle, inside the 50% band -> accepted.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let near = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(140_000)],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await;
+    assert!(
+        near.is_ok(),
+        "an in-band resting limit must be accepted (#36): {near:?}"
+    );
+}
+
+/// #36 permissionless expiry-reaper: an EXPIRED GTT order is reclaimed by anyone,
+/// while a GTC order (expires_at_slot == 0) at the same price is NEVER touched.
+/// Verified via cancel_order_v2 as the oracle: after reaping, cancelling the GTT
+/// id fails (it's gone) but cancelling the GTC id succeeds (still resting).
+#[tokio::test]
+async fn reap_expired_orders_removes_only_expired() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    let maker = Keypair::new();
+    let place = |expires: u64| {
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side: 1, // ask, at the 100_000 oracle (in-band)
+                size_lots: 1,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: expires,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+            ],
+        )
+    };
+    // seq is 1-based + monotonic: first order seq=1 (GTT, expires slot 50),
+    // second seq=2 (GTC, never expires).
+    send(&mut ctx, place(50), &[&payer, &maker]).await.unwrap();
+    send(&mut ctx, place(0), &[&payer, &maker]).await.unwrap();
+
+    let gtt_id = flash_book::state_v2::encode_order_id(100_000, 1, false);
+    let gtc_id = flash_book::state_v2::encode_order_id(100_000, 2, false);
+
+    // Advance past the GTT expiry, then reap (permissionless — payer cranks).
+    ctx.warp_to_slot(100).unwrap();
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ReapExpiredOrders {
+                order_ids: vec![gtt_id, gtc_id],
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true), // cranker — any signer
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Oracle: cancelling the reaped GTT id must FAIL (it's gone)...
+    let cancel = |order_id: u64| {
+        build_ix(
+            flash_book::instruction::CancelOrderV2 { side: 1, order_id },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+            ],
+        )
+    };
+    let gtt_cancel = send(&mut ctx, cancel(gtt_id), &[&payer, &maker]).await;
+    assert!(
+        gtt_cancel.is_err(),
+        "the expired GTT order must have been reaped (cancel should fail)"
+    );
+    // ...but the GTC order is untouched, so cancelling it SUCCEEDS.
+    let gtc_cancel = send(&mut ctx, cancel(gtc_id), &[&payer, &maker]).await;
+    assert!(
+        gtc_cancel.is_ok(),
+        "the GTC order must NOT be reaped (cancel should succeed): {gtc_cancel:?}"
+    );
 }
 
 #[tokio::test]
@@ -2898,6 +3170,7 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 2,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer
@@ -2920,7 +3193,8 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[ix],
+            // H1: clone so the original `ix` survives for the replay assertion below.
+            &[ix.clone()],
             Some(&payer.pubkey()),
             &[&payer],
             bh,
@@ -2946,6 +3220,36 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(market.oi_long_lots, 1);
     assert_eq!(market.oi_short_lots, 1);
+    // H1: the settlement nonce advanced to the applied fill_seq.
+    assert_eq!(market.last_settlement_seq, 2);
+
+    // ── H1 replay guard ─────────────────────────────────────────────────
+    // Re-submitting the IDENTICAL fill (same fill_seq = 2 ≤ last_settlement_seq)
+    // must be rejected on-chain — this is the crashed/restarting-sequencer
+    // re-emit case. A fresh blockhash (via a slot warp) makes it a DISTINCT
+    // transaction so it actually reaches the program (not deduped by the
+    // runtime), proving the on-chain guard — not tx-dedup — is what rejects it.
+    ctx.warp_to_slot(100).unwrap();
+    let bh2 = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let replay = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh2,
+        ))
+        .await;
+    assert!(
+        replay.is_err(),
+        "replayed fill (fill_seq <= last_settlement_seq) must be rejected"
+    );
+
+    // The replay had NO effect: OI is unchanged and the nonce is still 2.
+    let market_after: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market_after.oi_long_lots, 1, "replay must not double OI");
+    assert_eq!(market_after.oi_short_lots, 1, "replay must not double OI");
+    assert_eq!(market_after.last_settlement_seq, 2);
 }
 
 /// C-1 regression: a signer that is NOT the market's configured
@@ -3005,6 +3309,7 @@ async fn apply_fill_rejects_unauthorized_sequencer() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 3,
         },
         vec![
             AccountMeta::new(rogue.pubkey(), true), // rogue, NOT market.sequencer
@@ -3042,6 +3347,328 @@ async fn apply_fill_rejects_unauthorized_sequencer() {
         taker_acct.is_none(),
         "no taker position should exist after a rejected apply_fill (C-1)"
     );
+}
+
+/// #35 / H1 part B: an `apply_fill` on a market ARMED with a FillCommitmentAccount
+/// must REJECT a fill the matcher never committed. A compromised sequencer cannot
+/// fabricate trades: with the commitment ring present but EMPTY, posting a fill
+/// finds no matching commitment and the whole tx rolls back — no position is
+/// created. This is the consumer-side verify-and-pop, proven on-chain.
+///
+/// Contrast with `apply_fill_opens_both_positions_and_moves_oi`, which posts the
+/// SAME fill UNARMED (no commitment account) and succeeds — so the rejection here
+/// is specifically the commitment gate, not a malformed fill.
+#[tokio::test]
+async fn apply_fill_rejects_fabricated_fill_when_armed() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // Arm the market: allocate the FillCommitmentAccount (its ring starts EMPTY).
+    let (fc_pda, _) = pda(&[
+        flash_book::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market_pda.as_ref(),
+    ]);
+    let init_ix = build_ix(
+        flash_book::instruction::InitFillCommitment {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // authority (== market.authority)
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(fc_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Sequencer posts a fill on the armed market with NOTHING committed -> reject.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // sequencer (== market.sequencer)
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
+            AccountMeta::new_readonly(flash_book::ID, false), // haircut None x3
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            // remaining_accounts: the armed (empty) FillCommitmentAccount
+            AccountMeta::new(fc_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "armed apply_fill must reject a fill with no matching commitment (#35)"
+    );
+
+    // Rolled back: no taker position created by the fabricated fill.
+    let taker_acct = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(
+        taker_acct.is_none(),
+        "no taker position after a rejected fabricated apply_fill (#35)"
+    );
+}
+
+/// #35 / H1 part B — HONEST PATH, end-to-end on the v2 hypertree book:
+/// init book + arm fill_commitment → maker rests an ask → taker crosses it
+/// (`place_taker_order_v2` pushes a keccak commitment for the real fill) →
+/// `apply_fill` recomputes the SAME commitment and consume-and-clears it, opening
+/// the taker's position. Proves the producer (matcher) and consumer (settlement)
+/// preimages AGREE across the two handlers — the one thing the buffer/Kani layers
+/// can't verify. Also the first end-to-end coverage of `place_taker_order_v2`.
+#[tokio::test]
+async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Same keypairs serve as place-order signers AND trader_state owners, so the
+    // producer's (taker/maker pubkeys) and consumer's (trader_state.trader)
+    // preimages match.
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[
+        flash_book::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market_pda.as_ref(),
+    ]);
+
+    // helper: process a tx with the given ix + signers
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    // 1) init the v2 book + arm the fill-commitment ring.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitFillCommitment {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // 2) maker rests an ask: side=1, 5 lots @ 100_000.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side: 1,
+                size_lots: 5,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+            ],
+        ),
+        &[&payer, &maker],
+    )
+    .await
+    .unwrap();
+
+    // 3) taker crosses: side=0 bid, 1 lot @ limit 100_000 -> fills 1 @ 100_000.
+    //    The fill_commitment account rides in remaining_accounts -> a commitment
+    //    is pushed for the crossed fill.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceTakerOrderV2 {
+                side: 0,
+                size_lots: 1,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new(fc_pda, false), // remaining_accounts
+            ],
+        ),
+        &[&payer, &taker],
+    )
+    .await
+    .unwrap();
+
+    // The ring now holds exactly one produced, zero settled.
+    let read_counters = |data: &[u8]| -> (u64, u64) {
+        let mut p = [0u8; 8];
+        p.copy_from_slice(&data[8..16]);
+        let mut s = [0u8; 8];
+        s.copy_from_slice(&data[16..24]);
+        (u64::from_le_bytes(p), u64::from_le_bytes(s))
+    };
+    let fc_data = ctx
+        .banks_client
+        .get_account(fc_pda)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(
+        read_counters(&fc_data),
+        (1, 0),
+        "matcher must have pushed exactly one commitment"
+    );
+
+    // 4) sequencer settles the SAME fill -> consumer recomputes the matching
+    //    commitment and consume-and-clears it. Honest path SUCCEEDS.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ApplyFill {
+                size_lots: 1,
+                price_ticks: 100_000,
+                taker_side: 0,
+                taker_was_jit: false,
+                taker_sub_index: 0,
+                maker_sub_index: 0,
+                fill_seq: 1,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(insurance_fund_pda, false),
+                AccountMeta::new(taker_state, false),
+                AccountMeta::new(maker_state, false),
+                AccountMeta::new(taker_pos, false),
+                AccountMeta::new(maker_pos, false),
+                AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
+                AccountMeta::new_readonly(flash_book::ID, false), // haircut None x3
+                AccountMeta::new_readonly(flash_book::ID, false),
+                AccountMeta::new_readonly(flash_book::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(fc_pda, false), // remaining_accounts
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .expect("honest committed fill must settle");
+
+    // Ring fully drained: produced == settled == 1.
+    let fc_data = ctx
+        .banks_client
+        .get_account(fc_pda)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(
+        read_counters(&fc_data),
+        (1, 1),
+        "the committed fill must be consumed exactly once"
+    );
+
+    // The taker position now exists, long 1 @ 100_000.
+    let taker_p: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(taker_p.side, 0, "taker is long after the honest fill");
+    assert_eq!(taker_p.size_lots, 1, "taker size 1 lot");
 }
 
 /// C-2 regression: `partial_withdraw_collateral` must reject a caller who
@@ -3090,6 +3717,7 @@ async fn partial_withdraw_rejects_omitted_position() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 4,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // payer IS market.sequencer
@@ -3287,6 +3915,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 5,
         },
         fill_metas(),
     );
@@ -3322,21 +3951,114 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 6,
         },
         fill_metas(),
     );
     let cu_apply_fill_close = cu_of(&mut ctx, close_ix, &payer.pubkey(), &[&payer]).await;
 
+    // ── New gated hot paths: #36 oracle band + #35 fill commitment ──────
+    // Set up the v2 book + arm the commitment ring (one-time; not measured).
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[
+        flash_book::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market_pda.as_ref(),
+    ]);
+    for ix in [
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        build_ix(
+            flash_book::instruction::InitFillCommitment {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+    ] {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&payer.pubkey()),
+                &[&payer],
+                bh,
+            ))
+            .await
+            .unwrap();
+    }
+
+    // (4) place_limit_order_v2 — rests a deep ask; exercises the #36 intake band
+    //     check. Also leaves liquidity for the taker measurements below.
+    let place_limit_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrderV2 {
+            side: 1,
+            size_lots: 10,
+            limit_ticks: 100_000,
+            flags: 0,
+            expires_at_slot: 0,
+            sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(maker.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(book_pda, false),
+        ],
+    );
+    let cu_place_limit = cu_of(&mut ctx, place_limit_ix, &payer.pubkey(), &[&payer, &maker]).await;
+
+    // (5) place_taker_order_v2 — UNARMED vs ARMED. The delta is the #35 per-fill
+    //     keccak commitment (the only added hot-path cost when a market is armed).
+    let taker_ix = |armed: bool| {
+        let mut metas = vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(book_pda, false),
+        ];
+        if armed {
+            metas.push(AccountMeta::new(fc_pda, false)); // remaining_accounts
+        }
+        build_ix(
+            flash_book::instruction::PlaceTakerOrderV2 {
+                side: 0,
+                size_lots: 1,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            metas,
+        )
+    };
+    let cu_taker_unarmed = cu_of(&mut ctx, taker_ix(false), &payer.pubkey(), &[&payer, &taker]).await;
+    let cu_taker_armed = cu_of(&mut ctx, taker_ix(true), &payer.pubkey(), &[&payer, &taker]).await;
+
     println!("\n=== Flash Book CU benchmark (settlement + risk paths) ===");
     println!("apply_fill (open, both positions) : {cu_apply_fill_open:>7} CU");
     println!("apply_fill (close, realize PnL)   : {cu_apply_fill_close:>7} CU");
     println!("partial_withdraw (1 pos, lattice) : {cu_partial_withdraw:>7} CU");
+    println!("place_limit_v2 (#36 band check)   : {cu_place_limit:>7} CU");
+    println!("place_taker_v2 (unarmed)          : {cu_taker_unarmed:>7} CU");
+    println!(
+        "place_taker_v2 (armed, #35 commit): {cu_taker_armed:>7} CU  (+{} keccak commitment)",
+        cu_taker_armed.saturating_sub(cu_taker_unarmed)
+    );
     println!("(200k default per-ix budget; 1.4M max/tx)\n");
 
     // Guardrail: these must comfortably fit the default per-ix budget.
     assert!(cu_apply_fill_open < 200_000, "apply_fill open exceeds 200k CU");
     assert!(cu_apply_fill_close < 200_000, "apply_fill close exceeds 200k CU");
     assert!(cu_partial_withdraw < 200_000, "partial_withdraw exceeds 200k CU");
+    assert!(cu_place_limit < 200_000, "place_limit exceeds 200k CU");
+    assert!(cu_taker_armed < 200_000, "place_taker (armed) exceeds 200k CU");
 }
 
 /// Phase 2g coverage end-to-end: open a winning position then close
@@ -3380,6 +4102,7 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 7,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -3433,6 +4156,7 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
+            fill_seq: 8,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -3557,6 +4281,7 @@ async fn apply_fill_rejects_wrong_sub_index_trader_state() {
             taker_was_jit: false,
             taker_sub_index: 0,  // ← lying: actually passing sub_state
             maker_sub_index: 0,
+            fill_seq: 9,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -3587,5 +4312,305 @@ async fn apply_fill_rejects_wrong_sub_index_trader_state() {
     assert!(
         result.is_err(),
         "ApplyFill must reject wrong-sub_index trader_state (Phase 2i)"
+    );
+}
+
+/// Instruction-level chaos: random sequences of `place_limit` / `place_taker` /
+/// `cancel` / `reap` against the REAL program (band gate, matching, expiry,
+/// account validation all live), across several seeds. After each run the
+/// on-chain book is PARSED and validated — count consistent, both best-first
+/// walks in strict price-time order, never corrupt. A program panic surfaces as
+/// `ProgramFailedToComplete` (asserted against); graceful `Custom` errors are
+/// expected and fine. Complements `proptest_book` (pure structure) by exercising
+/// the handlers + gates under random interleaving.
+async fn chaos_send(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    ix: Instruction,
+    payer_pk: &Pubkey,
+    signers: &[&Keypair],
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(payer_pk),
+            signers,
+            bh,
+        ))
+        .await
+}
+
+#[tokio::test]
+async fn chaos_instruction_sequences_keep_book_consistent() {
+    fn nxt(s: &mut u64) -> u64 {
+        *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    for seed in 1u64..=4 {
+        let pt = make_program_test();
+        let mut ctx = pt.start_with_context().await;
+        let payer = ctx.payer.insecure_clone();
+        let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+        let (book_pda, _) =
+            pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+        chaos_send(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            ),
+            &payer.pubkey(),
+            &[&payer],
+        )
+        .await
+        .unwrap();
+
+        let traders: Vec<Keypair> = (0..3).map(|_| Keypair::new()).collect();
+        let mut resting: Vec<(usize, u8, u64)> = Vec::new(); // (trader_idx, side, order_id)
+        let mut seq: u64 = 1;
+        let mut warp_slot: u64 = 100;
+        let mut s = seed;
+
+        for _ in 0..35 {
+            let r = nxt(&mut s);
+            let ti = (r % 3) as usize;
+            let kind = (r >> 8) % 5;
+            let side = ((r >> 16) & 1) as u8;
+            let price = 80_000 + (r >> 17) % 40_001; // 80k..120k — inside the 50% band of the 100k oracle
+            let size = 1 + (r >> 40) % 5;
+            // GTT expiry sits AHEAD of the current clock (valid at placement) but
+            // behind a later reap-warp (so it becomes reapable) — exercises the
+            // expiry/reaper path rather than pre-expiring. ~half are GTC (0).
+            let expires = if (r >> 50) & 1 == 1 { warp_slot + 50 } else { 0 };
+
+            let place_metas = |t: &Keypair| {
+                vec![
+                    AccountMeta::new(t.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                ]
+            };
+
+            let res = match kind {
+                0 | 4 => {
+                    let ix = build_ix(
+                        flash_book::instruction::PlaceLimitOrderV2 {
+                            side,
+                            size_lots: size,
+                            limit_ticks: price,
+                            flags: 0,
+                            expires_at_slot: expires,
+                            sub_index: 0,
+                        },
+                        place_metas(&traders[ti]),
+                    );
+                    let res = chaos_send(&mut ctx, ix, &payer.pubkey(), &[&payer, &traders[ti]]).await;
+                    if res.is_ok() {
+                        resting.push((ti, side, flash_book::state_v2::encode_order_id(price, seq, side == 0)));
+                        seq += 1;
+                    }
+                    res
+                }
+                1 => {
+                    let ix = build_ix(
+                        flash_book::instruction::PlaceTakerOrderV2 {
+                            side,
+                            size_lots: size,
+                            limit_ticks: price,
+                            flags: 0,
+                            expires_at_slot: expires,
+                            sub_index: 0,
+                        },
+                        place_metas(&traders[ti]),
+                    );
+                    let res = chaos_send(&mut ctx, ix, &payer.pubkey(), &[&payer, &traders[ti]]).await;
+                    if res.is_ok() {
+                        seq += 1;
+                    }
+                    res
+                }
+                2 => {
+                    if resting.is_empty() {
+                        continue;
+                    }
+                    let i = (r >> 24) as usize % resting.len();
+                    let (oti, oside, oid) = resting[i];
+                    let ix = build_ix(
+                        flash_book::instruction::CancelOrderV2 {
+                            side: oside,
+                            order_id: oid,
+                        },
+                        place_metas(&traders[oti]),
+                    );
+                    chaos_send(&mut ctx, ix, &payer.pubkey(), &[&payer, &traders[oti]]).await
+                }
+                _ => {
+                    ctx.warp_to_slot(warp_slot).unwrap();
+                    warp_slot += 100;
+                    let ids: Vec<u64> = resting.iter().rev().take(10).map(|x| x.2).collect();
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    let ix = build_ix(
+                        flash_book::instruction::ReapExpiredOrders { order_ids: ids },
+                        vec![
+                            AccountMeta::new(payer.pubkey(), true),
+                            AccountMeta::new_readonly(market_pda, false),
+                            AccountMeta::new(book_pda, false),
+                        ],
+                    );
+                    chaos_send(&mut ctx, ix, &payer.pubkey(), &[&payer]).await
+                }
+            };
+
+            if let Err(e) = &res {
+                let dbg = format!("{e:?}");
+                assert!(
+                    !dbg.contains("ProgramFailedToComplete"),
+                    "program aborted under chaos (seed {seed}): {dbg}"
+                );
+            }
+        }
+
+        let acct = ctx
+            .banks_client
+            .get_account(book_pda)
+            .await
+            .unwrap()
+            .expect("book account exists");
+        let mut data = acct.data;
+        let handle = flash_book::state_v2::MarketBookHandle::from_account_data(&mut data)
+            .expect("book still parses after chaos");
+        let mut bids: Vec<(u64, u64)> = Vec::new();
+        handle.for_each_bid_best_first(|_i, o| {
+            bids.push((o.price_ticks, o.seq));
+            true
+        });
+        let mut asks: Vec<(u64, u64)> = Vec::new();
+        handle.for_each_ask_best_first(|_i, o| {
+            asks.push((o.price_ticks, o.seq));
+            true
+        });
+        assert_eq!(
+            bids.len() + asks.len(),
+            handle.header.total_orders_active as usize,
+            "book count corrupt after chaos (seed {seed})"
+        );
+        for w in bids.windows(2) {
+            let ((p0, s0), (p1, s1)) = (w[0], w[1]);
+            assert!(p0 > p1 || (p0 == p1 && s0 < s1), "bid order corrupt (seed {seed})");
+        }
+        for w in asks.windows(2) {
+            let ((p0, s0), (p1, s1)) = (w[0], w[1]);
+            assert!(p0 < p1 || (p0 == p1 && s0 < s1), "ask order corrupt (seed {seed})");
+        }
+    }
+}
+
+/// ER-layer coverage (honest scope): a faithful delegate→commit→undelegate
+/// round-trip needs a live MagicBlock ER (the handlers CPI into the delegation
+/// program, absent here) and is a devnet lifecycle test. What IS real and
+/// testable in the unit harness is the BASE-LAYER auth gate that runs BEFORE the
+/// CPI: the `market.authority` constraint on the delegation instructions. This
+/// verifies a non-authority is rejected (Unauthorized = Anchor Custom(7100)) by
+/// `delegate_fill_commitment` and `undelegate_fill_commitment` (the #35 ER ix) —
+/// so a rogue can never delegate/undelegate a market's commitment ring.
+#[tokio::test]
+async fn er_delegation_rejects_non_authority() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (fc_pda, _) = pda(&[
+        flash_book::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market_pda.as_ref(),
+    ]);
+
+    // Allocate the commitment account (payer IS the market authority here).
+    chaos_send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitFillCommitment {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    let rogue = Keypair::new();
+    let d1 = Pubkey::new_unique();
+    let d2 = Pubkey::new_unique();
+    let d3 = Pubkey::new_unique();
+
+    // delegate_fill_commitment with a ROGUE authority → rejected at the auth gate.
+    let del = chaos_send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::DelegateFillCommitment {
+                commit_frequency_ms: 1_000,
+                validator: None,
+            },
+            vec![
+                AccountMeta::new(rogue.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(flash_book::ID, false), // owner_program
+                AccountMeta::new(d1, false),                      // delegate_buffer
+                AccountMeta::new(d2, false),                      // delegation_record
+                AccountMeta::new(d3, false),                      // delegation_metadata
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(flash_book::er::DELEGATION_PROGRAM_ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer, &rogue],
+    )
+    .await;
+    let dbg = format!("{del:?}");
+    assert!(
+        dbg.contains("Custom(7100)"),
+        "delegate_fill_commitment must reject a non-authority with Unauthorized, got: {dbg}"
+    );
+
+    // undelegate_fill_commitment with a ROGUE authority → same auth gate.
+    let und = chaos_send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::UndelegateFillCommitment {},
+            vec![
+                AccountMeta::new(rogue.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(flash_book::ID, false),
+                AccountMeta::new(d1, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(flash_book::er::DELEGATION_PROGRAM_ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer, &rogue],
+    )
+    .await;
+    let dbg2 = format!("{und:?}");
+    assert!(
+        dbg2.contains("Custom(7100)"),
+        "undelegate_fill_commitment must reject a non-authority with Unauthorized, got: {dbg2}"
     );
 }

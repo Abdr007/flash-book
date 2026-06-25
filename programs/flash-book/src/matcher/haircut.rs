@@ -1099,4 +1099,40 @@ mod kani_proofs {
             assert!(m == 0, "future-attached reserve has matured nothing");
         }
     }
+
+    // ── P-SOLV-5: residual delta-tracking conservation ───────────────────
+    // The pure core of the Residual identity `Residual == V − C_tot − I`: every
+    // money move applies a SIGNED delta via `apply_residual_delta`. These prove
+    // the delta is applied EXACTLY and is perfectly INVERTIBLE — no value is
+    // created or lost by the tracking itself (the whole-program identity across
+    // all instructions remains the [CERTORA-TARGET]). Add/sub only → CBMC fast.
+
+    /// EXACTNESS: a successful apply moves the residual by exactly the signed
+    /// delta — `r + delta` for a credit, `r − |delta|` for a debit (and a debit
+    /// can only shrink it). No value invented by the tracking.
+    #[kani::proof]
+    fn residual_delta_applied_exactly() {
+        let r: u128 = kani::any();
+        let delta: i128 = kani::any();
+        if let Ok(new) = apply_residual_delta(r, delta) {
+            if delta >= 0 {
+                assert!(new == r + (delta as u128));
+            } else {
+                assert!(new == r - delta.unsigned_abs());
+                assert!(new <= r);
+            }
+        }
+    }
+
+    /// INVERTIBILITY: applying a delta then its exact inverse restores the
+    /// residual bit-for-bit — the tracking never drifts (no rounding, no leak).
+    #[kani::proof]
+    fn residual_delta_roundtrip_conserves() {
+        let r: u128 = kani::any();
+        let delta: i128 = kani::any();
+        kani::assume(delta != i128::MIN); // `-delta` must be representable
+        if let Ok(after) = apply_residual_delta(r, delta) {
+            assert!(apply_residual_delta(after, -delta) == Ok(r));
+        }
+    }
 }

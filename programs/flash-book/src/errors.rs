@@ -96,6 +96,8 @@ pub enum FlashBookError {
     FillOrKillNotFilled = 1226,
     #[msg("Post-only order would cross the book — rejected")]
     PostOnlyWouldCross = 1227,
+    #[msg("Resting order price too far from the oracle — anti-stuffing band (#36)")]
+    RestingOrderTooFarFromOracle = 1228,
 
     // ── 1300-1399 matcher / clearing ────────────────────────────────
     #[msg("Order book buffer at capacity")]
@@ -184,6 +186,21 @@ pub enum FlashBookError {
     // ── 2100-2199 trigger orders (Wave 27) ──────────────────────────
     #[msg("Trigger slippage cap breached — oracle moved past acceptable_price")]
     TriggerSlippageExceeded = 2100,
+
+    // ── 2200-2299 settlement integrity (H1) ─────────────────────────
+    #[msg("Fill sequence not strictly increasing — replayed or out-of-order settlement")]
+    FillSeqReplay = 2200,
+    // ── H1 part B: settlement-authenticity fill-commitment queue (#35) ──
+    #[msg("Settled fill does not match the matcher's committed fill — fabricated or out-of-order")]
+    FillNotCommitted = 2201,
+    #[msg("Fill commitment ring is full — settlement must drain pending fills before more match")]
+    FillRingFull = 2202,
+    #[msg("No pending committed fill to settle")]
+    FillRingEmpty = 2203,
+    #[msg("Fill commitment ring counters corrupt — settled exceeds produced")]
+    FillRingCorrupt = 2204,
+    #[msg("FLP fill price deviates from the oracle by more than the safety band — fabricated or mispriced")]
+    FlpPriceOutsideBand = 2205,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
