@@ -3957,16 +3957,108 @@ async fn cu_benchmark_settlement_and_risk_paths() {
     );
     let cu_apply_fill_close = cu_of(&mut ctx, close_ix, &payer.pubkey(), &[&payer]).await;
 
+    // ── New gated hot paths: #36 oracle band + #35 fill commitment ──────
+    // Set up the v2 book + arm the commitment ring (one-time; not measured).
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[
+        flash_book::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market_pda.as_ref(),
+    ]);
+    for ix in [
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        build_ix(
+            flash_book::instruction::InitFillCommitment {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+    ] {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&payer.pubkey()),
+                &[&payer],
+                bh,
+            ))
+            .await
+            .unwrap();
+    }
+
+    // (4) place_limit_order_v2 — rests a deep ask; exercises the #36 intake band
+    //     check. Also leaves liquidity for the taker measurements below.
+    let place_limit_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrderV2 {
+            side: 1,
+            size_lots: 10,
+            limit_ticks: 100_000,
+            flags: 0,
+            expires_at_slot: 0,
+            sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(maker.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(book_pda, false),
+        ],
+    );
+    let cu_place_limit = cu_of(&mut ctx, place_limit_ix, &payer.pubkey(), &[&payer, &maker]).await;
+
+    // (5) place_taker_order_v2 — UNARMED vs ARMED. The delta is the #35 per-fill
+    //     keccak commitment (the only added hot-path cost when a market is armed).
+    let taker_ix = |armed: bool| {
+        let mut metas = vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(book_pda, false),
+        ];
+        if armed {
+            metas.push(AccountMeta::new(fc_pda, false)); // remaining_accounts
+        }
+        build_ix(
+            flash_book::instruction::PlaceTakerOrderV2 {
+                side: 0,
+                size_lots: 1,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            metas,
+        )
+    };
+    let cu_taker_unarmed = cu_of(&mut ctx, taker_ix(false), &payer.pubkey(), &[&payer, &taker]).await;
+    let cu_taker_armed = cu_of(&mut ctx, taker_ix(true), &payer.pubkey(), &[&payer, &taker]).await;
+
     println!("\n=== Flash Book CU benchmark (settlement + risk paths) ===");
     println!("apply_fill (open, both positions) : {cu_apply_fill_open:>7} CU");
     println!("apply_fill (close, realize PnL)   : {cu_apply_fill_close:>7} CU");
     println!("partial_withdraw (1 pos, lattice) : {cu_partial_withdraw:>7} CU");
+    println!("place_limit_v2 (#36 band check)   : {cu_place_limit:>7} CU");
+    println!("place_taker_v2 (unarmed)          : {cu_taker_unarmed:>7} CU");
+    println!(
+        "place_taker_v2 (armed, #35 commit): {cu_taker_armed:>7} CU  (+{} keccak commitment)",
+        cu_taker_armed.saturating_sub(cu_taker_unarmed)
+    );
     println!("(200k default per-ix budget; 1.4M max/tx)\n");
 
     // Guardrail: these must comfortably fit the default per-ix budget.
     assert!(cu_apply_fill_open < 200_000, "apply_fill open exceeds 200k CU");
     assert!(cu_apply_fill_close < 200_000, "apply_fill close exceeds 200k CU");
     assert!(cu_partial_withdraw < 200_000, "partial_withdraw exceeds 200k CU");
+    assert!(cu_place_limit < 200_000, "place_limit exceeds 200k CU");
+    assert!(cu_taker_armed < 200_000, "place_taker (armed) exceeds 200k CU");
 }
 
 /// Phase 2g coverage end-to-end: open a winning position then close
