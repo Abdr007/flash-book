@@ -134,6 +134,23 @@ injected (and no second reward paid) while one for the same position rests.
 
 ---
 
+## 6. Matching engine
+
+**P-MATCH-1 — Price-time priority.** The hypertree walks orders ascending by
+`order_id`, so the encoding alone must yield correct price-time priority on both
+books: a better price always sorts first (asks ascending, bids descending), and at
+equal price the earlier `seq` sorts first (FIFO, both sides).
+→ **`[KANI]`** `encode_order_id` (`state_v2`) — `ask_lower_price_fills_first`,
+`bid_higher_price_fills_first`, `earlier_seq_fills_first_at_same_price` (rules out
+the old LIFO-bid bug). Inputs in the encodable range (placement-enforced).
+
+**P-MATCH-2 — Order-id injectivity.** No two live orders with distinct
+`(price, seq)` collide on `order_id` (the RBT key is injective, so no order can
+displace another).
+→ **`[KANI]`** `distinct_orders_never_collide`.
+
+---
+
 ## Running
 
 ```bash
