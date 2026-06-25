@@ -96,6 +96,8 @@ pub enum FlashBookError {
     FillOrKillNotFilled = 1226,
     #[msg("Post-only order would cross the book — rejected")]
     PostOnlyWouldCross = 1227,
+    #[msg("Resting order price too far from the oracle — anti-stuffing band (#36)")]
+    RestingOrderTooFarFromOracle = 1228,
 
     // ── 1300-1399 matcher / clearing ────────────────────────────────
     #[msg("Order book buffer at capacity")]

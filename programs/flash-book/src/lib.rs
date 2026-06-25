@@ -706,6 +706,19 @@ pub mod flash_book {
             return err!(FlashBookError::PriceNotOnTick);
         }
 
+        // #36 anti-stuffing: a RESTING limit must sit within the band of the fresh
+        // oracle. Far-from-market orders never fill, so they are cheap to spam and
+        // are the node-arena-exhaustion vector; the band forces a resting order
+        // close enough to market to bear real fill risk. `price_within_band`
+        // returns true when `oracle_price_ticks == 0` (no anchor → skipped).
+        if !matcher::flp_quoter::price_within_band(
+            market.oracle_price_ticks,
+            limit_ticks,
+            crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS,
+        ) {
+            return err!(FlashBookError::RestingOrderTooFarFromOracle);
+        }
+
         // Per-market OI hard cap (cold for most markets — oi_cap == 0).
         let oi_cap = p.max_oi_base_lots;
         if oi_cap > 0 {
@@ -1067,7 +1080,20 @@ pub mod flash_book {
         // size. A sub-min remainder is dropped (IOC-style, inserted_idx stays
         // NIL) rather than resting as a dust order that violates the
         // `min_base_lots` invariant the rest of the system assumes.
-        if remaining > 0 && !ioc && remaining >= p.min_base_lots {
+        //
+        // #36 anti-stuffing: likewise only rest a residual that sits within the
+        // oracle band. An out-of-band residual is DROPPED, not rested (and not
+        // an error — the cross already settled above; we must never revert it).
+        // `price_within_band` returns true when `oracle_price_ticks == 0`.
+        if remaining > 0
+            && !ioc
+            && remaining >= p.min_base_lots
+            && matcher::flp_quoter::price_within_band(
+                market.oracle_price_ticks,
+                limit_ticks,
+                crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS,
+            )
+        {
             let order = state_v2::RestingOrderV2 {
                 order_id: taker_order_id,
                 seq: taker_seq,
@@ -6143,7 +6169,7 @@ pub mod flash_book {
         // so re-deriving would reject legitimate fills). Enforced only when a live
         // oracle anchors it (`oracle == 0` returns true → skipped, cannot verify).
         require!(
-            matcher::flp_quoter::flp_fill_price_within_band(
+            matcher::flp_quoter::price_within_band(
                 ctx.accounts.market.oracle_price_ticks,
                 price_ticks,
                 crate::constants::FLP_MAX_FILL_DEVIATION_BPS,

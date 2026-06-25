@@ -109,3 +109,16 @@ pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
 /// `MarketParams` field) because `MarketParams` has no reserved slack; a future
 /// governance override can replace it once that layout is versioned.
 pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 2000;
+
+/// #36 — anti-book-stuffing: max deviation (bps, symmetric) a RESTING order's
+/// price may sit from the fresh oracle. Far-from-market orders are the classic
+/// node-arena-exhaustion vector (cheap because they never fill); requiring a
+/// resting order to be within band forces it close enough to market to bear real
+/// fill/position risk, turning "free" stuffing into risky stuffing. 5000 bps =
+/// 50% is generous — it rejects only absurd prices (a bid below half the oracle
+/// or an ask above 1.5×), never a realistic limit (DCA / catch-a-dip orders sit
+/// well inside). Enforced only when a live oracle anchors it (`oracle == 0`
+/// skips). Reuses the Kani-proven `price_within_band` predicate. NOTE: this
+/// raises the attacker's cost; it does not by itself stop a sybil (N wallets ×
+/// orders) — that is bounded by the expandable arena + economic future work.
+pub const MAX_RESTING_ORDER_DEVIATION_BPS: u32 = 5000;

@@ -2386,6 +2386,91 @@ async fn apply_flp_fill_rejects_price_far_from_oracle() {
     );
 }
 
+/// #36 anti-book-stuffing: a RESTING limit order priced far from the oracle is
+/// rejected (the node-arena-exhaustion vector), while an in-band order is
+/// accepted. Oracle = 100_000; an ask @ 200_000 (100% deviation, beyond the 50%
+/// band) fails with RestingOrderTooFarFromOracle; an ask @ 140_000 (40%, inside)
+/// succeeds.
+#[tokio::test]
+async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    // init the v2 book.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let maker = Keypair::new();
+    let place = |price: u64| {
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side: 1, // ask
+                size_lots: 1,
+                limit_ticks: price,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+            ],
+        )
+    };
+
+    // 200_000 = 100% above the 100_000 oracle, beyond the 50% band -> rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let far = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(200_000)],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await;
+    assert!(
+        far.is_err(),
+        "a resting limit far from the oracle must be rejected (#36)"
+    );
+
+    // 140_000 = 40% above oracle, inside the 50% band -> accepted.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let near = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(140_000)],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await;
+    assert!(
+        near.is_ok(),
+        "an in-band resting limit must be accepted (#36): {near:?}"
+    );
+}
+
 #[tokio::test]
 async fn update_oracle_rejects_stale_price() {
     // With oracle_staleness_max_seconds = 60, a price published 1 hour ago

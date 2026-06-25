@@ -253,7 +253,7 @@ fn align_tick(price: Ticks, tick_size: u64) -> Ticks {
 /// `oracle_ticks == 0` (no anchor) returns true — the caller gates on a live
 /// oracle. Overflow-free: with `oracle ≤ 2^64` and `max_dev_bps ≤ 2^32`, both
 /// sides fit in u128.
-pub fn flp_fill_price_within_band(oracle_ticks: u64, price_ticks: u64, max_dev_bps: u32) -> bool {
+pub fn price_within_band(oracle_ticks: u64, price_ticks: u64, max_dev_bps: u32) -> bool {
     if oracle_ticks == 0 {
         return true;
     }
@@ -266,7 +266,7 @@ pub fn flp_fill_price_within_band(oracle_ticks: u64, price_ticks: u64, max_dev_b
 /// comparisons + multiplies over u128 — bounded and terminating. Runs in CI.
 #[cfg(kani)]
 mod flp_band_kani_proofs {
-    use super::flp_fill_price_within_band;
+    use super::price_within_band;
     use crate::constants::BPS_DENOM;
 
     // Inputs bounded to a large-but-realistic range so CBMC's `oracle·max_dev`
@@ -289,7 +289,7 @@ mod flp_band_kani_proofs {
     // 54-bit multiplies exceeds CBMC's solver. The two harnesses below capture the
     // actual security properties; the no-overflow of the real function's internal
     // multiplies is checked inside them (the `multiply with overflow` checks on
-    // `flp_fill_price_within_band` resolve SUCCESS).
+    // `price_within_band` resolve SUCCESS).
 
     /// FAIR VALUE always passes — an FLP fill exactly at the oracle is never
     /// rejected (no false reject of the most honest possible price).
@@ -299,7 +299,7 @@ mod flp_band_kani_proofs {
         let max_dev: u32 = kani::any();
         kani::assume(oracle <= PRICE_MAX);
         kani::assume(max_dev <= DEV_MAX);
-        assert!(flp_fill_price_within_band(oracle, oracle, max_dev));
+        assert!(price_within_band(oracle, oracle, max_dev));
     }
 
     /// CATASTROPHE BOUND: with the protocol cap (< 100%), a price at 2× the oracle
@@ -311,7 +311,7 @@ mod flp_band_kani_proofs {
         let max_dev: u32 = kani::any();
         kani::assume(oracle > 0 && oracle <= PRICE_MAX);
         kani::assume(max_dev < DEV_MAX); // cap strictly below 100%
-        assert!(!flp_fill_price_within_band(oracle, oracle * 2, max_dev)); // 100% high
-        assert!(!flp_fill_price_within_band(oracle, 0, max_dev)); // 100% low
+        assert!(!price_within_band(oracle, oracle * 2, max_dev)); // 100% high
+        assert!(!price_within_band(oracle, 0, max_dev)); // 100% low
     }
 }
