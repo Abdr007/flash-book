@@ -6132,6 +6132,25 @@ pub mod flash_book {
         );
         ctx.accounts.market.last_settlement_seq = fill_seq;
 
+        // ── #35 / H1 part B: FLP fill-price authenticity band ────────────
+        // FLP fills aren't matcher-produced on-chain, so they can't ride the
+        // fill-commitment ring (book path). Instead: an authentic FLP fill is
+        // within the quoter's spread of fair value, so it sits well inside
+        // FLP_MAX_FILL_DEVIATION_BPS of the FRESH oracle. This bound stops a
+        // compromised sequencer settling an FLP fill far enough from the oracle to
+        // drain the pool. It is a BOUND, not exact quote re-derivation (unsound
+        // here: the quoter's inputs drift between ER quote-time and L1 settle-time,
+        // so re-deriving would reject legitimate fills). Enforced only when a live
+        // oracle anchors it (`oracle == 0` returns true → skipped, cannot verify).
+        require!(
+            matcher::flp_quoter::flp_fill_price_within_band(
+                ctx.accounts.market.oracle_price_ticks,
+                price_ticks,
+                crate::constants::FLP_MAX_FILL_DEVIATION_BPS,
+            ),
+            FlashBookError::FlpPriceOutsideBand
+        );
+
         // Phase 2i — verify the trader_state PDA matches
         // (taker_trader_state.trader, taker_sub_index). See apply_fill
         // for the full rationale.

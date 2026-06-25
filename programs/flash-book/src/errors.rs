@@ -197,6 +197,8 @@ pub enum FlashBookError {
     FillRingEmpty = 2203,
     #[msg("Fill commitment ring counters corrupt — settled exceeds produced")]
     FillRingCorrupt = 2204,
+    #[msg("FLP fill price deviates from the oracle by more than the safety band — fabricated or mispriced")]
+    FlpPriceOutsideBand = 2205,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

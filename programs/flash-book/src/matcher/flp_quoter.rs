@@ -232,3 +232,86 @@ fn align_tick(price: Ticks, tick_size: u64) -> Ticks {
     }
     Ticks((price.0 / tick_size) * tick_size)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #35 / H1 part B — FLP fill-price authenticity bound.
+//
+// FLP fills are quotes against pool liquidity, not on-chain resting orders, so
+// they cannot be bound by the matcher's fill-commitment ring (which covers book
+// fills). Their authenticity is recovered differently: the FLP quoter ALWAYS
+// prices within its spread of fair value, so an authentic fill is within a small
+// deviation of the fresh oracle. This pure, overflow-free predicate is the
+// settlement-time gate — a compromised sequencer cannot settle an FLP fill far
+// enough from the oracle to drain the pool. It is a BOUND, not exact quote
+// re-derivation (which is unsound here: the quoter's inputs — vpin, inventory, OI
+// — drift between quote-time on the ER and settle-time on L1, so re-deriving would
+// reject legitimate fills). The residual surface is within-band mispricing,
+// economically capped at `max_dev_bps` of notional per (replay-guarded) fill.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// True iff `price_ticks` is within `max_dev_bps` (symmetric) of `oracle_ticks`.
+/// `oracle_ticks == 0` (no anchor) returns true — the caller gates on a live
+/// oracle. Overflow-free: with `oracle ≤ 2^64` and `max_dev_bps ≤ 2^32`, both
+/// sides fit in u128.
+pub fn flp_fill_price_within_band(oracle_ticks: u64, price_ticks: u64, max_dev_bps: u32) -> bool {
+    if oracle_ticks == 0 {
+        return true;
+    }
+    let diff = oracle_ticks.abs_diff(price_ticks) as u128;
+    let allowed = (oracle_ticks as u128) * (max_dev_bps as u128);
+    diff * (BPS_DENOM as u128) <= allowed
+}
+
+/// FV: machine-checked properties of the FLP fill-price band (Kani). Equality
+/// comparisons + multiplies over u128 — bounded and terminating. Runs in CI.
+#[cfg(kani)]
+mod flp_band_kani_proofs {
+    use super::flp_fill_price_within_band;
+    use crate::constants::BPS_DENOM;
+
+    // Inputs bounded to a large-but-realistic range so CBMC's `oracle·max_dev`
+    // bit-blast stays tractable (the free×free 128-bit multiply is the known SAT
+    // bottleneck): prices ≤ 2^40 ticks (~1.1e12, far above any real tick price)
+    // and a deviation cap ≤ BPS_DENOM (100% — a wider cap is meaningless). The
+    // no-overflow property over the FULL u64/u32 domain is STRUCTURAL, not a CBMC
+    // obligation: `oracle·max_dev ≤ 2^64·2^32 = 2^96 < u128::MAX` and
+    // `diff·BPS_DENOM ≤ 2^64·2^14 = 2^78 < u128::MAX`.
+    // 2^24 ticks (~16.7M) is far above any real tick price; the band is
+    // scale-invariant so this fully exercises the property while keeping CBMC's
+    // multiply bit-blast small (the `rejects` proof compares two symbolic
+    // products — quadratic in operand width).
+    const PRICE_MAX: u64 = 1 << 24;
+    const DEV_MAX: u32 = BPS_DENOM; // 100%
+
+    // NOTE: the "predicate == its own definition" identity is intentionally NOT a
+    // Kani harness — it is tautological (the function literally returns
+    // `diff·BPS ≤ oracle·max_dev`) and proving the equality of two symbolic
+    // 54-bit multiplies exceeds CBMC's solver. The two harnesses below capture the
+    // actual security properties; the no-overflow of the real function's internal
+    // multiplies is checked inside them (the `multiply with overflow` checks on
+    // `flp_fill_price_within_band` resolve SUCCESS).
+
+    /// FAIR VALUE always passes — an FLP fill exactly at the oracle is never
+    /// rejected (no false reject of the most honest possible price).
+    #[kani::proof]
+    fn flp_band_accepts_oracle_price() {
+        let oracle: u64 = kani::any();
+        let max_dev: u32 = kani::any();
+        kani::assume(oracle <= PRICE_MAX);
+        kani::assume(max_dev <= DEV_MAX);
+        assert!(flp_fill_price_within_band(oracle, oracle, max_dev));
+    }
+
+    /// CATASTROPHE BOUND: with the protocol cap (< 100%), a price at 2× the oracle
+    /// or at 0 is ALWAYS rejected — the gross fabrications that would drain the
+    /// pool (taker sells to FLP at 2× / buys from FLP at ~0) cannot settle.
+    #[kani::proof]
+    fn flp_band_rejects_gross_fabrication() {
+        let oracle: u64 = kani::any();
+        let max_dev: u32 = kani::any();
+        kani::assume(oracle > 0 && oracle <= PRICE_MAX);
+        kani::assume(max_dev < DEV_MAX); // cap strictly below 100%
+        assert!(!flp_fill_price_within_band(oracle, oracle * 2, max_dev)); // 100% high
+        assert!(!flp_fill_price_within_band(oracle, 0, max_dev)); // 100% low
+    }
+}

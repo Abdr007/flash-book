@@ -98,3 +98,14 @@ pub const MAX_BASKET_LEGS_N: usize = 4;
 /// timed windfall. Security floor; a future governance field can override it once
 /// the FlpExposureAccount layout is versioned (it currently has no reserved space).
 pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
+
+/// #35 / H1 part B — protocol-level safety cap on how far an `apply_flp_fill`
+/// price may deviate from the FRESH oracle, in bps (symmetric band). The FLP
+/// quoter always prices within its spread of fair value, so a legitimate fill is
+/// far inside this bound; the cap exists only to stop a compromised sequencer
+/// settling an FLP fill far enough from the oracle to drain the pool. 2000 bps =
+/// 20% — comfortably above any realistic FLP spread (sub-2% even in stress) while
+/// capping per-fill pool value-extraction at 20% of notional. A constant (not a
+/// `MarketParams` field) because `MarketParams` has no reserved slack; a future
+/// governance override can replace it once that layout is versioned.
+pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 2000;

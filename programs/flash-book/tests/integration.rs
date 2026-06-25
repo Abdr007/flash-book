@@ -2320,6 +2320,72 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
     assert_eq!(market.oi_short_lots, 1);
 }
 
+/// #35 / H1 part B — FLP authenticity band: an `apply_flp_fill` priced far from
+/// the FRESH oracle (a compromised sequencer pricing the pool fill to extract
+/// value) is REJECTED. Oracle = 100_000; posting 300_000 (200% deviation, far
+/// beyond the 20% cap) fails and creates no position. Contrast with
+/// `apply_flp_fill_creates_taker_position_and_flp_entry` (the SAME fill AT the
+/// oracle succeeds) isolates the rejection to the band gate.
+#[tokio::test]
+async fn apply_flp_fill_rejects_price_far_from_oracle() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // oracle == 100_000 (setup_market). 300_000 is a 200% deviation >> 20% cap.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFlpFill {
+            size_lots: 1,
+            price_ticks: 300_000,
+            taker_side: 0,
+            taker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "FLP fill far from the oracle must be rejected (#35 band gate)"
+    );
+    let taker_acct = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(
+        taker_acct.is_none(),
+        "no taker position after a rejected out-of-band FLP fill (#35)"
+    );
+}
+
 #[tokio::test]
 async fn update_oracle_rejects_stale_price() {
     // With oracle_staleness_max_seconds = 60, a price published 1 hour ago
