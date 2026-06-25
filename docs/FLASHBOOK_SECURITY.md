@@ -347,22 +347,60 @@ Every fix re-attacked + cross-checked (workflows `wv774res1`, `wvc3kk3be`,
 fixed). 156+ distinct attacks attempted and survived across all passes.
 
 ### Open (remaining work)
-- **H1 part B** (HIGH, architectural): fill-authenticity match-commitment — the
-  sequencer-SPOF removal (§3.2). Replay is closed (part A); authenticity is the redesign.
-- **Book-stuffing DoS** (MEDIUM, economic pass) — **2 of 3 fixes shipped** (#36):
-  (1) **price-band** (`MAX_RESTING_ORDER_DEVIATION_BPS`): `place_limit_order_v2`
-  (intake) + `place_taker_order_v2` (residual) reject/drop a resting order priced
-  >50% from the fresh oracle, so the cheap "free far-from-market" vector is closed
-  — a resting order must be near enough to market to bear fill risk (Kani
-  `price_within_band`). (2) **permissionless expiry-reaper** `reap_expired_orders`:
-  anyone reclaims expired GTT nodes so the arena self-heals; only genuinely-expired
-  orders are touched (no grief). Both have integration tests. **Residual:** raises
-  attacker cost but does not alone stop a sybil (N wallets × near-market orders);
-  bounded by the expandable arena (`BufferFull`) + the remaining optional fix —
-  per-trader cap (needs `ClaimedSeat` lifecycle wiring) or per-order economic cost
-  (fee/rent).
-- Mediums M1–M13, lows L1–L5, info cleanup; H3 deeper "reward on realized close".
-- **FV sweep** (in progress): margin-completeness, funding conservation; extend Lean
-  to H6/H7; author Certora CVL specs.
-- **Process**: IDL regen (C1/H9/H1 changed accounts/args); open the PR; **external
-  audit** (the mainnet gate — third-party, not self-certifiable).
+
+*Refreshed after #35/#36/FV-sweep landed and PR #34 merged to `main`.*
+
+**Closed since this doc's first draft** (no longer open): **H1 part B /
+settlement authenticity (#35)** — a compromised sequencer can no longer fabricate
+fills on either path (book consume-and-clear commitment ring + FLP oracle band,
+both proven on-chain); the **FV sweep** (now **31 Kani proofs + 7 Lean theorems**,
+all CI-gated); **IDL regen**; **PR #34 opened and merged to `main`**.
+
+**Still open:**
+- **External audit (#39)** — *the single largest remaining security item.* The code
+  is **unaudited**; a third-party audit is the mainnet-upgrade gate and is not
+  self-certifiable. Scope package ready (`docs/AUDIT_SCOPE.md`).
+- **Book-stuffing sybil residual (#36)** — price-band + permissionless
+  expiry-reaper shipped (the cheap far-from-market vector is closed). A
+  **per-trader cap** (needs `ClaimedSeat` lifecycle wiring) **or per-order economic
+  cost** to stop a *sybil* (N wallets × near-market orders) is the deferred 3rd fix.
+- **Whole-program invariants** (`[CERTORA-TARGET]`, runtime-enforced today, not yet
+  machine-proven — need the Certora Prover + a license): **P-MARGIN-4** margin-walk
+  exhaustiveness, **P-SETTLE-3** no settlement path bypasses the sequencer gate,
+  **P-LIQ-2** no duplicate liquidation. Prime audit targets.
+- **ER trust boundary** — #35 removed the single sequencer *key* as a fabrication
+  point, but on the ER path trust shifts to the **MagicBlock validator set**
+  (trust-*minimized*, not trust-*less*). Full SPOF removal is a multi-validator /
+  shared-sequencer redesign.
+- **#37** — enumerate mediums M1–M13 / lows L1–L5 from the review record into
+  discrete findings (blocked on the transcripts); H3 deeper "reward on realized
+  close" refinement.
+
+---
+
+## Security posture — strict self-rating
+
+**Overall: 6 / 10 — strong pre-audit engineering, NOT yet production-secure.**
+
+This is a deliberately strict self-assessment, not a certification. For a
+fund-custody perps DEX the dominant gates are *external validation* and *production
+exposure* — and Flash Book has **neither** yet. No internal rigor substitutes for
+an audit; that single fact caps a responsible self-rating well below the engineering
+quality.
+
+| Dimension | Score | Why |
+|---|---|---|
+| Formal-verification rigor | **9/10** | 31 Kani + 7 Lean, bound to deployed code, CI-gated. Genuinely top-percentile — most *audited* protocols have zero FV. |
+| Known-vuln hardening (post-fix) | **8/10** | 2 CRIT + 10 HIGH closed + adversarially re-verified. (Caveat: that 12 serious issues *existed* signals real complexity/attack surface.) |
+| Settlement integrity | **8/10** | Replay + fabrication closed on both paths, proven on-chain. |
+| Proof completeness | **7/10** | Money-paths proven; 3 whole-program invariants (P-MARGIN-4/SETTLE-3/LIQ-2) runtime-enforced only. |
+| DoS resistance | **6/10** | Cheap book-stuffing closed; sybil residual open (per-trader cap deferred). |
+| Trust-minimization | **5/10** | Sequencer *key* can't fabricate, but the ER path trusts the MagicBlock validator set — trust-*minimized*, not trust-*less*. |
+| **External audit** | **1/10** | **None.** The biggest gap for fund custody. |
+| Production battle-testing | **2/10** | Devnet only; no bug bounty, no mainnet TVL, no incident history. |
+
+**What would move the number:** a clean external audit (→ ~7–8), then a live bug
+bounty + guarded mainnet with real TVL surviving over time (→ 8+). Until then, the
+honest ceiling is ~6 regardless of internal quality. The engineering is
+best-in-class for a *pre-audit* protocol; the *security posture* is mid — exactly
+because "unaudited + never on mainnet" dominates.
