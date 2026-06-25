@@ -1201,6 +1201,67 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Permissionless expiry-reaper (#36 anti-book-stuffing). Removes GTT orders
+    /// whose `expires_at_slot` has passed, reclaiming node-arena space so a market
+    /// self-heals from stale-order accumulation. ANYONE may call it — but only a
+    /// GENUINELY-expired GTT order is ever removed: a live order or a GTC order
+    /// (`expires_at_slot == 0`) is skipped, so the reaper can never cancel an
+    /// order out from under a trader. `order_id` is globally unique among live
+    /// orders (proven: `state_v2` `distinct_orders_never_collide`), so each id is
+    /// searched on both books without a side hint. Bounded per call.
+    pub fn reap_expired_orders(
+        ctx: Context<ReapExpiredOrders>,
+        order_ids: Vec<u64>,
+    ) -> Result<()> {
+        require!(!order_ids.is_empty(), FlashBookError::EmptyBatch);
+        require!(
+            order_ids.len() <= crate::constants::MAX_REAP_PER_CALL,
+            FlashBookError::OutOfRange
+        );
+        let now_slot = Clock::get()?.slot;
+        let market_key = ctx.accounts.market.key();
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        if handle.header.market_pubkey != market_key {
+            return err!(FlashBookError::WrongMarket);
+        }
+
+        let mut reaped: u32 = 0;
+        for order_id in &order_ids {
+            // Globally-unique id → try the bid book, then the ask book.
+            let b = handle.lookup_bid_by_order_id(*order_id);
+            let (idx, side_is_bid) = if b != crate::hypertree::NIL {
+                (b, true)
+            } else {
+                (handle.lookup_ask_by_order_id(*order_id), false)
+            };
+            if idx == crate::hypertree::NIL {
+                continue; // already gone / not on this book
+            }
+            // Only reap a GENUINELY-expired GTT order. `expires == 0` is GTC
+            // (never expires); `expires > now` is still live. Both are skipped —
+            // the reaper can only reclaim truly-stale nodes, never grief.
+            let expires = handle.order_at(idx).expires_at_slot;
+            if expires == 0 || expires > now_slot {
+                continue;
+            }
+            if side_is_bid {
+                handle.remove_bid_node(idx);
+            } else {
+                handle.remove_ask_node(idx);
+            }
+            reaped = reaped.saturating_add(1);
+        }
+
+        emit!(ExpiredOrdersReapedEvent {
+            market: market_key,
+            reaped,
+            total_orders_after: handle.header.total_orders_active,
+        });
+        Ok(())
+    }
+
     /// V2 cancel-all: remove every resting order owned by the caller in
     /// this market. Walks both bid and ask RBTs, collecting indices of
     /// orders whose `trader == caller`, then removes each in two
@@ -10280,6 +10341,29 @@ pub struct CancelOrderV2<'info> {
     pub market_book: UncheckedAccount<'info>,
 }
 
+/// #36 permissionless expiry-reaper. No authority gate — `cranker` is any signer
+/// (pays the tx; the handler only removes genuinely-expired orders, so it cannot
+/// grief). Market is read-only (only the book mutates).
+#[derive(Accounts)]
+pub struct ReapExpiredOrders<'info> {
+    pub cranker: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at the market_book seed; disc validated inside handler. Mut
+    /// because we remove nodes + update header indices + free-list.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
 // ─── Wave 24b — H-haircut account contexts ──────────────────────────
 
 #[derive(Accounts)]
@@ -12799,6 +12883,14 @@ pub struct OrderCancelledV2Event {
     pub order_seq: u64,
     pub side: u8,
     pub node_index: u32,
+    pub total_orders_after: u32,
+}
+
+#[event]
+pub struct ExpiredOrdersReapedEvent {
+    pub market: Pubkey,
+    /// Number of expired orders actually removed this call.
+    pub reaped: u32,
     pub total_orders_after: u32,
 }
 

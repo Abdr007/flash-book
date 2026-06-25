@@ -122,3 +122,8 @@ pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 2000;
 /// raises the attacker's cost; it does not by itself stop a sybil (N wallets ×
 /// orders) — that is bounded by the expandable arena + economic future work.
 pub const MAX_RESTING_ORDER_DEVIATION_BPS: u32 = 5000;
+
+/// #36 — max expired orders a single `reap_expired_orders` call may reclaim.
+/// Bounds CU/transaction size; the permissionless cranker batches more across
+/// calls. 64 comfortably fits a transaction's account/data budget.
+pub const MAX_REAP_PER_CALL: usize = 64;

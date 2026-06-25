@@ -2471,6 +2471,119 @@ async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
     );
 }
 
+/// #36 permissionless expiry-reaper: an EXPIRED GTT order is reclaimed by anyone,
+/// while a GTC order (expires_at_slot == 0) at the same price is NEVER touched.
+/// Verified via cancel_order_v2 as the oracle: after reaping, cancelling the GTT
+/// id fails (it's gone) but cancelling the GTC id succeeds (still resting).
+#[tokio::test]
+async fn reap_expired_orders_removes_only_expired() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    let maker = Keypair::new();
+    let place = |expires: u64| {
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side: 1, // ask, at the 100_000 oracle (in-band)
+                size_lots: 1,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: expires,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+            ],
+        )
+    };
+    // seq is 1-based + monotonic: first order seq=1 (GTT, expires slot 50),
+    // second seq=2 (GTC, never expires).
+    send(&mut ctx, place(50), &[&payer, &maker]).await.unwrap();
+    send(&mut ctx, place(0), &[&payer, &maker]).await.unwrap();
+
+    let gtt_id = flash_book::state_v2::encode_order_id(100_000, 1, false);
+    let gtc_id = flash_book::state_v2::encode_order_id(100_000, 2, false);
+
+    // Advance past the GTT expiry, then reap (permissionless — payer cranks).
+    ctx.warp_to_slot(100).unwrap();
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ReapExpiredOrders {
+                order_ids: vec![gtt_id, gtc_id],
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true), // cranker — any signer
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Oracle: cancelling the reaped GTT id must FAIL (it's gone)...
+    let cancel = |order_id: u64| {
+        build_ix(
+            flash_book::instruction::CancelOrderV2 { side: 1, order_id },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+            ],
+        )
+    };
+    let gtt_cancel = send(&mut ctx, cancel(gtt_id), &[&payer, &maker]).await;
+    assert!(
+        gtt_cancel.is_err(),
+        "the expired GTT order must have been reaped (cancel should fail)"
+    );
+    // ...but the GTC order is untouched, so cancelling it SUCCEEDS.
+    let gtc_cancel = send(&mut ctx, cancel(gtc_id), &[&payer, &maker]).await;
+    assert!(
+        gtc_cancel.is_ok(),
+        "the GTC order must NOT be reaped (cancel should succeed): {gtc_cancel:?}"
+    );
+}
+
 #[tokio::test]
 async fn update_oracle_rejects_stale_price() {
     // With oracle_staleness_max_seconds = 60, a price published 1 hour ago
