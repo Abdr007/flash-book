@@ -132,3 +132,23 @@ exact production-constant statement.
   parked until a stronger division/UNSAT backend is wired in.
 - Extend coverage to the matching engine (`state_v2.rs` hypertree ordering
   invariants) and the margin/liquidation gates.
+
+## Settlement-authenticity & gate proofs (#35/#36/FV-sweep)
+
+Beyond the haircut/MMR/funding core, the settlement and liquidation gates carry
+their own Kani harnesses (all `VERIFICATION: SUCCESSFUL`):
+
+| Harness (module) | Property |
+|---|---|
+| `matcher::fill_commitment` ring ×4 | consume-and-clear ring: settlement never outruns production, depth-bounded, fabricated/out-of-order fill rejected, no double-settle (INV-S1/S2) |
+| `matcher::fill_commitment` nonce ×3 | **P-SETTLE-1** settlement nonce strictly monotone — replay/reorder rejected, advance is strict + exact, chain monotone |
+| `matcher::flp_quoter` band ×2 | **#35 FLP / #36 resting** price band: accepts the oracle price (no false reject), rejects 2×/0× oracle (catastrophe bound), overflow-free |
+| `matcher::liquidation` health ×3 | **P-LIQ-1** worse-of(mark, oracle): always the worse of the two real sources for the side, never a fabricated price |
+
+Each handler routes through the proven pure function (e.g. `apply_fill`/
+`apply_flp_fill` → `advance_settlement_seq`; `liquidate_position_v2` →
+`worse_of_health_price`), so the proof binds to the deployed logic, not a copy.
+
+CBMC note (reconfirmed): equality of two free *symbolic* multiplies is the SAT
+backend's limit — band inputs are bounded to a large realistic range, and the
+tautological "predicate == its definition" identity is intentionally not a harness.

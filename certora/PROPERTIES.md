@@ -101,8 +101,10 @@ position set.
 **P-SETTLE-1 — No replay.** Each settlement carries a `fill_seq` strictly greater
 than `market.last_settlement_seq`, which it then advances atomically; a replayed
 or out-of-order settlement reverts the whole transaction.
-→ **`[REQUIRE]`** `apply_fill`/`apply_flp_fill`; **`[CERTORA-TARGET]`** prove the
-nonce is strictly monotone across any reachable sequence (no wraparound).
+→ **`[KANI]`** `advance_settlement_seq` (`matcher::fill_commitment`) —
+`nonce_rejects_non_increasing`, `nonce_advance_is_strict_and_exact`,
+`nonce_chain_strictly_monotone`. Both `apply_fill` and `apply_flp_fill` route
+through the proven helper.
 
 **P-SETTLE-2 — Bad debt is bounded.** A bankrupt close draws at most `shortfall`
 from the insurance fund (saturating at its balance) and never reverts settlement.
@@ -120,9 +122,11 @@ state-mutating settlement path bypasses it.
 **P-LIQ-1 — No wrongful liquidation.** A position healthy at the fresh oracle is
 never liquidated: the health price is the worse of (mark, oracle), liquidation is
 refused when the oracle is stale, and the EMA mark is clamped into the oracle band.
-→ **`[REQUIRE]`** dual-source gate + staleness gate + band clamp; band-clamp and
-staleness gates are byte-identical (no gap). **`[CERTORA-TARGET]`** prove the
-combined gate.
+→ **`[KANI]`** worse-of core: `worse_of_health_price` (`matcher::liquidation`) —
+`health_price_worse_for_{long,short}` (always the worse of the two real sources,
+never under-states risk), `health_price_is_a_real_source` (never a fabricated
+price); `liquidate_position_v2` routes through it. **`[REQUIRE]`** staleness gate +
+band clamp (byte-identical, no gap). **`[CERTORA-TARGET]`** the fully-combined gate.
 
 **P-LIQ-2 — No duplicate liquidation.** No second synthetic close order is
 injected (and no second reward paid) while one for the same position rests.
