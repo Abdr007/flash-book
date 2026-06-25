@@ -43,9 +43,11 @@ credit satisfies `credit ≤ Residual` and `credit + dust == matured` at the rea
 **P-SOLV-4 — Global solvency invariant.** At all times
 `vault.amount ≥ Σ trader_collateral + Σ FLP_capital + insurance.balance`
 (no instruction may make protocol liabilities exceed protocol assets).
-→ **`[REQUIRE]`** `verify_protocol_solvency`; **`[CERTORA-TARGET]`** prove it is
-*preserved* by every state-mutating instruction (the Manifest "loss-of-funds"
-property set).
+→ **`[KANI]`** (protocol-owned buckets) `assess_solvency` (`matcher::insurance`) —
+`solvent_iff_vault_covers_buckets` + `surplus_exact_when_solvent` (vault accounts
+exactly to insurance + FLP + surplus; no value invented); `verify_protocol_solvency`
+routes through it. **`[CERTORA-TARGET]`** the broader `vault ≥ Σ trader_collateral
++ FLP + insurance` *preserved by every instruction* (the Manifest "loss-of-funds" set).
 
 **P-SOLV-5 — Residual conservation identity.** `Residual == V − C_tot − I` is
 preserved by every money-moving instruction (funding pay/receive, realized
