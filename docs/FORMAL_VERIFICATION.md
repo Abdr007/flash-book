@@ -145,6 +145,8 @@ their own Kani harnesses (all `VERIFICATION: SUCCESSFUL`):
 | `matcher::flp_quoter` band ×2 | **#35 FLP / #36 resting** price band: accepts the oracle price (no false reject), rejects 2×/0× oracle (catastrophe bound), overflow-free |
 | `matcher::liquidation` health ×3 | **P-LIQ-1** worse-of(mark, oracle): always the worse of the two real sources for the side, never a fabricated price |
 | `state_v2` order-id ×4 | **P-MATCH-1/2** price-time priority of the `order_id` encoding: better price first (asks↑/bids↓), FIFO seq tiebreak both sides (rules out the old LIFO-bid bug), id injective on live orders |
+| `matcher::insurance` solvency ×2 | **P-SOLV-4** (protocol buckets) solvent⟺vault≥insurance+FLP; surplus exact (vault accounts to insurance+FLP+surplus) |
+| `matcher::haircut` residual ×2 | **P-SOLV-5** (delta core) residual delta applied exactly + perfectly invertible (tracking never drifts) |
 
 Each handler routes through the proven pure function (e.g. `apply_fill`/
 `apply_flp_fill` → `advance_settlement_seq`; `liquidate_position_v2` →
