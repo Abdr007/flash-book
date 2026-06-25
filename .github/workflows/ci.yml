@@ -28,6 +28,7 @@ jobs:
           cargo test -p flash-book --test proptest_haircut
           cargo test -p flash-book --test proptest_envelope
           cargo test -p flash-book --test proptest_arg
+          cargo test -p flash-book --test proptest_book
       - name: Run all wave-integration tests
         run: |
           cargo test -p flash-book --test wave24b_haircut_ix
