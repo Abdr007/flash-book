@@ -3406,11 +3406,15 @@ pub mod flash_book {
         // replay/restart vector; it does NOT defend against a malicious
         // sequencer FABRICATING a fresh-seq fill — that is the fill-authenticity
         // commitment (the §3.2 settlement redesign), tracked separately.
-        require!(
-            fill_seq > ctx.accounts.market.last_settlement_seq,
-            FlashBookError::FillSeqReplay
-        );
-        ctx.accounts.market.last_settlement_seq = fill_seq;
+        // P-SETTLE-1: advance the per-market settlement nonce through the
+        // Kani-proven monotonic helper — strictly-increasing `fill_seq` only;
+        // any replay/reorder is rejected (FillSeqReplay) before state mutates.
+        ctx.accounts.market.last_settlement_seq =
+            matcher::fill_commitment::advance_settlement_seq(
+                ctx.accounts.market.last_settlement_seq,
+                fill_seq,
+            )
+            .map_err(|_| error!(FlashBookError::FillSeqReplay))?;
 
         // ── Phase 2i sub-account PDA verification ───────────────────
         // Closes the 1-byte routing-attack surface left open by Phase 2d.
@@ -6152,11 +6156,15 @@ pub mod flash_book {
         // The FLP settlement nonce shares the SAME market counter as apply_fill,
         // so a replay of either path is rejected and the two interleave under a
         // single strictly-increasing sequence.
-        require!(
-            fill_seq > ctx.accounts.market.last_settlement_seq,
-            FlashBookError::FillSeqReplay
-        );
-        ctx.accounts.market.last_settlement_seq = fill_seq;
+        // P-SETTLE-1: advance the per-market settlement nonce through the
+        // Kani-proven monotonic helper — strictly-increasing `fill_seq` only;
+        // any replay/reorder is rejected (FillSeqReplay) before state mutates.
+        ctx.accounts.market.last_settlement_seq =
+            matcher::fill_commitment::advance_settlement_seq(
+                ctx.accounts.market.last_settlement_seq,
+                fill_seq,
+            )
+            .map_err(|_| error!(FlashBookError::FillSeqReplay))?;
 
         // ── #35 / H1 part B: FLP fill-price authenticity band ────────────
         // FLP fills aren't matcher-produced on-chain, so they can't ride the

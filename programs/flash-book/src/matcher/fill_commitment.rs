@@ -283,6 +283,74 @@ pub fn buffer_settle(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Settlement nonce (H1 part A / P-SETTLE-1). The pure core of the per-market
+// replay/reorder guard shared by `apply_fill` and `apply_flp_fill`: a settlement
+// must carry a `fill_seq` STRICTLY greater than the market's current nonce, and
+// the nonce then advances to exactly that value. Extracted here so the monotonic
+// property is machine-checked (below) and both settlement handlers call the same
+// proven function.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Advance the settlement nonce. `Ok(fill_seq)` iff `fill_seq > current`
+/// (rejects replays + out-of-order settlements); the returned nonce is exactly
+/// `fill_seq` and strictly exceeds `current`. `Err(())` leaves the caller to
+/// reject without mutating state.
+#[inline]
+pub fn advance_settlement_seq(current: u64, fill_seq: u64) -> Result<u64, ()> {
+    if fill_seq > current {
+        Ok(fill_seq)
+    } else {
+        Err(())
+    }
+}
+
+/// FV: machine-checked monotonicity of the settlement nonce (Kani, multiply-free
+/// → fast). Proves P-SETTLE-1: no replay/reorder advances the nonce, and a
+/// successful advance strictly increases it to exactly the fill's seq.
+#[cfg(kani)]
+mod settlement_seq_kani_proofs {
+    use super::advance_settlement_seq;
+
+    /// A non-increasing seq (replay or out-of-order) is REJECTED.
+    #[kani::proof]
+    fn nonce_rejects_non_increasing() {
+        let current: u64 = kani::any();
+        let fill_seq: u64 = kani::any();
+        kani::assume(fill_seq <= current);
+        assert!(advance_settlement_seq(current, fill_seq).is_err());
+    }
+
+    /// A successful advance strictly increases the nonce to EXACTLY `fill_seq`.
+    #[kani::proof]
+    fn nonce_advance_is_strict_and_exact() {
+        let current: u64 = kani::any();
+        let fill_seq: u64 = kani::any();
+        match advance_settlement_seq(current, fill_seq) {
+            Ok(next) => {
+                assert!(next > current);
+                assert!(next == fill_seq);
+            }
+            Err(()) => assert!(fill_seq <= current),
+        }
+    }
+
+    /// Inductive monotonicity: applying two successful advances yields a strictly
+    /// increasing chain — so any reachable sequence of settlements has a strictly
+    /// monotone nonce (no two fills settle under the same seq).
+    #[kani::proof]
+    fn nonce_chain_strictly_monotone() {
+        let s0: u64 = kani::any();
+        let a: u64 = kani::any();
+        let b: u64 = kani::any();
+        if let Ok(s1) = advance_settlement_seq(s0, a) {
+            if let Ok(s2) = advance_settlement_seq(s1, b) {
+                assert!(s2 > s1 && s1 > s0);
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // FV: machine-checked invariants for the consume-and-clear ring (Kani). These
 // prove the STATE MACHINE (INV-S1/S2): settlement can never outrun production,
 // the ring is depth-bounded, a fabricated/out-of-order fill is rejected, and a
