@@ -14275,6 +14275,11 @@
       "code": 8204,
       "name": "FillRingCorrupt",
       "msg": "Fill commitment ring counters corrupt \u2014 settled exceeds produced"
+    },
+    {
+      "code": 8205,
+      "name": "FlpPriceOutsideBand",
+      "msg": "FLP fill price deviates from the oracle by more than the safety band \u2014 fabricated or mispriced"
     }
   ],
   "types": [
