@@ -52,8 +52,10 @@ routes through it. **`[CERTORA-TARGET]`** the broader `vault ≥ Σ trader_colla
 **P-SOLV-5 — Residual conservation identity.** `Residual == V − C_tot − I` is
 preserved by every money-moving instruction (funding pay/receive, realized
 loss/gain, convert, dust flush).
-→ **`[REQUIRE]`** delta-tracked; **`[CERTORA-TARGET]`** prove the delta-tracking
-matches the recomputed identity across all paths.
+→ **`[KANI]`** (delta-application core) `apply_residual_delta` (`matcher::haircut`) —
+`residual_delta_applied_exactly` + `residual_delta_roundtrip_conserves` (exact +
+perfectly invertible; the tracking never drifts). **`[CERTORA-TARGET]`** the
+identity *preserved across all money-moving instructions* (whole-program).
 
 ---
 
