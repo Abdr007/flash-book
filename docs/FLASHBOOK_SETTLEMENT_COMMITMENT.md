@@ -77,14 +77,34 @@ honesty):**
    `buffer_check` disc/market binding — unique without a hot-path
    `find_program_address`).
 
-## 3. The FLP path (`apply_flp_fill`)
+## 3. The FLP path (`apply_flp_fill`) — *shipped*
 
 FLP fills are quotes **against pool liquidity**, not book makers — there is no
-resting order to commit. Their authenticity is recovered differently: the FLP
-quote is a **deterministic function of on-chain pool state**
-(`matcher::flp_quoter`). `apply_flp_fill` re-derives the quote from the pool
-account and requires the posted `(size, price)` to match within tolerance —
-direct verification, no ring. Scoped as a sibling task to the book path.
+resting order to commit, so they cannot ride the ring. Authenticity is recovered
+by an **oracle-anchored band** instead of exact quote re-derivation.
+
+*Why not exact re-derivation* (the first sketch, now corrected for honesty): the
+FLP quote is a function of pool state — vpin, inventory, OI — that **drifts**
+between quote-time (ER) and settle-time (L1). Re-deriving `generate_quotes` at
+settlement would produce a different result than the matcher actually quoted and
+**reject legitimate fills**. So exact re-derivation is unsound here.
+
+*What ships:* an authenticity **bound**. An honest FLP fill is always within the
+quoter's spread of fair value, so it must lie within `FLP_MAX_FILL_DEVIATION_BPS`
+(2000 = 20%) of the **fresh** `oracle_price_ticks`
+(`matcher::flp_quoter::flp_fill_price_within_band`, gated in `apply_flp_fill`,
+`FlpPriceOutsideBand`). The band anchors to the oracle (fresh at settle, immune to
+quoter-input drift) and caps how far a compromised sequencer can price an FLP fill
+from fair value — blocking the pool-drain fabrication (FLP "selling" cheap /
+"buying" rich). 20% sits far above any real FLP spread (sub-2% even in stress), so
+it never rejects an honest fill. **Proven:** Kani `flp_band_accepts_oracle_price`
+(no false reject) + `flp_band_rejects_gross_fabrication` (2×/0× oracle always
+rejected); integration `apply_flp_fill_rejects_price_far_from_oracle`.
+
+*Honest residual:* this is a **bound, not exact pinning** — within-band mispricing
+remains, economically capped at 20% of notional per (replay-guarded) fill. Exact
+pinning would require committing the quoter's input snapshot on-chain per fill (a
+larger change), noted as future hardening.
 
 ## 4. Trust boundary — honest statement
 
