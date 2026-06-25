@@ -10055,16 +10055,15 @@ pub mod flash_book {
         let insurance_bal = ctx.accounts.insurance_fund.balance_quote_lots;
         let flp_capital = ctx.accounts.flp_exposure.total_capital_quote_lots;
 
+        // P-SOLV-4 (protocol-owned buckets): Kani-proven solvency arithmetic —
+        // `solvent` iff vault covers insurance + FLP capital, and when solvent the
+        // vault accounts exactly to insurance + FLP + surplus (no value invented).
+        let (solvent, surplus) =
+            matcher::insurance::assess_solvency(vault_amount, insurance_bal, flp_capital)
+                .map_err(|_| error!(FlashBookError::ArithmeticOverflow))?;
         let minimum_required = insurance_bal
             .checked_add(flp_capital)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-
-        let solvent = vault_amount >= minimum_required;
-        let surplus = if solvent {
-            vault_amount.saturating_sub(minimum_required)
-        } else {
-            0
-        };
 
         emit!(ProtocolSolvencyCheckedEvent {
             vault_quote_lots: vault_amount,
