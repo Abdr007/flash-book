@@ -6591,26 +6591,14 @@ pub mod flash_book {
         let pos_side = if position.side == 0 { Side::Long } else { Side::Short };
         let mark_t = market.mark_price_ticks;
         let oracle_t = market.oracle_price_ticks;
-        let (health_price_ticks, hp_source) = match pos_side {
-            Side::Long => {
-                if oracle_t > 0 && oracle_t < mark_t {
-                    (oracle_t, 1u8)
-                } else if oracle_t > 0 && oracle_t == mark_t {
-                    (mark_t, 2u8)
-                } else {
-                    (mark_t, 0u8)
-                }
-            }
-            Side::Short => {
-                if oracle_t > mark_t {
-                    (oracle_t, 1u8)
-                } else if oracle_t == mark_t {
-                    (mark_t, 2u8)
-                } else {
-                    (mark_t, 0u8)
-                }
-            }
-        };
+        // P-LIQ-1: worse-of(mark, oracle) via the Kani-proven pure helper — the
+        // health price is always the worse of the two REAL sources for the
+        // position's side (never under-states risk, never invents a price).
+        let (health_price_ticks, hp_source) = matcher::liquidation::worse_of_health_price(
+            mark_t,
+            oracle_t,
+            matches!(pos_side, Side::Long),
+        );
 
         let pos_snap = RiskPosSnap {
             market: position.market,

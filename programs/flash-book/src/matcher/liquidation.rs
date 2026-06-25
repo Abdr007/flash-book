@@ -187,3 +187,77 @@ pub fn compute_shortfall(
         })
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dual-source health price (P-LIQ-1). The WORSE of mark and oracle for the
+// position's direction — the pure core of `liquidate_position_v2`'s health gate.
+// LONG: lower is worse → min(mark, oracle); SHORT: higher is worse → max(mark,
+// oracle). A LONG ignores an UNSET oracle (`oracle == 0`) — otherwise it would
+// read as price 0 (max loss) and wrongfully liquidate. Returns (price, source)
+// with source 0 = mark, 1 = oracle, 2 = equal. Extracted so the worse-of
+// selection is machine-checked and the handler calls the proven function.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Worse-of-(mark, oracle) health price for a position. See module note.
+#[inline]
+pub fn worse_of_health_price(mark_t: u64, oracle_t: u64, is_long: bool) -> (u64, u8) {
+    if is_long {
+        if oracle_t > 0 && oracle_t < mark_t {
+            (oracle_t, 1)
+        } else if oracle_t > 0 && oracle_t == mark_t {
+            (mark_t, 2)
+        } else {
+            (mark_t, 0)
+        }
+    } else if oracle_t > mark_t {
+        (oracle_t, 1)
+    } else if oracle_t == mark_t {
+        (mark_t, 2)
+    } else {
+        (mark_t, 0)
+    }
+}
+
+/// FV: machine-checked correctness of the dual-source health price (Kani,
+/// comparison-only → fast). Proves P-LIQ-1's core: the health price is always the
+/// WORSE of the two real sources for the position's side, never under-states risk,
+/// and never invents a price.
+#[cfg(kani)]
+mod health_price_kani_proofs {
+    use super::worse_of_health_price;
+
+    /// LONG: the health price is never HIGHER than the mark, and never higher than
+    /// a LIVE oracle — i.e. it is the worse (lower) of the two. So a long is never
+    /// liquidated at a price more favourable than both sources.
+    #[kani::proof]
+    fn health_price_worse_for_long() {
+        let mark: u64 = kani::any();
+        let oracle: u64 = kani::any();
+        let (hp, _) = worse_of_health_price(mark, oracle, true);
+        assert!(hp <= mark);
+        assert!(oracle == 0 || hp <= oracle);
+    }
+
+    /// SHORT: the health price is never LOWER than the mark OR the oracle — the
+    /// worse (higher) of the two.
+    #[kani::proof]
+    fn health_price_worse_for_short() {
+        let mark: u64 = kani::any();
+        let oracle: u64 = kani::any();
+        let (hp, _) = worse_of_health_price(mark, oracle, false);
+        assert!(hp >= mark);
+        assert!(hp >= oracle);
+    }
+
+    /// The health price is ALWAYS one of the two real sources — never a fabricated
+    /// value (no third price can enter the liquidation decision).
+    #[kani::proof]
+    fn health_price_is_a_real_source() {
+        let mark: u64 = kani::any();
+        let oracle: u64 = kani::any();
+        let is_long: bool = kani::any();
+        let (hp, src) = worse_of_health_price(mark, oracle, is_long);
+        assert!(hp == mark || hp == oracle);
+        assert!(src <= 2);
+    }
+}
