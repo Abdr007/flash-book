@@ -257,6 +257,79 @@ pub fn probe_order(order_id: u64) -> RestingOrderV2 {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// FV: machine-checked price-TIME priority of the `order_id` encoding (Kani).
+// The hypertree walks orders ascending by `order_id` ("best first"), so the
+// encoding alone determines matching priority. These prove — multiply-free, so
+// CBMC is fast — that a single ascending walk yields correct price-time priority
+// on BOTH books, and in particular that the seq tiebreak is FIFO for bids (the
+// exact property the old whole-word-inversion bug violated; see encode_order_id).
+// Inputs are assumed within the encodable range (price ≤ MAX_PRICE_TICKS_ENCODABLE,
+// seq ≤ MAX_SEQ_ENCODABLE), which placement enforces fail-loud.
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(kani)]
+mod order_id_priority_kani_proofs {
+    use super::{encode_order_id, MAX_PRICE_TICKS_ENCODABLE, MAX_SEQ_ENCODABLE};
+
+    /// ASK price priority: a LOWER-priced ask has a smaller `order_id`, so it
+    /// fills first — regardless of either order's seq (price dominates the key).
+    #[kani::proof]
+    fn ask_lower_price_fills_first() {
+        let p1: u64 = kani::any();
+        let p2: u64 = kani::any();
+        let s1: u64 = kani::any();
+        let s2: u64 = kani::any();
+        kani::assume(p1 <= MAX_PRICE_TICKS_ENCODABLE && p2 <= MAX_PRICE_TICKS_ENCODABLE);
+        kani::assume(s1 <= MAX_SEQ_ENCODABLE && s2 <= MAX_SEQ_ENCODABLE);
+        kani::assume(p1 < p2);
+        assert!(encode_order_id(p1, s1, false) < encode_order_id(p2, s2, false));
+    }
+
+    /// BID price priority: a HIGHER-priced bid has a smaller `order_id` (the price
+    /// field is inverted for bids), so the best bid fills first — regardless of seq.
+    #[kani::proof]
+    fn bid_higher_price_fills_first() {
+        let p1: u64 = kani::any();
+        let p2: u64 = kani::any();
+        let s1: u64 = kani::any();
+        let s2: u64 = kani::any();
+        kani::assume(p1 <= MAX_PRICE_TICKS_ENCODABLE && p2 <= MAX_PRICE_TICKS_ENCODABLE);
+        kani::assume(s1 <= MAX_SEQ_ENCODABLE && s2 <= MAX_SEQ_ENCODABLE);
+        kani::assume(p1 > p2);
+        assert!(encode_order_id(p1, s1, true) < encode_order_id(p2, s2, true));
+    }
+
+    /// TIME priority within a price level (FIFO), for BOTH sides: at the same
+    /// price, the EARLIER seq has a smaller `order_id` and fills first. (Bids must
+    /// NOT invert the seq — the old bug made bids LIFO; this rules it out.)
+    #[kani::proof]
+    fn earlier_seq_fills_first_at_same_price() {
+        let side: bool = kani::any();
+        let p: u64 = kani::any();
+        let s1: u64 = kani::any();
+        let s2: u64 = kani::any();
+        kani::assume(p <= MAX_PRICE_TICKS_ENCODABLE);
+        kani::assume(s1 <= MAX_SEQ_ENCODABLE && s2 <= MAX_SEQ_ENCODABLE);
+        kani::assume(s1 < s2);
+        assert!(encode_order_id(p, s1, side) < encode_order_id(p, s2, side));
+    }
+
+    /// No collision: two orders with distinct (price, seq) within range never
+    /// encode to the same `order_id` (so the RBT key is injective on live orders).
+    #[kani::proof]
+    fn distinct_orders_never_collide() {
+        let side: bool = kani::any();
+        let p1: u64 = kani::any();
+        let p2: u64 = kani::any();
+        let s1: u64 = kani::any();
+        let s2: u64 = kani::any();
+        kani::assume(p1 <= MAX_PRICE_TICKS_ENCODABLE && p2 <= MAX_PRICE_TICKS_ENCODABLE);
+        kani::assume(s1 <= MAX_SEQ_ENCODABLE && s2 <= MAX_SEQ_ENCODABLE);
+        kani::assume(p1 != p2 || s1 != s2);
+        assert!(encode_order_id(p1, s1, side) != encode_order_id(p2, s2, side));
+    }
+}
+
 // ─── ClaimedSeatV2 ───────────────────────────────────────────────────
 
 /// 64-byte per-(market, trader) seat. Holds the trader pubkey + open
