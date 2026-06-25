@@ -14072,6 +14072,11 @@
       "msg": "Post-only order would cross the book \u2014 rejected"
     },
     {
+      "code": 7228,
+      "name": "RestingOrderTooFarFromOracle",
+      "msg": "Resting order price too far from the oracle \u2014 anti-stuffing band (#36)"
+    },
+    {
       "code": 7300,
       "name": "BufferFull",
       "msg": "Order book buffer at capacity"
