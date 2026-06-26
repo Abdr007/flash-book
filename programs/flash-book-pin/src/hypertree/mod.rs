@@ -26,12 +26,14 @@
 
 pub use free_list::*;
 pub use hypertree::*;
-pub use llrb::*;
 pub use red_black_tree::*;
 pub use utils::*;
 
 pub mod free_list;
 pub mod hypertree;
-pub mod llrb;
 pub mod red_black_tree;
 pub mod utils;
+
+// NOTE: the upstream `llrb` module was REMOVED (audit 2026-06) — see the same
+// note in the Anchor crate's hypertree/mod.rs. Broken (`remove_by_index` /
+// leaf-delete) and never instantiated; the live book uses `RedBlackTree` only.
