@@ -67,32 +67,31 @@ rushed in. **None is an anonymous single-tx drain.**
 - **H-6** — `vault_withdraw_v3_rejects_when_vault_has_open_position_h6`: position opened on the VAULT's own trader_state via a real `apply_fill` (open_positions==1) → `Custom(7214)` SweepRequiresFlat.
 - **H-7** — `place_basket_order_n_v2_rejects_noncanonical_position_h7`: attacker basket leg references a victim's real position (non-canonical for the attacker) → `Custom(7104)` WrongTrader.
 - **H-8** — `twap_v3_space_matches_borsh_serialized_len`: pins the EXACT 148-byte Borsh body (stronger than the sibling `>= 8+body` checks).
+- **H-3** — `flush_haircut_dust_debits_residual_h3`: drives the FULL real haircut pipeline (2 cross positions → enable haircut residual=1000 → release 1000 each → mature both, matured_total=2000 → convert one at h=0.5 ⇒ credit=500/dust=500, residual 1000→500 → flush) and asserts `residual_after == residual_before − dust` exactly (plus dust→0 and insurance +=dust). **No byte injection.** Reachable only after the Phase-2c re-key below.
 - **M-2** — `liquidate_position_v2_rejects_self_liquidation_m2`: `caller == liquidatee` → `Custom(8208)`. (The self-liquidation case collapses `caller_trader_state`/`trader_state` onto one PDA; confirmed the guard fires *before* any mutation, so `8208` surfaces — not an Anchor collision.)
-- H-1/H-4/H-5/H-6 + M-2 reuse a shared `open_cross_position` helper (unarmed `apply_fill` opens a zero-collateral cross leg). All are real-pipeline tests — **no byte injection**.
+- H-1/H-3/H-4/H-5/H-6 + M-2 reuse a shared `open_cross_position` helper (unarmed `apply_fill` opens a zero-collateral cross leg). All are real-pipeline tests — **no byte injection**.
 
-### H-3 — NOT testable on-chain today (blocked by a separate latent defect)
-The H-3 fix (flush debits `residual` by the flushed dust) is correct by inspection
-against the conservation contract and is covered by the `wave24b/c` host tests of
-the dust math. An on-chain E2E was attempted and is **blocked**: `dust_accrued` can
-only be produced by `convert_position`, and the whole interim haircut pipeline
-(`init_position_haircut_state` / `release_gain_to_haircut` / `mature_position` /
-`convert_position`) derives the **position PDA from `position.trader` (the wallet)**,
-e.g. `seeds = [PositionAccount::SEED, position.market, position.trader]`. But
-`apply_fill` (Phase 2c) keys positions by **`trader_state.key()`** and stores the
-wallet in `position.trader` (lib.rs:3736). wallet ≠ trader_state PDA ⇒ every haircut
-instruction fails Anchor `ConstraintSeeds` (Custom **2006**) on any current position.
-Empirically confirmed (the `init_position_haircut_state` call reverts with 2006).
+### Haircut Phase-2c re-key (FIXED — was a latent blocker found while testing H-3)
+While building the H-3 test I found the entire interim haircut pipeline was
+**unreachable on-chain**: `init_position_haircut_state` / `release_gain_to_haircut` /
+`mature_position` / `convert_position` derived the position PDA from
+`position.trader` (the **wallet**), e.g. `seeds = [PositionAccount::SEED,
+position.market, position.trader]`. But `apply_fill` (Phase 2c) keys positions by
+**`trader_state.key()`** and stores the wallet in `position.trader` (lib.rs:3736), so
+wallet ≠ trader_state PDA ⇒ every haircut instruction reverted with Anchor
+`ConstraintSeeds` (Custom **2006**). This made `convert_position` (the only producer
+of `dust_accrued`) — and therefore H-3's flush path — dead code on any real position.
 
-> **NEW FINDING (flag for the user / external audit):** the interim haircut
-> instructions are **unreachable on-chain for Phase-2c positions** — the convert→
-> flush pipeline (and therefore H-3's residual debit) can't run until those contexts
-> are re-keyed to `trader_state.key()` (matching `apply_fill`). This aligns with the
-> audit's M-3/Info note that the haircut engine is only partially wired. Fixing the
-> keying is a context change (4 structs) and a separate decision — I did **not** make
-> it (it's beyond test scope and would be a production change to make a test pass).
-> Once re-keyed, the removed `flush_haircut_dust_debits_residual_h3` test (two matured
-> positions, convert one at h=0.5, assert `residual_after == residual_before − dust`)
-> drops straight in.
+**Fix:** re-keyed all four contexts to the established Phase-2d relaxed-`trader_state`
+pattern (same as `liquidate_position_v2` / `apply_fill`): a `trader_state`
+`AccountLoader` is declared **before** `position` (relaxed — no seed), the position
+seeds use `trader_state.key()`, and `constraint = position.trader ==
+trader_state.trader` re-checks identity. A wrong `trader_state` derives a different
+PDA → `ConstraintSeeds`, so it's bound canonically. Handlers are unchanged (the
+`trader_state` field name is preserved; `ConvertPosition`/`ReleaseGainToHaircut`
+already used it, just reordered + relaxed). Account-list order for these four
+instructions changed — safe, since they had no working callers. `build-sbf` clean
+(no stack regression); H-3 now passes end-to-end; full host suite 0 failed.
 
 - **H-2 and M-1** — verified by build-sbf + full host suite (0 failed) + source inspection. Dedicated negative tests remain a recommended follow-up.
 - These remediations should themselves be **re-reviewed** (ideally by the external audit) — a fix can introduce new issues.

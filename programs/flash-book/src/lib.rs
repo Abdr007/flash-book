@@ -10532,13 +10532,19 @@ pub struct MaturePosition<'info> {
     )]
     pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
 
+    /// Phase 2c FIX (audit 2026-06): positions are PDA-keyed by the trader_state
+    /// account, NOT the wallet. Relaxed (no seed) — the `position` seeds below
+    /// bind it to the canonical trader_state (a wrong one derives a different PDA
+    /// → ConstraintSeeds), and the identity constraint re-checks
+    /// `position.trader == trader_state.trader`.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
     /// The Position the per-position haircut state attaches to.
-    /// Re-derive its PDA via the account's stored fields so we don't
-    /// have to thread market/trader through ix args.
     #[account(
-        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), trader_state.key().as_ref()],
         bump = position.load()?.bump,
         constraint = position.load()?.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
+        constraint = position.load()?.trader == trader_state.load()?.trader @ FlashBookError::WrongTrader,
     )]
     pub position: AccountLoader<'info, state::PositionAccount>,
 
@@ -10568,24 +10574,23 @@ pub struct ConvertPosition<'info> {
     )]
     pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
 
+    /// H9: the converted matured PnL is credited here (isolated bucket if the
+    /// position is isolated, else the cross pool). Phase 2c FIX (audit 2026-06):
+    /// declared BEFORE `position` and relaxed (no seed) so the position PDA can
+    /// be keyed by `trader_state.key()` — the old wallet-keyed seed never matched
+    /// a Phase-2c position. The position seeds + identity constraint below bind
+    /// this trader_state canonically (a wrong one → ConstraintSeeds on `position`).
+    #[account(mut)]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
     #[account(
         mut,
-        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), trader_state.key().as_ref()],
         bump = position.load()?.bump,
         constraint = position.load()?.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
+        constraint = position.load()?.trader == trader_state.load()?.trader @ FlashBookError::WrongTrader,
     )]
     pub position: AccountLoader<'info, state::PositionAccount>,
-
-    /// H9: the converted matured PnL is credited here — the isolated bucket on
-    /// `position` if isolated, else this cross pool. Bound to the position's
-    /// trader (main account). Previously absent, so the credit was never landed.
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, position.load()?.trader.as_ref()],
-        bump = trader_state.load()?.bump,
-        constraint = trader_state.load()?.trader == position.load()?.trader @ FlashBookError::WrongTrader,
-    )]
-    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         mut,
@@ -10627,9 +10632,15 @@ pub struct InitPositionHaircutState<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
+    /// Phase 2c FIX (audit 2026-06): position PDA is keyed by the trader_state
+    /// account, not the wallet. Relaxed (no seed); the `position` seeds bind it
+    /// canonically and the identity constraint re-checks the trader.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
     #[account(
-        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), trader_state.key().as_ref()],
         bump = position.load()?.bump,
+        constraint = position.load()?.trader == trader_state.load()?.trader @ FlashBookError::WrongTrader,
     )]
     pub position: AccountLoader<'info, state::PositionAccount>,
 
@@ -10666,21 +10677,22 @@ pub struct ReleaseGainToHaircut<'info> {
     )]
     pub market: Box<Account<'info, state::MarketAccount>>,
 
-    #[account(
-        mut,
-        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
-        bump = position.load()?.bump,
-        constraint = position.load()?.market == market.key() @ FlashBookError::HaircutStateMismatch,
-    )]
-    pub position: AccountLoader<'info, state::PositionAccount>,
+    /// Phase 2c FIX (audit 2026-06): declared BEFORE `position` and relaxed (no
+    /// seed) so the position PDA can be keyed by `trader_state.key()` — the old
+    /// wallet-keyed seed never matched a Phase-2c position. The cross bucket this
+    /// handler debits lives on this account; the position seeds + identity
+    /// constraint bind it canonically.
+    #[account(mut)]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, position.load()?.trader.as_ref()],
-        bump = trader_state.load()?.bump,
-        constraint = trader_state.load()?.trader == position.load()?.trader @ FlashBookError::WrongTrader,
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), trader_state.key().as_ref()],
+        bump = position.load()?.bump,
+        constraint = position.load()?.market == market.key() @ FlashBookError::HaircutStateMismatch,
+        constraint = position.load()?.trader == trader_state.load()?.trader @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         mut,

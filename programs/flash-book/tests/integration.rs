@@ -5401,3 +5401,233 @@ async fn place_basket_order_n_v2_rejects_noncanonical_position_h7() {
         "basket leg referencing a non-canonical position must be rejected with WrongTrader (H-7), got: {dbg}"
     );
 }
+
+/// H-3: flush_haircut_dust must DEBIT residual by the flushed dust (ΔResidual =
+/// −dust), preserving `Residual = V − C_tot − I` when the dust moves to insurance.
+/// Driven through the REAL haircut pipeline (no byte injection), reachable after
+/// the audit-2026-06 Phase-2c re-key of the haircut contexts (position PDA now
+/// keyed by `trader_state.key()`, not the wallet):
+///   open 2 cross positions → enable haircut (residual=1000) → release 1000 into
+///   each reserve → mature both (matured_total=2000) → convert ONE (h=0.5 ⇒
+///   credit=500, dust=500; residual 1000→500) → flush (residual 500→0).
+/// Two positions are required: a single one has matured_pos==matured_total, so any
+/// h<1 would drive `residual − credit − dust` negative and underflow at flush. The
+/// converted leg's matured (1000) ≤ residual (1000) < matured_total (2000) keeps
+/// the debit in range. The exact assertion `residual_after == residual_before −
+/// dust` is what fails on the pre-fix code (which left residual untouched at flush).
+#[tokio::test]
+async fn flush_haircut_dust_debits_residual_h3() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ixs: &[Instruction],
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                ixs,
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    // Two traders open CROSS positions via apply_fill BEFORE the haircut engine
+    // is enabled (initialize_haircut_state sets the sticky haircut_enabled flag).
+    let ta = Keypair::new();
+    let tb = Keypair::new();
+    let ma = Keypair::new();
+    let mb = Keypair::new();
+    let ta_state = setup_trader(&mut ctx, &payer, &ta, 50_000, &protocol).await;
+    let tb_state = setup_trader(&mut ctx, &payer, &tb, 50_000, &protocol).await;
+    let ma_state = setup_trader(&mut ctx, &payer, &ma, 50_000, &protocol).await;
+    let mb_state = setup_trader(&mut ctx, &payer, &mb, 50_000, &protocol).await;
+    let pos_a = open_cross_position(&mut ctx, &payer, market_pda, protocol.insurance_fund, ta_state, ma_state, 1).await;
+    let pos_b = open_cross_position(&mut ctx, &payer, market_pda, protocol.insurance_fund, tb_state, mb_state, 2).await;
+
+    let (haircut_state, _) = pda(&[
+        flash_book::state_v3::MarketHaircutStateAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let (pos_a_hc, _) = pda(&[
+        flash_book::state_v3::PositionHaircutStateAccount::SEED,
+        market_pda.as_ref(),
+        pos_a.as_ref(),
+    ]);
+    let (pos_b_hc, _) = pda(&[
+        flash_book::state_v3::PositionHaircutStateAccount::SEED,
+        market_pda.as_ref(),
+        pos_b.as_ref(),
+    ]);
+
+    // Enable the haircut engine, seed residual = 1000 (h_min=0, h_max=1).
+    send(
+        &mut ctx,
+        &[build_ix(
+            flash_book::instruction::InitializeHaircutState {
+                h_min_slots: 0,
+                h_max_slots: 1,
+                initial_residual_quote_lots: 1000,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        )],
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Lazy-init both position haircut states. New account order (Phase-2c re-key):
+    // payer, trader_state, position, haircut_state, position_haircut, system.
+    let init_pos_hc = |ts: Pubkey, pos: Pubkey, pos_hc: Pubkey| {
+        build_ix(
+            flash_book::instruction::InitPositionHaircutState {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(ts, false),
+                AccountMeta::new_readonly(pos, false),
+                AccountMeta::new_readonly(haircut_state, false),
+                AccountMeta::new(pos_hc, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        )
+    };
+    send(
+        &mut ctx,
+        &[
+            init_pos_hc(ta_state, pos_a, pos_a_hc),
+            init_pos_hc(tb_state, pos_b, pos_b_hc),
+        ],
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Release 1000 of each trader's collateral into the reserve (authority-gated).
+    // Order: authority, market, trader_state, position, haircut_state, position_haircut.
+    let release = |ts: Pubkey, pos: Pubkey, pos_hc: Pubkey| {
+        build_ix(
+            flash_book::instruction::ReleaseGainToHaircut { gain_quote_lots: 1000 },
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(ts, false),
+                AccountMeta::new(pos, false),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new(pos_hc, false),
+            ],
+        )
+    };
+    send(
+        &mut ctx,
+        &[
+            release(ta_state, pos_a, pos_a_hc),
+            release(tb_state, pos_b, pos_b_hc),
+        ],
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Warp past h_max so both reserves fully mature.
+    ctx.warp_to_slot(1_000).unwrap();
+
+    // Mature both → matured_pos_total == 2000.
+    // Order: keeper, haircut_state, trader_state, position, position_haircut.
+    let mature = |ts: Pubkey, pos: Pubkey, pos_hc: Pubkey| {
+        build_ix(
+            flash_book::instruction::MaturePosition {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new_readonly(ts, false),
+                AccountMeta::new_readonly(pos, false),
+                AccountMeta::new(pos_hc, false),
+            ],
+        )
+    };
+    send(
+        &mut ctx,
+        &[
+            mature(ta_state, pos_a, pos_a_hc),
+            mature(tb_state, pos_b, pos_b_hc),
+        ],
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Convert ONLY position A (signed by trader A, the authorized keeper).
+    // Order: keeper, haircut_state, trader_state, position, position_haircut.
+    send(
+        &mut ctx,
+        &[build_ix(
+            flash_book::instruction::ConvertPosition {},
+            vec![
+                AccountMeta::new(ta.pubkey(), true),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new(ta_state, false),
+                AccountMeta::new(pos_a, false),
+                AccountMeta::new(pos_a_hc, false),
+            ],
+        )],
+        &[&ta],
+    )
+    .await
+    .unwrap();
+
+    // Snapshot residual + dust AFTER convert, BEFORE flush.
+    let hc_before: flash_book::state_v3::MarketHaircutStateAccount =
+        fetch(&mut ctx.banks_client, haircut_state).await;
+    let residual_before = hc_before.residual_quote_lots;
+    let dust = hc_before.dust_accrued_quote_lots;
+    assert!(dust > 0, "convert at h<1 must have accrued dust");
+    assert!(
+        residual_before >= dust,
+        "scenario must keep residual >= dust so flush does not underflow (residual={residual_before}, dust={dust})"
+    );
+    let ins_before: InsuranceFundAccount = fetch(&mut ctx.banks_client, protocol.insurance_fund).await;
+
+    // Flush: H-3 debits residual by the flushed dust.
+    send(
+        &mut ctx,
+        &[build_ix(
+            flash_book::instruction::FlushHaircutDust {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new(protocol.insurance_fund, false),
+            ],
+        )],
+        &[&payer],
+    )
+    .await
+    .expect("flush must succeed (residual covers the dust debit)");
+
+    let hc_after: flash_book::state_v3::MarketHaircutStateAccount =
+        fetch(&mut ctx.banks_client, haircut_state).await;
+    let ins_after: InsuranceFundAccount = fetch(&mut ctx.banks_client, protocol.insurance_fund).await;
+
+    // H-3: residual debited by EXACTLY the dust (pre-fix left it untouched).
+    assert_eq!(
+        hc_after.residual_quote_lots,
+        residual_before - dust,
+        "H-3: flush must debit residual by exactly the flushed dust"
+    );
+    assert_eq!(hc_after.dust_accrued_quote_lots, 0, "dust fully flushed");
+    assert_eq!(
+        ins_after.balance_quote_lots,
+        ins_before.balance_quote_lots + dust as u64,
+        "insurance credited by the flushed dust"
+    );
+}
