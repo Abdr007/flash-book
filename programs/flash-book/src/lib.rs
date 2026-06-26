@@ -3530,6 +3530,17 @@ pub mod flash_book {
             !ctx.accounts.market.fill_commitment_required || fc_opt.is_some(),
             FlashBookError::FillCommitmentMissing
         );
+        // H-2 (audit 2026-06) FIX: if the market has the haircut engine ENABLED, the
+        // (optional) haircut accounts are MANDATORY — otherwise a settlement that
+        // omits them routes positive realized PnL straight to collateral with NO
+        // Residual/solvency gating, defeating the junior-claim engine.
+        require!(
+            !ctx.accounts.market.haircut_enabled
+                || (ctx.accounts.market_haircut.is_some()
+                    && ctx.accounts.taker_position_haircut.is_some()
+                    && ctx.accounts.maker_position_haircut.is_some()),
+            FlashBookError::HaircutNotInitialized
+        );
         if let Some(fc_acct) = fc_opt {
             use matcher::fill_commitment as fc;
             let market_bytes = fc_market_bytes;
@@ -6290,6 +6301,15 @@ pub mod flash_book {
                 crate::constants::FLP_MAX_FILL_DEVIATION_BPS,
             ),
             FlashBookError::FlpPriceOutsideBand
+        );
+        // H-2 (audit 2026-06) FIX: on a haircut-enabled market the haircut accounts
+        // are MANDATORY (FLP path has market + taker only — FLP is the maker), so a
+        // settlement can't omit them to route the taker's PnL past the solvency gate.
+        require!(
+            !ctx.accounts.market.haircut_enabled
+                || (ctx.accounts.market_haircut.is_some()
+                    && ctx.accounts.taker_position_haircut.is_some()),
+            FlashBookError::HaircutNotInitialized
         );
 
         // Phase 2i — verify the trader_state PDA matches
@@ -9643,6 +9663,10 @@ pub mod flash_book {
         matcher::haircut::validate_market_params(h_min_slots, h_max_slots)
             .map_err(map_haircut_error)?;
 
+        // H-2 fix: ENABLE the haircut engine on the market — settlement now REQUIRES
+        // the haircut accounts (sticky), closing the omit-the-accounts bypass.
+        ctx.accounts.market.haircut_enabled = true;
+
         let st = &mut ctx.accounts.haircut_state;
         st.market = ctx.accounts.market.key();
         st.bump = ctx.bumps.haircut_state;
@@ -10441,7 +10465,10 @@ pub struct InitializeHaircutState<'info> {
     pub authority: Signer<'info>,
     /// Authority must match the market's authority — same trust model
     /// as `update_market_params`.
+    // H-2 fix: `mut` so the handler can set `haircut_enabled = true` (enabling the
+    // haircut engine makes its accounts mandatory in settlement, sticky).
     #[account(
+        mut,
         seeds = [state::MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
         constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,

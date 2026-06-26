@@ -335,6 +335,13 @@ pub struct MarketAccount {
     /// (e.g. `book_delegated_at_slot`); reconcile the field ORDER on merge so the
     /// Borsh layout is consistent across both.
     pub fill_commitment_required: bool,
+    /// H-2 (audit 2026-06): sticky flag — once `initialize_haircut_state` enables
+    /// the haircut junior-claim engine for this market, the (optional) haircut
+    /// accounts become MANDATORY in `apply_fill`/`apply_flp_fill`. Without this a
+    /// settlement could omit them and route positive realized PnL straight to
+    /// collateral with NO Residual/solvency gating (then withdraw it). Additive
+    /// migration: pre-existing markets read back `false`.
+    pub haircut_enabled: bool,
 }
 
 // H1: build-time guard — the struct (incl. the new nonce) must still fit the
