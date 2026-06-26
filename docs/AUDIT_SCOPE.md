@@ -6,18 +6,42 @@ code proves.
 
 ## 1. Scope
 
-- **Program:** `programs/flash-book` (the deployed **Anchor 0.31.1** program).
-  The Pinocchio/no_std port (`programs/flash-book-pin`) is WIP and **out of scope**.
-- **Branch / PR:** `fix-security-c1-c2` → PR #34. Squash-diff against `main` is the
-  review surface.
-- **Build/test gate (CI, green):** `cargo build-sbf`; `cargo test` (388 lib + 44
-  integration); `cargo kani` (31 harnesses); Lean `lake build` (7 theorems). See
-  `.github/workflows/ci.yml` — a regression in any of these fails CI.
+- **Program:** `programs/flash-book` (the deployed **Anchor 0.31.1** program,
+  ~32.9k LOC). The Pinocchio/no_std port (`programs/flash-book-pin`) is WIP and
+  **out of scope**.
+- **Review surface:** `main` HEAD. All hardening + audit-remediation work is now
+  merged (PRs #34–#42); review the whole program at `main` (no review branch).
+- **Build/test gate (CI, green):** `cargo build-sbf`; `cargo test` (405 lib + 57
+  integration + full proptest/wave suites); `cargo kani` (**41 harnesses**); Lean
+  `lake build` (Haircut/Funding/OiMmr, axiom-clean). See `.github/workflows/ci.yml`
+  — a regression in any of these fails CI.
 
-## 2. What changed on this branch (review focus)
+## 2. What changed (review focus)
 
-Three bodies of work; the **first two touch funds and settlement and deserve the
-most scrutiny**.
+### 0. Audit-2026-06 remediation — latest, MERGED (`docs/AUDIT_REMEDIATION_2026-06.md`, `docs/INTERNAL_AUDIT_2026-06.md`)
+A fresh adversarial pass (PRs #40/#41/#42) closing **every reachable Critical/
+High/Medium**, each with a discriminating regression test; the two highest-value
+fixes are **machine-proven** (Kani):
+- **C-1 (CRITICAL, margin):** `assess_margin` double-counted unrealized PnL
+  (mark frame in equity + entry frame in scenario loss) — under-margined winners
+  (bad debt) and wrongly liquidated solvent losers. Now gates on
+  `(collateral − funding) ≥ required`. Proven stress-sound + frame-independent.
+- **H1:** `order_id` 24-bit seq could wrap → price-time-priority break + id
+  collision. Fail-loud guard at the book-insert chokepoint; proven to admit
+  exactly the bound the encoding proofs assume.
+- **F1/F2/F3 (ER liveness):** censorship-escape pre-upgrade trap (permissionless
+  baseline stamp); and a **sequencer-authenticated ER heartbeat** so a quiet
+  healthy market is no longer auto-paused / force-undelegated on a normal lull —
+  two-tier `force_undelegate` (fast=ER-dark, slow censorship backstop) proven
+  non-griefable while preserving the F1 escape.
+- **F4:** oracle-only liquidation fallback now requires provable oracle freshness.
+- **M1/M2:** crossed-residual on walk-limit; pro-rata maker overfill.
+**Auditor focus:** the margin-frame fix (C-1) backs every solvency decision —
+confirm the entry-frame gate is exhaustive across all call sites; and the ER
+heartbeat trust model (only the sequencer can attest liveness).
+
+The three bodies below are EARLIER merged work; the **first two touch funds and
+settlement and deserve the most scrutiny**.
 
 ### a. Security hardening — 2 CRITICAL + 10 HIGH (`docs/FLASHBOOK_SECURITY.md`)
 Closed C1/C2 + H1–H9 (deposit-vault binding, margin-walk completeness, duplicate-
@@ -47,8 +71,11 @@ implemented (it would consume the node arena it protects — see issue #36).
 
 ## 3. Formal-verification evidence (`certora/PROPERTIES.md`, `docs/FORMAL_VERIFICATION.md`)
 
-**31 Kani proofs + 7 Lean theorems, all CI-gated.** Each binds to deployed code
-(handlers route through the proven pure function). Proven: P-SOLV-1…5,
+**41 Kani harnesses + Lean (Haircut/Funding/OiMmr, axiom-clean), all CI-gated.**
+Each binds to deployed code (handlers route through the proven pure function).
+2026-06 additions: C-1 stress-soundness + frame-independence, H1 seq-guard ⇔
+encoding precondition + collision-freedom, F3 force-undelegate soundness +
+anti-grief. Proven: P-SOLV-1…5,
 P-FUND-1/2, P-MARGIN-1/2/3, P-SETTLE-1/2, P-LIQ-1, P-MATCH-1/2. Where CBMC can't
 reach (128-bit multiply, non-power-of-two division), the proof is in **Lean** over
 unbounded `Nat`/`Int` at the real constants.
@@ -77,6 +104,9 @@ security gates do not threaten the CU budget.
 | Whole-program invariants (§3) | `[CERTORA-TARGET]`; runtime-enforced, not proven |
 | #37 mediums M1–M13 / lows L1–L5 | Not yet enumerated from the review record |
 | ER commit/undelegate round-trip | ER-gated; not unit-testable without a live MagicBlock ER |
+| ER heartbeat (F2/F3) | Off-chain sequencer must call `er_heartbeat` every <150 slots; auditor: confirm the sequencer-only auth + the two-tier timeouts |
+| Pinocchio port (`flash-book-pin`) | WIP/out-of-scope; math layer parity-verified, instruction glue (account validation, replay guard, OI) not deployed |
+| ~~Hypertree LLRB~~ | RESOLVED — dead/broken `LLRB` deleted (2026-06); live book uses `RedBlackTree` only |
 
 ## 6. Deployment plan (post-audit)
 
@@ -87,9 +117,9 @@ widen as it survives real volume. See `docs/FLASHBOOK_PRODUCTION_ROADMAP.md`.
 
 ## 7. Reproduce everything
 ```bash
-cargo build-sbf && cargo test                                   # build + 432 tests
-cargo kani --package flash-book --features no-entrypoint        # 31/31 proofs
-cd formal_verification/lean && lake build                       # 7 theorems
+cargo build-sbf && cargo test                                   # build + 462 tests (405 lib + 57 integ)
+cargo kani --package flash-book --features no-entrypoint        # 41 harnesses
+cd formal_verification/lean && lake build                       # Haircut/Funding/OiMmr
 BPF_OUT_DIR="$PWD/target/deploy" \
   cargo test -p flash-book --test integration cu_benchmark -- --ignored --nocapture
 ```
