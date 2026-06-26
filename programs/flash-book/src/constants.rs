@@ -142,6 +142,12 @@ pub const FORCE_UNDELEGATE_TIMEOUT_SLOTS: u64 = 750;
 /// short enough that censorship cannot trap funds indefinitely.
 pub const CENSORSHIP_ESCAPE_TIMEOUT_SLOTS: u64 = 9_000;
 
+/// Max reader allow-list size for a private (dark-pool) book's ephemeral
+/// permission. Bounds the `set_book_privacy` CPI data (`8 + 1 + N*33` bytes) so a
+/// single permission update stays well inside instruction-data limits. 32 readers
+/// ⇒ ~1065 bytes.
+pub const MAX_PRIVACY_MEMBERS: usize = 32;
+
 /// #35 / H1 part B — protocol-level safety cap on how far an `apply_flp_fill`
 /// price may deviate from the FRESH oracle, in bps (symmetric band). The FLP
 /// quoter always prices within its spread of fair value, so a legitimate fill is

@@ -1330,6 +1330,173 @@
       "args": []
     },
     {
+      "name": "close_book_permission",
+      "docs": [
+        "PRIVATE / DARK-POOL BOOK (TEE), teardown. Close the ephemeral permission,",
+        "refunding rent to the book PDA. Authority-gated; the book PDA signs."
+      ],
+      "discriminator": [
+        253,
+        98,
+        211,
+        47,
+        223,
+        164,
+        237,
+        11
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "Market authority — only they may manage the book's privacy posture."
+          ],
+          "signer": true,
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "permission",
+          "docs": [
+            "UNDER the permission program — Anchor validates the derivation."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  114,
+                  109,
+                  105,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110,
+                  58
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_book"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                136,
+                161,
+                10,
+                196,
+                33,
+                152,
+                1,
+                214,
+                246,
+                106,
+                29,
+                60,
+                6,
+                152,
+                192,
+                102,
+                169,
+                175,
+                212,
+                217,
+                180,
+                252,
+                231,
+                71,
+                151,
+                141,
+                209,
+                5,
+                168,
+                212,
+                103,
+                82
+              ]
+            }
+          }
+        },
+        {
+          "name": "ephemeral_vault",
+          "writable": true,
+          "address": "MagicVau1t999999999999999999999999999999999"
+        },
+        {
+          "name": "magic_program",
+          "address": "Magic11111111111111111111111111111111111111"
+        },
+        {
+          "name": "permission_program",
+          "address": "ACLseoPoyC3cBqoUtkbjZ4aDrkurZW86v19pXz2XQnp1"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "close_trader_ata",
       "docs": [
         "Close the trader's quote ATA and refund the rent lamports to",
@@ -3800,6 +3967,178 @@
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "init_book_permission",
+      "docs": [
+        "PRIVATE / DARK-POOL BOOK (TEE), step 1 of 2. Create the MagicBlock",
+        "ephemeral-permission account for this market's DELEGATED book PDA, so the",
+        "book can run on a Private (TEE-backed) ER where reads are gated. Starts",
+        "PUBLIC — flip with `set_book_privacy`. Authority-gated; the book PDA signs",
+        "the CPI. Idempotent (skips if the permission already exists). The book must",
+        "already be delegated (`delegate_market_book`). Additive + isolated: no",
+        "matching/risk/settlement path depends on this."
+      ],
+      "discriminator": [
+        106,
+        96,
+        17,
+        173,
+        186,
+        147,
+        87,
+        158
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "Market authority — only they may manage the book's privacy posture."
+          ],
+          "signer": true,
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "permission",
+          "docs": [
+            "UNDER the permission program — Anchor validates the derivation."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  114,
+                  109,
+                  105,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110,
+                  58
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_book"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                136,
+                161,
+                10,
+                196,
+                33,
+                152,
+                1,
+                214,
+                246,
+                106,
+                29,
+                60,
+                6,
+                152,
+                192,
+                102,
+                169,
+                175,
+                212,
+                217,
+                180,
+                252,
+                231,
+                71,
+                151,
+                141,
+                209,
+                5,
+                168,
+                212,
+                103,
+                82
+              ]
+            }
+          }
+        },
+        {
+          "name": "ephemeral_vault",
+          "writable": true,
+          "address": "MagicVau1t999999999999999999999999999999999"
+        },
+        {
+          "name": "magic_program",
+          "address": "Magic11111111111111111111111111111111111111"
+        },
+        {
+          "name": "permission_program",
+          "address": "ACLseoPoyC3cBqoUtkbjZ4aDrkurZW86v19pXz2XQnp1"
+        }
+      ],
+      "args": []
     },
     {
       "name": "init_fee_tiers",
@@ -7900,6 +8239,187 @@
         {
           "name": "delta",
           "type": "i128"
+        }
+      ]
+    },
+    {
+      "name": "set_book_privacy",
+      "docs": [
+        "PRIVATE / DARK-POOL BOOK (TEE), step 2. Toggle the book's privacy and set",
+        "the reader allow-list. When `is_private`, ONLY the listed members can read",
+        "the ER's book state through the TEE (each granted logs+messages+balances) —",
+        "a hidden order book. When public, the allow-list is cleared. Authority-gated;",
+        "the book PDA signs. `members` is capped at `MAX_PRIVACY_MEMBERS`."
+      ],
+      "discriminator": [
+        180,
+        120,
+        170,
+        98,
+        100,
+        242,
+        112,
+        176
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "Market authority — only they may manage the book's privacy posture."
+          ],
+          "signer": true,
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "permission",
+          "docs": [
+            "UNDER the permission program — Anchor validates the derivation."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  114,
+                  109,
+                  105,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110,
+                  58
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_book"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                136,
+                161,
+                10,
+                196,
+                33,
+                152,
+                1,
+                214,
+                246,
+                106,
+                29,
+                60,
+                6,
+                152,
+                192,
+                102,
+                169,
+                175,
+                212,
+                217,
+                180,
+                252,
+                231,
+                71,
+                151,
+                141,
+                209,
+                5,
+                168,
+                212,
+                103,
+                82
+              ]
+            }
+          }
+        },
+        {
+          "name": "ephemeral_vault",
+          "writable": true,
+          "address": "MagicVau1t999999999999999999999999999999999"
+        },
+        {
+          "name": "magic_program",
+          "address": "Magic11111111111111111111111111111111111111"
+        },
+        {
+          "name": "permission_program",
+          "address": "ACLseoPoyC3cBqoUtkbjZ4aDrkurZW86v19pXz2XQnp1"
+        }
+      ],
+      "args": [
+        {
+          "name": "is_private",
+          "type": "bool"
+        },
+        {
+          "name": "members",
+          "type": {
+            "vec": "pubkey"
+          }
         }
       ]
     },
@@ -12883,6 +13403,19 @@
       ]
     },
     {
+      "name": "BookPermissionEvent",
+      "discriminator": [
+        7,
+        151,
+        3,
+        129,
+        240,
+        130,
+        186,
+        143
+      ]
+    },
+    {
       "name": "BracketOrderV3PlacedEvent",
       "discriminator": [
         210,
@@ -15105,6 +15638,37 @@
           {
             "name": "baseline_slot",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BookPermissionEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "market_book",
+            "type": "pubkey"
+          },
+          {
+            "name": "is_private",
+            "type": "bool"
+          },
+          {
+            "name": "member_count",
+            "type": "u32"
+          },
+          {
+            "name": "action",
+            "docs": [
+              "0 = init, 1 = set_privacy, 2 = close."
+            ],
+            "type": "u8"
           }
         ]
       }
