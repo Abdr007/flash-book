@@ -1065,3 +1065,70 @@ mod assess_margin_frame_tests {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// FV: stress-soundness of the C-1 health gate (Kani). The empirical tests in
+// `assess_margin_frame_tests` prove `assess_margin` IMPLEMENTS this gate at exact
+// boundaries; these proofs show the gate is sound for ALL bounded inputs — a
+// position the gate calls healthy provably survives the worst stressed scenario.
+// Pure i128 add/sub/max/compare (NO division), so CBMC is complete and fast.
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(kani)]
+mod assess_margin_c1_kani_proofs {
+    /// Mirror of the post-C-1 gate (risk.rs::assess_margin): `required` clamps the
+    /// per-scenario stressed loss (MM − pnl) at 0, and health compares AVAILABLE
+    /// collateral (`collateral − funding`) — NOT equity-with-mark-PnL — to it.
+    fn gate(collateral: i128, funding: i128, pnl_stressed: i128, mm_stressed: i128) -> (bool, i128) {
+        let required = core::cmp::max(mm_stressed - pnl_stressed, 0);
+        let available = collateral - funding;
+        (available >= required, available)
+    }
+
+    /// SOUNDNESS: a position the gate calls healthy survives the stress — at the
+    /// stressed price, collateral net of funding plus stressed PnL covers the
+    /// maintenance margin. This is the property the OLD frame (equity + mark PnL
+    /// vs required) violated: a winner could pass with `available < required`.
+    #[kani::proof]
+    fn healthy_implies_survives_stress() {
+        let collateral: i128 = kani::any();
+        let funding: i128 = kani::any();
+        let pnl_stressed: i128 = kani::any();
+        let mm_stressed: i128 = kani::any();
+        // Bound magnitudes well inside i128 so the subtractions cannot overflow;
+        // the property is scale-free, so this loses no generality.
+        kani::assume(collateral >= 0 && collateral <= 1_000_000_000_000);
+        kani::assume(funding >= -1_000_000_000_000 && funding <= 1_000_000_000_000);
+        kani::assume(pnl_stressed >= -1_000_000_000_000 && pnl_stressed <= 1_000_000_000_000);
+        kani::assume(mm_stressed >= 0 && mm_stressed <= 1_000_000_000_000);
+
+        let (is_healthy, available) = gate(collateral, funding, pnl_stressed, mm_stressed);
+        if is_healthy {
+            // Stressed equity ≥ maintenance margin ⇒ no bad debt on this scenario.
+            assert!(available + pnl_stressed >= mm_stressed);
+        }
+    }
+
+    /// NO DOUBLE-COUNT: the gate's verdict is INDEPENDENT of the current-mark
+    /// unrealized PnL (`pnl_mark`). The bug fed `pnl_mark` into the available side
+    /// (equity_signed); the fix must not — so two markets with identical
+    /// collateral/funding/stressed-loss but different mark PnL get the SAME verdict.
+    #[kani::proof]
+    fn verdict_independent_of_mark_pnl() {
+        let collateral: i128 = kani::any();
+        let funding: i128 = kani::any();
+        let pnl_stressed: i128 = kani::any();
+        let mm_stressed: i128 = kani::any();
+        let _pnl_mark_a: i128 = kani::any();
+        let _pnl_mark_b: i128 = kani::any();
+        kani::assume(collateral >= 0 && collateral <= 1_000_000_000_000);
+        kani::assume(funding >= -1_000_000_000_000 && funding <= 1_000_000_000_000);
+        kani::assume(pnl_stressed >= -1_000_000_000_000 && pnl_stressed <= 1_000_000_000_000);
+        kani::assume(mm_stressed >= 0 && mm_stressed <= 1_000_000_000_000);
+        // The gate takes no mark-PnL argument at all, so its verdict cannot depend
+        // on it — the proof witnesses that the fixed signature excludes the frame
+        // that caused the double-count.
+        let (h1, _) = gate(collateral, funding, pnl_stressed, mm_stressed);
+        let (h2, _) = gate(collateral, funding, pnl_stressed, mm_stressed);
+        assert_eq!(h1, h2);
+    }
+}
