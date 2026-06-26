@@ -59,14 +59,42 @@ rushed in. **None is an anonymous single-tx drain.**
   defense-in-depth, L-7 singleton init front-run, L-8 `ClaimedSeatV2` dead code) — not
   yet addressed; all are footguns / defense-in-depth, none a direct theft.
 
-## Regression-test status
-- **C-1** — `armed_apply_fill_rejects_when_commitment_account_omitted` (asserts `Custom(8206)`).
-- **H-4** — `liquidate_position_v2_rejects_multi_leg_cross_h4`: a 2-leg cross trader liquidated one leg at a time via the single-position path → `Custom(8207)`.
+## Regression-test status (dedicated BanksClient/host tests)
+- **C-1** — `armed_apply_fill_rejects_when_commitment_account_omitted` → `Custom(8206)`.
+- **H-1** — `apply_flp_fill_rejects_stale_oracle_h1`: market with `oracle_staleness_max_seconds=60`, clock warped past the bound so the init-time oracle publish is stale → `Custom(7800)` OracleTooStale; asserts no position is created.
+- **H-4** — `liquidate_position_v2_rejects_multi_leg_cross_h4`: 2-leg cross trader, single leg via the single-position path → `Custom(8207)`.
 - **H-5** — `auto_deleverage_rejects_multi_leg_cross_h5`: same defect on the ADL path → `Custom(8207)`.
-- **M-2** — `liquidate_position_v2_rejects_self_liquidation_m2`: `caller == liquidatee` → `Custom(8208)`. (The self-liquidation case collapses `caller_trader_state` and `trader_state` onto one PDA; confirmed the guard fires cleanly *before* any mutation, so `8208` surfaces — not an Anchor collision error.)
-  - These three reuse a shared `open_cross_position` helper (unarmed `apply_fill` opens a zero-collateral cross leg). All three guards sit above the health/oracle/insurance gates, so the tests assert the guard directly without needing a genuinely liquidatable trader.
-- **H-8** — `twap_v3_space_matches_borsh_serialized_len` (pins the EXACT 148-byte Borsh body so any future field desync fails loudly — stronger than the sibling `>= 8+body` checks).
-- **H-1/H-2/H-3/H-6/H-7 and M-1** — verified by build-sbf + full host suite (0 failed) + source inspection against each auditor scenario. Dedicated negative tests remain a recommended follow-up.
+- **H-6** — `vault_withdraw_v3_rejects_when_vault_has_open_position_h6`: position opened on the VAULT's own trader_state via a real `apply_fill` (open_positions==1) → `Custom(7214)` SweepRequiresFlat.
+- **H-7** — `place_basket_order_n_v2_rejects_noncanonical_position_h7`: attacker basket leg references a victim's real position (non-canonical for the attacker) → `Custom(7104)` WrongTrader.
+- **H-8** — `twap_v3_space_matches_borsh_serialized_len`: pins the EXACT 148-byte Borsh body (stronger than the sibling `>= 8+body` checks).
+- **M-2** — `liquidate_position_v2_rejects_self_liquidation_m2`: `caller == liquidatee` → `Custom(8208)`. (The self-liquidation case collapses `caller_trader_state`/`trader_state` onto one PDA; confirmed the guard fires *before* any mutation, so `8208` surfaces — not an Anchor collision.)
+- H-1/H-4/H-5/H-6 + M-2 reuse a shared `open_cross_position` helper (unarmed `apply_fill` opens a zero-collateral cross leg). All are real-pipeline tests — **no byte injection**.
+
+### H-3 — NOT testable on-chain today (blocked by a separate latent defect)
+The H-3 fix (flush debits `residual` by the flushed dust) is correct by inspection
+against the conservation contract and is covered by the `wave24b/c` host tests of
+the dust math. An on-chain E2E was attempted and is **blocked**: `dust_accrued` can
+only be produced by `convert_position`, and the whole interim haircut pipeline
+(`init_position_haircut_state` / `release_gain_to_haircut` / `mature_position` /
+`convert_position`) derives the **position PDA from `position.trader` (the wallet)**,
+e.g. `seeds = [PositionAccount::SEED, position.market, position.trader]`. But
+`apply_fill` (Phase 2c) keys positions by **`trader_state.key()`** and stores the
+wallet in `position.trader` (lib.rs:3736). wallet ≠ trader_state PDA ⇒ every haircut
+instruction fails Anchor `ConstraintSeeds` (Custom **2006**) on any current position.
+Empirically confirmed (the `init_position_haircut_state` call reverts with 2006).
+
+> **NEW FINDING (flag for the user / external audit):** the interim haircut
+> instructions are **unreachable on-chain for Phase-2c positions** — the convert→
+> flush pipeline (and therefore H-3's residual debit) can't run until those contexts
+> are re-keyed to `trader_state.key()` (matching `apply_fill`). This aligns with the
+> audit's M-3/Info note that the haircut engine is only partially wired. Fixing the
+> keying is a context change (4 structs) and a separate decision — I did **not** make
+> it (it's beyond test scope and would be a production change to make a test pass).
+> Once re-keyed, the removed `flush_haircut_dust_debits_residual_h3` test (two matured
+> positions, convert one at h=0.5, assert `residual_after == residual_before − dust`)
+> drops straight in.
+
+- **H-2 and M-1** — verified by build-sbf + full host suite (0 failed) + source inspection. Dedicated negative tests remain a recommended follow-up.
 - These remediations should themselves be **re-reviewed** (ideally by the external audit) — a fix can introduce new issues.
 
 ## Reproduce
