@@ -93,7 +93,9 @@ already used it, just reordered + relaxed). Account-list order for these four
 instructions changed — safe, since they had no working callers. `build-sbf` clean
 (no stack regression); H-3 now passes end-to-end; full host suite 0 failed.
 
-- **H-2 and M-1** — verified by build-sbf + full host suite (0 failed) + source inspection. Dedicated negative tests remain a recommended follow-up.
+- **H-2** — `apply_fill_requires_haircut_accounts_when_enabled_h2`: enable the haircut engine, then settle with the haircut accounts omitted (None sentinels) → `Custom(7904)` HaircutNotInitialized; asserts no position is created.
+- **M-1** — `apply_flp_fill_band_tightened_rejects_ten_percent_m1`: an FLP fill priced +10% from the fresh oracle (inside the OLD 20% band, outside the new 3%) → `Custom(8205)` FlpPriceOutsideBand; asserts no position is created.
+- **Every Critical/High + both remediated Mediums (M-1, M-2) now has a dedicated test.** Only the constants/inspection items remain test-free by nature.
 - These remediations should themselves be **re-reviewed** (ideally by the external audit) — a fix can introduce new issues.
 
 ## Reproduce

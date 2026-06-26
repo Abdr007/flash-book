@@ -5631,3 +5631,163 @@ async fn flush_haircut_dust_debits_residual_h3() {
         "insurance credited by the flushed dust"
     );
 }
+
+/// H-2: once the haircut engine is enabled (initialize_haircut_state sets the
+/// sticky `haircut_enabled`), settlement may NOT omit the haircut accounts — a
+/// fill that passes the `None` sentinels routes realized PnL with no
+/// Residual/solvency gating. apply_fill must reject with HaircutNotInitialized
+/// (1904 → Custom(7904)).
+#[tokio::test]
+async fn apply_fill_requires_haircut_accounts_when_enabled_h2() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+
+    // Enable the haircut engine (sets sticky haircut_enabled = true).
+    let (haircut_state, _) = pda(&[
+        flash_book::state_v3::MarketHaircutStateAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitializeHaircutState {
+                    h_min_slots: 0,
+                    h_max_slots: 1,
+                    initial_residual_quote_lots: 0,
+                },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(haircut_state, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // apply_fill that OMITS the haircut accounts (program-id None sentinels) must
+    // now be rejected.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(protocol.insurance_fund, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
+            AccountMeta::new_readonly(flash_book::ID, false), // market_haircut None
+            AccountMeta::new_readonly(flash_book::ID, false), // taker_position_haircut None
+            AccountMeta::new_readonly(flash_book::ID, false), // maker_position_haircut None
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(7904)"),
+        "haircut-enabled apply_fill must reject when the haircut accounts are omitted (H-2), got: {dbg}"
+    );
+    let pos = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(pos.is_none(), "no position created after the H-2 rejection");
+}
+
+/// M-1: the FLP fill band was tightened 2000 bps (20%) → 300 bps (3%). A fill
+/// priced 10% from the fresh oracle — comfortably inside the OLD 20% band but
+/// outside the new 3% — must now be rejected with FlpPriceOutsideBand
+/// (2205 → Custom(8205)). Oracle = 100_000; posting 110_000 = +10%.
+#[tokio::test]
+async fn apply_flp_fill_band_tightened_rejects_ten_percent_m1() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader_state.as_ref(),
+    ]);
+
+    let ix = build_ix(
+        flash_book::instruction::ApplyFlpFill {
+            size_lots: 1,
+            price_ticks: 110_000, // +10% vs the 100_000 oracle: inside old 20%, outside new 3%
+            taker_side: 0,
+            taker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(protocol.insurance_fund, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
+            AccountMeta::new_readonly(flash_book::ID, false), // market_haircut None
+            AccountMeta::new_readonly(flash_book::ID, false), // taker_position_haircut None
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8205)"),
+        "a 10% FLP fill must be rejected by the tightened 3% band (M-1), got: {dbg}"
+    );
+    let pos = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(pos.is_none(), "no position created after the M-1 band rejection");
+}
