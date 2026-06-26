@@ -178,6 +178,10 @@ pub mod flash_book {
         let mut data = ctx.accounts.fill_commitment.try_borrow_mut_data()?;
         fc::buffer_init(&mut data, &market_key.to_bytes(), cap, bump)
             .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+        drop(data);
+
+        // C-1 fix: ARM the market — settlement now REQUIRES the ring (sticky).
+        ctx.accounts.market.fill_commitment_required = true;
 
         emit!(FillCommitmentInitializedEvent {
             market: market_key,
@@ -3516,9 +3520,17 @@ pub mod flash_book {
         // and settlement order must agree. Composes with the H1-A `fill_seq`
         // replay guard above.
         let fc_market_bytes = ctx.accounts.market.key().to_bytes();
-        if let Some(fc_acct) =
-            find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes)
-        {
+        let fc_opt =
+            find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes);
+        // C-1 (audit 2026-06) FIX: once a market is ARMED (`init_fill_commitment`
+        // sets `fill_commitment_required`), the ring is MANDATORY. The sequencer
+        // builds this tx; without this hard-require a compromised sequencer could
+        // simply omit the optional account and settle FABRICATED fills unguarded.
+        require!(
+            !ctx.accounts.market.fill_commitment_required || fc_opt.is_some(),
+            FlashBookError::FillCommitmentMissing
+        );
+        if let Some(fc_acct) = fc_opt {
             use matcher::fill_commitment as fc;
             let market_bytes = fc_market_bytes;
             let taker_bytes = ctx.accounts.taker_trader_state.load()?.trader.to_bytes();
@@ -10969,7 +10981,10 @@ pub struct InitFillCommitment<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
+    // C-1 fix: `mut` so the handler can set `fill_commitment_required = true`
+    // (arming the market makes the ring mandatory in apply_fill, sticky).
     #[account(
+        mut,
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
         constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,

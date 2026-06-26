@@ -3391,7 +3391,7 @@ async fn apply_fill_rejects_fabricated_fill_when_armed() {
         flash_book::instruction::InitFillCommitment {},
         vec![
             AccountMeta::new(payer.pubkey(), true), // authority (== market.authority)
-            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(market_pda, false),
             AccountMeta::new(fc_pda, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
@@ -3456,6 +3456,104 @@ async fn apply_fill_rejects_fabricated_fill_when_armed() {
         taker_acct.is_none(),
         "no taker position after a rejected fabricated apply_fill (#35)"
     );
+}
+
+/// C-1 (audit 2026-06) regression: on an ARMED market, an `apply_fill` that OMITS
+/// the fill_commitment account is HARD-REJECTED (`FillCommitmentMissing` = Anchor
+/// Custom(8206)). Before the fix, a compromised sequencer bypassed the entire
+/// anti-fabrication ring by simply not passing the optional account; now arming is
+/// sticky and the account is mandatory.
+#[tokio::test]
+async fn armed_apply_fill_rejects_when_commitment_account_omitted() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (fc_pda, _) = pda(&[
+        flash_book::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market_pda.as_ref(),
+    ]);
+
+    // Arm the market.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitFillCommitment {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(fc_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Sequencer settles WITHOUT the fill_commitment account in remaining_accounts.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            // NO fill_commitment account — the bypass C-1 closes.
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8206)"),
+        "armed apply_fill must reject when the commitment account is omitted (C-1), got: {dbg}"
+    );
+    // Rolled back: no taker position.
+    let taker_acct = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(taker_acct.is_none(), "no position after C-1 rejection");
 }
 
 /// #35 / H1 part B — HONEST PATH, end-to-end on the v2 hypertree book:
@@ -3536,7 +3634,7 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
             flash_book::instruction::InitFillCommitment {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
                 AccountMeta::new_readonly(system_program::ID, false),
             ],
@@ -3978,7 +4076,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             flash_book::instruction::InitFillCommitment {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
                 AccountMeta::new_readonly(system_program::ID, false),
             ],
@@ -4543,7 +4641,7 @@ async fn er_delegation_rejects_non_authority() {
             flash_book::instruction::InitFillCommitment {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
                 AccountMeta::new_readonly(system_program::ID, false),
             ],
@@ -4569,7 +4667,7 @@ async fn er_delegation_rejects_non_authority() {
             },
             vec![
                 AccountMeta::new(rogue.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
                 AccountMeta::new_readonly(flash_book::ID, false), // owner_program
                 AccountMeta::new(d1, false),                      // delegate_buffer
@@ -4596,7 +4694,7 @@ async fn er_delegation_rejects_non_authority() {
             flash_book::instruction::UndelegateFillCommitment {},
             vec![
                 AccountMeta::new(rogue.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
                 AccountMeta::new_readonly(flash_book::ID, false),
                 AccountMeta::new(d1, false),

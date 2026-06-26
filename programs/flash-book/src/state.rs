@@ -326,6 +326,15 @@ pub struct MarketAccount {
     /// existing `space()` headroom (no size change); pre-existing markets read
     /// back 0 (Borsh zero-slack), so the first real fill (`fill_seq` ≥ 1) passes.
     pub last_settlement_seq: u64,
+    /// C-1 (audit 2026-06): sticky flag — once `init_fill_commitment` arms this
+    /// market, the fill-commitment ring becomes MANDATORY in `apply_fill`, so a
+    /// (compromised) sequencer can no longer bypass the anti-fabrication guard by
+    /// omitting the optional ring account. Additive migration: pre-existing
+    /// markets read back `false` (legacy optional behaviour).
+    /// MERGE NOTE: a parallel branch also adds additive `MarketAccount` fields
+    /// (e.g. `book_delegated_at_slot`); reconcile the field ORDER on merge so the
+    /// Borsh layout is consistent across both.
+    pub fill_commitment_required: bool,
 }
 
 // H1: build-time guard — the struct (incl. the new nonce) must still fit the
