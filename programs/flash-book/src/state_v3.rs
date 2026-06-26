@@ -122,9 +122,11 @@ impl TwapOrderAccountV3 {
     pub const SEED: &'static [u8] = b"twap_v3";
     pub const FLAG_ACTIVE: u8 = 1 << 0;
     pub fn space() -> usize {
-        // 8 disc + 32+32+1+1+1+1 + 8×8 + 1 sub + 8 acceptable + 7 reserved = 144.
-        // Existing space 8 + 144 = 152 → fits.
-        8 + 144
+        // H-8 (audit 2026-06): body = 32+32 + 4×u8 + 8×u64 + 1 sub + 8 acceptable
+        // + 7 reserved = 64+4+64+1+8+7 = 148 (the old comment miscounted as 144,
+        // returning 152 < the 156 a full account needs → AccountDidNotSerialize on
+        // a populated V3 TWAP). Correct size is 8 + 148.
+        8 + 148
     }
 }
 

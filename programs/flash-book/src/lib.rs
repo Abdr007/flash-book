@@ -5234,6 +5234,21 @@ pub mod flash_book {
             validate_leg_intake(&market, &legs[i])?;
             check_caps_for_leg(&market, &position, &ctx.accounts.flp_exposure, &legs[i])?;
 
+            // H-7 (audit 2026-06) FIX: bind this leg's position to the CANONICAL
+            // PDA for (leg market, signing trader_state). The 2-leg `PlaceBasketOrderV2`
+            // PDA-binds via Anchor seeds; this N-leg path did not. Without it, an
+            // attacker passed a small/empty PositionAccount so the margin lattice saw
+            // ~no exposure (healthy), while the leg injects tagged to the trader_state
+            // and the fill accrues to their REAL large, unassessed position →
+            // undercollateralized. Derivation is in an #[inline(never)] helper so its
+            // stack stays out of this (large) handler's BPF frame.
+            require_canonical_position_pda(
+                &m_ai.key(),
+                &ctx.accounts.trader_state.key(),
+                &pos_ai.key(),
+                program_id,
+            )?;
+
             if position.size_lots > 0 {
                 require!(position.trader == trader_key, FlashBookError::WrongTrader);
                 require!(position.market == m_ai.key(), FlashBookError::WrongMarket);
@@ -6249,6 +6264,25 @@ pub mod flash_book {
         // here: the quoter's inputs drift between ER quote-time and L1 settle-time,
         // so re-deriving would reject legitimate fills). Enforced only when a live
         // oracle anchors it (`oracle == 0` returns true → skipped, cannot verify).
+        //
+        // H-1 (audit 2026-06) FIX: the band is only meaningful against a FRESH
+        // oracle. Every other oracle-consuming path checks staleness; this one did
+        // not, so a compromised sequencer could settle FLP fills against a STALE
+        // frozen anchor (passing the band) while the real market had moved, draining
+        // the pool. When a staleness bound is configured, require the oracle fresh
+        // (and treat `published_at == 0` as stale → reject). `max_age == 0` is the
+        // operator's explicit "no staleness gate" (tracked separately as L-5).
+        {
+            let max_age = ctx.accounts.market.params.oracle_staleness_max_seconds as u64;
+            if max_age > 0 {
+                let now = Clock::get()?.unix_timestamp.max(0) as u64;
+                let published = ctx.accounts.market.oracle_published_at_unix_seconds;
+                require!(
+                    published != 0 && now.saturating_sub(published) <= max_age,
+                    FlashBookError::OracleTooStale
+                );
+            }
+        }
         require!(
             matcher::flp_quoter::price_within_band(
                 ctx.accounts.market.oracle_price_ticks,
@@ -8721,6 +8755,18 @@ pub mod flash_book {
         let live_nav = ctx.accounts.vault_trader_state.load()?.collateral_quote_lots as u128;
         require!(live_nav > 0, FlashBookError::InsufficientCollateral);
 
+        // H-6 (audit 2026-06) FIX: a v3 vault holds open positions
+        // (`vault_place_order_v3`), and `live_nav = collateral_quote_lots` ignores
+        // unrealized loss. Without a gate, early depositors burn shares and exit at
+        // the inflated NAV, pulling the collateral that backs the open position and
+        // socializing the loss onto remaining depositors (a run on an insolvent
+        // vault) — and could drop collateral below maintenance with no IM check.
+        // Require the vault FLAT for redemptions, mirroring `settle_vault_perf_fee`.
+        require!(
+            ctx.accounts.vault_trader_state.load()?.open_positions == 0,
+            FlashBookError::SweepRequiresFlat
+        );
+
         let amount_u128 = (shares_to_burn as u128)
             .checked_mul(live_nav)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
@@ -9795,6 +9841,17 @@ pub mod flash_book {
             .dust_accrued_quote_lots
             .checked_sub(dust_u64 as u128)
             .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+
+        // H-3 (audit 2026-06) FIX: the dust just moved into insurance (ΔI=+dust),
+        // so the Residual identity `Residual = V − C_tot − I` demands ΔResidual =
+        // −dust (the contract table in `matcher::haircut`). `convert_position`
+        // debits Residual only by `credit`, so the dust portion stays in Residual;
+        // without this debit it is double-counted, inflating `h` and letting
+        // traders convert matured PnL beyond the protocol's real backing.
+        market_haircut.residual_quote_lots = market_haircut
+            .residual_quote_lots
+            .checked_sub(dust_u64 as u128)
+            .ok_or_else(|| error!(FlashBookError::HaircutResidualUnderflow))?;
 
         emit!(HaircutDustFlushedEvent {
             market: market_haircut.market,
@@ -14946,6 +15003,30 @@ fn verify_position_pda(
     )
     .map_err(|_| error!(FlashBookError::OutOfRange))?;
     require_keys_eq!(expected, *actual, FlashBookError::WrongTrader);
+    Ok(())
+}
+
+/// H-7 (audit 2026-06): assert `actual` IS the canonical position PDA for
+/// `(market, trader_state)`, deriving the canonical bump itself (so it also accepts
+/// a fresh, not-yet-initialized position whose stored `bump` is 0 — `verify_position_pda`
+/// needs a known bump and so can't be used for the open-via-basket case). `#[inline(never)]`
+/// keeps `find_program_address`'s stack out of the caller's BPF frame.
+#[inline(never)]
+fn require_canonical_position_pda(
+    market_key: &Pubkey,
+    trader_state_key: &Pubkey,
+    actual: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<()> {
+    let (expected, _) = Pubkey::find_program_address(
+        &[
+            state::PositionAccount::SEED,
+            market_key.as_ref(),
+            trader_state_key.as_ref(),
+        ],
+        program_id,
+    );
+    require_keys_eq!(*actual, expected, FlashBookError::WrongTrader);
     Ok(())
 }
 
