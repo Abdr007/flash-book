@@ -2193,13 +2193,11 @@ pub mod flash_book {
     /// 30-day rolling notional — the universal pattern at every CEX
     /// (Binance, OKX, Bybit, Hyperliquid).
     ///
-    /// `discount_bps` is bounded to `MAX_FEE_DISCOUNT_BPS` = 12_000 (120%).
-    /// Values up to 10_000 are a normal discount (down to zero fee);
-    /// 10_000..12_000 enable HL/MM-pro top-tier NEGATIVE fees — the
-    /// taker is *paid* for routing flow, with the rebate sourced from
-    /// the protocol's own insurance contribution. Apply_fill clamps the
-    /// rebate so the trader never extracts more than `max(rebate)` of
-    /// notional, and the math respects the maker rebate priority.
+    /// `discount_bps` is bounded to `MAX_FEE_DISCOUNT_BPS` = 10_000 (100%) —
+    /// a discount can reach a zero taker fee but never a negative one.
+    /// M-5 (audit 2026-06): the old 12_000 cap allowed a negative top-tier
+    /// fee whose rebate was credited but never debited (unbacked mint); the
+    /// tier is removed by capping at 100%. See `constants::MAX_FEE_DISCOUNT_BPS`.
     pub fn set_trader_fee_tier(
         ctx: Context<SetTraderFeeTier>,
         discount_bps: u32,

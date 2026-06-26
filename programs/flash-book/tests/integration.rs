@@ -5791,3 +5791,61 @@ async fn apply_flp_fill_band_tightened_rejects_ten_percent_m1() {
     let pos = ctx.banks_client.get_account(taker_pos).await.unwrap();
     assert!(pos.is_none(), "no position created after the M-1 band rejection");
 }
+
+/// M-5: the negative-fee tier is removed by capping `MAX_FEE_DISCOUNT_BPS` at
+/// 10_000 (100%). A discount above 100% (which previously minted an unbacked
+/// taker rebate) must now be rejected at `set_trader_fee_tier` with OutOfRange
+/// (1003 → Custom(7003)); a 100% discount (zero fee, no negative) is still
+/// accepted.
+#[tokio::test]
+async fn set_trader_fee_tier_rejects_negative_fee_m5() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, _market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 100_000, &protocol).await;
+
+    let set_tier = |discount_bps: u32| {
+        build_ix(
+            flash_book::instruction::SetTraderFeeTier { discount_bps },
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true), // protocol authority
+                AccountMeta::new_readonly(protocol.insurance_fund, false),
+                AccountMeta::new(trader_state, false),
+            ],
+        )
+    };
+
+    // A >100% discount (negative fee) must be rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let neg = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[set_tier(10_001)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{neg:?}");
+    assert!(
+        dbg.contains("Custom(7003)"),
+        "a >100% fee discount (unbacked negative fee) must be rejected (M-5), got: {dbg}"
+    );
+
+    // Exactly 100% (zero fee, never negative) is still accepted.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[set_tier(10_000)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .expect("a 100% discount (zero fee) must still be accepted");
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(ts.fee_discount_bps, 10_000, "100% discount persisted");
+}

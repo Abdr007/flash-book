@@ -9,14 +9,21 @@ pub const USD_UNIT: u64 = 1_000_000;
 /// Basis points denominator. 1 bp = 1/10_000.
 pub const BPS_DENOM: u32 = 10_000;
 
-/// Maximum fee discount allowed via `set_trader_fee_tier`. Values up to
-/// 10_000 (100%) zero out the taker fee; values 10_001..=12_000 enable
-/// HL/MM-pro top-tier NEGATIVE fees — the taker is *paid* for routing
-/// flow. Apply_fill clamps the resulting rebate so the protocol never
-/// pays out more than its insurance contribution can absorb. 12_000 =
-/// 120% means the maximum negative fee is 20% of the base taker fee
-/// (e.g. 5 bps base × -0.2 = -1 bps rebate to taker).
-pub const MAX_FEE_DISCOUNT_BPS: u32 = 12_000;
+/// Maximum fee discount allowed via `set_trader_fee_tier`. Capped at
+/// 10_000 (100%) — a discount zeroes out the taker fee but can never make
+/// it negative.
+///
+/// M-5 (audit 2026-06) FIX: was 12_000 (120%), which enabled a NEGATIVE
+/// top-tier fee (taker *paid* for flow). The doc claimed the rebate was
+/// "sourced from the protocol's insurance contribution", but the apply_fill
+/// path computed it with a `saturating_sub` that floors at zero — so the
+/// >100% rebate credited the taker collateral that was NEVER debited from
+/// insurance/Residual: an unbacked mint. Capping at 100% removes the
+/// negative-fee tier (and the mint) entirely; the maker rebate
+/// (`maker_rebate_bps`) is a separate, properly-funded path and is
+/// unaffected. If negative taker fees are wanted later, they must debit a
+/// real source and revert if uncovered (the deferred option B).
+pub const MAX_FEE_DISCOUNT_BPS: u32 = 10_000;
 
 /// WAVE 22: hard cap on any single tier's `taker_fee_bps` or
 /// `maker_rebate_bps`. 1_000 bps = 10% — well above HL's worst-tier

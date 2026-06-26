@@ -42,13 +42,22 @@ authenticity control disable-able by the tx-builder. Both now use a sticky
 | **M-2** | Self-liquidation skims the Dutch-auction reward ahead of the insurance `cover_bad_debt` draw | **FIXED** — `liquidate_position_v2` requires `caller != liquidatee` (`SelfLiquidationForbidden = 2208`). |
 | **M-3** | v3 FLP (`flp_deposit_v3`/`flp_withdraw_v3`) missing H8 min-hold + undercollateralization guard | **DEFERRED (latent)** — v3 FLP exposure not yet wired into matching. Port `deposited_at_slot`/`can_withdraw` + `FlpWithdrawUndercollateralized` *before* wiring. Becomes High the moment it is wired. |
 | **M-4** | No global cross-domain solvency invariant on the shared `quote_vault` | **DEFERRED (design)** — needs a documented `Σledgers == vault.amount` invariant (proof/test) and/or pool segregation. Structural; not a one-line guard. |
-| **M-5** | Negative-fee tier (`MAX_FEE_DISCOUNT_BPS=12000`) mints unbacked rebate credit | **DEFERRED (product decision)** — two options: (a) cap to `10_000` (disables negative fees entirely — removes a maker-incentive feature), or (b) source the rebate from a real insurance/Residual debit and revert if uncovered. Authority-gated footgun; needs the team's call on (a) vs (b). |
+| **M-5** | Negative-fee tier (`MAX_FEE_DISCOUNT_BPS=12000`) mints unbacked rebate credit | **FIXED** — capped `MAX_FEE_DISCOUNT_BPS` 12000→**10000** (100%). A discount can zero the taker fee but never make it negative, so the unbacked-mint path is gone; `maker_rebate_bps` (separately funded) is unaffected. Chose the cap over insurance-sourcing because making a cosmetic taker rebate draw from the bad-debt backstop is the wrong trade for a solvency-critical DEX. Tested. |
 | **M-6** | Arena-exhaustion DoS / no per-trader order cap (#36 sybil) | **DEFERRED (larger)** — wire `ClaimedSeatV2.open_orders_count` (currently dead code) or add per-order rent. Multi-site change to the place/reap paths. |
 | **M-7** | N-leg basket assesses only touched markets → cross-margin understatement | **DEFERRED (scope rework)** — assess against the trader's full `open_positions`, not just the basket legs; changes the assess call's account set. |
-| **M-8** | `MAX_POSITIONS_PER_TRADER`/`MAX_STRESS_SCENARIOS` unenforced → O(N²) un-liquidatable trader | **DEFERRED (placement vs settlement)** — enforce at order **placement** (not in `apply_fill`: a revert there would strand a committed fill in the #35 ring → DoS). Needs the trader's open-position count + same-market check at intake. |
+| **M-8** | `MAX_POSITIONS_PER_TRADER`/`MAX_STRESS_SCENARIOS` unenforced → O(N²) un-liquidatable trader | **DEFERRED (needs an architectural fix — no safe surgical guard exists)** — see analysis below. |
 
-The two FIXED Mediums (M-1, M-2) are constant/guard changes — safe and verified
-(build-sbf clean, full host suite 0 failed). The six DEFERRED are each structural,
+### M-8 — why there is no safe localized guard (investigated 2026-06)
+Every surgical enforcement point fails on the v2 CLOB:
+- **`apply_fill` (the 0→nonzero transition):** the only airtight point, but a `require!` revert there strands the already-pushed `#35` fill commitment in the per-market ring → `FillRingFull` → settlement wedged. DoS on any armed (production) market.
+- **Order placement on `trader_state.open_positions`:** v2 has **no reduce-only** (bit1 is rejected at intake, lib.rs:687), so a "block orders at the cap" rule also blocks a maxed trader from *closing* — worsening the very un-liquidatable state it's meant to prevent. Distinguishing open-vs-close needs the per-market position account (not in the placement context today).
+- **Placement count-check even with the position account is leaky (TOCTOU):** two new-market limit orders placed while `open_positions==15` both rest, then both match → 17. Placement-time counts don't bound settlement-time outcomes.
+
+**Required fix (feature-level, flagged for the team / external audit):** the v2 **matcher** must refuse a match that would open a trader's `(MAX+1)`th position *before* the fill is rung (needs per-trader open-position awareness in the match path), **or** settlement must be made tolerant of a skipped/rejected fill (drain-and-continue instead of revert). Either is a real change to the matching/ring core, not a remediation-sized guard — so it is intentionally **not** attempted here.
+
+The three FIXED Mediums (M-1, M-2, M-5) are constant/guard changes — safe, verified
+(build-sbf clean, full host suite 0 failed), each with a dedicated test. The five
+DEFERRED are each structural,
 a product decision, or carry a settlement/ring-safety risk that a one-line guard
 can't satisfy — they're documented with the exact recommended fix above rather than
 rushed in. **None is an anonymous single-tx drain.**
@@ -95,7 +104,8 @@ instructions changed — safe, since they had no working callers. `build-sbf` cl
 
 - **H-2** — `apply_fill_requires_haircut_accounts_when_enabled_h2`: enable the haircut engine, then settle with the haircut accounts omitted (None sentinels) → `Custom(7904)` HaircutNotInitialized; asserts no position is created.
 - **M-1** — `apply_flp_fill_band_tightened_rejects_ten_percent_m1`: an FLP fill priced +10% from the fresh oracle (inside the OLD 20% band, outside the new 3%) → `Custom(8205)` FlpPriceOutsideBand; asserts no position is created.
-- **Every Critical/High + both remediated Mediums (M-1, M-2) now has a dedicated test.** Only the constants/inspection items remain test-free by nature.
+- **M-5** — `set_trader_fee_tier_rejects_negative_fee_m5`: a >100% fee discount → `Custom(7003)` OutOfRange; a 100% discount (zero fee) still persists.
+- **Every Critical/High + all three remediated Mediums (M-1, M-2, M-5) now has a dedicated test.** Only the deferred design items remain.
 - These remediations should themselves be **re-reviewed** (ideally by the external audit) — a fix can introduce new issues.
 
 ## Reproduce
