@@ -983,6 +983,11 @@ pub mod flash_book {
             Vec::with_capacity(TYPICAL_WALK_DEPTH);
         let mut stp_cancels: Vec<hypertree::DataIndex> = Vec::new();
         let mut stp_aborted = false;
+        // M1 (audit 2026-06): set when the walk stops because it hit `walk_limit`
+        // (NOT because crossing liquidity was exhausted). In that case unmatched
+        // crossing orders may remain on the book, so the residual must NOT rest at
+        // `limit_ticks` (it would cross the book). See the residual-rest guard.
+        let mut walk_truncated = false;
         let walk_limit = MAX_BATCH_ORDERS_PER_SIDE_V2;
 
         // Always walk to detect crossings. post_only check happens
@@ -991,7 +996,7 @@ pub mod flash_book {
         // cross conditions.
         if side_is_bid {
             handle.for_each_ask_best_first(|idx, ask| {
-                if matches.len() >= walk_limit { return false; }
+                if matches.len() >= walk_limit { walk_truncated = true; return false; }
                 if remaining == 0 { return false; }
                 if ask.price_ticks > limit_ticks { return false; }
                 if ask.expires_at_slot > 0 && now_slot > ask.expires_at_slot { return true; }
@@ -1015,7 +1020,7 @@ pub mod flash_book {
             });
         } else {
             handle.for_each_bid_best_first(|idx, bid| {
-                if matches.len() >= walk_limit { return false; }
+                if matches.len() >= walk_limit { walk_truncated = true; return false; }
                 if remaining == 0 { return false; }
                 if bid.price_ticks < limit_ticks { return false; }
                 if bid.expires_at_slot > 0 && now_slot > bid.expires_at_slot { return true; }
@@ -1156,6 +1161,7 @@ pub mod flash_book {
         // `price_within_band` returns true when `oracle_price_ticks == 0`.
         if remaining > 0
             && !ioc
+            && !walk_truncated
             && remaining >= p.min_base_lots
             && matcher::flp_quoter::price_within_band(
                 market.oracle_price_ticks,
