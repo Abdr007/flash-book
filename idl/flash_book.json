@@ -1213,6 +1213,124 @@
       ]
     },
     {
+      "name": "cancel_order_v2_session",
+      "docs": [
+        "SESSION-KEY cancel (additive): an ephemeral `session_signer` cancels an",
+        "order owned by `session_token.owner` (verified + unexpired). Same core",
+        "logic via `cancel_v2_core`; only the identity source differs."
+      ],
+      "discriminator": [
+        36,
+        186,
+        245,
+        60,
+        149,
+        208,
+        80,
+        108
+      ],
+      "accounts": [
+        {
+          "name": "session_signer",
+          "signer": true
+        },
+        {
+          "name": "session_token",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  101,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "session_token.owner",
+                "account": "SessionTokenAccount"
+              },
+              {
+                "kind": "account",
+                "path": "session_signer"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "order_id",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "cancel_trigger_order",
       "docs": [
         "Cancel a trigger order. Trader signs; account is closed and rent",
@@ -1974,6 +2092,76 @@
         }
       ],
       "args": []
+    },
+    {
+      "name": "create_session_token",
+      "docs": [
+        "Create a SESSION KEY: authorize `session_signer` to trade for the signing",
+        "owner until `now + ttl_seconds` (capped at `MAX_SESSION_TTL_SECONDS`). The",
+        "session can only place/cancel via the `*_session` variants — never withdraw",
+        "or move collateral. Revocable any time via `revoke_session_token`."
+      ],
+      "discriminator": [
+        173,
+        88,
+        67,
+        107,
+        92,
+        144,
+        1,
+        154
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "session_signer",
+          "docs": [
+            "no signature is required from it here."
+          ]
+        },
+        {
+          "name": "session_token",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  101,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              },
+              {
+                "kind": "account",
+                "path": "session_signer"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "ttl_seconds",
+          "type": "i64"
+        }
+      ]
     },
     {
       "name": "create_vault_v3",
@@ -7331,6 +7519,149 @@
       ]
     },
     {
+      "name": "place_limit_order_v2_session",
+      "docs": [
+        "SESSION-KEY path (additive): an ephemeral `session_signer` places an order",
+        "for `session_token.owner` (verified + unexpired), so a client trading on",
+        "the ER need not sign every order with the cold wallet. IDENTICAL matching",
+        "logic to `place_limit_order_v2` — both call the same `place_limit_v2_core`,",
+        "differing only in how the trader identity is authenticated."
+      ],
+      "discriminator": [
+        158,
+        209,
+        45,
+        26,
+        220,
+        65,
+        110,
+        180
+      ],
+      "accounts": [
+        {
+          "name": "session_signer",
+          "docs": [
+            "The ephemeral session key. Must equal `session_token.session_signer`."
+          ],
+          "signer": true
+        },
+        {
+          "name": "session_token",
+          "docs": [
+            "The session authorization, owned by the real trader."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  101,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "session_token.owner",
+                "account": "SessionTokenAccount"
+              },
+              {
+                "kind": "account",
+                "path": "session_signer"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "flags",
+          "type": "u8"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
+        },
+        {
+          "name": "sub_index",
+          "type": "u8"
+        }
+      ]
+    },
+    {
       "name": "place_taker_order_v2",
       "docs": [
         "Immediate CLOB-style placement — walks the opposite-side book at",
@@ -8153,6 +8484,62 @@
         {
           "name": "iceberg_order",
           "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "revoke_session_token",
+      "docs": [
+        "Revoke a session key immediately (closes the token, rent back to owner)."
+      ],
+      "discriminator": [
+        31,
+        32,
+        234,
+        12,
+        146,
+        70,
+        103,
+        117
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "session_token"
+          ]
+        },
+        {
+          "name": "session_token",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  101,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              },
+              {
+                "kind": "account",
+                "path": "session_token.session_signer",
+                "account": "SessionTokenAccount"
+              }
+            ]
+          }
         }
       ],
       "args": []
@@ -13206,6 +13593,19 @@
       ]
     },
     {
+      "name": "SessionTokenAccount",
+      "discriminator": [
+        239,
+        163,
+        141,
+        28,
+        45,
+        7,
+        85,
+        51
+      ]
+    },
+    {
       "name": "TraderStateAccount",
       "discriminator": [
         80,
@@ -14508,6 +14908,19 @@
       ]
     },
     {
+      "name": "SessionTokenEvent",
+      "discriminator": [
+        137,
+        130,
+        15,
+        140,
+        54,
+        12,
+        123,
+        209
+      ]
+    },
+    {
       "name": "SideAccrualInitializedEvent",
       "discriminator": [
         39,
@@ -15387,6 +15800,11 @@
       "code": 8211,
       "name": "BookNotDelegated",
       "msg": "Market book is not delegated; nothing to stamp a liveness baseline for (F1)"
+    },
+    {
+      "code": 8212,
+      "name": "SessionExpired",
+      "msg": "Session token expired (or not yet valid); re-create the session key"
     }
   ],
   "types": [
@@ -20402,6 +20820,67 @@
           {
             "name": "new_residual",
             "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SessionTokenAccount",
+      "docs": [
+        "A revocable, auto-expiring authorization for `session_signer` to act for",
+        "`owner`. 73 bytes + 8 disc."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "docs": [
+              "The real trader the session acts on behalf of."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "session_signer",
+            "docs": [
+              "The ephemeral key allowed to sign session-authorized instructions."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "expires_at_unix",
+            "docs": [
+              "Unix seconds after which the session is invalid (checked on every use)."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SessionTokenEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "session_signer",
+            "type": "pubkey"
+          },
+          {
+            "name": "expires_at_unix",
+            "type": "i64"
+          },
+          {
+            "name": "revoked",
+            "type": "bool"
           }
         ]
       }

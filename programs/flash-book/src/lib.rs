@@ -19,6 +19,7 @@ pub mod constants;
 pub mod er;
 pub mod er_permission;
 pub mod errors;
+pub mod session;
 pub mod hypertree;
 pub mod matcher;
 pub mod state;
@@ -899,119 +900,94 @@ pub mod flash_book {
         expires_at_slot: u64,
         sub_index: u8,
     ) -> Result<()> {
-        // ── Hot-path validation (collapsed). Single Clock::get(), one
-        // bounded match per family of inputs. Branch order matches
-        // empirical frequency: malformed inputs rare → fast-path through.
-        let market = &ctx.accounts.market;
-        let now_slot = Clock::get()?.slot;
-
-        // Fast input guards (most-common-pass first).
-        if side > 1
-            || size_lots == 0
-            || limit_ticks == 0
-            || (flags & !0b0111_1111) != 0
-            // H4: reduce_only (bit1) is NOT enforced on the v2 CLOB (there is no
-            // settlement-time reduce-only check; matcher::reduce_only is uncalled).
-            // Reject it LOUDLY so a trader cannot set a "protective close" that
-            // would silently OPEN or FLIP a position. (Full enforcement = separate feature.)
-            || (flags & 0b0000_0010) != 0
-        {
-            return err!(FlashBookError::OutOfRange);
-        }
-        if expires_at_slot != 0 && expires_at_slot <= now_slot {
-            return err!(FlashBookError::OutOfRange);
-        }
-
-        // Market-state guards.
-        let p = &market.params;
-        if market.status != MarketStatus::Active as u8
-            && market.status != MarketStatus::PostOnly as u8
-        {
-            return err!(FlashBookError::OutOfRange);
-        }
-        if size_lots < p.min_base_lots {
-            return err!(FlashBookError::SizeBelowMinLot);
-        }
-        if limit_ticks % p.tick_size != 0 {
-            return err!(FlashBookError::PriceNotOnTick);
-        }
-
-        // #36 anti-stuffing: a RESTING limit must sit within the band of the fresh
-        // oracle. Far-from-market orders never fill, so they are cheap to spam and
-        // are the node-arena-exhaustion vector; the band forces a resting order
-        // close enough to market to bear real fill risk. `price_within_band`
-        // returns true when `oracle_price_ticks == 0` (no anchor → skipped).
-        if !matcher::flp_quoter::price_within_band(
-            market.oracle_price_ticks,
+        // Cold-wallet path: the trader signs directly (unchanged behaviour).
+        place_limit_v2_core(
+            &ctx.accounts.market,
+            &ctx.accounts.market_book,
+            ctx.accounts.trader.key(),
+            side,
+            size_lots,
             limit_ticks,
-            crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS,
-        ) {
-            return err!(FlashBookError::RestingOrderTooFarFromOracle);
-        }
-
-        // Per-market OI hard cap (cold for most markets — oi_cap == 0).
-        let oi_cap = p.max_oi_base_lots;
-        if oi_cap > 0 {
-            let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
-            if cur.saturating_add(size_lots) > oi_cap {
-                return err!(FlashBookError::OpenInterestCapExceeded);
-            }
-        }
-
-        let trader_pk = ctx.accounts.trader.key();
-        let market_key = market.key();
-
-        // Borrow the market_book account data + load the handle.
-        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
-        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
-        if handle.header.market_pubkey != market_key {
-            return err!(FlashBookError::WrongMarket);
-        }
-
-        // Allocate seq + build the resting order.
-        let seq = handle
-            .header
-            .order_seq_counter
-            .checked_add(1)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        handle.header.order_seq_counter = seq;
-
-        let side_is_bid = side == 0;
-        let order = state_v2::RestingOrderV2 {
-            order_id: state_v2::encode_order_id(limit_ticks, seq, side_is_bid),
-            seq,
-            price_ticks: limit_ticks,
-            size_lots,
-            expires_at_slot,
-            trader: trader_pk,
-            last_valid_slot: u32::try_from(now_slot).unwrap_or(u32::MAX),
-            side,
-            order_type: 0, // 0 = limit (the only kind for now)
             flags,
-            // Phase 2e — written from the ix param so ApplyFill can
-            // resolve the correct TraderState (main or sub) when this
-            // order matches as a maker. 0 = main (default).
+            expires_at_slot,
             sub_index,
-        };
+        )
+    }
 
-        let inserted_idx = if side_is_bid {
-            handle.insert_bid(order)?
-        } else {
-            handle.insert_ask(order)?
-        };
-
-        emit!(OrderPlacedV2Event {
-            market: market_key,
-            trader: trader_pk,
-            seq,
+    /// SESSION-KEY path (additive): an ephemeral `session_signer` places an order
+    /// for `session_token.owner` (verified + unexpired), so a client trading on
+    /// the ER need not sign every order with the cold wallet. IDENTICAL matching
+    /// logic to `place_limit_order_v2` — both call the same `place_limit_v2_core`,
+    /// differing only in how the trader identity is authenticated.
+    pub fn place_limit_order_v2_session(
+        ctx: Context<PlaceLimitOrderV2Session>,
+        side: u8,
+        size_lots: u64,
+        limit_ticks: u64,
+        flags: u8,
+        expires_at_slot: u64,
+        sub_index: u8,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        session::verify(
+            &ctx.accounts.session_token,
+            ctx.accounts.session_signer.key(),
+            now,
+        )?;
+        place_limit_v2_core(
+            &ctx.accounts.market,
+            &ctx.accounts.market_book,
+            ctx.accounts.session_token.owner,
             side,
-            price_ticks: limit_ticks,
             size_lots,
-            node_index: inserted_idx,
-            total_orders_after: handle.header.total_orders_active,
+            limit_ticks,
+            flags,
+            expires_at_slot,
+            sub_index,
+        )
+    }
+
+    /// Create a SESSION KEY: authorize `session_signer` to trade for the signing
+    /// owner until `now + ttl_seconds` (capped at `MAX_SESSION_TTL_SECONDS`). The
+    /// session can only place/cancel via the `*_session` variants — never withdraw
+    /// or move collateral. Revocable any time via `revoke_session_token`.
+    pub fn create_session_token(
+        ctx: Context<CreateSessionToken>,
+        ttl_seconds: i64,
+    ) -> Result<()> {
+        require!(
+            ttl_seconds > 0 && ttl_seconds <= session::MAX_SESSION_TTL_SECONDS,
+            FlashBookError::OutOfRange
+        );
+        let now = Clock::get()?.unix_timestamp;
+        let expires_at_unix = now
+            .checked_add(ttl_seconds)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let token = &mut ctx.accounts.session_token;
+        token.owner = ctx.accounts.owner.key();
+        token.session_signer = ctx.accounts.session_signer.key();
+        token.expires_at_unix = expires_at_unix;
+        token.bump = ctx.bumps.session_token;
+        emit!(SessionTokenEvent {
+            owner: token.owner,
+            session_signer: token.session_signer,
+            expires_at_unix,
+            revoked: false,
         });
         Ok(())
     }
+
+    /// Revoke a session key immediately (closes the token, rent back to owner).
+    pub fn revoke_session_token(ctx: Context<RevokeSessionToken>) -> Result<()> {
+        emit!(SessionTokenEvent {
+            owner: ctx.accounts.session_token.owner,
+            session_signer: ctx.accounts.session_token.session_signer,
+            expires_at_unix: ctx.accounts.session_token.expires_at_unix,
+            revoked: true,
+        });
+        Ok(())
+    }
+
 
     /// Immediate CLOB-style placement — walks the opposite-side book at
     /// the maker's resting price (strict price-time priority) and matches
@@ -1389,52 +1365,37 @@ pub mod flash_book {
         side: u8,
         order_id: u64,
     ) -> Result<()> {
-        if side > 1 {
-            return err!(FlashBookError::OutOfRange);
-        }
-        let trader_pk = ctx.accounts.trader.key();
-        let market_key = ctx.accounts.market.key();
-
-        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
-        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
-        if handle.header.market_pubkey != market_key {
-            return err!(FlashBookError::WrongMarket);
-        }
-
-        let side_is_bid = side == 0;
-        let idx = if side_is_bid {
-            handle.lookup_bid_by_order_id(order_id)
-        } else {
-            handle.lookup_ask_by_order_id(order_id)
-        };
-        if idx == crate::hypertree::NIL {
-            return err!(FlashBookError::LiquidationStale);
-        }
-
-        // Ownership check — only the original trader can cancel.
-        let order_seq = {
-            let order = handle.order_at(idx);
-            if order.trader != trader_pk {
-                return err!(FlashBookError::WrongTrader);
-            }
-            order.seq
-        };
-
-        if side_is_bid {
-            handle.remove_bid_node(idx);
-        } else {
-            handle.remove_ask_node(idx);
-        }
-
-        emit!(OrderCancelledV2Event {
-            market: market_key,
-            trader: trader_pk,
-            order_seq,
+        // Cold-wallet path: the trader signs directly (unchanged behaviour).
+        cancel_v2_core(
+            &ctx.accounts.market_book,
+            ctx.accounts.market.key(),
+            ctx.accounts.trader.key(),
             side,
-            node_index: idx,
-            total_orders_after: handle.header.total_orders_active,
-        });
-        Ok(())
+            order_id,
+        )
+    }
+
+    /// SESSION-KEY cancel (additive): an ephemeral `session_signer` cancels an
+    /// order owned by `session_token.owner` (verified + unexpired). Same core
+    /// logic via `cancel_v2_core`; only the identity source differs.
+    pub fn cancel_order_v2_session(
+        ctx: Context<CancelOrderV2Session>,
+        side: u8,
+        order_id: u64,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        session::verify(
+            &ctx.accounts.session_token,
+            ctx.accounts.session_signer.key(),
+            now,
+        )?;
+        cancel_v2_core(
+            &ctx.accounts.market_book,
+            ctx.accounts.market.key(),
+            ctx.accounts.session_token.owner,
+            side,
+            order_id,
+        )
     }
 
     /// Permissionless expiry-reaper (#36 anti-book-stuffing). Removes GTT orders
@@ -10736,6 +10697,191 @@ pub mod flash_book {
     }
 }
 
+/// Shared core for limit placement. Identity-agnostic: the caller resolves
+/// `trader_pk` (cold wallet OR a verified session). NOT an instruction (no
+/// `pub`), so Anchor does not dispatch it. Body is byte-identical to the
+/// pre-extraction handler, guarded by the full place/proptest/integration suite.
+fn place_limit_v2_core(
+    market: &Account<'_, MarketAccount>,
+    market_book: &UncheckedAccount<'_>,
+    trader_pk: Pubkey,
+    side: u8,
+    size_lots: u64,
+    limit_ticks: u64,
+    flags: u8,
+    expires_at_slot: u64,
+    sub_index: u8,
+) -> Result<()> {
+    // ── Hot-path validation (collapsed). Single Clock::get(), one
+    // bounded match per family of inputs. Branch order matches
+    // empirical frequency: malformed inputs rare → fast-path through.
+    let now_slot = Clock::get()?.slot;
+
+    // Fast input guards (most-common-pass first).
+    if side > 1
+        || size_lots == 0
+        || limit_ticks == 0
+        || (flags & !0b0111_1111) != 0
+        // H4: reduce_only (bit1) is NOT enforced on the v2 CLOB (there is no
+        // settlement-time reduce-only check; matcher::reduce_only is uncalled).
+        // Reject it LOUDLY so a trader cannot set a "protective close" that
+        // would silently OPEN or FLIP a position. (Full enforcement = separate feature.)
+        || (flags & 0b0000_0010) != 0
+    {
+        return err!(FlashBookError::OutOfRange);
+    }
+    if expires_at_slot != 0 && expires_at_slot <= now_slot {
+        return err!(FlashBookError::OutOfRange);
+    }
+
+    // Market-state guards.
+    let p = &market.params;
+    if market.status != MarketStatus::Active as u8
+        && market.status != MarketStatus::PostOnly as u8
+    {
+        return err!(FlashBookError::OutOfRange);
+    }
+    if size_lots < p.min_base_lots {
+        return err!(FlashBookError::SizeBelowMinLot);
+    }
+    if limit_ticks % p.tick_size != 0 {
+        return err!(FlashBookError::PriceNotOnTick);
+    }
+
+    // #36 anti-stuffing: a RESTING limit must sit within the band of the fresh
+    // oracle. Far-from-market orders never fill, so they are cheap to spam and
+    // are the node-arena-exhaustion vector; the band forces a resting order
+    // close enough to market to bear real fill risk. `price_within_band`
+    // returns true when `oracle_price_ticks == 0` (no anchor → skipped).
+    if !matcher::flp_quoter::price_within_band(
+        market.oracle_price_ticks,
+        limit_ticks,
+        crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS,
+    ) {
+        return err!(FlashBookError::RestingOrderTooFarFromOracle);
+    }
+
+    // Per-market OI hard cap (cold for most markets — oi_cap == 0).
+    let oi_cap = p.max_oi_base_lots;
+    if oi_cap > 0 {
+        let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
+        if cur.saturating_add(size_lots) > oi_cap {
+            return err!(FlashBookError::OpenInterestCapExceeded);
+        }
+    }
+
+    let market_key = market.key();
+
+    // Borrow the market_book account data + load the handle.
+    let mut book_data = market_book.try_borrow_mut_data()?;
+    let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+    if handle.header.market_pubkey != market_key {
+        return err!(FlashBookError::WrongMarket);
+    }
+
+    // Allocate seq + build the resting order.
+    let seq = handle
+        .header
+        .order_seq_counter
+        .checked_add(1)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    handle.header.order_seq_counter = seq;
+
+    let side_is_bid = side == 0;
+    let order = state_v2::RestingOrderV2 {
+        order_id: state_v2::encode_order_id(limit_ticks, seq, side_is_bid),
+        seq,
+        price_ticks: limit_ticks,
+        size_lots,
+        expires_at_slot,
+        trader: trader_pk,
+        last_valid_slot: u32::try_from(now_slot).unwrap_or(u32::MAX),
+        side,
+        order_type: 0, // 0 = limit (the only kind for now)
+        flags,
+        // Phase 2e — written from the ix param so ApplyFill can
+        // resolve the correct TraderState (main or sub) when this
+        // order matches as a maker. 0 = main (default).
+        sub_index,
+    };
+
+    let inserted_idx = if side_is_bid {
+        handle.insert_bid(order)?
+    } else {
+        handle.insert_ask(order)?
+    };
+
+    emit!(OrderPlacedV2Event {
+        market: market_key,
+        trader: trader_pk,
+        seq,
+        side,
+        price_ticks: limit_ticks,
+        size_lots,
+        node_index: inserted_idx,
+        total_orders_after: handle.header.total_orders_active,
+    });
+    Ok(())
+}
+
+/// Shared core for order cancellation. Identity-agnostic: the caller resolves
+/// `trader_pk` (cold wallet OR a verified session). Body is byte-identical to the
+/// pre-extraction `cancel_order_v2` handler; ownership is enforced against the
+/// resting order's recorded `trader`, so a session can only cancel its OWNER's
+/// orders. Guarded by the full integration/proptest suite.
+fn cancel_v2_core(
+    market_book: &UncheckedAccount<'_>,
+    market_key: Pubkey,
+    trader_pk: Pubkey,
+    side: u8,
+    order_id: u64,
+) -> Result<()> {
+    if side > 1 {
+        return err!(FlashBookError::OutOfRange);
+    }
+    let mut book_data = market_book.try_borrow_mut_data()?;
+    let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+    if handle.header.market_pubkey != market_key {
+        return err!(FlashBookError::WrongMarket);
+    }
+
+    let side_is_bid = side == 0;
+    let idx = if side_is_bid {
+        handle.lookup_bid_by_order_id(order_id)
+    } else {
+        handle.lookup_ask_by_order_id(order_id)
+    };
+    if idx == crate::hypertree::NIL {
+        return err!(FlashBookError::LiquidationStale);
+    }
+
+    // Ownership check — only the original trader (or its session) can cancel.
+    let order_seq = {
+        let order = handle.order_at(idx);
+        if order.trader != trader_pk {
+            return err!(FlashBookError::WrongTrader);
+        }
+        order.seq
+    };
+
+    if side_is_bid {
+        handle.remove_bid_node(idx);
+    } else {
+        handle.remove_ask_node(idx);
+    }
+
+    emit!(OrderCancelledV2Event {
+        market: market_key,
+        trader: trader_pk,
+        order_seq,
+        side,
+        node_index: idx,
+        total_orders_after: handle.header.total_orders_active,
+    });
+    Ok(())
+}
+
+
 /// Shared init body for `initialize_market`. Permissionless market
 /// creation has been removed — markets are authority-gated and the
 /// `creator` field on the market account is zeroed (no HIP-3-style
@@ -10876,6 +11022,75 @@ pub struct PlaceLimitOrderV2<'info> {
     // validated in-handler by `find_fill_commitment`.
 }
 
+/// SESSION-KEY limit placement. Mirror of `PlaceLimitOrderV2` but the signer is
+/// an ephemeral `session_signer` instead of the trader; the `session_token`
+/// (seed-bound to its owner + signer) is verified in-handler.
+#[derive(Accounts)]
+pub struct PlaceLimitOrderV2Session<'info> {
+    /// The ephemeral session key. Must equal `session_token.session_signer`.
+    pub session_signer: Signer<'info>,
+
+    /// The session authorization, owned by the real trader.
+    #[account(
+        seeds = [session::SESSION_SEED, session_token.owner.as_ref(), session_signer.key().as_ref()],
+        bump = session_token.bump,
+    )]
+    pub session_token: Box<Account<'info, session::SessionTokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at the market_book seed; validated in-handler.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
+/// Create a session key: owner authorizes `session_signer` for a bounded TTL.
+#[derive(Accounts)]
+pub struct CreateSessionToken<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    /// CHECK: the ephemeral key being authorized — only its pubkey is recorded;
+    /// no signature is required from it here.
+    pub session_signer: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + session::SessionTokenAccount::LEN,
+        seeds = [session::SESSION_SEED, owner.key().as_ref(), session_signer.key().as_ref()],
+        bump,
+    )]
+    pub session_token: Box<Account<'info, session::SessionTokenAccount>>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Revoke a session key (owner only); rent refunds to the owner.
+#[derive(Accounts)]
+pub struct RevokeSessionToken<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(
+        mut,
+        close = owner,
+        has_one = owner,
+        seeds = [session::SESSION_SEED, owner.key().as_ref(), session_token.session_signer.as_ref()],
+        bump = session_token.bump,
+    )]
+    pub session_token: Box<Account<'info, session::SessionTokenAccount>>,
+}
+
 #[derive(Accounts)]
 pub struct ViewBookDepthV2<'info> {
     #[account(
@@ -10905,6 +11120,33 @@ pub struct CancelOrderV2<'info> {
 
     /// CHECK: PDA at the market_book seed; disc validated inside handler.
     /// Mut because we remove a node + update header indices + free-list.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
+/// SESSION-KEY cancel. Mirror of `CancelOrderV2` but signed by an ephemeral
+/// `session_signer`; the `session_token` is seed-bound + verified in-handler.
+#[derive(Accounts)]
+pub struct CancelOrderV2Session<'info> {
+    pub session_signer: Signer<'info>,
+
+    #[account(
+        seeds = [session::SESSION_SEED, session_token.owner.as_ref(), session_signer.key().as_ref()],
+        bump = session_token.bump,
+    )]
+    pub session_token: Box<Account<'info, session::SessionTokenAccount>>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at the market_book seed; disc validated inside handler.
     #[account(
         mut,
         seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
@@ -13537,6 +13779,14 @@ pub struct BookPermissionEvent {
     pub member_count: u32,
     /// 0 = init, 1 = set_privacy, 2 = close.
     pub action: u8,
+}
+
+#[event]
+pub struct SessionTokenEvent {
+    pub owner: Pubkey,
+    pub session_signer: Pubkey,
+    pub expires_at_unix: i64,
+    pub revoked: bool,
 }
 
 #[event]
