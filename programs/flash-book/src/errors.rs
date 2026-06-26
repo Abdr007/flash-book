@@ -215,6 +215,8 @@ pub enum FlashBookError {
     CrossLiquidationNeedsPortfolio = 2207,
     #[msg("Self-liquidation forbidden: the liquidator must not be the liquidatee (M-2)")]
     SelfLiquidationForbidden = 2208,
+    #[msg("Order sequence exhausted: per-market seq exceeded the 24-bit order_id encoding ceiling; reseat the market (H1)")]
+    OrderSeqExhausted = 2209,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
