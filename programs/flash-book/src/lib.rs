@@ -16494,7 +16494,7 @@ pub struct MigrateMarketToV3<'info> {
     /// Owner-checked: must be owned by this program (the discriminator check
     /// inside the handler validates it's actually a Market account).
     #[account(mut, owner = crate::ID)]
-    pub market: AccountInfo<'info>,
+    pub market: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }
