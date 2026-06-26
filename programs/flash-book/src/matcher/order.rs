@@ -6,6 +6,7 @@ use anchor_lang::prelude::*;
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, AnchorSerialize, AnchorDeserialize,
 )]
+#[borsh(use_discriminant = true)]
 #[repr(u8)]
 pub enum Side {
     Long = 0,
@@ -27,6 +28,7 @@ impl Side {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, AnchorSerialize, AnchorDeserialize,
 )]
+#[borsh(use_discriminant = true)]
 #[repr(u8)]
 pub enum OrderType {
     /// Resting maker quote. Lowest priority in the matcher.
@@ -67,6 +69,7 @@ impl OrderType {
 ///     Useful for MMs replacing quotes — they want the new quote up.
 ///   • CancelBoth — drop both, no fill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AnchorSerialize, AnchorDeserialize)]
+#[borsh(use_discriminant = true)]
 #[repr(u8)]
 pub enum StpMode {
     CancelNewest = 0,

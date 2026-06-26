@@ -746,7 +746,10 @@ mod tests {
             acceptable_price_ticks: u64::MAX,
             _reserved: [0xAB; 7],
         };
-        let body = acc.try_to_vec().expect("borsh serialize");
+        // borsh 1.x (anchor 1.x) removed the inherent `try_to_vec`; serialize via
+        // AnchorSerialize into a buffer instead.
+        let mut body = Vec::new();
+        acc.serialize(&mut body).expect("borsh serialize");
         assert_eq!(body.len(), 148, "serialized TWAP body must be 148 bytes");
         assert_eq!(
             TwapOrderAccountV3::space(),

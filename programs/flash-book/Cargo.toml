@@ -22,15 +22,22 @@ anchor-lang = { workspace = true, features = ["init-if-needed"] }
 anchor-spl = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
-pyth-solana-receiver-sdk = "0.6.1"
 solana-security-txt = "1.1.1"
+ephemeral-rollups-sdk = { version = "0.15.4", features = ["anchor"] }
+solana-keccak-hasher = "2.2.1"
 
 [dev-dependencies]
 proptest = "1.6"
-solana-program-test = "~2.1"
-solana-sdk = "~2.1"
-spl-token = { version = "6", features = ["no-entrypoint"] }
-spl-associated-token-account = { version = "3", features = ["no-entrypoint"] }
+# solana-sdk 3.x is a cohesive umbrella: message/instruction/pubkey/keypair +
+# system_program all resolve to the same solana-* 3.x crate set (solana-pubkey
+# 3.0), which ALSO matches the anchor 1.x program -> host and program share one
+# Pubkey type. Paired with the contemporaneous program-test 3.1.
+solana-program-test = "3.1"
+solana-sdk = "3.0"
+# Pin to 2.0 so it links solana-pubkey 3.0 (matches solana-sdk 3.0 + the program).
+solana-system-interface = { version = "2.0", features = ["bincode"] }
+spl-token = { version = "8", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "6", features = ["no-entrypoint"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

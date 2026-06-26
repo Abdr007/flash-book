@@ -15,14 +15,18 @@ use flash_book::state::{
     FlpExposureAccount, InsuranceFundAccount, MarketAccount, MarketParams,
     TraderStateAccount,
 };
-use solana_program_test::{processor, BanksClient, ProgramTest};
+use solana_program_test::{BanksClient, ProgramTest};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    system_program,
     transaction::Transaction,
 };
+// The system program id + its instruction builders live in solana-system-interface.
+// Pinned to 2.0 so it links solana-pubkey 3.0 — the SAME pubkey the rest of the
+// host stack (solana-sdk 3.0) and the anchor 1.x program use, so all three agree.
+use solana_system_interface::instruction as system_instruction;
+use solana_system_interface::program as system_program;
 
 // Must match `declare_id!()` in src/lib.rs — Anchor verifies this at
 // runtime via the DeclaredProgramIdMismatch gate (Anchor error 4100).
@@ -32,47 +36,82 @@ fn program_id() -> Pubkey {
     PROGRAM_ID_STR.parse().unwrap()
 }
 
+// The harness spans three solana-pubkey type universes that are layout-identical
+// (32 bytes) but distinct Rust types, so we byte-bridge across the boundaries:
+//   * host test stack  -> solana-sdk 4.x  (`Pubkey` in this file)
+//   * the program      -> anchor 1.x / solana-pubkey 3.x (`anchor_lang::prelude::Pubkey`)
+//   * spl-token 8      -> solana-program 2.x (`SplPubkey`, via spl_token's re-export)
+fn to_anchor(p: Pubkey) -> anchor_lang::prelude::Pubkey {
+    anchor_lang::prelude::Pubkey::new_from_array(p.to_bytes())
+}
+#[allow(dead_code)]
+fn to_sdk(p: anchor_lang::prelude::Pubkey) -> Pubkey {
+    Pubkey::new_from_array(p.to_bytes())
+}
+
+// --- spl-token (solana-program 2.x) <-> host (solana-sdk 4.x) bridges ---
+type SplPubkey = spl_token::solana_program::pubkey::Pubkey;
+type SplInstruction = spl_token::solana_program::instruction::Instruction;
+
+/// spl-token Pubkey -> host Pubkey.
+fn from_spl(p: SplPubkey) -> Pubkey {
+    Pubkey::new_from_array(p.to_bytes())
+}
+/// host Pubkey -> spl-token Pubkey.
+fn to_spl(p: &Pubkey) -> SplPubkey {
+    SplPubkey::new_from_array(p.to_bytes())
+}
+/// The SPL Token program id, as a host Pubkey.
+fn spl_token_id() -> Pubkey {
+    from_spl(spl_token::id())
+}
+/// The Associated-Token-Account program id, as a host Pubkey.
+fn spl_ata_id() -> Pubkey {
+    from_spl(spl_associated_token_account::id())
+}
+/// Re-type an spl-token-built `Instruction` (solana 2.x) into the host
+/// `Instruction` (solana 4.x): same wire format, different Rust types.
+fn host_ix(ix: SplInstruction) -> Instruction {
+    Instruction {
+        program_id: from_spl(ix.program_id),
+        accounts: ix
+            .accounts
+            .into_iter()
+            .map(|m| AccountMeta {
+                pubkey: from_spl(m.pubkey),
+                is_signer: m.is_signer,
+                is_writable: m.is_writable,
+            })
+            .collect(),
+        data: ix.data,
+    }
+}
+
 fn pda(seeds: &[&[u8]]) -> (Pubkey, u8) {
     Pubkey::find_program_address(seeds, &program_id())
 }
 
-/// Lifetime-bridge wrapper around `flash_book::entry`.
+/// Builds a `ProgramTest` that loads the compiled SBF `.so`
+/// (`target/deploy/flash_book.so`) and runs it in the real BPF VM.
 ///
-/// SAFETY: solana-program-test's `BuiltinFunctionWithContext` allocates the
-/// AccountInfo slice on its own stack and frees it after this fn returns.
-/// The lifetime parameters in the HRTB form (`'b` for slice, `'c` for items)
-/// can be safely unified to a single `'info` for the call into Anchor's
-/// `entry` since they are co-extensive at runtime — the slice and items
-/// share the same allocation lifetime within this fn's frame.
+/// This loads the program as actual on-chain bytecode rather than as an
+/// in-process native `processor!`. That is both more faithful (real syscalls,
+/// real CU metering, real account layout) AND avoids any host/program type
+/// coupling: the program inside the VM uses its own (anchor 1.x / solana 3.x)
+/// types, while the host test stack can be any solana version — they never
+/// share Rust types in-process, so there is no `transmute` and no version skew.
 ///
-/// `transmute` here only changes the type-level lifetime parameter; the
-/// runtime layout of `&[AccountInfo<'_>]` is identical regardless of `'_`.
-fn anchor_entry_wrapper<'a, 'b, 'c, 'd>(
-    program_id: &'a Pubkey,
-    accounts: &'b [AccountInfo<'c>],
-    instruction_data: &'d [u8],
-) -> std::result::Result<(), anchor_lang::solana_program::program_error::ProgramError> {
-    let accounts_unified: &'c [AccountInfo<'c>] =
-        unsafe { std::mem::transmute(accounts) };
-    flash_book::entry(program_id, accounts_unified, instruction_data)
-}
-
+/// Requires `cargo build-sbf` to have been run first (CI does this before
+/// `cargo test`). The `None` processor tells `solana-program-test` to locate
+/// and load `flash_book.so` from the deploy dir.
 fn make_program_test() -> ProgramTest {
-    ProgramTest::new(
-        "flash_book",
-        program_id(),
-        processor!(anchor_entry_wrapper),
-    )
+    ProgramTest::new("flash_book", program_id(), None)
 }
 
-/// Like `make_program_test`, but loads the compiled SBF `.so`
-/// (target/deploy/flash_book.so) and runs it in the BPF VM so that
-/// `compute_units_consumed` reflects REAL on-chain CU metering. The
-/// native `processor!` harness above is fine for functional assertions
-/// but reports meaningless CU. Requires `cargo build-sbf` to have been
-/// run first. Used only by the CU benchmark.
+/// Back-compat alias: the CU benchmark used to call a separate SBF builder.
+/// Both now load the `.so`, so this just forwards.
 fn make_program_test_sbf() -> ProgramTest {
-    ProgramTest::new("flash_book", program_id(), None)
+    make_program_test()
 }
 
 async fn fetch<T: AccountDeserialize>(client: &mut BanksClient, address: Pubkey) -> T {
@@ -181,21 +220,23 @@ async fn create_mint(
     let lamports = rent.minimum_balance(space);
 
     let ixs = vec![
-        solana_sdk::system_instruction::create_account(
+        system_instruction::create_account(
             &payer.pubkey(),
             &mint.pubkey(),
             lamports,
             space as u64,
-            &spl_token::id(),
+            &spl_token_id(),
         ),
-        spl_token::instruction::initialize_mint(
-            &spl_token::id(),
-            &mint.pubkey(),
-            &payer.pubkey(),
-            None,
-            6,
-        )
-        .unwrap(),
+        host_ix(
+            spl_token::instruction::initialize_mint(
+                &spl_token::id(),
+                &to_spl(&mint.pubkey()),
+                &to_spl(&payer.pubkey()),
+                None,
+                6,
+            )
+            .unwrap(),
+        ),
     ];
 
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -227,20 +268,22 @@ async fn create_token_account(
     let lamports = rent.minimum_balance(space);
 
     let ixs = vec![
-        solana_sdk::system_instruction::create_account(
+        system_instruction::create_account(
             &payer.pubkey(),
             &acct.pubkey(),
             lamports,
             space as u64,
-            &spl_token::id(),
+            &spl_token_id(),
         ),
-        spl_token::instruction::initialize_account(
-            &spl_token::id(),
-            &acct.pubkey(),
-            &mint,
-            &owner_authority,
-        )
-        .unwrap(),
+        host_ix(
+            spl_token::instruction::initialize_account(
+                &spl_token::id(),
+                &to_spl(&acct.pubkey()),
+                &to_spl(&mint),
+                &to_spl(&owner_authority),
+            )
+            .unwrap(),
+        ),
     ];
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
@@ -257,7 +300,10 @@ async fn create_token_account(
 
 /// Derive the canonical Associated Token Account address for (owner, mint).
 fn ata_for(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-    spl_associated_token_account::get_associated_token_address(owner, mint)
+    from_spl(spl_associated_token_account::get_associated_token_address(
+        &to_spl(owner),
+        &to_spl(mint),
+    ))
 }
 
 /// Create the canonical ATA for (owner, mint) via the Associated Token
@@ -268,11 +314,13 @@ async fn create_ata(
     owner: Pubkey,
     mint: Pubkey,
 ) -> Pubkey {
-    let ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-        &payer.pubkey(),
-        &owner,
-        &mint,
-        &spl_token::id(),
+    let ix = host_ix(
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            &to_spl(&payer.pubkey()),
+            &to_spl(&owner),
+            &to_spl(&mint),
+            &spl_token::id(),
+        ),
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
@@ -295,15 +343,17 @@ async fn mint_tokens(
     dest: Pubkey,
     amount: u64,
 ) {
-    let ix = spl_token::instruction::mint_to(
-        &spl_token::id(),
-        &mint,
-        &dest,
-        &payer.pubkey(),
-        &[],
-        amount,
-    )
-    .unwrap();
+    let ix = host_ix(
+        spl_token::instruction::mint_to(
+            &spl_token::id(),
+            &to_spl(&mint),
+            &to_spl(&dest),
+            &to_spl(&payer.pubkey()),
+            &[],
+            amount,
+        )
+        .unwrap(),
+    );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -339,7 +389,7 @@ async fn setup_protocol(
             AccountMeta::new(insurance_fund, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(quote_vault_kp.pubkey(), true),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
             AccountMeta::new_readonly(solana_sdk::sysvar::rent::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
@@ -522,7 +572,7 @@ async fn setup_trader(
     deposit_amount: u64,
     protocol: &Protocol,
 ) -> Pubkey {
-    let transfer = solana_sdk::system_instruction::transfer(
+    let transfer = system_instruction::transfer(
         &payer.pubkey(),
         &trader.pubkey(),
         100_000_000,
@@ -575,7 +625,7 @@ async fn setup_trader(
                 AccountMeta::new_readonly(protocol.quote_mint, false),
                 AccountMeta::new(trader_ata, false),
                 AccountMeta::new(protocol.quote_vault, false),
-                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new_readonly(spl_token_id(), false),
             ],
         );
         let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -608,8 +658,8 @@ async fn initialize_insurance_fund_writes_state() {
     assert_eq!(fund.pause_threshold_quote_lots, 5_000);
     assert_eq!(fund.total_contributions, 0);
     assert_eq!(fund.total_payouts, 0);
-    assert_eq!(fund.quote_mint, protocol.quote_mint);
-    assert_eq!(fund.quote_vault, protocol.quote_vault);
+    assert_eq!(fund.quote_mint, to_anchor(protocol.quote_mint));
+    assert_eq!(fund.quote_vault, to_anchor(protocol.quote_vault));
 }
 
 #[tokio::test]
@@ -665,7 +715,7 @@ async fn withdraw_insurance_fund_succeeds_above_pause_threshold() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(auth_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -685,7 +735,7 @@ async fn withdraw_insurance_fund_succeeds_above_pause_threshold() {
     assert_eq!(fund_after.total_payouts, 50_000);
 
     let ata_after = ctx.banks_client.get_account(auth_ata).await.unwrap().unwrap();
-    let ata_state = <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(
+    let ata_state = <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(
         &ata_after.data,
     )
     .unwrap();
@@ -740,7 +790,7 @@ async fn withdraw_insurance_fund_blocked_below_pause_threshold() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(auth_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -776,7 +826,7 @@ async fn withdraw_insurance_fund_rejects_non_authority() {
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[solana_sdk::system_instruction::transfer(
+            &[system_instruction::transfer(
                 &payer.pubkey(),
                 &attacker.pubkey(),
                 100_000_000,
@@ -799,7 +849,7 @@ async fn withdraw_insurance_fund_rejects_non_authority() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(attacker_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -867,7 +917,7 @@ async fn open_trader_state_initializes_zero_balance() {
     let trader = Keypair::new();
 
     // Fund the trader.
-    let transfer = solana_sdk::system_instruction::transfer(
+    let transfer = system_instruction::transfer(
         &payer.pubkey(),
         &trader.pubkey(),
         100_000_000,
@@ -905,7 +955,7 @@ async fn open_trader_state_initializes_zero_balance() {
         .unwrap();
 
     let state: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
-    assert_eq!(state.trader, trader.pubkey());
+    assert_eq!(state.trader, to_anchor(trader.pubkey()));
     assert_eq!(state.collateral_quote_lots, 0);
     assert_eq!(state.realized_pnl_quote_lots, 0);
     assert_eq!(state.open_positions, 0);
@@ -939,8 +989,8 @@ async fn init_trader_ata_creates_canonical_ata_idempotently() {
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(expected_ata, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_associated_token_account::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(spl_ata_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -964,12 +1014,12 @@ async fn init_trader_ata_creates_canonical_ata_idempotently() {
         .await
         .unwrap()
         .expect("ATA should exist after init_trader_ata");
-    assert_eq!(ata_acc.owner, spl_token::id());
+    assert_eq!(ata_acc.owner, spl_token_id());
     let ata_state =
-        <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&ata_acc.data)
+        <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(&ata_acc.data)
             .unwrap();
-    assert_eq!(ata_state.mint, protocol.quote_mint);
-    assert_eq!(ata_state.owner, trader.pubkey());
+    assert_eq!(from_spl(ata_state.mint), protocol.quote_mint);
+    assert_eq!(from_spl(ata_state.owner), trader.pubkey());
     assert_eq!(ata_state.amount, 0);
 
     // Idempotency: calling again must succeed (init_if_needed semantics).
@@ -999,7 +1049,7 @@ async fn init_trader_ata_then_deposit_in_same_tx() {
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[solana_sdk::system_instruction::transfer(
+            &[system_instruction::transfer(
                 &payer.pubkey(),
                 &trader.pubkey(),
                 100_000_000,
@@ -1032,8 +1082,8 @@ async fn init_trader_ata_then_deposit_in_same_tx() {
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(trader_ata, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_associated_token_account::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(spl_ata_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -1061,7 +1111,7 @@ async fn init_trader_ata_then_deposit_in_same_tx() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(trader_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -1090,7 +1140,7 @@ async fn close_trader_ata_refunds_rent_and_destroys_account() {
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[solana_sdk::system_instruction::transfer(
+            &[system_instruction::transfer(
                 &payer.pubkey(),
                 &trader.pubkey(),
                 100_000_000,
@@ -1128,7 +1178,7 @@ async fn close_trader_ata_refunds_rent_and_destroys_account() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(trader_ata, false),
             AccountMeta::new(trader.pubkey(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -1178,7 +1228,7 @@ async fn close_trader_ata_rejects_non_empty_balance() {
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[solana_sdk::system_instruction::transfer(
+            &[system_instruction::transfer(
                 &payer.pubkey(),
                 &trader.pubkey(),
                 100_000_000,
@@ -1202,7 +1252,7 @@ async fn close_trader_ata_rejects_non_empty_balance() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(trader_ata, false),
             AccountMeta::new(trader.pubkey(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -1246,7 +1296,7 @@ async fn deposit_collateral_credits_balance_and_emits_event() {
         .unwrap()
         .unwrap();
     let vault_first =
-        <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&vault_after_first.data).unwrap();
+        <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(&vault_after_first.data).unwrap();
     assert_eq!(vault_first.amount, 50_000);
 
     // Second deposit reuses the canonical ATA (idempotent — already created by
@@ -1265,7 +1315,7 @@ async fn deposit_collateral_credits_balance_and_emits_event() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(trader_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh3 = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -1289,7 +1339,7 @@ async fn deposit_collateral_credits_balance_and_emits_event() {
         .unwrap()
         .unwrap();
     let vault_second =
-        <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&vault_after_second.data).unwrap();
+        <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(&vault_after_second.data).unwrap();
     assert_eq!(vault_second.amount, 75_000);
 }
 
@@ -1318,7 +1368,7 @@ async fn withdraw_collateral_reduces_balance() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(trader_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -1343,7 +1393,7 @@ async fn withdraw_collateral_reduces_balance() {
         .unwrap()
         .unwrap();
     let vault_state =
-        <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&vault_after.data).unwrap();
+        <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(&vault_after.data).unwrap();
     assert_eq!(vault_state.amount, 70_000);
 
     // Trader's ATA should hold the withdrawn 30_000.
@@ -1354,7 +1404,7 @@ async fn withdraw_collateral_reduces_balance() {
         .unwrap()
         .unwrap();
     let dest_state =
-        <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&dest_after.data).unwrap();
+        <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(&dest_after.data).unwrap();
     assert_eq!(dest_state.amount, 30_000);
 }
 
@@ -1367,9 +1417,9 @@ async fn initialize_market_writes_state() {
     let (_protocol, market_pda, _order_buf, base_mint, quote_mint) = setup_market(&mut ctx, &payer).await;
 
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    assert_eq!(market.authority, payer.pubkey());
-    assert_eq!(market.base_mint, base_mint);
-    assert_eq!(market.quote_mint, quote_mint);
+    assert_eq!(market.authority, to_anchor(payer.pubkey()));
+    assert_eq!(market.base_mint, to_anchor(base_mint));
+    assert_eq!(market.quote_mint, to_anchor(quote_mint));
     assert_eq!(market.oracle_price_ticks, 100_000);
     assert_eq!(market.mark_price_ticks, 100_000);
     assert_eq!(market.cum_funding_index, 0);
@@ -1477,7 +1527,7 @@ async fn deposit_flp_capital_grows_pool() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -1510,7 +1560,7 @@ async fn deposit_flp_capital_grows_pool() {
         .await
         .unwrap()
         .unwrap();
-    let vs = <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(
+    let vs = <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(
         &vault_after.data,
     )
     .unwrap();
@@ -1548,7 +1598,7 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -1580,7 +1630,7 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -1601,7 +1651,7 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
     assert_eq!(after.lp_shares_outstanding, 5_000_000);
 
     let lp_after = ctx.banks_client.get_account(lp_ata).await.unwrap().unwrap();
-    let lp_state = <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(
+    let lp_state = <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(
         &lp_after.data,
     )
     .unwrap();
@@ -1620,7 +1670,7 @@ async fn lp_deposit(
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[solana_sdk::system_instruction::transfer(
+            &[system_instruction::transfer(
                 &payer.pubkey(),
                 &lp.pubkey(),
                 100_000_000,
@@ -1650,7 +1700,7 @@ async fn lp_deposit(
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -1701,8 +1751,8 @@ async fn lp_units_two_lps_split_shares_pro_rata_with_no_pnl() {
         fetch(&mut ctx.banks_client, bob_pos).await;
     assert_eq!(alice_state.shares, 1_000_000);
     assert_eq!(bob_state.shares, 2_000_000);
-    assert_eq!(alice_state.lp, alice.pubkey());
-    assert_eq!(bob_state.lp, bob.pubkey());
+    assert_eq!(alice_state.lp, to_anchor(alice.pubkey()));
+    assert_eq!(bob_state.lp, to_anchor(bob.pubkey()));
 }
 
 #[tokio::test]
@@ -1787,7 +1837,7 @@ async fn lp_units_withdraw_burns_shares_and_distributes_nav() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(alice_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -1817,7 +1867,7 @@ async fn lp_units_withdraw_burns_shares_and_distributes_nav() {
         .unwrap()
         .unwrap();
     let ata_state =
-        <spl_token::state::Account as solana_sdk::program_pack::Pack>::unpack(&alice_ata_after.data).unwrap();
+        <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(&alice_ata_after.data).unwrap();
     assert_eq!(ata_state.amount, 1_000_000);
 }
 
@@ -1841,7 +1891,7 @@ async fn flp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure()
             .unwrap();
     flp_state.markets_count = 1;
     flp_state.per_market[0] = flash_book::state::FlpMarketExposure {
-        market: market_pda,
+        market: to_anchor(market_pda),
         side: 0, // long
         size_lots: 10_000,
         entry_price_ticks: 1_000,
@@ -1898,7 +1948,7 @@ async fn flp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure()
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(auth_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
             // remaining_accounts: the active market.
             AccountMeta::new_readonly(market_pda, false),
         ],
@@ -1953,7 +2003,7 @@ async fn lp_units_withdraw_rejects_other_lps_shares() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(bob_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -1988,7 +2038,7 @@ async fn update_oracle_authority_only() {
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
             // Wave 26b — None sentinel for optional envelope_config.
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2010,7 +2060,7 @@ async fn update_oracle_authority_only() {
     let attacker = Keypair::new();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[solana_sdk::system_instruction::transfer(
+            &[system_instruction::transfer(
                 &payer.pubkey(),
                 &attacker.pubkey(),
                 100_000_000,
@@ -2031,7 +2081,7 @@ async fn update_oracle_authority_only() {
         vec![
             AccountMeta::new_readonly(attacker.pubkey(), true),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2063,7 +2113,7 @@ async fn transfer_market_authority_rotates_keys() {
 
     let ix = build_ix(
         flash_book::instruction::TransferMarketAuthority {
-            new_authority: new_authority.pubkey(),
+            new_authority: to_anchor(new_authority.pubkey()),
         },
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
@@ -2082,7 +2132,7 @@ async fn transfer_market_authority_rotates_keys() {
         .unwrap();
 
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    assert_eq!(market.authority, new_authority.pubkey());
+    assert_eq!(market.authority, to_anchor(new_authority.pubkey()));
 
     // Old authority can't update oracle anymore.
     let bad_ix = build_ix(
@@ -2094,7 +2144,7 @@ async fn transfer_market_authority_rotates_keys() {
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2276,11 +2326,11 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
             AccountMeta::new(flp_exposure, false),
             // Wave 22 phase 2 — Optional<FeeTiersAccount>. Anchor's
             // convention for "None" is the program ID itself.
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
             // Wave 24d — Optional<MarketHaircutStateAccount> + taker
             // Optional<PositionHaircutStateAccount> on FLP path.
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -2308,7 +2358,7 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
     let entry = flp
         .per_market
         .iter()
-        .find(|e| e.side != 255 && e.market == market_pda)
+        .find(|e| e.side != 255 && e.market == to_anchor(market_pda))
         .expect("FLP should have an entry on this market");
     assert_eq!(entry.side, 1); // short
     assert_eq!(entry.size_lots, 1);
@@ -2359,9 +2409,9 @@ async fn apply_flp_fill_rejects_price_far_from_oracle() {
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(flp_exposure, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -2601,7 +2651,7 @@ async fn update_oracle_rejects_stale_price() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let order_buf = Pubkey::default();
+    let order_buf = to_anchor(Pubkey::default());
 
     let mut params = default_params();
     params.oracle_staleness_max_seconds = 60; // 1-min max age
@@ -2645,7 +2695,7 @@ async fn update_oracle_rejects_stale_price() {
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2678,7 +2728,7 @@ async fn update_oracle_rejects_wide_confidence() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let order_buf = Pubkey::default();
+    let order_buf = to_anchor(Pubkey::default());
 
     let mut params = default_params();
     params.oracle_confidence_max_bps = 100; // 1% max
@@ -2727,7 +2777,7 @@ async fn update_oracle_rejects_wide_confidence() {
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
             // Wave 26b — None sentinel for optional envelope_config.
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2767,7 +2817,7 @@ async fn update_oracle_quorum_writes_median_with_three_close_sources() {
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2802,7 +2852,7 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let order_buf = Pubkey::default();
+    let order_buf = to_anchor(Pubkey::default());
 
     let mut params = default_params();
     params.oracle_quorum_max_dispersion_bps = 50; // 0.5%
@@ -2850,7 +2900,7 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2925,7 +2975,7 @@ async fn deposit_collateral_credits_sub_account_when_used_as_trader_state() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(trader_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2984,7 +3034,7 @@ async fn deposit_collateral_rejects_wrong_trader_state() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(bob_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -3039,8 +3089,8 @@ async fn migrate_position_to_trader_state_key_moves_state() {
         // irrelevant here (named-field literal) and bytemuck preserves the
         // exact in-memory layout the on-chain `load()` expects.
         let pos = flash_book::state::PositionAccount {
-            market: market_pda,
-            trader: trader.pubkey(),
+            market: to_anchor(market_pda),
+            trader: to_anchor(trader.pubkey()),
             bump: legacy_bump,
             side: 0,
             size_lots: 7,
@@ -3064,7 +3114,7 @@ async fn migrate_position_to_trader_state_key_moves_state() {
         &SolanaAccount {
             lamports: 10_000_000,
             data: legacy_pos_data,
-            owner: flash_book::ID,
+            owner: program_id(),
             executable: false,
             rent_epoch: 0,
         }
@@ -3116,8 +3166,8 @@ async fn migrate_position_to_trader_state_key_moves_state() {
     );
     let new_after: flash_book::state::PositionAccount =
         fetch(&mut ctx_setup.banks_client, new_pos).await;
-    assert_eq!(new_after.market, market_pda);
-    assert_eq!(new_after.trader, trader.pubkey());
+    assert_eq!(new_after.market, to_anchor(market_pda));
+    assert_eq!(new_after.trader, to_anchor(trader.pubkey()));
     assert_eq!(new_after.side, 0);
     assert_eq!(new_after.size_lots, 7);
     assert_eq!(new_after.entry_price_ticks, 12_345);
@@ -3181,12 +3231,12 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(maker_pos, false),
             // None for the optional FeeTiersAccount.
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
             // Wave 24d — three None sentinels for optional H-haircut
             // accounts (market + taker_position + maker_position).
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -3289,7 +3339,7 @@ async fn apply_fill_rejects_unauthorized_sequencer() {
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[solana_sdk::system_instruction::transfer(
+            &[system_instruction::transfer(
                 &payer.pubkey(),
                 &rogue.pubkey(),
                 1_000_000_000,
@@ -3319,10 +3369,10 @@ async fn apply_fill_rejects_unauthorized_sequencer() {
             AccountMeta::new(maker_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(maker_pos, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -3426,10 +3476,10 @@ async fn apply_fill_rejects_fabricated_fill_when_armed() {
             AccountMeta::new(maker_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(maker_pos, false),
-            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
-            AccountMeta::new_readonly(flash_book::ID, false), // haircut None x3
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false), // fee_tiers None
+            AccountMeta::new_readonly(program_id(), false), // haircut None x3
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
             // remaining_accounts: the armed (empty) FillCommitmentAccount
             AccountMeta::new(fc_pda, false),
@@ -3528,10 +3578,10 @@ async fn armed_apply_fill_rejects_when_commitment_account_omitted() {
             AccountMeta::new(maker_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(maker_pos, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
             // NO fill_commitment account — the bypass C-1 closes.
         ],
@@ -3736,10 +3786,10 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
                 AccountMeta::new(maker_state, false),
                 AccountMeta::new(taker_pos, false),
                 AccountMeta::new(maker_pos, false),
-                AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
-                AccountMeta::new_readonly(flash_book::ID, false), // haircut None x3
-                AccountMeta::new_readonly(flash_book::ID, false),
-                AccountMeta::new_readonly(flash_book::ID, false),
+                AccountMeta::new_readonly(program_id(), false), // fee_tiers None
+                AccountMeta::new_readonly(program_id(), false), // haircut None x3
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new(fc_pda, false), // remaining_accounts
             ],
@@ -3825,10 +3875,10 @@ async fn partial_withdraw_rejects_omitted_position() {
             AccountMeta::new(maker_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(maker_pos, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -3857,7 +3907,7 @@ async fn partial_withdraw_rejects_omitted_position() {
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(taker_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ]
     };
 
@@ -3949,14 +3999,15 @@ async fn cu_of(
 ///   - `partial_withdraw` runs the full stress-lattice margin assessment
 ///     over the trader's positions, behind the C-2 coverage check.
 ///
-/// `#[ignore]` because it needs the compiled SBF `.so` (real CU metering);
-/// excluded from the default `cargo test` run so the functional suite
-/// stays fast and validator-free. Run with:
-///   cargo build-sbf
-///   BPF_OUT_DIR="$PWD/target/deploy" \
-///     cargo test -p flash-book --test integration cu_benchmark -- --ignored --nocapture
+/// Now that the whole suite loads the program as a compiled SBF `.so`, this CU
+/// benchmark is a first-class member of the run: with `SBF_OUT_DIR`/`BPF_OUT_DIR`
+/// set (as the suite is run) it measures real on-chain compute; without it, it
+/// self-skips cleanly (see the guard below) so a bare `cargo test` still passes.
+/// To see the per-path CU numbers it prints:
+///   cargo build-sbf --tools-version v1.52
+///   SBF_OUT_DIR="$PWD/target/deploy" \
+///     cargo test -p flash-book --test integration cu_benchmark -- --nocapture
 #[tokio::test]
-#[ignore = "CU benchmark; requires BPF_OUT_DIR + cargo build-sbf"]
 async fn cu_benchmark_settlement_and_risk_paths() {
     if std::env::var("BPF_OUT_DIR").is_err() && std::env::var("SBF_OUT_DIR").is_err() {
         eprintln!(
@@ -3996,10 +4047,10 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             AccountMeta::new(maker_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(maker_pos, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ]
     };
@@ -4028,7 +4079,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
         AccountMeta::new_readonly(protocol.quote_mint, false),
         AccountMeta::new(taker_ata, false),
         AccountMeta::new(protocol.quote_vault, false),
-        AccountMeta::new_readonly(spl_token::id(), false),
+        AccountMeta::new_readonly(spl_token_id(), false),
     ];
     pw_metas.push(AccountMeta::new_readonly(market_pda, false));
     pw_metas.push(AccountMeta::new_readonly(taker_pos, false));
@@ -4210,11 +4261,11 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             AccountMeta::new(counter_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(counter_pos, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
             // Wave 24d — three None sentinels for optional H-haircut.
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -4264,11 +4315,11 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             AccountMeta::new(counter_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(counter_pos, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
             // Wave 24d — three None sentinels for optional H-haircut.
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -4389,11 +4440,11 @@ async fn apply_fill_rejects_wrong_sub_index_trader_state() {
             AccountMeta::new(maker_main_state, false),
             AccountMeta::new(taker_main_pos, false),
             AccountMeta::new(maker_main_pos, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
             // Wave 24d — three None sentinels for optional H-haircut.
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -4669,12 +4720,12 @@ async fn er_delegation_rejects_non_authority() {
                 AccountMeta::new(rogue.pubkey(), true),
                 AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
-                AccountMeta::new_readonly(flash_book::ID, false), // owner_program
+                AccountMeta::new_readonly(program_id(), false), // owner_program
                 AccountMeta::new(d1, false),                      // delegate_buffer
                 AccountMeta::new(d2, false),                      // delegation_record
                 AccountMeta::new(d3, false),                      // delegation_metadata
                 AccountMeta::new_readonly(system_program::ID, false),
-                AccountMeta::new_readonly(flash_book::er::DELEGATION_PROGRAM_ID, false),
+                AccountMeta::new_readonly(to_sdk(flash_book::er::DELEGATION_PROGRAM_ID), false),
             ],
         ),
         &payer.pubkey(),
@@ -4696,10 +4747,10 @@ async fn er_delegation_rejects_non_authority() {
                 AccountMeta::new(rogue.pubkey(), true),
                 AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
-                AccountMeta::new_readonly(flash_book::ID, false),
+                AccountMeta::new_readonly(program_id(), false),
                 AccountMeta::new(d1, false),
                 AccountMeta::new_readonly(system_program::ID, false),
-                AccountMeta::new_readonly(flash_book::er::DELEGATION_PROGRAM_ID, false),
+                AccountMeta::new_readonly(to_sdk(flash_book::er::DELEGATION_PROGRAM_ID), false),
             ],
         ),
         &payer.pubkey(),
@@ -4770,10 +4821,10 @@ async fn open_cross_position(
             AccountMeta::new(maker_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(maker_pos, false),
-            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
-            AccountMeta::new_readonly(flash_book::ID, false), // haircut None ×3
-            AccountMeta::new_readonly(flash_book::ID, false),
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false), // fee_tiers None
+            AccountMeta::new_readonly(program_id(), false), // haircut None ×3
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -4920,7 +4971,7 @@ async fn liquidate_position_v2_rejects_multi_leg_cross_h4() {
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[solana_sdk::system_instruction::transfer(
+            &[system_instruction::transfer(
                 &payer.pubkey(),
                 &liquidator.pubkey(),
                 100_000_000,
@@ -5131,9 +5182,9 @@ async fn apply_flp_fill_rejects_stale_oracle_h1() {
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(protocol.flp_exposure, false),
-            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
-            AccountMeta::new_readonly(flash_book::ID, false), // haircut None ×2
-            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(program_id(), false), // fee_tiers None
+            AccountMeta::new_readonly(program_id(), false), // haircut None ×2
+            AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -5215,7 +5266,7 @@ async fn vault_withdraw_v3_rejects_when_vault_has_open_position_h6() {
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[solana_sdk::system_instruction::transfer(
+            &[system_instruction::transfer(
                 &payer.pubkey(),
                 &depositor.pubkey(),
                 100_000_000,
@@ -5246,7 +5297,7 @@ async fn vault_withdraw_v3_rejects_when_vault_has_open_position_h6() {
             AccountMeta::new(depositor_ata, false),
             AccountMeta::new(protocol.quote_vault, false),
             AccountMeta::new(vault_trader_state, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -5290,7 +5341,7 @@ async fn vault_withdraw_v3_rejects_when_vault_has_open_position_h6() {
             AccountMeta::new(protocol.quote_vault, false),
             AccountMeta::new(depositor_ata, false),
             AccountMeta::new(vault_trader_state, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -5707,10 +5758,10 @@ async fn apply_fill_requires_haircut_accounts_when_enabled_h2() {
             AccountMeta::new(maker_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(maker_pos, false),
-            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
-            AccountMeta::new_readonly(flash_book::ID, false), // market_haircut None
-            AccountMeta::new_readonly(flash_book::ID, false), // taker_position_haircut None
-            AccountMeta::new_readonly(flash_book::ID, false), // maker_position_haircut None
+            AccountMeta::new_readonly(program_id(), false), // fee_tiers None
+            AccountMeta::new_readonly(program_id(), false), // market_haircut None
+            AccountMeta::new_readonly(program_id(), false), // taker_position_haircut None
+            AccountMeta::new_readonly(program_id(), false), // maker_position_haircut None
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -5767,9 +5818,9 @@ async fn apply_flp_fill_band_tightened_rejects_ten_percent_m1() {
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
             AccountMeta::new(protocol.flp_exposure, false),
-            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
-            AccountMeta::new_readonly(flash_book::ID, false), // market_haircut None
-            AccountMeta::new_readonly(flash_book::ID, false), // taker_position_haircut None
+            AccountMeta::new_readonly(program_id(), false), // fee_tiers None
+            AccountMeta::new_readonly(program_id(), false), // market_haircut None
+            AccountMeta::new_readonly(program_id(), false), // taker_position_haircut None
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
