@@ -221,6 +221,8 @@ pub enum FlashBookError {
     BaselineAlreadyStamped = 2210,
     #[msg("Market book is not delegated; nothing to stamp a liveness baseline for (F1)")]
     BookNotDelegated = 2211,
+    #[msg("Session token expired (or not yet valid); re-create the session key")]
+    SessionExpired = 2212,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
