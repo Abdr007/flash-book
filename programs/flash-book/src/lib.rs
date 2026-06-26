@@ -6855,6 +6855,23 @@ pub mod flash_book {
         let mark_stale = market.last_mark_update_slot == 0
             || current_slot.saturating_sub(market.last_mark_update_slot)
                 > constants::MARK_STALENESS_MAX_SLOTS;
+        // F4/L-1 (audit 2026-06): when the mark is stale the oracle becomes the
+        // SOLE health price (worse-of degenerates to oracle-only), so its
+        // freshness must be MANDATORY here — the conditional gate above only
+        // enforced it "when configured", leaving an unconfigured (max_age == 0)
+        // or never-stamped (published_at == 0) oracle unvalidated. Treat such an
+        // oracle as untrusted ⇒ refuse to liquidate (fail-safe).
+        if mark_stale {
+            require!(oracle_max_age > 0, FlashBookError::MarkTooStale);
+            require!(
+                market.oracle_published_at_unix_seconds > 0,
+                FlashBookError::MarkTooStale
+            );
+            let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            let oracle_age =
+                now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
+            require!(oracle_age <= oracle_max_age, FlashBookError::OracleTooStale);
+        }
         // P-LIQ-1/2 via the Kani-proven pure helper: worse-of(mark, oracle) when
         // the mark is fresh; oracle-only when it's stale; None when neither
         // source is trustworthy (stale mark + dead oracle) ⇒ refuse to
@@ -14200,14 +14217,23 @@ fn effective_health_mark(market: &MarketAccount, now_unix: u64, current_slot: u6
     if !mark_stale {
         return Ok(market.mark_price_ticks);
     }
-    // Stale mark ⇒ price off the oracle alone — but only a FRESH, non-zero oracle.
+    // Stale mark ⇒ price off the oracle alone — but only a PROVABLY-fresh,
+    // non-zero oracle. F4/L-1 (audit 2026-06): the oracle is now the SOLE health
+    // price, so freshness is MANDATORY, not "checked only if configured". An
+    // unconfigured staleness window (max_age == 0) or a never-stamped publish
+    // time (published_at == 0) leaves the oracle unvalidated — treat it as
+    // untrusted and refuse to liquidate (fail-safe), exactly as this function's
+    // contract states, rather than pricing a liquidation off an unproven oracle.
     let oracle = market.oracle_price_ticks;
     require!(oracle > 0, FlashBookError::MarkTooStale);
     let max_age = market.params.oracle_staleness_max_seconds as u64;
-    if max_age > 0 && market.oracle_published_at_unix_seconds > 0 {
-        let age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
-        require!(age <= max_age, FlashBookError::OracleTooStale);
-    }
+    require!(max_age > 0, FlashBookError::MarkTooStale);
+    require!(
+        market.oracle_published_at_unix_seconds > 0,
+        FlashBookError::MarkTooStale
+    );
+    let age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
+    require!(age <= max_age, FlashBookError::OracleTooStale);
     Ok(oracle)
 }
 
