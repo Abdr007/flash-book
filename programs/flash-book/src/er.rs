@@ -35,7 +35,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
     instruction::{AccountMeta, Instruction},
     program::{invoke, invoke_signed},
-    pubkey, system_instruction,
+    system_instruction,
 };
 
 /// MagicBlock Delegation Program ID. Mainnet + devnet share this address.
