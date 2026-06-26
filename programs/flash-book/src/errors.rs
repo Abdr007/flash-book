@@ -205,6 +205,8 @@ pub enum FlashBookError {
     FillCommitmentMissing = 2206,
     #[msg("Cross-margined trader with multiple positions must be liquidated via liquidate_portfolio_v2 (H-4)")]
     CrossLiquidationNeedsPortfolio = 2207,
+    #[msg("Self-liquidation forbidden: the liquidator must not be the liquidatee (M-2)")]
+    SelfLiquidationForbidden = 2208,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

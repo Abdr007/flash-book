@@ -103,12 +103,15 @@ pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
 /// price may deviate from the FRESH oracle, in bps (symmetric band). The FLP
 /// quoter always prices within its spread of fair value, so a legitimate fill is
 /// far inside this bound; the cap exists only to stop a compromised sequencer
-/// settling an FLP fill far enough from the oracle to drain the pool. 2000 bps =
-/// 20% — comfortably above any realistic FLP spread (sub-2% even in stress) while
-/// capping per-fill pool value-extraction at 20% of notional. A constant (not a
-/// `MarketParams` field) because `MarketParams` has no reserved slack; a future
-/// governance override can replace it once that layout is versioned.
-pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 2000;
+/// settling an FLP fill far enough from the oracle to drain the pool.
+/// M-1 (audit 2026-06) FIX: tightened 2000 bps (20%) → 300 bps (3%). 20% left a
+/// compromised sequencer able to extract up to a fifth of notional per fill,
+/// repeatable; 3% is still comfortably above any realistic FLP spread (sub-2%
+/// even in stress) while capping per-fill pool value-extraction at 3% of
+/// notional. A constant (not a `MarketParams` field) because `MarketParams` has
+/// no reserved slack; a future governance override can replace it once that
+/// layout is versioned.
+pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 300;
 
 /// #36 — anti-book-stuffing: max deviation (bps, symmetric) a RESTING order's
 /// price may sit from the fresh oracle. Far-from-market orders are the classic

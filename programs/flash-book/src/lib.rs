@@ -6672,6 +6672,17 @@ pub mod flash_book {
             position.collateral_quote_lots > 0 || ts_open_positions <= 1,
             FlashBookError::CrossLiquidationNeedsPortfolio
         );
+        // M-2 (audit 2026-06) FIX: forbid self-liquidation. If the caller is the
+        // liquidatee, the Dutch-auction reward below is skimmed from the
+        // liquidatee's own collateral (or isolated bucket) and routed to the
+        // caller's main account — on a bankrupt close that reward is pulled
+        // AHEAD of the insurance `cover_bad_debt` draw, letting the trader
+        // extract value that should backstop the deficit. A liquidation must be
+        // performed by a third party.
+        require!(
+            ctx.accounts.caller.key() != trader_state_pre_trader,
+            FlashBookError::SelfLiquidationForbidden
+        );
         require!(
             position.market == market.key(),
             FlashBookError::WrongMarket
