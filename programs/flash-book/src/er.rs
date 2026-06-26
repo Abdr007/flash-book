@@ -221,22 +221,50 @@ pub fn cpi_undelegate(
 /// trap. A 0 baseline (book not delegated via the upgraded path) is never
 /// escapable. Extracted pure so the "never fires while the ER is live" property
 /// is host-tested and Kani-proven, and the handler calls the proven function.
+/// F3 (audit 2026-06): two-tier so a healthy-but-QUIET market is not griefed off
+/// the ER, while a CENSORING sequencer still cannot trap funds (preserving F1).
+///   • FAST path — the ER shows NO liveness of any kind (no fill, no heartbeat,
+///     no recent delegation) for `stall_timeout_slots`. Heartbeat-aware, so a
+///     live ER that simply has no trades keeps this shut.
+///   • CENSORSHIP backstop — SETTLEMENT (a committed fill) has not advanced for
+///     the much longer `censorship_timeout_slots`, IGNORING the heartbeat (an
+///     alive-but-censoring sequencer heartbeats but settles nothing).
+/// Either opens the escape. A zero baseline (book never delegated via the
+/// upgraded path and never stamped) is never escapable.
 #[inline]
 pub fn force_undelegate_allowed(
     current_slot: u64,
     last_mark_update_slot: u64,
+    last_heartbeat_slot: u64,
     book_delegated_at_slot: u64,
-    timeout_slots: u64,
+    stall_timeout_slots: u64,
+    censorship_timeout_slots: u64,
 ) -> bool {
-    let baseline = if last_mark_update_slot > book_delegated_at_slot {
+    // FAST: any liveness signal (fill, heartbeat, or the delegation baseline).
+    let er_baseline = max3(last_mark_update_slot, last_heartbeat_slot, book_delegated_at_slot);
+    let er_stalled =
+        er_baseline != 0 && current_slot.saturating_sub(er_baseline) > stall_timeout_slots;
+
+    // BACKSTOP: settlement liveness only (heartbeat deliberately excluded).
+    let settle_baseline = if last_mark_update_slot > book_delegated_at_slot {
         last_mark_update_slot
     } else {
         book_delegated_at_slot
     };
-    if baseline == 0 {
-        return false;
+    let censored = settle_baseline != 0
+        && current_slot.saturating_sub(settle_baseline) > censorship_timeout_slots;
+
+    er_stalled || censored
+}
+
+#[inline]
+fn max3(a: u64, b: u64, c: u64) -> u64 {
+    let ab = if a > b { a } else { b };
+    if ab > c {
+        ab
+    } else {
+        c
     }
-    current_slot.saturating_sub(baseline) > timeout_slots
 }
 
 /// FV: the force-undelegate gate NEVER fires while the ER is live — i.e. it can
@@ -247,20 +275,46 @@ pub fn force_undelegate_allowed(
 mod force_undelegate_kani_proofs {
     use super::force_undelegate_allowed;
 
+    /// SOUNDNESS: the escape only opens when a real liveness baseline is stale —
+    /// either the ER shows no signal past the stall timeout, OR settlement has
+    /// not advanced past the (longer) censorship timeout.
     #[kani::proof]
-    fn never_fires_while_live() {
+    fn only_fires_when_a_baseline_is_stale() {
         let current: u64 = kani::any();
         let last_fill: u64 = kani::any();
+        let heartbeat: u64 = kani::any();
         let delegated: u64 = kani::any();
-        let timeout: u64 = kani::any();
-        if force_undelegate_allowed(current, last_fill, delegated, timeout) {
-            // Then BOTH liveness signals are older than the full timeout window,
-            // and at least one real baseline exists.
-            let baseline = core::cmp::max(last_fill, delegated);
-            assert!(baseline > 0);
-            assert!(current > baseline);
-            assert!(current - baseline > timeout);
+        let stall: u64 = kani::any();
+        let censor: u64 = kani::any();
+        if force_undelegate_allowed(current, last_fill, heartbeat, delegated, stall, censor) {
+            let er_baseline = core::cmp::max(last_fill, core::cmp::max(heartbeat, delegated));
+            let settle_baseline = core::cmp::max(last_fill, delegated);
+            let er_stalled = er_baseline != 0 && current.saturating_sub(er_baseline) > stall;
+            let censored =
+                settle_baseline != 0 && current.saturating_sub(settle_baseline) > censor;
+            assert!(er_stalled || censored);
         }
+    }
+
+    /// F3 ANTI-GRIEF: a market with a FRESH ER signal (recent fill or heartbeat
+    /// within the stall window) AND recent settlement (within the censorship
+    /// window) can NEVER be force-undelegated — so a healthy/heartbeating market
+    /// is not griefed off the ER.
+    #[kani::proof]
+    fn fresh_heartbeat_and_settlement_cannot_be_undelegated() {
+        let current: u64 = kani::any();
+        let last_fill: u64 = kani::any();
+        let heartbeat: u64 = kani::any();
+        let delegated: u64 = kani::any();
+        let stall: u64 = kani::any();
+        let censor: u64 = kani::any();
+        // ER alive within the stall window (heartbeat fresh) ...
+        kani::assume(heartbeat <= current && current - heartbeat <= stall);
+        // ... and settlement within the censorship window (recent fill).
+        kani::assume(last_fill <= current && current - last_fill <= censor);
+        assert!(!force_undelegate_allowed(
+            current, last_fill, heartbeat, delegated, stall, censor
+        ));
     }
 }
 
@@ -454,28 +508,55 @@ pub fn process_external_undelegate<'info>(
 mod tests {
     use super::*;
 
+    // Censorship backstop is far away in these fast-path tests (heartbeat=0).
+    const CENSOR: u64 = 9_000;
+
     #[test]
     fn force_undelegate_blocked_without_baseline() {
         // No liveness baseline (never delegated via upgraded path) ⇒ never escapable.
-        assert!(!force_undelegate_allowed(1_000_000, 0, 0, 750));
+        assert!(!force_undelegate_allowed(1_000_000, 0, 0, 0, 750, CENSOR));
     }
 
     #[test]
     fn force_undelegate_blocked_while_live() {
         // Last fill 1 slot ago, timeout 750 ⇒ ER is live ⇒ blocked.
-        assert!(!force_undelegate_allowed(1000, 999, 500, 750));
+        assert!(!force_undelegate_allowed(1000, 999, 0, 500, 750, CENSOR));
         // Exactly at the timeout boundary is NOT enough (strictly greater).
-        assert!(!force_undelegate_allowed(1750, 1000, 0, 750));
+        assert!(!force_undelegate_allowed(1750, 1000, 0, 0, 750, CENSOR));
     }
 
     #[test]
     fn force_undelegate_allowed_after_timeout() {
-        // 751 slots since last fill ⇒ escape opens.
-        assert!(force_undelegate_allowed(1751, 1000, 0, 750));
-        // Sequencer delegated then never filled: baseline = delegation slot.
-        assert!(force_undelegate_allowed(2000, 0, 1000, 750));
+        // 751 slots since last fill AND no heartbeat ⇒ ER dark ⇒ escape opens.
+        assert!(force_undelegate_allowed(1751, 1000, 0, 0, 750, CENSOR));
+        // Sequencer delegated then never filled/heartbeat: baseline = delegation slot.
+        assert!(force_undelegate_allowed(2000, 0, 0, 1000, 750, CENSOR));
         // The MORE RECENT signal wins (a fresh fill keeps it live even if old delegation).
-        assert!(!force_undelegate_allowed(2000, 1900, 100, 750));
+        assert!(!force_undelegate_allowed(2000, 1900, 0, 100, 750, CENSOR));
+    }
+
+    #[test]
+    fn f2_f3_fresh_heartbeat_blocks_fast_escape_on_quiet_market() {
+        // F3: a QUIET but healthy market — last fill 5_000 slots ago (≫ stall 750,
+        // but within the 9_000 censorship window so the backstop is NOT in play),
+        // and the ER heartbeats every ~100 slots. WITHOUT the heartbeat the fast
+        // path would fire (5_000 > 750); WITH it the escape must stay SHUT (no grief).
+        // current 100_000, last_fill 95_000, heartbeat 99_900, delegated 1_000.
+        assert!(!force_undelegate_allowed(100_000, 95_000, 99_900, 1_000, 750, CENSOR));
+        // Same market, ER now ALSO stops heartbeating for > 750 slots ⇒ dark ⇒ escape.
+        assert!(force_undelegate_allowed(100_000, 95_000, 99_000, 1_000, 750, CENSOR));
+    }
+
+    #[test]
+    fn f3_censorship_backstop_fires_despite_fresh_heartbeat() {
+        // F1 preserved: an alive-but-CENSORING sequencer heartbeats every slot but
+        // settles NOTHING. The fast path stays shut (heartbeat fresh), but the
+        // censorship backstop opens once settlement is older than CENSOR.
+        // current 1_000_000, last_fill 990_000 (10k ago > CENSOR 9_000),
+        // heartbeat 999_999 (1 slot ago), delegated 990_000.
+        assert!(force_undelegate_allowed(1_000_000, 990_000, 999_999, 990_000, 750, CENSOR));
+        // If the fill is within the censorship window, NOT escapable (still trading).
+        assert!(!force_undelegate_allowed(1_000_000, 995_000, 999_999, 990_000, 750, CENSOR));
     }
 
     #[test]
@@ -484,26 +565,28 @@ mod tests {
         // goes dark with no committed fill → baseline 0 → trapped forever.
         let timeout = 750;
         assert!(
-            !force_undelegate_allowed(10_000_000, 0, 0, timeout),
+            !force_undelegate_allowed(10_000_000, 0, 0, 0, timeout, CENSOR),
             "pre-upgrade market with no baseline must be trapped (the F1 bug)"
         );
         // stamp_book_liveness_baseline sets book_delegated_at_slot = current slot.
         let stamp_slot = 10_000_000;
         // Immediately after stamping, the ER has NOT yet been silent past the
         // timeout, so the escape stays closed (cannot be used to grief).
-        assert!(!force_undelegate_allowed(stamp_slot, 0, stamp_slot, timeout));
-        assert!(!force_undelegate_allowed(stamp_slot + timeout, 0, stamp_slot, timeout));
+        assert!(!force_undelegate_allowed(stamp_slot, 0, 0, stamp_slot, timeout, CENSOR));
+        assert!(!force_undelegate_allowed(stamp_slot + timeout, 0, 0, stamp_slot, timeout, CENSOR));
         // A genuinely live ER that posts a fill after the stamp pushes the
         // baseline forward via last_mark_update_slot → still blocked.
         assert!(!force_undelegate_allowed(
             stamp_slot + timeout + 1,
             stamp_slot + 5,
+            0,
             stamp_slot,
-            timeout
+            timeout,
+            CENSOR
         ));
-        // After a FULL timeout of continued silence post-stamp, the trapped
-        // trader can finally escape — the trap is closed.
-        assert!(force_undelegate_allowed(stamp_slot + timeout + 1, 0, stamp_slot, timeout));
+        // After a FULL timeout of continued silence post-stamp (no fill, no
+        // heartbeat), the trapped trader can finally escape — the trap is closed.
+        assert!(force_undelegate_allowed(stamp_slot + timeout + 1, 0, 0, stamp_slot, timeout, CENSOR));
     }
 
     #[test]

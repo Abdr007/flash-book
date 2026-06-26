@@ -414,19 +414,26 @@ pub mod flash_book {
     pub fn force_undelegate_market_book(ctx: Context<ForceUndelegateMarketBook>) -> Result<()> {
         let current_slot = Clock::get()?.slot;
         let last_fill = ctx.accounts.market.last_mark_update_slot;
+        let heartbeat = ctx.accounts.market.last_heartbeat_slot;
         let delegated_at = ctx.accounts.market.book_delegated_at_slot;
-        // Kani-proven gate: only fires when the ER has been silent past the full
-        // timeout (and a real liveness baseline exists). Never grief-able while live.
+        // Kani-proven gate (F2/F3): opens only when the ER shows NO liveness of any
+        // kind past the stall timeout (FAST path — heartbeat-aware, so a quiet but
+        // heartbeating market is never griefed), OR settlement has not advanced for
+        // the much longer censorship backstop (catches an alive-but-censoring
+        // sequencer that heartbeats but settles nothing — preserves the F1 escape).
         require!(
             er::force_undelegate_allowed(
                 current_slot,
                 last_fill,
+                heartbeat,
                 delegated_at,
                 constants::FORCE_UNDELEGATE_TIMEOUT_SLOTS,
+                constants::CENSORSHIP_ESCAPE_TIMEOUT_SLOTS,
             ),
             FlashBookError::ErStillLive
         );
-        let baseline = core::cmp::max(last_fill, delegated_at);
+        // Report the most recent ER liveness signal (fill/heartbeat/delegation).
+        let baseline = last_fill.max(heartbeat).max(delegated_at);
         let silent_for = current_slot.saturating_sub(baseline);
 
         let market_key = ctx.accounts.market.key();
@@ -4750,6 +4757,40 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// ER LIVENESS HEARTBEAT (F2/F3, audit 2026-06). Sequencer-authenticated,
+    /// trade-flow-INDEPENDENT proof that the MagicBlock ER is alive. The prior
+    /// liveness signal (`last_mark_update_slot`) only advances on a committed
+    /// fill or `settle_mark`, so a healthy-but-quiet market looked "stalled"
+    /// within ~60s and was wrongly auto-paused (F2) / force-undelegated (F3).
+    ///
+    /// The ER operator calls this every < `MARK_STALENESS_MAX_SLOTS` slots as a
+    /// keepalive (cheap: one field write, no oracle, no book). It MUST be gated
+    /// on `market.sequencer` — a permissionless heartbeat would let anyone keep a
+    /// dead/censoring market "alive" and defeat the censorship escape. A genuinely
+    /// down ER stops signing, so the heartbeat goes stale and the escape opens.
+    pub fn er_heartbeat(ctx: Context<ErHeartbeat>) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        // C-1 trust model: only the configured settlement signer can attest
+        // liveness. A zero/unset sequencer (pre-field market) fails closed.
+        require_keys_eq!(
+            ctx.accounts.sequencer.key(),
+            market.sequencer,
+            FlashBookError::Unauthorized
+        );
+        let slot = Clock::get()?.slot;
+        // Monotonic: never let a stale/replayed heartbeat move the signal backward.
+        require!(
+            slot >= market.last_heartbeat_slot,
+            FlashBookError::OutOfRange
+        );
+        market.last_heartbeat_slot = slot;
+        emit!(ErHeartbeatEvent {
+            market: market.key(),
+            heartbeat_slot: slot,
+        });
+        Ok(())
+    }
+
     /// Verify market invariants and auto-halt on breach.
     ///
     /// Permissionless: anyone can poke a market to check. The protocol
@@ -4770,16 +4811,25 @@ pub mod flash_book {
     pub fn verify_market_invariants(ctx: Context<VerifyMarketInvariants>) -> Result<()> {
         let market = &mut ctx.accounts.market;
 
-        // S7 — ER-stall mark staleness: if the mark hasn't moved for longer than
-        // MARK_STALENESS_MAX_SLOTS the MagicBlock ER is presumed stalled. Auto-
-        // pause so no new orders land against a frozen book/mark until the ER
-        // recovers (and `settle_mark`/fills resume stamping freshness). Guard on
-        // `> 0` so a legacy market that has never stamped the field is not paused
-        // on missing data (liquidation already prices such markets oracle-only).
-        if market.last_mark_update_slot > 0 {
+        // S7 — ER-stall liveness: if the ER shows NO liveness signal for longer
+        // than MARK_STALENESS_MAX_SLOTS it is presumed stalled. Auto-pause so no
+        // new orders land against a frozen book until it recovers.
+        //
+        // F2 (audit 2026-06): liveness is `max(last_mark_update_slot,
+        // last_heartbeat_slot)`, NOT the mark alone. A healthy-but-quiet market
+        // legitimately stops stamping `last_mark_update_slot` (no fills, no
+        // `settle_mark`), but a live ER keeps `er_heartbeat` fresh — so it stays
+        // Active. Only a market with no fill AND no heartbeat (ER actually down)
+        // auto-pauses. Guard on `> 0` so a legacy market that has never stamped
+        // either field is not paused on missing data (liquidation already prices
+        // such markets oracle-only).
+        let liveness_slot = market
+            .last_mark_update_slot
+            .max(market.last_heartbeat_slot);
+        if liveness_slot > 0 {
             let current_slot = Clock::get()?.slot;
-            let mark_age = current_slot.saturating_sub(market.last_mark_update_slot);
-            if mark_age > constants::MARK_STALENESS_MAX_SLOTS {
+            let liveness_age = current_slot.saturating_sub(liveness_slot);
+            if liveness_age > constants::MARK_STALENESS_MAX_SLOTS {
                 let prev_status = market.status;
                 if market.status != MarketStatus::Closed as u8 {
                     market.status = MarketStatus::Paused as u8;
@@ -4788,7 +4838,7 @@ pub mod flash_book {
                     market: market.key(),
                     invariant_code: 7,
                     expected: current_slot,
-                    actual: market.last_mark_update_slot,
+                    actual: liveness_slot,
                     previous_status: prev_status,
                     new_status: market.status,
                 });
@@ -12215,6 +12265,22 @@ pub struct SettleMark<'info> {
     pub market: Account<'info, MarketAccount>,
 }
 
+/// F2/F3: ER liveness heartbeat. NOT permissionless — the handler requires
+/// `sequencer.key() == market.sequencer`, so only the genuine ER operator can
+/// attest liveness (a permissionless heartbeat would block the censorship escape).
+#[derive(Accounts)]
+pub struct ErHeartbeat<'info> {
+    /// Must equal `market.sequencer` (enforced in the handler).
+    pub sequencer: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+}
+
 #[derive(Accounts)]
 pub struct UpdateMarketAuthority<'info> {
     pub authority: Signer<'info>,
@@ -13293,6 +13359,12 @@ pub struct BookLivenessBaselineStampedEvent {
     pub market: Pubkey,
     pub market_book: Pubkey,
     pub baseline_slot: u64,
+}
+
+#[event]
+pub struct ErHeartbeatEvent {
+    pub market: Pubkey,
+    pub heartbeat_slot: u64,
 }
 
 #[event]
