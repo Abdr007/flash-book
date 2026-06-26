@@ -129,6 +129,19 @@ pub const MARK_STALENESS_MAX_SLOTS: u64 = 150;
 /// PRICING): auto-pause/oracle-fallback engage first; forced exit is last resort.
 pub const FORCE_UNDELEGATE_TIMEOUT_SLOTS: u64 = 750;
 
+/// F3 (audit 2026-06) — censorship BACKSTOP timeout. `FORCE_UNDELEGATE_TIMEOUT_
+/// SLOTS` now governs the FAST escape, which requires NO ER liveness signal at
+/// all (no fill AND no `er_heartbeat`) — i.e. the ER is genuinely dark. But an
+/// alive-but-CENSORING sequencer can keep heartbeating while including zero
+/// trades, which would otherwise trap traders forever (defeating F1). So a
+/// second, much longer threshold gates on SETTLEMENT liveness alone
+/// (`last_mark_update_slot`), ignoring the heartbeat: if the market has settled
+/// NOTHING for this long, the escape opens regardless of heartbeats. ~0.4s/slot
+/// ⇒ 9000 slots ≈ 1 hour. Long enough that a healthy-but-quiet market is never
+/// griefed off the ER on a normal lull (the heartbeat keeps the fast path shut),
+/// short enough that censorship cannot trap funds indefinitely.
+pub const CENSORSHIP_ESCAPE_TIMEOUT_SLOTS: u64 = 9_000;
+
 /// #35 / H1 part B — protocol-level safety cap on how far an `apply_flp_fill`
 /// price may deviate from the FRESH oracle, in bps (symmetric band). The FLP
 /// quoter always prices within its spread of fair value, so a legitimate fill is

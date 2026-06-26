@@ -359,6 +359,19 @@ pub struct MarketAccount {
     /// `max(last_mark_update_slot, book_delegated_at_slot)`. Additive-migration
     /// field: pre-existing markets read back 0.
     pub book_delegated_at_slot: u64,
+    /// F2/F3 (audit 2026-06): ER liveness HEARTBEAT slot, stamped by the
+    /// sequencer-authenticated `er_heartbeat` ix INDEPENDENT of trade flow. The
+    /// prior staleness signals (`last_mark_update_slot`) only advance on a fill
+    /// or `settle_mark`, so a healthy-but-QUIET market looked "stalled" within
+    /// ~60s and got auto-paused (F2) / force-undelegated (F3). The heartbeat lets
+    /// the chain distinguish "ER alive, no trades" (heartbeat fresh) from "ER
+    /// dead" (heartbeat stale). Auto-pause and the FAST force-undelegate path use
+    /// `max(last_mark_update_slot, last_heartbeat_slot)`; the censorship backstop
+    /// deliberately ignores it (an alive-but-censoring sequencer heartbeats).
+    /// Must be sequencer-authenticated — a permissionless heartbeat would let
+    /// anyone keep a dead market "alive" and block the escape. Additive-migration
+    /// field: pre-existing markets read back 0.
+    pub last_heartbeat_slot: u64,
 }
 
 // H1: build-time guard — the struct (incl. the new nonce) must still fit the
