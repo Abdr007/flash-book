@@ -13274,7 +13274,9 @@ pub struct ExecuteTriggerOrderV2<'info> {
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    // Boxed (anchor 1.x / rust 1.89): MarketAccount (~1.1KB) on the stack pushed
+    // ExecuteTriggerOrderV2::try_accounts 8 bytes over the 4096 BPF stack frame.
+    pub market: Box<Account<'info, MarketAccount>>,
 
     /// CHECK: PDA at the market_book seed; disc validated inside handler
     /// via `MarketBookHandle::from_account_data`. Mut because the trigger
