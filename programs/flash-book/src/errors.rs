@@ -217,6 +217,10 @@ pub enum FlashBookError {
     SelfLiquidationForbidden = 2208,
     #[msg("Order sequence exhausted: per-market seq exceeded the 24-bit order_id encoding ceiling; reseat the market (H1)")]
     OrderSeqExhausted = 2209,
+    #[msg("Liveness baseline already stamped (book_delegated_at_slot != 0) (F1)")]
+    BaselineAlreadyStamped = 2210,
+    #[msg("Market book is not delegated; nothing to stamp a liveness baseline for (F1)")]
+    BookNotDelegated = 2211,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

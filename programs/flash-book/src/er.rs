@@ -479,6 +479,34 @@ mod tests {
     }
 
     #[test]
+    fn f1_stamp_baseline_closes_the_pre_upgrade_trap() {
+        // F1: a market delegated BEFORE the upgrade has both signals at 0. Its ER
+        // goes dark with no committed fill → baseline 0 → trapped forever.
+        let timeout = 750;
+        assert!(
+            !force_undelegate_allowed(10_000_000, 0, 0, timeout),
+            "pre-upgrade market with no baseline must be trapped (the F1 bug)"
+        );
+        // stamp_book_liveness_baseline sets book_delegated_at_slot = current slot.
+        let stamp_slot = 10_000_000;
+        // Immediately after stamping, the ER has NOT yet been silent past the
+        // timeout, so the escape stays closed (cannot be used to grief).
+        assert!(!force_undelegate_allowed(stamp_slot, 0, stamp_slot, timeout));
+        assert!(!force_undelegate_allowed(stamp_slot + timeout, 0, stamp_slot, timeout));
+        // A genuinely live ER that posts a fill after the stamp pushes the
+        // baseline forward via last_mark_update_slot → still blocked.
+        assert!(!force_undelegate_allowed(
+            stamp_slot + timeout + 1,
+            stamp_slot + 5,
+            stamp_slot,
+            timeout
+        ));
+        // After a FULL timeout of continued silence post-stamp, the trapped
+        // trader can finally escape — the trap is closed.
+        assert!(force_undelegate_allowed(stamp_slot + timeout + 1, 0, stamp_slot, timeout));
+    }
+
+    #[test]
     fn delegation_program_id_is_canonical() {
         assert_eq!(
             DELEGATION_PROGRAM_ID.to_string(),

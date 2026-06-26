@@ -455,6 +455,45 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// PERMISSIONLESS one-shot: stamp the force-undelegate liveness baseline for a
+    /// market whose book was DELEGATED BEFORE the censorship-escape upgrade shipped
+    /// (so `book_delegated_at_slot == 0`). F1 (audit 2026-06): without this, such a
+    /// market whose ER then goes dark with NO committed fill keeps
+    /// `last_mark_update_slot == 0` too, so `force_undelegate_allowed` returns false
+    /// forever and traders are trapped — exactly the population the escape exists to
+    /// free. `delegate_market_book` only stamps the baseline for NEW delegations;
+    /// re-delegating to backfill it requires first undelegating, which is
+    /// authority-gated (the very party assumed to be censoring/dead).
+    ///
+    /// Safe and non-griefable: settable ONLY while the baseline is 0 and the book
+    /// is genuinely delegated (owned by the delegation program), and it merely
+    /// STARTS the clock from now — a live ER's next committed fill advances
+    /// `last_mark_update_slot` past this stamp, and the escape still needs a FULL
+    /// `FORCE_UNDELEGATE_TIMEOUT_SLOTS` of silence afterward. `delegate_market_book`
+    /// overwrites it on any legitimate re-delegation.
+    pub fn stamp_book_liveness_baseline(
+        ctx: Context<StampBookLivenessBaseline>,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.market.book_delegated_at_slot == 0,
+            FlashBookError::BaselineAlreadyStamped
+        );
+        // The book must ACTUALLY be delegated (owned by the delegation program),
+        // else there is no censorship clock to start and no escape to enable.
+        require!(
+            ctx.accounts.market_book.owner == &er::DELEGATION_PROGRAM_ID,
+            FlashBookError::BookNotDelegated
+        );
+        let slot = Clock::get()?.slot;
+        ctx.accounts.market.book_delegated_at_slot = slot;
+        emit!(BookLivenessBaselineStampedEvent {
+            market: ctx.accounts.market.key(),
+            market_book: ctx.accounts.market_book.key(),
+            baseline_slot: slot,
+        });
+        Ok(())
+    }
+
     /// Delegate the MarketAccount itself to the ER. The matcher running
     /// on the ER mutates `mark_price_ticks`, `cum_funding_index`,
     /// `last_funding_rate_bps_per_sec`, `vpin`, `current_batch`, and
@@ -11318,6 +11357,32 @@ pub struct ForceUndelegateMarketBook<'info> {
     pub delegation_program: UncheckedAccount<'info>,
 }
 
+/// F1: permissionless stamp of the force-undelegate liveness baseline for a
+/// book delegated before the censorship-escape upgrade (`book_delegated_at_slot
+/// == 0`). The market account is settled on L1 (book-on-ER, market-on-L1 mode),
+/// so it is mutable here; the handler requires the book PDA be owned by the
+/// delegation program (actually delegated) before stamping.
+#[derive(Accounts)]
+pub struct StampBookLivenessBaseline<'info> {
+    /// Permissionless caller.
+    pub payer: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: the delegated book PDA; handler requires `.owner ==
+    /// DELEGATION_PROGRAM_ID` (i.e. currently delegated). Seed-validated.
+    #[account(
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
 #[derive(Accounts)]
 pub struct DelegateMarket<'info> {
     #[account(mut)]
@@ -13221,6 +13286,13 @@ pub struct MarketBookForceUndelegatedEvent {
     pub liveness_baseline_slot: u64,
     pub current_slot: u64,
     pub silent_slots: u64,
+}
+
+#[event]
+pub struct BookLivenessBaselineStampedEvent {
+    pub market: Pubkey,
+    pub market_book: Pubkey,
+    pub baseline_slot: u64,
 }
 
 #[event]
