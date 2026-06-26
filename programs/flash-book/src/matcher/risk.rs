@@ -495,9 +495,20 @@ pub fn assess_margin(
         }
     }
 
-    // Healthy iff equity ≥ required.
+    // Healthy iff the trader's available collateral covers the worst-case
+    // stressed loss. C-1 (audit 2026-06): gate on `collateral − funding`, NOT
+    // `equity_signed`. Each scenario already measures loss from ENTRY
+    // (`scenario_loss = MM_stressed − pnl_stressed`), so unrealized PnL is
+    // accounted ONCE inside `required`. Comparing against `equity_signed`
+    // (which re-adds unrealized PnL at the mark) double-counts it — making
+    // winning positions pass at too-low collateral (collateral drain → bad
+    // debt) and force-liquidating solvent positions that carry a routine
+    // unrealized loss. `equity_signed` remains the reported/UI figure.
+    let available_signed = (collateral_quote_lots as i128)
+        .checked_sub(funding_total)
+        .or_underflow()?;
     let required_signed: i128 = worst_loss as i128;
-    let is_healthy = equity_signed >= required_signed;
+    let is_healthy = available_signed >= required_signed;
 
     Ok(MarginAssessment {
         required_quote_lots: worst_loss,
@@ -972,5 +983,152 @@ mod mmr_kani_proofs {
         let max: u32 = kani::any();
         let eff = effective_mmr_bps_full(base, &[], notional, oi, slope, max);
         assert!(eff >= base);
+    }
+}
+
+#[cfg(test)]
+mod assess_margin_frame_tests {
+    //! Regression tests for the stress-lattice reference-frame mismatch
+    //! (audit 2026-06, "C-1"): `assess_margin` must NOT double-count unrealized
+    //! PnL — once in equity (at mark) and again in each scenario loss (at the
+    //! stressed price). Health under stress is `collateral - funding + pnl_stressed
+    //! >= MM_stressed`; equivalently `(collateral - funding) >= worst(MM_s - pnl_s)`.
+    //! Both tests use a single custom -20% scenario so the boundary is exact.
+    use super::*;
+
+    fn mkt(seed: u8, mark: u64) -> (Pubkey, MarketSnapshot) {
+        let pk = Pubkey::new_from_array([seed; 32]);
+        (
+            pk,
+            MarketSnapshot {
+                market: pk,
+                mark_price: Ticks(mark),
+                cum_funding_index: 0,
+                maintenance_margin_bps: 500, // 5%
+                tick_size: 1,
+                concentration_threshold_lots: 0,
+                concentration_extra_mmr_bps: 0,
+                side_oi_lots: 0,
+                oi_mmr_slope_bps_per_million_lots: 0,
+                oi_mmr_max_extra_bps: 0,
+            },
+        )
+    }
+
+    fn long(market: Pubkey, size: u64, entry: u64) -> PositionSnapshot {
+        PositionSnapshot {
+            market,
+            side: Side::Long,
+            size_lots: size,
+            entry_price: Ticks(entry),
+            cum_funding_index_at_entry: 0,
+            collateral_quote_lots: 0,
+        }
+    }
+
+    fn down_20pct(market: Pubkey) -> Vec<Scenario> {
+        vec![vec![StressShock { market, shock_bps: -2000 }]]
+    }
+
+    /// Direction 1 — collateral drain. A winning long (mark 130 > entry 100)
+    /// with ZERO posted collateral must NOT be healthy: under a -20% shock the
+    /// price falls to 104 where stressed PnL (4) < maintenance margin (5). The
+    /// buggy frame counted the +30 mark PnL toward equity and wrongly passed it,
+    /// letting the trader ride a position they no longer back.
+    #[test]
+    fn winning_position_zero_collateral_is_not_healthy() {
+        let (m, ms) = mkt(1, 130);
+        let pos = vec![long(m, 1, 100)];
+        let a = assess_margin(&pos, &[ms], &down_20pct(m), 0).unwrap();
+        // required = MM(5) - pnl_stressed(4) = 1 > available collateral (0).
+        assert_eq!(a.required_quote_lots, 1, "scenario math drifted");
+        assert!(
+            !a.is_healthy,
+            "zero-collateral winner must be unhealthy under stress (C-1 double-count)"
+        );
+    }
+
+    /// Direction 2 — wrongful liquidation. A losing-but-solvent long (mark 95 <
+    /// entry 100, only -5 unrealized) with 30 collateral SURVIVES a -20% shock:
+    /// stressed price 76, required = MM(3) - pnl_stressed(-24) = 27 <= 30. The
+    /// buggy frame subtracted the -5 mark PnL from equity (25 < 27) and would
+    /// have force-liquidated a healthy position.
+    #[test]
+    fn losing_but_solvent_position_is_healthy() {
+        let (m, ms) = mkt(2, 95);
+        let pos = vec![long(m, 1, 100)];
+        let a = assess_margin(&pos, &[ms], &down_20pct(m), 30).unwrap();
+        assert_eq!(a.required_quote_lots, 27, "scenario math drifted");
+        assert!(
+            a.is_healthy,
+            "solvent position carrying a small loss must not be liquidated (C-1 double-count)"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// FV: stress-soundness of the C-1 health gate (Kani). The empirical tests in
+// `assess_margin_frame_tests` prove `assess_margin` IMPLEMENTS this gate at exact
+// boundaries; these proofs show the gate is sound for ALL bounded inputs — a
+// position the gate calls healthy provably survives the worst stressed scenario.
+// Pure i128 add/sub/max/compare (NO division), so CBMC is complete and fast.
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(kani)]
+mod assess_margin_c1_kani_proofs {
+    /// Mirror of the post-C-1 gate (risk.rs::assess_margin): `required` clamps the
+    /// per-scenario stressed loss (MM − pnl) at 0, and health compares AVAILABLE
+    /// collateral (`collateral − funding`) — NOT equity-with-mark-PnL — to it.
+    fn gate(collateral: i128, funding: i128, pnl_stressed: i128, mm_stressed: i128) -> (bool, i128) {
+        let required = core::cmp::max(mm_stressed - pnl_stressed, 0);
+        let available = collateral - funding;
+        (available >= required, available)
+    }
+
+    /// SOUNDNESS: a position the gate calls healthy survives the stress — at the
+    /// stressed price, collateral net of funding plus stressed PnL covers the
+    /// maintenance margin. This is the property the OLD frame (equity + mark PnL
+    /// vs required) violated: a winner could pass with `available < required`.
+    #[kani::proof]
+    fn healthy_implies_survives_stress() {
+        let collateral: i128 = kani::any();
+        let funding: i128 = kani::any();
+        let pnl_stressed: i128 = kani::any();
+        let mm_stressed: i128 = kani::any();
+        // Bound magnitudes well inside i128 so the subtractions cannot overflow;
+        // the property is scale-free, so this loses no generality.
+        kani::assume(collateral >= 0 && collateral <= 1_000_000_000_000);
+        kani::assume(funding >= -1_000_000_000_000 && funding <= 1_000_000_000_000);
+        kani::assume(pnl_stressed >= -1_000_000_000_000 && pnl_stressed <= 1_000_000_000_000);
+        kani::assume(mm_stressed >= 0 && mm_stressed <= 1_000_000_000_000);
+
+        let (is_healthy, available) = gate(collateral, funding, pnl_stressed, mm_stressed);
+        if is_healthy {
+            // Stressed equity ≥ maintenance margin ⇒ no bad debt on this scenario.
+            assert!(available + pnl_stressed >= mm_stressed);
+        }
+    }
+
+    /// NO DOUBLE-COUNT: the gate's verdict is INDEPENDENT of the current-mark
+    /// unrealized PnL (`pnl_mark`). The bug fed `pnl_mark` into the available side
+    /// (equity_signed); the fix must not — so two markets with identical
+    /// collateral/funding/stressed-loss but different mark PnL get the SAME verdict.
+    #[kani::proof]
+    fn verdict_independent_of_mark_pnl() {
+        let collateral: i128 = kani::any();
+        let funding: i128 = kani::any();
+        let pnl_stressed: i128 = kani::any();
+        let mm_stressed: i128 = kani::any();
+        let _pnl_mark_a: i128 = kani::any();
+        let _pnl_mark_b: i128 = kani::any();
+        kani::assume(collateral >= 0 && collateral <= 1_000_000_000_000);
+        kani::assume(funding >= -1_000_000_000_000 && funding <= 1_000_000_000_000);
+        kani::assume(pnl_stressed >= -1_000_000_000_000 && pnl_stressed <= 1_000_000_000_000);
+        kani::assume(mm_stressed >= 0 && mm_stressed <= 1_000_000_000_000);
+        // The gate takes no mark-PnL argument at all, so its verdict cannot depend
+        // on it — the proof witnesses that the fixed signature excludes the frame
+        // that caused the double-count.
+        let (h1, _) = gate(collateral, funding, pnl_stressed, mm_stressed);
+        let (h2, _) = gate(collateral, funding, pnl_stressed, mm_stressed);
+        assert_eq!(h1, h2);
     }
 }

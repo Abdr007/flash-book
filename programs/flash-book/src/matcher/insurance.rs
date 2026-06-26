@@ -102,6 +102,52 @@ impl InsuranceFund {
 // insurance` is the [CERTORA-TARGET] whole-program invariant.
 // ─────────────────────────────────────────────────────────────────────
 
+/// FULL-invariant solvency (P-SOLV-4): the vault must cover ALL liabilities —
+/// `vault >= total_collateral + flp_capital + insurance`. Stronger than
+/// [`assess_solvency`], which omits trader collateral and so only covers the
+/// protocol-owned subset. Returns `(solvent, surplus)`; `Err(())` iff the summed
+/// liabilities overflow u64 (unreachable for real balances).
+#[inline]
+pub fn assess_solvency_full(
+    vault: u64,
+    total_collateral: u64,
+    flp_capital: u64,
+    insurance: u64,
+) -> core::result::Result<(bool, u64), ()> {
+    let required = total_collateral
+        .checked_add(flp_capital)
+        .ok_or(())?
+        .checked_add(insurance)
+        .ok_or(())?;
+    let solvent = vault >= required;
+    let surplus = if solvent { vault - required } else { 0 };
+    Ok((solvent, surplus))
+}
+
+/// One-sided insolvency detector over a PARTIAL (deduplicated) collateral sum.
+///
+/// The full invariant needs `Σ collateral` over ALL traders, which is unbounded
+/// on-chain. But solvency only requires `Σ collateral <= vault - (flp +
+/// insurance)`, so if any DEDUPLICATED SUBSET of trader collateral already
+/// exceeds that headroom, the protocol is provably insolvent regardless of the
+/// unseen remainder (the real total is `>=` the partial sum). This is sound in
+/// one direction (it only ever fires on genuine insolvency) and drift-free: it
+/// reads real summed balances rather than a stored aggregate that could desync
+/// from the 47 collateral-mutation sites. Returns `true` ⇒ definitely insolvent.
+#[inline]
+pub fn partial_collateral_proves_insolvent(
+    partial_collateral: u64,
+    flp_capital: u64,
+    insurance: u64,
+    vault: u64,
+) -> core::result::Result<bool, ()> {
+    let buckets = flp_capital.checked_add(insurance).ok_or(())?;
+    // headroom = vault - buckets, saturating at 0: if the protocol-owned buckets
+    // alone already exceed the vault, ANY positive collateral proves insolvency.
+    let headroom = vault.saturating_sub(buckets);
+    Ok(partial_collateral > headroom)
+}
+
 /// Assess protocol solvency over the vault / insurance / FLP-capital buckets.
 /// `Err(())` iff `insurance + flp_capital` overflows u64 (unreachable for real
 /// balances — the caller maps it to ArithmeticOverflow).
@@ -124,7 +170,50 @@ pub fn assess_solvency(
 /// FV: machine-checked protocol-solvency arithmetic (Kani, add/compare only → fast).
 #[cfg(kani)]
 mod solvency_kani_proofs {
-    use super::assess_solvency;
+    use super::{
+        assess_solvency, assess_solvency_full, partial_collateral_proves_insolvent,
+    };
+
+    /// P-SOLV-4 CORRECTNESS: full-invariant `solvent` is exactly
+    /// `vault >= total_collateral + flp + insurance`.
+    #[kani::proof]
+    fn full_solvent_iff_vault_covers_all_liabilities() {
+        let vault: u64 = kani::any();
+        let collateral: u64 = kani::any();
+        let flp: u64 = kani::any();
+        let insurance: u64 = kani::any();
+        if let Ok((solvent, surplus)) = assess_solvency_full(vault, collateral, flp, insurance) {
+            // no-overflow path: collateral + flp + insurance fits u64
+            let req = collateral + flp + insurance;
+            assert!(solvent == (vault >= req));
+            if solvent {
+                assert!(req + surplus == vault); // surplus exact, no value invented
+            } else {
+                assert!(surplus == 0);
+            }
+        }
+    }
+
+    /// SOUNDNESS: the one-sided detector NEVER fires unless the protocol is
+    /// genuinely insolvent. If a deduplicated PARTIAL collateral sum proves
+    /// insolvency, then for ANY real total `>=` that partial, the full check
+    /// reports NOT solvent. (When the full sum overflows u64 it is `> vault`
+    /// too, i.e. also insolvent — consistent, just not exercised by the assert.)
+    #[kani::proof]
+    fn partial_insolvency_detector_is_sound() {
+        let partial: u64 = kani::any();
+        let flp: u64 = kani::any();
+        let insurance: u64 = kani::any();
+        let vault: u64 = kani::any();
+        let total: u64 = kani::any();
+        kani::assume(total >= partial);
+        if let Ok(true) = partial_collateral_proves_insolvent(partial, flp, insurance, vault) {
+            if let Ok((solvent, _)) = assess_solvency_full(vault, total, flp, insurance) {
+                assert!(!solvent);
+            }
+        }
+    }
+
 
     /// CORRECTNESS: `solvent` is exactly `vault ≥ insurance + flp_capital`.
     #[kani::proof]
@@ -153,6 +242,47 @@ mod solvency_kani_proofs {
                 assert!(req + surplus == vault);
             } else {
                 assert!(surplus == 0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod solvency_full_tests {
+    use super::{assess_solvency_full, partial_collateral_proves_insolvent};
+
+    #[test]
+    fn full_invariant_counts_collateral() {
+        // vault exactly covers collateral + flp + insurance ⇒ solvent, zero surplus.
+        assert_eq!(assess_solvency_full(100, 60, 30, 10), Ok((true, 0)));
+        // one extra lot of headroom ⇒ surplus 1.
+        assert_eq!(assess_solvency_full(101, 60, 30, 10), Ok((true, 1)));
+        // collateral the OLD protocol-bucket check ignored now tips it insolvent.
+        assert_eq!(assess_solvency_full(40, 60, 30, 10), Ok((false, 0)));
+    }
+
+    #[test]
+    fn partial_detector_fires_only_on_real_insolvency() {
+        // vault 100, buckets flp30+ins10=40 ⇒ headroom 60.
+        // A partial collateral sum of 61 (subset!) already exceeds headroom ⇒ insolvent.
+        assert_eq!(partial_collateral_proves_insolvent(61, 30, 10, 100), Ok(true));
+        // A partial of 60 is within headroom ⇒ not proven (more traders may exist).
+        assert_eq!(partial_collateral_proves_insolvent(60, 30, 10, 100), Ok(false));
+        // Buckets alone exceed the vault ⇒ any positive collateral proves it.
+        assert_eq!(partial_collateral_proves_insolvent(1, 80, 30, 100), Ok(true));
+    }
+
+    #[test]
+    fn partial_detector_is_one_sided_sound_vs_full() {
+        // Whenever the partial detector fires, the full check on the SAME-or-larger
+        // total must agree it's insolvent.
+        for &(partial, flp, ins, vault) in &[(61u64, 30u64, 10u64, 100u64), (1, 80, 30, 100)] {
+            if partial_collateral_proves_insolvent(partial, flp, ins, vault) == Ok(true) {
+                for extra in 0..5u64 {
+                    let total = partial + extra;
+                    let (solvent, _) = assess_solvency_full(vault, total, flp, ins).unwrap();
+                    assert!(!solvent, "detector fired but full check called it solvent");
+                }
             }
         }
     }

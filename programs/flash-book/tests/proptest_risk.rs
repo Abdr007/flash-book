@@ -7,7 +7,8 @@
 //!
 //!   1. required_margin ≥ 0 for any portfolio
 //!   2. equity = collateral + Σ unrealized_pnl − Σ funding_owed  (linearity)
-//!   3. is_healthy ↔ equity ≥ required (definitional)
+//!   3. is_healthy ↔ (collateral − funding) ≥ required (C-1 frame; NOT equity,
+//!      which would double-count unrealized PnL)
 //!   4. hedge always reduces required margin: M(long+short) < M(long alone)
 //!   5. monotonic collateral: more collateral can only make you healthier
 //!
@@ -142,9 +143,15 @@ proptest! {
         );
     }
 
-    /// is_healthy is exactly equity ≥ required.
+    /// is_healthy is exactly AVAILABLE collateral ≥ required (C-1 frame).
+    ///
+    /// Post-C-1 (audit 2026-06), health gates on `collateral − funding`, NOT on
+    /// `equity_signed` (which re-adds unrealized PnL at the mark and double-counts
+    /// it — the scenario `required` already carries PnL via −pnl_stressed). These
+    /// fixtures set both funding indices to 0, so funding is 0 and the available
+    /// frame reduces to `collateral`.
     #[test]
-    fn is_healthy_consistent_with_equity_required(
+    fn is_healthy_consistent_with_available_required(
         size in 1u64..500u64,
         entry in 50u64..200u64,
         mark in 50u64..200u64,
@@ -154,7 +161,8 @@ proptest! {
         let positions = vec![position(Side::Long, size, entry)];
         let scenarios = default_scenarios(&[m.market]);
         let a = assess_margin(&positions, &[m], &scenarios, collateral)?;
-        let expected_healthy = a.equity_quote_lots_signed >= a.required_quote_lots as i128;
+        // funding == 0 in these fixtures ⇒ available == collateral.
+        let expected_healthy = (collateral as i128) >= a.required_quote_lots as i128;
         prop_assert_eq!(a.is_healthy, expected_healthy);
     }
 

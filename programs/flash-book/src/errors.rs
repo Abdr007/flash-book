@@ -37,6 +37,8 @@ pub enum FlashBookError {
     WrongTrader = 1104,
     #[msg("Stale account version")]
     StaleVersion = 1105,
+    #[msg("Unexpected account type in remaining_accounts")]
+    UnexpectedAccountType = 1106,
 
     // ── 1200-1299 order intake ──────────────────────────────────────
     #[msg("Order size below market minimum lot")]
@@ -124,6 +126,8 @@ pub enum FlashBookError {
     InsuranceBelowFloor = 1500,
     #[msg("Insurance fund cannot cover bankruptcy; ADL needed")]
     InsuranceExhausted = 1501,
+    #[msg("Protocol insolvent: summed trader collateral exceeds vault headroom over FLP + insurance")]
+    ProtocolInsolvent = 1502,
 
     // ── 1700-1799 delegation (MagicBlock ER) ────────────────────────
     #[msg("Account not delegated to ER; instruction must run on L1")]
@@ -134,6 +138,8 @@ pub enum FlashBookError {
     DelegationExpired = 1702,
     #[msg("Force-include from L1 not yet supported in this build")]
     ForceIncludeUnsupported = 1703,
+    #[msg("ER still live: settlement-liveness timeout not elapsed; cannot force-undelegate")]
+    ErStillLive = 1704,
 
     // ── 1800-1899 oracle ────────────────────────────────────────────
     #[msg("Oracle price is too stale to be trusted")]
@@ -144,6 +150,8 @@ pub enum FlashBookError {
     OraclePausedConfidence = 1802,
     #[msg("Oracle quorum dispersion exceeds configured maximum — sources disagree")]
     OracleQuorumDispersionTooWide = 1803,
+    #[msg("Mark price is too stale (ER stalled); no trustworthy price to liquidate against")]
+    MarkTooStale = 1804,
 
     // ── 1900-1999 haircut (Wave 24) ─────────────────────────────────
     #[msg("Haircut warmup window inverted (h_min > h_max)")]
@@ -207,6 +215,12 @@ pub enum FlashBookError {
     CrossLiquidationNeedsPortfolio = 2207,
     #[msg("Self-liquidation forbidden: the liquidator must not be the liquidatee (M-2)")]
     SelfLiquidationForbidden = 2208,
+    #[msg("Order sequence exhausted: per-market seq exceeded the 24-bit order_id encoding ceiling; reseat the market (H1)")]
+    OrderSeqExhausted = 2209,
+    #[msg("Liveness baseline already stamped (book_delegated_at_slot != 0) (F1)")]
+    BaselineAlreadyStamped = 2210,
+    #[msg("Market book is not delegated; nothing to stamp a liveness baseline for (F1)")]
+    BookNotDelegated = 2211,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

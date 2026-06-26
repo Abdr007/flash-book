@@ -366,7 +366,16 @@ pub fn assess_margin(
         }
     }
 
-    let is_healthy = equity_signed >= worst_loss as i128;
+    // C-1 (audit 2026-06): gate on `collateral − funding`, NOT `equity_signed`.
+    // Each scenario already measures loss from ENTRY (MM_stressed − pnl_stressed),
+    // so unrealized PnL is counted ONCE inside `required`; comparing against
+    // `equity_signed` (which re-adds mark PnL) double-counts it — under-margining
+    // winners and wrongly liquidating solvent losers. `equity_signed` stays the
+    // reported figure. Mirrors the Anchor fix in matcher/risk.rs.
+    let available_signed = (collateral_quote_lots as i128)
+        .checked_sub(funding_total)
+        .or_underflow()?;
+    let is_healthy = available_signed >= worst_loss as i128;
     Ok(MarginAssessment {
         required_quote_lots: worst_loss,
         equity_quote_lots_signed: equity_signed,

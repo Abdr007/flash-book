@@ -22,26 +22,38 @@ pub fn split_pro_rata(fill_size: u64, maker_sizes: &[u64], out: &mut [(usize, u6
         return 0;
     }
     let fill_u128 = fill_size as u128;
-    let mut n: usize = 0;
+    // M2 (audit 2026-06): a maker is never filled past its OWN size, and the
+    // level fills at most min(fill_size, Σ sizes); the remainder is unfillable
+    // taker liquidity and is dropped, NOT crammed onto the first maker. Mirrors
+    // the Anchor `split_pro_rata` fix. The caller buffer (cap ≥ maker count) doubles
+    // as index-addressable scratch: write every maker's capped share, distribute
+    // the flooring residual by remaining capacity, then compact out the zeros.
+    let target = fill_u128.min(total);
+    let m = maker_sizes.len().min(out.len());
+
     let mut assigned: u128 = 0;
-    for (i, size) in maker_sizes.iter().enumerate() {
-        let share = ((*size as u128) * fill_u128 / total).min(u64::MAX as u128) as u64;
-        if share > 0 {
-            if n < out.len() {
-                out[n] = (i, share);
-                n += 1;
-            }
-            assigned = assigned.saturating_add(share as u128);
-        }
+    for i in 0..m {
+        let size = maker_sizes[i] as u128;
+        let share = (size * fill_u128 / total).min(size);
+        out[i] = (i, share.min(u64::MAX as u128) as u64);
+        assigned = assigned.saturating_add(share);
     }
-    // Residual (from flooring) → first non-zero maker.
-    if assigned < fill_u128 {
-        let residual = (fill_u128 - assigned).min(u64::MAX as u128) as u64;
-        if n > 0 {
-            out[0].1 = out[0].1.saturating_add(residual);
-        } else if !out.is_empty() {
-            out[0] = (0, residual);
-            n = 1;
+    let mut residual = target.saturating_sub(assigned);
+    for i in 0..m {
+        if residual == 0 {
+            break;
+        }
+        let capacity = (maker_sizes[i] as u128).saturating_sub(out[i].1 as u128);
+        let add = capacity.min(residual);
+        out[i].1 = out[i].1.saturating_add(add.min(u64::MAX as u128) as u64);
+        residual = residual.saturating_sub(add);
+    }
+    // Compact non-zero fills to the front, preserving index order.
+    let mut n: usize = 0;
+    for i in 0..m {
+        if out[i].1 > 0 {
+            out[n] = out[i];
+            n += 1;
         }
     }
     n
@@ -90,24 +102,25 @@ mod tests {
     }
 
     #[test]
-    fn residual_lots_go_to_first_maker() {
-        // 10 lots, makers 3+3+3=9, each floors to 3, residual 1 → first +1.
-        let (out, n) = run(10, &[3, 3, 3]);
-        assert_eq!(n, 3);
+    fn flooring_residual_goes_to_first_maker_with_capacity() {
+        // 11 lots, makers 7+7=14, each floors to 5, residual 1 → first (cap 2) +1.
+        let (out, n) = run(11, &[7, 7]);
+        assert_eq!(n, 2);
         let total: u64 = out[..n].iter().map(|(_, s)| s).sum();
-        assert_eq!(total, 10);
-        assert_eq!(out[0].1, 4);
-        assert_eq!(out[1].1, 3);
-        assert_eq!(out[2].1, 3);
+        assert_eq!(total, 11);
+        assert_eq!(out[0].1, 6);
+        assert_eq!(out[1].1, 5);
     }
 
     #[test]
-    fn fill_larger_than_total() {
+    fn fill_larger_than_total_caps_each_maker_at_its_size() {
+        // M2: fill exceeds total displayed (200 > 100) → each maker fills its
+        // full size (50) and no more; the extra 100 is dropped. Old: (100, 100).
         let (out, n) = run(200, &[50, 50]);
         let total: u64 = out[..n].iter().map(|(_, s)| s).sum();
-        assert_eq!(total, 200);
-        assert_eq!(out[0].1, 100);
-        assert_eq!(out[1].1, 100);
+        assert_eq!(total, 100);
+        assert_eq!(out[0].1, 50);
+        assert_eq!(out[1].1, 50);
     }
 
     #[test]

@@ -343,6 +343,11 @@ pub mod flash_book {
             signer_seeds,
         )?;
 
+        // Settlement-liveness baseline for the permissionless force-undelegate
+        // escape: even if the sequencer never posts a fill, the censorship
+        // timeout starts ticking from here.
+        ctx.accounts.market.book_delegated_at_slot = Clock::get()?.slot;
+
         emit!(MarketBookDelegatedEvent {
             market: market_key,
             market_book: ctx.accounts.market_book.key(),
@@ -386,6 +391,105 @@ pub mod flash_book {
         emit!(MarketBookUndelegatedEvent {
             market: market_key,
             market_book: ctx.accounts.market_book.key(),
+        });
+        Ok(())
+    }
+
+    /// PERMISSIONLESS censorship / ER-stall escape (force-include, #1703).
+    ///
+    /// `undelegate_market_book` is authority-gated, so a censoring sequencer (or
+    /// a dead ER) can trap traders: while the book is delegated they cannot place
+    /// a closing order, and `withdraw_collateral` requires `open_positions == 0`.
+    /// This variant drops the authority check and gates ONLY on settlement
+    /// liveness — the book must have been silent for more than
+    /// `FORCE_UNDELEGATE_TIMEOUT_SLOTS`. Liveness is `max(last_mark_update_slot,
+    /// book_delegated_at_slot)`: `last_mark_update_slot` advances on every
+    /// committed fill (apply_fill on L1), and the delegation-slot baseline closes
+    /// the "delegate then never fill" trap (which would otherwise hold
+    /// `last_mark_update_slot == 0` forever). The undelegate CPI is signed by the
+    /// program via the book PDA seeds — NO sequencer signature — so after it lands
+    /// the book is authoritative on L1 and the trader can close + withdraw. The
+    /// book reverts to its last-committed L1 state (the trapped trader wants out,
+    /// not the censored continuation). Ties exit to liveness, not goodwill.
+    pub fn force_undelegate_market_book(ctx: Context<ForceUndelegateMarketBook>) -> Result<()> {
+        let current_slot = Clock::get()?.slot;
+        let last_fill = ctx.accounts.market.last_mark_update_slot;
+        let delegated_at = ctx.accounts.market.book_delegated_at_slot;
+        // Kani-proven gate: only fires when the ER has been silent past the full
+        // timeout (and a real liveness baseline exists). Never grief-able while live.
+        require!(
+            er::force_undelegate_allowed(
+                current_slot,
+                last_fill,
+                delegated_at,
+                constants::FORCE_UNDELEGATE_TIMEOUT_SLOTS,
+            ),
+            FlashBookError::ErStillLive
+        );
+        let baseline = core::cmp::max(last_fill, delegated_at);
+        let silent_for = current_slot.saturating_sub(baseline);
+
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.market_book;
+        let signer_seeds: &[&[u8]] = &[state_v2::MARKET_BOOK_SEED, market_key.as_ref(), &[bump]];
+
+        er::cpi_undelegate(
+            er::UndelegateAccounts {
+                payer: ctx.accounts.payer.to_account_info(),
+                delegated_account: ctx.accounts.market_book.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            signer_seeds,
+        )?;
+
+        emit!(MarketBookForceUndelegatedEvent {
+            market: market_key,
+            market_book: ctx.accounts.market_book.key(),
+            liveness_baseline_slot: baseline,
+            current_slot,
+            silent_slots: silent_for,
+        });
+        Ok(())
+    }
+
+    /// PERMISSIONLESS one-shot: stamp the force-undelegate liveness baseline for a
+    /// market whose book was DELEGATED BEFORE the censorship-escape upgrade shipped
+    /// (so `book_delegated_at_slot == 0`). F1 (audit 2026-06): without this, such a
+    /// market whose ER then goes dark with NO committed fill keeps
+    /// `last_mark_update_slot == 0` too, so `force_undelegate_allowed` returns false
+    /// forever and traders are trapped — exactly the population the escape exists to
+    /// free. `delegate_market_book` only stamps the baseline for NEW delegations;
+    /// re-delegating to backfill it requires first undelegating, which is
+    /// authority-gated (the very party assumed to be censoring/dead).
+    ///
+    /// Safe and non-griefable: settable ONLY while the baseline is 0 and the book
+    /// is genuinely delegated (owned by the delegation program), and it merely
+    /// STARTS the clock from now — a live ER's next committed fill advances
+    /// `last_mark_update_slot` past this stamp, and the escape still needs a FULL
+    /// `FORCE_UNDELEGATE_TIMEOUT_SLOTS` of silence afterward. `delegate_market_book`
+    /// overwrites it on any legitimate re-delegation.
+    pub fn stamp_book_liveness_baseline(
+        ctx: Context<StampBookLivenessBaseline>,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.market.book_delegated_at_slot == 0,
+            FlashBookError::BaselineAlreadyStamped
+        );
+        // The book must ACTUALLY be delegated (owned by the delegation program),
+        // else there is no censorship clock to start and no escape to enable.
+        require!(
+            ctx.accounts.market_book.owner == &er::DELEGATION_PROGRAM_ID,
+            FlashBookError::BookNotDelegated
+        );
+        let slot = Clock::get()?.slot;
+        ctx.accounts.market.book_delegated_at_slot = slot;
+        emit!(BookLivenessBaselineStampedEvent {
+            market: ctx.accounts.market.key(),
+            market_book: ctx.accounts.market_book.key(),
+            baseline_slot: slot,
         });
         Ok(())
     }
@@ -918,6 +1022,11 @@ pub mod flash_book {
             Vec::with_capacity(TYPICAL_WALK_DEPTH);
         let mut stp_cancels: Vec<hypertree::DataIndex> = Vec::new();
         let mut stp_aborted = false;
+        // M1 (audit 2026-06): set when the walk stops because it hit `walk_limit`
+        // (NOT because crossing liquidity was exhausted). In that case unmatched
+        // crossing orders may remain on the book, so the residual must NOT rest at
+        // `limit_ticks` (it would cross the book). See the residual-rest guard.
+        let mut walk_truncated = false;
         let walk_limit = MAX_BATCH_ORDERS_PER_SIDE_V2;
 
         // Always walk to detect crossings. post_only check happens
@@ -926,7 +1035,7 @@ pub mod flash_book {
         // cross conditions.
         if side_is_bid {
             handle.for_each_ask_best_first(|idx, ask| {
-                if matches.len() >= walk_limit { return false; }
+                if matches.len() >= walk_limit { walk_truncated = true; return false; }
                 if remaining == 0 { return false; }
                 if ask.price_ticks > limit_ticks { return false; }
                 if ask.expires_at_slot > 0 && now_slot > ask.expires_at_slot { return true; }
@@ -950,7 +1059,7 @@ pub mod flash_book {
             });
         } else {
             handle.for_each_bid_best_first(|idx, bid| {
-                if matches.len() >= walk_limit { return false; }
+                if matches.len() >= walk_limit { walk_truncated = true; return false; }
                 if remaining == 0 { return false; }
                 if bid.price_ticks < limit_ticks { return false; }
                 if bid.expires_at_slot > 0 && now_slot > bid.expires_at_slot { return true; }
@@ -1091,6 +1200,7 @@ pub mod flash_book {
         // `price_within_band` returns true when `oracle_price_ticks == 0`.
         if remaining > 0
             && !ioc
+            && !walk_truncated
             && remaining >= p.min_base_lots
             && matcher::flp_quoter::price_within_band(
                 market.oracle_price_ticks,
@@ -4353,6 +4463,16 @@ pub mod flash_book {
             }
         }
 
+        // ── ER liveness: stamp the mark-freshness slot ──────────────
+        // The mark engine just ran on a real fill, so the ER is alive and the
+        // mark reflects current tape. Record the slot UNCONDITIONALLY (even when
+        // the EMA produced no net change, or alpha==0 froze it) so a calm market
+        // whose mark sits on the oracle is never mistaken for a stalled ER. A
+        // genuinely stalled ER stops fills → this slot ages past
+        // MARK_STALENESS_MAX_SLOTS → `liquidate_position_v2` falls back to
+        // oracle-only health pricing and `verify_market_invariants` auto-pauses.
+        market.last_mark_update_slot = Clock::get()?.slot;
+
         // ── Multi-threshold margin warning ──────────────────────────
         // Single-position equity-vs-MMR view (cheap, no portfolio walk):
         //   equity   = collateral + unrealized_pnl(pos, mark)
@@ -4614,6 +4734,10 @@ pub mod flash_book {
         let old_mark = market.mark_price_ticks;
         market.mark_price_ticks = oracle;
         market.last_mark_settle_slot = current_slot;
+        // A hard settle is also a mark-freshness event (the second update path
+        // besides the fill-EMA). Stamp it so an ER that's down but kept alive by
+        // permissionless `settle_mark` calls is not flagged as stalled.
+        market.last_mark_update_slot = current_slot;
 
         emit!(MarkPriceUpdatedEvent {
             market: market_key,
@@ -4645,6 +4769,32 @@ pub mod flash_book {
     ///   S14 — mark price within oracle band ±band_bps
     pub fn verify_market_invariants(ctx: Context<VerifyMarketInvariants>) -> Result<()> {
         let market = &mut ctx.accounts.market;
+
+        // S7 — ER-stall mark staleness: if the mark hasn't moved for longer than
+        // MARK_STALENESS_MAX_SLOTS the MagicBlock ER is presumed stalled. Auto-
+        // pause so no new orders land against a frozen book/mark until the ER
+        // recovers (and `settle_mark`/fills resume stamping freshness). Guard on
+        // `> 0` so a legacy market that has never stamped the field is not paused
+        // on missing data (liquidation already prices such markets oracle-only).
+        if market.last_mark_update_slot > 0 {
+            let current_slot = Clock::get()?.slot;
+            let mark_age = current_slot.saturating_sub(market.last_mark_update_slot);
+            if mark_age > constants::MARK_STALENESS_MAX_SLOTS {
+                let prev_status = market.status;
+                if market.status != MarketStatus::Closed as u8 {
+                    market.status = MarketStatus::Paused as u8;
+                }
+                emit!(InvariantBreachDetectedEvent {
+                    market: market.key(),
+                    invariant_code: 7,
+                    expected: current_slot,
+                    actual: market.last_mark_update_slot,
+                    previous_status: prev_status,
+                    new_status: market.status,
+                });
+                return Err(error!(FlashBookError::MarkTooStale));
+            }
+        }
 
         if market.oi_long_lots != market.oi_short_lots {
             // Auto-halt: flip market to Paused. Closed is terminal — preserve.
@@ -6738,14 +6888,49 @@ pub mod flash_book {
         let pos_side = if position.side == 0 { Side::Long } else { Side::Short };
         let mark_t = market.mark_price_ticks;
         let oracle_t = market.oracle_price_ticks;
-        // P-LIQ-1: worse-of(mark, oracle) via the Kani-proven pure helper — the
-        // health price is always the worse of the two REAL sources for the
-        // position's side (never under-states risk, never invents a price).
-        let (health_price_ticks, hp_source) = matcher::liquidation::worse_of_health_price(
-            mark_t,
-            oracle_t,
-            matches!(pos_side, Side::Long),
-        );
+        // ─── ER-STALL MARK FRESHNESS GATE (P-LIQ-2) ────────────────────
+        // If the MagicBlock ER has stalled, the fill stream stops and
+        // `mark_price_ticks` freezes at its last value. A frozen, adverse mark
+        // must not be allowed to drive a wrongful liquidation. When the mark
+        // hasn't moved for more than MARK_STALENESS_MAX_SLOTS (via the fill-EMA
+        // in apply_fill OR a settle_mark), drop it and price health off the
+        // FRESH oracle alone (the oracle freshness gate above already enforced
+        // the oracle isn't stale when configured). A 0 freshness slot (legacy /
+        // never-stamped market) is treated as stale ⇒ oracle-only too.
+        let mark_stale = market.last_mark_update_slot == 0
+            || current_slot.saturating_sub(market.last_mark_update_slot)
+                > constants::MARK_STALENESS_MAX_SLOTS;
+        // F4/L-1 (audit 2026-06): when the mark is stale the oracle becomes the
+        // SOLE health price (worse-of degenerates to oracle-only), so its
+        // freshness must be MANDATORY here — the conditional gate above only
+        // enforced it "when configured", leaving an unconfigured (max_age == 0)
+        // or never-stamped (published_at == 0) oracle unvalidated. Treat such an
+        // oracle as untrusted ⇒ refuse to liquidate (fail-safe).
+        if mark_stale {
+            require!(oracle_max_age > 0, FlashBookError::MarkTooStale);
+            require!(
+                market.oracle_published_at_unix_seconds > 0,
+                FlashBookError::MarkTooStale
+            );
+            let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+            let oracle_age =
+                now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
+            require!(oracle_age <= oracle_max_age, FlashBookError::OracleTooStale);
+        }
+        // P-LIQ-1/2 via the Kani-proven pure helper: worse-of(mark, oracle) when
+        // the mark is fresh; oracle-only when it's stale; None when neither
+        // source is trustworthy (stale mark + dead oracle) ⇒ refuse to
+        // liquidate, keeping the position open until a price source recovers.
+        let (health_price_ticks, hp_source) =
+            match matcher::liquidation::health_price_with_staleness(
+                mark_t,
+                oracle_t,
+                mark_stale,
+                matches!(pos_side, Side::Long),
+            ) {
+                Some(v) => v,
+                None => return Err(error!(FlashBookError::MarkTooStale)),
+            };
 
         let pos_snap = RiskPosSnap {
             market: position.market,
@@ -7525,12 +7710,19 @@ pub mod flash_book {
             FlashBookError::WrongMarket
         );
 
+        // ER-stall freshness clock for the whole cross-margin walk: each leg's
+        // mark is replaced by the oracle if its mark is stale (see
+        // `effective_health_mark`), so a stalled ER cannot drive a wrongful
+        // portfolio liquidation on any leg.
+        let liq_now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
+        let liq_current_slot = Clock::get()?.slot;
+
         // Build snapshot vectors with the execution market+position first.
         let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
         let mut position_snaps: Vec<RiskPosSnap> = Vec::new();
         market_snaps.push(RiskMarketSnap {
             market: exec_market.key(),
-            mark_price: Ticks(exec_market.mark_price_ticks),
+            mark_price: Ticks(effective_health_mark(exec_market, liq_now_unix, liq_current_slot)?),
             cum_funding_index: exec_market.cum_funding_index,
             maintenance_margin_bps: exec_market.params.maintenance_margin_ratio_bps,
             tick_size: exec_market.params.tick_size,
@@ -7608,7 +7800,7 @@ pub mod flash_book {
             market_keys.push(market_ai.key());
             market_snaps.push(RiskMarketSnap {
                 market: market_ai.key(),
-                mark_price: Ticks(market.mark_price_ticks),
+                mark_price: Ticks(effective_health_mark(&market, liq_now_unix, liq_current_slot)?),
                 cum_funding_index: market.cum_funding_index,
                 maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
                 tick_size: market.params.tick_size,
@@ -10267,6 +10459,90 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Permissionless DRIFT-FREE collateral-solvency sweep (P-SOLV-4, one-sided).
+    ///
+    /// `verify_protocol_solvency` only checks the protocol-owned buckets
+    /// (`vault >= flp + insurance`); it omits trader collateral, the largest
+    /// liability. This proves the safety-critical direction of the FULL invariant
+    /// `vault >= Σ collateral + flp + insurance`: it sums REAL collateral from the
+    /// deduplicated trader-state (cross) and isolated-position accounts supplied in
+    /// `remaining_accounts` and errors if that PARTIAL sum already exceeds the
+    /// vault's headroom over FLP + insurance — sound regardless of unseen accounts,
+    /// since the real total is `>=` the partial sum. It reads live balances, so it
+    /// CANNOT desync from the 47 collateral-mutation sites the way a stored
+    /// aggregate would. `fully_covered` is the caller's off-chain attestation that
+    /// every collateral account was supplied (recorded in the event for monitors —
+    /// only then does a non-insolvent result also imply solvency); the on-chain
+    /// enforcement is purely the one-sided insolvency error. The complete
+    /// all-paths preservation proof is the Certora target (see `certora/`).
+    pub fn verify_collateral_solvency<'info>(
+        ctx: Context<'_, '_, 'info, 'info, VerifyCollateralSolvency<'info>>,
+        fully_covered: bool,
+    ) -> Result<()> {
+        let vault_amount = ctx.accounts.quote_vault.amount;
+        let insurance_bal = ctx.accounts.insurance_fund.balance_quote_lots;
+        let flp_capital = ctx.accounts.flp_exposure.total_capital_quote_lots;
+        let program_id = ctx.program_id;
+
+        let mut partial_collateral: u64 = 0;
+        let mut count: u32 = 0;
+        let mut seen: Vec<Pubkey> = Vec::with_capacity(ctx.remaining_accounts.len());
+        for ai in ctx.remaining_accounts {
+            // Only program-owned accounts contribute; dedup so a repeated account
+            // can't inflate the partial sum into a false insolvency.
+            require_keys_eq!(*ai.owner, *program_id, FlashBookError::Unauthorized);
+            let key = ai.key();
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            // Cross collateral (TraderStateAccount) or isolated collateral
+            // (PositionAccount). AccountLoader::try_from validates owner +
+            // discriminator, so the wrong type returns Err and we try the next.
+            if let Ok(loader) = AccountLoader::<TraderStateAccount>::try_from(ai) {
+                let ts = loader.load()?;
+                partial_collateral = partial_collateral
+                    .checked_add(ts.collateral_quote_lots)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                count += 1;
+                continue;
+            }
+            if let Ok(loader) = AccountLoader::<state::PositionAccount>::try_from(ai) {
+                let p = loader.load()?;
+                partial_collateral = partial_collateral
+                    .checked_add(p.collateral_quote_lots)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                count += 1;
+                continue;
+            }
+            return Err(error!(FlashBookError::UnexpectedAccountType));
+        }
+
+        // Kani-proven one-sided detector: true ⇒ definitely insolvent.
+        let insolvent = matcher::insurance::partial_collateral_proves_insolvent(
+            partial_collateral,
+            flp_capital,
+            insurance_bal,
+            vault_amount,
+        )
+        .map_err(|_| error!(FlashBookError::ArithmeticOverflow))?;
+
+        emit!(CollateralSolvencySweptEvent {
+            vault_quote_lots: vault_amount,
+            flp_capital_quote_lots: flp_capital,
+            insurance_quote_lots: insurance_bal,
+            partial_collateral_quote_lots: partial_collateral,
+            collateral_accounts_summed: count,
+            insolvent_proven: insolvent,
+            fully_covered,
+        });
+
+        // One-sided hard fail — only ever fires on genuine insolvency. Off-chain
+        // monitors should poll this with the full trader set and page on error.
+        require!(!insolvent, FlashBookError::ProtocolInsolvent);
+        Ok(())
+    }
+
     /// Authority-only: set/grow the per-market Residual explicitly.
     /// Interim mechanism until Wave 28's per-market FLP attribution
     /// wires Residual into automatic delta-tracking on every money
@@ -10346,6 +10622,12 @@ fn initialize_market_inner(
     market.period_started_at_unix = 0;
     market.period_funding_paid_abs_bps = 0;
     market.last_mark_settle_slot = 0;
+    // 0 ⇒ "freshness not yet stamped"; the first apply_fill/settle_mark sets it.
+    // Until then liquidation prices oracle-only (fail-safe) and the market is
+    // not auto-paused for staleness.
+    market.last_mark_update_slot = 0;
+    // 0 ⇒ book never delegated; set by delegate_market_book.
+    market.book_delegated_at_slot = 0;
     market.params = params;
     // C-1: settlement signer defaults to the deployer/authority. Rotate
     // via `set_market_sequencer` before burning authority so fills keep
@@ -10772,6 +11054,32 @@ pub struct VerifyProtocolSolvency<'info> {
     pub quote_vault: Account<'info, TokenAccount>,
 }
 
+/// Drift-free collateral-solvency sweep. Same protocol accounts as
+/// `VerifyProtocolSolvency`; the trader-state / isolated-position accounts whose
+/// collateral is summed are passed in `remaining_accounts` (validated for
+/// program ownership + discriminator at runtime, and deduplicated).
+#[derive(Accounts)]
+pub struct VerifyCollateralSolvency<'info> {
+    /// Permissionless caller.
+    pub keeper: Signer<'info>,
+
+    #[account(
+        seeds = [state::InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Box<Account<'info, state::InsuranceFundAccount>>,
+
+    #[account(
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
+    )]
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+
+    /// The protocol's quote-token vault.
+    #[account(address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+}
+
 #[derive(Accounts)]
 pub struct VerifyEnvelopeConfig<'info> {
     pub keeper: Signer<'info>,
@@ -10928,6 +11236,7 @@ pub struct DelegateMarketBook<'info> {
     pub authority: Signer<'info>,
 
     #[account(
+        mut,
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
         constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
@@ -11006,6 +11315,72 @@ pub struct UndelegateMarketBook<'info> {
     /// CHECK: MagicBlock delegation program.
     #[account(address = er::DELEGATION_PROGRAM_ID)]
     pub delegation_program: UncheckedAccount<'info>,
+}
+
+/// Permissionless force-undelegate of the market book after a settlement-
+/// liveness timeout. Mirrors `UndelegateMarketBook` exactly EXCEPT the signer is
+/// any `payer` (no `market.authority` gate) — the censorship timeout is enforced
+/// in the handler. The seeds + bump still pin `market`/`market_book` to the
+/// canonical PDAs, so nothing can be spoofed; only the authorization differs.
+#[derive(Accounts)]
+pub struct ForceUndelegateMarketBook<'info> {
+    /// Permissionless caller — pays the undelegate CPI rent/fees.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; signed via seeds for the undelegate CPI.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    /// CHECK: this program's account info.
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: same buffer PDA from delegate (it carries the committed state).
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
+}
+
+/// F1: permissionless stamp of the force-undelegate liveness baseline for a
+/// book delegated before the censorship-escape upgrade (`book_delegated_at_slot
+/// == 0`). The market account is settled on L1 (book-on-ER, market-on-L1 mode),
+/// so it is mutable here; the handler requires the book PDA be owned by the
+/// delegation program (actually delegated) before stamping.
+#[derive(Accounts)]
+pub struct StampBookLivenessBaseline<'info> {
+    /// Permissionless caller.
+    pub payer: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: the delegated book PDA; handler requires `.owner ==
+    /// DELEGATION_PROGRAM_ID` (i.e. currently delegated). Seed-validated.
+    #[account(
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -12900,6 +13275,26 @@ pub struct MarketBookUndelegatedEvent {
     pub market_book: Pubkey,
 }
 
+/// Emitted by the permissionless `force_undelegate_market_book` escape. Records
+/// the settlement-liveness baseline and how long the ER had been silent, so
+/// monitors can distinguish a forced (censorship/stall) undelegate from a normal
+/// authority one and audit that the timeout was genuinely exceeded.
+#[event]
+pub struct MarketBookForceUndelegatedEvent {
+    pub market: Pubkey,
+    pub market_book: Pubkey,
+    pub liveness_baseline_slot: u64,
+    pub current_slot: u64,
+    pub silent_slots: u64,
+}
+
+#[event]
+pub struct BookLivenessBaselineStampedEvent {
+    pub market: Pubkey,
+    pub market_book: Pubkey,
+    pub baseline_slot: u64,
+}
+
 #[event]
 pub struct FillCommitmentDelegatedEvent {
     pub market: Pubkey,
@@ -13294,6 +13689,23 @@ pub struct ProtocolSolvencyCheckedEvent {
     pub minimum_required_quote_lots: u64,
     pub surplus_quote_lots: u64,
     pub solvent: bool,
+}
+
+/// Result of a drift-free collateral-solvency sweep (`verify_collateral_solvency`).
+/// `collateral_accounts_summed` deduplicated trader/position accounts contributed
+/// `partial_collateral_quote_lots`; if that already exceeds the vault headroom
+/// over FLP + insurance the protocol is provably insolvent (`insolvent_proven`).
+/// `fully_covered` is the caller's attestation that EVERY collateral-holding
+/// account was supplied — only then does a non-insolvent result prove solvency.
+#[event]
+pub struct CollateralSolvencySweptEvent {
+    pub vault_quote_lots: u64,
+    pub flp_capital_quote_lots: u64,
+    pub insurance_quote_lots: u64,
+    pub partial_collateral_quote_lots: u64,
+    pub collateral_accounts_summed: u32,
+    pub insolvent_proven: bool,
+    pub fully_covered: bool,
 }
 
 #[event]
@@ -13867,6 +14279,40 @@ pub struct BasketLeg {
     pub size_lots: u64,
     pub limit_ticks: u64,
     pub post_only: bool,
+}
+
+/// ER-stall mark freshness (P-LIQ-2) for the cross-margin risk walk. Returns the
+/// mark to feed `assess_margin` for `market`: the live mark when it is fresh, or
+/// the oracle ALONE when the mark is stale (a stalled ER froze the fill stream).
+/// A stale mark with no usable / fresh oracle has no trustworthy price ⇒ errors
+/// so the caller refuses to liquidate (fail-safe). Mirrors the single-position
+/// gate in `liquidate_position_v2` so `liquidate_portfolio_v2` cannot be driven
+/// by a frozen mark on any leg.
+fn effective_health_mark(market: &MarketAccount, now_unix: u64, current_slot: u64) -> Result<u64> {
+    let mark_stale = market.last_mark_update_slot == 0
+        || current_slot.saturating_sub(market.last_mark_update_slot)
+            > constants::MARK_STALENESS_MAX_SLOTS;
+    if !mark_stale {
+        return Ok(market.mark_price_ticks);
+    }
+    // Stale mark ⇒ price off the oracle alone — but only a PROVABLY-fresh,
+    // non-zero oracle. F4/L-1 (audit 2026-06): the oracle is now the SOLE health
+    // price, so freshness is MANDATORY, not "checked only if configured". An
+    // unconfigured staleness window (max_age == 0) or a never-stamped publish
+    // time (published_at == 0) leaves the oracle unvalidated — treat it as
+    // untrusted and refuse to liquidate (fail-safe), exactly as this function's
+    // contract states, rather than pricing a liquidation off an unproven oracle.
+    let oracle = market.oracle_price_ticks;
+    require!(oracle > 0, FlashBookError::MarkTooStale);
+    let max_age = market.params.oracle_staleness_max_seconds as u64;
+    require!(max_age > 0, FlashBookError::MarkTooStale);
+    require!(
+        market.oracle_published_at_unix_seconds > 0,
+        FlashBookError::MarkTooStale
+    );
+    let age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
+    require!(age <= max_age, FlashBookError::OracleTooStale);
+    Ok(oracle)
 }
 
 /// Validate per-leg intake gates: status, size/price floors, tick alignment.

@@ -211,6 +211,36 @@ pub const ORDER_ID_SEQ_BITS: u32 = 24;
 pub const MAX_PRICE_TICKS_ENCODABLE: u64 = (1u64 << ORDER_ID_PRICE_BITS) - 1;
 pub const MAX_SEQ_ENCODABLE: u64 = (1u64 << ORDER_ID_SEQ_BITS) - 1;
 
+/// H1 (audit 2026-06) FIX: fail-loud ceiling on the FIFO `seq` before it is
+/// committed to the book. `encode_order_id` masks `seq` to `ORDER_ID_SEQ_BITS`
+/// (24) bits; once the per-market `order_seq_counter` exceeds `MAX_SEQ_ENCODABLE`
+/// the masked low bits WRAP toward 0, so a fresh order would get a SMALLER
+/// `order_id` than older orders at the same price (price-time-priority violation)
+/// and could even collide on `order_id` with a live order (mis-resolving
+/// cancel/modify and corrupting the best-index cache). Every resting order —
+/// user, FLP, trigger, TWAP, iceberg, basket — funnels through `insert_bid`/
+/// `insert_ask`, so enforcing the bound here is the single complete chokepoint
+/// and is exactly the precondition the `encode_order_id` Kani proofs assume.
+/// Fail-loud (reject the order) forces a market reseat before the counter wraps,
+/// rather than silently corrupting the book. The prior `< FLP_SEQ_RESERVED_OFFSET`
+/// (2^56) checks at placement were 32 bits too loose to protect the 24-bit field.
+/// Pure predicate: does `seq` fit the 24-bit `order_id` field without aliasing?
+/// This is the SAME bound the `encode_order_id` priority/collision Kani proofs
+/// `assume()`, so the runtime guard and the FV precondition can never drift.
+#[inline]
+pub const fn seq_is_encodable(seq: u64) -> bool {
+    seq <= MAX_SEQ_ENCODABLE
+}
+
+#[inline]
+pub fn require_seq_encodable(seq: u64) -> Result<()> {
+    require!(
+        seq_is_encodable(seq),
+        crate::errors::FlashBookError::OrderSeqExhausted
+    );
+    Ok(())
+}
+
 /// Compose the side-encoded `order_id` from (price_ticks, seq, side).
 ///
 /// For BIDS we invert ONLY the price field — not the whole word — so a
@@ -269,7 +299,36 @@ pub fn probe_order(order_id: u64) -> RestingOrderV2 {
 // ─────────────────────────────────────────────────────────────────────
 #[cfg(kani)]
 mod order_id_priority_kani_proofs {
-    use super::{encode_order_id, MAX_PRICE_TICKS_ENCODABLE, MAX_SEQ_ENCODABLE};
+    use super::{
+        encode_order_id, seq_is_encodable, MAX_PRICE_TICKS_ENCODABLE, MAX_SEQ_ENCODABLE,
+    };
+
+    /// H1: the insert-time guard `seq_is_encodable` admits EXACTLY the seqs every
+    /// proof in this module `assume()`s — so runtime enforcement and the FV
+    /// precondition are provably the same bound, not two constants that can drift.
+    #[kani::proof]
+    fn seq_guard_matches_encoding_precondition() {
+        let seq: u64 = kani::any();
+        assert_eq!(seq_is_encodable(seq), seq <= MAX_SEQ_ENCODABLE);
+    }
+
+    /// H1: composing the guard with the encoding — any two DISTINCT orders the
+    /// guard admits never collide on `order_id` (the book key stays injective).
+    /// This restates `distinct_orders_never_collide` through the ACTUAL runtime
+    /// predicate (`seq_is_encodable`) instead of a free `assume`, closing the loop
+    /// between what `insert_bid`/`insert_ask` enforce and what the proofs need.
+    #[kani::proof]
+    fn guard_admitted_orders_never_collide() {
+        let side: bool = kani::any();
+        let p1: u64 = kani::any();
+        let p2: u64 = kani::any();
+        let s1: u64 = kani::any();
+        let s2: u64 = kani::any();
+        kani::assume(p1 <= MAX_PRICE_TICKS_ENCODABLE && p2 <= MAX_PRICE_TICKS_ENCODABLE);
+        kani::assume(seq_is_encodable(s1) && seq_is_encodable(s2));
+        kani::assume(p1 != p2 || s1 != s2);
+        assert!(encode_order_id(p1, s1, side) != encode_order_id(p2, s2, side));
+    }
 
     /// ASK price priority: a LOWER-priced ask has a smaller `order_id`, so it
     /// fills first — regardless of either order's seq (price dominates the key).
@@ -559,6 +618,7 @@ impl<'a> MarketBookHandle<'a> {
     /// the bid root + best (= MIN-of-tree, which is the highest-priced
     /// bid given our inverted encoding) indices on the header.
     pub fn insert_bid(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
+        require_seq_encodable(order.seq)?;
         let idx = self.alloc_node()?;
         // O(1) cache update: capture order_id now, compare against cached
         // best AFTER tree insertion. Both sides encode best = MIN-by-order_id.
@@ -590,6 +650,7 @@ impl<'a> MarketBookHandle<'a> {
     /// "Best" = MIN of tree = lowest-priced ask (asks are NOT inverted, so
     /// natural ascending order — smallest order_id is the best ask).
     pub fn insert_ask(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
+        require_seq_encodable(order.seq)?;
         let idx = self.alloc_node()?;
         let new_order_id = order.order_id;
         let new_root;
@@ -1010,6 +1071,27 @@ mod tests {
         handle.insert_ask(make_order(150, 5, false)).unwrap();
         assert_eq!(collect_asks(&handle), vec![100, 125, 150, 175, 200]);
         assert_eq!(handle.header.total_orders_active, 5);
+    }
+
+    #[test]
+    fn insert_rejects_seq_beyond_encoding_ceiling() {
+        // H1 (audit 2026-06): a seq past the 24-bit encoding ceiling would wrap
+        // the low bits of order_id (price-time-priority break + id collision).
+        // Both insert paths must fail loud, and a seq exactly at the ceiling
+        // must still be accepted (boundary).
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+
+        assert!(handle.insert_bid(make_order(100, MAX_SEQ_ENCODABLE, true)).is_ok());
+        assert!(handle.insert_ask(make_order(100, MAX_SEQ_ENCODABLE, false)).is_ok());
+        assert!(handle
+            .insert_bid(make_order(100, MAX_SEQ_ENCODABLE + 1, true))
+            .is_err());
+        assert!(handle
+            .insert_ask(make_order(100, u64::MAX, false))
+            .is_err());
+        // Only the two in-range orders ever joined the book.
+        assert_eq!(handle.header.total_orders_active, 2);
     }
 
     #[test]
