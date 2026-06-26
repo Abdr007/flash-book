@@ -26,12 +26,18 @@
 
 pub use free_list::*;
 pub use hypertree::*;
-pub use llrb::*;
 pub use red_black_tree::*;
 pub use utils::*;
 
 pub mod free_list;
 pub mod hypertree;
-pub mod llrb;
 pub mod red_black_tree;
 pub mod utils;
+
+// NOTE: the upstream `llrb` module was REMOVED (audit 2026-06). The live book
+// uses `RedBlackTree` exclusively; `LLRB`/`LLRBReadOnly` were never instantiated,
+// yet `LLRB::remove_by_index` corrupted the tree (discarded the recursive new
+// root) and leaf-delete passed `NIL` into `swap_node_with_successor`. Shipping
+// a broken, `pub use`-exported data structure is a latent landmine — deleted
+// rather than fixing code nothing exercises. Restore from upstream Manifest if a
+// left-leaning RB tree is ever genuinely needed (and add real tests first).

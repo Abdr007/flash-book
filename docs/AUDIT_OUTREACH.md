@@ -21,10 +21,12 @@ a fund-custody program.
 ## What to send (all ready in-repo)
 - `docs/AUDIT_SCOPE.md` — scope, focus areas, FV evidence, the **explicit
   not-proven list** (prime targets), residuals, deployment plan.
-- Repo read access to branch `fix-security-c1-c2` (PR #34) + the squash-diff vs `main`.
+- Repo read access at `main` HEAD (all hardening + audit-2026-06 remediation
+  merged, PRs #34–#42; no review branch needed).
 - `docs/FLASHBOOK_SECURITY.md` (threat model + remediation ledger),
-  `certora/PROPERTIES.md` (invariant status).
-- Reproduce commands (build + 432 tests + 31 Kani + 7 Lean + CU benchmark).
+  `docs/AUDIT_REMEDIATION_2026-06.md` + `docs/INTERNAL_AUDIT_2026-06.md` (latest
+  pass), `certora/PROPERTIES.md` (invariant status).
+- Reproduce commands (build + 462 tests + 41 Kani + Lean + CU benchmark).
 
 ## Outreach email template (fill the [brackets], then send)
 
@@ -34,8 +36,8 @@ a fund-custody program.
 >
 > We're seeking a security audit of **Flash Book**, a fully on-chain central-limit-
 > order-book perpetual-futures DEX on Solana (Anchor 0.31.1, ~32k LOC (32459 lines)). The code is
-> on a single review branch and is **audit-ready**: full test suite green, plus a
-> machine-checked formal-verification suite (31 Kani proofs + 7 Lean theorems,
+> at `main` HEAD and is **audit-ready**: full test suite green (462 tests), plus a
+> machine-checked formal-verification suite (41 Kani harnesses + Lean theorems,
 > CI-gated).
 >
 > **Scope:** the deployed Anchor program (`programs/flash-book`). One self-contained
@@ -45,7 +47,9 @@ a fund-custody program.
 >
 > **Recent work to review:** an adversarial hardening pass (2 critical + 10 high,
 > all remediated), a settlement-authenticity redesign that removes sequencer
-> fill-fabrication, and a book-stuffing mitigation.
+> fill-fabrication, a book-stuffing mitigation, and a fresh audit-2026-06 pass
+> closing every reachable Critical/High/Medium (incl. a margin-solvency CRITICAL)
+> with machine-checked proofs for the headline fixes.
 >
 > **Context:** the program is **currently deployed** (devnet → mainnet upgrade
 > planned post-audit), so this is a pre-upgrade audit gating a guarded launch.
