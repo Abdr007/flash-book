@@ -17,6 +17,7 @@ use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer}
 
 pub mod constants;
 pub mod er;
+pub mod er_permission;
 pub mod errors;
 pub mod hypertree;
 pub mod matcher;
@@ -497,6 +498,120 @@ pub mod flash_book {
             market: ctx.accounts.market.key(),
             market_book: ctx.accounts.market_book.key(),
             baseline_slot: slot,
+        });
+        Ok(())
+    }
+
+    /// PRIVATE / DARK-POOL BOOK (TEE), step 1 of 2. Create the MagicBlock
+    /// ephemeral-permission account for this market's DELEGATED book PDA, so the
+    /// book can run on a Private (TEE-backed) ER where reads are gated. Starts
+    /// PUBLIC — flip with `set_book_privacy`. Authority-gated; the book PDA signs
+    /// the CPI. Idempotent (skips if the permission already exists). The book must
+    /// already be delegated (`delegate_market_book`). Additive + isolated: no
+    /// matching/risk/settlement path depends on this.
+    pub fn init_book_permission(ctx: Context<BookPermission>) -> Result<()> {
+        if ctx.accounts.permission.lamports() > 0 {
+            return Ok(()); // already created
+        }
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.market_book;
+        let seeds: &[&[u8]] = &[state_v2::MARKET_BOOK_SEED, market_key.as_ref(), &[bump]];
+        er_permission::cpi_create_permission(
+            er_permission::PermissionCpiAccounts {
+                payer: ctx.accounts.market_book.to_account_info(),
+                permissioned_account: ctx.accounts.market_book.to_account_info(),
+                permission: ctx.accounts.permission.to_account_info(),
+                vault: ctx.accounts.ephemeral_vault.to_account_info(),
+                magic_program: ctx.accounts.magic_program.to_account_info(),
+                permission_program: ctx.accounts.permission_program.to_account_info(),
+            },
+            &er_permission::EphemeralMembersArgs { is_private: false, members: vec![] },
+            seeds,
+        )?;
+        emit!(BookPermissionEvent {
+            market: market_key,
+            market_book: ctx.accounts.market_book.key(),
+            is_private: false,
+            member_count: 0,
+            action: 0,
+        });
+        Ok(())
+    }
+
+    /// PRIVATE / DARK-POOL BOOK (TEE), step 2. Toggle the book's privacy and set
+    /// the reader allow-list. When `is_private`, ONLY the listed members can read
+    /// the ER's book state through the TEE (each granted logs+messages+balances) —
+    /// a hidden order book. When public, the allow-list is cleared. Authority-gated;
+    /// the book PDA signs. `members` is capped at `MAX_PRIVACY_MEMBERS`.
+    pub fn set_book_privacy(
+        ctx: Context<BookPermission>,
+        is_private: bool,
+        members: Vec<Pubkey>,
+    ) -> Result<()> {
+        require!(
+            members.len() <= constants::MAX_PRIVACY_MEMBERS,
+            FlashBookError::OutOfRange
+        );
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.market_book;
+        let seeds: &[&[u8]] = &[state_v2::MARKET_BOOK_SEED, market_key.as_ref(), &[bump]];
+        let member_list: Vec<er_permission::Member> = if is_private {
+            members
+                .iter()
+                .map(|pk| er_permission::Member {
+                    flags: er_permission::MEMBER_READ_FLAGS,
+                    pubkey: *pk,
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        let member_count = member_list.len() as u32;
+        er_permission::cpi_update_permission(
+            er_permission::PermissionCpiAccounts {
+                payer: ctx.accounts.market_book.to_account_info(),
+                permissioned_account: ctx.accounts.market_book.to_account_info(),
+                permission: ctx.accounts.permission.to_account_info(),
+                vault: ctx.accounts.ephemeral_vault.to_account_info(),
+                magic_program: ctx.accounts.magic_program.to_account_info(),
+                permission_program: ctx.accounts.permission_program.to_account_info(),
+            },
+            &er_permission::EphemeralMembersArgs { is_private, members: member_list },
+            seeds,
+        )?;
+        emit!(BookPermissionEvent {
+            market: market_key,
+            market_book: ctx.accounts.market_book.key(),
+            is_private,
+            member_count,
+            action: 1,
+        });
+        Ok(())
+    }
+
+    /// PRIVATE / DARK-POOL BOOK (TEE), teardown. Close the ephemeral permission,
+    /// refunding rent to the book PDA. Authority-gated; the book PDA signs.
+    pub fn close_book_permission(ctx: Context<BookPermission>) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.market_book;
+        let seeds: &[&[u8]] = &[state_v2::MARKET_BOOK_SEED, market_key.as_ref(), &[bump]];
+        er_permission::cpi_close_permission(
+            er_permission::PermissionCpiAccounts {
+                payer: ctx.accounts.market_book.to_account_info(),
+                permissioned_account: ctx.accounts.market_book.to_account_info(),
+                permission: ctx.accounts.permission.to_account_info(),
+                vault: ctx.accounts.ephemeral_vault.to_account_info(),
+                magic_program: ctx.accounts.magic_program.to_account_info(),
+                permission_program: ctx.accounts.permission_program.to_account_info(),
+            },
+            seeds,
+        )?;
+        emit!(BookPermissionEvent {
+            market: market_key,
+            market_book: ctx.accounts.market_book.key(),
+            is_private: false,
+            member_count: 0,
+            action: 2,
         });
         Ok(())
     }
@@ -11433,6 +11548,53 @@ pub struct StampBookLivenessBaseline<'info> {
     pub market_book: UncheckedAccount<'info>,
 }
 
+/// Private/dark-pool book permission management. Authority-gated (`has_one`); the
+/// book PDA signs the permission CPI. The permission PDA is seed-validated under
+/// the MagicBlock permission program, and the vault/magic/permission programs are
+/// address-pinned — so a caller cannot substitute a rogue program/account.
+#[derive(Accounts)]
+pub struct BookPermission<'info> {
+    /// Market authority — only they may manage the book's privacy posture.
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        has_one = authority,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: the delegated book PDA (protected account + payer). Signed via seeds.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    /// CHECK: ephemeral permission PDA, derived `[PERMISSION_SEED, market_book]`
+    /// UNDER the permission program — Anchor validates the derivation.
+    #[account(
+        mut,
+        seeds = [er_permission::PERMISSION_SEED, market_book.key().as_ref()],
+        bump,
+        seeds::program = er_permission::PERMISSION_PROGRAM_ID,
+    )]
+    pub permission: UncheckedAccount<'info>,
+
+    /// CHECK: ephemeral vault — address-pinned.
+    #[account(mut, address = er_permission::EPHEMERAL_VAULT_ID)]
+    pub ephemeral_vault: UncheckedAccount<'info>,
+
+    /// CHECK: MagicBlock magic program — address-pinned.
+    #[account(address = er_permission::MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+
+    /// CHECK: MagicBlock permission program — address-pinned.
+    #[account(address = er_permission::PERMISSION_PROGRAM_ID)]
+    pub permission_program: UncheckedAccount<'info>,
+}
+
 #[derive(Accounts)]
 pub struct DelegateMarket<'info> {
     #[account(mut)]
@@ -13365,6 +13527,16 @@ pub struct BookLivenessBaselineStampedEvent {
 pub struct ErHeartbeatEvent {
     pub market: Pubkey,
     pub heartbeat_slot: u64,
+}
+
+#[event]
+pub struct BookPermissionEvent {
+    pub market: Pubkey,
+    pub market_book: Pubkey,
+    pub is_private: bool,
+    pub member_count: u32,
+    /// 0 = init, 1 = set_privacy, 2 = close.
+    pub action: u8,
 }
 
 #[event]
