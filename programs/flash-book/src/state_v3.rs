@@ -718,6 +718,43 @@ mod tests {
         assert_ne!(jit, PositionHaircutStateAccount::SEED);
     }
 
+    /// H-8 (audit 2026-06) REGRESSION: `space()` must cover the FULL Borsh
+    /// serialization of a populated account, not an undercounted body. The bug
+    /// returned 8+144 while the real body is 148 bytes → AccountDidNotSerialize
+    /// on a fully-populated V3 TWAP (e.g. one carrying `acceptable_price_ticks`).
+    /// Unlike the sibling `>= 8 + body` checks, this pins the EXACT serialized
+    /// length so any future field addition that desyncs `space()` fails loudly.
+    #[test]
+    fn twap_v3_space_matches_borsh_serialized_len() {
+        use anchor_lang::AnchorSerialize;
+        let acc = TwapOrderAccountV3 {
+            trader: Pubkey::new_unique(),
+            market: Pubkey::new_unique(),
+            bump: 255,
+            twap_id: 7,
+            side: 1,
+            flags: TwapOrderAccountV3::FLAG_ACTIVE,
+            slice_size_lots: u64::MAX,
+            total_size_lots: u64::MAX,
+            size_executed_lots: 123,
+            limit_price_ticks: 456,
+            start_slot: 1,
+            slot_interval: 2,
+            end_slot: 3,
+            last_slice_at_slot: 4,
+            sub_index: 9,
+            acceptable_price_ticks: u64::MAX,
+            _reserved: [0xAB; 7],
+        };
+        let body = acc.try_to_vec().expect("borsh serialize");
+        assert_eq!(body.len(), 148, "serialized TWAP body must be 148 bytes");
+        assert_eq!(
+            TwapOrderAccountV3::space(),
+            8 + body.len(),
+            "space() must equal 8-byte disc + exact serialized body"
+        );
+    }
+
     #[test]
     fn haircut_seeds_are_stable_and_distinct() {
         assert_eq!(MarketHaircutStateAccount::SEED, b"haircut");

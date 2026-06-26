@@ -34,15 +34,36 @@ authenticity control disable-able by the tx-builder. Both now use a sticky
    (`H-4/H-5`) and `apply_flp_fill`/`apply_fill` edits will need conflict resolution
    against any parallel edits to those handlers.
 
-## Remaining (not in this branch)
-- **8 Medium** (M-1 FLP band width, M-2 liquidator-reward pre-skim, M-3 latent v3-FLP
-  guards, M-4 cross-domain solvency invariant, M-5 negative-fee mint, M-6 sybil
-  arena DoS, M-7 basket scope, M-8 O(N²) position DoS) and **~8 Low/Info**.
-- **Dedicated regression tests** for H-1/H-2/H-3/H-4/H-5/H-6/H-7/H-8 (C-1 has one).
-  The fixes are verified by build + the full suite passing + inspection against each
-  auditor scenario; per-finding negative tests are the recommended follow-up.
-- These remediations should themselves be **re-reviewed** (ideally by the external
-  audit) — a fix can introduce new issues.
+## MEDIUM — partial
+
+| # | Finding | Status |
+|---|---|---|
+| **M-1** | FLP fill band 20% wide → ≤20% notional extraction per fill by a compromised sequencer | **FIXED** — `FLP_MAX_FILL_DEVIATION_BPS` 2000→300 bps (3%). Still clears any realistic FLP spread; caps per-fill extraction at 3%. |
+| **M-2** | Self-liquidation skims the Dutch-auction reward ahead of the insurance `cover_bad_debt` draw | **FIXED** — `liquidate_position_v2` requires `caller != liquidatee` (`SelfLiquidationForbidden = 2208`). |
+| **M-3** | v3 FLP (`flp_deposit_v3`/`flp_withdraw_v3`) missing H8 min-hold + undercollateralization guard | **DEFERRED (latent)** — v3 FLP exposure not yet wired into matching. Port `deposited_at_slot`/`can_withdraw` + `FlpWithdrawUndercollateralized` *before* wiring. Becomes High the moment it is wired. |
+| **M-4** | No global cross-domain solvency invariant on the shared `quote_vault` | **DEFERRED (design)** — needs a documented `Σledgers == vault.amount` invariant (proof/test) and/or pool segregation. Structural; not a one-line guard. |
+| **M-5** | Negative-fee tier (`MAX_FEE_DISCOUNT_BPS=12000`) mints unbacked rebate credit | **DEFERRED (product decision)** — two options: (a) cap to `10_000` (disables negative fees entirely — removes a maker-incentive feature), or (b) source the rebate from a real insurance/Residual debit and revert if uncovered. Authority-gated footgun; needs the team's call on (a) vs (b). |
+| **M-6** | Arena-exhaustion DoS / no per-trader order cap (#36 sybil) | **DEFERRED (larger)** — wire `ClaimedSeatV2.open_orders_count` (currently dead code) or add per-order rent. Multi-site change to the place/reap paths. |
+| **M-7** | N-leg basket assesses only touched markets → cross-margin understatement | **DEFERRED (scope rework)** — assess against the trader's full `open_positions`, not just the basket legs; changes the assess call's account set. |
+| **M-8** | `MAX_POSITIONS_PER_TRADER`/`MAX_STRESS_SCENARIOS` unenforced → O(N²) un-liquidatable trader | **DEFERRED (placement vs settlement)** — enforce at order **placement** (not in `apply_fill`: a revert there would strand a committed fill in the #35 ring → DoS). Needs the trader's open-position count + same-market check at intake. |
+
+The two FIXED Mediums (M-1, M-2) are constant/guard changes — safe and verified
+(build-sbf clean, full host suite 0 failed). The six DEFERRED are each structural,
+a product decision, or carry a settlement/ring-safety risk that a one-line guard
+can't satisfy — they're documented with the exact recommended fix above rather than
+rushed in. **None is an anonymous single-tx drain.**
+
+## Low / Info
+- **~8 Low/Info** (L-1 seq ceiling, L-2 price ceiling, L-3 portfolio-mark conservatism,
+  L-4 funding truncation, L-5 oracle-gate config floor, L-6 `process_undelegation`
+  defense-in-depth, L-7 singleton init front-run, L-8 `ClaimedSeatV2` dead code) — not
+  yet addressed; all are footguns / defense-in-depth, none a direct theft.
+
+## Regression-test status
+- **C-1** — dedicated integration test `armed_apply_fill_rejects_when_commitment_account_omitted` (asserts `Custom(8206)`).
+- **H-8** — dedicated host test `twap_v3_space_matches_borsh_serialized_len` (pins the EXACT 148-byte Borsh body so any future field desync fails loudly — stronger than the sibling `>= 8+body` checks).
+- **H-1/H-2/H-3/H-4/H-5/H-6/H-7 and M-1/M-2** — verified by build-sbf + full host suite (0 failed) + source inspection against each auditor scenario. Dedicated negative tests are the recommended follow-up; note the liquidation-path guards (H-4/H-5/M-2) need a liquidatable multi-leg state built through BanksClient, and the M-2 self-liquidation case collapses `caller_trader_state` and `trader_state` onto one PDA (an Anchor account-collision can surface before the `8208` guard) — the test must be written to disambiguate, which is why it's scoped as follow-up rather than shipped half-right.
+- These remediations should themselves be **re-reviewed** (ideally by the external audit) — a fix can introduce new issues.
 
 ## Reproduce
 ```bash
