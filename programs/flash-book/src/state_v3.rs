@@ -122,9 +122,11 @@ impl TwapOrderAccountV3 {
     pub const SEED: &'static [u8] = b"twap_v3";
     pub const FLAG_ACTIVE: u8 = 1 << 0;
     pub fn space() -> usize {
-        // 8 disc + 32+32+1+1+1+1 + 8×8 + 1 sub + 8 acceptable + 7 reserved = 144.
-        // Existing space 8 + 144 = 152 → fits.
-        8 + 144
+        // H-8 (audit 2026-06): body = 32+32 + 4×u8 + 8×u64 + 1 sub + 8 acceptable
+        // + 7 reserved = 64+4+64+1+8+7 = 148 (the old comment miscounted as 144,
+        // returning 152 < the 156 a full account needs → AccountDidNotSerialize on
+        // a populated V3 TWAP). Correct size is 8 + 148.
+        8 + 148
     }
 }
 
@@ -714,6 +716,43 @@ mod tests {
         assert_ne!(jit, FlpPositionAccountV3::SEED);
         assert_ne!(jit, MarketHaircutStateAccount::SEED);
         assert_ne!(jit, PositionHaircutStateAccount::SEED);
+    }
+
+    /// H-8 (audit 2026-06) REGRESSION: `space()` must cover the FULL Borsh
+    /// serialization of a populated account, not an undercounted body. The bug
+    /// returned 8+144 while the real body is 148 bytes → AccountDidNotSerialize
+    /// on a fully-populated V3 TWAP (e.g. one carrying `acceptable_price_ticks`).
+    /// Unlike the sibling `>= 8 + body` checks, this pins the EXACT serialized
+    /// length so any future field addition that desyncs `space()` fails loudly.
+    #[test]
+    fn twap_v3_space_matches_borsh_serialized_len() {
+        use anchor_lang::AnchorSerialize;
+        let acc = TwapOrderAccountV3 {
+            trader: Pubkey::new_unique(),
+            market: Pubkey::new_unique(),
+            bump: 255,
+            twap_id: 7,
+            side: 1,
+            flags: TwapOrderAccountV3::FLAG_ACTIVE,
+            slice_size_lots: u64::MAX,
+            total_size_lots: u64::MAX,
+            size_executed_lots: 123,
+            limit_price_ticks: 456,
+            start_slot: 1,
+            slot_interval: 2,
+            end_slot: 3,
+            last_slice_at_slot: 4,
+            sub_index: 9,
+            acceptable_price_ticks: u64::MAX,
+            _reserved: [0xAB; 7],
+        };
+        let body = acc.try_to_vec().expect("borsh serialize");
+        assert_eq!(body.len(), 148, "serialized TWAP body must be 148 bytes");
+        assert_eq!(
+            TwapOrderAccountV3::space(),
+            8 + body.len(),
+            "space() must equal 8-byte disc + exact serialized body"
+        );
     }
 
     #[test]

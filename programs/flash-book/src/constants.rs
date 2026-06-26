@@ -9,14 +9,21 @@ pub const USD_UNIT: u64 = 1_000_000;
 /// Basis points denominator. 1 bp = 1/10_000.
 pub const BPS_DENOM: u32 = 10_000;
 
-/// Maximum fee discount allowed via `set_trader_fee_tier`. Values up to
-/// 10_000 (100%) zero out the taker fee; values 10_001..=12_000 enable
-/// HL/MM-pro top-tier NEGATIVE fees — the taker is *paid* for routing
-/// flow. Apply_fill clamps the resulting rebate so the protocol never
-/// pays out more than its insurance contribution can absorb. 12_000 =
-/// 120% means the maximum negative fee is 20% of the base taker fee
-/// (e.g. 5 bps base × -0.2 = -1 bps rebate to taker).
-pub const MAX_FEE_DISCOUNT_BPS: u32 = 12_000;
+/// Maximum fee discount allowed via `set_trader_fee_tier`. Capped at
+/// 10_000 (100%) — a discount zeroes out the taker fee but can never make
+/// it negative.
+///
+/// M-5 (audit 2026-06) FIX: was 12_000 (120%), which enabled a NEGATIVE
+/// top-tier fee (taker *paid* for flow). The doc claimed the rebate was
+/// "sourced from the protocol's insurance contribution", but the apply_fill
+/// path computed it with a `saturating_sub` that floors at zero — so the
+/// >100% rebate credited the taker collateral that was NEVER debited from
+/// insurance/Residual: an unbacked mint. Capping at 100% removes the
+/// negative-fee tier (and the mint) entirely; the maker rebate
+/// (`maker_rebate_bps`) is a separate, properly-funded path and is
+/// unaffected. If negative taker fees are wanted later, they must debit a
+/// real source and revert if uncovered (the deferred option B).
+pub const MAX_FEE_DISCOUNT_BPS: u32 = 10_000;
 
 /// WAVE 22: hard cap on any single tier's `taker_fee_bps` or
 /// `maker_rebate_bps`. 1_000 bps = 10% — well above HL's worst-tier
@@ -103,12 +110,15 @@ pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
 /// price may deviate from the FRESH oracle, in bps (symmetric band). The FLP
 /// quoter always prices within its spread of fair value, so a legitimate fill is
 /// far inside this bound; the cap exists only to stop a compromised sequencer
-/// settling an FLP fill far enough from the oracle to drain the pool. 2000 bps =
-/// 20% — comfortably above any realistic FLP spread (sub-2% even in stress) while
-/// capping per-fill pool value-extraction at 20% of notional. A constant (not a
-/// `MarketParams` field) because `MarketParams` has no reserved slack; a future
-/// governance override can replace it once that layout is versioned.
-pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 2000;
+/// settling an FLP fill far enough from the oracle to drain the pool.
+/// M-1 (audit 2026-06) FIX: tightened 2000 bps (20%) → 300 bps (3%). 20% left a
+/// compromised sequencer able to extract up to a fifth of notional per fill,
+/// repeatable; 3% is still comfortably above any realistic FLP spread (sub-2%
+/// even in stress) while capping per-fill pool value-extraction at 3% of
+/// notional. A constant (not a `MarketParams` field) because `MarketParams` has
+/// no reserved slack; a future governance override can replace it once that
+/// layout is versioned.
+pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 300;
 
 /// #36 — anti-book-stuffing: max deviation (bps, symmetric) a RESTING order's
 /// price may sit from the fresh oracle. Far-from-market orders are the classic

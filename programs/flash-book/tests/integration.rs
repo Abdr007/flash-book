@@ -3391,7 +3391,7 @@ async fn apply_fill_rejects_fabricated_fill_when_armed() {
         flash_book::instruction::InitFillCommitment {},
         vec![
             AccountMeta::new(payer.pubkey(), true), // authority (== market.authority)
-            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(market_pda, false),
             AccountMeta::new(fc_pda, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
@@ -3456,6 +3456,104 @@ async fn apply_fill_rejects_fabricated_fill_when_armed() {
         taker_acct.is_none(),
         "no taker position after a rejected fabricated apply_fill (#35)"
     );
+}
+
+/// C-1 (audit 2026-06) regression: on an ARMED market, an `apply_fill` that OMITS
+/// the fill_commitment account is HARD-REJECTED (`FillCommitmentMissing` = Anchor
+/// Custom(8206)). Before the fix, a compromised sequencer bypassed the entire
+/// anti-fabrication ring by simply not passing the optional account; now arming is
+/// sticky and the account is mandatory.
+#[tokio::test]
+async fn armed_apply_fill_rejects_when_commitment_account_omitted() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (fc_pda, _) = pda(&[
+        flash_book::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market_pda.as_ref(),
+    ]);
+
+    // Arm the market.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitFillCommitment {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(fc_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Sequencer settles WITHOUT the fill_commitment account in remaining_accounts.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            // NO fill_commitment account — the bypass C-1 closes.
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8206)"),
+        "armed apply_fill must reject when the commitment account is omitted (C-1), got: {dbg}"
+    );
+    // Rolled back: no taker position.
+    let taker_acct = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(taker_acct.is_none(), "no position after C-1 rejection");
 }
 
 /// #35 / H1 part B — HONEST PATH, end-to-end on the v2 hypertree book:
@@ -3536,7 +3634,7 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
             flash_book::instruction::InitFillCommitment {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
                 AccountMeta::new_readonly(system_program::ID, false),
             ],
@@ -3978,7 +4076,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             flash_book::instruction::InitFillCommitment {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
                 AccountMeta::new_readonly(system_program::ID, false),
             ],
@@ -4543,7 +4641,7 @@ async fn er_delegation_rejects_non_authority() {
             flash_book::instruction::InitFillCommitment {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
                 AccountMeta::new_readonly(system_program::ID, false),
             ],
@@ -4569,7 +4667,7 @@ async fn er_delegation_rejects_non_authority() {
             },
             vec![
                 AccountMeta::new(rogue.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
                 AccountMeta::new_readonly(flash_book::ID, false), // owner_program
                 AccountMeta::new(d1, false),                      // delegate_buffer
@@ -4596,7 +4694,7 @@ async fn er_delegation_rejects_non_authority() {
             flash_book::instruction::UndelegateFillCommitment {},
             vec![
                 AccountMeta::new(rogue.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(market_pda, false),
                 AccountMeta::new(fc_pda, false),
                 AccountMeta::new_readonly(flash_book::ID, false),
                 AccountMeta::new(d1, false),
@@ -4613,4 +4711,1141 @@ async fn er_delegation_rejects_non_authority() {
         dbg2.contains("Custom(7100)"),
         "undelegate_fill_commitment must reject a non-authority with Unauthorized, got: {dbg2}"
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Audit 2026-06 remediation — liquidation-path guard regression tests.
+//
+// H-4 / H-5 → CrossLiquidationNeedsPortfolio (2207 → Custom(8207)): a CROSS
+// position (zero per-position collateral) belonging to a trader with >1 open
+// leg must NOT be liquidated/deleveraged via the single-leg path — it has to
+// route through liquidate_portfolio_v2, which assesses the whole pool.
+// M-2 → SelfLiquidationForbidden (2208 → Custom(8208)): the liquidator must
+// not be the liquidatee.
+//
+// All three guards sit at the TOP of their handler, BEFORE the
+// health/oracle/insurance gates, so these tests don't need a genuinely
+// liquidatable trader — only the exact account shape each guard rejects.
+// ════════════════════════════════════════════════════════════════════════
+
+/// Open a CROSS position (long for `taker`, short for `maker`) on `market` via
+/// an UNARMED `apply_fill` (no fill-commitment ring). Cross ⇒
+/// `position.collateral_quote_lots == 0`, and the taker's
+/// `TraderState.open_positions` is incremented by one. Returns the taker's
+/// position PDA.
+async fn open_cross_position(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    market: Pubkey,
+    insurance_fund: Pubkey,
+    taker_state: Pubkey,
+    maker_state: Pubkey,
+    fill_seq: u64,
+) -> Pubkey {
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+            fill_seq,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // payer IS the market sequencer
+            AccountMeta::new(market, false),
+            AccountMeta::new(insurance_fund, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
+            AccountMeta::new_readonly(flash_book::ID, false), // haircut None ×3
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .expect("unarmed apply_fill opens a cross position");
+    taker_pos
+}
+
+/// M-2: the liquidatee cannot liquidate itself. One open leg (open_positions==1)
+/// clears the H-4 cross gate, so execution reaches the M-2 guard, which rejects
+/// `caller == liquidatee` with `SelfLiquidationForbidden`.
+#[tokio::test]
+async fn liquidate_position_v2_rejects_self_liquidation_m2() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    let taker_pos = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_pda,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    assert_eq!(ts.open_positions, 1, "taker has exactly one open position");
+    let pos: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(
+        pos.collateral_quote_lots, 0,
+        "cross position carries zero per-position collateral"
+    );
+
+    // caller == liquidatee. caller_trader_state seed == [SEED, taker] == taker_state,
+    // so the same account rides at both the trader_state and caller_trader_state
+    // slots; the M-2 guard fires before either is mutated.
+    let (market_book, _) = pda(&[
+        flash_book::state_v2::MARKET_BOOK_SEED,
+        market_pda.as_ref(),
+    ]);
+    let ix = build_ix(
+        flash_book::instruction::LiquidatePositionV2 {
+            requested_close_lots: 0,
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true), // caller == liquidatee
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(taker_state, false), // trader_state
+            AccountMeta::new(taker_state, false), // caller_trader_state (== trader_state)
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&taker.pubkey()),
+            &[&taker],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8208)"),
+        "self-liquidation must be rejected with SelfLiquidationForbidden (M-2), got: {dbg}"
+    );
+    let pos_after: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(
+        pos_after.size_lots, 1,
+        "position must be untouched after the M-2 rejection"
+    );
+}
+
+/// H-4: a multi-leg CROSS trader (open_positions==2, zero per-position
+/// collateral) cannot be liquidated one leg at a time via the single-position
+/// path — that would assess one leg against the full pool and wrongfully
+/// liquidate a portfolio-healthy trader. It must route through
+/// liquidate_portfolio_v2.
+#[tokio::test]
+async fn liquidate_position_v2_rejects_multi_leg_cross_h4() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_a, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (market_b, _, _, _) = setup_additional_market(&mut ctx, &payer, 100_000).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    // A CROSS leg on each market ⇒ taker.open_positions == 2.
+    let taker_pos_a = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_a,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+    let _taker_pos_b = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_b,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    assert_eq!(ts.open_positions, 2, "taker is a multi-leg cross trader");
+    let pos_a: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, taker_pos_a).await;
+    assert_eq!(
+        pos_a.collateral_quote_lots, 0,
+        "leg A is cross (zero per-position collateral)"
+    );
+
+    // A third-party liquidator targets ONE leg via the single-position path.
+    let liquidator = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &liquidator.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let (caller_state, _) = pda(&[TraderStateAccount::SEED, liquidator.pubkey().as_ref()]);
+    let (market_book_a, _) = pda(&[
+        flash_book::state_v2::MARKET_BOOK_SEED,
+        market_a.as_ref(),
+    ]);
+
+    let ix = build_ix(
+        flash_book::instruction::LiquidatePositionV2 {
+            requested_close_lots: 0,
+        },
+        vec![
+            AccountMeta::new(liquidator.pubkey(), true),
+            AccountMeta::new_readonly(market_a, false),
+            AccountMeta::new(market_book_a, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(caller_state, false),
+            AccountMeta::new(taker_pos_a, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&liquidator.pubkey()),
+            &[&liquidator],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8207)"),
+        "single-leg liquidation of a multi-leg cross trader must be rejected (H-4), got: {dbg}"
+    );
+}
+
+/// H-5: same defect on the ADL path. A multi-leg CROSS underwater trader cannot
+/// be auto-deleveraged one leg at a time — the single-leg eligibility check
+/// excludes their other legs and can wrongfully ADL a portfolio-healthy trader.
+#[tokio::test]
+async fn auto_deleverage_rejects_multi_leg_cross_h5() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_a, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (market_b, _, _, _) = setup_additional_market(&mut ctx, &payer, 100_000).await;
+
+    let under = Keypair::new();
+    let counter = Keypair::new();
+    let maker2 = Keypair::new();
+    let under_state = setup_trader(&mut ctx, &payer, &under, 100_000, &protocol).await;
+    let counter_state = setup_trader(&mut ctx, &payer, &counter, 100_000, &protocol).await;
+    let maker2_state = setup_trader(&mut ctx, &payer, &maker2, 100_000, &protocol).await;
+
+    // Market A: `under` LONG, `counter` SHORT — opposite legs on one market.
+    let under_pos_a = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_a,
+        protocol.insurance_fund,
+        under_state,
+        counter_state,
+        1,
+    )
+    .await;
+    let (counter_pos_a, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_a.as_ref(),
+        counter_state.as_ref(),
+    ]);
+    // Market B: a SECOND leg for `under` ⇒ under.open_positions == 2.
+    let _under_pos_b = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_b,
+        protocol.insurance_fund,
+        under_state,
+        maker2_state,
+        1,
+    )
+    .await;
+
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, under_state).await;
+    assert_eq!(ts.open_positions, 2, "underwater trader is multi-leg cross");
+    let upos: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, under_pos_a).await;
+    assert_eq!(
+        upos.collateral_quote_lots, 0,
+        "underwater leg is cross (zero per-position collateral)"
+    );
+
+    let ix = build_ix(
+        flash_book::instruction::AutoDeleverage { close_size_lots: 1 },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // caller — anyone may ADL
+            AccountMeta::new(market_a, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new(under_state, false),
+            AccountMeta::new(under_pos_a, false),
+            AccountMeta::new(counter_state, false),
+            AccountMeta::new(counter_pos_a, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8207)"),
+        "single-leg ADL of a multi-leg cross trader must be rejected (H-5), got: {dbg}"
+    );
+}
+
+/// H-1: apply_flp_fill must reject a STALE oracle. The FLP price band is only
+/// meaningful against a fresh oracle; a compromised sequencer could otherwise
+/// settle FLP fills against a frozen anchor while the market moved. A market
+/// with oracle_staleness_max_seconds=60 whose oracle was never published
+/// (`oracle_published_at_unix_seconds == 0`, never set by InitializeMarket) is
+/// stale-by-definition → OracleTooStale (1800 → Custom(7800)).
+#[tokio::test]
+async fn apply_flp_fill_rejects_stale_oracle_h1() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+
+    // Market with a staleness bound. published_at stays 0 after init.
+    let base_mint = Keypair::new().pubkey();
+    let quote_mint = Keypair::new().pubkey();
+    let (market_pda, _) = pda(&[
+        MarketAccount::SEED,
+        base_mint.as_ref(),
+        quote_mint.as_ref(),
+    ]);
+    let mut params = default_params();
+    params.oracle_staleness_max_seconds = 60;
+    let init_ix = build_ix(
+        flash_book::instruction::InitializeMarket {
+            params,
+            initial_oracle_ticks: 100_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new_readonly(Keypair::new().pubkey(), false),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader_state.as_ref(),
+    ]);
+
+    // Advance the clock far past the 60s bound so the init-time oracle publish
+    // (set to the genesis timestamp by initialize_market) is now stale.
+    ctx.warp_to_slot(432_000).unwrap();
+
+    let ix = build_ix(
+        flash_book::instruction::ApplyFlpFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(protocol.insurance_fund, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
+            AccountMeta::new_readonly(flash_book::ID, false), // haircut None ×2
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(7800)"),
+        "stale-oracle FLP fill must be rejected with OracleTooStale (H-1), got: {dbg}"
+    );
+    let pos = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(pos.is_none(), "no taker position created after the H-1 rejection");
+}
+
+/// H-6: vault_withdraw_v3 must reject while the vault's TraderState carries an
+/// open position — redemptions require the vault FLAT, else a depositor redeems
+/// against unrealized exposure and skips the settlement waterfall. The open
+/// position is created through the REAL apply_fill path on the vault's own
+/// trader_state (no byte injection). → SweepRequiresFlat (1214 → Custom(7214)).
+#[tokio::test]
+async fn vault_withdraw_v3_rejects_when_vault_has_open_position_h6() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // 1) Create the vault (strategist = payer) + its TraderState.
+    let vault_id: u8 = 0;
+    let (vault_pda, _) = pda(&[
+        flash_book::state_v3::VaultAccountV3::SEED,
+        payer.pubkey().as_ref(),
+        &[vault_id],
+    ]);
+    let (vault_trader_state, _) = pda(&[TraderStateAccount::SEED, vault_pda.as_ref()]);
+
+    let create_ix = build_ix(
+        flash_book::instruction::CreateVaultV3 {
+            vault_id,
+            name: [0u8; 32],
+            perf_fee_bps: 0,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let open_ts_ix = build_ix(
+        flash_book::instruction::VaultOpenTraderStateV3 {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(vault_pda, false),
+            AccountMeta::new(vault_trader_state, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[create_ix, open_ts_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // 2) Depositor funds the vault (gives the vault TraderState collateral and
+    //    mints shares so the withdraw passes its share/live-nav checks).
+    let depositor = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &depositor.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let depositor_ata = create_ata(&mut ctx, &payer, depositor.pubkey(), protocol.quote_mint).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, depositor_ata, 10_000_000).await;
+    let (vault_position, _) = pda(&[
+        flash_book::state_v3::VaultPositionAccountV3::SEED,
+        vault_pda.as_ref(),
+        depositor.pubkey().as_ref(),
+    ]);
+    let deposit_ix = build_ix(
+        flash_book::instruction::VaultDepositV3 {
+            amount_quote_lots: 1_000_000,
+        },
+        vec![
+            AccountMeta::new(depositor.pubkey(), true),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(vault_position, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(depositor_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new(vault_trader_state, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[deposit_ix],
+            Some(&depositor.pubkey()),
+            &[&depositor],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // 3) Open a position FOR THE VAULT via a real apply_fill that uses the vault's
+    //    own trader_state as the taker ⇒ vault_trader_state.open_positions == 1.
+    let maker = Keypair::new();
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let _ = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_pda,
+        protocol.insurance_fund,
+        vault_trader_state,
+        maker_state,
+        1,
+    )
+    .await;
+    let vts: TraderStateAccount = fetch(&mut ctx.banks_client, vault_trader_state).await;
+    assert_eq!(vts.open_positions, 1, "vault now carries an open position");
+    assert!(vts.collateral_quote_lots > 0, "vault has live NAV from the deposit");
+
+    // 4) Depositor tries to redeem while the vault is NOT flat.
+    let withdraw_ix = build_ix(
+        flash_book::instruction::VaultWithdrawV3 { shares_to_burn: 1 },
+        vec![
+            AccountMeta::new_readonly(depositor.pubkey(), true),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(vault_position, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new(depositor_ata, false),
+            AccountMeta::new(vault_trader_state, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[withdraw_ix],
+            Some(&depositor.pubkey()),
+            &[&depositor],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(7214)"),
+        "withdraw from a non-flat vault must be rejected with SweepRequiresFlat (H-6), got: {dbg}"
+    );
+}
+
+/// H-7: place_basket_order_n_v2 must bind each leg's position account to the
+/// canonical PDA `[PositionAccount::SEED, market, trader_state]`. A leg that
+/// references ANOTHER trader's real (initialized, program-owned) position —
+/// non-canonical for the basket caller — is rejected with WrongTrader
+/// (1104 → Custom(7104)), preventing cross-trader position confusion.
+#[tokio::test]
+async fn place_basket_order_n_v2_rejects_noncanonical_position_h7() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[
+        flash_book::state_v2::MARKET_BOOK_SEED,
+        market_pda.as_ref(),
+    ]);
+    // Initialize the book so the leg's market_book account is program-owned.
+    let init_book = build_ix(
+        flash_book::instruction::InitMarketBook {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(book_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_book],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Victim opens a REAL position on the market — canonical for the victim,
+    // non-canonical for the attacker.
+    let victim = Keypair::new();
+    let vmaker = Keypair::new();
+    let victim_state = setup_trader(&mut ctx, &payer, &victim, 100_000, &protocol).await;
+    let vmaker_state = setup_trader(&mut ctx, &payer, &vmaker, 100_000, &protocol).await;
+    let victim_pos = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_pda,
+        protocol.insurance_fund,
+        victim_state,
+        vmaker_state,
+        1,
+    )
+    .await;
+
+    // Attacker submits a basket whose single leg references the victim's position.
+    let attacker = Keypair::new();
+    let attacker_state = setup_trader(&mut ctx, &payer, &attacker, 100_000, &protocol).await;
+    let legs = vec![flash_book::BasketLeg {
+        side: 0,
+        size_lots: 1,
+        limit_ticks: 100_000,
+        post_only: false,
+    }];
+    let ix = build_ix(
+        flash_book::instruction::PlaceBasketOrderNV2 { legs },
+        vec![
+            AccountMeta::new(attacker.pubkey(), true),
+            AccountMeta::new(attacker_state, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            // leg 0 triple: [market, market_book, position] — position is the
+            // victim's (non-canonical for the attacker's trader_state).
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(book_pda, false),
+            AccountMeta::new(victim_pos, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&attacker.pubkey()),
+            &[&attacker],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(7104)"),
+        "basket leg referencing a non-canonical position must be rejected with WrongTrader (H-7), got: {dbg}"
+    );
+}
+
+/// H-3: flush_haircut_dust must DEBIT residual by the flushed dust (ΔResidual =
+/// −dust), preserving `Residual = V − C_tot − I` when the dust moves to insurance.
+/// Driven through the REAL haircut pipeline (no byte injection), reachable after
+/// the audit-2026-06 Phase-2c re-key of the haircut contexts (position PDA now
+/// keyed by `trader_state.key()`, not the wallet):
+///   open 2 cross positions → enable haircut (residual=1000) → release 1000 into
+///   each reserve → mature both (matured_total=2000) → convert ONE (h=0.5 ⇒
+///   credit=500, dust=500; residual 1000→500) → flush (residual 500→0).
+/// Two positions are required: a single one has matured_pos==matured_total, so any
+/// h<1 would drive `residual − credit − dust` negative and underflow at flush. The
+/// converted leg's matured (1000) ≤ residual (1000) < matured_total (2000) keeps
+/// the debit in range. The exact assertion `residual_after == residual_before −
+/// dust` is what fails on the pre-fix code (which left residual untouched at flush).
+#[tokio::test]
+async fn flush_haircut_dust_debits_residual_h3() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ixs: &[Instruction],
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                ixs,
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    // Two traders open CROSS positions via apply_fill BEFORE the haircut engine
+    // is enabled (initialize_haircut_state sets the sticky haircut_enabled flag).
+    let ta = Keypair::new();
+    let tb = Keypair::new();
+    let ma = Keypair::new();
+    let mb = Keypair::new();
+    let ta_state = setup_trader(&mut ctx, &payer, &ta, 50_000, &protocol).await;
+    let tb_state = setup_trader(&mut ctx, &payer, &tb, 50_000, &protocol).await;
+    let ma_state = setup_trader(&mut ctx, &payer, &ma, 50_000, &protocol).await;
+    let mb_state = setup_trader(&mut ctx, &payer, &mb, 50_000, &protocol).await;
+    let pos_a = open_cross_position(&mut ctx, &payer, market_pda, protocol.insurance_fund, ta_state, ma_state, 1).await;
+    let pos_b = open_cross_position(&mut ctx, &payer, market_pda, protocol.insurance_fund, tb_state, mb_state, 2).await;
+
+    let (haircut_state, _) = pda(&[
+        flash_book::state_v3::MarketHaircutStateAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let (pos_a_hc, _) = pda(&[
+        flash_book::state_v3::PositionHaircutStateAccount::SEED,
+        market_pda.as_ref(),
+        pos_a.as_ref(),
+    ]);
+    let (pos_b_hc, _) = pda(&[
+        flash_book::state_v3::PositionHaircutStateAccount::SEED,
+        market_pda.as_ref(),
+        pos_b.as_ref(),
+    ]);
+
+    // Enable the haircut engine, seed residual = 1000 (h_min=0, h_max=1).
+    send(
+        &mut ctx,
+        &[build_ix(
+            flash_book::instruction::InitializeHaircutState {
+                h_min_slots: 0,
+                h_max_slots: 1,
+                initial_residual_quote_lots: 1000,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        )],
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Lazy-init both position haircut states. New account order (Phase-2c re-key):
+    // payer, trader_state, position, haircut_state, position_haircut, system.
+    let init_pos_hc = |ts: Pubkey, pos: Pubkey, pos_hc: Pubkey| {
+        build_ix(
+            flash_book::instruction::InitPositionHaircutState {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(ts, false),
+                AccountMeta::new_readonly(pos, false),
+                AccountMeta::new_readonly(haircut_state, false),
+                AccountMeta::new(pos_hc, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        )
+    };
+    send(
+        &mut ctx,
+        &[
+            init_pos_hc(ta_state, pos_a, pos_a_hc),
+            init_pos_hc(tb_state, pos_b, pos_b_hc),
+        ],
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Release 1000 of each trader's collateral into the reserve (authority-gated).
+    // Order: authority, market, trader_state, position, haircut_state, position_haircut.
+    let release = |ts: Pubkey, pos: Pubkey, pos_hc: Pubkey| {
+        build_ix(
+            flash_book::instruction::ReleaseGainToHaircut { gain_quote_lots: 1000 },
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(ts, false),
+                AccountMeta::new(pos, false),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new(pos_hc, false),
+            ],
+        )
+    };
+    send(
+        &mut ctx,
+        &[
+            release(ta_state, pos_a, pos_a_hc),
+            release(tb_state, pos_b, pos_b_hc),
+        ],
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Warp past h_max so both reserves fully mature.
+    ctx.warp_to_slot(1_000).unwrap();
+
+    // Mature both → matured_pos_total == 2000.
+    // Order: keeper, haircut_state, trader_state, position, position_haircut.
+    let mature = |ts: Pubkey, pos: Pubkey, pos_hc: Pubkey| {
+        build_ix(
+            flash_book::instruction::MaturePosition {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new_readonly(ts, false),
+                AccountMeta::new_readonly(pos, false),
+                AccountMeta::new(pos_hc, false),
+            ],
+        )
+    };
+    send(
+        &mut ctx,
+        &[
+            mature(ta_state, pos_a, pos_a_hc),
+            mature(tb_state, pos_b, pos_b_hc),
+        ],
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Convert ONLY position A (signed by trader A, the authorized keeper).
+    // Order: keeper, haircut_state, trader_state, position, position_haircut.
+    send(
+        &mut ctx,
+        &[build_ix(
+            flash_book::instruction::ConvertPosition {},
+            vec![
+                AccountMeta::new(ta.pubkey(), true),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new(ta_state, false),
+                AccountMeta::new(pos_a, false),
+                AccountMeta::new(pos_a_hc, false),
+            ],
+        )],
+        &[&ta],
+    )
+    .await
+    .unwrap();
+
+    // Snapshot residual + dust AFTER convert, BEFORE flush.
+    let hc_before: flash_book::state_v3::MarketHaircutStateAccount =
+        fetch(&mut ctx.banks_client, haircut_state).await;
+    let residual_before = hc_before.residual_quote_lots;
+    let dust = hc_before.dust_accrued_quote_lots;
+    assert!(dust > 0, "convert at h<1 must have accrued dust");
+    assert!(
+        residual_before >= dust,
+        "scenario must keep residual >= dust so flush does not underflow (residual={residual_before}, dust={dust})"
+    );
+    let ins_before: InsuranceFundAccount = fetch(&mut ctx.banks_client, protocol.insurance_fund).await;
+
+    // Flush: H-3 debits residual by the flushed dust.
+    send(
+        &mut ctx,
+        &[build_ix(
+            flash_book::instruction::FlushHaircutDust {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new(protocol.insurance_fund, false),
+            ],
+        )],
+        &[&payer],
+    )
+    .await
+    .expect("flush must succeed (residual covers the dust debit)");
+
+    let hc_after: flash_book::state_v3::MarketHaircutStateAccount =
+        fetch(&mut ctx.banks_client, haircut_state).await;
+    let ins_after: InsuranceFundAccount = fetch(&mut ctx.banks_client, protocol.insurance_fund).await;
+
+    // H-3: residual debited by EXACTLY the dust (pre-fix left it untouched).
+    assert_eq!(
+        hc_after.residual_quote_lots,
+        residual_before - dust,
+        "H-3: flush must debit residual by exactly the flushed dust"
+    );
+    assert_eq!(hc_after.dust_accrued_quote_lots, 0, "dust fully flushed");
+    assert_eq!(
+        ins_after.balance_quote_lots,
+        ins_before.balance_quote_lots + dust as u64,
+        "insurance credited by the flushed dust"
+    );
+}
+
+/// H-2: once the haircut engine is enabled (initialize_haircut_state sets the
+/// sticky `haircut_enabled`), settlement may NOT omit the haircut accounts — a
+/// fill that passes the `None` sentinels routes realized PnL with no
+/// Residual/solvency gating. apply_fill must reject with HaircutNotInitialized
+/// (1904 → Custom(7904)).
+#[tokio::test]
+async fn apply_fill_requires_haircut_accounts_when_enabled_h2() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+
+    // Enable the haircut engine (sets sticky haircut_enabled = true).
+    let (haircut_state, _) = pda(&[
+        flash_book::state_v3::MarketHaircutStateAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitializeHaircutState {
+                    h_min_slots: 0,
+                    h_max_slots: 1,
+                    initial_residual_quote_lots: 0,
+                },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(haircut_state, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // apply_fill that OMITS the haircut accounts (program-id None sentinels) must
+    // now be rejected.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(protocol.insurance_fund, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
+            AccountMeta::new_readonly(flash_book::ID, false), // market_haircut None
+            AccountMeta::new_readonly(flash_book::ID, false), // taker_position_haircut None
+            AccountMeta::new_readonly(flash_book::ID, false), // maker_position_haircut None
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(7904)"),
+        "haircut-enabled apply_fill must reject when the haircut accounts are omitted (H-2), got: {dbg}"
+    );
+    let pos = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(pos.is_none(), "no position created after the H-2 rejection");
+}
+
+/// M-1: the FLP fill band was tightened 2000 bps (20%) → 300 bps (3%). A fill
+/// priced 10% from the fresh oracle — comfortably inside the OLD 20% band but
+/// outside the new 3% — must now be rejected with FlpPriceOutsideBand
+/// (2205 → Custom(8205)). Oracle = 100_000; posting 110_000 = +10%.
+#[tokio::test]
+async fn apply_flp_fill_band_tightened_rejects_ten_percent_m1() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader_state.as_ref(),
+    ]);
+
+    let ix = build_ix(
+        flash_book::instruction::ApplyFlpFill {
+            size_lots: 1,
+            price_ticks: 110_000, // +10% vs the 100_000 oracle: inside old 20%, outside new 3%
+            taker_side: 0,
+            taker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(protocol.insurance_fund, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
+            AccountMeta::new_readonly(flash_book::ID, false), // market_haircut None
+            AccountMeta::new_readonly(flash_book::ID, false), // taker_position_haircut None
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8205)"),
+        "a 10% FLP fill must be rejected by the tightened 3% band (M-1), got: {dbg}"
+    );
+    let pos = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(pos.is_none(), "no position created after the M-1 band rejection");
+}
+
+/// M-5: the negative-fee tier is removed by capping `MAX_FEE_DISCOUNT_BPS` at
+/// 10_000 (100%). A discount above 100% (which previously minted an unbacked
+/// taker rebate) must now be rejected at `set_trader_fee_tier` with OutOfRange
+/// (1003 → Custom(7003)); a 100% discount (zero fee, no negative) is still
+/// accepted.
+#[tokio::test]
+async fn set_trader_fee_tier_rejects_negative_fee_m5() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, _market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 100_000, &protocol).await;
+
+    let set_tier = |discount_bps: u32| {
+        build_ix(
+            flash_book::instruction::SetTraderFeeTier { discount_bps },
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true), // protocol authority
+                AccountMeta::new_readonly(protocol.insurance_fund, false),
+                AccountMeta::new(trader_state, false),
+            ],
+        )
+    };
+
+    // A >100% discount (negative fee) must be rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let neg = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[set_tier(10_001)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{neg:?}");
+    assert!(
+        dbg.contains("Custom(7003)"),
+        "a >100% fee discount (unbacked negative fee) must be rejected (M-5), got: {dbg}"
+    );
+
+    // Exactly 100% (zero fee, never negative) is still accepted.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[set_tier(10_000)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .expect("a 100% discount (zero fee) must still be accepted");
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(ts.fee_discount_bps, 10_000, "100% discount persisted");
 }

@@ -178,6 +178,10 @@ pub mod flash_book {
         let mut data = ctx.accounts.fill_commitment.try_borrow_mut_data()?;
         fc::buffer_init(&mut data, &market_key.to_bytes(), cap, bump)
             .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+        drop(data);
+
+        // C-1 fix: ARM the market — settlement now REQUIRES the ring (sticky).
+        ctx.accounts.market.fill_commitment_required = true;
 
         emit!(FillCommitmentInitializedEvent {
             market: market_key,
@@ -2189,13 +2193,11 @@ pub mod flash_book {
     /// 30-day rolling notional — the universal pattern at every CEX
     /// (Binance, OKX, Bybit, Hyperliquid).
     ///
-    /// `discount_bps` is bounded to `MAX_FEE_DISCOUNT_BPS` = 12_000 (120%).
-    /// Values up to 10_000 are a normal discount (down to zero fee);
-    /// 10_000..12_000 enable HL/MM-pro top-tier NEGATIVE fees — the
-    /// taker is *paid* for routing flow, with the rebate sourced from
-    /// the protocol's own insurance contribution. Apply_fill clamps the
-    /// rebate so the trader never extracts more than `max(rebate)` of
-    /// notional, and the math respects the maker rebate priority.
+    /// `discount_bps` is bounded to `MAX_FEE_DISCOUNT_BPS` = 10_000 (100%) —
+    /// a discount can reach a zero taker fee but never a negative one.
+    /// M-5 (audit 2026-06): the old 12_000 cap allowed a negative top-tier
+    /// fee whose rebate was credited but never debited (unbacked mint); the
+    /// tier is removed by capping at 100%. See `constants::MAX_FEE_DISCOUNT_BPS`.
     pub fn set_trader_fee_tier(
         ctx: Context<SetTraderFeeTier>,
         discount_bps: u32,
@@ -3516,9 +3518,28 @@ pub mod flash_book {
         // and settlement order must agree. Composes with the H1-A `fill_seq`
         // replay guard above.
         let fc_market_bytes = ctx.accounts.market.key().to_bytes();
-        if let Some(fc_acct) =
-            find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes)
-        {
+        let fc_opt =
+            find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes);
+        // C-1 (audit 2026-06) FIX: once a market is ARMED (`init_fill_commitment`
+        // sets `fill_commitment_required`), the ring is MANDATORY. The sequencer
+        // builds this tx; without this hard-require a compromised sequencer could
+        // simply omit the optional account and settle FABRICATED fills unguarded.
+        require!(
+            !ctx.accounts.market.fill_commitment_required || fc_opt.is_some(),
+            FlashBookError::FillCommitmentMissing
+        );
+        // H-2 (audit 2026-06) FIX: if the market has the haircut engine ENABLED, the
+        // (optional) haircut accounts are MANDATORY — otherwise a settlement that
+        // omits them routes positive realized PnL straight to collateral with NO
+        // Residual/solvency gating, defeating the junior-claim engine.
+        require!(
+            !ctx.accounts.market.haircut_enabled
+                || (ctx.accounts.market_haircut.is_some()
+                    && ctx.accounts.taker_position_haircut.is_some()
+                    && ctx.accounts.maker_position_haircut.is_some()),
+            FlashBookError::HaircutNotInitialized
+        );
+        if let Some(fc_acct) = fc_opt {
             use matcher::fill_commitment as fc;
             let market_bytes = fc_market_bytes;
             let taker_bytes = ctx.accounts.taker_trader_state.load()?.trader.to_bytes();
@@ -5222,6 +5243,21 @@ pub mod flash_book {
             validate_leg_intake(&market, &legs[i])?;
             check_caps_for_leg(&market, &position, &ctx.accounts.flp_exposure, &legs[i])?;
 
+            // H-7 (audit 2026-06) FIX: bind this leg's position to the CANONICAL
+            // PDA for (leg market, signing trader_state). The 2-leg `PlaceBasketOrderV2`
+            // PDA-binds via Anchor seeds; this N-leg path did not. Without it, an
+            // attacker passed a small/empty PositionAccount so the margin lattice saw
+            // ~no exposure (healthy), while the leg injects tagged to the trader_state
+            // and the fill accrues to their REAL large, unassessed position →
+            // undercollateralized. Derivation is in an #[inline(never)] helper so its
+            // stack stays out of this (large) handler's BPF frame.
+            require_canonical_position_pda(
+                &m_ai.key(),
+                &ctx.accounts.trader_state.key(),
+                &pos_ai.key(),
+                program_id,
+            )?;
+
             if position.size_lots > 0 {
                 require!(position.trader == trader_key, FlashBookError::WrongTrader);
                 require!(position.market == m_ai.key(), FlashBookError::WrongMarket);
@@ -6237,6 +6273,25 @@ pub mod flash_book {
         // here: the quoter's inputs drift between ER quote-time and L1 settle-time,
         // so re-deriving would reject legitimate fills). Enforced only when a live
         // oracle anchors it (`oracle == 0` returns true → skipped, cannot verify).
+        //
+        // H-1 (audit 2026-06) FIX: the band is only meaningful against a FRESH
+        // oracle. Every other oracle-consuming path checks staleness; this one did
+        // not, so a compromised sequencer could settle FLP fills against a STALE
+        // frozen anchor (passing the band) while the real market had moved, draining
+        // the pool. When a staleness bound is configured, require the oracle fresh
+        // (and treat `published_at == 0` as stale → reject). `max_age == 0` is the
+        // operator's explicit "no staleness gate" (tracked separately as L-5).
+        {
+            let max_age = ctx.accounts.market.params.oracle_staleness_max_seconds as u64;
+            if max_age > 0 {
+                let now = Clock::get()?.unix_timestamp.max(0) as u64;
+                let published = ctx.accounts.market.oracle_published_at_unix_seconds;
+                require!(
+                    published != 0 && now.saturating_sub(published) <= max_age,
+                    FlashBookError::OracleTooStale
+                );
+            }
+        }
         require!(
             matcher::flp_quoter::price_within_band(
                 ctx.accounts.market.oracle_price_ticks,
@@ -6244,6 +6299,15 @@ pub mod flash_book {
                 crate::constants::FLP_MAX_FILL_DEVIATION_BPS,
             ),
             FlashBookError::FlpPriceOutsideBand
+        );
+        // H-2 (audit 2026-06) FIX: on a haircut-enabled market the haircut accounts
+        // are MANDATORY (FLP path has market + taker only — FLP is the maker), so a
+        // settlement can't omit them to route the taker's PnL past the solvency gate.
+        require!(
+            !ctx.accounts.market.haircut_enabled
+                || (ctx.accounts.market_haircut.is_some()
+                    && ctx.accounts.taker_position_haircut.is_some()),
+            FlashBookError::HaircutNotInitialized
         );
 
         // Phase 2i — verify the trader_state PDA matches
@@ -6585,15 +6649,37 @@ pub mod flash_book {
         // Snapshot the position (Copy) so reads don't hold a borrow that
         // would collide with the later `load_mut()` write-back.
         let position = *ctx.accounts.position.load()?;
-        let (trader_state_pre_trader, trader_state_pre_collateral) = {
+        let (trader_state_pre_trader, trader_state_pre_collateral, ts_open_positions) = {
             let ts = ctx.accounts.trader_state.load()?;
-            (ts.trader, ts.collateral_quote_lots)
+            (ts.trader, ts.collateral_quote_lots, ts.open_positions)
         };
 
         require!(position.size_lots > 0, FlashBookError::LiquidationStale);
         require!(
             position.trader == trader_state_pre_trader,
             FlashBookError::WrongTrader
+        );
+        // H-4 (audit 2026-06) FIX: a CROSS position (collateral==0) shares the
+        // trader's pool with their OTHER cross legs, but this single-position path
+        // assesses ONLY this leg against the full pool — excluding the other legs'
+        // equity → a hedged, portfolio-HEALTHY trader is wrongfully liquidated on one
+        // leg (or, ignoring a losing leg, dodges). The single-leg assessment is sound
+        // only for an ISOLATED position OR a cross trader with no other legs; a
+        // multi-position cross trader MUST be routed through liquidate_portfolio_v2.
+        require!(
+            position.collateral_quote_lots > 0 || ts_open_positions <= 1,
+            FlashBookError::CrossLiquidationNeedsPortfolio
+        );
+        // M-2 (audit 2026-06) FIX: forbid self-liquidation. If the caller is the
+        // liquidatee, the Dutch-auction reward below is skimmed from the
+        // liquidatee's own collateral (or isolated bucket) and routed to the
+        // caller's main account — on a bankrupt close that reward is pulled
+        // AHEAD of the insurance `cover_bad_debt` draw, letting the trader
+        // extract value that should backstop the deficit. A liquidation must be
+        // performed by a third party.
+        require!(
+            ctx.accounts.caller.key() != trader_state_pre_trader,
+            FlashBookError::SelfLiquidationForbidden
         );
         require!(
             position.market == market.key(),
@@ -7165,6 +7251,18 @@ pub mod flash_book {
         require!(
             underwater.trader != counter.trader,
             FlashBookError::OutOfRange
+        );
+        // H-5 (audit 2026-06) FIX: same single-leg defect as H-4 — the underwater
+        // eligibility assesses ONLY this leg against the underwater trader's full
+        // cross pool, excluding their other cross legs. A cross trader whose
+        // portfolio is healthy (winning leg, excluded) can be wrongfully ADL'd. The
+        // single-leg health check is sound only for an isolated position or a
+        // single-position cross trader; otherwise the underwater state must be
+        // assessed over the full portfolio.
+        require!(
+            underwater.collateral_quote_lots > 0
+                || ctx.accounts.underwater_trader_state.load()?.open_positions <= 1,
+            FlashBookError::CrossLiquidationNeedsPortfolio
         );
 
         // Trigger gate: insurance fund must be below the pause threshold
@@ -8709,6 +8807,18 @@ pub mod flash_book {
         let live_nav = ctx.accounts.vault_trader_state.load()?.collateral_quote_lots as u128;
         require!(live_nav > 0, FlashBookError::InsufficientCollateral);
 
+        // H-6 (audit 2026-06) FIX: a v3 vault holds open positions
+        // (`vault_place_order_v3`), and `live_nav = collateral_quote_lots` ignores
+        // unrealized loss. Without a gate, early depositors burn shares and exit at
+        // the inflated NAV, pulling the collateral that backs the open position and
+        // socializing the loss onto remaining depositors (a run on an insolvent
+        // vault) — and could drop collateral below maintenance with no IM check.
+        // Require the vault FLAT for redemptions, mirroring `settle_vault_perf_fee`.
+        require!(
+            ctx.accounts.vault_trader_state.load()?.open_positions == 0,
+            FlashBookError::SweepRequiresFlat
+        );
+
         let amount_u128 = (shares_to_burn as u128)
             .checked_mul(live_nav)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
@@ -9585,6 +9695,10 @@ pub mod flash_book {
         matcher::haircut::validate_market_params(h_min_slots, h_max_slots)
             .map_err(map_haircut_error)?;
 
+        // H-2 fix: ENABLE the haircut engine on the market — settlement now REQUIRES
+        // the haircut accounts (sticky), closing the omit-the-accounts bypass.
+        ctx.accounts.market.haircut_enabled = true;
+
         let st = &mut ctx.accounts.haircut_state;
         st.market = ctx.accounts.market.key();
         st.bump = ctx.bumps.haircut_state;
@@ -9783,6 +9897,17 @@ pub mod flash_book {
             .dust_accrued_quote_lots
             .checked_sub(dust_u64 as u128)
             .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+
+        // H-3 (audit 2026-06) FIX: the dust just moved into insurance (ΔI=+dust),
+        // so the Residual identity `Residual = V − C_tot − I` demands ΔResidual =
+        // −dust (the contract table in `matcher::haircut`). `convert_position`
+        // debits Residual only by `credit`, so the dust portion stays in Residual;
+        // without this debit it is double-counted, inflating `h` and letting
+        // traders convert matured PnL beyond the protocol's real backing.
+        market_haircut.residual_quote_lots = market_haircut
+            .residual_quote_lots
+            .checked_sub(dust_u64 as u128)
+            .ok_or_else(|| error!(FlashBookError::HaircutResidualUnderflow))?;
 
         emit!(HaircutDustFlushedEvent {
             market: market_haircut.market,
@@ -10372,7 +10497,10 @@ pub struct InitializeHaircutState<'info> {
     pub authority: Signer<'info>,
     /// Authority must match the market's authority — same trust model
     /// as `update_market_params`.
+    // H-2 fix: `mut` so the handler can set `haircut_enabled = true` (enabling the
+    // haircut engine makes its accounts mandatory in settlement, sticky).
     #[account(
+        mut,
         seeds = [state::MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
         constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
@@ -10402,13 +10530,19 @@ pub struct MaturePosition<'info> {
     )]
     pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
 
+    /// Phase 2c FIX (audit 2026-06): positions are PDA-keyed by the trader_state
+    /// account, NOT the wallet. Relaxed (no seed) — the `position` seeds below
+    /// bind it to the canonical trader_state (a wrong one derives a different PDA
+    /// → ConstraintSeeds), and the identity constraint re-checks
+    /// `position.trader == trader_state.trader`.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
     /// The Position the per-position haircut state attaches to.
-    /// Re-derive its PDA via the account's stored fields so we don't
-    /// have to thread market/trader through ix args.
     #[account(
-        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), trader_state.key().as_ref()],
         bump = position.load()?.bump,
         constraint = position.load()?.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
+        constraint = position.load()?.trader == trader_state.load()?.trader @ FlashBookError::WrongTrader,
     )]
     pub position: AccountLoader<'info, state::PositionAccount>,
 
@@ -10438,24 +10572,23 @@ pub struct ConvertPosition<'info> {
     )]
     pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
 
+    /// H9: the converted matured PnL is credited here (isolated bucket if the
+    /// position is isolated, else the cross pool). Phase 2c FIX (audit 2026-06):
+    /// declared BEFORE `position` and relaxed (no seed) so the position PDA can
+    /// be keyed by `trader_state.key()` — the old wallet-keyed seed never matched
+    /// a Phase-2c position. The position seeds + identity constraint below bind
+    /// this trader_state canonically (a wrong one → ConstraintSeeds on `position`).
+    #[account(mut)]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
     #[account(
         mut,
-        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), trader_state.key().as_ref()],
         bump = position.load()?.bump,
         constraint = position.load()?.market == haircut_state.market @ FlashBookError::HaircutStateMismatch,
+        constraint = position.load()?.trader == trader_state.load()?.trader @ FlashBookError::WrongTrader,
     )]
     pub position: AccountLoader<'info, state::PositionAccount>,
-
-    /// H9: the converted matured PnL is credited here — the isolated bucket on
-    /// `position` if isolated, else this cross pool. Bound to the position's
-    /// trader (main account). Previously absent, so the credit was never landed.
-    #[account(
-        mut,
-        seeds = [TraderStateAccount::SEED, position.load()?.trader.as_ref()],
-        bump = trader_state.load()?.bump,
-        constraint = trader_state.load()?.trader == position.load()?.trader @ FlashBookError::WrongTrader,
-    )]
-    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         mut,
@@ -10497,9 +10630,15 @@ pub struct InitPositionHaircutState<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
+    /// Phase 2c FIX (audit 2026-06): position PDA is keyed by the trader_state
+    /// account, not the wallet. Relaxed (no seed); the `position` seeds bind it
+    /// canonically and the identity constraint re-checks the trader.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
     #[account(
-        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), trader_state.key().as_ref()],
         bump = position.load()?.bump,
+        constraint = position.load()?.trader == trader_state.load()?.trader @ FlashBookError::WrongTrader,
     )]
     pub position: AccountLoader<'info, state::PositionAccount>,
 
@@ -10536,21 +10675,22 @@ pub struct ReleaseGainToHaircut<'info> {
     )]
     pub market: Box<Account<'info, state::MarketAccount>>,
 
-    #[account(
-        mut,
-        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), position.load()?.trader.as_ref()],
-        bump = position.load()?.bump,
-        constraint = position.load()?.market == market.key() @ FlashBookError::HaircutStateMismatch,
-    )]
-    pub position: AccountLoader<'info, state::PositionAccount>,
+    /// Phase 2c FIX (audit 2026-06): declared BEFORE `position` and relaxed (no
+    /// seed) so the position PDA can be keyed by `trader_state.key()` — the old
+    /// wallet-keyed seed never matched a Phase-2c position. The cross bucket this
+    /// handler debits lives on this account; the position seeds + identity
+    /// constraint bind it canonically.
+    #[account(mut)]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
         mut,
-        seeds = [TraderStateAccount::SEED, position.load()?.trader.as_ref()],
-        bump = trader_state.load()?.bump,
-        constraint = trader_state.load()?.trader == position.load()?.trader @ FlashBookError::WrongTrader,
+        seeds = [state::PositionAccount::SEED, position.load()?.market.as_ref(), trader_state.key().as_ref()],
+        bump = position.load()?.bump,
+        constraint = position.load()?.market == market.key() @ FlashBookError::HaircutStateMismatch,
+        constraint = position.load()?.trader == trader_state.load()?.trader @ FlashBookError::WrongTrader,
     )]
-    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+    pub position: AccountLoader<'info, state::PositionAccount>,
 
     #[account(
         mut,
@@ -10969,7 +11109,10 @@ pub struct InitFillCommitment<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
+    // C-1 fix: `mut` so the handler can set `fill_commitment_required = true`
+    // (arming the market makes the ring mandatory in apply_fill, sticky).
     #[account(
+        mut,
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
         constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
@@ -14931,6 +15074,30 @@ fn verify_position_pda(
     )
     .map_err(|_| error!(FlashBookError::OutOfRange))?;
     require_keys_eq!(expected, *actual, FlashBookError::WrongTrader);
+    Ok(())
+}
+
+/// H-7 (audit 2026-06): assert `actual` IS the canonical position PDA for
+/// `(market, trader_state)`, deriving the canonical bump itself (so it also accepts
+/// a fresh, not-yet-initialized position whose stored `bump` is 0 — `verify_position_pda`
+/// needs a known bump and so can't be used for the open-via-basket case). `#[inline(never)]`
+/// keeps `find_program_address`'s stack out of the caller's BPF frame.
+#[inline(never)]
+fn require_canonical_position_pda(
+    market_key: &Pubkey,
+    trader_state_key: &Pubkey,
+    actual: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<()> {
+    let (expected, _) = Pubkey::find_program_address(
+        &[
+            state::PositionAccount::SEED,
+            market_key.as_ref(),
+            trader_state_key.as_ref(),
+        ],
+        program_id,
+    );
+    require_keys_eq!(*actual, expected, FlashBookError::WrongTrader);
     Ok(())
 }
 

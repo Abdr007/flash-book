@@ -201,6 +201,12 @@ pub enum FlashBookError {
     FillRingCorrupt = 2204,
     #[msg("FLP fill price deviates from the oracle by more than the safety band — fabricated or mispriced")]
     FlpPriceOutsideBand = 2205,
+    #[msg("Market is armed: the fill-commitment account is mandatory for settlement (C-1)")]
+    FillCommitmentMissing = 2206,
+    #[msg("Cross-margined trader with multiple positions must be liquidated via liquidate_portfolio_v2 (H-4)")]
+    CrossLiquidationNeedsPortfolio = 2207,
+    #[msg("Self-liquidation forbidden: the liquidator must not be the liquidatee (M-2)")]
+    SelfLiquidationForbidden = 2208,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
