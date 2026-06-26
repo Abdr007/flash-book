@@ -13,10 +13,18 @@
 //! when `market.params.matching_policy == MatchingPolicy::ProRata`.
 
 /// Split `fill_size` proportionally across N makers with sizes
-/// `maker_sizes`. Returns a Vec of `(maker_index, fill_lots)`.
+/// `maker_sizes`. Returns a Vec of `(maker_index, fill_lots)` in index order.
 ///
-/// Pure function. Floor-rounds; any residual lots (from rounding)
-/// are assigned to the first maker (deterministic tiebreak).
+/// Pure function. Two invariants the matcher relies on for value conservation
+/// (M2, audit 2026-06):
+///   1. No maker is ever filled beyond its OWN displayed size — a maker cannot
+///      be forced into a larger fill than it rested.
+///   2. The level fills at most `min(fill_size, Σ maker_sizes)` lots total; any
+///      remainder is genuine unfillable taker liquidity and is dropped here (the
+///      caller leaves it as the taker residual), NOT crammed onto a maker.
+/// Floor-rounds the proportional share; the flooring residual is distributed to
+/// makers with REMAINING capacity in index order (deterministic), never past a
+/// maker's size.
 pub fn split_pro_rata(fill_size: u64, maker_sizes: &[u64]) -> Vec<(usize, u64)> {
     if fill_size == 0 || maker_sizes.is_empty() {
         return Vec::new();
@@ -26,25 +34,42 @@ pub fn split_pro_rata(fill_size: u64, maker_sizes: &[u64]) -> Vec<(usize, u64)> 
         return Vec::new();
     }
     let fill_u128 = fill_size as u128;
-    let mut splits: Vec<(usize, u64)> = Vec::with_capacity(maker_sizes.len());
+    // The level can fill no more than every maker's full displayed size.
+    let target = fill_u128.min(total);
+
+    let mut fills: Vec<u128> = vec![0; maker_sizes.len()];
     let mut assigned: u128 = 0;
     for (i, size) in maker_sizes.iter().enumerate() {
-        let share = ((*size as u128) * fill_u128 / total).min(u64::MAX as u128) as u64;
-        if share > 0 {
-            splits.push((i, share));
-            assigned = assigned.saturating_add(share as u128);
-        }
+        // Floor proportional share, hard-capped at the maker's own size.
+        let share = ((*size as u128) * fill_u128 / total).min(*size as u128);
+        fills[i] = share;
+        assigned = assigned.saturating_add(share);
     }
-    // Residual (from flooring) → first maker.
-    if assigned < fill_u128 {
-        let residual = (fill_u128 - assigned).min(u64::MAX as u128) as u64;
-        if let Some(first) = splits.first_mut() {
-            first.1 = first.1.saturating_add(residual);
-        } else if !maker_sizes.is_empty() {
-            splits.push((0, residual));
+    // Distribute the flooring residual ONLY to makers that still have capacity,
+    // in index order. `target ≤ total` and total capacity == `total`, so the
+    // residual is always fully placed; the loop just stops early once it is.
+    let mut residual = target.saturating_sub(assigned);
+    for (i, size) in maker_sizes.iter().enumerate() {
+        if residual == 0 {
+            break;
         }
+        let capacity = (*size as u128).saturating_sub(fills[i]);
+        let add = capacity.min(residual);
+        fills[i] = fills[i].saturating_add(add);
+        residual = residual.saturating_sub(add);
     }
-    splits
+
+    maker_sizes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, _)| {
+            if fills[i] > 0 {
+                Some((i, fills[i].min(u64::MAX as u128) as u64))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -85,26 +110,48 @@ mod tests {
     }
 
     #[test]
-    fn residual_lots_go_to_first_maker() {
-        // 10 lots, makers 3+3+3 = 9 total. Each gets 10×3/9 = 3 (floor).
-        // 9 assigned, 1 residual → first gets +1 → (4, 3, 3).
-        let r = split_pro_rata(10, &[3, 3, 3]);
+    fn flooring_residual_goes_to_first_maker_with_capacity() {
+        // 11 lots, makers 7+7 = 14 total. Each gets floor(11×7/14) = 5 (floor),
+        // 10 assigned, 1 residual → first maker (capacity 2) absorbs it → (6, 5).
+        // Neither maker exceeds its size of 7.
+        let r = split_pro_rata(11, &[7, 7]);
         let total: u64 = r.iter().map(|(_, s)| s).sum();
-        assert_eq!(total, 10);
-        assert_eq!(r[0].1, 4);
-        assert_eq!(r[1].1, 3);
-        assert_eq!(r[2].1, 3);
+        assert_eq!(total, 11);
+        assert_eq!(r[0].1, 6);
+        assert_eq!(r[1].1, 5);
     }
 
     #[test]
-    fn fill_larger_than_total_capped_implicitly() {
-        // If fill exceeds total maker size, split proportionally to total.
-        // 200 fill, makers 50+50 → each gets 200×50/100 = 100.
+    fn fill_larger_than_total_caps_each_maker_at_its_size() {
+        // M2: fill exceeds total displayed (200 > 100). Each maker fills its FULL
+        // size (50) and NO MORE — the extra 100 lots are unfillable and dropped,
+        // NOT crammed onto a maker. Old behaviour wrongly returned (100, 100).
         let r = split_pro_rata(200, &[50, 50]);
         let total: u64 = r.iter().map(|(_, s)| s).sum();
-        assert_eq!(total, 200);
-        assert_eq!(r[0].1, 100);
-        assert_eq!(r[1].1, 100);
+        assert_eq!(total, 100, "level fills at most Σ maker sizes");
+        assert_eq!(r[0].1, 50);
+        assert_eq!(r[1].1, 50);
+    }
+
+    #[test]
+    fn no_maker_ever_overfilled_beyond_its_size() {
+        // M2 invariant sweep: across assorted fills and maker books, every
+        // maker's fill is ≤ its displayed size and the total ≤ min(fill, Σsizes).
+        let books: &[&[u64]] = &[&[3, 3, 3], &[1, 100], &[10, 1, 1], &[5], &[7, 7, 1]];
+        for book in books {
+            let sigma: u64 = book.iter().sum();
+            for fill in [0u64, 1, 2, 9, 10, 11, 100, 500] {
+                let r = split_pro_rata(fill, book);
+                let mut got = 0u64;
+                for (i, f) in &r {
+                    assert!(*f <= book[*i], "maker {i} overfilled: {f} > {}", book[*i]);
+                    got += f;
+                }
+                assert!(got <= fill.min(sigma), "level overfilled: {got} > min({fill},{sigma})");
+                // Conservation: when there is fillable liquidity, fill it exactly.
+                assert_eq!(got, fill.min(sigma), "must fill exactly min(fill, Σsizes)");
+            }
+        }
     }
 
     #[test]
