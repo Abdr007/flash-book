@@ -60,9 +60,13 @@ rushed in. **None is an anonymous single-tx drain.**
   yet addressed; all are footguns / defense-in-depth, none a direct theft.
 
 ## Regression-test status
-- **C-1** — dedicated integration test `armed_apply_fill_rejects_when_commitment_account_omitted` (asserts `Custom(8206)`).
-- **H-8** — dedicated host test `twap_v3_space_matches_borsh_serialized_len` (pins the EXACT 148-byte Borsh body so any future field desync fails loudly — stronger than the sibling `>= 8+body` checks).
-- **H-1/H-2/H-3/H-4/H-5/H-6/H-7 and M-1/M-2** — verified by build-sbf + full host suite (0 failed) + source inspection against each auditor scenario. Dedicated negative tests are the recommended follow-up; note the liquidation-path guards (H-4/H-5/M-2) need a liquidatable multi-leg state built through BanksClient, and the M-2 self-liquidation case collapses `caller_trader_state` and `trader_state` onto one PDA (an Anchor account-collision can surface before the `8208` guard) — the test must be written to disambiguate, which is why it's scoped as follow-up rather than shipped half-right.
+- **C-1** — `armed_apply_fill_rejects_when_commitment_account_omitted` (asserts `Custom(8206)`).
+- **H-4** — `liquidate_position_v2_rejects_multi_leg_cross_h4`: a 2-leg cross trader liquidated one leg at a time via the single-position path → `Custom(8207)`.
+- **H-5** — `auto_deleverage_rejects_multi_leg_cross_h5`: same defect on the ADL path → `Custom(8207)`.
+- **M-2** — `liquidate_position_v2_rejects_self_liquidation_m2`: `caller == liquidatee` → `Custom(8208)`. (The self-liquidation case collapses `caller_trader_state` and `trader_state` onto one PDA; confirmed the guard fires cleanly *before* any mutation, so `8208` surfaces — not an Anchor collision error.)
+  - These three reuse a shared `open_cross_position` helper (unarmed `apply_fill` opens a zero-collateral cross leg). All three guards sit above the health/oracle/insurance gates, so the tests assert the guard directly without needing a genuinely liquidatable trader.
+- **H-8** — `twap_v3_space_matches_borsh_serialized_len` (pins the EXACT 148-byte Borsh body so any future field desync fails loudly — stronger than the sibling `>= 8+body` checks).
+- **H-1/H-2/H-3/H-6/H-7 and M-1** — verified by build-sbf + full host suite (0 failed) + source inspection against each auditor scenario. Dedicated negative tests remain a recommended follow-up.
 - These remediations should themselves be **re-reviewed** (ideally by the external audit) — a fix can introduce new issues.
 
 ## Reproduce

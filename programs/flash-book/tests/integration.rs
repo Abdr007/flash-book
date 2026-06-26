@@ -4712,3 +4712,342 @@ async fn er_delegation_rejects_non_authority() {
         "undelegate_fill_commitment must reject a non-authority with Unauthorized, got: {dbg2}"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// Audit 2026-06 remediation — liquidation-path guard regression tests.
+//
+// H-4 / H-5 → CrossLiquidationNeedsPortfolio (2207 → Custom(8207)): a CROSS
+// position (zero per-position collateral) belonging to a trader with >1 open
+// leg must NOT be liquidated/deleveraged via the single-leg path — it has to
+// route through liquidate_portfolio_v2, which assesses the whole pool.
+// M-2 → SelfLiquidationForbidden (2208 → Custom(8208)): the liquidator must
+// not be the liquidatee.
+//
+// All three guards sit at the TOP of their handler, BEFORE the
+// health/oracle/insurance gates, so these tests don't need a genuinely
+// liquidatable trader — only the exact account shape each guard rejects.
+// ════════════════════════════════════════════════════════════════════════
+
+/// Open a CROSS position (long for `taker`, short for `maker`) on `market` via
+/// an UNARMED `apply_fill` (no fill-commitment ring). Cross ⇒
+/// `position.collateral_quote_lots == 0`, and the taker's
+/// `TraderState.open_positions` is incremented by one. Returns the taker's
+/// position PDA.
+async fn open_cross_position(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    market: Pubkey,
+    insurance_fund: Pubkey,
+    taker_state: Pubkey,
+    maker_state: Pubkey,
+    fill_seq: u64,
+) -> Pubkey {
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+            fill_seq,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // payer IS the market sequencer
+            AccountMeta::new(market, false),
+            AccountMeta::new(insurance_fund, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(flash_book::ID, false), // fee_tiers None
+            AccountMeta::new_readonly(flash_book::ID, false), // haircut None ×3
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(flash_book::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .expect("unarmed apply_fill opens a cross position");
+    taker_pos
+}
+
+/// M-2: the liquidatee cannot liquidate itself. One open leg (open_positions==1)
+/// clears the H-4 cross gate, so execution reaches the M-2 guard, which rejects
+/// `caller == liquidatee` with `SelfLiquidationForbidden`.
+#[tokio::test]
+async fn liquidate_position_v2_rejects_self_liquidation_m2() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    let taker_pos = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_pda,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    assert_eq!(ts.open_positions, 1, "taker has exactly one open position");
+    let pos: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(
+        pos.collateral_quote_lots, 0,
+        "cross position carries zero per-position collateral"
+    );
+
+    // caller == liquidatee. caller_trader_state seed == [SEED, taker] == taker_state,
+    // so the same account rides at both the trader_state and caller_trader_state
+    // slots; the M-2 guard fires before either is mutated.
+    let (market_book, _) = pda(&[
+        flash_book::state_v2::MARKET_BOOK_SEED,
+        market_pda.as_ref(),
+    ]);
+    let ix = build_ix(
+        flash_book::instruction::LiquidatePositionV2 {
+            requested_close_lots: 0,
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true), // caller == liquidatee
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(taker_state, false), // trader_state
+            AccountMeta::new(taker_state, false), // caller_trader_state (== trader_state)
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&taker.pubkey()),
+            &[&taker],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8208)"),
+        "self-liquidation must be rejected with SelfLiquidationForbidden (M-2), got: {dbg}"
+    );
+    let pos_after: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(
+        pos_after.size_lots, 1,
+        "position must be untouched after the M-2 rejection"
+    );
+}
+
+/// H-4: a multi-leg CROSS trader (open_positions==2, zero per-position
+/// collateral) cannot be liquidated one leg at a time via the single-position
+/// path — that would assess one leg against the full pool and wrongfully
+/// liquidate a portfolio-healthy trader. It must route through
+/// liquidate_portfolio_v2.
+#[tokio::test]
+async fn liquidate_position_v2_rejects_multi_leg_cross_h4() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_a, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (market_b, _, _, _) = setup_additional_market(&mut ctx, &payer, 100_000).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    // A CROSS leg on each market ⇒ taker.open_positions == 2.
+    let taker_pos_a = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_a,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+    let _taker_pos_b = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_b,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    assert_eq!(ts.open_positions, 2, "taker is a multi-leg cross trader");
+    let pos_a: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, taker_pos_a).await;
+    assert_eq!(
+        pos_a.collateral_quote_lots, 0,
+        "leg A is cross (zero per-position collateral)"
+    );
+
+    // A third-party liquidator targets ONE leg via the single-position path.
+    let liquidator = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &liquidator.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let (caller_state, _) = pda(&[TraderStateAccount::SEED, liquidator.pubkey().as_ref()]);
+    let (market_book_a, _) = pda(&[
+        flash_book::state_v2::MARKET_BOOK_SEED,
+        market_a.as_ref(),
+    ]);
+
+    let ix = build_ix(
+        flash_book::instruction::LiquidatePositionV2 {
+            requested_close_lots: 0,
+        },
+        vec![
+            AccountMeta::new(liquidator.pubkey(), true),
+            AccountMeta::new_readonly(market_a, false),
+            AccountMeta::new(market_book_a, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(caller_state, false),
+            AccountMeta::new(taker_pos_a, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&liquidator.pubkey()),
+            &[&liquidator],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8207)"),
+        "single-leg liquidation of a multi-leg cross trader must be rejected (H-4), got: {dbg}"
+    );
+}
+
+/// H-5: same defect on the ADL path. A multi-leg CROSS underwater trader cannot
+/// be auto-deleveraged one leg at a time — the single-leg eligibility check
+/// excludes their other legs and can wrongfully ADL a portfolio-healthy trader.
+#[tokio::test]
+async fn auto_deleverage_rejects_multi_leg_cross_h5() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_a, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (market_b, _, _, _) = setup_additional_market(&mut ctx, &payer, 100_000).await;
+
+    let under = Keypair::new();
+    let counter = Keypair::new();
+    let maker2 = Keypair::new();
+    let under_state = setup_trader(&mut ctx, &payer, &under, 100_000, &protocol).await;
+    let counter_state = setup_trader(&mut ctx, &payer, &counter, 100_000, &protocol).await;
+    let maker2_state = setup_trader(&mut ctx, &payer, &maker2, 100_000, &protocol).await;
+
+    // Market A: `under` LONG, `counter` SHORT — opposite legs on one market.
+    let under_pos_a = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_a,
+        protocol.insurance_fund,
+        under_state,
+        counter_state,
+        1,
+    )
+    .await;
+    let (counter_pos_a, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_a.as_ref(),
+        counter_state.as_ref(),
+    ]);
+    // Market B: a SECOND leg for `under` ⇒ under.open_positions == 2.
+    let _under_pos_b = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_b,
+        protocol.insurance_fund,
+        under_state,
+        maker2_state,
+        1,
+    )
+    .await;
+
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, under_state).await;
+    assert_eq!(ts.open_positions, 2, "underwater trader is multi-leg cross");
+    let upos: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, under_pos_a).await;
+    assert_eq!(
+        upos.collateral_quote_lots, 0,
+        "underwater leg is cross (zero per-position collateral)"
+    );
+
+    let ix = build_ix(
+        flash_book::instruction::AutoDeleverage { close_size_lots: 1 },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // caller — anyone may ADL
+            AccountMeta::new(market_a, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new(under_state, false),
+            AccountMeta::new(under_pos_a, false),
+            AccountMeta::new(counter_state, false),
+            AccountMeta::new(counter_pos_a, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8207)"),
+        "single-leg ADL of a multi-leg cross trader must be rejected (H-5), got: {dbg}"
+    );
+}
