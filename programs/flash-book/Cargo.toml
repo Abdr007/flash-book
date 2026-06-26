@@ -28,8 +28,10 @@ solana-keccak-hasher = "2.2.1"
 
 [dev-dependencies]
 proptest = "1.6"
-solana-program-test = "2.3"
-solana-sdk = "2.3"
+# solana-program-test 4.x gates its ENTIRE API behind `agave-unstable-api`.
+solana-program-test = { version = "4.1", features = ["agave-unstable-api"] }
+solana-sdk = "4.0"
+solana-system-interface = { version = "1.0", features = ["bincode"] }
 spl-token = { version = "8", features = ["no-entrypoint"] }
 spl-associated-token-account = { version = "6", features = ["no-entrypoint"] }
 tokio = { version = "1", features = ["full"] }
