@@ -6651,15 +6651,26 @@ pub mod flash_book {
         // Snapshot the position (Copy) so reads don't hold a borrow that
         // would collide with the later `load_mut()` write-back.
         let position = *ctx.accounts.position.load()?;
-        let (trader_state_pre_trader, trader_state_pre_collateral) = {
+        let (trader_state_pre_trader, trader_state_pre_collateral, ts_open_positions) = {
             let ts = ctx.accounts.trader_state.load()?;
-            (ts.trader, ts.collateral_quote_lots)
+            (ts.trader, ts.collateral_quote_lots, ts.open_positions)
         };
 
         require!(position.size_lots > 0, FlashBookError::LiquidationStale);
         require!(
             position.trader == trader_state_pre_trader,
             FlashBookError::WrongTrader
+        );
+        // H-4 (audit 2026-06) FIX: a CROSS position (collateral==0) shares the
+        // trader's pool with their OTHER cross legs, but this single-position path
+        // assesses ONLY this leg against the full pool — excluding the other legs'
+        // equity → a hedged, portfolio-HEALTHY trader is wrongfully liquidated on one
+        // leg (or, ignoring a losing leg, dodges). The single-leg assessment is sound
+        // only for an ISOLATED position OR a cross trader with no other legs; a
+        // multi-position cross trader MUST be routed through liquidate_portfolio_v2.
+        require!(
+            position.collateral_quote_lots > 0 || ts_open_positions <= 1,
+            FlashBookError::CrossLiquidationNeedsPortfolio
         );
         require!(
             position.market == market.key(),
@@ -7231,6 +7242,18 @@ pub mod flash_book {
         require!(
             underwater.trader != counter.trader,
             FlashBookError::OutOfRange
+        );
+        // H-5 (audit 2026-06) FIX: same single-leg defect as H-4 — the underwater
+        // eligibility assesses ONLY this leg against the underwater trader's full
+        // cross pool, excluding their other cross legs. A cross trader whose
+        // portfolio is healthy (winning leg, excluded) can be wrongfully ADL'd. The
+        // single-leg health check is sound only for an isolated position or a
+        // single-position cross trader; otherwise the underwater state must be
+        // assessed over the full portfolio.
+        require!(
+            underwater.collateral_quote_lots > 0
+                || ctx.accounts.underwater_trader_state.load()?.open_positions <= 1,
+            FlashBookError::CrossLiquidationNeedsPortfolio
         );
 
         // Trigger gate: insurance fund must be below the pause threshold
