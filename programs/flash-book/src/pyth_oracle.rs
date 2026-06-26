@@ -10,9 +10,11 @@
 //! escape a bad dep" pattern already used for the ER CPIs in `er.rs`.
 //!
 //! ## Safety
-//! Byte-correctness is proven by a DIFFERENTIAL unit test: the same account bytes
-//! are read by BOTH this parser and the real `pyth-solana-receiver-sdk` (kept as a
-//! dev-dependency) and asserted equal — so any offset/discriminator drift fails CI.
+//! Byte-correctness is locked by a CAPTURED-FIXTURE test: a real `PriceUpdateV2`
+//! account, serialized by the actual `pyth-solana-receiver-sdk` (in the prior
+//! pyth-as-dev-dep step) is embedded here and the parser must read back the exact
+//! price/conf/exponent/publish_time — so any offset/discriminator drift fails CI,
+//! with NO pyth dependency at build time.
 
 use anchor_lang::prelude::*;
 
@@ -85,101 +87,63 @@ pub fn get_price_no_older_than_full(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anchor_lang::AccountSerialize;
-    use anchor_lang::solana_program::clock::Clock;
-    use pyth_solana_receiver_sdk::price_update::{
-        PriceFeedMessage, PriceUpdateV2, VerificationLevel,
-    };
 
-    fn serialize(acct: &PriceUpdateV2) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        acct.try_serialize(&mut bytes).unwrap();
-        bytes
-    }
-
-    fn make(feed: [u8; 32], level: VerificationLevel) -> PriceUpdateV2 {
-        PriceUpdateV2 {
-            write_authority: Pubkey::new_unique(),
-            verification_level: level,
-            price_message: PriceFeedMessage {
-                feed_id: feed,
-                price: 5_123_456,
-                conf: 9_999,
-                exponent: -8,
-                publish_time: 1_700_000_000,
-                prev_publish_time: 1_699_999_999,
-                ema_price: 5_120_000,
-                ema_conf: 10_000,
-            },
-            posted_slot: 12345,
-        }
-    }
-
-    /// THE safety net: parse the same bytes with BOTH this parser and the real
-    /// SDK, assert every field agrees. Immune to test-fixture mistakes.
-    #[test]
-    fn parser_matches_sdk_exactly() {
-        let feed = [7u8; 32];
-        let acct = make(feed, VerificationLevel::Full);
-        let bytes = serialize(&acct);
-
-        // discriminator we hard-code must equal the SDK's serialized one.
-        assert_eq!(&bytes[..8], &PRICE_UPDATE_V2_DISCRIMINATOR);
-
-        let now = 1_700_000_005i64;
-        let max_age = 30u64;
-        let mine = get_price_no_older_than_full(&bytes, &feed, now, max_age).unwrap();
-
-        let clock = Clock { unix_timestamp: now, ..Default::default() };
-        let sdk = acct.get_price_no_older_than(&clock, max_age, &feed).unwrap();
-
-        assert_eq!(mine.price, sdk.price, "price");
-        assert_eq!(mine.conf, sdk.conf, "conf");
-        assert_eq!(mine.exponent, sdk.exponent, "exponent");
-        assert_eq!(mine.publish_time, sdk.publish_time, "publish_time");
-    }
+    // A REAL `PriceUpdateV2` account, serialized by `pyth-solana-receiver-sdk`
+    // (`try_serialize`) with: feed_id=[0x11;32], price=6_500_123, conf=4_242,
+    // exponent=-8, publish_time=1_750_000_000, verification_level=Full. Captured
+    // while pyth was a dev-dependency (see git history of this module); embedding
+    // it lets us drop the pyth dep entirely while still pinning byte-correctness.
+    const FIXTURE: [u8; 133] = [
+        34, 241, 35, 99, 157, 126, 244, 205, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171,
+        171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171,
+        171, 171, 171, 171, 1, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
+        17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 27, 47, 99, 0, 0, 0, 0, 0, 146,
+        16, 0, 0, 0, 0, 0, 0, 248, 255, 255, 255, 128, 225, 78, 104, 0, 0, 0, 0, 127, 225, 78, 104,
+        0, 0, 0, 0, 184, 42, 99, 0, 0, 0, 0, 0, 204, 16, 0, 0, 0, 0, 0, 0, 99, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    const FEED: [u8; 32] = [0x11; 32];
+    const PUB_TIME: i64 = 1_750_000_000;
 
     #[test]
-    fn rejects_partial_verification() {
-        let feed = [3u8; 32];
-        let acct = make(feed, VerificationLevel::Partial { num_signatures: 5 });
-        let bytes = serialize(&acct);
-        // Our parser rejects Partial (Full required) — and so does the SDK's
-        // Full-level reader.
-        assert!(get_price_no_older_than_full(&bytes, &feed, 1_700_000_005, 30).is_err());
-        let clock = Clock { unix_timestamp: 1_700_000_005, ..Default::default() };
-        assert!(acct.get_price_no_older_than(&clock, 30, &feed).is_err());
+    fn parses_real_pyth_account_exactly() {
+        let p = get_price_no_older_than_full(&FIXTURE, &FEED, PUB_TIME + 5, 30).unwrap();
+        assert_eq!(p.price, 6_500_123);
+        assert_eq!(p.conf, 4_242);
+        assert_eq!(p.exponent, -8);
+        assert_eq!(p.publish_time, PUB_TIME);
+        // discriminator we hard-code matches the real serialized one.
+        assert_eq!(&FIXTURE[..8], &PRICE_UPDATE_V2_DISCRIMINATOR);
     }
 
     #[test]
     fn rejects_wrong_feed_id() {
-        let feed = [1u8; 32];
-        let acct = make(feed, VerificationLevel::Full);
-        let bytes = serialize(&acct);
-        assert!(get_price_no_older_than_full(&bytes, &[9u8; 32], 1_700_000_005, 30).is_err());
+        assert!(get_price_no_older_than_full(&FIXTURE, &[9u8; 32], PUB_TIME + 5, 30).is_err());
     }
 
     #[test]
     fn rejects_stale_price() {
-        let feed = [2u8; 32];
-        let acct = make(feed, VerificationLevel::Full); // publish_time = 1_700_000_000
-        let bytes = serialize(&acct);
-        // now is 100s later, max_age 30 → stale.
-        assert!(get_price_no_older_than_full(&bytes, &feed, 1_700_000_100, 30).is_err());
-        // within window → ok.
-        assert!(get_price_no_older_than_full(&bytes, &feed, 1_700_000_020, 30).is_ok());
+        assert!(get_price_no_older_than_full(&FIXTURE, &FEED, PUB_TIME + 100, 30).is_err());
+        assert!(get_price_no_older_than_full(&FIXTURE, &FEED, PUB_TIME + 20, 30).is_ok());
     }
 
     #[test]
-    fn program_id_matches_sdk() {
-        assert_eq!(PYTH_RECEIVER_PROGRAM_ID, pyth_solana_receiver_sdk::ID);
+    fn rejects_partial_verification() {
+        // byte 40 is the verification_level tag; 1 = Full. Anything else (Partial)
+        // is rejected by the parser.
+        let mut b = FIXTURE;
+        b[40] = 0;
+        assert!(get_price_no_older_than_full(&b, &FEED, PUB_TIME + 5, 30).is_err());
     }
 
     #[test]
     fn rejects_bad_discriminator() {
-        let feed = [4u8; 32];
-        let mut bytes = serialize(&make(feed, VerificationLevel::Full));
-        bytes[0] ^= 0xFF; // corrupt the discriminator
-        assert!(get_price_no_older_than_full(&bytes, &feed, 1_700_000_005, 30).is_err());
+        let mut b = FIXTURE;
+        b[0] ^= 0xFF;
+        assert!(get_price_no_older_than_full(&b, &FEED, PUB_TIME + 5, 30).is_err());
+    }
+
+    #[test]
+    fn rejects_short_buffer() {
+        assert!(get_price_no_older_than_full(&FIXTURE[..40], &FEED, PUB_TIME + 5, 30).is_err());
     }
 }

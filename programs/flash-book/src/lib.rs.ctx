@@ -265,7 +265,7 @@ pub mod flash_book {
 
         // Grow in place; zero-init the appended tail so the bump allocator
         // and free-list see clean memory.
-        book_ai.resize(new_len)?;
+        book_ai.realloc(new_len, true)?;
 
         // Sanity: the grown account must still parse as a valid book (disc +
         // node-aligned size). Cheap, and catches a botched realloc loudly.
@@ -1769,7 +1769,7 @@ pub mod flash_book {
             authority: ctx.accounts.authority.to_account_info(),
         };
         let cpi_ctx =
-            CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts);
+            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
         let flp = &mut ctx.accounts.flp_exposure;
@@ -1842,7 +1842,7 @@ pub mod flash_book {
     /// positions, as long as enough NAV remains to absorb a max-shock
     /// loss. The empty-pool case (markets_count == 0) skips the walk.
     pub fn withdraw_flp_capital<'info>(
-        ctx: Context<'info, WithdrawFlpCapital<'info>>,
+        ctx: Context<'_, '_, '_, 'info, WithdrawFlpCapital<'info>>,
         shares_to_burn: u64,
     ) -> Result<()> {
         require!(shares_to_burn > 0, FlashBookError::ZeroSize);
@@ -1945,7 +1945,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -2049,7 +2049,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -2464,7 +2464,7 @@ pub mod flash_book {
     ///
     /// Cannot sweep to/from the same account.
     pub fn sweep_collateral<'info>(
-        ctx: Context<'info, SweepCollateral<'info>>,
+        ctx: Context<'_, '_, 'info, 'info, SweepCollateral<'info>>,
         amount: u64,
     ) -> Result<()> {
         require!(amount > 0, FlashBookError::ZeroSize);
@@ -2786,7 +2786,7 @@ pub mod flash_book {
             authority: ctx.accounts.trader.to_account_info(),
         };
         let cpi_ctx =
-            CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts);
+            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
         token::close_account(cpi_ctx)
     }
 
@@ -2807,7 +2807,7 @@ pub mod flash_book {
             authority: ctx.accounts.trader.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
         );
         token::transfer(cpi_ctx, amount_quote_lots)?;
@@ -2860,7 +2860,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -2907,7 +2907,7 @@ pub mod flash_book {
     /// path. A trader with no positions should prefer that ix —
     /// no remaining_accounts walk, smaller fee.
     pub fn partial_withdraw_collateral<'info>(
-        ctx: Context<'info, PartialWithdrawCollateral<'info>>,
+        ctx: Context<'_, '_, '_, 'info, PartialWithdrawCollateral<'info>>,
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
@@ -3050,7 +3050,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -3091,7 +3091,7 @@ pub mod flash_book {
     /// target position is passed inline (see Accounts struct); do not
     /// re-include it in remaining_accounts.
     pub fn set_position_isolated<'info>(
-        ctx: Context<'info, SetPositionMarginMode<'info>>,
+        ctx: Context<'_, '_, '_, 'info, SetPositionMarginMode<'info>>,
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
@@ -3293,7 +3293,7 @@ pub mod flash_book {
     /// alternating (market, position) pairs for every OTHER position
     /// the trader has a non-zero size on.
     pub fn set_position_cross<'info>(
-        ctx: Context<'info, SetPositionMarginMode<'info>>,
+        ctx: Context<'_, '_, '_, 'info, SetPositionMarginMode<'info>>,
     ) -> Result<()> {
         let (trader_pk, ts_open, ts_collateral) = {
             let ts = ctx.accounts.trader_state.load()?;
@@ -5481,7 +5481,7 @@ pub mod flash_book {
     /// stress lattice, rate limit. remaining_accounts layout: triples
     /// of (market, market_book, position) per leg, so 3 × K accounts.
     pub fn place_basket_order_n_v2<'info>(
-        ctx: Context<'info, PlaceBasketOrderNV2<'info>>,
+        ctx: Context<'_, '_, '_, 'info, PlaceBasketOrderNV2<'info>>,
         legs: Vec<BasketLeg>,
     ) -> Result<()> {
         require!(!legs.is_empty(), FlashBookError::ZeroSize);
@@ -6375,7 +6375,7 @@ pub mod flash_book {
     /// positions (returns equity == collateral, required == 0,
     /// health_ratio_bps == u32::MAX).
     pub fn view_portfolio_risk<'info>(
-        ctx: Context<'info, ViewPortfolioRisk<'info>>,
+        ctx: Context<'_, '_, 'info, 'info, ViewPortfolioRisk<'info>>,
     ) -> Result<()> {
         let trader_state = ctx.accounts.trader_state.load()?;
         let open = trader_state.open_positions as usize;
@@ -7818,7 +7818,7 @@ pub mod flash_book {
     /// order_type byte is set to 3 (Liquidation) so wave 19e's matcher
     /// mapping promotes it to FIFO liquidation priority.
     pub fn liquidate_portfolio_v2<'info>(
-        ctx: Context<'info, LiquidatePortfolioV2<'info>>,
+        ctx: Context<'_, '_, '_, 'info, LiquidatePortfolioV2<'info>>,
     ) -> Result<()> {
         let exec_market = &ctx.accounts.execution_market;
         let exec_position = *ctx.accounts.execution_position.load()?;
@@ -9038,7 +9038,7 @@ pub mod flash_book {
             authority: ctx.accounts.depositor.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
         );
         token::transfer(cpi_ctx, amount_quote_lots)?;
@@ -9182,7 +9182,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -9542,7 +9542,7 @@ pub mod flash_book {
             authority: ctx.accounts.lp.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
         );
         token::transfer(cpi_ctx, amount_quote_lots)?;
@@ -9639,7 +9639,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -9833,7 +9833,7 @@ pub mod flash_book {
         let lamports_diff = new_minimum_balance.saturating_sub(market_ai.lamports());
         if lamports_diff > 0 {
             let cpi_ctx = CpiContext::new(
-                ctx.accounts.system_program.key(),
+                ctx.accounts.system_program.to_account_info(),
                 anchor_lang::system_program::Transfer {
                     from: ctx.accounts.authority.to_account_info(),
                     to: market_ai.to_account_info(),
@@ -9841,7 +9841,7 @@ pub mod flash_book {
             );
             anchor_lang::system_program::transfer(cpi_ctx, lamports_diff)?;
         }
-        market_ai.resize(target_size)?;
+        market_ai.realloc(target_size, true)?;
 
         // 3. Write V3 defaults
         market.params.mark_ema_alpha_bps = 2_000;
@@ -10614,7 +10614,7 @@ pub mod flash_book {
     /// enforcement is purely the one-sided insolvency error. The complete
     /// all-paths preservation proof is the Certora target (see `certora/`).
     pub fn verify_collateral_solvency<'info>(
-        ctx: Context<'info, VerifyCollateralSolvency<'info>>,
+        ctx: Context<'_, '_, 'info, 'info, VerifyCollateralSolvency<'info>>,
         fully_covered: bool,
     ) -> Result<()> {
         let vault_amount = ctx.accounts.quote_vault.amount;

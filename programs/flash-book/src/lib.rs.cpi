@@ -1769,7 +1769,7 @@ pub mod flash_book {
             authority: ctx.accounts.authority.to_account_info(),
         };
         let cpi_ctx =
-            CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts);
+            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
         let flp = &mut ctx.accounts.flp_exposure;
@@ -1945,7 +1945,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -2049,7 +2049,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -2786,7 +2786,7 @@ pub mod flash_book {
             authority: ctx.accounts.trader.to_account_info(),
         };
         let cpi_ctx =
-            CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts);
+            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
         token::close_account(cpi_ctx)
     }
 
@@ -2807,7 +2807,7 @@ pub mod flash_book {
             authority: ctx.accounts.trader.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
         );
         token::transfer(cpi_ctx, amount_quote_lots)?;
@@ -2860,7 +2860,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -3050,7 +3050,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -9038,7 +9038,7 @@ pub mod flash_book {
             authority: ctx.accounts.depositor.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
         );
         token::transfer(cpi_ctx, amount_quote_lots)?;
@@ -9182,7 +9182,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -9542,7 +9542,7 @@ pub mod flash_book {
             authority: ctx.accounts.lp.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
         );
         token::transfer(cpi_ctx, amount_quote_lots)?;
@@ -9639,7 +9639,7 @@ pub mod flash_book {
             authority: ctx.accounts.insurance_fund.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
+            ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
             signers,
         );
@@ -9833,7 +9833,7 @@ pub mod flash_book {
         let lamports_diff = new_minimum_balance.saturating_sub(market_ai.lamports());
         if lamports_diff > 0 {
             let cpi_ctx = CpiContext::new(
-                ctx.accounts.system_program.key(),
+                ctx.accounts.system_program.to_account_info(),
                 anchor_lang::system_program::Transfer {
                     from: ctx.accounts.authority.to_account_info(),
                     to: market_ai.to_account_info(),
