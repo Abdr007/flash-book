@@ -22,11 +22,14 @@ anchor-lang = { workspace = true, features = ["init-if-needed"] }
 anchor-spl = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
-pyth-solana-receiver-sdk = "0.6.1"
 solana-security-txt = "1.1.1"
 
 [dev-dependencies]
 proptest = "1.6"
+# Test-only: the in-house `pyth_oracle` parser is differential-tested against the
+# real SDK. The on-chain program no longer depends on pyth (its borsh-0.10 lock
+# blocks framework modernization); flash-book reads PriceUpdateV2 bytes directly.
+pyth-solana-receiver-sdk = "0.6.1"
 solana-program-test = "~2.1"
 solana-sdk = "~2.1"
 spl-token = { version = "6", features = ["no-entrypoint"] }

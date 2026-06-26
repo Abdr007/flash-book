@@ -19,6 +19,7 @@ pub mod constants;
 pub mod er;
 pub mod er_permission;
 pub mod errors;
+pub mod pyth_oracle;
 pub mod session;
 pub mod hypertree;
 pub mod matcher;
@@ -9920,21 +9921,32 @@ pub mod flash_book {
     pub fn update_oracle_from_pyth(
         ctx: Context<UpdateOracleFromPyth>,
     ) -> Result<()> {
-        use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
-
         let cfg = &ctx.accounts.oracle_config;
         require!(
             cfg.source == state_v3::MarketOracleConfigAccount::SOURCE_PYTH,
             FlashBookError::OutOfRange,
         );
 
-        let price_update: &Account<PriceUpdateV2> = &ctx.accounts.price_update;
+        // Read the Pyth PriceUpdateV2 via the in-house byte-faithful parser
+        // (pyth-solana-receiver-sdk is borsh-0.10-locked and blocks framework
+        // modernization; see pyth_oracle.rs). Preserve the owner check that
+        // `Account<PriceUpdateV2>` gave for free.
+        require_keys_eq!(
+            *ctx.accounts.price_update.owner,
+            pyth_oracle::PYTH_RECEIVER_PROGRAM_ID,
+            FlashBookError::Unauthorized
+        );
         let max_age = cfg.max_staleness_seconds as u64;
-        let price_data = price_update.get_price_no_older_than(
-            &Clock::get()?,
-            max_age,
+        let now_unix = Clock::get()?.unix_timestamp;
+        let price_update_data = ctx.accounts.price_update.try_borrow_data()?;
+        let price_data = pyth_oracle::get_price_no_older_than_full(
+            &price_update_data,
             &cfg.pyth_price_feed_id,
-        ).map_err(|_| error!(FlashBookError::OracleTooStale))?;
+            now_unix,
+            max_age,
+        )
+        .map_err(|_| error!(FlashBookError::OracleTooStale))?;
+        drop(price_update_data);
 
         require!(price_data.price > 0, FlashBookError::ZeroPrice);
 
@@ -16537,9 +16549,10 @@ pub struct UpdateOracleFromPyth<'info> {
     )]
     pub oracle_config: Account<'info, state_v3::MarketOracleConfigAccount>,
 
-    /// CHECK: deserialized via pyth-solana-receiver-sdk's account type.
-    /// The SDK's get_price_no_older_than validates feed_id matches.
-    pub price_update: Account<'info, pyth_solana_receiver_sdk::price_update::PriceUpdateV2>,
+    /// CHECK: a Pyth `PriceUpdateV2` account. The handler validates owner ==
+    /// PYTH_RECEIVER_PROGRAM_ID, the account discriminator, feed_id, verification
+    /// level, and staleness via the in-house `pyth_oracle` parser.
+    pub price_update: UncheckedAccount<'info>,
 
     /// Wave 26b — optional envelope gate. Same semantics as on
     /// `UpdateOracle`. When omitted: legacy Pyth-pull behavior.
