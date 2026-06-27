@@ -45,8 +45,18 @@ pub struct Market {
     /// Cumulative net fees booked to the protocol (gross, before the insurance
     /// contribution split). Carved from `_reserved`; total layout size unchanged.
     pub total_fees_collected: u64,
-    pub _reserved: [u8; 1032],
+    /// Admin authority for this market (rotate sequencer, pause, set params).
+    /// Set to the creator at init. Carved from `_reserved`; size unchanged.
+    pub authority: Pubkey,
+    /// Trading status: 0 = active, 1 = paused. Carved from `_reserved`.
+    pub status: u8,
+    pub _reserved: [u8; 999],
 }
+
+/// Market trading-status values.
+pub const MARKET_STATUS_ACTIVE: u8 = 0;
+pub const MARKET_STATUS_PAUSED: u8 = 1;
+
 impl Market {
     #[inline] pub fn cum_funding(&self) -> i128 { i128::from_le_bytes(self.cum_funding_index) }
 }

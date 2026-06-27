@@ -11,3 +11,6 @@ pub mod initialize_insurance_fund;
 pub mod deposit_collateral;
 pub mod initialize_market;
 pub mod withdraw_collateral;
+pub mod set_market_sequencer;
+pub mod set_market_status;
+pub mod update_oracle;

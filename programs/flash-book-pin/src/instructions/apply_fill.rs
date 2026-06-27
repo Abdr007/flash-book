@@ -38,6 +38,8 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         let market: &mut Market = view(&accounts[1]);
         // C-1 settlement authorization: signer must be the market's sequencer.
         if market.sequencer != *sequencer.key() { return Err(ProgramError::IllegalOwner); }
+        // Paused markets settle no fills.
+        if market.status == crate::state::MARKET_STATUS_PAUSED { return Err(ProgramError::InvalidArgument); }
         let insurance: &mut Insurance = view(&accounts[2]);
         let taker_ts: &mut TraderState = view(&accounts[3]);
         let maker_ts: &mut TraderState = view(&accounts[4]);
