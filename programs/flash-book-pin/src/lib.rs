@@ -111,6 +111,8 @@ mod program {
         DepositFlpCapital = 28,
         WithdrawFlpCapital = 29,
         VerifyProtocolSolvency = 30,
+        VerifyMarketInvariants = 31,
+        VerifyCollateralSolvency = 32,
     }
 
     #[inline(always)]
@@ -148,6 +150,8 @@ mod program {
             x if x == Ix::DepositFlpCapital as u8 => instructions::deposit_flp_capital::process(program_id, accounts, rest),
             x if x == Ix::WithdrawFlpCapital as u8 => instructions::withdraw_flp_capital::process(program_id, accounts, rest),
             x if x == Ix::VerifyProtocolSolvency as u8 => instructions::verify_protocol_solvency::process(program_id, accounts, rest),
+            x if x == Ix::VerifyMarketInvariants as u8 => instructions::verify_market_invariants::process(program_id, accounts, rest),
+            x if x == Ix::VerifyCollateralSolvency as u8 => instructions::verify_collateral_solvency::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
