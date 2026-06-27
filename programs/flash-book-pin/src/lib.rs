@@ -113,6 +113,7 @@ mod program {
         VerifyProtocolSolvency = 30,
         VerifyMarketInvariants = 31,
         VerifyCollateralSolvency = 32,
+        ErHeartbeat = 33,
     }
 
     #[inline(always)]
@@ -152,6 +153,7 @@ mod program {
             x if x == Ix::VerifyProtocolSolvency as u8 => instructions::verify_protocol_solvency::process(program_id, accounts, rest),
             x if x == Ix::VerifyMarketInvariants as u8 => instructions::verify_market_invariants::process(program_id, accounts, rest),
             x if x == Ix::VerifyCollateralSolvency as u8 => instructions::verify_collateral_solvency::process(program_id, accounts, rest),
+            x if x == Ix::ErHeartbeat as u8 => instructions::er_heartbeat::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
