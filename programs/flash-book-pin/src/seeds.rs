@@ -20,3 +20,6 @@ pub const FLP_EXPOSURE_SEED: &[u8] = b"flp_exposure";
 
 /// `[b"lp_position", lp]` — a liquidity provider's FLP share position.
 pub const LP_POSITION_SEED: &[u8] = b"lp_position";
+
+/// `[b"leverage_tiers", market]` — a market's notional-banded MMR tier ladder.
+pub const LEVERAGE_TIERS_SEED: &[u8] = b"leverage_tiers";

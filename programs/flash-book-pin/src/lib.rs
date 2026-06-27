@@ -54,6 +54,7 @@ pub mod risk;
 pub mod liquidation;
 pub mod seeds;
 pub mod solvency;
+pub mod leverage_tiers;
 pub mod cpi;
 pub mod guard;
 
@@ -114,6 +115,8 @@ mod program {
         VerifyMarketInvariants = 31,
         VerifyCollateralSolvency = 32,
         ErHeartbeat = 33,
+        InitMarketLeverageTiers = 34,
+        UpdateMarketLeverageTiers = 35,
     }
 
     #[inline(always)]
@@ -154,6 +157,8 @@ mod program {
             x if x == Ix::VerifyMarketInvariants as u8 => instructions::verify_market_invariants::process(program_id, accounts, rest),
             x if x == Ix::VerifyCollateralSolvency as u8 => instructions::verify_collateral_solvency::process(program_id, accounts, rest),
             x if x == Ix::ErHeartbeat as u8 => instructions::er_heartbeat::process(program_id, accounts, rest),
+            x if x == Ix::InitMarketLeverageTiers as u8 => instructions::init_market_leverage_tiers::process(program_id, accounts, rest),
+            x if x == Ix::UpdateMarketLeverageTiers as u8 => instructions::update_market_leverage_tiers::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
