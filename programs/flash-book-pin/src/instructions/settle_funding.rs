@@ -2,21 +2,32 @@
 //! position, applies funding owed to collateral, advances the position's
 //! funding index. Isolated-bucket + haircut routing are TODO (documented).
 use crate::funding::funding_owed;
-use crate::state::{Market, Position, TraderState};
+use crate::guard::{assert_disc, assert_market, assert_owned_by};
+use crate::instructions::apply_fill::assert_position;
+use crate::state::{Market, Position, TraderState, TRADER_STATE_DISC};
 use pinocchio::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult};
 
 #[inline(always)]
 unsafe fn view<T>(ai: &AccountInfo) -> &mut T { &mut *(ai.borrow_mut_data_unchecked().as_mut_ptr() as *mut T) }
 
 /// accounts: [market, trader_state, position]
-pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramResult {
+pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramResult {
     if accounts.len() < 3 { return Err(ProgramError::NotEnoughAccountKeys); }
+    // Hardening: validate ownership + discriminators before pointer-casting.
+    assert_market(&accounts[0], pid)?;
+    assert_owned_by(&accounts[1], pid)?; assert_disc(&accounts[1], &TRADER_STATE_DISC)?;
+    assert_position(&accounts[2], pid)?;
     unsafe {
         let market: &Market = view(&accounts[0]);
         let trader_state: &mut TraderState = view(&accounts[1]);
         let position: &mut Position = view(&accounts[2]);
         let cum_now = market.cum_funding();
         if position.size_lots == 0 { position.set_cum_funding(cum_now); return Ok(()); }
+        // Bind the position to THIS trader_state + market — settle is
+        // permissionless, so without this anyone could apply one trader's
+        // funding against another trader's collateral.
+        if position.trader != trader_state.trader { return Err(ProgramError::InvalidArgument); }
+        if position.market != *accounts[0].key() { return Err(ProgramError::InvalidArgument); }
         let notional = (position.size_lots as u128)
             .checked_mul(market.mark_price_ticks as u128).ok_or(ProgramError::ArithmeticOverflow)?
             .checked_mul(market.tick_size as u128).ok_or(ProgramError::ArithmeticOverflow)?;

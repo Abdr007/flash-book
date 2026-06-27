@@ -27,6 +27,8 @@ pub fn check_disc(data: &[u8], expected: &[u8; 8]) -> bool {
 #[cfg(target_os = "solana")]
 mod sol {
     use super::check_disc;
+    use crate::book::MARKET_BOOK_SEED;
+    use crate::state::MARKET_DISC;
     use pinocchio::{
         account_info::AccountInfo,
         program_error::ProgramError,
@@ -88,6 +90,27 @@ mod sol {
         if !check_disc(&data, expected) {
             return Err(ProgramError::InvalidAccountData);
         }
+        Ok(())
+    }
+
+    /// Require `ai` to be a program-owned market (owner + `MARKET_DISC`).
+    #[inline]
+    pub fn assert_market(ai: &AccountInfo, program_id: &Pubkey) -> ProgramResult {
+        assert_owned_by(ai, program_id)?;
+        assert_disc(ai, &MARKET_DISC)
+    }
+
+    /// Require `book` to be the canonical market_book PDA for `market`
+    /// (program-owned + `[b"market_book", market]`). Binds the orderbook to its
+    /// market so a caller can't pair market A with book B.
+    #[inline]
+    pub fn assert_market_book(
+        book: &AccountInfo,
+        market: &AccountInfo,
+        program_id: &Pubkey,
+    ) -> ProgramResult {
+        assert_owned_by(book, program_id)?;
+        assert_pda(book, &[MARKET_BOOK_SEED, &market.key()[..]], program_id)?;
         Ok(())
     }
 }
