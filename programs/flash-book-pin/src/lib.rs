@@ -54,6 +54,7 @@ pub mod risk;
 pub mod liquidation;
 pub mod seeds;
 pub mod solvency;
+pub mod leverage;
 pub mod leverage_tiers;
 pub mod fee_tiers;
 pub mod cpi;
@@ -130,6 +131,7 @@ mod program {
         SetMarketMaxLeverage = 45,
         SetPositionLeverage = 46,
         VerifyPortfolioStress = 47,
+        VerifyLeverageCap = 48,
     }
 
     #[inline(always)]
@@ -184,6 +186,7 @@ mod program {
             x if x == Ix::SetMarketMaxLeverage as u8 => instructions::set_market_max_leverage::process(program_id, accounts, rest),
             x if x == Ix::SetPositionLeverage as u8 => instructions::set_position_leverage::process(program_id, accounts, rest),
             x if x == Ix::VerifyPortfolioStress as u8 => instructions::verify_portfolio_stress::process(program_id, accounts, rest),
+            x if x == Ix::VerifyLeverageCap as u8 => instructions::verify_leverage_cap::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
