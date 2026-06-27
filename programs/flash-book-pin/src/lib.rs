@@ -104,6 +104,7 @@ mod program {
         TransferInsuranceAuthority = 22,
         SetInsuranceFeeContribution = 23,
         VerifySolvency = 24,
+        SetMarketMaintenanceMargin = 25,
     }
 
     #[inline(always)]
@@ -135,6 +136,7 @@ mod program {
             x if x == Ix::TransferInsuranceAuthority as u8 => instructions::transfer_insurance_authority::process(program_id, accounts, rest),
             x if x == Ix::SetInsuranceFeeContribution as u8 => instructions::set_insurance_fee_contribution::process(program_id, accounts, rest),
             x if x == Ix::VerifySolvency as u8 => instructions::verify_solvency::process(program_id, accounts, rest),
+            x if x == Ix::SetMarketMaintenanceMargin as u8 => instructions::set_market_maintenance_margin::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
