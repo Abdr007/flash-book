@@ -1,6 +1,7 @@
 //! place_limit_order_v2 — validate + insert a resting order into the book.
 //! Delegates to the ported (tested) MarketBookHandle::insert_bid/ask.
 use crate::book::{self, MarketBookHandle, RestingOrderV2};
+use crate::guard::{assert_market, assert_market_book};
 use crate::state::Market;
 use pinocchio::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult};
 
@@ -9,7 +10,7 @@ unsafe fn market_of(ai: &AccountInfo) -> &Market { &*(ai.borrow_data_unchecked()
 
 /// data: [side u8][size_lots u64][limit_ticks u64][expires u64][flags u8][sub_index u8]
 /// accounts: [trader(signer), market, market_book]
-pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if data.len() < 26 || accounts.len() < 3 { return Err(ProgramError::InvalidInstructionData); }
     let side = data[0];
     let size_lots = u64::from_le_bytes(data[1..9].try_into().unwrap());
@@ -19,6 +20,8 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
     let trader = &accounts[0];
     if !trader.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
     if side > 1 { return Err(ProgramError::InvalidInstructionData); }
+    assert_market(&accounts[1], pid)?;
+    assert_market_book(&accounts[2], &accounts[1], pid)?;
     unsafe {
         let market = market_of(&accounts[1]);
         if size_lots < market.min_base_lots { return Err(ProgramError::Custom(1)); }

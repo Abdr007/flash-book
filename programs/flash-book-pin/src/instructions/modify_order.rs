@@ -5,6 +5,7 @@
 //!
 //! Faithful port of the Anchor `modify_order_v2`.
 use crate::book::{self, MarketBookHandle, RestingOrderV2};
+use crate::guard::{assert_market, assert_market_book};
 use crate::hypertree::NIL;
 use crate::state::Market;
 use pinocchio::{
@@ -19,7 +20,7 @@ unsafe fn market_of(ai: &AccountInfo) -> &Market {
 
 /// data: [side u8][old_order_id u64][new_size u64][new_limit u64][new_expires u64][new_flags u8]
 /// accounts: [trader(signer), market, market_book]
-pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if data.len() < 34 || accounts.len() < 3 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -43,6 +44,8 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
     }
     let trader_pk = *trader.key();
 
+    assert_market(&accounts[1], pid)?;
+    assert_market_book(&accounts[2], &accounts[1], pid)?;
     unsafe {
         let market = market_of(&accounts[1]);
         if new_size_lots < market.min_base_lots {

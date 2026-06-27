@@ -5,6 +5,7 @@
 //! Faithful port of the Anchor `cancel_all_v2`. no_std: collected indices live
 //! in fixed-size stack buffers (no Vec).
 use crate::book::MarketBookHandle;
+use crate::guard::{assert_market, assert_market_book};
 use crate::hypertree::{DataIndex, NIL};
 use pinocchio::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult};
 
@@ -12,7 +13,7 @@ const MAX_CANCELS_PER_IX: usize = 24;
 
 /// data: (none)
 /// accounts: [trader(signer), market, market_book]
-pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramResult {
+pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramResult {
     if accounts.len() < 3 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
@@ -22,6 +23,8 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Program
     }
     let trader_pk = *trader.key();
 
+    assert_market(&accounts[1], pid)?;
+    assert_market_book(&accounts[2], &accounts[1], pid)?;
     unsafe {
         let book_data = accounts[2].borrow_mut_data_unchecked();
         let mut handle = MarketBookHandle::from_account_data(book_data)?;

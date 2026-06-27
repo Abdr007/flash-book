@@ -9,6 +9,7 @@
 //!   * fills are applied silently — the Pinocchio port does not emit events yet
 //!     (mirrors the ported `place`/`cancel`).
 use crate::book::{self, MarketBookHandle, RestingOrderV2};
+use crate::guard::{assert_market, assert_market_book};
 use crate::hypertree::{DataIndex, NIL};
 use crate::state::Market;
 use pinocchio::{
@@ -35,7 +36,7 @@ const MAX_TAKER_MATCHES: usize = 64;
 
 /// data: [side u8][size_lots u64][limit_ticks u64][expires u64][flags u8][sub_index u8]
 /// accounts: [trader(signer), market, market_book]
-pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if data.len() < 26 || accounts.len() < 3 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -59,6 +60,8 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
     }
     let trader_pk = *trader.key();
 
+    assert_market(&accounts[1], pid)?;
+    assert_market_book(&accounts[2], &accounts[1], pid)?;
     unsafe {
         let market = market_of(&accounts[1]);
         if size_lots < market.min_base_lots {
