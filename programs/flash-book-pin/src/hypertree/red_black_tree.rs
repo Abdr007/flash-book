@@ -1580,7 +1580,7 @@ pub(crate) mod test {
         tree.insert(TEST_BLOCK_WIDTH * 7, TestOrderBid::new(6000));
     }
 
-    fn init_simple_tree(data: &mut [u8]) -> RedBlackTree<TestOrderBid> {
+    fn init_simple_tree(data: &mut [u8]) -> RedBlackTree<'_, TestOrderBid> {
         let mut tree: RedBlackTree<TestOrderBid> = RedBlackTree::new(data, NIL, NIL);
 
         for i in 1..12 {

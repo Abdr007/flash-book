@@ -10,7 +10,12 @@
 //! README): the FLP per-market exposure (size/entry) update, the toxicity tax
 //! (vpin is ported — wiring pending), fee-tier resolution, events, and the
 //! `init_if_needed` position-create CPI / PDA verification.
-use crate::state::{FlpExposure, Insurance, Market, Position, TraderState, POSITION_DISC};
+use crate::guard::{assert_disc, assert_owned_by};
+use crate::instructions::apply_fill::assert_position;
+use crate::state::{
+    FlpExposure, Insurance, Market, Position, TraderState, FLP_EXPOSURE_DISC, INSURANCE_DISC,
+    MARKET_DISC, POSITION_DISC, TRADER_STATE_DISC,
+};
 use pinocchio::{
     account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
 };
@@ -47,6 +52,15 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
     if !sequencer.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
+
+    // Hardening: validate ownership + discriminator before casting (closes the
+    // fake-account vector — same as apply_fill).
+    // accounts: [sequencer, market, insurance, flp_exposure, taker_ts, taker_pos]
+    assert_owned_by(&accounts[1], _pid)?; assert_disc(&accounts[1], &MARKET_DISC)?;
+    assert_owned_by(&accounts[2], _pid)?; assert_disc(&accounts[2], &INSURANCE_DISC)?;
+    assert_owned_by(&accounts[3], _pid)?; assert_disc(&accounts[3], &FLP_EXPOSURE_DISC)?;
+    assert_owned_by(&accounts[4], _pid)?; assert_disc(&accounts[4], &TRADER_STATE_DISC)?;
+    assert_position(&accounts[5], _pid)?;
 
     unsafe {
         let market: &mut Market = view(&accounts[1]);
