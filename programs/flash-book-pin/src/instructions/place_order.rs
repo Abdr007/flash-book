@@ -27,7 +27,7 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
             let cur = if side == 0 { market.long_oi_lots } else { market.short_oi_lots };
             if cur.saturating_add(size_lots) > market.max_oi_base_lots { return Err(ProgramError::Custom(3)); }
         }
-        let mut book_data = accounts[2].borrow_mut_data_unchecked();
+        let book_data = accounts[2].borrow_mut_data_unchecked();
         let mut handle = MarketBookHandle::from_account_data(book_data)?;
         let seq = handle.header.order_seq_counter.checked_add(1).ok_or(ProgramError::ArithmeticOverflow)?;
         handle.header.order_seq_counter = seq;

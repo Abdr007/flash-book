@@ -27,6 +27,7 @@ pub mod errors {
 
 macro_rules! require { ($c:expr, $e:expr $(,)?) => { if !($c) { return Err($e.into()); } }; }
 macro_rules! error { ($e:expr) => { ProgramError::from($e) }; }
+#[allow(unused_macros)]
 macro_rules! msg { ($($a:tt)*) => {}; }
 
 use crate::hypertree::{

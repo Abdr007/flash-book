@@ -2,10 +2,29 @@
 //! Pointer-casts the 6 accounts (no Borsh) and applies the fill: position
 //! update (weighted entry / realized PnL / side flip — identical math to the
 //! Anchor `apply_fill_to_position`), market OI, fee/rebate split, funding stamp.
-use crate::state::{Insurance, Market, Position, TraderState, POSITION_DISC};
+use crate::guard::{assert_disc, assert_owned_by};
+use crate::state::{
+    Insurance, Market, Position, TraderState, INSURANCE_DISC, MARKET_DISC, POSITION_DISC,
+    TRADER_STATE_DISC,
+};
 use pinocchio::{
     account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
 };
+
+/// A position account must be program-owned and either FRESH (zero disc, to be
+/// stamped on first fill) or already a `POSITION_DISC` position — never another
+/// program-owned account type (which would be type-confused by the cast).
+pub(crate) fn assert_position(ai: &AccountInfo, pid: &Pubkey) -> ProgramResult {
+    assert_owned_by(ai, pid)?;
+    let d = ai.try_borrow_data()?;
+    if d.len() < 8 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if d[..8] != [0u8; 8] && d[..8] != POSITION_DISC {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
 
 const BPS_DENOM: u128 = 10_000;
 
@@ -24,15 +43,28 @@ unsafe fn ensure_pos_disc(ai: &AccountInfo) {
 
 /// data: [size_lots u64][price_ticks u64][taker_side u8]
 /// accounts: [sequencer(signer), market, insurance, taker_ts, maker_ts, taker_pos, maker_pos]
-pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if data.len() < 17 || accounts.len() < 7 { return Err(ProgramError::InvalidInstructionData); }
     let size = u64::from_le_bytes(data[0..8].try_into().unwrap());
     let price = u64::from_le_bytes(data[8..16].try_into().unwrap());
     let taker_side = data[16];
+    if taker_side > 1 { return Err(ProgramError::InvalidInstructionData); }
     let maker_side = 1 - taker_side;
 
     let sequencer = &accounts[0];
     if !sequencer.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
+
+    // Hardening: every account we pointer-cast must be program-owned with the
+    // correct discriminator — otherwise a caller could pass a FAKE account (e.g.
+    // a "market" whose `sequencer` field they control) and the cast would trust
+    // attacker-supplied bytes. This closes the fake-account vector the original
+    // benchmark handler left open on the settlement path.
+    assert_owned_by(&accounts[1], pid)?; assert_disc(&accounts[1], &MARKET_DISC)?;
+    assert_owned_by(&accounts[2], pid)?; assert_disc(&accounts[2], &INSURANCE_DISC)?;
+    assert_owned_by(&accounts[3], pid)?; assert_disc(&accounts[3], &TRADER_STATE_DISC)?;
+    assert_owned_by(&accounts[4], pid)?; assert_disc(&accounts[4], &TRADER_STATE_DISC)?;
+    assert_position(&accounts[5], pid)?;
+    assert_position(&accounts[6], pid)?;
 
     unsafe {
         let market: &mut Market = view(&accounts[1]);

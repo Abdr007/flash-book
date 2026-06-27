@@ -9,6 +9,9 @@
 //! equivalence with the Anchor implementation; the pinocchio glue
 //! (`instructions`, entrypoint) compiles only for the Solana target.
 #![cfg_attr(target_os = "solana", no_std)]
+// `nightly` (perf gate) and `certora` (formal-verification harness) are
+// out-of-tree cfgs; acknowledge them so the build is warning-clean.
+#![allow(unexpected_cfgs)]
 
 pub mod hypertree;
 pub mod book;
