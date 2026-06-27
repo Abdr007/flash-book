@@ -10,3 +10,11 @@ target/
 bun.lock
 .anchor/
 test-ledger/
+
+# Stray editor/tool backup copies of source files (a tool wrote lib.rs.kk /
+# .cpi / .ctx / .rz next to lib.rs; the .kk copy made GitHub Linguist report the
+# repo as 23% "Koka"). These are never compiled — keep them out of git.
+*.rs.kk
+*.rs.cpi
+*.rs.ctx
+*.rs.rz
