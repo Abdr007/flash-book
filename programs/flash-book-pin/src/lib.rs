@@ -101,6 +101,8 @@ mod program {
         SetTraderFeeTier = 19,
         SetMarketParams = 20,
         TransferMarketAuthority = 21,
+        TransferInsuranceAuthority = 22,
+        SetInsuranceFeeContribution = 23,
     }
 
     #[inline(always)]
@@ -129,6 +131,8 @@ mod program {
             x if x == Ix::SetTraderFeeTier as u8 => instructions::set_trader_fee_tier::process(program_id, accounts, rest),
             x if x == Ix::SetMarketParams as u8 => instructions::set_market_params::process(program_id, accounts, rest),
             x if x == Ix::TransferMarketAuthority as u8 => instructions::transfer_market_authority::process(program_id, accounts, rest),
+            x if x == Ix::TransferInsuranceAuthority as u8 => instructions::transfer_insurance_authority::process(program_id, accounts, rest),
+            x if x == Ix::SetInsuranceFeeContribution as u8 => instructions::set_insurance_fee_contribution::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
