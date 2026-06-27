@@ -18,6 +18,7 @@ pub mod set_trader_fee_tier;
 pub mod set_market_sequencer;
 pub mod transfer_insurance_authority;
 pub mod set_insurance_fee_contribution;
+pub mod verify_solvency;
 pub mod set_market_params;
 pub mod transfer_market_authority;
 pub mod set_market_status;

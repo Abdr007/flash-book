@@ -32,7 +32,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let [authority, market, base_mint, quote_mint, system_program, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
-    if data.len() < 40 {
+    if data.len() < 44 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let tick_size = u64::from_le_bytes(data[0..8].try_into().unwrap());
@@ -41,9 +41,14 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let maker_rebate_bps = i32::from_le_bytes(data[20..24].try_into().unwrap());
     let min_base_lots = u64::from_le_bytes(data[24..32].try_into().unwrap());
     let max_oi_base_lots = u64::from_le_bytes(data[32..40].try_into().unwrap());
+    let maintenance_margin_bps = u32::from_le_bytes(data[40..44].try_into().unwrap());
 
     // ── parameter bounds ────────────────────────────────────────────────
     if tick_size == 0 || mark_price_ticks == 0 || min_base_lots == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    // Maintenance margin must be a real, sub-100% fraction.
+    if maintenance_margin_bps == 0 || maintenance_margin_bps >= crate::constants::BPS_DENOM {
         return Err(ProgramError::InvalidArgument);
     }
     if taker_fee_bps > crate::constants::BPS_DENOM {
@@ -104,6 +109,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         m.min_base_lots = min_base_lots;
         m.max_oi_base_lots = max_oi_base_lots;
         m.total_fees_collected = 0;
+        m.maintenance_margin_bps = maintenance_margin_bps;
         m.authority = *authority.key();
         m.status = crate::state::MARKET_STATUS_ACTIVE;
     }
