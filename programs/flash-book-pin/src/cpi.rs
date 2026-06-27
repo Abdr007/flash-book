@@ -74,13 +74,27 @@ pub fn transfer_data(amount: u64) -> [u8; 9] {
     d
 }
 
+/// `SplTokenInstruction::InitializeAccount3` data: tag byte `18`, then the
+/// token account `owner` authority (32 bytes). Unlike v1 it does not require
+/// the rent sysvar. The mint is supplied as an account, not in data.
+#[inline]
+pub fn init_account3_data(owner: &[u8; 32]) -> [u8; 33] {
+    let mut d = [0u8; 33];
+    d[0] = 18; // InitializeAccount3
+    d[1..33].copy_from_slice(owner);
+    d
+}
+
+/// SPL token account size in bytes (`spl_token::state::Account::LEN`).
+pub const TOKEN_ACCOUNT_LEN: u64 = 165;
+
 // ─────────────────────────────── invoke wrappers (SBF) ─────────────────────
 
 #[cfg(target_os = "solana")]
 mod sol {
     use super::{
-        allocate_data, assign_data, create_account_data, system_transfer_data, transfer_data,
-        SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID,
+        allocate_data, assign_data, create_account_data, init_account3_data, system_transfer_data,
+        transfer_data, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID,
     };
     use pinocchio::{
         account_info::AccountInfo,
@@ -199,6 +213,32 @@ mod sol {
         )
     }
 
+    /// `InitializeAccount3` on a freshly-created (token-program-owned) account,
+    /// setting its mint + `authority`. The account must already exist with
+    /// `TOKEN_ACCOUNT_LEN` bytes owned by the token program (see
+    /// `create_pda_account(.., owner = TOKEN_PROGRAM_ID, ..)`).
+    pub fn init_token_account(
+        token_program: &AccountInfo,
+        account: &AccountInfo,
+        mint: &AccountInfo,
+        authority: &Pubkey,
+    ) -> ProgramResult {
+        if token_program.key() != &TOKEN_PROGRAM_ID {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+        let data = init_account3_data(authority);
+        let metas = [
+            AccountMeta::new(account.key(), true, false),
+            AccountMeta::new(mint.key(), false, false),
+        ];
+        let ix = Instruction {
+            program_id: &TOKEN_PROGRAM_ID,
+            accounts: &metas,
+            data: &data,
+        };
+        slice_invoke(&ix, &[account, mint, token_program])
+    }
+
     fn transfer_inner(
         token_program: &AccountInfo,
         source: &AccountInfo,
@@ -252,6 +292,15 @@ mod tests {
         let d = transfer_data(42_000);
         assert_eq!(d[0], 3, "tag 3 = Transfer");
         assert_eq!(u64::from_le_bytes(d[1..9].try_into().unwrap()), 42_000);
+    }
+
+    #[test]
+    fn init_account3_data_layout() {
+        let owner = [3u8; 32];
+        let d = init_account3_data(&owner);
+        assert_eq!(d[0], 18, "tag 18 = InitializeAccount3");
+        assert_eq!(&d[1..33], &owner);
+        assert_eq!(TOKEN_ACCOUNT_LEN, 165);
     }
 
     #[test]
