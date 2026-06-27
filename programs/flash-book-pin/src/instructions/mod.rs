@@ -12,6 +12,8 @@ pub mod deposit_collateral;
 pub mod initialize_market;
 pub mod withdraw_collateral;
 pub mod open_trader_sub_account;
+pub mod transfer_collateral;
+pub mod close_trader_sub_account;
 pub mod set_market_sequencer;
 pub mod set_market_status;
 pub mod update_oracle;
