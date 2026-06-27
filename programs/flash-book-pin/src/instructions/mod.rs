@@ -52,5 +52,6 @@ pub mod cancel_trigger_order;
 pub mod cancel_twap_order;
 pub mod set_market_params;
 pub mod transfer_market_authority;
+pub mod burn_market_authority;
 pub mod set_market_status;
 pub mod update_oracle;
