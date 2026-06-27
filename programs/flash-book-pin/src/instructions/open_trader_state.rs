@@ -66,6 +66,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> P
         ts.disc = TRADER_STATE_DISC;
         ts.trader = *trader.key();
         ts.collateral_quote_lots = 0;
+        ts.open_positions = 0;
+        ts.sub_index = 0; // main account
     }
     Ok(())
 }

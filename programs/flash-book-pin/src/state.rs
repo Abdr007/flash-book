@@ -71,7 +71,12 @@ pub struct TraderState {
     /// `withdraw_collateral` (no full withdrawal while positions are open).
     /// Carved from `_reserved`; total layout size unchanged (200 bytes).
     pub open_positions: u8,
-    pub _reserved: [u8; 151],
+    /// Sub-account index: 0 = the wallet's main account (PDA
+    /// `[b"trader_state", wallet]`); 1..=255 = a sub-account (PDA
+    /// `[b"trader_state", wallet, [sub_index]]`). All carry `.trader = wallet`,
+    /// which is what deposit/withdraw bind to. Carved from `_reserved`.
+    pub sub_index: u8,
+    pub _reserved: [u8; 150],
 }
 
 impl TraderState {
