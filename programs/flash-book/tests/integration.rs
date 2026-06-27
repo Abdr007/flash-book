@@ -5900,3 +5900,420 @@ async fn set_trader_fee_tier_rejects_negative_fee_m5() {
     let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
     assert_eq!(ts.fee_discount_bps, 10_000, "100% discount persisted");
 }
+
+// ───────────────────── #8 cross-domain collateral (ER reserved margin) ─────
+
+/// Init the ER margin attestation for a trader (authority pins the attestor),
+/// returning the attestation PDA.
+async fn init_er_margin(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    protocol: &Protocol,
+    trader_state: Pubkey,
+    attestor: Pubkey,
+) -> Pubkey {
+    let (er_margin, _) = pda(&[flash_book::xmargin::ER_MARGIN_SEED, trader_state.as_ref()]);
+    let ix = build_ix(
+        flash_book::instruction::InitErMarginAttestation { attestor },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(trader_state, false),
+            AccountMeta::new(er_margin, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    er_margin
+}
+
+/// Build an `attest_er_reserved_margin` instruction (attestor signs).
+fn attest_ix(
+    er_margin: Pubkey,
+    trader_state: Pubkey,
+    attestor: Pubkey,
+    reserved: u64,
+    epoch: u64,
+) -> Instruction {
+    build_ix(
+        flash_book::instruction::AttestErReservedMargin {
+            reserved_margin_quote_lots: reserved,
+            epoch,
+        },
+        vec![
+            AccountMeta::new_readonly(attestor, true),
+            AccountMeta::new(er_margin, false),
+            AccountMeta::new(trader_state, false),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn er_margin_xdomain_withdraw_respects_reservation() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let trader = Keypair::new();
+    let attestor = Keypair::new();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 100_000, &protocol).await;
+    let trader_ata = ata_for(&trader.pubkey(), &protocol.quote_mint);
+    let er_margin = init_er_margin(&mut ctx, &payer, &protocol, trader_state, attestor.pubkey()).await;
+
+    // Attest 60_000 reserved for resting ER orders (epoch 1).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[attest_ix(er_margin, trader_state, attestor.pubkey(), 60_000, 1)],
+            Some(&payer.pubkey()),
+            &[&payer, &attestor],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let att: flash_book::xmargin::ErMarginAttestation = fetch(&mut ctx.banks_client, er_margin).await;
+    assert_eq!(att.reserved_margin_quote_lots, 60_000);
+    assert_eq!(att.epoch, 1);
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(ts.er_active, 1, "attest with reserved>0 must flip er_active");
+
+    // STRICT withdraw is now fail-closed (must use the xdomain variant).
+    let strict_ix = build_ix(
+        flash_book::instruction::WithdrawCollateral { amount_quote_lots: 10_000 },
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(trader_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let strict = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[strict_ix],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(strict.is_err(), "ER-active trader must not use the strict withdraw path");
+
+    // XDOMAIN withdraw of 50_000 would leave 50_000 < 60_000 reserved ⇒ reject.
+    let over = withdraw_xdomain_ix(&protocol, trader_state, er_margin, trader_ata, &trader, 50_000);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let over_res = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(&[over], Some(&trader.pubkey()), &[&trader], bh))
+        .await;
+    assert!(over_res.is_err(), "withdraw below the ER reservation must be rejected");
+
+    // XDOMAIN withdraw of 40_000 leaves exactly 60_000 == reserved ⇒ ok.
+    let ok = withdraw_xdomain_ix(&protocol, trader_state, er_margin, trader_ata, &trader, 40_000);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(&[ok], Some(&trader.pubkey()), &[&trader], bh))
+        .await
+        .unwrap();
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(ts.collateral_quote_lots, 60_000);
+
+    // Attestor clears the reservation (epoch 2) ⇒ er_active back to 0, strict path re-opens.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[attest_ix(er_margin, trader_state, attestor.pubkey(), 0, 2)],
+            Some(&payer.pubkey()),
+            &[&payer, &attestor],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(ts.er_active, 0, "clearing the reservation must clear er_active");
+
+    let strict_ok = build_ix(
+        flash_book::instruction::WithdrawCollateral { amount_quote_lots: 10_000 },
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(trader_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(&[strict_ok], Some(&trader.pubkey()), &[&trader], bh))
+        .await
+        .expect("strict withdraw must work again once the reservation clears");
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(ts.collateral_quote_lots, 50_000);
+}
+
+fn withdraw_xdomain_ix(
+    protocol: &Protocol,
+    trader_state: Pubkey,
+    er_margin: Pubkey,
+    trader_ata: Pubkey,
+    trader: &Keypair,
+    amount: u64,
+) -> Instruction {
+    build_ix(
+        flash_book::instruction::WithdrawCollateralXdomain { amount_quote_lots: amount },
+        vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new_readonly(er_margin, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(trader_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn er_margin_attest_epoch_replay_rejected() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let trader = Keypair::new();
+    let attestor = Keypair::new();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 100_000, &protocol).await;
+    let er_margin = init_er_margin(&mut ctx, &payer, &protocol, trader_state, attestor.pubkey()).await;
+
+    // epoch 5 ok.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[attest_ix(er_margin, trader_state, attestor.pubkey(), 10_000, 5)],
+            Some(&payer.pubkey()),
+            &[&payer, &attestor],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Replaying epoch 5 (and going backwards to 4) must be rejected.
+    for stale in [5u64, 4u64] {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let res = ctx
+            .banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[attest_ix(er_margin, trader_state, attestor.pubkey(), 1, stale)],
+                Some(&payer.pubkey()),
+                &[&payer, &attestor],
+                bh,
+            ))
+            .await;
+        assert!(res.is_err(), "non-increasing epoch {stale} must be rejected");
+    }
+
+    // epoch 6 strictly increases ⇒ ok.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[attest_ix(er_margin, trader_state, attestor.pubkey(), 12_000, 6)],
+            Some(&payer.pubkey()),
+            &[&payer, &attestor],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let att: flash_book::xmargin::ErMarginAttestation = fetch(&mut ctx.banks_client, er_margin).await;
+    assert_eq!(att.epoch, 6);
+    assert_eq!(att.reserved_margin_quote_lots, 12_000);
+}
+
+#[tokio::test]
+async fn er_margin_attest_rejects_wrong_attestor() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let trader = Keypair::new();
+    let attestor = Keypair::new();
+    let impostor = Keypair::new();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 100_000, &protocol).await;
+    let er_margin = init_er_margin(&mut ctx, &payer, &protocol, trader_state, attestor.pubkey()).await;
+
+    // Fund the impostor so it can be a signer.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(&payer.pubkey(), &impostor.pubkey(), 100_000_000)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let res = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[attest_ix(er_margin, trader_state, impostor.pubkey(), 9_999, 1)],
+            Some(&impostor.pubkey()),
+            &[&impostor],
+            bh,
+        ))
+        .await;
+    assert!(res.is_err(), "a non-pinned attestor must not be able to attest");
+}
+
+#[tokio::test]
+async fn partial_withdraw_xdomain_adds_reserved_to_floor() {
+    // No filled positions, but a live ER reservation: the partial xdomain floor
+    // is max(0, 0) + er_reserved, so it gates exactly on the reservation.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let trader = Keypair::new();
+    let attestor = Keypair::new();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 100_000, &protocol).await;
+    let trader_ata = ata_for(&trader.pubkey(), &protocol.quote_mint);
+    let er_margin = init_er_margin(&mut ctx, &payer, &protocol, trader_state, attestor.pubkey()).await;
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[attest_ix(er_margin, trader_state, attestor.pubkey(), 70_000, 1)],
+            Some(&payer.pubkey()),
+            &[&payer, &attestor],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let part = |amount: u64| {
+        build_ix(
+            flash_book::instruction::PartialWithdrawCollateralXdomain { amount_quote_lots: amount },
+            vec![
+                AccountMeta::new_readonly(trader.pubkey(), true),
+                AccountMeta::new(trader_state, false),
+                AccountMeta::new_readonly(er_margin, false),
+                AccountMeta::new_readonly(protocol.insurance_fund, false),
+                AccountMeta::new_readonly(protocol.quote_mint, false),
+                AccountMeta::new(trader_ata, false),
+                AccountMeta::new(protocol.quote_vault, false),
+                AccountMeta::new_readonly(spl_token_id(), false),
+            ],
+        )
+    };
+
+    // 40_000 leaves 60_000 < 70_000 reserved ⇒ reject.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let over = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(&[part(40_000)], Some(&trader.pubkey()), &[&trader], bh))
+        .await;
+    assert!(over.is_err(), "partial xdomain must include er_reserved in the floor");
+
+    // 30_000 leaves exactly 70_000 == reserved ⇒ ok.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(&[part(30_000)], Some(&trader.pubkey()), &[&trader], bh))
+        .await
+        .unwrap();
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(ts.collateral_quote_lots, 70_000);
+}
+
+#[tokio::test]
+async fn deposit_collateral_session_funds_owner_margin() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let owner = Keypair::new();
+    let session_signer = Keypair::new();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &owner, 50_000, &protocol).await;
+
+    // Owner authorizes the session key.
+    let (session_token, _) = pda(&[
+        flash_book::session::SESSION_SEED,
+        owner.pubkey().as_ref(),
+        session_signer.pubkey().as_ref(),
+    ]);
+    let create_session = build_ix(
+        flash_book::instruction::CreateSessionToken { ttl_seconds: 3_600 },
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new_readonly(session_signer.pubkey(), false),
+            AccountMeta::new(session_token, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(&[create_session], Some(&owner.pubkey()), &[&owner], bh))
+        .await
+        .unwrap();
+
+    // Fund the SESSION signer's own ATA (it spends its own tokens).
+    let session_ata = create_ata(&mut ctx, &payer, session_signer.pubkey(), protocol.quote_mint).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, session_ata, 20_000).await;
+    // Give the session signer lamports so it can co-sign.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(&payer.pubkey(), &session_signer.pubkey(), 100_000_000)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let deposit = build_ix(
+        flash_book::instruction::DepositCollateralSession { amount_quote_lots: 20_000 },
+        vec![
+            AccountMeta::new_readonly(session_signer.pubkey(), true),
+            AccountMeta::new_readonly(session_token, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(session_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[deposit],
+            Some(&session_signer.pubkey()),
+            &[&session_signer],
+            bh,
+        ))
+        .await
+        .expect("session signer must be able to fund the owner's margin");
+
+    // Owner's margin grew by the session deposit (50_000 + 20_000).
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
+    assert_eq!(ts.collateral_quote_lots, 70_000);
+}

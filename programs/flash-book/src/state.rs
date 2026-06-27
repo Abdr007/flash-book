@@ -958,7 +958,16 @@ pub struct TraderStateAccount {
     /// Phase 2f — sub-account index. `0` = main; `1..=255` = sub. Set at
     /// `open_trader_state` (0) / `open_trader_sub_account` (sub_index).
     pub sub_index: u8,
-    pub _pad: [u8; 5],
+    /// #8 — cross-domain (ER) margin enforcement flag. `0` = not ER-active:
+    /// the strict L1 withdraw paths apply unchanged (the default for every
+    /// pre-existing account, since this byte was previously zero padding).
+    /// `1` = the trader has ER-reserved margin attested, so collateral
+    /// withdrawals MUST route through the cross-domain variants (which honor
+    /// `ErMarginAttestation`); the strict paths fail closed with
+    /// `UseXDomainWithdraw`. Carved from the former `_pad` tail, so the Pod
+    /// layout and 192-byte size are UNCHANGED — no account migration.
+    pub er_active: u8,
+    pub _pad: [u8; 4],
 }
 
 impl TraderStateAccount {

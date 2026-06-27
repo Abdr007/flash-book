@@ -223,6 +223,18 @@ pub enum FlashBookError {
     BookNotDelegated = 2211,
     #[msg("Session token expired (or not yet valid); re-create the session key")]
     SessionExpired = 2212,
+
+    // ── 2300-2399 cross-domain collateral (ER reserved margin, #8) ──────
+    #[msg("ER margin attestation epoch not strictly increasing — replayed or stale attestation")]
+    ErEpochReplay = 2300,
+    #[msg("Withdrawal would leave collateral below the ER-reserved margin for resting orders")]
+    ErMarginReserved = 2301,
+    #[msg("Trader is ER-active: collateral withdrawals must use the cross-domain (xdomain) variant")]
+    UseXDomainWithdraw = 2302,
+    #[msg("Signer is not the authorized attestor for this ER margin attestation")]
+    ErAttestorMismatch = 2303,
+    #[msg("ER margin attestation account does not belong to this trader_state")]
+    ErMarginAccountMismatch = 2304,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

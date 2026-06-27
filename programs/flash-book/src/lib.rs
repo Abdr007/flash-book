@@ -21,6 +21,7 @@ pub mod er_permission;
 pub mod errors;
 pub mod pyth_oracle;
 pub mod session;
+pub mod xmargin;
 pub mod hypertree;
 pub mod matcher;
 pub mod state;
@@ -2843,6 +2844,11 @@ pub mod flash_book {
         // mutate vault state on a rejected withdrawal).
         {
             let s = ctx.accounts.trader_state.load()?;
+            // #8 cross-domain: an ER-active trader (one with attested ER-reserved
+            // margin for resting orders) MUST withdraw via the xdomain variant,
+            // which honors that reservation. Default 0 ⇒ no-op for every trader
+            // that never touched the ER, so the strict path is unchanged for them.
+            require!(s.er_active == 0, FlashBookError::UseXDomainWithdraw);
             require!(s.open_positions == 0, FlashBookError::InsufficientCollateral);
             require!(
                 amount_quote_lots <= s.collateral_quote_lots,
@@ -2910,137 +2916,148 @@ pub mod flash_book {
         ctx: Context<'info, PartialWithdrawCollateral<'info>>,
         amount_quote_lots: u64,
     ) -> Result<()> {
+        // #8 cross-domain: an ER-active trader must use the xdomain variant
+        // (which honors the ER-reserved margin). Default 0 ⇒ unchanged for
+        // every trader that never touched the ER.
+        require!(
+            ctx.accounts.trader_state.load()?.er_active == 0,
+            FlashBookError::UseXDomainWithdraw
+        );
+        partial_withdraw_core(
+            &ctx.accounts.trader_state,
+            &ctx.accounts.insurance_fund,
+            &ctx.accounts.quote_vault,
+            &ctx.accounts.trader_quote_ata,
+            &ctx.accounts.token_program,
+            ctx.remaining_accounts,
+            ctx.program_id,
+            amount_quote_lots,
+            0, // no ER reservation on the strict path
+        )
+    }
+
+    /// Cross-domain (#8) partial withdraw: identical to
+    /// `partial_withdraw_collateral`, but additionally honors the trader's
+    /// sequencer-attested ER reserved margin for resting orders — the safety
+    /// floor becomes `max(IM_filled, notional_floor) + er_reserved`. This is
+    /// the variant ER-active traders MUST use; the strict path fails closed for
+    /// them. Shares the exact C-2 position-walk + margin core via
+    /// `partial_withdraw_core`.
+    pub fn partial_withdraw_collateral_xdomain<'info>(
+        ctx: Context<'info, PartialWithdrawCollateralXdomain<'info>>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        // Bind the attestation to this trader_state (blocks passing another
+        // trader's — or a stale — attestation to understate the reservation).
+        require_keys_eq!(
+            ctx.accounts.er_margin.trader_state,
+            ctx.accounts.trader_state.key(),
+            FlashBookError::ErMarginAccountMismatch
+        );
+        let er_reserved = ctx.accounts.er_margin.reserved_margin_quote_lots;
+        partial_withdraw_core(
+            &ctx.accounts.trader_state,
+            &ctx.accounts.insurance_fund,
+            &ctx.accounts.quote_vault,
+            &ctx.accounts.trader_quote_ata,
+            &ctx.accounts.token_program,
+            ctx.remaining_accounts,
+            ctx.program_id,
+            amount_quote_lots,
+            er_reserved,
+        )
+    }
+
+    // ───────────────────────── #8 cross-domain collateral ─────────────────
+    //
+    // The order book is delegated to the ER while collateral stays authoritative
+    // on L1, so a trader's resting ER orders reserve margin that L1 can't see.
+    // These instructions bridge that: the ER's trusted attestor writes, per
+    // trader, the margin reserved by live ER orders (monotonic-epoch replay
+    // guard, mirroring apply_fill's nonce), and the xdomain withdraw variants
+    // honor it. All additive + fail-closed; a trader with no attestation
+    // (er_active == 0) is completely unaffected.
+
+    /// Create a trader's ER reserved-margin attestation account. Protocol
+    /// authority only — it pins the trusted `attestor` (the ER margin
+    /// sequencer key) that may subsequently update the reservation.
+    pub fn init_er_margin_attestation(
+        ctx: Context<InitErMarginAttestation>,
+        attestor: Pubkey,
+    ) -> Result<()> {
+        let bump = ctx.bumps.er_margin;
+        let a = &mut ctx.accounts.er_margin;
+        a.trader_state = ctx.accounts.trader_state.key();
+        a.attestor = attestor;
+        a.reserved_margin_quote_lots = 0;
+        a.epoch = 0;
+        a.bump = bump;
+        emit!(ErMarginAttestationInitEvent {
+            trader_state: ctx.accounts.trader_state.key(),
+            attestor,
+        });
+        Ok(())
+    }
+
+    /// Attest the total ER reserved margin for a trader's live resting orders.
+    /// Sequencer-signed (must equal the pinned `attestor`), behind a strictly
+    /// increasing epoch so a replayed/stale attestation is rejected. Flips the
+    /// trader's `er_active` flag so the strict withdraw paths fail closed while
+    /// a reservation is live (and re-open when it returns to zero).
+    pub fn attest_er_reserved_margin(
+        ctx: Context<AttestErReservedMargin>,
+        reserved_margin_quote_lots: u64,
+        epoch: u64,
+    ) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.attestor.key(),
+            ctx.accounts.er_margin.attestor,
+            FlashBookError::ErAttestorMismatch
+        );
+        require_keys_eq!(
+            ctx.accounts.er_margin.trader_state,
+            ctx.accounts.trader_state.key(),
+            FlashBookError::ErMarginAccountMismatch
+        );
+        let next = xmargin::advance_epoch(ctx.accounts.er_margin.epoch, epoch)?;
+        ctx.accounts.er_margin.epoch = next;
+        ctx.accounts.er_margin.reserved_margin_quote_lots = reserved_margin_quote_lots;
+        {
+            let mut s = ctx.accounts.trader_state.load_mut()?;
+            s.er_active = if reserved_margin_quote_lots > 0 { 1 } else { 0 };
+        }
+        emit!(ErMarginAttestedEvent {
+            trader_state: ctx.accounts.trader_state.key(),
+            reserved_margin_quote_lots,
+            epoch: next,
+        });
+        Ok(())
+    }
+
+    /// Cross-domain (#8) strict withdraw: like `withdraw_collateral` (requires
+    /// `open_positions == 0`) but additionally requires post-withdrawal
+    /// collateral to cover the trader's ER-reserved margin, so collateral
+    /// backing resting ER orders can never be pulled. The variant ER-active
+    /// traders MUST use.
+    pub fn withdraw_collateral_xdomain(
+        ctx: Context<WithdrawCollateralXdomain>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-
-        // Walk remaining_accounts in (market, position) pairs to build
-        // the post-withdrawal margin snapshot.
-        let trader_state_key = ctx.accounts.trader_state.key();
-        let (trader_pk, open, current_collateral) = {
+        require_keys_eq!(
+            ctx.accounts.er_margin.trader_state,
+            ctx.accounts.trader_state.key(),
+            FlashBookError::ErMarginAccountMismatch
+        );
+        let er_reserved = ctx.accounts.er_margin.reserved_margin_quote_lots;
+        {
             let s = ctx.accounts.trader_state.load()?;
-            // Pre-flight: amount available.
-            require!(
-                amount_quote_lots <= s.collateral_quote_lots,
-                FlashBookError::InsufficientCollateral,
-            );
-            (s.trader, s.open_positions as usize, s.collateral_quote_lots)
-        };
-        let program_id = ctx.program_id;
-        let remaining = ctx.remaining_accounts;
-        // C-2: the caller MUST supply EVERY open position. Exact-count +
-        // size>0 + market-dedupe + PDA-binding (below) together make it
-        // impossible to omit a risky position to understate the margin
-        // requirement and over-withdraw. `% 2 == 0` alone was the bug.
-        require!(remaining.len() == open * 2, FlashBookError::OutOfRange);
-
-        let mut snaps: Vec<RiskPosSnap> = Vec::new();
-        let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
-        let mut market_keys: Vec<Pubkey> = Vec::new();
-        let mut total_notional_quote: u128 = 0;
-
-        let mut i = 0usize;
-        while i + 1 < remaining.len() {
-            let m_ai = &remaining[i];
-            let p_ai = &remaining[i + 1];
-            require_keys_eq!(*m_ai.owner, *program_id, FlashBookError::Unauthorized);
-            require_keys_eq!(*p_ai.owner, *program_id, FlashBookError::Unauthorized);
-
-            let market: MarketAccount =
-                MarketAccount::try_deserialize(&mut &m_ai.try_borrow_data()?[..])?;
-            let position: state::PositionAccount =
-                state::PositionAccount::try_deserialize(&mut &p_ai.try_borrow_data()?[..])?;
-            require!(
-                position.trader == trader_pk,
-                FlashBookError::WrongTrader
-            );
-            require!(
-                position.market == m_ai.key(),
-                FlashBookError::WrongMarket
-            );
-            // C-2: bind this position to THIS trader_state (blocks
-            // substituting another sub-account's / a stale position).
-            verify_position_pda(
-                &m_ai.key(),
-                &trader_state_key,
-                position.bump,
-                &p_ai.key(),
-                program_id,
-            )?;
-            // C-2: every supplied position must be live, and no market may
-            // appear twice (else the exact-count check could be padded
-            // with a duplicate while a real position is omitted).
-            require!(position.size_lots > 0, FlashBookError::ZeroSize);
-            require!(
-                !market_keys.contains(&m_ai.key()),
-                FlashBookError::OutOfRange
-            );
-
-            let notional = (position.size_lots as u128)
-                .saturating_mul(market.mark_price_ticks as u128)
-                .saturating_mul(market.params.tick_size as u128);
-            total_notional_quote = total_notional_quote.saturating_add(notional);
-
-            snaps.push(RiskPosSnap {
-                market: position.market,
-                side: if position.side == 0 { Side::Long } else { Side::Short },
-                size_lots: position.size_lots,
-                entry_price: Ticks(position.entry_price_ticks),
-                cum_funding_index_at_entry: position.cum_funding_index(),
-                collateral_quote_lots: position.collateral_quote_lots,
-            });
-            market_snaps.push(RiskMarketSnap {
-                market: m_ai.key(),
-                mark_price: Ticks(market.mark_price_ticks),
-                cum_funding_index: market.cum_funding_index,
-                // RISK-2: withdraw gate enforces INITIAL margin (buffer above liquidation).
-                maintenance_margin_bps: market.params.initial_margin_ratio_bps,
-                tick_size: market.params.tick_size,
-                concentration_threshold_lots: market.params.concentration_threshold_lots,
-                concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
-                side_oi_lots: 0,
-                oi_mmr_slope_bps_per_million_lots: 0,
-                oi_mmr_max_extra_bps: 0,
-            });
-            market_keys.push(m_ai.key());
-            i += 2;
+            require!(s.open_positions == 0, FlashBookError::InsufficientCollateral);
+            xmargin::check_simple_withdraw(s.collateral_quote_lots, amount_quote_lots, er_reserved)?;
         }
 
-        // Pre-mutate snapshot of the post-withdrawal collateral.
-        let post_collateral = current_collateral
-            .checked_sub(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
-
-        // Compute the safety floor.
-        // (a) IM required under joint stress lattice.
-        let im_required: u64 = if snaps.is_empty() {
-            0
-        } else {
-            let scenarios = default_scenarios_fn(&market_keys);
-            let assessment = assess_margin_unified_fn(
-                &snaps,
-                &market_snaps,
-                &scenarios,
-                post_collateral,
-            )?;
-            assessment.required_quote_lots
-        };
-
-        // (b) HL withdrawal floor: 10% of total notional.
-        let notional_floor_u128 = total_notional_quote
-            .saturating_mul(WITHDRAWAL_FLOOR_BPS as u128)
-            / (constants::BPS_DENOM as u128);
-        let notional_floor = if notional_floor_u128 > u64::MAX as u128 {
-            u64::MAX
-        } else {
-            notional_floor_u128 as u64
-        };
-
-        let floor = im_required.max(notional_floor);
-        require!(
-            post_collateral >= floor,
-            FlashBookError::InsufficientCollateral
-        );
-
-        // SPL transfer (identical to withdraw_collateral).
+        // SPL transfer: quote_vault → trader_quote_ata (program signs as the
+        // insurance_fund PDA). Identical to withdraw_collateral.
         let bump = ctx.accounts.insurance_fund.bump;
         let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
         let signers = &[signer_seeds];
@@ -3056,19 +3073,57 @@ pub mod flash_book {
         );
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
-        // Accounting.
-        {
+        let (trader, new_balance) = {
             let mut s = ctx.accounts.trader_state.load_mut()?;
-            s.collateral_quote_lots = post_collateral;
-        }
-        emit!(PartialCollateralWithdrawnEvent {
-            trader: trader_pk,
+            s.collateral_quote_lots = s
+                .collateral_quote_lots
+                .checked_sub(amount_quote_lots)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+            (s.trader, s.collateral_quote_lots)
+        };
+        emit!(CollateralWithdrawnEvent {
+            trader,
             amount: amount_quote_lots,
-            new_balance: post_collateral,
-            im_required,
-            notional_floor,
-            applied_floor: floor,
+            new_balance,
         });
+        Ok(())
+    }
+
+    /// Single-sig deposit during an ER session (#8): a session/hot key funds the
+    /// owner's margin from ITS OWN token account, without unlocking the cold
+    /// wallet. Deposits are value-additive, so a session key is allowed to add
+    /// collateral (it can never withdraw). Credits the session token owner's
+    /// trader_state.
+    pub fn deposit_collateral_session(
+        ctx: Context<DepositCollateralSession>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+        let now = Clock::get()?.unix_timestamp;
+        session::verify(
+            &ctx.accounts.session_token,
+            ctx.accounts.session_signer.key(),
+            now,
+        )?;
+        // The credited trader_state must be the session token's owner.
+        require_keys_eq!(
+            ctx.accounts.trader_state.load()?.trader,
+            ctx.accounts.session_token.owner,
+            FlashBookError::WrongTrader
+        );
+
+        // SPL transfer: session signer's ATA → quote_vault (session signer
+        // authorizes spending ITS OWN tokens to fund the owner's margin).
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.session_signer_quote_ata.to_account_info(),
+            to: ctx.accounts.quote_vault.to_account_info(),
+            authority: ctx.accounts.session_signer.to_account_info(),
+        };
+        token::transfer(
+            CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts),
+            amount_quote_lots,
+        )?;
+        credit_collateral(&ctx.accounts.trader_state, amount_quote_lots)?;
         Ok(())
     }
 
@@ -10709,6 +10764,189 @@ pub mod flash_book {
     }
 }
 
+/// Shared core for the strict + cross-domain (#8) partial-withdraw
+/// instructions. NOT an instruction (no `pub`). Walks the (market, position)
+/// remaining-accounts pairs to build the joint stress-lattice margin snapshot
+/// (the C-2 exact-count + PDA-binding checks), enforces the safety floor
+/// `max(IM_required, 10%-notional) + er_reserved`, then transfers from the
+/// vault and debits. `er_reserved` is 0 on the strict path and the
+/// sequencer-attested ER reservation on the xdomain path — the ONLY behavioral
+/// difference between the two callers. Body is the pre-extraction
+/// `partial_withdraw_collateral` handler, guarded by the integration suite.
+#[allow(clippy::too_many_arguments)]
+fn partial_withdraw_core<'info>(
+    trader_state: &AccountLoader<'info, TraderStateAccount>,
+    insurance_fund: &Account<'info, InsuranceFundAccount>,
+    quote_vault: &Account<'info, TokenAccount>,
+    trader_quote_ata: &Account<'info, TokenAccount>,
+    token_program: &Program<'info, Token>,
+    remaining: &[AccountInfo<'info>],
+    program_id: &Pubkey,
+    amount_quote_lots: u64,
+    er_reserved: u64,
+) -> Result<()> {
+    require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
+
+    let trader_state_key = trader_state.key();
+    let (trader_pk, open, current_collateral) = {
+        let s = trader_state.load()?;
+        require!(
+            amount_quote_lots <= s.collateral_quote_lots,
+            FlashBookError::InsufficientCollateral,
+        );
+        (s.trader, s.open_positions as usize, s.collateral_quote_lots)
+    };
+    // C-2: the caller MUST supply EVERY open position. Exact-count + size>0 +
+    // market-dedupe + PDA-binding together make it impossible to omit a risky
+    // position to understate the margin requirement and over-withdraw.
+    require!(remaining.len() == open * 2, FlashBookError::OutOfRange);
+
+    let mut snaps: Vec<RiskPosSnap> = Vec::new();
+    let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
+    let mut market_keys: Vec<Pubkey> = Vec::new();
+    let mut total_notional_quote: u128 = 0;
+
+    let mut i = 0usize;
+    while i + 1 < remaining.len() {
+        let m_ai = &remaining[i];
+        let p_ai = &remaining[i + 1];
+        require_keys_eq!(*m_ai.owner, *program_id, FlashBookError::Unauthorized);
+        require_keys_eq!(*p_ai.owner, *program_id, FlashBookError::Unauthorized);
+
+        let market: MarketAccount =
+            MarketAccount::try_deserialize(&mut &m_ai.try_borrow_data()?[..])?;
+        let position: state::PositionAccount =
+            state::PositionAccount::try_deserialize(&mut &p_ai.try_borrow_data()?[..])?;
+        require!(position.trader == trader_pk, FlashBookError::WrongTrader);
+        require!(position.market == m_ai.key(), FlashBookError::WrongMarket);
+        // C-2: bind this position to THIS trader_state (blocks substituting
+        // another sub-account's / a stale position).
+        verify_position_pda(
+            &m_ai.key(),
+            &trader_state_key,
+            position.bump,
+            &p_ai.key(),
+            program_id,
+        )?;
+        // C-2: every supplied position must be live, and no market may appear
+        // twice (else the exact-count check could be padded with a duplicate).
+        require!(position.size_lots > 0, FlashBookError::ZeroSize);
+        require!(!market_keys.contains(&m_ai.key()), FlashBookError::OutOfRange);
+
+        let notional = (position.size_lots as u128)
+            .saturating_mul(market.mark_price_ticks as u128)
+            .saturating_mul(market.params.tick_size as u128);
+        total_notional_quote = total_notional_quote.saturating_add(notional);
+
+        snaps.push(RiskPosSnap {
+            market: position.market,
+            side: if position.side == 0 { Side::Long } else { Side::Short },
+            size_lots: position.size_lots,
+            entry_price: Ticks(position.entry_price_ticks),
+            cum_funding_index_at_entry: position.cum_funding_index(),
+            collateral_quote_lots: position.collateral_quote_lots,
+        });
+        market_snaps.push(RiskMarketSnap {
+            market: m_ai.key(),
+            mark_price: Ticks(market.mark_price_ticks),
+            cum_funding_index: market.cum_funding_index,
+            // RISK-2: withdraw gate enforces INITIAL margin (buffer above liquidation).
+            maintenance_margin_bps: market.params.initial_margin_ratio_bps,
+            tick_size: market.params.tick_size,
+            concentration_threshold_lots: market.params.concentration_threshold_lots,
+            concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+            side_oi_lots: 0,
+            oi_mmr_slope_bps_per_million_lots: 0,
+            oi_mmr_max_extra_bps: 0,
+        });
+        market_keys.push(m_ai.key());
+        i += 2;
+    }
+
+    // Pre-mutate snapshot of the post-withdrawal collateral.
+    let post_collateral = current_collateral
+        .checked_sub(amount_quote_lots)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+
+    // (a) IM required under the joint stress lattice.
+    let im_required: u64 = if snaps.is_empty() {
+        0
+    } else {
+        let scenarios = default_scenarios_fn(&market_keys);
+        let assessment =
+            assess_margin_unified_fn(&snaps, &market_snaps, &scenarios, post_collateral)?;
+        assessment.required_quote_lots
+    };
+
+    // (b) HL withdrawal floor: 10% of total notional.
+    let notional_floor_u128 = total_notional_quote
+        .saturating_mul(WITHDRAWAL_FLOOR_BPS as u128)
+        / (constants::BPS_DENOM as u128);
+    let notional_floor = if notional_floor_u128 > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        notional_floor_u128 as u64
+    };
+
+    // #8: the cross-domain floor adds the ER reservation on top of the existing
+    // max(IM, 10%-notional). `er_reserved == 0` ⇒ byte-identical to the original.
+    let floor = xmargin::required_collateral_with_er(im_required, notional_floor, er_reserved);
+    require!(
+        post_collateral >= floor,
+        FlashBookError::InsufficientCollateral
+    );
+
+    // SPL transfer (program signs as the insurance_fund PDA).
+    let bump = insurance_fund.bump;
+    let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
+    let signers = &[signer_seeds];
+    let cpi_accounts = Transfer {
+        from: quote_vault.to_account_info(),
+        to: trader_quote_ata.to_account_info(),
+        authority: insurance_fund.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new_with_signer(token_program.key(), cpi_accounts, signers);
+    token::transfer(cpi_ctx, amount_quote_lots)?;
+
+    // Accounting.
+    {
+        let mut s = trader_state.load_mut()?;
+        s.collateral_quote_lots = post_collateral;
+    }
+    emit!(PartialCollateralWithdrawnEvent {
+        trader: trader_pk,
+        amount: amount_quote_lots,
+        new_balance: post_collateral,
+        im_required,
+        notional_floor,
+        applied_floor: floor,
+    });
+    Ok(())
+}
+
+/// Shared collateral-credit accounting for the deposit instructions (cold
+/// wallet + session). NOT an instruction. Increments `collateral_quote_lots`
+/// with checked overflow and emits `CollateralDepositedEvent`.
+fn credit_collateral(
+    trader_state: &AccountLoader<TraderStateAccount>,
+    amount_quote_lots: u64,
+) -> Result<()> {
+    let (trader, new_balance) = {
+        let mut s = trader_state.load_mut()?;
+        s.collateral_quote_lots = s
+            .collateral_quote_lots
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        (s.trader, s.collateral_quote_lots)
+    };
+    emit!(CollateralDepositedEvent {
+        trader,
+        amount: amount_quote_lots,
+        new_balance,
+    });
+    Ok(())
+}
+
 /// Shared core for limit placement. Identity-agnostic: the caller resolves
 /// `trader_pk` (cold wallet OR a verified session). NOT an instruction (no
 /// `pub`), so Anchor does not dispatch it. Body is byte-identical to the
@@ -12921,6 +13159,200 @@ pub struct PartialWithdrawCollateral<'info> {
     // remaining_accounts: alternating (market, position) pairs for every
     // market the trader has a non-zero position in. Walked inside the
     // handler to compute total notional + IM required for the floor check.
+}
+
+// ───────────────────────── #8 cross-domain collateral ─────────────────────
+
+#[derive(Accounts)]
+pub struct InitErMarginAttestation<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// Protocol singleton — its `authority` gates creation (which pins the
+    /// trusted attestor for this account).
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+        constraint = insurance_fund.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    /// The trader_state this attestation binds to; only its key is used (for
+    /// the PDA seed), so it is not deserialized for content here.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + xmargin::ErMarginAttestation::LEN,
+        seeds = [xmargin::ER_MARGIN_SEED, trader_state.key().as_ref()],
+        bump,
+    )]
+    pub er_margin: Account<'info, xmargin::ErMarginAttestation>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AttestErReservedMargin<'info> {
+    /// Must equal the attestation's pinned `attestor` (checked in the handler).
+    pub attestor: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [xmargin::ER_MARGIN_SEED, trader_state.key().as_ref()],
+        bump = er_margin.bump,
+    )]
+    pub er_margin: Account<'info, xmargin::ErMarginAttestation>,
+
+    /// Mutated only to flip the `er_active` flag; the attestor is trusted for
+    /// that flag alone (it cannot touch collateral).
+    #[account(mut)]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+}
+
+/// Cross-domain strict withdraw — `WithdrawCollateral` plus the trader's ER
+/// reserved-margin attestation (read-only); the handler enforces post-withdrawal
+/// collateral `>= er_reserved`.
+#[derive(Accounts)]
+pub struct WithdrawCollateralXdomain<'info> {
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    #[account(
+        seeds = [xmargin::ER_MARGIN_SEED, trader_state.key().as_ref()],
+        bump = er_margin.bump,
+    )]
+    pub er_margin: Account<'info, xmargin::ErMarginAttestation>,
+
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = trader,
+    )]
+    pub trader_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        address = insurance_fund.quote_vault,
+    )]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+/// Cross-domain partial withdraw — `PartialWithdrawCollateral` plus the ER
+/// reserved-margin attestation (read-only). remaining_accounts: the same
+/// alternating (market, position) pairs as the strict variant.
+#[derive(Accounts)]
+pub struct PartialWithdrawCollateralXdomain<'info> {
+    pub trader: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
+    )]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    #[account(
+        seeds = [xmargin::ER_MARGIN_SEED, trader_state.key().as_ref()],
+        bump = er_margin.bump,
+    )]
+    pub er_margin: Account<'info, xmargin::ErMarginAttestation>,
+
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = trader,
+    )]
+    pub trader_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        address = insurance_fund.quote_vault,
+    )]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+/// Single-sig session deposit — a session/hot key funds the OWNER's margin from
+/// its own ATA. The session signer can only ADD collateral (never withdraw).
+#[derive(Accounts)]
+pub struct DepositCollateralSession<'info> {
+    pub session_signer: Signer<'info>,
+
+    #[account(
+        seeds = [session::SESSION_SEED, session_token.owner.as_ref(), session_signer.key().as_ref()],
+        bump = session_token.bump,
+    )]
+    pub session_token: Box<Account<'info, session::SessionTokenAccount>>,
+
+    /// Credited trader_state — must belong to the session token's owner
+    /// (enforced in the handler).
+    #[account(mut)]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// The SESSION SIGNER's own USDC ATA — the source of the deposited funds.
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = session_signer,
+    )]
+    pub session_signer_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        address = insurance_fund.quote_vault,
+    )]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[event]
+pub struct ErMarginAttestationInitEvent {
+    pub trader_state: Pubkey,
+    pub attestor: Pubkey,
+}
+
+#[event]
+pub struct ErMarginAttestedEvent {
+    pub trader_state: Pubkey,
+    pub reserved_margin_quote_lots: u64,
+    pub epoch: u64,
 }
 
 /// Shared Accounts context for `set_position_isolated` and
