@@ -2651,7 +2651,7 @@ async fn update_oracle_rejects_stale_price() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let order_buf = to_anchor(Pubkey::default());
+    let _order_buf = to_anchor(Pubkey::default());
 
     let mut params = default_params();
     params.oracle_staleness_max_seconds = 60; // 1-min max age
@@ -2728,7 +2728,7 @@ async fn update_oracle_rejects_wide_confidence() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let order_buf = to_anchor(Pubkey::default());
+    let _order_buf = to_anchor(Pubkey::default());
 
     let mut params = default_params();
     params.oracle_confidence_max_bps = 100; // 1% max
@@ -2852,7 +2852,7 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let order_buf = to_anchor(Pubkey::default());
+    let _order_buf = to_anchor(Pubkey::default());
 
     let mut params = default_params();
     params.oracle_quorum_max_dispersion_bps = 50; // 0.5%
@@ -3060,7 +3060,7 @@ async fn deposit_collateral_rejects_wrong_trader_state() {
 #[tokio::test]
 async fn migrate_position_to_trader_state_key_moves_state() {
     use solana_sdk::account::Account as SolanaAccount;
-    let mut pt = make_program_test();
+    let pt = make_program_test();
     let mut ctx_setup = pt.start_with_context().await;
     let payer = ctx_setup.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx_setup, &payer).await;
