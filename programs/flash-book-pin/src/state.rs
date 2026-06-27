@@ -67,7 +67,18 @@ pub struct Market {
     /// healthy market with no recent fills. Carved from `_reserved`; size
     /// unchanged (1152 bytes).
     pub last_heartbeat_slot: u64,
-    pub _reserved: [u8; 976],
+    /// Concentration penalty: a position whose `size_lots` reaches this threshold
+    /// pays `concentration_extra_mmr_bps` extra maintenance margin. `0` disables
+    /// (the carved default — existing markets behave exactly as before). 8-aligned
+    /// at offset 176. Carved from `_reserved`; size unchanged (1152 bytes).
+    pub concentration_threshold_lots: u64,
+    pub concentration_extra_mmr_bps: u32,
+    /// OI-scaled MMR: extra maintenance bps per million lots of same-side open
+    /// interest, capped at `oi_mmr_max_extra_bps` (where `0` = uncapped, matching
+    /// `MarketSnapshot::effective_mmr_bps`). Both default `0` = disabled.
+    pub oi_mmr_slope_bps_per_million_lots: u32,
+    pub oi_mmr_max_extra_bps: u32,
+    pub _reserved: [u8; 956],
 }
 
 /// Market trading-status values.

@@ -117,6 +117,7 @@ mod program {
         ErHeartbeat = 33,
         InitMarketLeverageTiers = 34,
         UpdateMarketLeverageTiers = 35,
+        SetMarketRiskParams = 36,
     }
 
     #[inline(always)]
@@ -159,6 +160,7 @@ mod program {
             x if x == Ix::ErHeartbeat as u8 => instructions::er_heartbeat::process(program_id, accounts, rest),
             x if x == Ix::InitMarketLeverageTiers as u8 => instructions::init_market_leverage_tiers::process(program_id, accounts, rest),
             x if x == Ix::UpdateMarketLeverageTiers as u8 => instructions::update_market_leverage_tiers::process(program_id, accounts, rest),
+            x if x == Ix::SetMarketRiskParams as u8 => instructions::set_market_risk_params::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
