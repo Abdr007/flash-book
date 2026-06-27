@@ -7,7 +7,8 @@
 //! a tier may only ever *raise* the requirement, never lower it below base.
 
 use crate::constants::BPS_DENOM;
-use crate::state::MAX_LEVERAGE_TIERS;
+use crate::risk::tiered_mmr_bps;
+use crate::state::{MarketLeverageTiers, MAX_LEVERAGE_TIERS};
 
 /// Validate a proposed ladder of `(min_notional_quote_lots, mmr_bps)` rungs
 /// against `base_mmr` (= `market.maintenance_margin_bps`). Returns `Err(())` on
@@ -61,9 +62,68 @@ pub fn parse_tiers(
     Ok(count)
 }
 
+/// Resolve the effective maintenance base MMR for a position of `notional` quote
+/// lots, given the market's flat `base_mmr` and its on-chain tier table. Reads at
+/// most `MAX_LEVERAGE_TIERS` rungs (clamping a corrupt `tier_count`) into a stack
+/// buffer and delegates to the proven `tiered_mmr_bps`. An empty table returns
+/// `base_mmr` unchanged.
+pub fn resolve_base_mmr(base_mmr: u32, tiers: &MarketLeverageTiers, notional: u128) -> u32 {
+    let count = (tiers.tier_count as usize).min(MAX_LEVERAGE_TIERS);
+    let mut buf = [(0u64, 0u32); MAX_LEVERAGE_TIERS];
+    for (i, slot) in buf.iter_mut().enumerate().take(count) {
+        *slot = (
+            tiers.tiers[i].min_notional_quote_lots,
+            tiers.tiers[i].mmr_bps,
+        );
+    }
+    tiered_mmr_bps(base_mmr, &buf[..count], notional)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{LeverageTier, LEVERAGE_TIERS_DISC};
+
+    fn tiers_account(rungs: &[(u64, u32)]) -> MarketLeverageTiers {
+        let mut t = MarketLeverageTiers {
+            disc: LEVERAGE_TIERS_DISC,
+            market: [0u8; 32],
+            bump: 0,
+            tier_count: rungs.len() as u8,
+            _pad0: [0u8; 6],
+            tiers: [LeverageTier { min_notional_quote_lots: 0, mmr_bps: 0, _pad: [0u8; 4] };
+                MAX_LEVERAGE_TIERS],
+        };
+        for (i, &(mn, mmr)) in rungs.iter().enumerate() {
+            t.tiers[i] = LeverageTier { min_notional_quote_lots: mn, mmr_bps: mmr, _pad: [0u8; 4] };
+        }
+        t
+    }
+
+    #[test]
+    fn resolve_picks_the_position_tier_and_falls_back_to_base() {
+        let t = tiers_account(&[(1_000_000, 200), (5_000_000, 300), (25_000_000, 500)]);
+        assert_eq!(resolve_base_mmr(100, &t, 999_999), 100); // below first rung → base
+        assert_eq!(resolve_base_mmr(100, &t, 1_000_000), 200);
+        assert_eq!(resolve_base_mmr(100, &t, 4_999_999), 200);
+        assert_eq!(resolve_base_mmr(100, &t, 5_000_000), 300);
+        assert_eq!(resolve_base_mmr(100, &t, u128::MAX), 500);
+    }
+
+    #[test]
+    fn resolve_empty_table_returns_base() {
+        let t = tiers_account(&[]);
+        assert_eq!(resolve_base_mmr(123, &t, u128::MAX), 123);
+    }
+
+    #[test]
+    fn resolve_clamps_a_corrupt_tier_count() {
+        // tier_count claims 200 but the array is fixed at MAX_LEVERAGE_TIERS;
+        // the clamp guarantees no out-of-bounds read.
+        let mut t = tiers_account(&[(1_000_000, 400)]);
+        t.tier_count = 200;
+        let _ = resolve_base_mmr(100, &t, u128::MAX);
+    }
 
     #[test]
     fn parse_round_trips_a_two_tier_ladder() {
