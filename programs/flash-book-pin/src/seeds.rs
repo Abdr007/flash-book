@@ -26,3 +26,7 @@ pub const LEVERAGE_TIERS_SEED: &[u8] = b"leverage_tiers";
 
 /// `[b"fee_tiers"]` — the protocol-singleton volume-based fee-tier table.
 pub const FEE_TIERS_SEED: &[u8] = b"fee_tiers";
+
+/// `[b"trigger_v3", market, trader, trigger_id]` — a v3 conditional (trigger)
+/// order. Distinct prefix from any legacy trigger so the two never collide.
+pub const TRIGGER_ORDER_SEED: &[u8] = b"trigger_v3";

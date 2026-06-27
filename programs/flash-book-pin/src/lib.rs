@@ -55,6 +55,7 @@ pub mod liquidation;
 pub mod seeds;
 pub mod solvency;
 pub mod leverage;
+pub mod trigger_order;
 pub mod leverage_tiers;
 pub mod fee_tiers;
 pub mod cpi;
@@ -132,6 +133,8 @@ mod program {
         SetPositionLeverage = 46,
         VerifyPortfolioStress = 47,
         VerifyLeverageCap = 48,
+        PlaceTriggerOrder = 49,
+        CancelTriggerOrder = 50,
     }
 
     #[inline(always)]
@@ -187,6 +190,8 @@ mod program {
             x if x == Ix::SetPositionLeverage as u8 => instructions::set_position_leverage::process(program_id, accounts, rest),
             x if x == Ix::VerifyPortfolioStress as u8 => instructions::verify_portfolio_stress::process(program_id, accounts, rest),
             x if x == Ix::VerifyLeverageCap as u8 => instructions::verify_leverage_cap::process(program_id, accounts, rest),
+            x if x == Ix::PlaceTriggerOrder as u8 => instructions::place_trigger_order::process(program_id, accounts, rest),
+            x if x == Ix::CancelTriggerOrder as u8 => instructions::cancel_trigger_order::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
