@@ -15,7 +15,7 @@
 
 use crate::cpi::{token_transfer_signed, TOKEN_PROGRAM_ID};
 use crate::guard::{assert_disc, assert_owned_by, assert_pda, assert_signer};
-use crate::seeds::{INSURANCE_SEED, TRADER_STATE_SEED};
+use crate::seeds::INSURANCE_SEED;
 use crate::state::{Insurance, TraderState, INSURANCE_DISC, TRADER_STATE_DISC};
 use pinocchio::{
     account_info::AccountInfo,
@@ -44,12 +44,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if token_program.key() != &TOKEN_PROGRAM_ID {
         return Err(ProgramError::IncorrectProgramId);
     }
+    // Sub-account aware: bind by program-ownership + disc + `.trader` (below),
+    // not a strict PDA seed, so withdrawals work on the main OR a sub account.
+    // Only a wallet's own trader_states carry `.trader == signer` (Phase-2d).
     assert_owned_by(trader_state, program_id)?;
-    assert_pda(
-        trader_state,
-        &[TRADER_STATE_SEED, &trader.key()[..]],
-        program_id,
-    )?;
     assert_disc(trader_state, &TRADER_STATE_DISC)?;
     assert_owned_by(insurance, program_id)?;
     let ins_bump = assert_pda(insurance, &[INSURANCE_SEED], program_id)?;

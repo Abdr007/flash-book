@@ -17,7 +17,7 @@
 
 use crate::cpi::{token_transfer, TOKEN_PROGRAM_ID};
 use crate::guard::{assert_disc, assert_owned_by, assert_pda, assert_signer};
-use crate::seeds::{INSURANCE_SEED, TRADER_STATE_SEED};
+use crate::seeds::INSURANCE_SEED;
 use crate::state::{Insurance, TraderState, INSURANCE_DISC, TRADER_STATE_DISC};
 use pinocchio::{
     account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
@@ -43,12 +43,12 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         return Err(ProgramError::IncorrectProgramId);
     }
 
+    // Sub-account aware: bind trader_state by program-ownership + discriminator
+    // + its `.trader` field (checked below), NOT a strict PDA seed — so this
+    // works on the wallet's MAIN or any SUB account. Only a wallet's own
+    // trader_states carry `.trader == signer`, so this is exactly as safe as a
+    // PDA re-derivation (anchor's Phase-2d pattern).
     assert_owned_by(trader_state, program_id)?;
-    assert_pda(
-        trader_state,
-        &[TRADER_STATE_SEED, &trader.key()[..]],
-        program_id,
-    )?;
     assert_disc(trader_state, &TRADER_STATE_DISC)?;
 
     assert_owned_by(insurance, program_id)?;

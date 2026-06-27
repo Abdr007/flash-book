@@ -92,6 +92,7 @@ mod program {
         SetMarketSequencer = 13,
         SetMarketStatus = 14,
         UpdateOracle = 15,
+        OpenTraderSubAccount = 16,
     }
 
     #[inline(always)]
@@ -114,6 +115,7 @@ mod program {
             x if x == Ix::SetMarketSequencer as u8 => instructions::set_market_sequencer::process(program_id, accounts, rest),
             x if x == Ix::SetMarketStatus as u8 => instructions::set_market_status::process(program_id, accounts, rest),
             x if x == Ix::UpdateOracle as u8 => instructions::update_oracle::process(program_id, accounts, rest),
+            x if x == Ix::OpenTraderSubAccount as u8 => instructions::open_trader_sub_account::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
