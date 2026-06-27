@@ -170,7 +170,15 @@ pub struct Insurance {
     /// in future, other global config). Set to the initializer at init. Carved
     /// from `_reserved`; size unchanged.
     pub authority: Pubkey,
-    pub _reserved: [u8; 76],
+    /// Padding so `pause_threshold_quote_lots` is 8-aligned (authority ends at an
+    /// offset ≡ 4 mod 8).
+    pub _pad_pause: [u8; 4],
+    /// Balance floor (quote lots): when the fund's `balance_quote_lots` falls to
+    /// or below this, markets are meant to auto-pause (the consuming check is a
+    /// later batch). `0` = disabled. Set by `set_insurance_pause_threshold`.
+    /// Carved from `_reserved`; size unchanged (200 bytes).
+    pub pause_threshold_quote_lots: u64,
+    pub _reserved: [u8; 64],
 }
 
 pub const FEE_TIERS_DISC: [u8; 8] = [0xFE, 0xE7, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01];
