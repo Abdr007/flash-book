@@ -118,6 +118,9 @@ mod program {
         InitMarketLeverageTiers = 34,
         UpdateMarketLeverageTiers = 35,
         SetMarketRiskParams = 36,
+        SetTraderDelegate = 37,
+        SetTraderReferrer = 38,
+        SetTraderBuilder = 39,
     }
 
     #[inline(always)]
@@ -161,6 +164,9 @@ mod program {
             x if x == Ix::InitMarketLeverageTiers as u8 => instructions::init_market_leverage_tiers::process(program_id, accounts, rest),
             x if x == Ix::UpdateMarketLeverageTiers as u8 => instructions::update_market_leverage_tiers::process(program_id, accounts, rest),
             x if x == Ix::SetMarketRiskParams as u8 => instructions::set_market_risk_params::process(program_id, accounts, rest),
+            x if x == Ix::SetTraderDelegate as u8 => instructions::set_trader_delegate::process(program_id, accounts, rest),
+            x if x == Ix::SetTraderReferrer as u8 => instructions::set_trader_referrer::process(program_id, accounts, rest),
+            x if x == Ix::SetTraderBuilder as u8 => instructions::set_trader_builder::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
