@@ -86,6 +86,8 @@ mod program {
         OpenTraderState = 8,
         InitializeInsuranceFund = 9,
         DepositCollateral = 10,
+        InitializeMarket = 11,
+        WithdrawCollateral = 12,
     }
 
     #[inline(always)]
@@ -103,6 +105,8 @@ mod program {
             x if x == Ix::OpenTraderState as u8 => instructions::open_trader_state::process(program_id, accounts, rest),
             x if x == Ix::InitializeInsuranceFund as u8 => instructions::initialize_insurance_fund::process(program_id, accounts, rest),
             x if x == Ix::DepositCollateral as u8 => instructions::deposit_collateral::process(program_id, accounts, rest),
+            x if x == Ix::InitializeMarket as u8 => instructions::initialize_market::process(program_id, accounts, rest),
+            x if x == Ix::WithdrawCollateral as u8 => instructions::withdraw_collateral::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
