@@ -22,7 +22,12 @@ pub struct Position {
     pub collateral_quote_lots: u64,
     pub realized_pnl_quote_lots: i64,
     pub side: u8, // 0 = long, 1 = short
-    pub _pad: [u8; 7],
+    pub _pad0: [u8; 3],
+    /// Per-position max-leverage cap, set by the trader via
+    /// `set_position_leverage` (bounded by `Market::max_leverage`). `0` = unset.
+    /// Carved from the old 7-byte pad (4-aligned at offset 124); size unchanged
+    /// (128 bytes). Enforced at order placement (a later batch).
+    pub leverage_cap: u32,
 }
 impl Position {
     #[inline] pub fn cum_funding(&self) -> i128 { i128::from_le_bytes(self.cum_funding_index) }
@@ -78,7 +83,11 @@ pub struct Market {
     /// `MarketSnapshot::effective_mmr_bps`). Both default `0` = disabled.
     pub oi_mmr_slope_bps_per_million_lots: u32,
     pub oi_mmr_max_extra_bps: u32,
-    pub _reserved: [u8; 956],
+    /// Max position leverage the market admits; `set_position_leverage` caps a
+    /// position's `leverage_cap` against it. `0` = unset (no max enforced).
+    /// 4-aligned. Carved from `_reserved`; size unchanged (1152 bytes).
+    pub max_leverage: u32,
+    pub _reserved: [u8; 952],
 }
 
 /// Market trading-status values.
