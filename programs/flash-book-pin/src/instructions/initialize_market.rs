@@ -104,6 +104,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         m.min_base_lots = min_base_lots;
         m.max_oi_base_lots = max_oi_base_lots;
         m.total_fees_collected = 0;
+        m.authority = *authority.key();
+        m.status = crate::state::MARKET_STATUS_ACTIVE;
     }
     Ok(())
 }

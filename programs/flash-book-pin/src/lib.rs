@@ -88,6 +88,10 @@ mod program {
         DepositCollateral = 10,
         InitializeMarket = 11,
         WithdrawCollateral = 12,
+        // ── admin / config ──
+        SetMarketSequencer = 13,
+        SetMarketStatus = 14,
+        UpdateOracle = 15,
     }
 
     #[inline(always)]
@@ -107,6 +111,9 @@ mod program {
             x if x == Ix::DepositCollateral as u8 => instructions::deposit_collateral::process(program_id, accounts, rest),
             x if x == Ix::InitializeMarket as u8 => instructions::initialize_market::process(program_id, accounts, rest),
             x if x == Ix::WithdrawCollateral as u8 => instructions::withdraw_collateral::process(program_id, accounts, rest),
+            x if x == Ix::SetMarketSequencer as u8 => instructions::set_market_sequencer::process(program_id, accounts, rest),
+            x if x == Ix::SetMarketStatus as u8 => instructions::set_market_status::process(program_id, accounts, rest),
+            x if x == Ix::UpdateOracle as u8 => instructions::update_oracle::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
