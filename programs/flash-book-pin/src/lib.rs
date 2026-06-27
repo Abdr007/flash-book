@@ -53,6 +53,7 @@ pub mod vpin;
 pub mod risk;
 pub mod liquidation;
 pub mod seeds;
+pub mod solvency;
 pub mod cpi;
 pub mod guard;
 
@@ -109,6 +110,7 @@ mod program {
         InitLpPosition = 27,
         DepositFlpCapital = 28,
         WithdrawFlpCapital = 29,
+        VerifyProtocolSolvency = 30,
     }
 
     #[inline(always)]
@@ -145,6 +147,7 @@ mod program {
             x if x == Ix::InitLpPosition as u8 => instructions::init_lp_position::process(program_id, accounts, rest),
             x if x == Ix::DepositFlpCapital as u8 => instructions::deposit_flp_capital::process(program_id, accounts, rest),
             x if x == Ix::WithdrawFlpCapital as u8 => instructions::withdraw_flp_capital::process(program_id, accounts, rest),
+            x if x == Ix::VerifyProtocolSolvency as u8 => instructions::verify_protocol_solvency::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

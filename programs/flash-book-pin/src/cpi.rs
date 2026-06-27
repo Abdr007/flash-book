@@ -88,6 +88,49 @@ pub fn init_account3_data(owner: &[u8; 32]) -> [u8; 33] {
 /// SPL token account size in bytes (`spl_token::state::Account::LEN`).
 pub const TOKEN_ACCOUNT_LEN: u64 = 165;
 
+/// Byte offset of the `amount` field in an SPL token account: `mint` (32) +
+/// `owner` (32). The field is a little-endian `u64`.
+pub const TOKEN_AMOUNT_OFFSET: usize = 64;
+
+/// Read the `amount` (balance) of an SPL token account from its raw data.
+/// `Err(())` if the buffer is too short to be a token account — the caller must
+/// also have checked the account is token-program-owned and the right length.
+/// Pure + host-tested; works on a borrowed data slice with no CPI.
+pub fn spl_token_amount(data: &[u8]) -> Result<u64, ()> {
+    if data.len() < TOKEN_AMOUNT_OFFSET + 8 {
+        return Err(());
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&data[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8]);
+    Ok(u64::from_le_bytes(b))
+}
+
+#[cfg(test)]
+mod amount_tests {
+    use super::{spl_token_amount, TOKEN_ACCOUNT_LEN, TOKEN_AMOUNT_OFFSET};
+
+    #[test]
+    fn reads_le_amount_at_offset_64() {
+        let mut buf = [0u8; TOKEN_ACCOUNT_LEN as usize];
+        buf[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8]
+            .copy_from_slice(&123_456_789u64.to_le_bytes());
+        assert_eq!(spl_token_amount(&buf), Ok(123_456_789));
+    }
+
+    #[test]
+    fn max_amount_round_trips() {
+        let mut buf = [0u8; TOKEN_ACCOUNT_LEN as usize];
+        buf[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(spl_token_amount(&buf), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn short_buffer_is_rejected() {
+        assert_eq!(spl_token_amount(&[0u8; TOKEN_AMOUNT_OFFSET + 7]), Err(()));
+        assert_eq!(spl_token_amount(&[]), Err(()));
+    }
+}
+
 // ─────────────────────────────── invoke wrappers (SBF) ─────────────────────
 
 #[cfg(target_os = "solana")]

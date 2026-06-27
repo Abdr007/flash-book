@@ -20,6 +20,7 @@ pub mod transfer_insurance_authority;
 pub mod set_insurance_fee_contribution;
 pub mod set_market_maintenance_margin;
 pub mod deposit_flp_capital;
+pub mod verify_protocol_solvency;
 pub mod withdraw_flp_capital;
 pub mod initialize_flp_exposure;
 pub mod init_lp_position;
