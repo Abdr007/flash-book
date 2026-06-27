@@ -56,7 +56,28 @@ pub struct TraderState {
     pub disc: [u8; 8],
     pub trader: Pubkey,
     pub collateral_quote_lots: u64,
-    pub _reserved: [u8; 152],
+    /// Number of the trader's positions with size > 0. Maintained by
+    /// `apply_fill` on every open (0 → >0) / close (>0 → 0) transition; gates
+    /// `withdraw_collateral` (no full withdrawal while positions are open).
+    /// Carved from `_reserved`; total layout size unchanged (200 bytes).
+    pub open_positions: u8,
+    pub _reserved: [u8; 151],
+}
+
+impl TraderState {
+    /// New `open_positions` count after one position's size transitions from
+    /// `before` to `after`. Opening (0 → >0) increments; closing (>0 → 0)
+    /// decrements (saturating); anything else is unchanged. Pure + host-tested.
+    #[inline]
+    pub fn open_positions_after(current: u8, before: u64, after: u64) -> u8 {
+        if before == 0 && after > 0 {
+            current.saturating_add(1)
+        } else if before > 0 && after == 0 {
+            current.saturating_sub(1)
+        } else {
+            current
+        }
+    }
 }
 
 #[repr(C)]
@@ -346,3 +367,23 @@ const _: () = assert!(core::mem::size_of::<MarketLeverageTiers>() == 176);
 const _: () = assert!(core::mem::size_of::<FlpExposurePerMarketV3>() == 136);
 const _: () = assert!(core::mem::size_of::<FlpPositionV3>() == 104);
 const _: () = assert!(core::mem::size_of::<LpPosition>() == 104);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_positions_transitions() {
+        // open: 0 -> >0 increments
+        assert_eq!(TraderState::open_positions_after(0, 0, 5), 1);
+        assert_eq!(TraderState::open_positions_after(2, 0, 5), 3);
+        // close: >0 -> 0 decrements (saturating)
+        assert_eq!(TraderState::open_positions_after(1, 5, 0), 0);
+        assert_eq!(TraderState::open_positions_after(0, 5, 0), 0);
+        // increase / reduce (both nonzero) — unchanged
+        assert_eq!(TraderState::open_positions_after(1, 5, 10), 1);
+        assert_eq!(TraderState::open_positions_after(1, 10, 3), 1);
+        // no position either side — unchanged
+        assert_eq!(TraderState::open_positions_after(2, 0, 0), 2);
+    }
+}

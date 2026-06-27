@@ -47,9 +47,18 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         let maker_pos: &mut Position = view(&accounts[6]);
 
         let fidx = market.cum_funding();
+        // Snapshot sizes so we can maintain each trader's open_positions count
+        // across the open (0 → >0) / close (>0 → 0) transitions below.
+        let taker_before = taker_pos.size_lots;
+        let maker_before = maker_pos.size_lots;
         // Fills update both legs with identical matcher math.
         crate::fill_math::apply_to_position(taker_pos, taker_side, size, price, fidx).map_err(|_| ProgramError::ArithmeticOverflow)?;
         crate::fill_math::apply_to_position(maker_pos, maker_side, size, price, fidx).map_err(|_| ProgramError::ArithmeticOverflow)?;
+        // Maintain open_positions (gates withdraw_collateral). Pure transition.
+        taker_ts.open_positions =
+            TraderState::open_positions_after(taker_ts.open_positions, taker_before, taker_pos.size_lots);
+        maker_ts.open_positions =
+            TraderState::open_positions_after(maker_ts.open_positions, maker_before, maker_pos.size_lots);
 
         // Open interest.
         if taker_side == 0 { market.long_oi_lots = market.long_oi_lots.saturating_add(size); }
