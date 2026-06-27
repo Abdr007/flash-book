@@ -2,13 +2,12 @@
 //! debit their recorded collateral. The vault authority is the Insurance PDA,
 //! so the payout is PDA-signed.
 //!
-//! ⚠ SAFETY SCOPE: this checks only that the trader has sufficient RECORDED
-//! collateral. It does NOT yet gate on open-position margin — the Pinocchio
-//! `TraderState` does not track `open_positions`, and the risk / liquidation
-//! flow is not yet ported. Until that lands, a withdrawal on a venue that holds
-//! open positions is unsafe. This instruction is bootstrap-complete (the
-//! init→fund→deposit→withdraw loop), but **margin-gating is a REQUIRED follow-up
-//! before any standalone venue carries real positions.**
+//! POSITION-SAFE: rejects any withdrawal while the trader has open positions
+//! (`open_positions != 0`, maintained by `apply_fill`). This is the conservative
+//! "flat to withdraw" rule (same as the Anchor strict path); a future
+//! partial/margin-aware withdraw can relax it once the full risk engine is
+//! ported. Combined with the recorded-balance check, collateral backing live
+//! positions can never be pulled.
 //!
 //! accounts: [trader (signer, w), trader_state (PDA, w), insurance (PDA, r),
 //!            quote_vault (w), trader_quote_ata (w), token_program]
@@ -61,6 +60,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         let d = trader_state.try_borrow_data()?;
         let ts = unsafe { &*(d.as_ptr() as *const TraderState) };
         if &ts.trader != trader.key() {
+            return Err(ProgramError::InvalidArgument);
+        }
+        // Position-safe: must be flat to withdraw (collateral may back positions).
+        if ts.open_positions != 0 {
             return Err(ProgramError::InvalidArgument);
         }
         if ts.collateral_quote_lots < amount {
