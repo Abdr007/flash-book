@@ -84,6 +84,8 @@ mod program {
         ApplyFlpFill = 7,
         // ── lifecycle / collateral (Phase 1 port) ──
         OpenTraderState = 8,
+        InitializeInsuranceFund = 9,
+        DepositCollateral = 10,
     }
 
     #[inline(always)]
@@ -99,6 +101,8 @@ mod program {
             x if x == Ix::CancelAll as u8 => instructions::cancel_all::process(program_id, accounts, rest),
             x if x == Ix::ApplyFlpFill as u8 => instructions::apply_flp_fill::process(program_id, accounts, rest),
             x if x == Ix::OpenTraderState as u8 => instructions::open_trader_state::process(program_id, accounts, rest),
+            x if x == Ix::InitializeInsuranceFund as u8 => instructions::initialize_insurance_fund::process(program_id, accounts, rest),
+            x if x == Ix::DepositCollateral as u8 => instructions::deposit_collateral::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

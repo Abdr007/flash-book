@@ -68,7 +68,14 @@ pub struct Insurance {
     /// Fraction (bps) of each net fee routed to the fund; the remainder is
     /// protocol revenue. Carved from `_reserved`; total layout size unchanged.
     pub fee_contribution_bps: u32,
-    pub _reserved: [u8; 172],
+    /// SPL mint of the protocol quote currency. Set at init; deposits/withdrawals
+    /// verify the trader ATA + vault are for this mint. Carved from `_reserved`.
+    pub quote_mint: Pubkey,
+    /// The protocol vault token account (authority = the Insurance PDA). Deposits
+    /// transfer INTO it; withdrawals transfer OUT signed by the PDA. Carved from
+    /// `_reserved`. Total layout size unchanged (200 bytes).
+    pub quote_vault: Pubkey,
+    pub _reserved: [u8; 108],
 }
 
 pub const FEE_TIERS_DISC: [u8; 8] = [0xFE, 0xE7, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01];
