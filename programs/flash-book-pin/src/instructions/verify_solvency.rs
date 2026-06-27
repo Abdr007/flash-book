@@ -105,16 +105,16 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
             market: *market.key(),
             mark_price: Ticks(m.mark_price_ticks),
             cum_funding_index: m.cum_funding(),
-            // Tier-resolved (or flat) maintenance base. Concentration + OI-scaled
-            // extras stay disabled in this probe (a follow-up once those params
-            // are on the Market).
+            // Tier-resolved (or flat) maintenance base, plus the market's
+            // configured concentration + OI-scaled MMR surcharges (all default 0
+            // ⇒ no surcharge; set via `set_market_risk_params`).
             maintenance_margin_bps: base_mmr,
             tick_size: m.tick_size,
-            concentration_threshold_lots: 0,
-            concentration_extra_mmr_bps: 0,
+            concentration_threshold_lots: m.concentration_threshold_lots,
+            concentration_extra_mmr_bps: m.concentration_extra_mmr_bps,
             side_oi_lots,
-            oi_mmr_slope_bps_per_million_lots: 0,
-            oi_mmr_max_extra_bps: 0,
+            oi_mmr_slope_bps_per_million_lots: m.oi_mmr_slope_bps_per_million_lots,
+            oi_mmr_max_extra_bps: m.oi_mmr_max_extra_bps,
         };
         (pos_snap, mkt_snap, ts.collateral_quote_lots)
     };
