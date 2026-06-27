@@ -14,3 +14,9 @@ pub const INSURANCE_SEED: &[u8] = b"insurance_fund";
 
 /// `[b"market", base_mint, quote_mint]` — a market account.
 pub const MARKET_SEED: &[u8] = b"market";
+
+/// `[b"flp_exposure"]` — the protocol singleton FLP (pool-as-maker) exposure.
+pub const FLP_EXPOSURE_SEED: &[u8] = b"flp_exposure";
+
+/// `[b"lp_position", lp]` — a liquidity provider's FLP share position.
+pub const LP_POSITION_SEED: &[u8] = b"lp_position";

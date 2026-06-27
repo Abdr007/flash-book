@@ -105,6 +105,8 @@ mod program {
         SetInsuranceFeeContribution = 23,
         VerifySolvency = 24,
         SetMarketMaintenanceMargin = 25,
+        InitializeFlpExposure = 26,
+        InitLpPosition = 27,
     }
 
     #[inline(always)]
@@ -137,6 +139,8 @@ mod program {
             x if x == Ix::SetInsuranceFeeContribution as u8 => instructions::set_insurance_fee_contribution::process(program_id, accounts, rest),
             x if x == Ix::VerifySolvency as u8 => instructions::verify_solvency::process(program_id, accounts, rest),
             x if x == Ix::SetMarketMaintenanceMargin as u8 => instructions::set_market_maintenance_margin::process(program_id, accounts, rest),
+            x if x == Ix::InitializeFlpExposure as u8 => instructions::initialize_flp_exposure::process(program_id, accounts, rest),
+            x if x == Ix::InitLpPosition as u8 => instructions::init_lp_position::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
