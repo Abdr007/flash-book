@@ -23,3 +23,6 @@ pub const LP_POSITION_SEED: &[u8] = b"lp_position";
 
 /// `[b"leverage_tiers", market]` — a market's notional-banded MMR tier ladder.
 pub const LEVERAGE_TIERS_SEED: &[u8] = b"leverage_tiers";
+
+/// `[b"fee_tiers"]` — the protocol-singleton volume-based fee-tier table.
+pub const FEE_TIERS_SEED: &[u8] = b"fee_tiers";
