@@ -91,6 +91,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         ins.fee_contribution_bps = fee_contribution_bps;
         ins.quote_mint = *quote_mint.key();
         ins.quote_vault = *quote_vault.key();
+        ins.authority = *authority.key();
     }
     Ok(())
 }
