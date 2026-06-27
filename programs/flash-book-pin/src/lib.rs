@@ -49,6 +49,9 @@ pub mod pro_rata;
 pub mod vpin;
 pub mod risk;
 pub mod liquidation;
+pub mod seeds;
+pub mod cpi;
+pub mod guard;
 
 #[cfg(target_os = "solana")]
 mod program {
@@ -79,6 +82,8 @@ mod program {
         ModifyOrder = 5,
         CancelAll = 6,
         ApplyFlpFill = 7,
+        // ── lifecycle / collateral (Phase 1 port) ──
+        OpenTraderState = 8,
     }
 
     #[inline(always)]
@@ -93,6 +98,7 @@ mod program {
             x if x == Ix::ModifyOrder as u8 => instructions::modify_order::process(program_id, accounts, rest),
             x if x == Ix::CancelAll as u8 => instructions::cancel_all::process(program_id, accounts, rest),
             x if x == Ix::ApplyFlpFill as u8 => instructions::apply_flp_fill::process(program_id, accounts, rest),
+            x if x == Ix::OpenTraderState as u8 => instructions::open_trader_state::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
