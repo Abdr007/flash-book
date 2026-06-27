@@ -187,6 +187,42 @@ impl FlpExposure {
     pub fn nav(&self) -> i128 {
         (self.total_capital_quote_lots as i128) + (self.realized_pnl as i128)
     }
+
+    /// LP shares minted for a deposit of `amount` quote-lots into a pool with
+    /// `outstanding` shares and `nav`. First deposit (outstanding == 0) mints
+    /// 1:1. `None` if the pool has shares but non-positive NAV (insolvent —
+    /// can't price), or on overflow. Pure + host-tested.
+    #[inline]
+    pub fn shares_for_deposit(amount: u64, outstanding: u64, nav: i128) -> Option<u64> {
+        if outstanding == 0 {
+            return Some(amount);
+        }
+        if nav <= 0 {
+            return None;
+        }
+        let s = (amount as u128).checked_mul(outstanding as u128)? / (nav as u128);
+        if s > u64::MAX as u128 {
+            None
+        } else {
+            Some(s as u64)
+        }
+    }
+
+    /// Quote-lots returned for burning `shares` from a pool with `outstanding`
+    /// shares and `nav`. `None` if `outstanding == 0`, `nav <= 0`, or on
+    /// overflow. Pure + host-tested.
+    #[inline]
+    pub fn amount_for_shares(shares: u64, outstanding: u64, nav: i128) -> Option<u64> {
+        if outstanding == 0 || nav <= 0 {
+            return None;
+        }
+        let a = (shares as u128).checked_mul(nav as u128)? / (outstanding as u128);
+        if a > u64::MAX as u128 {
+            None
+        } else {
+            Some(a as u64)
+        }
+    }
 }
 
 pub const TRIGGER_ORDER_V3_DISC: [u8; 8] = [0x71, 0x67, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
@@ -398,6 +434,26 @@ const _: () = assert!(core::mem::size_of::<LpPosition>() == 104);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flp_share_math_round_trips_and_guards() {
+        // First deposit mints 1:1.
+        assert_eq!(FlpExposure::shares_for_deposit(1_000, 0, 0), Some(1_000));
+        // Second deposit at NAV == capital == 1000, 1000 shares: 1:1 still.
+        assert_eq!(FlpExposure::shares_for_deposit(500, 1_000, 1_000), Some(500));
+        // After the pool gained (nav 2000 vs 1000 shares), new deposit gets
+        // fewer shares per lot: 500 * 1000 / 2000 = 250.
+        assert_eq!(FlpExposure::shares_for_deposit(500, 1_000, 2_000), Some(250));
+        // Insolvent pool (nav <= 0 with shares outstanding) can't be priced.
+        assert_eq!(FlpExposure::shares_for_deposit(500, 1_000, 0), None);
+        assert_eq!(FlpExposure::shares_for_deposit(500, 1_000, -5), None);
+
+        // Redeem is the inverse: burning 250 shares at nav 2000 / 1000 shares
+        // returns 500 lots.
+        assert_eq!(FlpExposure::amount_for_shares(250, 1_000, 2_000), Some(500));
+        assert_eq!(FlpExposure::amount_for_shares(100, 0, 1_000), None);
+        assert_eq!(FlpExposure::amount_for_shares(100, 1_000, 0), None);
+    }
 
     #[test]
     fn open_positions_transitions() {

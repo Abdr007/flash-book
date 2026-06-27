@@ -107,6 +107,8 @@ mod program {
         SetMarketMaintenanceMargin = 25,
         InitializeFlpExposure = 26,
         InitLpPosition = 27,
+        DepositFlpCapital = 28,
+        WithdrawFlpCapital = 29,
     }
 
     #[inline(always)]
@@ -141,6 +143,8 @@ mod program {
             x if x == Ix::SetMarketMaintenanceMargin as u8 => instructions::set_market_maintenance_margin::process(program_id, accounts, rest),
             x if x == Ix::InitializeFlpExposure as u8 => instructions::initialize_flp_exposure::process(program_id, accounts, rest),
             x if x == Ix::InitLpPosition as u8 => instructions::init_lp_position::process(program_id, accounts, rest),
+            x if x == Ix::DepositFlpCapital as u8 => instructions::deposit_flp_capital::process(program_id, accounts, rest),
+            x if x == Ix::WithdrawFlpCapital as u8 => instructions::withdraw_flp_capital::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
