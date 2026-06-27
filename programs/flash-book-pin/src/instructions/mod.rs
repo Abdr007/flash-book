@@ -43,6 +43,7 @@ pub mod verify_stress_solvency;
 pub mod verify_stress_lattice;
 pub mod verify_portfolio_solvency;
 pub mod verify_portfolio_stress;
+pub mod verify_leverage_cap;
 pub mod set_market_params;
 pub mod transfer_market_authority;
 pub mod set_market_status;
