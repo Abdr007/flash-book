@@ -35,6 +35,7 @@ pub mod update_market_leverage_tiers;
 pub mod verify_market_invariants;
 pub mod verify_collateral_solvency;
 pub mod withdraw_flp_capital;
+pub mod init_flp_per_market;
 pub mod initialize_flp_exposure;
 pub mod init_lp_position;
 pub mod margin_probe;
