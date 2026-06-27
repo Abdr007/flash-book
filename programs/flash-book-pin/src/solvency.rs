@@ -17,9 +17,48 @@ pub fn assess_solvency(vault: u64, insurance: u64, flp_capital: u64) -> Result<(
     Ok((solvent, surplus))
 }
 
+/// One-sided insolvency detector — `true` ⇒ the protocol is *definitely*
+/// insolvent (anchor `partial_collateral_proves_insolvent`, Kani-proven there).
+///
+/// `headroom = vault − (flp_capital + insurance)` saturating at 0 is the slice
+/// of the vault not already owed to the protocol-owned buckets. If a *partial*
+/// sum of trader collateral already exceeds that headroom, the full set must too
+/// — so any caller can prove insolvency without summing every trader. `false` is
+/// inconclusive (a larger trader set may still prove it). `Err(())` only on a
+/// `flp_capital + insurance` overflow.
+pub fn partial_collateral_proves_insolvent(
+    partial_collateral: u64,
+    flp_capital: u64,
+    insurance: u64,
+    vault: u64,
+) -> Result<bool, ()> {
+    let buckets = flp_capital.checked_add(insurance).ok_or(())?;
+    let headroom = vault.saturating_sub(buckets);
+    Ok(partial_collateral > headroom)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_proof_is_one_sided_and_monotone() {
+        // vault 100, buckets 60 → headroom 40. collateral 41 proves insolvency.
+        assert_eq!(partial_collateral_proves_insolvent(41, 30, 30, 100), Ok(true));
+        // collateral exactly at headroom is NOT proof (vault still covers).
+        assert_eq!(partial_collateral_proves_insolvent(40, 30, 30, 100), Ok(false));
+        // buckets alone exceed vault → ANY positive collateral proves it.
+        assert_eq!(partial_collateral_proves_insolvent(1, 80, 80, 100), Ok(true));
+        assert_eq!(partial_collateral_proves_insolvent(0, 80, 80, 100), Ok(false));
+    }
+
+    #[test]
+    fn detector_bucket_overflow_is_an_error() {
+        assert_eq!(
+            partial_collateral_proves_insolvent(1, u64::MAX, 1, u64::MAX),
+            Err(())
+        );
+    }
 
     #[test]
     fn solvent_when_vault_covers_buckets_and_surplus_is_exact() {
