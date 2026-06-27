@@ -3539,6 +3539,40 @@ pub mod flash_book {
     /// underwater positions block keepers from settling them.
     pub fn settle_funding(ctx: Context<SettleFunding>) -> Result<()> {
         let market = &ctx.accounts.market;
+        let mkey = market.key();
+        let mark_px = market.mark_price_ticks;
+        let funding_rate = market.last_funding_rate_bps_per_sec;
+
+        // ── Wave 25b: advance the per-side K/F accrual indices ───────────
+        // Maintenance-only wiring. The side indices track the market's live
+        // mark price (K) + funding rate (F) so a later wave can settle
+        // positions against them in O(1). Optional + additive: a market with
+        // no initialized side-accrual account (None) keeps the EXACT
+        // pre-Wave-25b funding behavior below. Idempotent per slot
+        // (`advance_indices` no-ops when dt == 0), so several settles in the
+        // same slot advance the index only once. Long side accrues +rate,
+        // short side −rate (funding is zero-sum across the book). Done before
+        // the per-position settle so even an empty-position poke keeps the
+        // market-level index current.
+        if let Some(side_accrual) = ctx.accounts.side_accrual.as_mut() {
+            require_keys_eq!(side_accrual.market, mkey, FlashBookError::WrongMarket);
+            use matcher::side_accrual as sa;
+            let now_slot = Clock::get()?.slot;
+            let mut long = side_accrual.long_side();
+            sa::advance_indices(&mut long, mark_px, funding_rate, now_slot);
+            side_accrual.write_long_side(&long);
+            let mut short = side_accrual.short_side();
+            sa::advance_indices(&mut short, mark_px, funding_rate.saturating_neg(), now_slot);
+            side_accrual.write_short_side(&short);
+            emit!(SideAccrualAdvancedEvent {
+                market: mkey,
+                price_ticks: mark_px,
+                funding_rate,
+                slot: now_slot,
+            });
+        }
+
+        let market = &ctx.accounts.market;
         let mut position = ctx.accounts.position.load_mut()?;
         let mut trader_state = ctx.accounts.trader_state.load_mut()?;
 
@@ -7848,6 +7882,56 @@ pub mod flash_book {
         }
         // Bookkeeping for monitoring.
         market.total_liquidations = market.total_liquidations.saturating_add(1);
+
+        // ── Wave 25b: reduce the counter (winning) side's ADL multiplier A ─
+        // Maintenance-only wiring. The targeted close above already realized
+        // the deleverage via collateral arithmetic; here we ALSO shrink the
+        // counter side's pro-rata `A` index by the closed fraction so the
+        // index reflects the deleveraging for a later wave to consume, then
+        // drive the side state machine (A < MIN_A_SIDE ⇒ DrainOnly; side OI 0
+        // ⇒ ResetPending ⇒ epoch reset to ADL_ONE). Optional + additive —
+        // a market with no side-accrual account (None) keeps the EXACT
+        // pre-Wave-25b ADL. The deleveraged side is the COUNTER side
+        // (`ct_pre_side`); its post-close OI is read below.
+        let counter_oi_post = if ct_pre_side == 0 {
+            ctx.accounts.market.oi_long_lots
+        } else {
+            ctx.accounts.market.oi_short_lots
+        };
+        if let Some(side_accrual) = ctx.accounts.side_accrual.as_mut() {
+            require_keys_eq!(side_accrual.market, market_key, FlashBookError::WrongMarket);
+            use matcher::side_accrual as sa;
+            let mut side = if ct_pre_side == 0 {
+                side_accrual.long_side()
+            } else {
+                side_accrual.short_side()
+            };
+            // Shrink by close_size / pre_close_oi only while positions remain
+            // on the side. `num = post_oi, denom = post_oi + close` ⇒ factor
+            // `post/(post+close)`; with post_oi > 0 this never drives A to 0
+            // (a fully-closed side is reset by the state machine instead).
+            if counter_oi_post > 0 {
+                let denom = (counter_oi_post as u128).saturating_add(close_size_lots as u128);
+                sa::reduce_a_pro_rata(&mut side, counter_oi_post as u128, denom);
+            }
+            let transition = sa::step_mode(&mut side, counter_oi_post);
+            if transition == sa::SideModeTransition::EnteredResetPending {
+                sa::epoch_advance(&mut side);
+            }
+            if ct_pre_side == 0 {
+                side_accrual.write_long_side(&side);
+            } else {
+                side_accrual.write_short_side(&side);
+            }
+            emit!(SideAdlAppliedEvent {
+                market: market_key,
+                counter_side: ct_pre_side,
+                close_size_lots,
+                new_a: side.a,
+                mode: side.mode as u8,
+                epoch: side.epoch,
+            });
+        }
 
         emit!(AutoDeleveragedEvent {
             market: market_key,
@@ -13494,6 +13578,13 @@ pub struct SettleFunding<'info> {
         constraint = haircut_state.market == market.key() @ FlashBookError::WrongMarket,
     )]
     pub haircut_state: Box<Account<'info, state_v3::MarketHaircutStateAccount>>,
+
+    /// Wave 25b (optional, additive): the per-market side-accrual account.
+    /// When supplied, `settle_funding` advances its K/F indices. Omit it
+    /// (None) on markets that have not initialized side accrual — behavior is
+    /// then byte-identical to pre-Wave-25b. Bound to the market in the handler.
+    #[account(mut)]
+    pub side_accrual: Option<Box<Account<'info, state_v3::MarketSideAccrualAccount>>>,
 }
 
 #[derive(Accounts)]
@@ -14146,6 +14237,13 @@ pub struct AutoDeleverage<'info> {
         bump = counter_position.load()?.bump,
     )]
     pub counter_position: AccountLoader<'info, state::PositionAccount>,
+
+    /// Wave 25b (optional, additive): the per-market side-accrual account.
+    /// When supplied, `auto_deleverage` reduces the counter side's `A` and
+    /// drives the side state machine. Omit it (None) to keep the EXACT
+    /// pre-Wave-25b ADL. Bound to the market in the handler.
+    #[account(mut)]
+    pub side_accrual: Option<Box<Account<'info, state_v3::MarketSideAccrualAccount>>>,
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────
@@ -14156,6 +14254,27 @@ pub struct MarketBookInitializedEvent {
     pub market_book: Pubkey,
     pub total_bytes: u32,
     pub data_bytes: u32,
+}
+
+/// Wave 25b: `settle_funding` advanced the per-side K/F accrual indices.
+#[event]
+pub struct SideAccrualAdvancedEvent {
+    pub market: Pubkey,
+    pub price_ticks: u64,
+    pub funding_rate: i64,
+    pub slot: u64,
+}
+
+/// Wave 25b: `auto_deleverage` reduced the counter side's ADL multiplier `A`
+/// and (possibly) advanced its side-mode state machine.
+#[event]
+pub struct SideAdlAppliedEvent {
+    pub market: Pubkey,
+    pub counter_side: u8,
+    pub close_size_lots: u64,
+    pub new_a: u128,
+    pub mode: u8,
+    pub epoch: u32,
 }
 
 #[event]

@@ -144,7 +144,7 @@ fn side_accrual_independence_of_long_short() {
     // the struct layout; this test guards against future refactors
     // that might accidentally share state.)
     let mut long = SideAccrual::default();
-    let mut short = SideAccrual::default();
+    let short = SideAccrual::default();
     long.k = 12_345;
     long.a = MIN_A_SIDE / 2;
     step_mode(&mut long, 0);

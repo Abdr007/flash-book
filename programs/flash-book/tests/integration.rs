@@ -2651,7 +2651,7 @@ async fn update_oracle_rejects_stale_price() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let order_buf = to_anchor(Pubkey::default());
+    let _order_buf = to_anchor(Pubkey::default());
 
     let mut params = default_params();
     params.oracle_staleness_max_seconds = 60; // 1-min max age
@@ -2728,7 +2728,7 @@ async fn update_oracle_rejects_wide_confidence() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let order_buf = to_anchor(Pubkey::default());
+    let _order_buf = to_anchor(Pubkey::default());
 
     let mut params = default_params();
     params.oracle_confidence_max_bps = 100; // 1% max
@@ -2852,7 +2852,7 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
         base_mint.as_ref(),
         quote_mint.as_ref(),
     ]);
-    let order_buf = to_anchor(Pubkey::default());
+    let _order_buf = to_anchor(Pubkey::default());
 
     let mut params = default_params();
     params.oracle_quorum_max_dispersion_bps = 50; // 0.5%
@@ -3060,7 +3060,7 @@ async fn deposit_collateral_rejects_wrong_trader_state() {
 #[tokio::test]
 async fn migrate_position_to_trader_state_key_moves_state() {
     use solana_sdk::account::Account as SolanaAccount;
-    let mut pt = make_program_test();
+    let pt = make_program_test();
     let mut ctx_setup = pt.start_with_context().await;
     let payer = ctx_setup.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx_setup, &payer).await;
@@ -5084,6 +5084,9 @@ async fn auto_deleverage_rejects_multi_leg_cross_h5() {
             AccountMeta::new(under_pos_a, false),
             AccountMeta::new(counter_state, false),
             AccountMeta::new(counter_pos_a, false),
+            // Wave 25b: optional side_accrual omitted ⇒ pass the program id to
+            // signal None (Anchor optional-account ABI).
+            AccountMeta::new_readonly(program_id(), false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -6316,4 +6319,230 @@ async fn deposit_collateral_session_funds_owner_margin() {
     // Owner's margin grew by the session deposit (50_000 + 20_000).
     let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
     assert_eq!(ts.collateral_quote_lots, 70_000);
+}
+
+// ───────────────────── Wave 25b — side-accrual index wiring ────────────────
+
+async fn send_one(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    ix: Instruction,
+    signers: &[&Keypair],
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&signers[0].pubkey()),
+            signers,
+            bh,
+        ))
+        .await
+}
+
+/// End-to-end: `settle_funding` with the optional side-accrual account advances
+/// the per-side K/F indices to the live mark, via the on-chain
+/// read → advance_indices → write round-trip.
+#[tokio::test]
+async fn settle_funding_advances_side_accrual_indices() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market, _ob, _b, _q) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 50_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 50_000, &protocol).await;
+    let pos = open_cross_position(
+        &mut ctx,
+        &payer,
+        market,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+
+    // settle_funding requires the market haircut state.
+    let (haircut_state, _) = pda(&[
+        flash_book::state_v3::MarketHaircutStateAccount::SEED,
+        market.as_ref(),
+    ]);
+    send_one(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitializeHaircutState {
+                h_min_slots: 0,
+                h_max_slots: 1,
+                initial_residual_quote_lots: 1_000,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Seed side accrual at slot 1 / price 50_000 — DIFFERENT from the market's
+    // 100_000 mark so the first advance produces a non-zero K.
+    let (side_accrual, _) = pda(&[
+        flash_book::state_v3::MarketSideAccrualAccount::SEED,
+        market.as_ref(),
+    ]);
+    send_one(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitializeSideAccrual {
+                initial_price_ticks: 50_000,
+                initial_slot: 1,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new(side_accrual, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Warp so dt > 0 for the K/F advance.
+    ctx.warp_to_slot(5_000).unwrap();
+
+    let market_acct: flash_book::state::MarketAccount = fetch(&mut ctx.banks_client, market).await;
+    let mark = market_acct.mark_price_ticks;
+
+    // settle_funding WITH the side_accrual account provided (Some).
+    send_one(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::SettleFunding {},
+            vec![
+                AccountMeta::new_readonly(taker.pubkey(), true), // caller (permissionless)
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(taker.pubkey(), false), // trader (unchecked)
+                AccountMeta::new(taker_state, false),
+                AccountMeta::new(pos, false),
+                AccountMeta::new(haircut_state, false),
+                AccountMeta::new(side_accrual, false), // Wave 25b optional, PROVIDED
+            ],
+        ),
+        &[&taker],
+    )
+    .await
+    .unwrap();
+
+    let sa: flash_book::state_v3::MarketSideAccrualAccount =
+        fetch(&mut ctx.banks_client, side_accrual).await;
+    assert_eq!(sa.long_price_last, mark, "long price_last tracks the live mark after advance");
+    assert!(sa.long_slot_last > 1, "long slot_last advanced past the seed slot");
+    assert!(sa.long_k > 0, "K advances up: mark (100k) rose above the 50k seed");
+    assert!(sa.short_k > 0, "short side advances on the same price move");
+    assert_eq!(sa.long_f, 0, "F stays 0 while the market funding rate is 0");
+}
+
+/// `auto_deleverage` accepts the optional side-accrual account when present, and
+/// the eligibility gates still fire first (the H-5 reject is unchanged whether
+/// or not the side-accrual account is supplied).
+#[tokio::test]
+async fn auto_deleverage_accepts_side_accrual_when_present() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_a, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (market_b, _, _, _) = setup_additional_market(&mut ctx, &payer, 100_000).await;
+
+    let under = Keypair::new();
+    let counter = Keypair::new();
+    let maker2 = Keypair::new();
+    let under_state = setup_trader(&mut ctx, &payer, &under, 100_000, &protocol).await;
+    let counter_state = setup_trader(&mut ctx, &payer, &counter, 100_000, &protocol).await;
+    let maker2_state = setup_trader(&mut ctx, &payer, &maker2, 100_000, &protocol).await;
+
+    let under_pos_a = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_a,
+        protocol.insurance_fund,
+        under_state,
+        counter_state,
+        1,
+    )
+    .await;
+    let (counter_pos_a, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_a.as_ref(),
+        counter_state.as_ref(),
+    ]);
+    let _under_pos_b = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_b,
+        protocol.insurance_fund,
+        under_state,
+        maker2_state,
+        1,
+    )
+    .await;
+
+    // Initialize the side-accrual account for market A and PASS it (Some).
+    let (side_accrual, _) = pda(&[
+        flash_book::state_v3::MarketSideAccrualAccount::SEED,
+        market_a.as_ref(),
+    ]);
+    send_one(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitializeSideAccrual {
+                initial_price_ticks: 100_000,
+                initial_slot: 1,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_a, false),
+                AccountMeta::new(side_accrual, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    let ix = build_ix(
+        flash_book::instruction::AutoDeleverage { close_size_lots: 1 },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_a, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new(under_state, false),
+            AccountMeta::new(under_pos_a, false),
+            AccountMeta::new(counter_state, false),
+            AccountMeta::new(counter_pos_a, false),
+            AccountMeta::new(side_accrual, false), // Wave 25b optional, PROVIDED
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8207)"),
+        "with side_accrual present the H-5 gate must still reject first, got: {dbg}"
+    );
 }

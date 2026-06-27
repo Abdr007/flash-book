@@ -21,6 +21,7 @@ use flash_book::matcher::haircut::{
 
 /// Mirror of the on-chain `MarketHaircutStateAccount` body (no Anchor
 /// disc, no padding) — just the fields the ix mutate.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct MarketHaircutState {
     residual: u128,
