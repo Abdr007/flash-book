@@ -70,7 +70,9 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         let notional = (size as u128)
             .checked_mul(price as u128).ok_or(ProgramError::ArithmeticOverflow)?
             .checked_mul(market.tick_size as u128).ok_or(ProgramError::ArithmeticOverflow)?;
-        let fee = (notional.checked_mul(market.taker_fee_bps as u128).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM) as u64;
+        let gross_fee = (notional.checked_mul(market.taker_fee_bps as u128).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM) as u64;
+        // Apply the taker's per-trader fee discount (0 by default ⇒ no change).
+        let fee = crate::fees::discounted_fee(gross_fee, taker_ts.fee_discount_bps);
         let rebate = if market.maker_rebate_bps > 0 {
             (notional.checked_mul(market.maker_rebate_bps as u128).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM) as u64
         } else { 0 };

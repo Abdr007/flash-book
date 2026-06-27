@@ -66,17 +66,21 @@ pub struct TraderState {
     pub disc: [u8; 8],
     pub trader: Pubkey,
     pub collateral_quote_lots: u64,
+    /// Per-trader taker-fee discount in bps (0..=BPS_DENOM), set by the protocol
+    /// authority via `set_trader_fee_tier` and applied in `apply_fill`. Placed
+    /// here (4-aligned) so the `repr(C)` layout stays padding-free. Carved from
+    /// `_reserved`.
+    pub fee_discount_bps: u32,
     /// Number of the trader's positions with size > 0. Maintained by
     /// `apply_fill` on every open (0 → >0) / close (>0 → 0) transition; gates
     /// `withdraw_collateral` (no full withdrawal while positions are open).
-    /// Carved from `_reserved`; total layout size unchanged (200 bytes).
     pub open_positions: u8,
     /// Sub-account index: 0 = the wallet's main account (PDA
     /// `[b"trader_state", wallet]`); 1..=255 = a sub-account (PDA
     /// `[b"trader_state", wallet, [sub_index]]`). All carry `.trader = wallet`,
-    /// which is what deposit/withdraw bind to. Carved from `_reserved`.
+    /// which is what deposit/withdraw bind to.
     pub sub_index: u8,
-    pub _reserved: [u8; 150],
+    pub _reserved: [u8; 146],
 }
 
 impl TraderState {
@@ -111,7 +115,11 @@ pub struct Insurance {
     /// transfer INTO it; withdrawals transfer OUT signed by the PDA. Carved from
     /// `_reserved`. Total layout size unchanged (200 bytes).
     pub quote_vault: Pubkey,
-    pub _reserved: [u8; 108],
+    /// Protocol admin: the key authorized to set per-trader fee discounts (and,
+    /// in future, other global config). Set to the initializer at init. Carved
+    /// from `_reserved`; size unchanged.
+    pub authority: Pubkey,
+    pub _reserved: [u8; 76],
 }
 
 pub const FEE_TIERS_DISC: [u8; 8] = [0xFE, 0xE7, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01];

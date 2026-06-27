@@ -95,6 +95,7 @@ mod program {
         OpenTraderSubAccount = 16,
         TransferCollateral = 17,
         CloseTraderSubAccount = 18,
+        SetTraderFeeTier = 19,
     }
 
     #[inline(always)]
@@ -120,6 +121,7 @@ mod program {
             x if x == Ix::OpenTraderSubAccount as u8 => instructions::open_trader_sub_account::process(program_id, accounts, rest),
             x if x == Ix::TransferCollateral as u8 => instructions::transfer_collateral::process(program_id, accounts, rest),
             x if x == Ix::CloseTraderSubAccount as u8 => instructions::close_trader_sub_account::process(program_id, accounts, rest),
+            x if x == Ix::SetTraderFeeTier as u8 => instructions::set_trader_fee_tier::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

@@ -48,9 +48,34 @@ pub fn tier_index_for_volume(pairs: &[(u64, i32, u32)], volume: u64) -> u8 {
     idx
 }
 
+/// Apply a per-trader taker-fee discount (bps) to a gross fee. Clamped: a
+/// discount ≥ BPS_DENOM yields 0, and the bps is capped at BPS_DENOM so the
+/// subtraction never underflows. u128 intermediate so `gross × bps` can't
+/// overflow. Pure + host-tested.
+#[inline]
+pub fn discounted_fee(gross_fee: u64, discount_bps: u32) -> u64 {
+    let denom = crate::constants::BPS_DENOM as u128;
+    let d = (discount_bps as u128).min(denom);
+    (((gross_fee as u128) * (denom - d)) / denom) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discount_applies_and_clamps() {
+        // no discount → gross unchanged
+        assert_eq!(discounted_fee(1_000, 0), 1_000);
+        // 50% off
+        assert_eq!(discounted_fee(1_000, 5_000), 500);
+        // 100% off → free
+        assert_eq!(discounted_fee(1_000, 10_000), 0);
+        // over-cap clamps to 100% off (no underflow), never negative
+        assert_eq!(discounted_fee(1_000, 99_999), 0);
+        // large gross doesn't overflow the u128 intermediate
+        assert_eq!(discounted_fee(u64::MAX, 0), u64::MAX);
+    }
 
     // Mirrors the Anchor `fee_tier_tests` so the ported math is exercised
     // with the same vectors.
