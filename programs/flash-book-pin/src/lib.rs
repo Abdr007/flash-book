@@ -127,6 +127,8 @@ mod program {
         InitFeeTiers = 42,
         UpdateFeeTiers = 43,
         VerifyStressLattice = 44,
+        SetMarketMaxLeverage = 45,
+        SetPositionLeverage = 46,
     }
 
     #[inline(always)]
@@ -178,6 +180,8 @@ mod program {
             x if x == Ix::InitFeeTiers as u8 => instructions::init_fee_tiers::process(program_id, accounts, rest),
             x if x == Ix::UpdateFeeTiers as u8 => instructions::update_fee_tiers::process(program_id, accounts, rest),
             x if x == Ix::VerifyStressLattice as u8 => instructions::verify_stress_lattice::process(program_id, accounts, rest),
+            x if x == Ix::SetMarketMaxLeverage as u8 => instructions::set_market_max_leverage::process(program_id, accounts, rest),
+            x if x == Ix::SetPositionLeverage as u8 => instructions::set_position_leverage::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

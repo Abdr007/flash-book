@@ -51,7 +51,7 @@ mod tests {
     use super::*;
     fn p(side: u8, size: u64, entry: u64) -> Position {
         Position { disc:[0;8], cum_funding_index:[0;16], trader:[0;32], market:[0;32],
-            size_lots:size, entry_price_ticks:entry, collateral_quote_lots:0, realized_pnl_quote_lots:0, side, _pad:[0;7] }
+            size_lots:size, entry_price_ticks:entry, collateral_quote_lots:0, realized_pnl_quote_lots:0, side, _pad0:[0;3], leverage_cap:0 }
     }
     #[test] fn open() { let mut x=p(0,0,0); apply_to_position(&mut x,1,10,200,7).unwrap();
         assert_eq!((x.side,x.size_lots,x.entry_price_ticks,x.cum_funding()),(1,10,200,7)); }

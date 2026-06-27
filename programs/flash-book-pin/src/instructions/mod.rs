@@ -23,6 +23,8 @@ pub mod transfer_insurance_authority;
 pub mod set_insurance_fee_contribution;
 pub mod set_market_maintenance_margin;
 pub mod set_market_risk_params;
+pub mod set_market_max_leverage;
+pub mod set_position_leverage;
 pub mod deposit_flp_capital;
 pub mod verify_protocol_solvency;
 pub mod er_heartbeat;
