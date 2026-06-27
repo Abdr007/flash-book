@@ -121,6 +121,7 @@ mod program {
         SetTraderDelegate = 37,
         SetTraderReferrer = 38,
         SetTraderBuilder = 39,
+        VerifyStressSolvency = 40,
     }
 
     #[inline(always)]
@@ -167,6 +168,7 @@ mod program {
             x if x == Ix::SetTraderDelegate as u8 => instructions::set_trader_delegate::process(program_id, accounts, rest),
             x if x == Ix::SetTraderReferrer as u8 => instructions::set_trader_referrer::process(program_id, accounts, rest),
             x if x == Ix::SetTraderBuilder as u8 => instructions::set_trader_builder::process(program_id, accounts, rest),
+            x if x == Ix::VerifyStressSolvency as u8 => instructions::verify_stress_solvency::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
