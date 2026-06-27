@@ -21,6 +21,7 @@ pub mod set_trader_builder;
 pub mod set_market_sequencer;
 pub mod transfer_insurance_authority;
 pub mod set_insurance_fee_contribution;
+pub mod set_insurance_pause_threshold;
 pub mod set_market_maintenance_margin;
 pub mod set_market_risk_params;
 pub mod set_market_max_leverage;
