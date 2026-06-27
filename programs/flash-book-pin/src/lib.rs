@@ -55,6 +55,7 @@ pub mod liquidation;
 pub mod seeds;
 pub mod solvency;
 pub mod leverage_tiers;
+pub mod fee_tiers;
 pub mod cpi;
 pub mod guard;
 
@@ -123,6 +124,8 @@ mod program {
         SetTraderBuilder = 39,
         VerifyStressSolvency = 40,
         VerifyPortfolioSolvency = 41,
+        InitFeeTiers = 42,
+        UpdateFeeTiers = 43,
     }
 
     #[inline(always)]
@@ -171,6 +174,8 @@ mod program {
             x if x == Ix::SetTraderBuilder as u8 => instructions::set_trader_builder::process(program_id, accounts, rest),
             x if x == Ix::VerifyStressSolvency as u8 => instructions::verify_stress_solvency::process(program_id, accounts, rest),
             x if x == Ix::VerifyPortfolioSolvency as u8 => instructions::verify_portfolio_solvency::process(program_id, accounts, rest),
+            x if x == Ix::InitFeeTiers as u8 => instructions::init_fee_tiers::process(program_id, accounts, rest),
+            x if x == Ix::UpdateFeeTiers as u8 => instructions::update_fee_tiers::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
