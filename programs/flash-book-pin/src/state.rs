@@ -486,6 +486,42 @@ const _: () = assert!(core::mem::size_of::<FlpExposurePerMarketV3>() == 136);
 const _: () = assert!(core::mem::size_of::<FlpPositionV3>() == 104);
 const _: () = assert!(core::mem::size_of::<LpPosition>() == 104);
 
+pub const ENVELOPE_CONFIG_DISC: [u8; 8] = [0xE0, 0x0E, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// Per-market envelope (price-band / risk-invariant) config. The 7 envelope
+/// params are validated by `envelope::prove_envelope` before they are written.
+/// Laid out grouped-by-alignment (a fresh, port-only account — no anchor byte
+/// parity needed), so the `repr(C)` layout is padding-free at 168 bytes. The
+/// `last_observed_*` / `gate_*` runtime fields are owned by the (deferred)
+/// matching-side price gate; the config setter leaves them at 0.
+#[repr(C)]
+pub struct MarketEnvelopeConfig {
+    pub disc: [u8; 8],
+    pub market: Pubkey,
+    // ── u64/i64 group (8-aligned) ──────────────────────────────────────
+    pub max_accrual_dt_slots: u64,
+    pub max_abs_funding_e9_per_slot: i64,
+    pub min_liquidation_abs_lots: u64,
+    pub min_nonzero_mm_req_lots: u64,
+    /// Slot at which params were last proven + set (bumps on every update).
+    pub last_proven_at_slot: u64,
+    pub last_observed_slot: u64,
+    pub last_observed_price_ticks: u64,
+    pub gate_passes: u64,
+    pub gate_rejects: u64,
+    // ── u32 group ──────────────────────────────────────────────────────
+    pub max_price_move_bps_per_slot: u32,
+    pub maintenance_bps: u32,
+    pub liquidation_fee_bps: u32,
+    /// Monotonic version counter, bumped on every successful set.
+    pub version: u32,
+    // ── u8 + padding ───────────────────────────────────────────────────
+    pub bump: u8,
+    pub _pad: [u8; 7],
+    pub _reserved: [u8; 32],
+}
+const _: () = assert!(core::mem::size_of::<MarketEnvelopeConfig>() == 168);
+
 #[cfg(test)]
 mod tests {
     use super::*;
