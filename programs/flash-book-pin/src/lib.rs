@@ -140,6 +140,7 @@ mod program {
         CancelTwapOrder = 52,
         InitFlpPerMarket = 53,
         SetInsurancePauseThreshold = 54,
+        BurnMarketAuthority = 55,
     }
 
     #[inline(always)]
@@ -201,6 +202,7 @@ mod program {
             x if x == Ix::CancelTwapOrder as u8 => instructions::cancel_twap_order::process(program_id, accounts, rest),
             x if x == Ix::InitFlpPerMarket as u8 => instructions::init_flp_per_market::process(program_id, accounts, rest),
             x if x == Ix::SetInsurancePauseThreshold as u8 => instructions::set_insurance_pause_threshold::process(program_id, accounts, rest),
+            x if x == Ix::BurnMarketAuthority as u8 => instructions::burn_market_authority::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
