@@ -54,7 +54,20 @@ pub struct Market {
     pub authority: Pubkey,
     /// Trading status: 0 = active, 1 = paused. Carved from `_reserved`.
     pub status: u8,
-    pub _reserved: [u8; 995],
+    /// Explicit padding so the following `u64`s are 8-aligned (status sits at an
+    /// odd offset). Keeps the layout padding-deterministic, not compiler-implicit.
+    pub _pad_liveness: [u8; 3],
+    /// L1 slot of the last mark/fill update — part of the liveness signal with
+    /// `last_heartbeat_slot`. A market that has never stamped it reads 0, which
+    /// the liveness check treats as "no data" (never a false auto-pause). Carved
+    /// from `_reserved`; size unchanged.
+    pub last_mark_update_slot: u64,
+    /// L1 slot of the last ER heartbeat (`er_heartbeat`). A live-but-quiet ER
+    /// keeps this fresh, so `verify_market_invariants` does not auto-pause a
+    /// healthy market with no recent fills. Carved from `_reserved`; size
+    /// unchanged (1152 bytes).
+    pub last_heartbeat_slot: u64,
+    pub _reserved: [u8; 976],
 }
 
 /// Market trading-status values.

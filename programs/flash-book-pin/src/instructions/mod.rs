@@ -21,6 +21,7 @@ pub mod set_insurance_fee_contribution;
 pub mod set_market_maintenance_margin;
 pub mod deposit_flp_capital;
 pub mod verify_protocol_solvency;
+pub mod er_heartbeat;
 pub mod verify_market_invariants;
 pub mod verify_collateral_solvency;
 pub mod withdraw_flp_capital;
