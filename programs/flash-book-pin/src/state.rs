@@ -45,12 +45,16 @@ pub struct Market {
     /// Cumulative net fees booked to the protocol (gross, before the insurance
     /// contribution split). Carved from `_reserved`; total layout size unchanged.
     pub total_fees_collected: u64,
+    /// Maintenance-margin requirement in bps, fed to `assess_margin` /
+    /// `verify_solvency`. Placed here (8-aligned) so the layout stays
+    /// padding-free. Carved from `_reserved`; size unchanged (1152 bytes).
+    pub maintenance_margin_bps: u32,
     /// Admin authority for this market (rotate sequencer, pause, set params).
     /// Set to the creator at init. Carved from `_reserved`; size unchanged.
     pub authority: Pubkey,
     /// Trading status: 0 = active, 1 = paused. Carved from `_reserved`.
     pub status: u8,
-    pub _reserved: [u8; 999],
+    pub _reserved: [u8; 995],
 }
 
 /// Market trading-status values.
