@@ -108,7 +108,21 @@ pub struct TraderState {
     /// `[b"trader_state", wallet, [sub_index]]`). All carry `.trader = wallet`,
     /// which is what deposit/withdraw bind to.
     pub sub_index: u8,
-    pub _reserved: [u8; 146],
+    /// Affiliate referrer (set once via `set_trader_referrer`). Default zero =
+    /// unset. Carved from `_reserved`; size unchanged (200 bytes).
+    pub referrer: Pubkey,
+    /// Authorized delegate that may act for this trader (`set_trader_delegate`).
+    /// Default zero = none. Carved from `_reserved`.
+    pub delegate: Pubkey,
+    /// Builder-code recipient for order-flow fee share (`set_trader_builder`).
+    /// Default zero = none. Carved from `_reserved`.
+    pub builder: Pubkey,
+    /// Padding so `builder_max_fee_share_bps` is 4-aligned.
+    pub _pad_builder: [u8; 2],
+    /// Max bps of net fee the builder may receive; forced to 0 when `builder` is
+    /// unset. Validated `<= BPS_DENOM` on set.
+    pub builder_max_fee_share_bps: u32,
+    pub _reserved: [u8; 44],
 }
 
 impl TraderState {
