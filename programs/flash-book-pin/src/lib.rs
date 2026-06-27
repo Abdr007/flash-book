@@ -138,6 +138,7 @@ mod program {
         CancelTriggerOrder = 50,
         PlaceTwapOrder = 51,
         CancelTwapOrder = 52,
+        InitFlpPerMarket = 53,
     }
 
     #[inline(always)]
@@ -197,6 +198,7 @@ mod program {
             x if x == Ix::CancelTriggerOrder as u8 => instructions::cancel_trigger_order::process(program_id, accounts, rest),
             x if x == Ix::PlaceTwapOrder as u8 => instructions::place_twap_order::process(program_id, accounts, rest),
             x if x == Ix::CancelTwapOrder as u8 => instructions::cancel_twap_order::process(program_id, accounts, rest),
+            x if x == Ix::InitFlpPerMarket as u8 => instructions::init_flp_per_market::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

@@ -33,3 +33,6 @@ pub const TRIGGER_ORDER_SEED: &[u8] = b"trigger_v3";
 
 /// `[b"twap_v3", market, trader, twap_id]` — a v3 TWAP (time-sliced) order.
 pub const TWAP_ORDER_SEED: &[u8] = b"twap_v3";
+
+/// `[b"flp_per_market", market]` — a market-scoped FLP-v3 exposure account.
+pub const FLP_PER_MARKET_SEED: &[u8] = b"flp_per_market";
