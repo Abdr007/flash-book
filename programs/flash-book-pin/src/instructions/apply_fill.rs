@@ -8,7 +8,11 @@ use crate::state::{
     TRADER_STATE_DISC,
 };
 use pinocchio::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
+    account_info::AccountInfo,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    sysvars::{clock::Clock, Sysvar},
+    ProgramResult,
 };
 
 /// A position account must be program-owned and either FRESH (zero disc, to be
@@ -53,6 +57,10 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 
     let sequencer = &accounts[0];
     if !sequencer.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
+    // A processed fill is an ER-liveness event — stamp it (mark half of the
+    // liveness signal `verify_market_invariants` reads), so an actively-trading
+    // market is never flagged as stalled even with no separate heartbeat.
+    let now_slot = Clock::get()?.slot;
 
     // Hardening: every account we pointer-cast must be program-owned with the
     // correct discriminator — otherwise a caller could pass a FAKE account (e.g.
@@ -97,6 +105,9 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         // Open interest.
         if taker_side == 0 { market.long_oi_lots = market.long_oi_lots.saturating_add(size); }
         else { market.short_oi_lots = market.short_oi_lots.saturating_add(size); }
+
+        // Mark-freshness stamp (liveness). Monotonic guard against re-ordering.
+        if now_slot > market.last_mark_update_slot { market.last_mark_update_slot = now_slot; }
 
         // Fee / rebate split (integer bps, like the matcher).
         let notional = (size as u128)
