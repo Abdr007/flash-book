@@ -267,4 +267,70 @@ mod position_tests {
         assert_eq!((x.side,x.size_lots,x.entry_price_ticks,x.realized_pnl_quote_lots,x.cum_funding()),(1,5,150,500,3)); }
     #[test] fn short_realizes_on_drop() { let mut x=p(1,10,100); apply_to_position(&mut x,0,10,80,0).unwrap();
         assert_eq!((x.size_lots,x.realized_pnl_quote_lots),(0,200)); }
+
+    /// Integration-level open-interest conservation: drive thousands of random
+    /// BALANCED fills (taker on one side, maker on the opposite, same size)
+    /// through the REAL `apply_to_position` + `oi_after_leg` path — the exact
+    /// settlement code `apply_fill` runs — over a small book of traders that
+    /// open / add / partially close / fully close / flip. After every fill it
+    /// asserts (1) `long_oi == short_oi` (the matcher conservation invariant)
+    /// and (2) the incrementally-tracked OI equals a from-scratch recompute of
+    /// every position's contribution. Complements the single-fill Kani proofs
+    /// with sequence-level coverage. Deterministic LCG ⇒ reproducible.
+    #[test]
+    fn oi_conservation_random_fill_sequences() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        const N: usize = 6;
+        let mut book: Vec<Position> = (0..N).map(|_| p(0, 0, 0)).collect();
+        let mut long_oi: u64 = 0;
+        let mut short_oi: u64 = 0;
+        for _ in 0..5000 {
+            let t = (next() as usize) % N;
+            let mut m = (next() as usize) % N;
+            if m == t {
+                m = (m + 1) % N;
+            }
+            let taker_side = (next() % 2) as u8;
+            let maker_side = 1 - taker_side;
+            let size = 1 + next() % 50;
+            let price = 100 + next() % 100;
+
+            // Taker leg (snapshot old side/size first, exactly like apply_fill).
+            let (t_os, t_oz) = (book[t].side, book[t].size_lots);
+            apply_to_position(&mut book[t], taker_side, size, price, 0).unwrap();
+            let (l, s) =
+                oi_after_leg(long_oi, short_oi, t_os, t_oz, book[t].side, book[t].size_lots);
+            long_oi = l;
+            short_oi = s;
+            // Maker leg — opposite side, same size.
+            let (m_os, m_oz) = (book[m].side, book[m].size_lots);
+            apply_to_position(&mut book[m], maker_side, size, price, 0).unwrap();
+            let (l, s) =
+                oi_after_leg(long_oi, short_oi, m_os, m_oz, book[m].side, book[m].size_lots);
+            long_oi = l;
+            short_oi = s;
+
+            // (1) conservation invariant.
+            assert_eq!(long_oi, short_oi, "long_oi != short_oi after a balanced fill");
+            // (2) incremental OI must equal a full recompute from the book.
+            let mut rl = 0u64;
+            let mut rs = 0u64;
+            for q in &book {
+                if q.size_lots > 0 {
+                    if q.side == 0 {
+                        rl += q.size_lots;
+                    } else {
+                        rs += q.size_lots;
+                    }
+                }
+            }
+            assert_eq!((long_oi, short_oi), (rl, rs), "incremental OI != recompute");
+        }
+    }
 }
