@@ -41,6 +41,7 @@ pub mod initialize_side_accrual;
 pub mod verify_side_accrual_invariants;
 pub mod initialize_haircut_state;
 pub mod init_position_haircut_state;
+pub mod verify_position_haircut;
 pub mod mature_position;
 pub mod seed_residual;
 pub mod init_er_margin_attestation;

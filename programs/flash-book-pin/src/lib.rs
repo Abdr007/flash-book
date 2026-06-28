@@ -163,6 +163,7 @@ mod program {
         VerifyLeverageTiers = 75,
         VerifyFeeTiers = 76,
         VerifySessionActive = 77,
+        VerifyPositionHaircut = 78,
     }
 
     #[inline(always)]
@@ -247,6 +248,7 @@ mod program {
             x if x == Ix::VerifyLeverageTiers as u8 => instructions::verify_leverage_tiers::process(program_id, accounts, rest),
             x if x == Ix::VerifyFeeTiers as u8 => instructions::verify_fee_tiers::process(program_id, accounts, rest),
             x if x == Ix::VerifySessionActive as u8 => instructions::verify_session_active::process(program_id, accounts, rest),
+            x if x == Ix::VerifyPositionHaircut as u8 => instructions::verify_position_haircut::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
