@@ -43,6 +43,13 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let limit_price_ticks = u64::from_le_bytes(data[21..29].try_into().unwrap());
     let expires_at_slot = u64::from_le_bytes(data[29..37].try_into().unwrap());
     let acceptable_price_ticks = u64::from_le_bytes(data[37..45].try_into().unwrap());
+    // Optional trailing-stop offset (bps) appended after the fixed 45 bytes;
+    // 0 / absent = a plain non-trailing trigger. Backward-compatible.
+    let trailing_offset_bps = if data.len() >= 47 {
+        u16::from_le_bytes(data[45..47].try_into().unwrap())
+    } else {
+        0
+    };
 
     assert_signer(trader)?;
     assert_market(market, program_id)?;
@@ -116,7 +123,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         t.kind = kind;
         t.flags = flags | crate::state::TRIGGER_FLAG_ACTIVE;
         t.sub_index = sub_index;
-        t._reserved = [0u8; 10];
+        t.trailing_offset_bps = trailing_offset_bps;
+        t.trailing_anchor_ticks = 0; // seeded on the first update_trailing_stop
     }
     Ok(())
 }

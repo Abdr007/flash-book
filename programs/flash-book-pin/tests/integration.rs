@@ -1664,3 +1664,87 @@ async fn vault_place_rejects_non_strategist() {
         .await;
     assert!(r.is_err(), "non-strategist place must be rejected");
 }
+
+// ─── update_trailing_stop e2e (positive, no CPI) ───
+// Pure ratchet + state write, no CPI → fully e2e-testable. A long trailing stop
+// (kind 0, 5% offset, prior anchor 1000 / trigger 950) sees the mark rise to
+// 1200 ⇒ anchor ratchets to 1200 and the stop tightens to 1140 (1200 − 60).
+const IX_UPDATE_TRAILING: u8 = 113;
+
+fn trailing_trigger(pid: Pubkey, market: Pubkey, kind: u8, offset_bps: u16, anchor: u64, trigger_price: u64) -> Account {
+    let mut d = vec![0u8; 136];
+    d[0..8].copy_from_slice(&TRIGGER_ORDER_V3_DISC);
+    put_key(&mut d, 8, &Pubkey::new_unique()); // trader
+    put_key(&mut d, 40, &market);
+    put_u64(&mut d, 80, trigger_price); // trigger_price_ticks
+    d[123] = kind;
+    d[124] = 0x01; // FLAG_ACTIVE
+    d[126..128].copy_from_slice(&offset_bps.to_le_bytes()); // trailing_offset_bps @ 126
+    put_u64(&mut d, 128, anchor); // trailing_anchor_ticks @ 128
+    rent_account(d, pid)
+}
+
+#[tokio::test]
+async fn update_trailing_stop_ratchets_long_up() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let market = Pubkey::new_unique();
+    let trigger = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 1_200, 1, 500, 0, 0)); // mark 1200, tick 1
+    pt.add_account(trigger, trailing_trigger(pid, market, 0, 500, 1_000, 950)); // long, 5%, anchor 1000
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(trigger, false),
+        ],
+        data: vec![IX_UPDATE_TRAILING],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await
+        .unwrap();
+
+    let t = banks.get_account(trigger).await.unwrap().unwrap();
+    assert_eq!(get_u64(&t.data, 80), 1_140, "stop tightened to mark − 5%");
+    assert_eq!(get_u64(&t.data, 128), 1_200, "anchor ratcheted to the new high");
+}
+
+#[tokio::test]
+async fn update_trailing_stop_no_progress_is_noop() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let market = Pubkey::new_unique();
+    let trigger = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 900, 1, 500, 0, 0)); // mark 900 < anchor 1000
+    pt.add_account(trigger, trailing_trigger(pid, market, 0, 500, 1_000, 950));
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(trigger, false),
+        ],
+        data: vec![IX_UPDATE_TRAILING],
+    };
+    // succeeds (idempotent) but changes nothing.
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await
+        .unwrap();
+
+    let t = banks.get_account(trigger).await.unwrap().unwrap();
+    assert_eq!(get_u64(&t.data, 80), 950, "trigger unchanged on no progress");
+    assert_eq!(get_u64(&t.data, 128), 1_000, "anchor unchanged");
+}

@@ -99,7 +99,8 @@ fn write_trigger(
         t.kind = kind;
         t.flags = TRIGGER_FLAG_ACTIVE | TRIGGER_FLAG_REDUCE_ONLY;
         t.sub_index = sub_index;
-        t._reserved = [0u8; 10];
+        t.trailing_offset_bps = 0; // bracket TP/SL are fixed, not trailing
+        t.trailing_anchor_ticks = 0;
     }
     Ok(())
 }
