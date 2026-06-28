@@ -46,8 +46,74 @@ pub fn apply_to_position(pos: &mut Position, fill_side: u8, fill_size: u64, fill
     Ok(())
 }
 
+/// Update `(long_oi, short_oi)` for ONE position leg transitioning from
+/// `(old_side, old_size)` to `(new_side, new_size)`. Each position contributes
+/// its `size` to the open interest on its side; we remove the old contribution
+/// and add the new. `side`: 0 = long, 1 = short. Pure + host-tested. Applied to
+/// both legs of a fill, it keeps `long_oi == short_oi` (the conservation
+/// invariant), since each fill changes the two legs by mirror amounts.
+#[inline]
+pub fn oi_after_leg(
+    mut long_oi: u64,
+    mut short_oi: u64,
+    old_side: u8,
+    old_size: u64,
+    new_side: u8,
+    new_size: u64,
+) -> (u64, u64) {
+    if old_size > 0 {
+        if old_side == 0 {
+            long_oi = long_oi.saturating_sub(old_size);
+        } else {
+            short_oi = short_oi.saturating_sub(old_size);
+        }
+    }
+    if new_size > 0 {
+        if new_side == 0 {
+            long_oi = long_oi.saturating_add(new_size);
+        } else {
+            short_oi = short_oi.saturating_add(new_size);
+        }
+    }
+    (long_oi, short_oi)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Apply a balanced fill (taker on `t_side`, maker on `1-t_side`, both by
+    /// `size`) to both legs and assert long_oi == short_oi is preserved.
+    fn fill_oi(long: u64, short: u64, legs: &[(u8, u64, u8, u64)]) -> (u64, u64) {
+        let mut l = long;
+        let mut s = short;
+        for &(os, oz, ns, nz) in legs {
+            let (nl, ns2) = oi_after_leg(l, s, os, oz, ns, nz);
+            l = nl;
+            s = ns2;
+        }
+        (l, s)
+    }
+
+    #[test]
+    fn oi_conserved_open_close_flip() {
+        // Opening fill from a flat book: taker opens long 10, maker opens short 10.
+        let (l, s) = fill_oi(0, 0, &[(0, 0, 0, 10), (0, 0, 1, 10)]);
+        assert_eq!((l, s), (10, 10));
+        // Closing fill: taker (long 10 → 0), maker (short 10 → 0).
+        let (l, s) = fill_oi(10, 10, &[(0, 10, 0, 0), (1, 10, 1, 0)]);
+        assert_eq!((l, s), (0, 0));
+        // Partial reduce: taker (long 10 → 4), maker (short 10 → 4).
+        let (l, s) = fill_oi(10, 10, &[(0, 10, 0, 4), (1, 10, 1, 4)]);
+        assert_eq!((l, s), (4, 4));
+        // Flip: taker (short 5 → long 5), maker (long 5 → short 5).
+        let (l, s) = fill_oi(5, 5, &[(1, 5, 0, 5), (0, 5, 1, 5)]);
+        assert_eq!((l, s), (5, 5));
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
     use super::*;
     fn p(side: u8, size: u64, entry: u64) -> Position {
         Position { disc:[0;8], cum_funding_index:[0;16], trader:[0;32], market:[0;32],
