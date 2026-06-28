@@ -41,6 +41,7 @@ pub mod init_position_haircut_state;
 pub mod mature_position;
 pub mod seed_residual;
 pub mod init_er_margin_attestation;
+pub mod init_trader_ata;
 pub mod attest_er_reserved_margin;
 pub mod create_session_token;
 pub mod revoke_session_token;
