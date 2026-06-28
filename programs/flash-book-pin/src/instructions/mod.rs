@@ -33,6 +33,7 @@ pub mod verify_protocol_solvency;
 pub mod er_heartbeat;
 pub mod init_fee_tiers;
 pub mod update_fee_tiers;
+pub mod init_market_oracle_config;
 pub mod init_market_leverage_tiers;
 pub mod update_market_leverage_tiers;
 pub mod verify_market_invariants;
