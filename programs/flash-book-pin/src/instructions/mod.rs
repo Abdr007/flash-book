@@ -38,6 +38,7 @@ pub mod vault_withdraw_v3;
 pub mod settle_vault_perf_fee_v3;
 pub mod vault_place_order_v3;
 pub mod vault_cancel_order_v3;
+pub mod update_trailing_stop;
 pub mod withdraw_collateral;
 pub mod open_trader_sub_account;
 pub mod transfer_collateral;

@@ -333,7 +333,14 @@ pub struct TriggerOrderV3 {
     pub kind: u8,
     pub flags: u8,
     pub sub_index: u8,
-    pub _reserved: [u8; 10],
+    /// Trailing-stop offset in bps (0 = a plain, non-trailing trigger). Carved
+    /// from `_reserved`; `u16` first so the following `u64` stays 8-aligned and
+    /// the struct size is unchanged. Set at placement; the stop's
+    /// `trigger_price_ticks` ratchets as the mark moves via `update_trailing_stop`.
+    pub trailing_offset_bps: u16,
+    /// Running anchor (max mark for a long stop / min mark for a short stop) the
+    /// trailing trigger is measured from. 0 = unseeded.
+    pub trailing_anchor_ticks: u64,
 }
 
 /// V3 TWAP order. Pod mirror of `TwapOrderAccountV3` (152 B).
