@@ -29,8 +29,8 @@ use crate::liquidation::{
 use crate::risk::{assess_margin, StressShock};
 use crate::seeds::POSITION_LIQ_STATE_SEED;
 use crate::state::{
-    Market, Position, PositionLiquidationState, TraderState, POSITION_LIQ_STATE_DISC,
-    TRADER_STATE_DISC,
+    JitLiquidationOffer, Market, Position, PositionLiquidationState, TraderState,
+    JIT_LIQ_OFFER_DISC, POSITION_LIQ_STATE_DISC, TRADER_STATE_DISC,
 };
 use pinocchio::{
     account_info::AccountInfo,
@@ -46,7 +46,7 @@ unsafe fn view_mut<T>(ai: &AccountInfo) -> &mut T {
 }
 
 pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [caller, market, market_book, trader_state, caller_trader_state, position, position_liq, ..] =
+    let [caller, market, market_book, trader_state, caller_trader_state, position, position_liq, jit_offers @ ..] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -157,12 +157,60 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         return Err(ProgramError::InvalidArgument); // NotLiquidatable
     }
 
-    // ── synthetic close price + Dutch-auction liquidator reward ─────────
+    // ── synthetic close price ───────────────────────────────────────────
     let close_side = 1 - pos_side;
-    let limit = liquidation_penalty_price(close_side, mark, penalty_bps);
-    if limit == 0 {
+    let synthetic = liquidation_penalty_price(close_side, mark, penalty_bps);
+    if synthetic == 0 {
         return Err(ProgramError::InvalidArgument); // degenerate price
     }
+
+    // ── JIT auction: a maker offer (in remaining_accounts) that BEATS the
+    // synthetic improves the trader's outcome — close_side==1 (selling a long):
+    // higher price is better; close_side==0 (buying a short): lower is better.
+    // The offer must be a program-owned JIT offer on this market, for this trader
+    // (or the wildcard), with `side == pos_side`, not expired, remaining > 0. The
+    // winner's commitment is reserved (remaining −= filled) after the inject.
+    // No offers ⇒ `limit` stays the synthetic.
+    let mut best_price: Option<u64> = None;
+    let mut best_idx: Option<usize> = None;
+    let mut best_remaining: u64 = 0;
+    for (idx, off) in jit_offers.iter().enumerate() {
+        if !off.is_owned_by(pid) {
+            continue;
+        }
+        let d = match off.try_borrow_data() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if d.len() < core::mem::size_of::<JitLiquidationOffer>() || d[..8] != JIT_LIQ_OFFER_DISC {
+            continue;
+        }
+        let o = unsafe { &*(d.as_ptr() as *const JitLiquidationOffer) };
+        if o.market != *market.key() || o.side != pos_side || o.remaining_size_lots == 0 {
+            continue;
+        }
+        if o.target_trader != [0u8; 32] && o.target_trader != pos_trader {
+            continue; // not the wildcard and not this trader
+        }
+        if o.expires_at_slot != 0 && now >= o.expires_at_slot {
+            continue;
+        }
+        let price = o.offer_price_ticks;
+        let beats = if close_side == 1 { price > synthetic } else { price < synthetic };
+        if !beats {
+            continue;
+        }
+        let better = match best_price {
+            None => true,
+            Some(bp) => if close_side == 1 { price > bp } else { price < bp },
+        };
+        if better {
+            best_price = Some(price);
+            best_idx = Some(idx);
+            best_remaining = o.remaining_size_lots;
+        }
+    }
+    let limit = best_price.unwrap_or(synthetic);
     let elapsed = if unhealthy_since > 0 { now.saturating_sub(unhealthy_since) } else { 0 };
     let reward_bps_eff = reward_bps_effective(reward_bps, elapsed, auction_dur);
     let gross_reward = liquidator_reward_lots(close_size, mark, tick, reward_bps_eff);
@@ -222,7 +270,17 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         }
     }
 
-    // (3) stamp the liquidation state (cooldown anchor + first-unhealthy slot).
+    // (3) reserve the winning JIT offer's commitment (remaining −= filled).
+    if let Some(idx) = best_idx {
+        let fill = close_size.min(best_remaining);
+        unsafe {
+            let o = &mut *(jit_offers[idx].borrow_mut_data_unchecked().as_mut_ptr()
+                as *mut JitLiquidationOffer);
+            o.remaining_size_lots = o.remaining_size_lots.saturating_sub(fill);
+        }
+    }
+
+    // (4) stamp the liquidation state (cooldown anchor + first-unhealthy slot).
     unsafe {
         let s: &mut PositionLiquidationState = view_mut(position_liq);
         if s.unhealthy_since_slot == 0 {
