@@ -1470,3 +1470,66 @@ async fn vault_withdraw_rejects_when_not_flat() {
     let p = banks.get_account(position).await.unwrap().unwrap();
     assert_eq!(get_u64(&p.data, 72), 50, "shares unchanged on reject");
 }
+
+// ─── settle_vault_perf_fee_v3 e2e (positive — no CPI) ───
+// Pure HWM/perf-fee math + state writes, NO token CPI or PDA creation → fully
+// e2e-testable. NAV doubled (2000 over 1000 shares ⇒ nav/share 2.0 vs HWM 1.0);
+// 20% of the 1000-qlot gain = 200 qlots ⇒ mint 200*1000/2000 = 100 fee shares
+// to the strategist, then reset HWM to the post-mint nav/share.
+const IX_SETTLE_PERF_FEE: u8 = 110;
+
+fn vault_perf(pid: Pubkey, strategist: Pubkey, shares: u64, hwm_x6: u64, perf_bps: u32) -> Account {
+    let mut d = vec![0u8; 152];
+    d[0..8].copy_from_slice(&VAULT_V3_DISC);
+    put_key(&mut d, 8, &strategist);
+    put_u64(&mut d, 72, shares); // shares_outstanding
+    put_u64(&mut d, 88, hwm_x6); // hwm_nav_per_share_u64x6
+    d[112..116].copy_from_slice(&perf_bps.to_le_bytes()); // perf_fee_bps @ 112
+    d[118] = 1; // accept_deposits
+    rent_account(d, pid)
+}
+
+#[tokio::test]
+async fn settle_perf_fee_mints_on_new_high() {
+    let pid = Pubkey::new_unique();
+    let strategist = Keypair::new();
+    let vault_id = 0u8;
+    let (vault, _) = Pubkey::find_program_address(
+        &[VAULT_SEED, &strategist.pubkey().to_bytes(), &[vault_id]], &pid);
+    let (vault_ts, _) = Pubkey::find_program_address(&[TRADER_STATE_SEED, &vault.to_bytes()], &pid);
+    let (sp, _) = Pubkey::find_program_address(
+        &[VAULT_POSITION_SEED, &vault.to_bytes(), &strategist.pubkey().to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(vault, vault_perf(pid, strategist.pubkey(), 1_000, 1_000_000, 2_000)); // 1.0 HWM, 20%
+    pt.add_account(vault_ts, trader_state(pid, vault, 2_000, 0)); // NAV 2000, flat
+    pt.add_account(sp, vault_position_shares(pid, vault, strategist.pubkey(), 0)); // strategist record
+    pt.add_account(
+        strategist.pubkey(),
+        Account { lamports: 5_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(strategist.pubkey(), true),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(vault_ts, false),
+            AccountMeta::new(sp, false),
+        ],
+        data: vec![IX_SETTLE_PERF_FEE],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &strategist], bh))
+        .await
+        .unwrap();
+
+    let sp_acct = banks.get_account(sp).await.unwrap().unwrap();
+    assert_eq!(get_u64(&sp_acct.data, 72), 100, "strategist minted 100 fee shares");
+    let v = banks.get_account(vault).await.unwrap().unwrap();
+    assert_eq!(get_u64(&v.data, 72), 1_100, "shares_outstanding grew by the fee shares");
+    // new HWM = floor(2000 * 1e6 / 1100) = 1_818_181
+    assert_eq!(get_u64(&v.data, 88), 1_818_181, "HWM reset to post-mint nav/share");
+}

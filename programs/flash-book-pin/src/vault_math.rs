@@ -73,6 +73,50 @@ pub fn payout_for_shares(
     Ok(payout as u64)
 }
 
+use crate::constants::{BPS_DENOM, USD_UNIT};
+
+/// Current NAV per share in 1e6 fixed point: `floor(nav * USD_UNIT / shares)`.
+/// Zero shares → 0 (caller bootstraps the HWM separately).
+pub fn nav_per_share_x6(nav: u64, shares_outstanding: u64) -> u64 {
+    if shares_outstanding == 0 {
+        return 0;
+    }
+    let x = (nav as u128).saturating_mul(USD_UNIT as u128) / (shares_outstanding as u128);
+    if x > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        x as u64
+    }
+}
+
+/// Performance-fee shares to mint to the strategist when NAV/share rises above
+/// the high-water mark. Returns 0 when there is no new high, the vault is empty,
+/// the HWM is unset, or the fee rounds to dust — faithful to the Anchor
+/// `settle_vault_perf_fee_v3` arithmetic.
+///
+/// fee_qlots = (nav/share − hwm)/USD_UNIT * shares * perf_fee_bps/BPS_DENOM;
+/// minted = fee_qlots * shares / nav (dilution that prices the fee in shares).
+pub fn perf_fee_shares(
+    nav: u64,
+    shares_outstanding: u64,
+    nav_per_share: u64,
+    prev_hwm_x6: u64,
+    perf_fee_bps: u32,
+) -> u64 {
+    if shares_outstanding == 0 || nav == 0 || prev_hwm_x6 == 0 || nav_per_share <= prev_hwm_x6 {
+        return 0;
+    }
+    let gain_per_share = (nav_per_share - prev_hwm_x6) as u128;
+    let total_gain = gain_per_share.saturating_mul(shares_outstanding as u128) / (USD_UNIT as u128);
+    let fee_qlots = total_gain.saturating_mul(perf_fee_bps as u128) / (BPS_DENOM as u128);
+    let minted = fee_qlots.saturating_mul(shares_outstanding as u128) / (nav as u128);
+    if minted > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        minted as u64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +204,63 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn nav_per_share_basic() {
+        // 1000 quote-lots over 1000 shares = 1.0 (1e6 fixed point).
+        assert_eq!(nav_per_share_x6(1_000, 1_000), 1_000_000);
+        // 2000 over 1000 = 2.0.
+        assert_eq!(nav_per_share_x6(2_000, 1_000), 2_000_000);
+        // empty vault → 0.
+        assert_eq!(nav_per_share_x6(1_000, 0), 0);
+    }
+
+    #[test]
+    fn perf_fee_no_fee_below_or_at_hwm() {
+        // nav/share 1.0, hwm 1.0 → no new high → 0.
+        assert_eq!(perf_fee_shares(1_000, 1_000, 1_000_000, 1_000_000, 2_000), 0);
+        // nav/share 0.9 < hwm 1.0 → 0.
+        assert_eq!(perf_fee_shares(900, 1_000, 900_000, 1_000_000, 2_000), 0);
+        // unset hwm → 0 (caller bootstraps).
+        assert_eq!(perf_fee_shares(2_000, 1_000, 2_000_000, 0, 2_000), 0);
+    }
+
+    #[test]
+    fn perf_fee_charges_on_new_high() {
+        // NAV doubled: 2000 over 1000 shares → nav/share 2.0, hwm was 1.0.
+        // gain/share = 1.0; total_gain = 1.0 * 1000 = 1000 qlots; 20% fee = 200
+        // qlots; minted = 200 * 1000 / 2000 = 100 shares.
+        let nps = nav_per_share_x6(2_000, 1_000);
+        assert_eq!(nps, 2_000_000);
+        assert_eq!(perf_fee_shares(2_000, 1_000, nps, 1_000_000, 2_000), 100);
+    }
+
+    #[test]
+    fn perf_fee_zero_bps_charges_nothing() {
+        let nps = nav_per_share_x6(2_000, 1_000);
+        assert_eq!(perf_fee_shares(2_000, 1_000, nps, 1_000_000, 0), 0);
+    }
+
+    #[test]
+    fn perf_fee_minting_does_not_exceed_the_gain_value() {
+        // The strategist's minted shares, valued at post-mint NAV/share, must not
+        // exceed perf_fee_bps of the gain — i.e. the fee can't over-charge.
+        for &nav in &[1_000u64, 50_000, 5_000_000] {
+            for &shares in &[1_000u64, 100_000] {
+                for &hwm in &[500_000u64, 1_000_000] {
+                    let nps = nav_per_share_x6(nav, shares);
+                    let minted = perf_fee_shares(nav, shares, nps, hwm, 2_000);
+                    if minted > 0 && nps > hwm {
+                        // fee value = minted * nav / (shares + minted) <= 20% of gain
+                        let gain_qlots = ((nps - hwm) as u128) * (shares as u128) / (USD_UNIT as u128);
+                        let max_fee = gain_qlots * 2_000 / (BPS_DENOM as u128);
+                        let fee_value = (minted as u128) * (nav as u128) / ((shares + minted) as u128);
+                        assert!(fee_value <= max_fee + 1, "over-charge: nav={nav} shares={shares} hwm={hwm} minted={minted}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(kani)]
@@ -190,4 +291,20 @@ mod proofs {
     // reward proof). The bound is instead covered by the host tests
     // `payout_basic_and_floors`, `payout_rejects_overburn_and_zero`, and
     // `deposit_withdraw_round_trip_never_creates_value`.
+
+    /// perf_fee_shares never panics for ANY u64/u32 inputs, and charges NOTHING
+    /// unless NAV/share strictly exceeds the high-water mark (no fee on a flat
+    /// or losing vault). The all-saturating arithmetic guarantees no overflow.
+    #[kani::proof]
+    fn proof_perf_fee_no_charge_below_hwm() {
+        let nav: u64 = kani::any();
+        let shares: u64 = kani::any();
+        let nps: u64 = kani::any();
+        let hwm: u64 = kani::any();
+        let bps: u32 = kani::any();
+        let minted = perf_fee_shares(nav, shares, nps, hwm, bps);
+        if nps <= hwm {
+            assert!(minted == 0);
+        }
+    }
 }
