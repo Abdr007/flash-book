@@ -1090,3 +1090,98 @@ async fn cancel_iceberg_closes_and_refunds() {
     let after = banks.get_account(trader.pubkey()).await.unwrap().unwrap().lamports;
     assert_eq!(after, before + rent_lamports, "trader reclaimed the iceberg rent");
 }
+
+// ─── place_bracket_order validation e2e ───
+// place_bracket creates two trigger PDAs via the create_pda CPI (build-sbf only
+// under solana-program-test). But the VALIDATION gate runs BEFORE any CPI/book
+// write, so invalid-param rejections ARE e2e-testable: they must fail with a
+// clean InvalidArgument (custom 0), never reach the CPI, and leave the book
+// untouched. The happy path is build-sbf-verified; execution reuses the
+// already-tested execute_trigger_order reduce-only path.
+const IX_PLACE_BRACKET: u8 = 104;
+
+#[allow(clippy::too_many_arguments)]
+fn bracket_data(
+    parent_side: u8, sub_index: u8, tp_id: u8, sl_id: u8, size: u64,
+    parent_limit: u64, tp_trig: u64, tp_limit: u64, sl_trig: u64, sl_limit: u64, expires: u64,
+) -> Vec<u8> {
+    let mut d = vec![IX_PLACE_BRACKET];
+    d.push(parent_side);
+    d.push(sub_index);
+    d.push(tp_id);
+    d.push(sl_id);
+    d.extend_from_slice(&size.to_le_bytes());
+    d.extend_from_slice(&parent_limit.to_le_bytes());
+    d.extend_from_slice(&tp_trig.to_le_bytes());
+    d.extend_from_slice(&tp_limit.to_le_bytes());
+    d.extend_from_slice(&sl_trig.to_le_bytes());
+    d.extend_from_slice(&sl_limit.to_le_bytes());
+    d.extend_from_slice(&expires.to_le_bytes());
+    d
+}
+
+async fn run_bracket(data: Vec<u8>) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let market = Pubkey::new_unique();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let (market_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+    let id0 = data[2];
+    let id1 = data[3];
+    let (tp, _) = Pubkey::find_program_address(
+        &[b"trigger_v3", &market.to_bytes(), &trader.pubkey().to_bytes(), &[id0]], &pid);
+    let (sl, _) = Pubkey::find_program_address(
+        &[b"trigger_v3", &market.to_bytes(), &trader.pubkey().to_bytes(), &[id1]], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 100, 1, 500, 0, 0)); // min_base_lots 0, tick 1
+    pt.add_account(market_book, init_book(pid, market, base, quote, book_bump));
+    pt.add_account(
+        trader.pubkey(),
+        Account { lamports: 5_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(tp, false),
+            AccountMeta::new(sl, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8; 32]), false),
+        ],
+        data,
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &trader], bh))
+        .await
+}
+
+/// tp_trigger_id == sl_trigger_id → rejected (the two children would collide).
+#[tokio::test]
+async fn place_bracket_rejects_equal_trigger_ids() {
+    // long: tp above (110), sl below (90); ids equal → reject before any CPI.
+    let d = bracket_data(0, 0, 7, 7, 5, 100, 110, 110, 90, 90, 0);
+    assert!(run_bracket(d).await.is_err(), "equal tp/sl ids must be rejected");
+}
+
+/// LONG with tp NOT above parent → rejected (a take-profit must be above entry).
+#[tokio::test]
+async fn place_bracket_rejects_long_tp_below_parent() {
+    // long parent 100, tp 95 (below — invalid), sl 90.
+    let d = bracket_data(0, 0, 1, 2, 5, 100, 95, 95, 90, 90, 0);
+    assert!(run_bracket(d).await.is_err(), "long tp below parent must be rejected");
+}
+
+/// SHORT with sl NOT above parent → rejected (a short's stop is above entry).
+#[tokio::test]
+async fn place_bracket_rejects_short_sl_below_parent() {
+    // short parent 100, tp 90 (below, ok for short), sl 95 (below — invalid).
+    let d = bracket_data(1, 0, 1, 2, 5, 100, 90, 90, 95, 95, 0);
+    assert!(run_bracket(d).await.is_err(), "short sl below parent must be rejected");
+}
