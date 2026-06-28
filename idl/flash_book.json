@@ -10478,6 +10478,114 @@
       "args": []
     },
     {
+      "name": "update_oracle_from_lazer",
+      "docs": [
+        "Permissionless: ingest a Pyth Lazer Ed25519-signed price.",
+        "feed_id + tick_decimals are validated against the market's oracle_config",
+        "(source must be SOURCE_LAZER); the Ed25519 precompile + TRUSTED_LAZER_SIGNER",
+        "are the trust anchor."
+      ],
+      "discriminator": [
+        90,
+        215,
+        198,
+        134,
+        60,
+        232,
+        81,
+        22
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "oracle_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "envelope_config",
+          "docs": [
+            "Wave 26b \u2014 optional envelope gate. Same semantics as on",
+            "`UpdateOracle`. When omitted: legacy Pyth-pull behavior."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  110,
+                  118,
+                  101,
+                  108,
+                  111,
+                  112,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "instructions_sysvar"
+        }
+      ],
+      "args": [
+        {
+          "name": "payload",
+          "type": "bytes"
+        },
+        {
+          "name": "ed25519_ix_index",
+          "type": "u8"
+        },
+        {
+          "name": "feed_id",
+          "type": "u32"
+        },
+        {
+          "name": "tick_decimals",
+          "type": "i8"
+        }
+      ]
+    },
+    {
       "name": "update_oracle_quorum",
       "docs": [
         "Update oracle price using a multi-oracle quorum (median of 3).",

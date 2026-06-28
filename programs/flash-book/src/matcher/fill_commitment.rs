@@ -29,9 +29,16 @@ pub type FillCommit = [u8; 32];
 pub const FILL_COMMIT_SEED: &[u8] = b"fill_commit";
 
 /// Default ring capacity (pending unsettled fills a market may hold before the
-/// matcher applies backpressure). 64 covers a deep taker sweep; settlement drains
-/// it. Sized into the account at init; the account is realloc-expandable later.
-pub const FILL_RING_CAP: u32 = 64;
+/// matcher applies backpressure). Sized into the account at init; the account is
+/// realloc-expandable later.
+///
+/// AUDIT M-2 fix: this MUST be >= `MAX_BATCH_ORDERS_PER_SIDE_V2` (256, lib.rs) —
+/// `place_taker_order_v2` can cross up to that many levels and pushes one
+/// commitment per fill in a single tx before any settlement drains the ring. At
+/// 64 a legitimate taker sweep of 65–256 levels on an ARMED market unconditionally
+/// reverted (`FillRingFull`). 256 covers the full matcher batch (account =
+/// 64 + 256*32 = 8256 bytes, well within limits).
+pub const FILL_RING_CAP: u32 = 256;
 
 /// Canonical fill-commitment preimage length (see `fill_preimage`).
 pub const FILL_PREIMAGE_LEN: usize = 136;

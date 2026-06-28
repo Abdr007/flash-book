@@ -4526,9 +4526,11 @@ pub mod flash_book {
             FlashBookError::Unauthorized
         );
 
-        // Staleness check.
+        // Staleness check. AUDIT M-1/F-2: reject a FUTURE-dated publish time —
+        // it would saturate `age` to 0 and silently defeat the staleness gate.
         let now = Clock::get()?.unix_timestamp.max(0) as u64;
         let max_age = market.params.oracle_staleness_max_seconds as u64;
+        require!(published_at_unix_seconds <= now, FlashBookError::OracleTooStale);
         if max_age > 0 {
             let age = now.saturating_sub(published_at_unix_seconds);
             require!(age <= max_age, FlashBookError::OracleTooStale);
@@ -4558,7 +4560,9 @@ pub mod flash_book {
         let market = &mut ctx.accounts.market;
         market.oracle_price_ticks = price_ticks;
         market.oracle_confidence = confidence;
-        market.oracle_published_at_unix_seconds = published_at_unix_seconds;
+        // AUDIT M-1: store the real on-chain observation time, not the caller's
+        // self-attested timestamp (which let an authority stamp any price "fresh").
+        market.oracle_published_at_unix_seconds = now;
         Ok(())
     }
 
@@ -4594,9 +4598,13 @@ pub mod flash_book {
             FlashBookError::Unauthorized,
         );
 
-        // Per-source staleness check.
+        // Per-source staleness check. AUDIT M-1/F-2: reject FUTURE-dated sources
+        // (they saturate `age` to 0 and defeat the gate).
         let now = Clock::get()?.unix_timestamp.max(0) as u64;
         let max_age = market.params.oracle_staleness_max_seconds as u64;
+        for &t in &published_at_unix_seconds {
+            require!(t <= now, FlashBookError::OracleTooStale);
+        }
         if max_age > 0 {
             for &t in &published_at_unix_seconds {
                 let age = now.saturating_sub(t);
@@ -4635,10 +4643,8 @@ pub mod flash_book {
             );
         }
 
-        // Write conservative aggregates: median price, max confidence,
-        // oldest publish_time.
+        // Write conservative aggregates: median price, max confidence.
         let combined_conf = confidences.iter().copied().max().unwrap_or(0);
-        let combined_published_at = published_at_unix_seconds.iter().copied().min().unwrap_or(0);
 
         // Wave 26b — optional envelope gate on the accepted median.
         let now_slot = Clock::get()?.slot;
@@ -4651,7 +4657,8 @@ pub mod flash_book {
         let market = &mut ctx.accounts.market;
         market.oracle_price_ticks = median;
         market.oracle_confidence = combined_conf;
-        market.oracle_published_at_unix_seconds = combined_published_at;
+        // AUDIT M-1: store the real on-chain observation time, not a caller value.
+        market.oracle_published_at_unix_seconds = now;
         Ok(())
     }
 
