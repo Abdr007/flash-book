@@ -9243,6 +9243,44 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// AUDIT CR-2: authority-gated binding for the Lazer oracle path. Creates
+    /// the market's `oracle_config` with `source = SOURCE_LAZER` plus the
+    /// canonical `lazer_feed_id` and `tick_decimals`, so the permissionless
+    /// `update_oracle_from_lazer` can validate its (untrusted) caller args
+    /// against a market-approved feed and scale. Without this, the Lazer path
+    /// fails closed. Same accounts struct as `init_market_oracle_config`.
+    pub fn init_lazer_oracle_config(
+        ctx: Context<InitMarketOracleConfig>,
+        lazer_feed_id: u32,
+        max_staleness_seconds: u32,
+        max_confidence_bps: u32,
+        tick_decimals: i8,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.market.authority == ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized,
+        );
+        require!(max_staleness_seconds > 0, FlashBookError::OutOfRange);
+
+        let cfg = &mut ctx.accounts.oracle_config;
+        cfg.bump = ctx.bumps.oracle_config;
+        cfg.source = state_v3::MarketOracleConfigAccount::SOURCE_LAZER;
+        cfg.market = ctx.accounts.market.key();
+        cfg.lazer_feed_id = lazer_feed_id;
+        cfg.tick_decimals = tick_decimals;
+        cfg.max_staleness_seconds = max_staleness_seconds;
+        cfg.max_confidence_bps = max_confidence_bps;
+
+        emit!(MarketOracleConfigInitializedEvent {
+            market: ctx.accounts.market.key(),
+            pyth_price_feed_id: [0u8; 32],
+            max_staleness_seconds,
+            max_confidence_bps,
+            tick_decimals,
+        });
+        Ok(())
+    }
+
     /// Permissionless: pull a fresh price from a Pyth `PriceUpdateV2`
     /// account into the market's `oracle_*` fields. Validates:
     ///   • feed_id matches the configured binding
@@ -9368,7 +9406,22 @@ pub mod flash_book {
         )
         .map_err(|_| error!(FlashBookError::Unauthorized))?;
 
-        // 2. Parse the signed payload for our feed.
+        // AUDIT CR-2 fix: the `feed_id` and `tick_decimals` instruction args are
+        // UNTRUSTED — a Lazer payload is public and carries many feeds, so a
+        // permissionless caller could otherwise apply a wrong-feed or mis-scaled
+        // price to this market. Bind both to the market's authority-set
+        // `oracle_config`, and require the config actually selects the Lazer
+        // source (fails closed for trusted/Pyth configs). `feed_id` and
+        // `tick_decimals` below are forced to the config-approved values.
+        let cfg = &ctx.accounts.oracle_config;
+        require!(
+            cfg.source == state_v3::MarketOracleConfigAccount::SOURCE_LAZER,
+            FlashBookError::Unauthorized
+        );
+        require!(feed_id == cfg.lazer_feed_id, FlashBookError::WrongMarket);
+        require!(tick_decimals == cfg.tick_decimals, FlashBookError::WrongMarket);
+
+        // 2. Parse the signed payload for our (config-bound) feed.
         let px = lazer_oracle::parse_lazer_price(&payload, feed_id)
             .map_err(|_| error!(FlashBookError::OracleTooStale))?;
         require!(px.price > 0, FlashBookError::ZeroPrice);
@@ -10601,6 +10654,14 @@ pub struct InitializeMarket<'info> {
     #[account(
         seeds = [InsuranceFundAccount::SEED],
         bump = insurance_fund.bump,
+        // AUDIT CR-1 fix: market creation is gated to the protocol authority
+        // (the insurance-fund initializer). Without this, ANY signer could
+        // create a market, become its `sequencer`, and fabricate `apply_fill`s
+        // that credit the global trader collateral / drain the shared quote
+        // vault. Restores the curated-markets model the code already assumes
+        // ("no permissionless market creation in V3"). Mirrors the gate on
+        // `InitErMarginAttestation` / `SetTraderFeeTier`.
+        constraint = insurance_fund.authority == authority.key() @ FlashBookError::Unauthorized,
     )]
     pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 
