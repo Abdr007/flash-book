@@ -178,6 +178,7 @@ mod program {
         AutoDeleverage = 89,
         InitPositionLiquidationState = 90,
         SetMarketLiquidationParams = 91,
+        LiquidatePositionV2 = 92,
     }
 
     #[inline(always)]
@@ -276,6 +277,7 @@ mod program {
             x if x == Ix::AutoDeleverage as u8 => instructions::auto_deleverage::process(program_id, accounts, rest),
             x if x == Ix::InitPositionLiquidationState as u8 => instructions::init_position_liquidation_state::process(program_id, accounts, rest),
             x if x == Ix::SetMarketLiquidationParams as u8 => instructions::set_market_liquidation_params::process(program_id, accounts, rest),
+            x if x == Ix::LiquidatePositionV2 as u8 => instructions::liquidate_position_v2::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
