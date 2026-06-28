@@ -67,6 +67,7 @@ pub mod withdraw_flp_capital;
 pub mod init_flp_per_market;
 pub mod flp_deposit_v3;
 pub mod flp_withdraw_v3;
+pub mod record_flp_fill_v3;
 pub mod initialize_flp_exposure;
 pub mod init_lp_position;
 pub mod margin_probe;
