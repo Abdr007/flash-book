@@ -37,6 +37,9 @@ pub const TWAP_ORDER_SEED: &[u8] = b"twap_v3";
 /// `[b"flp_per_market", market]` — a market-scoped FLP-v3 exposure account.
 pub const FLP_PER_MARKET_SEED: &[u8] = b"flp_per_market";
 
+/// `[b"flp_position_v3", exposure, lp]` — an LP's per-market FLP-v3 share position.
+pub const FLP_POSITION_V3_SEED: &[u8] = b"flp_position_v3";
+
 /// `[b"envelope", market]` — a market's envelope (price-band) config account.
 pub const ENVELOPE_CONFIG_SEED: &[u8] = b"envelope";
 
