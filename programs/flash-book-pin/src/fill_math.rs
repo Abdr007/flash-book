@@ -268,6 +268,52 @@ mod position_tests {
     #[test] fn short_realizes_on_drop() { let mut x=p(1,10,100); apply_to_position(&mut x,0,10,80,0).unwrap();
         assert_eq!((x.size_lots,x.realized_pnl_quote_lots),(0,200)); }
 
+    /// State-contract fuzz for the core settlement fn: drive 20k random fills
+    /// through ONE position and assert the invariants `apply_fill` and the OI /
+    /// margin code rely on after EVERY fill: `side ∈ {0,1}`; a flat position
+    /// (size 0) carries zero entry; opening from flat takes the fill's
+    /// side/size/price exactly; a same-side ADD's weighted entry never escapes
+    /// `[min, max]` of the prior entry and the fill price (no weighted-avg
+    /// blow-up / overflow). Deterministic LCG ⇒ reproducible.
+    #[test]
+    fn apply_to_position_state_invariants() {
+        let mut seed: u64 = 0xCAFE_F00D_D15E_A5E5;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let mut x = p(0, 0, 0);
+        for _ in 0..20_000 {
+            let fill_side = (next() % 2) as u8;
+            let fill_size = 1 + next() % 100;
+            let fill_price = 1 + next() % 10_000;
+            let (old_side, old_size, old_entry) = (x.side, x.size_lots, x.entry_price_ticks);
+            apply_to_position(&mut x, fill_side, fill_size, fill_price, 0).unwrap();
+
+            assert!(x.side <= 1, "side out of range");
+            if x.size_lots == 0 {
+                assert_eq!(x.entry_price_ticks, 0, "flat position must have zero entry");
+            }
+            if old_size == 0 {
+                assert_eq!(
+                    (x.side, x.size_lots, x.entry_price_ticks),
+                    (fill_side, fill_size, fill_price),
+                    "open-from-flat must take the fill exactly"
+                );
+            } else if old_side == fill_side {
+                let lo = old_entry.min(fill_price);
+                let hi = old_entry.max(fill_price);
+                assert!(
+                    x.entry_price_ticks >= lo && x.entry_price_ticks <= hi,
+                    "same-side weighted entry {} escaped [{lo}, {hi}]",
+                    x.entry_price_ticks
+                );
+            }
+        }
+    }
+
     /// Integration-level open-interest conservation: drive thousands of random
     /// BALANCED fills (taker on one side, maker on the opposite, same size)
     /// through the REAL `apply_to_position` + `oi_after_leg` path — the exact
