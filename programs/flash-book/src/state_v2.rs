@@ -528,6 +528,34 @@ impl<'a> MarketBookHandle<'a> {
         );
         let (header_bytes, dyn_data) = data[8..].split_at_mut(256);
         let header: &mut MarketBookHeader = bytemuck::from_bytes_mut(header_bytes);
+        // AUDIT (re-audit ER L-2): bounds-check the header's node indices against
+        // the slab capacity. A structurally-invalid book — e.g. one committed by a
+        // malicious or buggy ER sequencer across an undelegate, or any tampered
+        // account — could otherwise drive a raw slab accessor out of bounds
+        // (panic/DoS) or misread an in-bounds-but-bogus node. `NIL` is the valid
+        // empty sentinel; a well-formed book's roots/best/free-list are always
+        // slab node ids < capacity, so this NEVER rejects a valid book — it fails
+        // closed only on corruption.
+        // `DataIndex` is a BYTE OFFSET into the slab (`get_helper` indexes
+        // `data[idx..idx+size]`), so a valid node index is `NIL` or a node-aligned
+        // offset whose whole node fits the slab.
+        let slab_len = dyn_data.len();
+        for idx in [
+            header.bids_root_index,
+            header.bids_best_index,
+            header.asks_root_index,
+            header.asks_best_index,
+            header.claimed_seats_root_index,
+            header.free_list_head_index,
+        ] {
+            let off = idx as usize;
+            require!(
+                idx == NIL
+                    || (off % NODE_TOTAL_BYTES == 0
+                        && off.checked_add(NODE_TOTAL_BYTES).is_some_and(|end| end <= slab_len)),
+                crate::errors::FlashBookError::OutOfRange
+            );
+        }
         Ok(MarketBookHandle { header, data: dyn_data })
     }
 
@@ -1324,6 +1352,39 @@ mod tests {
         let mut huge = vec![0u8; MARKET_BOOK_MAX_TOTAL_BYTES + NODE_TOTAL_BYTES];
         huge[..8].copy_from_slice(&MARKET_BOOK_DISC);
         assert!(MarketBookHandle::from_account_data(&mut huge).is_err());
+    }
+
+    // ER L-2 (re-audit): from_account_data must reject a structurally-corrupt
+    // header node index (OOB or misaligned) — never feed it to a raw slab
+    // accessor — while still accepting a well-formed book.
+    #[test]
+    fn from_account_data_rejects_corrupt_node_index() {
+        // out-of-bounds byte offset
+        let mut data = make_book();
+        {
+            let mut h = MarketBookHandle::from_account_data(&mut data).unwrap();
+            h.header.bids_root_index = 9_999_999;
+        }
+        assert!(
+            MarketBookHandle::from_account_data(&mut data).is_err(),
+            "OOB node index must be rejected"
+        );
+        // in-bounds but not node-aligned
+        let mut data = make_book();
+        {
+            let mut h = MarketBookHandle::from_account_data(&mut data).unwrap();
+            h.header.asks_best_index = 1;
+        }
+        assert!(
+            MarketBookHandle::from_account_data(&mut data).is_err(),
+            "misaligned node index must be rejected"
+        );
+        // a well-formed (empty, all-NIL) book still loads
+        let mut data = make_book();
+        assert!(
+            MarketBookHandle::from_account_data(&mut data).is_ok(),
+            "valid book must still load"
+        );
     }
 
     #[test]
