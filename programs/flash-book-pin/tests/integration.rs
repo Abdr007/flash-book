@@ -8,7 +8,7 @@
 //! Run: `cargo build-sbf` then `SBF_OUT_DIR=target/deploy cargo test --test integration`.
 
 use flash_book_pin::seeds::INSURANCE_SEED;
-use flash_book_pin::state::{INSURANCE_DISC, MARKET_DISC};
+use flash_book_pin::state::{INSURANCE_DISC, MARKET_DISC, POSITION_DISC, TRADER_STATE_DISC};
 use solana_program_test::ProgramTest;
 use solana_sdk::{
     account::Account,
@@ -161,4 +161,137 @@ async fn cover_bad_debt_rejects_wrong_sequencer() {
     let acct = banks.get_account(insurance).await.unwrap().unwrap();
     let balance = u64::from_le_bytes(acct.data[INS_BALANCE..INS_BALANCE + 8].try_into().unwrap());
     assert_eq!(balance, 1_000, "fund untouched on a rejected draw");
+}
+// ─── append to tests/integration.rs ───
+
+const IX_AUTO_DELEVERAGE: u8 = 89;
+const TRADER_STATE_LEN: usize = 200;
+const POSITION_LEN: usize = 128;
+
+// Market offsets
+const MKT_LONG_OI: usize = 56;
+const MKT_SHORT_OI: usize = 64;
+const MKT_TICK: usize = 72;
+const MKT_MARK: usize = 88;
+const MKT_MMR_BPS: usize = 120;
+// Insurance offsets
+const INS_PAUSE_THRESH: usize = 128;
+// TraderState offsets
+const TS_TRADER: usize = 8;
+const TS_COLLATERAL: usize = 40;
+const TS_OPEN_POSITIONS: usize = 52;
+// Position offsets
+const POS_TRADER: usize = 24;
+const POS_MARKET: usize = 56;
+const POS_SIZE: usize = 88;
+const POS_ENTRY: usize = 96;
+const POS_COLLATERAL: usize = 104;
+const POS_SIDE: usize = 120;
+
+fn put_u64(d: &mut [u8], off: usize, v: u64) {
+    d[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+fn put_u32(d: &mut [u8], off: usize, v: u32) {
+    d[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn put_key(d: &mut [u8], off: usize, k: &Pubkey) {
+    d[off..off + 32].copy_from_slice(&k.to_bytes());
+}
+fn get_u64(d: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(d[off..off + 8].try_into().unwrap())
+}
+
+fn market_full(pid: Pubkey, mark: u64, tick: u64, mmr_bps: u32, long_oi: u64, short_oi: u64) -> Account {
+    let mut d = vec![0u8; MARKET_LEN];
+    d[0..8].copy_from_slice(&MARKET_DISC);
+    put_u64(&mut d, MKT_LONG_OI, long_oi);
+    put_u64(&mut d, MKT_SHORT_OI, short_oi);
+    put_u64(&mut d, MKT_TICK, tick);
+    put_u64(&mut d, MKT_MARK, mark);
+    put_u32(&mut d, MKT_MMR_BPS, mmr_bps);
+    rent_account(d, pid)
+}
+fn insurance_full(pid: Pubkey, balance: u64, pause_threshold: u64) -> Account {
+    let mut d = vec![0u8; INSURANCE_LEN];
+    d[0..8].copy_from_slice(&INSURANCE_DISC);
+    put_u64(&mut d, INS_BALANCE, balance);
+    put_u64(&mut d, INS_PAUSE_THRESH, pause_threshold);
+    rent_account(d, pid)
+}
+fn trader_state(pid: Pubkey, trader: Pubkey, collateral: u64, open: u8) -> Account {
+    let mut d = vec![0u8; TRADER_STATE_LEN];
+    d[0..8].copy_from_slice(&TRADER_STATE_DISC);
+    put_key(&mut d, TS_TRADER, &trader);
+    put_u64(&mut d, TS_COLLATERAL, collateral);
+    d[TS_OPEN_POSITIONS] = open;
+    rent_account(d, pid)
+}
+fn position(pid: Pubkey, trader: Pubkey, market: Pubkey, side: u8, size: u64, entry: u64, collateral: u64) -> Account {
+    let mut d = vec![0u8; POSITION_LEN];
+    d[0..8].copy_from_slice(&POSITION_DISC);
+    put_key(&mut d, POS_TRADER, &trader);
+    put_key(&mut d, POS_MARKET, &market);
+    put_u64(&mut d, POS_SIZE, size);
+    put_u64(&mut d, POS_ENTRY, entry);
+    put_u64(&mut d, POS_COLLATERAL, collateral);
+    d[POS_SIDE] = side;
+    rent_account(d, pid)
+}
+
+/// auto_deleverage end-to-end: an UNHEALTHY isolated long is force-closed against
+/// a profitable short counter at the bankruptcy price. Underwater long 10 @200,
+/// isolated collateral 100; mark 100 (mmr 500bps) ⇒ available 100 < required 1050
+/// ⇒ unhealthy. bp = 200 − 100/(10·1) = 190; short counter @250 (> 190) is
+/// eligible. Closing 5: uw loss 100·5/10 = 50 (collat 100→50); ct gain
+/// (250−190)·5 = 300 (cross pool 1000→1300); both sizes 10→5; OI 10→5 each.
+#[tokio::test]
+async fn auto_deleverage_settles_underwater_vs_counter() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (insurance, _b) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let uw_trader = Pubkey::new_unique();
+    let ct_trader = Pubkey::new_unique();
+    let uw_ts = Pubkey::new_unique();
+    let uw_pos = Pubkey::new_unique();
+    let ct_ts = Pubkey::new_unique();
+    let ct_pos = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 100, 1, 500, 10, 10));
+    pt.add_account(insurance, insurance_full(pid, 100, 1_000)); // balance < threshold ⇒ ADL eligible
+    pt.add_account(uw_ts, trader_state(pid, uw_trader, 0, 1));
+    pt.add_account(uw_pos, position(pid, uw_trader, market, 0, 10, 200, 100)); // long, isolated 100
+    pt.add_account(ct_ts, trader_state(pid, ct_trader, 1_000, 1));
+    pt.add_account(ct_pos, position(pid, ct_trader, market, 1, 10, 250, 0)); // short, cross
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_AUTO_DELEVERAGE];
+    data.extend_from_slice(&5u64.to_le_bytes()); // close_size = 5
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new(uw_ts, false),
+            AccountMeta::new(uw_pos, false),
+            AccountMeta::new(ct_ts, false),
+            AccountMeta::new(ct_pos, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &caller], bh);
+    banks.process_transaction(tx).await.unwrap();
+
+    let uwp = banks.get_account(uw_pos).await.unwrap().unwrap();
+    assert_eq!(get_u64(&uwp.data, POS_COLLATERAL), 50, "uw isolated bucket 100 − loss 50");
+    assert_eq!(get_u64(&uwp.data, POS_SIZE), 5, "uw size 10 − 5");
+    let ctt = banks.get_account(ct_ts).await.unwrap().unwrap();
+    assert_eq!(get_u64(&ctt.data, TS_COLLATERAL), 1_300, "ct cross pool 1000 + gain 300");
+    let ctp = banks.get_account(ct_pos).await.unwrap().unwrap();
+    assert_eq!(get_u64(&ctp.data, POS_SIZE), 5, "ct size 10 − 5");
+    let m = banks.get_account(market).await.unwrap().unwrap();
+    assert_eq!(get_u64(&m.data, MKT_LONG_OI), 5, "long_oi 10 − 5");
+    assert_eq!(get_u64(&m.data, MKT_SHORT_OI), 5, "short_oi 10 − 5 (long==short preserved)");
 }
