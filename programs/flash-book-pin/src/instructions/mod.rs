@@ -22,6 +22,8 @@ pub mod cover_bad_debt;
 pub mod set_position_cross;
 pub mod set_position_isolated;
 pub mod liquidate_portfolio_v2;
+pub mod place_jit_liquidation_offer;
+pub mod cancel_jit_liquidation_offer;
 pub mod withdraw_collateral;
 pub mod open_trader_sub_account;
 pub mod transfer_collateral;
