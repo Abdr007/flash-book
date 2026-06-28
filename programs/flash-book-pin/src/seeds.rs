@@ -57,6 +57,7 @@ pub const HAIRCUT_SEED: &[u8] = b"haircut";
 
 /// `[b"position_haircut", market, position]` — a position's haircut state.
 pub const POSITION_HAIRCUT_SEED: &[u8] = b"position_haircut";
+pub const POSITION_LIQ_STATE_SEED: &[u8] = b"position_liq";
 
 /// `[b"session", owner, session_signer]` — a delegated session-signing token.
 pub const SESSION_SEED: &[u8] = b"session";

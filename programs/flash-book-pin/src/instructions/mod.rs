@@ -15,6 +15,7 @@ pub mod init_market_book;
 pub mod expand_market_book;
 pub mod reap_expired_orders;
 pub mod auto_deleverage;
+pub mod init_position_liquidation_state;
 pub mod withdraw_collateral;
 pub mod open_trader_sub_account;
 pub mod transfer_collateral;
