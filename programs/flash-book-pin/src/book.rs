@@ -234,6 +234,40 @@ pub const MAX_SEQ_ENCODABLE: u64 = (1u64 << ORDER_ID_SEQ_BITS) - 1;
 /// ordering monotonic; the old code masked, which would wrap an out-of-range
 /// price to a tiny key and mis-order the book). Seq is masked to 24 bits;
 /// placement enforces the 24-bit ceiling so masking can never alias a live id.
+/// Anti-stuffing band check: is `price_ticks` within `max_dev_bps` of `anchor`?
+/// `anchor == 0` (no price anchor yet) → always true (skipped). Pure +
+/// host-tested; mirrors the anchor `flp_quoter::price_within_band`. `u128`
+/// intermediates so the bps comparison can't overflow.
+pub fn price_within_band(anchor_ticks: u64, price_ticks: u64, max_dev_bps: u32) -> bool {
+    if anchor_ticks == 0 {
+        return true;
+    }
+    let diff = anchor_ticks.abs_diff(price_ticks) as u128;
+    let allowed = (anchor_ticks as u128) * (max_dev_bps as u128);
+    diff * (crate::constants::BPS_DENOM as u128) <= allowed
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::price_within_band;
+
+    #[test]
+    fn within_band_skips_on_zero_anchor_and_enforces_otherwise() {
+        // anchor 0 → always in band (no price reference yet).
+        assert!(price_within_band(0, 999_999, 1));
+        // anchor 1000, 50% band → [500, 1500] inclusive.
+        assert!(price_within_band(1_000, 1_500, 5_000));
+        assert!(price_within_band(1_000, 500, 5_000));
+        assert!(price_within_band(1_000, 1_000, 5_000));
+        // just outside.
+        assert!(!price_within_band(1_000, 1_501, 5_000));
+        assert!(!price_within_band(1_000, 499, 5_000));
+        // 0% band → only exact.
+        assert!(price_within_band(1_000, 1_000, 0));
+        assert!(!price_within_band(1_000, 1_001, 0));
+    }
+}
+
 pub fn encode_order_id(price_ticks: u64, seq: u64, side_is_bid: bool) -> u64 {
     let price = price_ticks.min(MAX_PRICE_TICKS_ENCODABLE);
     let seq_low = seq & MAX_SEQ_ENCODABLE;
