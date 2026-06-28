@@ -78,9 +78,56 @@ pub fn oi_after_leg(
     (long_oi, short_oi)
 }
 
+/// Open-interest update for an `apply_flp_fill` settlement, where the **FLP
+/// pool is the maker** and has no on-chain `Position` (its per-market exposure
+/// side/size is tracked elsewhere / deferred). The taker leg is precise
+/// (`oi_after_leg`); the pool, being the taker's exact counterparty for this
+/// fill, contributes the MIRROR of the taker's per-side deltas — adding the
+/// taker's short-delta to `long_oi` and its long-delta to `short_oi`. This
+/// keeps `long_oi == short_oi` (the conservation invariant) across open / close
+/// / flip without needing the pool's tracked position. Pure + host-tested.
+///
+/// (The prior code added the fill size to ONLY the taker side, breaking the
+/// invariant on every FLP fill — `verify_market_invariants` would auto-pause
+/// the market.)
+#[inline]
+pub fn oi_after_flp_fill(
+    long_oi: u64,
+    short_oi: u64,
+    t_old_side: u8,
+    t_old_size: u64,
+    t_new_side: u8,
+    t_new_size: u64,
+) -> (u64, u64) {
+    let (l1, s1) = oi_after_leg(long_oi, short_oi, t_old_side, t_old_size, t_new_side, t_new_size);
+    // Taker's per-side deltas.
+    let dl = l1 as i128 - long_oi as i128;
+    let ds = s1 as i128 - short_oi as i128;
+    // Pool (maker) mirror: +ds to long, +dl to short. Total long-delta = dl+ds
+    // = total short-delta, so equality is preserved.
+    let new_long = (l1 as i128 + ds).max(0) as u64;
+    let new_short = (s1 as i128 + dl).max(0) as u64;
+    (new_long, new_short)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FLP fill: taker leg + pool mirror must preserve long_oi == short_oi.
+    #[test]
+    fn flp_oi_conserved() {
+        // Taker opens long 10 from a flat book; pool (maker) takes short 10.
+        assert_eq!(oi_after_flp_fill(0, 0, 0, 0, 0, 10), (10, 10));
+        // Taker opens short 10; pool takes long 10.
+        assert_eq!(oi_after_flp_fill(0, 0, 1, 0, 1, 10), (10, 10));
+        // Taker closes long 10 → 0; pool closes its short.
+        assert_eq!(oi_after_flp_fill(10, 10, 0, 10, 0, 0), (0, 0));
+        // Taker partial reduce long 10 → 4; pool reduces short to 4.
+        assert_eq!(oi_after_flp_fill(10, 10, 0, 10, 0, 4), (4, 4));
+        // Taker flips short 5 → long 5; pool flips long 5 → short 5. Unchanged.
+        assert_eq!(oi_after_flp_fill(5, 5, 1, 5, 0, 5), (5, 5));
+    }
 
     /// Apply a balanced fill (taker on `t_side`, maker on `1-t_side`, both by
     /// `size`) to both legs and assert long_oi == short_oi is preserved.
