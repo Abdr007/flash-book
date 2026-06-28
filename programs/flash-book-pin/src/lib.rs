@@ -147,6 +147,7 @@ mod program {
         InitializeSideAccrual = 59,
         CreateVault = 60,
         InitializeHaircutState = 61,
+        VerifyHaircutInvariants = 62,
     }
 
     #[inline(always)]
@@ -215,6 +216,7 @@ mod program {
             x if x == Ix::InitializeSideAccrual as u8 => instructions::initialize_side_accrual::process(program_id, accounts, rest),
             x if x == Ix::CreateVault as u8 => instructions::create_vault::process(program_id, accounts, rest),
             x if x == Ix::InitializeHaircutState as u8 => instructions::initialize_haircut_state::process(program_id, accounts, rest),
+            x if x == Ix::VerifyHaircutInvariants as u8 => instructions::verify_haircut_invariants::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

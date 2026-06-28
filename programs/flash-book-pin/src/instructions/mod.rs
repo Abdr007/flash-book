@@ -36,6 +36,7 @@ pub mod update_fee_tiers;
 pub mod init_market_oracle_config;
 pub mod initialize_side_accrual;
 pub mod initialize_haircut_state;
+pub mod verify_haircut_invariants;
 pub mod create_vault;
 pub mod init_market_leverage_tiers;
 pub mod update_market_leverage_tiers;
