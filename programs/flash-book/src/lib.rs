@@ -1176,6 +1176,10 @@ pub mod flash_book {
                 use matcher::fill_commitment as fc;
                 let market_bytes = fc_market_bytes;
                 let taker_bytes = trader_pk.to_bytes();
+                // §3.2: commit the taker order's actual JIT flag (bit3) so the
+                // sequencer cannot flip `taker_was_jit` at settlement to skim/deny
+                // the JIT rebate bonus. Settlement must present the same value.
+                let taker_was_jit = flags & (1 << 3) != 0;
                 let mut fc_data = fc_acct.try_borrow_mut_data()?;
                 for f in &fills {
                     let idx = fc::buffer_next_index(&fc_data);
@@ -1189,6 +1193,7 @@ pub mod flash_book {
                         sub_index,
                         f.maker_sub_index,
                         idx,
+                        taker_was_jit,
                     );
                     let commit =
                         solana_keccak_hasher::hashv(&[&pre[..]]).0;
@@ -3638,6 +3643,9 @@ pub mod flash_book {
                 taker_sub_index,
                 maker_sub_index,
                 idx,
+                // §3.2: the sequencer's `taker_was_jit` is now bound to the
+                // matcher's committed value — a flip yields FillNotCommitted.
+                taker_was_jit,
             );
             let recomputed = solana_keccak_hasher::hashv(&[&pre[..]]).0;
             fc::buffer_settle(&mut fc_data, &market_bytes, recomputed).map_err(|e| match e {

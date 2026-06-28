@@ -45,7 +45,7 @@ pub const FILL_PREIMAGE_LEN: usize = 136;
 
 /// Domain-separation tag so a fill commitment can never collide with any other
 /// keccak preimage the program hashes.
-pub const FILL_COMMIT_DOMAIN: [u8; 8] = *b"FBfillC1";
+pub const FILL_COMMIT_DOMAIN: [u8; 8] = *b"FBfillC2";
 
 /// Pure ring-state-machine errors. The handler maps these onto `FlashBookError`
 /// (`FillRingFull`/`FillRingEmpty`/`FillNotCommitted`/`FillRingCorrupt`).
@@ -78,7 +78,18 @@ pub enum FillRingError {
 /// | 107 |   8 | size_lots         |
 /// | 115 |   8 | price_ticks       |
 /// | 123 |   8 | produced_index    |
-/// | 131 |   5 | zero pad          |
+/// | 131 |   1 | taker_was_jit     |  (AUDIT §3.2: now bound — was zero pad)
+/// | 132 |   4 | zero pad          |
+///
+/// §3.2 fill-authenticity: `taker_was_jit` drives a real value transfer at
+/// settlement (`market.params.jit_bonus_rebate_bps` added to the maker rebate),
+/// so it is part of the fill's economic content and MUST be committed. Before
+/// this it was an unbound `apply_fill` arg, letting a compromised sequencer flip
+/// it on a fully-committed fill to skim/deny the JIT bonus while the keccak still
+/// matched. The matcher commits the taker order's actual JIT flag; settlement
+/// must present the same value or the commitment fails (`FillNotCommitted`). The
+/// domain tag is bumped (C1→C2) so any pre-upgrade in-flight commitment is
+/// invalidated rather than silently reinterpreted.
 #[allow(clippy::too_many_arguments)]
 pub fn fill_preimage(
     market: &[u8; 32],
@@ -90,6 +101,7 @@ pub fn fill_preimage(
     taker_sub_index: u8,
     maker_sub_index: u8,
     produced_index: u64,
+    taker_was_jit: bool,
 ) -> [u8; FILL_PREIMAGE_LEN] {
     let mut p = [0u8; FILL_PREIMAGE_LEN];
     p[0..8].copy_from_slice(&FILL_COMMIT_DOMAIN);
@@ -102,7 +114,8 @@ pub fn fill_preimage(
     p[107..115].copy_from_slice(&size_lots.to_le_bytes());
     p[115..123].copy_from_slice(&price_ticks.to_le_bytes());
     p[123..131].copy_from_slice(&produced_index.to_le_bytes());
-    // bytes 131..136 stay zero
+    p[131] = taker_was_jit as u8;
+    // bytes 132..136 stay zero
     p
 }
 
@@ -489,6 +502,29 @@ mod tests {
         let mut a = [0u8; 32];
         a[0] = n;
         a
+    }
+
+    // §3.2 regression: the commitment preimage MUST be sensitive to
+    // `taker_was_jit`. Two otherwise-identical fills differing only in that flag
+    // must produce different preimages (and thus different keccak commitments), so
+    // a sequencer that flips the flag at settlement fails the ring's recompute
+    // (`NotCommitted`). Pre-fix, byte 131 was zero pad and the flag was unbound.
+    #[test]
+    fn preimage_binds_taker_was_jit() {
+        let m = [1u8; 32];
+        let t = [2u8; 32];
+        let k = [3u8; 32];
+        let base = |jit| fill_preimage(&m, &t, &k, 0, 10, 94_000, 1, 2, 7, jit);
+        let p_false = base(false);
+        let p_true = base(true);
+        assert_ne!(p_false, p_true, "taker_was_jit must change the preimage");
+        // Exactly one byte (131) differs.
+        assert_eq!(p_false[131], 0);
+        assert_eq!(p_true[131], 1);
+        let diff = p_false.iter().zip(p_true.iter()).filter(|(a, b)| a != b).count();
+        assert_eq!(diff, 1, "only the taker_was_jit byte should differ");
+        // Domain bumped so pre-upgrade commitments can't be reinterpreted.
+        assert_eq!(&p_false[0..8], b"FBfillC2");
     }
 
     #[test]
