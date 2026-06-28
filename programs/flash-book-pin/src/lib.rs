@@ -143,6 +143,7 @@ mod program {
         BurnMarketAuthority = 55,
         SetEnvelopeConfig = 56,
         VerifyEnvelopeConfig = 57,
+        InitMarketOracleConfig = 58,
     }
 
     #[inline(always)]
@@ -207,6 +208,7 @@ mod program {
             x if x == Ix::BurnMarketAuthority as u8 => instructions::burn_market_authority::process(program_id, accounts, rest),
             x if x == Ix::SetEnvelopeConfig as u8 => instructions::set_envelope_config::process(program_id, accounts, rest),
             x if x == Ix::VerifyEnvelopeConfig as u8 => instructions::verify_envelope_config::process(program_id, accounts, rest),
+            x if x == Ix::InitMarketOracleConfig as u8 => instructions::init_market_oracle_config::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

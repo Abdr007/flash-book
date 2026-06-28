@@ -486,6 +486,31 @@ const _: () = assert!(core::mem::size_of::<FlpExposurePerMarketV3>() == 136);
 const _: () = assert!(core::mem::size_of::<FlpPositionV3>() == 104);
 const _: () = assert!(core::mem::size_of::<LpPosition>() == 104);
 
+pub const ORACLE_CONFIG_DISC: [u8; 8] = [0x09, 0xAC, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// Per-market oracle config. `source`: 0 = trusted `update_oracle` (the simplified
+/// port default), 1 = Pyth pull (the Pyth consumer is a later batch). Grouped-by-
+/// alignment, padding-free `repr(C)` at 88 bytes (a fresh port-only account).
+#[repr(C)]
+pub struct MarketOracleConfig {
+    pub disc: [u8; 8],
+    pub market: Pubkey,
+    /// 32-byte Pyth feed identifier (when `source == 1`).
+    pub pyth_price_feed_id: [u8; 32],
+    pub max_staleness_seconds: u32,
+    pub max_confidence_bps: u32,
+    /// Tick decimal scaling (`scale_exp = pyth.exponent + tick_decimals`).
+    pub tick_decimals: i8,
+    pub source: u8,
+    pub bump: u8,
+    pub _pad: [u8; 5],
+}
+const _: () = assert!(core::mem::size_of::<MarketOracleConfig>() == 88);
+
+/// `source` values for `MarketOracleConfig`.
+pub const ORACLE_SOURCE_TRUSTED: u8 = 0;
+pub const ORACLE_SOURCE_PYTH: u8 = 1;
+
 pub const ENVELOPE_CONFIG_DISC: [u8; 8] = [0xE0, 0x0E, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
 
 /// Per-market envelope (price-band / risk-invariant) config. The 7 envelope

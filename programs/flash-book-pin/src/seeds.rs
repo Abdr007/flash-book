@@ -39,3 +39,6 @@ pub const FLP_PER_MARKET_SEED: &[u8] = b"flp_per_market";
 
 /// `[b"envelope", market]` — a market's envelope (price-band) config account.
 pub const ENVELOPE_CONFIG_SEED: &[u8] = b"envelope";
+
+/// `[b"oracle_config", market]` — a market's oracle config account.
+pub const ORACLE_CONFIG_SEED: &[u8] = b"oracle_config";
