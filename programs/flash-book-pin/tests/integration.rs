@@ -1281,3 +1281,46 @@ async fn vault_open_trader_state_rejects_non_strategist() {
     assert!(r.is_err(), "non-strategist must be rejected");
     assert!(banks.get_account(vault_ts).await.unwrap().is_none(), "no TraderState created on reject");
 }
+
+// ─── init_vault_position_v3 guard e2e ───
+// Creates the position PDA via create_pda CPI (build-sbf only), but the
+// vault disc check runs BEFORE the CPI: a vault account with the wrong
+// discriminator must be rejected cleanly, with no position created.
+const IX_INIT_VAULT_POSITION: u8 = 107;
+
+#[tokio::test]
+async fn init_vault_position_rejects_bad_vault_disc() {
+    let pid = Pubkey::new_unique();
+    let depositor = Keypair::new();
+    let vault = Pubkey::new_unique();
+    let (position, _) = Pubkey::find_program_address(
+        &[b"vault_position_v3", &vault.to_bytes(), &depositor.pubkey().to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    // Vault-sized account owned by the program but with a GARBAGE discriminator.
+    let mut bad = vec![0u8; 152];
+    bad[0..8].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0]);
+    pt.add_account(vault, rent_account(bad, pid));
+    pt.add_account(
+        depositor.pubkey(),
+        Account { lamports: 5_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(depositor.pubkey(), true),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8; 32]), false),
+        ],
+        data: vec![IX_INIT_VAULT_POSITION],
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &depositor], bh))
+        .await;
+    assert!(r.is_err(), "bad vault discriminator must be rejected");
+    assert!(banks.get_account(position).await.unwrap().is_none(), "no position created on reject");
+}
