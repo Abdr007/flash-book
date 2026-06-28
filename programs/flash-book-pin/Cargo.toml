@@ -20,3 +20,11 @@ overflow-checks = true
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+[dev-dependencies]
+solana-program-test = { version = "3.1", features = ["agave-unstable-api"] }
+solana-sdk = "3.0"
+tokio = { version = "1", features = ["full"] }
+# Pin the transitive transaction-error to 3.2.0 — 3.3.0 added a variant
+# solana-runtime 3.1.12 does not match (non-exhaustive compile error).
+solana-transaction-error = "=3.2.0"
