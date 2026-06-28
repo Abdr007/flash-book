@@ -1402,3 +1402,71 @@ async fn vault_deposit_rejects_when_deposits_closed() {
         .await;
     assert!(r.is_err(), "deposit into a closed vault must be rejected");
 }
+
+// ─── vault_withdraw_v3 flat-gate e2e ───
+// Withdraw burns shares + PDA-signed SPL release (build-sbf only). The H-6
+// "redemption requires flat" gate runs BEFORE the release: a vault holding an
+// open position (open_positions != 0) must reject redemptions, so an early
+// depositor can't exit at an inflated NAV. (payout correctness is covered by
+// vault_math.) Reuses vault_with_accept / vault_position / trader_state helpers.
+const IX_VAULT_WITHDRAW: u8 = 109;
+
+fn vault_position_shares(pid: Pubkey, vault: Pubkey, depositor: Pubkey, shares: u64) -> Account {
+    let mut d = vec![0u8; 120];
+    d[0..8].copy_from_slice(&VAULT_POSITION_V3_DISC);
+    put_key(&mut d, 8, &vault);
+    put_key(&mut d, 40, &depositor);
+    put_u64(&mut d, 72, shares); // shares
+    rent_account(d, pid)
+}
+
+#[tokio::test]
+async fn vault_withdraw_rejects_when_not_flat() {
+    let pid = Pubkey::new_unique();
+    let depositor = Keypair::new();
+    let strategist = Pubkey::new_unique();
+    let vault_id = 0u8;
+    let (vault, _) = Pubkey::find_program_address(&[VAULT_SEED, &strategist.to_bytes(), &[vault_id]], &pid);
+    let (vault_ts, _) = Pubkey::find_program_address(&[TRADER_STATE_SEED, &vault.to_bytes()], &pid);
+    let (position, _) = Pubkey::find_program_address(
+        &[VAULT_POSITION_SEED, &vault.to_bytes(), &depositor.pubkey().to_bytes()], &pid);
+    let (insurance, _) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let quote_vault = Pubkey::new_unique();
+    let depositor_ata = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(vault, vault_with_accept(pid, strategist, vault_id, 1, 100)); // 100 shares
+    pt.add_account(vault_ts, trader_state(pid, vault, 1_000, 1)); // NAV 1000, open_positions=1 (NOT flat)
+    pt.add_account(position, vault_position_shares(pid, vault, depositor.pubkey(), 50)); // owns 50
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(
+        depositor.pubkey(),
+        Account { lamports: 5_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_VAULT_WITHDRAW];
+    data.extend_from_slice(&10u64.to_le_bytes()); // burn 10 (<= owned 50)
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(depositor.pubkey(), true),
+            AccountMeta::new(vault, false),
+            AccountMeta::new(vault_ts, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new(quote_vault, false),
+            AccountMeta::new(depositor_ata, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(TOKEN_PROGRAM_ID), false),
+        ],
+        data,
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &depositor], bh))
+        .await;
+    assert!(r.is_err(), "redemption from a non-flat vault must be rejected (H-6)");
+    // shares untouched on reject.
+    let p = banks.get_account(position).await.unwrap().unwrap();
+    assert_eq!(get_u64(&p.data, 72), 50, "shares unchanged on reject");
+}
