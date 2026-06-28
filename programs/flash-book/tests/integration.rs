@@ -4737,31 +4737,10 @@ async fn er_delegation_rejects_non_authority() {
         dbg.contains("Custom(7100)"),
         "delegate_fill_commitment must reject a non-authority with Unauthorized, got: {dbg}"
     );
-
-    // undelegate_fill_commitment with a ROGUE authority → same auth gate.
-    let und = chaos_send(
-        &mut ctx,
-        build_ix(
-            flash_book::instruction::UndelegateFillCommitment {},
-            vec![
-                AccountMeta::new(rogue.pubkey(), true),
-                AccountMeta::new(market_pda, false),
-                AccountMeta::new(fc_pda, false),
-                AccountMeta::new_readonly(program_id(), false),
-                AccountMeta::new(d1, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-                AccountMeta::new_readonly(to_sdk(flash_book::er::DELEGATION_PROGRAM_ID), false),
-            ],
-        ),
-        &payer.pubkey(),
-        &[&payer, &rogue],
-    )
-    .await;
-    let dbg2 = format!("{und:?}");
-    assert!(
-        dbg2.contains("Custom(7100)"),
-        "undelegate_fill_commitment must reject a non-authority with Unauthorized, got: {dbg2}"
-    );
+    // NOTE: the former `undelegate_fill_commitment` rogue-rejection sub-test was
+    // removed — that instruction was deleted in the dead-code cleanup (undelegation
+    // is validator-driven: the supported path is `commit_and_undelegate_fill_commitment`
+    // finalized by `process_undelegation`).
 }
 
 // ════════════════════════════════════════════════════════════════════════
