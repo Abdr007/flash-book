@@ -5,7 +5,7 @@ A faithful, zero-alloc `no_std` (on the SBF target) Pinocchio port of the Anchor
 (its `program_id` comes from the runtime — no hardcoded `declare_id!`), so it
 deploys to its own address and never collides with the Anchor program.
 
-**Progress: 79 / 134 instructions** (Ix tags `0..=78`). The Anchor program is
+**Progress: 89 / 134 instructions** (Ix tags `0..=88`). The Anchor program is
 unchanged.
 
 ## Port conventions
@@ -22,11 +22,46 @@ unchanged.
   `assert_pda` / `assert_disc` / `assert_market` / `assert_uninitialized` /
   `assert_position`, applied before any pointer-cast.
 - Pure math (risk, fill, fees, tiers, envelope, haircut, side-accrual, leverage,
-  solvency) is **host-unit-tested** (393 tests); handlers are SBF-only and
-  verified by `cargo build-sbf` + anchor parity.
-- CI gates every merge on 4 checks: Rust, `cargo build-sbf`, Kani, Lean.
+  solvency, liquidation) is **host-unit-tested** (406 tests); handlers are
+  SBF-only and verified by `cargo build-sbf` + anchor parity.
+- CI gates every merge on 4 checks: Rust, `cargo build-sbf`, Kani, Lean. The
+  Kani check runs the Anchor proofs **and** this crate's **12 harnesses** (5
+  haircut, 2 open-interest conservation, 5 liquidation health-price), so the
+  port's formal invariants are CI-enforced on every PR.
 
-## Ported instructions (79)
+## Conservation audit + liquidation FV (2026-06-28)
+
+A focused audit of the already-ported settlement/fund surface for value-
+conservation correctness. Three real bugs found and fixed, plus hardening and
+formal/property coverage:
+
+- **`apply_fill` open-interest** — added the fill size to ONLY the taker side,
+  breaking `long_oi == short_oi` (the invariant `verify_market_invariants` auto-
+  pauses on). Fixed via host-tested `fill_math::oi_after_leg` (remove old + add
+  new, per leg), Kani-proven (`proof_fill_two_leg_oi_balanced`).
+- **`apply_flp_fill` open-interest** — same class; the FLP pool is the maker
+  with no on-chain position. Fixed via `oi_after_flp_fill` (taker leg + pool
+  mirror), Kani-proven (`proof_flp_fill_oi_balanced`).
+- **`settle_funding` RISK-1** — funding (entry-priced, lazy) is NOT zero-sum, so
+  it must move the haircut solvency residual `V − C_tot − I`; the path omitted
+  this entirely. Added the residual delta (threading the haircut PDA) + an i64
+  clamp (a received credit past `u64::MAX` had wrapped) + isolated/cross routing.
+- **`update_oracle`** — added an OPTIONAL envelope rate-limit gate so a buggy/
+  compromised sequencer cannot jump the mark far enough in one update to mass-
+  liquidate or drain via funding.
+- **Liquidation pure-math foundation** — `assess_margin` (health) +
+  `worse_of_health_price` / `health_price_with_staleness` (conservative dual-
+  source price, P-LIQ-1/2, 5 Kani proofs) + `compute_shortfall` (bankruptcy
+  resolution, 50k-case invariant fuzz). Only the fund-moving liquidation
+  instruction wiring remains.
+
+Audited clean (no bug): deposit / withdraw / transfer collateral (C_tot-neutral),
+FLP-v3 deposit/withdraw (capital-based shares, round-trip never creates value —
+200k-case test), insurance withdraw (floored at pause threshold), haircut
+convert / release (exact value conservation), the `place_taker_order` matcher
+(book-only; settlement is `apply_fill`), and the fee path.
+
+## Ported instructions (89)
 
 ### Core lifecycle & matching-settlement (hardened)
 `ApplyFill` (0), `SettleFunding` (1), `PlaceLimitOrder` (2), `CancelOrder` (3),
