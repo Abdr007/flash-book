@@ -182,7 +182,10 @@ pub struct Insurance {
     /// later batch). `0` = disabled. Set by `set_insurance_pause_threshold`.
     /// Carved from `_reserved`; size unchanged (200 bytes).
     pub pause_threshold_quote_lots: u64,
-    pub _reserved: [u8; 64],
+    /// Cumulative quote-lots paid OUT of the fund via `withdraw_insurance_fund`
+    /// (informational). 8-aligned. Carved from `_reserved`; size unchanged (200).
+    pub total_payouts: u64,
+    pub _reserved: [u8; 56],
 }
 
 pub const FEE_TIERS_DISC: [u8; 8] = [0xFE, 0xE7, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01];
