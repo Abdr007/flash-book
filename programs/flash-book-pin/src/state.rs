@@ -301,6 +301,11 @@ impl FlpExposure {
 }
 
 pub const TRIGGER_ORDER_V3_DISC: [u8; 8] = [0x71, 0x67, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+/// `TriggerOrderV3.flags` bits. ACTIVE is set on placement and cleared when the
+/// trigger fires (one-shot). REDUCE_ONLY marks a position-closing trigger
+/// (execution is a follow-up).
+pub const TRIGGER_FLAG_ACTIVE: u8 = 0x01;
+pub const TRIGGER_FLAG_REDUCE_ONLY: u8 = 0x02;
 pub const TWAP_ORDER_V3_DISC: [u8; 8] = [0x77, 0xA9, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
 pub const ICEBERG_ORDER_V3_DISC: [u8; 8] = [0x1C, 0xEB, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
 

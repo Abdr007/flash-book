@@ -746,3 +746,65 @@ async fn liquidate_position_v2_consumes_jit_offer() {
     let o = banks.get_account(jit_offer).await.unwrap().unwrap();
     assert_eq!(get_u64(&o.data, JIT_REMAINING_OFF), 45, "offer remaining 50 − closed 5 (JIT auction fired)");
 }
+
+// ─── execute_trigger_order e2e ───
+use flash_book_pin::state::TRIGGER_ORDER_V3_DISC;
+const IX_EXECUTE_TRIGGER: u8 = 99;
+
+fn trigger_acct(pid: Pubkey, trader: Pubkey, market: Pubkey, side: u8, kind: u8, size: u64, trigger_price: u64, limit: u64) -> Account {
+    let mut d = vec![0u8; 136];
+    d[0..8].copy_from_slice(&TRIGGER_ORDER_V3_DISC);
+    put_key(&mut d, 8, &trader);   // trader @ 8
+    put_key(&mut d, 40, &market);  // market @ 40
+    put_u64(&mut d, 72, size);     // size_lots
+    put_u64(&mut d, 80, trigger_price); // trigger_price_ticks
+    put_u64(&mut d, 88, limit);    // limit_price_ticks
+    d[122] = side;
+    d[123] = kind;
+    d[124] = 0x01; // FLAG_ACTIVE
+    rent_account(d, pid)
+}
+
+/// execute_trigger_order: an ACTIVE kind-1 trigger (fire when mark >= 100) with
+/// mark 100 fires — its limit order is injected into the book and FLAG_ACTIVE is
+/// cleared (one-shot).
+#[tokio::test]
+async fn execute_trigger_order_fires_and_injects() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let trader = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let (market_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+    let trigger = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 100, 1, 500, 0, 0)); // mark 100
+    pt.add_account(market_book, init_book(pid, market, base, quote, book_bump));
+    pt.add_account(trigger, trigger_acct(pid, trader, market, 0, 1, 5, 100, 100)); // kind1, trig 100, mark 100 → fired
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(trigger, false),
+        ],
+        data: vec![IX_EXECUTE_TRIGGER],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await
+        .unwrap();
+
+    let mut bd = banks.get_account(market_book).await.unwrap().unwrap().data;
+    let handle = MarketBookHandle::from_account_data(&mut bd).unwrap();
+    assert_eq!(handle.header.total_orders_active, 1, "trigger order injected");
+    let t = banks.get_account(trigger).await.unwrap().unwrap();
+    assert_eq!(t.data[124] & 0x01, 0, "FLAG_ACTIVE cleared (one-shot)");
+}

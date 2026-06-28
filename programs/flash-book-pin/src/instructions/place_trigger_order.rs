@@ -114,7 +114,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         t.trigger_id = trigger_id;
         t.side = side;
         t.kind = kind;
-        t.flags = flags;
+        t.flags = flags | crate::state::TRIGGER_FLAG_ACTIVE;
         t.sub_index = sub_index;
         t._reserved = [0u8; 10];
     }
