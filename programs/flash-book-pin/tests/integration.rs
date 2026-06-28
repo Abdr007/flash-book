@@ -514,3 +514,83 @@ async fn set_position_isolated_splits_collateral_and_stays_healthy() {
     let tp = banks.get_account(target_position).await.unwrap().unwrap();
     assert_eq!(get_u64(&tp.data, POS_COLLATERAL), 100, "target isolated bucket = 100");
 }
+
+// ─── liquidate_portfolio_v2 e2e ───
+const IX_LIQUIDATE_PORTFOLIO_V2: u8 = 96;
+
+/// liquidate_portfolio_v2 e2e: a CROSS trader with two underwater longs (exec +
+/// sibling, each 10 @200; mark 100, mmr 500bps) and a tiny cross pool (100). The
+/// full-portfolio required ≈ 2·1050 = 2100 ≫ 100 ⇒ unhealthy, so liquidating
+/// injects ONE forced-liquidation order (order_type 3, full exec size) into the
+/// execution book. Asserts the book now holds exactly one active order.
+#[tokio::test]
+async fn liquidate_portfolio_v2_injects_on_unhealthy_portfolio() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let caller = Keypair::new();
+    let trader = Pubkey::new_unique();
+    let exec_market = Pubkey::new_unique();
+    let (exec_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &exec_market.to_bytes()], &pid);
+    let ts = Pubkey::new_unique();
+    let exec_position = Pubkey::new_unique();
+    let market2 = Pubkey::new_unique();
+    let sibling = Pubkey::new_unique();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+
+    let mut exec_market_acct = market_full(pid, 100, 1, 500, 0, 0);
+    put_key(&mut exec_market_acct.data, MKT_AUTHORITY, &authority.pubkey());
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(exec_market, exec_market_acct);
+    pt.add_account(exec_book, init_book(pid, exec_market, base, quote, book_bump));
+    pt.add_account(ts, trader_state(pid, trader, 100, 2)); // cross pool 100, 2 open
+    pt.add_account(exec_position, position(pid, trader, exec_market, 0, 10, 200, 0)); // cross long
+    pt.add_account(market2, market_full(pid, 100, 1, 500, 0, 0));
+    pt.add_account(sibling, position(pid, trader, market2, 0, 10, 200, 0)); // cross long
+    let (banks, payer, bh) = pt.start().await;
+
+    // set penalty 100bps (reward/auction/cooldown 0)
+    let mut sp = vec![IX_SET_LIQ_PARAMS];
+    sp.extend_from_slice(&100u32.to_le_bytes());
+    sp.extend_from_slice(&0u32.to_le_bytes());
+    sp.extend_from_slice(&0u64.to_le_bytes());
+    sp.extend_from_slice(&0u64.to_le_bytes());
+    let ix_p = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new(exec_market, false),
+        ],
+        data: sp,
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix_p], Some(&payer.pubkey()), &[&payer, &authority], bh))
+        .await
+        .unwrap();
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new_readonly(exec_market, false),
+            AccountMeta::new(exec_book, false),
+            AccountMeta::new_readonly(ts, false),
+            AccountMeta::new_readonly(exec_position, false),
+            AccountMeta::new_readonly(market2, false),
+            AccountMeta::new_readonly(sibling, false),
+        ],
+        data: vec![IX_LIQUIDATE_PORTFOLIO_V2],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await
+        .unwrap();
+
+    let mut bd = banks.get_account(exec_book).await.unwrap().unwrap().data;
+    let handle = MarketBookHandle::from_account_data(&mut bd).unwrap();
+    assert_eq!(handle.header.total_orders_active, 1, "one liquidation order injected");
+}
