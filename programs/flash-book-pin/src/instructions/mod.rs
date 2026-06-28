@@ -52,6 +52,7 @@ pub mod verify_haircut_invariants;
 pub mod create_vault;
 pub mod init_market_leverage_tiers;
 pub mod update_market_leverage_tiers;
+pub mod verify_leverage_tiers;
 pub mod verify_market_invariants;
 pub mod verify_collateral_solvency;
 pub mod withdraw_flp_capital;
