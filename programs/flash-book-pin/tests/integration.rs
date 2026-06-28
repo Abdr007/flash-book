@@ -808,3 +808,69 @@ async fn execute_trigger_order_fires_and_injects() {
     let t = banks.get_account(trigger).await.unwrap().unwrap();
     assert_eq!(t.data[124] & 0x01, 0, "FLAG_ACTIVE cleared (one-shot)");
 }
+
+// ─── execute_twap_slice e2e ───
+use flash_book_pin::state::TWAP_ORDER_V3_DISC;
+const IX_EXECUTE_TWAP: u8 = 100;
+const TWAP_EXECUTED: usize = 88; // size_executed_lots
+const TWAP_FLAGS: usize = 147;
+
+fn twap_acct(pid: Pubkey, trader: Pubkey, market: Pubkey, side: u8, slice: u64, total: u64, limit: u64) -> Account {
+    let mut d = vec![0u8; 152];
+    d[0..8].copy_from_slice(&TWAP_ORDER_V3_DISC);
+    put_key(&mut d, 8, &trader);
+    put_key(&mut d, 40, &market);
+    put_u64(&mut d, 72, slice); // slice_size_lots
+    put_u64(&mut d, 80, total); // total_size_lots
+    // size_executed_lots @ 88 = 0
+    put_u64(&mut d, 96, limit); // limit_price_ticks
+    // slot_interval @ 112 = 0 (no throttle), end_slot @ 120 = 0, last_slice @ 128 = 0
+    d[146] = side;
+    d[TWAP_FLAGS] = 0x01; // FLAG_ACTIVE
+    rent_account(d, pid)
+}
+
+/// execute_twap_slice: an ACTIVE TWAP (total 20, slice 5, interval 0) executes
+/// one slice — 5 lots are injected into the book, size_executed advances to 5,
+/// and the order STAYS active (5 < 20).
+#[tokio::test]
+async fn execute_twap_slice_injects_and_advances() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let trader = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let (market_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+    let twap = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 100, 1, 500, 0, 0)); // min_base_lots 0
+    pt.add_account(market_book, init_book(pid, market, base, quote, book_bump));
+    pt.add_account(twap, twap_acct(pid, trader, market, 0, 5, 20, 100));
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(twap, false),
+        ],
+        data: vec![IX_EXECUTE_TWAP],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await
+        .unwrap();
+
+    let t = banks.get_account(twap).await.unwrap().unwrap();
+    assert_eq!(get_u64(&t.data, TWAP_EXECUTED), 5, "one 5-lot slice executed");
+    assert_eq!(t.data[TWAP_FLAGS] & 0x01, 0x01, "still active (5 < 20)");
+    let mut bd = banks.get_account(market_book).await.unwrap().unwrap().data;
+    let handle = MarketBookHandle::from_account_data(&mut bd).unwrap();
+    assert_eq!(handle.header.total_orders_active, 1, "slice order injected");
+}
