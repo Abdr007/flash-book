@@ -3476,112 +3476,21 @@ pub mod flash_book {
             return Ok(());
         }
 
-        // RISK-M2: funding notional uses the MARK price (current), not the
-        // entry price — matching `assess_margin`'s funding term and the perp
-        // standard. Previously settle charged entry-priced funding while the
-        // risk/health check assessed mark-priced funding, so the amount a
-        // trader was *shown* to owe diverged from what they were *charged*.
-        // notional = size × mark_price × tick_size, in quote lots.
-        let notional_u128 = (position.size_lots as u128)
-            .checked_mul(market.mark_price_ticks as u128)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
-            .checked_mul(market.params.tick_size as u128)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        require!(
-            notional_u128 <= u64::MAX as u128,
-            FlashBookError::ArithmeticOverflow
-        );
-        let notional = notional_u128 as u64;
-
-        let is_long = position.side == 0;
-        let owed_i128 = funding_owed(
-            is_long,
-            notional,
-            market.cum_funding_index,
-            position.cum_funding_index(),
+        // §3.2 P4: the per-position funding settlement (mark-priced notional,
+        // isolated/cross collateral routing, RISK-1 Residual move, anchor advance)
+        // is shared with `apply_fill` via `settle_position_funding` so the two can
+        // never diverge. Behavior here is byte-identical to the prior inline body.
+        let mkt_cfi = market.cum_funding_index;
+        let mkt_mark = market.mark_price_ticks;
+        let mkt_tick = market.params.tick_size;
+        let owed_i64 = settle_position_funding(
+            mkt_cfi,
+            mkt_mark,
+            mkt_tick,
+            &mut position,
+            &mut trader_state,
+            &mut ctx.accounts.haircut_state.residual_quote_lots,
         )?;
-
-        // Apply settlement: positive owed → trader pays, negative → receives.
-        // Clamp owed to i64 range; rounded values that overflow i64 are
-        // capped (extreme case only reachable with insane funding rates).
-        let owed_i64 = if owed_i128 > i64::MAX as i128 {
-            i64::MAX
-        } else if owed_i128 < i64::MIN as i128 {
-            i64::MIN
-        } else {
-            owed_i128 as i64
-        };
-
-        // ── Phase 2 isolated-margin funding routing ──────────────────────
-        // For an isolated position, funding owed/received moves between
-        // the per-position bucket and the protocol — NEVER the trader's
-        // cross pool. That insulation is the entire point of isolation:
-        // a runaway funding bill on an isolated short cannot drain the
-        // trader's other (cross) positions. For a cross position,
-        // behavior is unchanged: funding settles to/from the pooled
-        // `trader_state.collateral_quote_lots`.
-        //
-        // If the isolated bucket is exhausted by the owed-funding case,
-        // we truncate (same conservative `.min()` semantics as the
-        // cross path) — the unpaid remainder is effectively absorbed
-        // because `cum_funding_index_at_entry` advances unconditionally.
-        // The next health check will mark the position liquidatable.
-        let is_isolated = position.collateral_quote_lots > 0;
-        // Track the ACTUAL collateral moved (clamped to availability) so the
-        // solvency residual delta matches the real change in total committed
-        // trader collateral (C_tot).
-        let mut paid: u64 = 0;
-        let mut received: u64 = 0;
-        if owed_i64 > 0 {
-            let owed_u64 = owed_i64 as u64;
-            if is_isolated {
-                paid = owed_u64.min(position.collateral_quote_lots);
-                position.collateral_quote_lots -= paid;
-            } else {
-                paid = owed_u64.min(trader_state.collateral_quote_lots);
-                trader_state.collateral_quote_lots -= paid;
-            }
-        } else if owed_i64 < 0 {
-            received = owed_i64.unsigned_abs();
-            if is_isolated {
-                position.collateral_quote_lots = position
-                    .collateral_quote_lots
-                    .checked_add(received)
-                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-            } else {
-                trader_state.collateral_quote_lots = trader_state
-                    .collateral_quote_lots
-                    .checked_add(received)
-                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-            }
-        }
-
-        // RISK-1: funding is not zero-sum (entry-priced + lazy per-position),
-        // so it must move the solvency residual `V − C_tot − I`:
-        //   trader PAYS    → C_tot ↓ by `paid`     → residual ↑ (more backing per claim)
-        //   trader RECEIVES→ C_tot ↑ by `received` → residual ↓ (underflow ⇒ insolvency, rejected)
-        // Net-zero-sum funding nets to zero across positions; any genuine
-        // drift now moves the residual so the haircut / kill-switch bounds it,
-        // instead of silently minting/burning protocol collateral.
-        let haircut = &mut ctx.accounts.haircut_state;
-        if paid > 0 {
-            haircut.residual_quote_lots = haircut
-                .residual_quote_lots
-                .checked_add(paid as u128)
-                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        }
-        if received > 0 {
-            haircut.residual_quote_lots = haircut
-                .residual_quote_lots
-                .checked_sub(received as u128)
-                .ok_or_else(|| error!(FlashBookError::HaircutResidualUnderflow))?;
-        }
-
-        position.funding_paid_quote_lots = position
-            .funding_paid_quote_lots
-            .checked_add(owed_i64)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        position.set_cum_funding_index(market.cum_funding_index);
 
         emit!(FundingSettledEvent {
             market: market.key(),
@@ -4264,6 +4173,31 @@ pub mod flash_book {
                 maker_pos.bump = ctx.bumps.maker_position;
                 maker_pos.set_cum_funding_index(funding_index);
                 maker_pos.last_settlement_batch = current_batch;
+            }
+
+            // §3.2 P4 (M-3): settle each leg's accrued funding against the CURRENT
+            // mark BEFORE the fill is applied. Otherwise a closing/flipping fill
+            // advances the position's funding anchor and the closed portion's
+            // accrued funding is silently dropped (a small vault leak + a divergence
+            // between funding *shown* by the health check and funding *charged*).
+            // Uses the SAME `settle_position_funding` as `settle_funding`, so it is
+            // idempotent vs the sequencer's crank (delta 0 if already settled) and
+            // the routing/Residual accounting can never diverge. RISK-1's Residual
+            // move needs the haircut state, so this runs only when the haircut engine
+            // is present (mandatory when `haircut_enabled`); haircut-disabled markets
+            // keep relying on the `settle_funding` crank exactly as before.
+            let mkt_mark = market.mark_price_ticks;
+            let mkt_tick = market.params.tick_size;
+            if let Some(mh) = ctx.accounts.market_haircut.as_mut() {
+                let res = &mut mh.residual_quote_lots;
+                {
+                    let mut tts = ctx.accounts.taker_trader_state.load_mut()?;
+                    settle_position_funding(funding_index, mkt_mark, mkt_tick, &mut taker_pos, &mut tts, res)?;
+                }
+                {
+                    let mut mts = ctx.accounts.maker_trader_state.load_mut()?;
+                    settle_position_funding(funding_index, mkt_mark, mkt_tick, &mut maker_pos, &mut mts, res)?;
+                }
             }
 
             // Snapshot pre-state so we can detect open/close transitions
@@ -15168,6 +15102,104 @@ fn emit_margin_threshold_if_crossed(
     }
 }
 
+/// §3.2 P4 / RISK-M2 + RISK-1: settle ONE position's accrued funding against the
+/// current mark, routing collateral (isolated→position bucket, cross→trader pool)
+/// and the solvency Residual exactly as `settle_funding` does, then advance the
+/// position's funding anchor. Returns the signed amount owed (+ pays / − receives)
+/// for the caller to record/emit.
+///
+/// IDEMPOTENT: once the anchor equals `market_cum_funding_index` the funding delta
+/// is 0 — so calling this in `apply_fill` (to charge funding on a position BEFORE a
+/// closing fill drops it) never double-charges a position the sequencer also
+/// settled via `settle_funding`. `settle_funding` and `apply_fill` share this one
+/// implementation, so the routing + Residual accounting can never diverge.
+fn settle_position_funding(
+    market_cum_funding_index: i128,
+    mark_price_ticks: u64,
+    tick_size: u64,
+    position: &mut state::PositionAccount,
+    trader_state: &mut TraderStateAccount,
+    residual_quote_lots: &mut u128,
+) -> Result<i64> {
+    if position.size_lots == 0 {
+        position.set_cum_funding_index(market_cum_funding_index);
+        return Ok(0);
+    }
+    // notional = size × mark_price × tick_size (quote lots); mark-priced to match
+    // assess_margin's funding term (RISK-M2).
+    let notional_u128 = (position.size_lots as u128)
+        .checked_mul(mark_price_ticks as u128)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+        .checked_mul(tick_size as u128)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    require!(notional_u128 <= u64::MAX as u128, FlashBookError::ArithmeticOverflow);
+    let notional = notional_u128 as u64;
+
+    let is_long = position.side == 0;
+    let owed_i128 = funding_owed(
+        is_long,
+        notional,
+        market_cum_funding_index,
+        position.cum_funding_index(),
+    )?;
+    let owed_i64 = if owed_i128 > i64::MAX as i128 {
+        i64::MAX
+    } else if owed_i128 < i64::MIN as i128 {
+        i64::MIN
+    } else {
+        owed_i128 as i64
+    };
+
+    // Isolated → per-position bucket; cross → pooled trader collateral. Track the
+    // ACTUAL collateral moved (clamped to availability) so the Residual delta
+    // matches the real change in committed collateral (C_tot).
+    let is_isolated = position.collateral_quote_lots > 0;
+    let mut paid: u64 = 0;
+    let mut received: u64 = 0;
+    if owed_i64 > 0 {
+        let owed_u64 = owed_i64 as u64;
+        if is_isolated {
+            paid = owed_u64.min(position.collateral_quote_lots);
+            position.collateral_quote_lots -= paid;
+        } else {
+            paid = owed_u64.min(trader_state.collateral_quote_lots);
+            trader_state.collateral_quote_lots -= paid;
+        }
+    } else if owed_i64 < 0 {
+        received = owed_i64.unsigned_abs();
+        if is_isolated {
+            position.collateral_quote_lots = position
+                .collateral_quote_lots
+                .checked_add(received)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        } else {
+            trader_state.collateral_quote_lots = trader_state
+                .collateral_quote_lots
+                .checked_add(received)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        }
+    }
+
+    // RISK-1: funding is not zero-sum, so it moves the solvency residual.
+    if paid > 0 {
+        *residual_quote_lots = residual_quote_lots
+            .checked_add(paid as u128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    }
+    if received > 0 {
+        *residual_quote_lots = residual_quote_lots
+            .checked_sub(received as u128)
+            .ok_or_else(|| error!(FlashBookError::HaircutResidualUnderflow))?;
+    }
+
+    position.funding_paid_quote_lots = position
+        .funding_paid_quote_lots
+        .checked_add(owed_i64)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    position.set_cum_funding_index(market_cum_funding_index);
+    Ok(owed_i64)
+}
+
 fn apply_fill_to_position(
     pos: &mut state::PositionAccount,
     fill_side: Side,
@@ -15939,6 +15971,40 @@ mod adl_routing_tests {
 #[cfg(test)]
 mod realized_pnl_routing_tests {
     use super::*;
+
+    // §3.2 P4 (M-3): settle_position_funding — the shared per-position funding
+    // settlement used by both settle_funding and apply_fill. Verifies (1) the
+    // funding anchor advances to the market index, (2) RISK-1 conservation
+    // (Δcollateral == −Δresidual: whatever leaves collateral lands in the Residual
+    // and vice-versa), and (3) IDEMPOTENCY — a second call once the anchor matches
+    // charges nothing (so charging funding in apply_fill never double-charges a
+    // position the sequencer also cranked via settle_funding).
+    #[test]
+    fn settle_position_funding_charges_and_is_idempotent() {
+        let zp = <state::PositionAccount as bytemuck::Zeroable>::zeroed();
+        let mut pos = state::PositionAccount { side: 0, size_lots: 100, entry_price_ticks: 1000, ..zp };
+        pos.set_cum_funding_index(0);
+        let mut ts = <TraderStateAccount as bytemuck::Zeroable>::zeroed();
+        ts.collateral_quote_lots = 1_000_000;
+        let mut residual: u128 = 1_000_000;
+        let market_index: i128 = 1 << 60; // non-zero funding accrued since entry
+        let (col0, res0) = (ts.collateral_quote_lots as i128, residual as i128);
+
+        let owed = settle_position_funding(market_index, 1000, 1, &mut pos, &mut ts, &mut residual).unwrap();
+        assert_eq!(pos.cum_funding_index(), market_index, "anchor advances to market index");
+        assert_ne!(owed, 0, "funding accrued, so a non-zero amount was settled");
+        // RISK-1 conservation: collateral and the Residual move by equal/opposite.
+        let dcol = ts.collateral_quote_lots as i128 - col0;
+        let dres = residual as i128 - res0;
+        assert_eq!(dcol, -dres, "Δcollateral == −Δresidual (no mint/burn)");
+
+        // Idempotent: anchor now == market_index, so a second call settles 0.
+        let (colp, resp) = (ts.collateral_quote_lots, residual);
+        let owed2 = settle_position_funding(market_index, 1000, 1, &mut pos, &mut ts, &mut residual).unwrap();
+        assert_eq!(owed2, 0, "already settled to this index → no further charge");
+        assert_eq!(ts.collateral_quote_lots, colp, "no double-charge of collateral");
+        assert_eq!(residual, resp, "no double-move of the Residual");
+    }
 
     // AUDIT H-1 regression: realized PnL settled into the position MUST scale by
     // `tick_size`, matching every other value path (unrealized PnL, funding,
