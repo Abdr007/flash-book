@@ -328,6 +328,33 @@ mod sol {
         )
     }
 
+    /// SPL-Token `CloseAccount` (tag byte `9`): close `account` and send its rent
+    /// lamports to `destination`. `authority` (the token account's owner) signs.
+    /// The token program ENFORCES that the account balance is 0 and that
+    /// `authority` is the owner — so NO token value can move and only the owner's
+    /// own account can be closed.
+    pub fn close_token_account(
+        token_program: &AccountInfo,
+        account: &AccountInfo,
+        destination: &AccountInfo,
+        authority: &AccountInfo,
+    ) -> ProgramResult {
+        if token_program.key() != &TOKEN_PROGRAM_ID {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+        let metas = [
+            AccountMeta::new(account.key(), true, false),
+            AccountMeta::new(destination.key(), true, false),
+            AccountMeta::new(authority.key(), false, true),
+        ];
+        let ix = Instruction {
+            program_id: &TOKEN_PROGRAM_ID,
+            accounts: &metas,
+            data: &[9u8], // SplTokenInstruction::CloseAccount
+        };
+        slice_invoke(&ix, &[account, destination, authority, token_program])
+    }
+
     fn transfer_inner(
         token_program: &AccountInfo,
         source: &AccountInfo,

@@ -157,6 +157,7 @@ mod program {
         SeedResidual = 69,
         GateEnvelopePriceMove = 70,
         InitTraderAta = 71,
+        CloseTraderAta = 72,
     }
 
     #[inline(always)]
@@ -235,6 +236,7 @@ mod program {
             x if x == Ix::SeedResidual as u8 => instructions::seed_residual::process(program_id, accounts, rest),
             x if x == Ix::GateEnvelopePriceMove as u8 => instructions::gate_envelope_price_move::process(program_id, accounts, rest),
             x if x == Ix::InitTraderAta as u8 => instructions::init_trader_ata::process(program_id, accounts, rest),
+            x if x == Ix::CloseTraderAta as u8 => instructions::close_trader_ata::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
