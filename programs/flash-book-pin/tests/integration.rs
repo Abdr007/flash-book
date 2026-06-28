@@ -874,3 +874,63 @@ async fn execute_twap_slice_injects_and_advances() {
     let handle = MarketBookHandle::from_account_data(&mut bd).unwrap();
     assert_eq!(handle.header.total_orders_active, 1, "slice order injected");
 }
+
+// ─── reduce-only trigger execution e2e ───
+/// A reduce-only trigger (FLAG_REDUCE_ONLY | ACTIVE, side 1 = close a long) fires
+/// only with a valid opposite-side position. position long 10 vs trigger close 5
+/// ⇒ valid; mark 100 ≥ trigger 100 ⇒ fired. Asserts the order is injected and
+/// ACTIVE is cleared (REDUCE_ONLY retained).
+#[tokio::test]
+async fn execute_trigger_order_reduce_only_fires_with_position() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let trader = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let (market_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+    let trigger = Pubkey::new_unique();
+    let pos_key = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 100, 1, 500, 0, 0));
+    pt.add_account(market_book, init_book(pid, market, base, quote, book_bump));
+    let mut td = vec![0u8; 136];
+    td[0..8].copy_from_slice(&TRIGGER_ORDER_V3_DISC);
+    put_key(&mut td, 8, &trader);
+    put_key(&mut td, 40, &market);
+    put_u64(&mut td, 72, 5); // size
+    put_u64(&mut td, 80, 100); // trigger_price
+    put_u64(&mut td, 88, 100); // limit
+    td[122] = 1; // side = close a long (opposite of the position)
+    td[123] = 1; // kind = fire when mark >= trigger
+    td[124] = 0x01 | 0x02; // ACTIVE | REDUCE_ONLY
+    pt.add_account(trigger, rent_account(td, pid));
+    pt.add_account(pos_key, position(pid, trader, market, 0, 10, 100, 0)); // long 10 (opposite side)
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(trigger, false),
+            AccountMeta::new_readonly(pos_key, false), // reduce-only: the position to close
+        ],
+        data: vec![IX_EXECUTE_TRIGGER],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await
+        .unwrap();
+
+    let mut bd = banks.get_account(market_book).await.unwrap().unwrap().data;
+    let handle = MarketBookHandle::from_account_data(&mut bd).unwrap();
+    assert_eq!(handle.header.total_orders_active, 1, "reduce-only trigger order injected");
+    let t = banks.get_account(trigger).await.unwrap().unwrap();
+    assert_eq!(t.data[124] & 0x01, 0, "ACTIVE cleared");
+    assert_eq!(t.data[124] & 0x02, 0x02, "REDUCE_ONLY retained");
+}

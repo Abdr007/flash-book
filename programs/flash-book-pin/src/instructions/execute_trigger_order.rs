@@ -14,8 +14,10 @@
 
 use crate::book::{encode_order_id, MarketBookHandle, RestingOrderV2};
 use crate::guard::{assert_disc, assert_market, assert_market_book, assert_owned_by, assert_signer};
+use crate::instructions::apply_fill::assert_position;
 use crate::state::{
-    Market, TriggerOrderV3, TRIGGER_FLAG_ACTIVE, TRIGGER_FLAG_REDUCE_ONLY, TRIGGER_ORDER_V3_DISC,
+    Market, Position, TriggerOrderV3, TRIGGER_FLAG_ACTIVE, TRIGGER_FLAG_REDUCE_ONLY,
+    TRIGGER_ORDER_V3_DISC,
 };
 use pinocchio::{
     account_info::AccountInfo,
@@ -26,7 +28,7 @@ use pinocchio::{
 };
 
 pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramResult {
-    let [caller, market, market_book, trigger_order, ..] = accounts else {
+    let [caller, market, market_book, trigger_order, rest @ ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
@@ -50,8 +52,18 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
     if t_flags & TRIGGER_FLAG_ACTIVE == 0 {
         return Err(ProgramError::Custom(150)); // inactive / already fired
     }
+    // Reduce-only: the trigger may only CLOSE an existing opposite-side position
+    // — validate the trader's position (passed as the first extra account).
     if t_flags & TRIGGER_FLAG_REDUCE_ONLY != 0 {
-        return Err(ProgramError::Custom(151)); // reduce-only execution is a follow-up
+        let position = rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+        assert_position(position, pid)?;
+        let p = unsafe { &*(position.borrow_data_unchecked().as_ptr() as *const Position) };
+        if p.trader != t_trader || p.market != *market.key() {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if p.size_lots == 0 || p.side == t_side || t_size > p.size_lots {
+            return Err(ProgramError::InvalidArgument); // not a valid reducing close
+        }
     }
     if t_side > 1 || t_size == 0 || t_limit == 0 {
         return Err(ProgramError::InvalidArgument);
