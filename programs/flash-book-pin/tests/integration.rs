@@ -934,3 +934,159 @@ async fn execute_trigger_order_reduce_only_fires_with_position() {
     assert_eq!(t.data[124] & 0x01, 0, "ACTIVE cleared");
     assert_eq!(t.data[124] & 0x02, 0x02, "REDUCE_ONLY retained");
 }
+
+// ─── iceberg replenish + cancel e2e ───
+use flash_book_pin::state::ICEBERG_ORDER_V3_DISC;
+const IX_REPLENISH_ICEBERG: u8 = 102;
+const IX_CANCEL_ICEBERG: u8 = 103;
+const ICE_REMAINING: usize = 88; // remaining_lots
+const ICE_FLAGS: usize = 131;
+
+fn iceberg_acct(
+    pid: Pubkey,
+    trader: Pubkey,
+    market: Pubkey,
+    side: u8,
+    limit: u64,
+    total: u64,
+    remaining: u64,
+    displayed: u64,
+) -> Account {
+    let mut d = vec![0u8; 136];
+    d[0..8].copy_from_slice(&ICEBERG_ORDER_V3_DISC);
+    put_key(&mut d, 8, &trader);
+    put_key(&mut d, 40, &market);
+    put_u64(&mut d, 72, limit); // limit_ticks
+    put_u64(&mut d, 80, total); // total_size_lots
+    put_u64(&mut d, 88, remaining); // remaining_lots
+    put_u64(&mut d, 96, displayed); // displayed_size_lots
+    // child_order_seq @ 104, created @ 112, expires @ 120 = 0
+    d[130] = side;
+    d[ICE_FLAGS] = 0x01; // FLAG_ACTIVE
+    rent_account(d, pid)
+}
+
+/// replenish_iceberg: an ACTIVE iceberg (total 20, displayed 5, remaining 15)
+/// rests its next 5-lot chunk on the book; remaining → 10; stays ACTIVE.
+#[tokio::test]
+async fn replenish_iceberg_injects_next_chunk_and_advances() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let trader = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let (market_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+    let iceberg = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 100, 1, 500, 0, 0));
+    pt.add_account(market_book, init_book(pid, market, base, quote, book_bump));
+    pt.add_account(iceberg, iceberg_acct(pid, trader, market, 0, 100, 20, 15, 5));
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(iceberg, false),
+        ],
+        data: vec![IX_REPLENISH_ICEBERG],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await
+        .unwrap();
+
+    let a = banks.get_account(iceberg).await.unwrap().unwrap();
+    assert_eq!(get_u64(&a.data, ICE_REMAINING), 10, "remaining decremented by the 5-lot chunk");
+    assert_eq!(a.data[ICE_FLAGS] & 0x01, 0x01, "still active (10 left)");
+    let mut bd = banks.get_account(market_book).await.unwrap().unwrap().data;
+    let handle = MarketBookHandle::from_account_data(&mut bd).unwrap();
+    assert_eq!(handle.header.total_orders_active, 1, "next chunk rested on the book");
+}
+
+/// replenish_iceberg: the FINAL chunk (displayed 5, remaining 5) clears
+/// FLAG_ACTIVE once remaining reaches 0.
+#[tokio::test]
+async fn replenish_iceberg_clears_active_when_fully_placed() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let trader = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let (market_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+    let iceberg = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 100, 1, 500, 0, 0));
+    pt.add_account(market_book, init_book(pid, market, base, quote, book_bump));
+    pt.add_account(iceberg, iceberg_acct(pid, trader, market, 1, 100, 20, 5, 5));
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(iceberg, false),
+        ],
+        data: vec![IX_REPLENISH_ICEBERG],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await
+        .unwrap();
+
+    let a = banks.get_account(iceberg).await.unwrap().unwrap();
+    assert_eq!(get_u64(&a.data, ICE_REMAINING), 0, "fully placed");
+    assert_eq!(a.data[ICE_FLAGS] & 0x01, 0, "ACTIVE cleared");
+}
+
+/// cancel_iceberg: the trader closes their iceberg and reclaims rent — the
+/// account is gone afterward and the trader's lamports increase by the rent.
+#[tokio::test]
+async fn cancel_iceberg_closes_and_refunds() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let market = Pubkey::new_unique();
+    let iceberg = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let ice = iceberg_acct(pid, trader.pubkey(), market, 0, 100, 20, 15, 5);
+    let rent_lamports = ice.lamports;
+    pt.add_account(iceberg, ice);
+    pt.add_account(
+        trader.pubkey(),
+        // owner = System Program (its id is 32 zero bytes).
+        Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let before = banks.get_account(trader.pubkey()).await.unwrap().unwrap().lamports;
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new(iceberg, false),
+        ],
+        data: vec![IX_CANCEL_ICEBERG],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &trader], bh))
+        .await
+        .unwrap();
+
+    assert!(banks.get_account(iceberg).await.unwrap().is_none(), "iceberg account closed");
+    let after = banks.get_account(trader.pubkey()).await.unwrap().unwrap().lamports;
+    assert_eq!(after, before + rent_lamports, "trader reclaimed the iceberg rent");
+}

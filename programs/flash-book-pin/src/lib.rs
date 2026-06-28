@@ -187,6 +187,9 @@ mod program {
         CancelJitLiquidationOffer = 98,
         ExecuteTriggerOrder = 99,
         ExecuteTwapSlice = 100,
+        PlaceIcebergOrder = 101,
+        ReplenishIceberg = 102,
+        CancelIceberg = 103,
     }
 
     #[inline(always)]
@@ -294,6 +297,9 @@ mod program {
             x if x == Ix::CancelJitLiquidationOffer as u8 => instructions::cancel_jit_liquidation_offer::process(program_id, accounts, rest),
             x if x == Ix::ExecuteTriggerOrder as u8 => instructions::execute_trigger_order::process(program_id, accounts, rest),
             x if x == Ix::ExecuteTwapSlice as u8 => instructions::execute_twap_slice::process(program_id, accounts, rest),
+            x if x == Ix::PlaceIcebergOrder as u8 => instructions::place_iceberg_order::process(program_id, accounts, rest),
+            x if x == Ix::ReplenishIceberg as u8 => instructions::replenish_iceberg::process(program_id, accounts, rest),
+            x if x == Ix::CancelIceberg as u8 => instructions::cancel_iceberg::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
