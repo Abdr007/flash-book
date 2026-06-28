@@ -8,6 +8,7 @@ pub mod cancel_all;
 pub mod apply_flp_fill;
 pub mod open_trader_state;
 pub mod initialize_insurance_fund;
+pub mod withdraw_insurance_fund;
 pub mod deposit_collateral;
 pub mod initialize_market;
 pub mod withdraw_collateral;
