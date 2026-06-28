@@ -38,6 +38,7 @@ pub mod initialize_side_accrual;
 pub mod initialize_haircut_state;
 pub mod init_position_haircut_state;
 pub mod mature_position;
+pub mod seed_residual;
 pub mod init_er_margin_attestation;
 pub mod attest_er_reserved_margin;
 pub mod create_session_token;
