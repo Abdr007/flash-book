@@ -57,3 +57,6 @@ pub const POSITION_HAIRCUT_SEED: &[u8] = b"position_haircut";
 
 /// `[b"session", owner, session_signer]` — a delegated session-signing token.
 pub const SESSION_SEED: &[u8] = b"session";
+
+/// `[b"er_margin", trader_state]` — a trader's ER margin attestation.
+pub const ER_MARGIN_SEED: &[u8] = b"er_margin";

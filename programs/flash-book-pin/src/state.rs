@@ -518,6 +518,25 @@ pub struct MarketHaircutState {
 }
 const _: () = assert!(core::mem::size_of::<MarketHaircutState>() == 208);
 
+pub const ER_MARGIN_DISC: [u8; 8] = [0xE2, 0x70, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// Per-trader ER (ephemeral-rollup) margin attestation. The `attestor` (ER margin
+/// sequencer) reports `reserved_margin_quote_lots` — initial margin locked by the
+/// trader's live ER resting orders; withdrawals must leave at least that behind.
+/// `epoch` is a strictly-increasing replay guard. Padding-free `repr(C)` at 96
+/// bytes. The consuming withdraw gate is a later batch.
+#[repr(C)]
+pub struct ErMarginAttestation {
+    pub disc: [u8; 8],
+    pub trader_state: Pubkey,
+    pub attestor: Pubkey,
+    pub reserved_margin_quote_lots: u64,
+    pub epoch: u64,
+    pub bump: u8,
+    pub _pad: [u8; 7],
+}
+const _: () = assert!(core::mem::size_of::<ErMarginAttestation>() == 96);
+
 pub const SESSION_TOKEN_DISC: [u8; 8] = [0x5E, 0x55, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
 
 /// A delegated session-signing token: `session_signer` may act for `owner` until
