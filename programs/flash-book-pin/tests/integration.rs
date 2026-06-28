@@ -295,3 +295,118 @@ async fn auto_deleverage_settles_underwater_vs_counter() {
     assert_eq!(get_u64(&m.data, MKT_LONG_OI), 5, "long_oi 10 − 5");
     assert_eq!(get_u64(&m.data, MKT_SHORT_OI), 5, "short_oi 10 − 5 (long==short preserved)");
 }
+
+// ─── liquidate_position_v2 e2e (pre-seeds a valid book — no create_pda CPI) ───
+use flash_book_pin::book::{MarketBookHandle, MARKET_BOOK_SEED, MARKET_BOOK_TOTAL_BYTES};
+use flash_book_pin::seeds::{MARKET_SEED, POSITION_LIQ_STATE_SEED};
+use flash_book_pin::state::POSITION_LIQ_STATE_DISC;
+
+const IX_SET_LIQ_PARAMS: u8 = 91;
+const IX_LIQUIDATE_V2: u8 = 92;
+const PL_MARKET: usize = 8;
+const PL_POSITION: usize = 40;
+const PL_UNHEALTHY_SINCE: usize = 72;
+const PL_LAST_LIQUIDATED: usize = 80;
+const MKT_AUTHORITY: usize = 124;
+
+fn init_book(pid: Pubkey, market: Pubkey, base: Pubkey, quote: Pubkey, bump: u8) -> Account {
+    let mut data = vec![0u8; MARKET_BOOK_TOTAL_BYTES];
+    MarketBookHandle::write_disc_and_init_header(
+        &mut data, bump, market.to_bytes(), base.to_bytes(), quote.to_bytes(),
+    )
+    .unwrap();
+    rent_account(data, pid)
+}
+fn position_liq_acct(pid: Pubkey, market: Pubkey, position: Pubkey) -> Account {
+    let mut d = vec![0u8; 120];
+    d[0..8].copy_from_slice(&POSITION_LIQ_STATE_DISC);
+    put_key(&mut d, PL_MARKET, &market);
+    put_key(&mut d, PL_POSITION, &position);
+    rent_account(d, pid)
+}
+
+/// liquidate_position_v2 e2e: inject a forced-liquidation order for an unhealthy
+/// isolated long and pay the flat (auction=0) liquidator reward. Same unhealthy
+/// scenario (long 10 @200, isolated 100; mark 100, mmr 500bps). penalty 100bps,
+/// reward 500bps. Closing 5: reward = (5·100·1)·500/10000 = 25 (≤ 100 bucket).
+/// Asserts: liquidatee bucket 100→75, caller pool 0→25, size UNCHANGED (10 — the
+/// close is deferred to the matcher), liq-state stamped (both slots > 0).
+#[tokio::test]
+async fn liquidate_position_v2_injects_and_rewards() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let caller = Keypair::new();
+    let base_mint = Pubkey::new_unique();
+    let quote_mint = Pubkey::new_unique();
+    let (market, _) = Pubkey::find_program_address(
+        &[MARKET_SEED, &base_mint.to_bytes(), &quote_mint.to_bytes()], &pid);
+    let (market_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+    let liq_trader = Pubkey::new_unique();
+    let liq_ts = Pubkey::new_unique();
+    let liq_position = Pubkey::new_unique();
+    let (position_liq, _) = Pubkey::find_program_address(
+        &[POSITION_LIQ_STATE_SEED, &market.to_bytes(), &liq_position.to_bytes()], &pid);
+    let caller_ts = Pubkey::new_unique();
+
+    let mut market_acct = market_full(pid, 100, 1, 500, 10, 10);
+    put_key(&mut market_acct.data, MKT_AUTHORITY, &authority.pubkey());
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_acct);
+    pt.add_account(market_book, init_book(pid, market, base_mint, quote_mint, book_bump));
+    pt.add_account(position_liq, position_liq_acct(pid, market, liq_position));
+    pt.add_account(liq_ts, trader_state(pid, liq_trader, 0, 1));
+    pt.add_account(liq_position, position(pid, liq_trader, market, 0, 10, 200, 100));
+    pt.add_account(caller_ts, trader_state(pid, caller.pubkey(), 0, 0));
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut sp = vec![IX_SET_LIQ_PARAMS];
+    sp.extend_from_slice(&100u32.to_le_bytes()); // penalty
+    sp.extend_from_slice(&500u32.to_le_bytes()); // reward
+    sp.extend_from_slice(&0u64.to_le_bytes()); // auction (flat)
+    sp.extend_from_slice(&0u64.to_le_bytes()); // cooldown
+    let ix_params = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new(market, false),
+        ],
+        data: sp,
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix_params], Some(&payer.pubkey()), &[&payer, &authority], bh))
+        .await
+        .unwrap();
+
+    let mut ld = vec![IX_LIQUIDATE_V2];
+    ld.extend_from_slice(&5u64.to_le_bytes());
+    let ix_liq = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(liq_ts, false),
+            AccountMeta::new(caller_ts, false),
+            AccountMeta::new(liq_position, false),
+            AccountMeta::new(position_liq, false),
+        ],
+        data: ld,
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix_liq], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await
+        .unwrap();
+
+    let pos = banks.get_account(liq_position).await.unwrap().unwrap();
+    assert_eq!(get_u64(&pos.data, POS_COLLATERAL), 75, "bucket 100 − reward 25");
+    assert_eq!(get_u64(&pos.data, POS_SIZE), 10, "size unchanged (close deferred to matcher)");
+    let cts = banks.get_account(caller_ts).await.unwrap().unwrap();
+    assert_eq!(get_u64(&cts.data, TS_COLLATERAL), 25, "liquidator reward credited");
+    let pl = banks.get_account(position_liq).await.unwrap().unwrap();
+    assert!(get_u64(&pl.data, PL_LAST_LIQUIDATED) > 0, "last_liquidated stamped");
+    assert!(get_u64(&pl.data, PL_UNHEALTHY_SINCE) > 0, "unhealthy_since stamped");
+}
