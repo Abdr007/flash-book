@@ -87,11 +87,24 @@ pub struct Market {
     /// position's `leverage_cap` against it. `0` = unset (no max enforced).
     /// 4-aligned. Carved from `_reserved`; size unchanged (1152 bytes).
     pub max_leverage: u32,
+    /// Liquidation params, fed to `liquidate_position_v2` (all `0` =
+    /// disabled/default). `liquidation_auction_duration_slots`: the Dutch-auction
+    /// ramp length over which the liquidator reward grows from 0 to the full
+    /// `liquidator_reward_bps` (0 = flat reward, no auction).
+    /// `liquidation_cooldown_slots`: min slots between liquidations of the same
+    /// position (0 = no cooldown). `liq_penalty_bps`: the synthetic-close penalty
+    /// moving the fill against the liquidatee. `liquidator_reward_bps`: the base
+    /// reward. The two `u64`s precede the `u32`s so the carve is 8-aligned +
+    /// padding-free. Carved from `_reserved`; size unchanged (1152 bytes).
+    pub liquidation_auction_duration_slots: u64,
+    pub liquidation_cooldown_slots: u64,
+    pub liq_penalty_bps: u32,
+    pub liquidator_reward_bps: u32,
     /// 1 once `initialize_haircut_state` has enabled the haircut engine on this
     /// market (sticky). The consuming settlement check is a later batch. `u8`
     /// (align 1) carved from `_reserved`; size unchanged (1152 bytes).
     pub haircut_enabled: u8,
-    pub _reserved: [u8; 951],
+    pub _reserved: [u8; 927],
 }
 
 /// Market trading-status values.
