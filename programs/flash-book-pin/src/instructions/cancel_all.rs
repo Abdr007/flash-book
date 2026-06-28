@@ -28,6 +28,10 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
     unsafe {
         let book_data = accounts[2].borrow_mut_data_unchecked();
         let mut handle = MarketBookHandle::from_account_data(book_data)?;
+        // Bind the book to THIS market (defence beyond the PDA check).
+        if &handle.header.market_pubkey != accounts[1].key() {
+            return Err(ProgramError::InvalidArgument);
+        }
 
         // Collect this trader's node indices first (the walk closure borrows
         // &handle immutably; removal needs &mut handle), capped at MAX_CANCELS.
