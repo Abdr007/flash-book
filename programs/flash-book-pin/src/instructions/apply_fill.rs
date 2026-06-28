@@ -93,6 +93,10 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         // across the open (0 → >0) / close (>0 → 0) transitions below.
         let taker_before = taker_pos.size_lots;
         let maker_before = maker_pos.size_lots;
+        // Also snapshot each leg's OLD side, so the open-interest delta below
+        // removes its prior contribution from the correct side (a fill may flip).
+        let taker_old_side = taker_pos.side;
+        let maker_old_side = maker_pos.side;
         // Fills update both legs with identical matcher math.
         crate::fill_math::apply_to_position(taker_pos, taker_side, size, price, fidx).map_err(|_| ProgramError::ArithmeticOverflow)?;
         crate::fill_math::apply_to_position(maker_pos, maker_side, size, price, fidx).map_err(|_| ProgramError::ArithmeticOverflow)?;
@@ -102,9 +106,23 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         maker_ts.open_positions =
             TraderState::open_positions_after(maker_ts.open_positions, maker_before, maker_pos.size_lots);
 
-        // Open interest.
-        if taker_side == 0 { market.long_oi_lots = market.long_oi_lots.saturating_add(size); }
-        else { market.short_oi_lots = market.short_oi_lots.saturating_add(size); }
+        // Open interest. Each position contributes its `size_lots` to OI on its
+        // side; a fill changes BOTH legs (one long, one short). Remove each leg's
+        // OLD contribution and add its NEW one (host-tested `oi_after_leg`) —
+        // correct across open / close / flip, and (crucially) keeps
+        // `long_oi_lots == short_oi_lots`, the conservation invariant
+        // `verify_market_invariants` enforces. (The prior code added the fill
+        // size to ONLY the taker side, breaking the invariant on every fill.)
+        let (long_oi, short_oi) = crate::fill_math::oi_after_leg(
+            market.long_oi_lots, market.short_oi_lots,
+            taker_old_side, taker_before, taker_pos.side, taker_pos.size_lots,
+        );
+        let (long_oi, short_oi) = crate::fill_math::oi_after_leg(
+            long_oi, short_oi,
+            maker_old_side, maker_before, maker_pos.side, maker_pos.size_lots,
+        );
+        market.long_oi_lots = long_oi;
+        market.short_oi_lots = short_oi;
 
         // Mark-freshness stamp (liveness). Monotonic guard against re-ordering.
         if now_slot > market.last_mark_update_slot { market.last_mark_update_slot = now_slot; }
