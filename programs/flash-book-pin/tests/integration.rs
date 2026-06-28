@@ -1533,3 +1533,134 @@ async fn settle_perf_fee_mints_on_new_high() {
     // new HWM = floor(2000 * 1e6 / 1100) = 1_818_181
     assert_eq!(get_u64(&v.data, 88), 1_818_181, "HWM reset to post-mint nav/share");
 }
+
+// ─── vault_place_order_v3 + vault_cancel_order_v3 e2e (positive, no CPI) ───
+// Both operate directly on the book (no token CPI / PDA creation) → fully
+// e2e-testable. Place a vault-PDA order, then cancel it — the cancel only
+// succeeds because the resting order's trader == the vault (binding proof).
+use flash_book_pin::book::encode_order_id;
+const IX_VAULT_PLACE: u8 = 111;
+const IX_VAULT_CANCEL: u8 = 112;
+
+#[tokio::test]
+async fn vault_place_then_cancel_round_trip() {
+    let pid = Pubkey::new_unique();
+    let strategist = Keypair::new();
+    let vault_id = 0u8;
+    let (vault, _) = Pubkey::find_program_address(
+        &[VAULT_SEED, &strategist.pubkey().to_bytes(), &[vault_id]], &pid);
+    let market = Pubkey::new_unique();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let (market_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(vault, vault_with_accept(pid, strategist.pubkey(), vault_id, 1, 0));
+    pt.add_account(market, market_full(pid, 100, 1, 500, 0, 0)); // mark 100, tick 1, status active
+    pt.add_account(market_book, init_book(pid, market, base, quote, book_bump));
+    pt.add_account(
+        strategist.pubkey(),
+        Account { lamports: 5_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    // place: bid side 0, size 5 @ 100 (== mark, within band).
+    let mut pdata = vec![IX_VAULT_PLACE, 0]; // side 0
+    pdata.extend_from_slice(&5u64.to_le_bytes()); // size
+    pdata.extend_from_slice(&100u64.to_le_bytes()); // limit
+    pdata.extend_from_slice(&0u64.to_le_bytes()); // expires
+    pdata.push(0); // flags
+    let place = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(strategist.pubkey(), true),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+        ],
+        data: pdata,
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place], Some(&payer.pubkey()), &[&payer, &strategist], bh))
+        .await
+        .unwrap();
+
+    let mut bd = banks.get_account(market_book).await.unwrap().unwrap().data;
+    assert_eq!(
+        MarketBookHandle::from_account_data(&mut bd).unwrap().header.total_orders_active,
+        1, "vault order rested"
+    );
+
+    // cancel: first bid has seq 1 → order_id = encode_order_id(100, 1, true).
+    let order_id = encode_order_id(100, 1, true);
+    let mut cdata = vec![IX_VAULT_CANCEL, 0]; // side 0
+    cdata.extend_from_slice(&order_id.to_le_bytes());
+    let cancel = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(strategist.pubkey(), true),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+        ],
+        data: cdata,
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[cancel], Some(&payer.pubkey()), &[&payer, &strategist], bh))
+        .await
+        .unwrap();
+
+    let mut bd2 = banks.get_account(market_book).await.unwrap().unwrap().data;
+    assert_eq!(
+        MarketBookHandle::from_account_data(&mut bd2).unwrap().header.total_orders_active,
+        0, "vault order cancelled"
+    );
+}
+
+#[tokio::test]
+async fn vault_place_rejects_non_strategist() {
+    let pid = Pubkey::new_unique();
+    let real = Pubkey::new_unique();
+    let imposter = Keypair::new();
+    let vault_id = 0u8;
+    let (vault, _) = Pubkey::find_program_address(&[VAULT_SEED, &real.to_bytes(), &[vault_id]], &pid);
+    let market = Pubkey::new_unique();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let (market_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(vault, vault_with_accept(pid, real, vault_id, 1, 0)); // strategist = real
+    pt.add_account(market, market_full(pid, 100, 1, 500, 0, 0));
+    pt.add_account(market_book, init_book(pid, market, base, quote, book_bump));
+    pt.add_account(
+        imposter.pubkey(),
+        Account { lamports: 5_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut pdata = vec![IX_VAULT_PLACE, 0];
+    pdata.extend_from_slice(&5u64.to_le_bytes());
+    pdata.extend_from_slice(&100u64.to_le_bytes());
+    pdata.extend_from_slice(&0u64.to_le_bytes());
+    pdata.push(0);
+    let place = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(imposter.pubkey(), true), // NOT the strategist
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+        ],
+        data: pdata,
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place], Some(&payer.pubkey()), &[&payer, &imposter], bh))
+        .await;
+    assert!(r.is_err(), "non-strategist place must be rejected");
+}

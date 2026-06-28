@@ -198,6 +198,8 @@ mod program {
         VaultDepositV3 = 108,
         VaultWithdrawV3 = 109,
         SettleVaultPerfFeeV3 = 110,
+        VaultPlaceOrderV3 = 111,
+        VaultCancelOrderV3 = 112,
     }
 
     #[inline(always)]
@@ -315,6 +317,8 @@ mod program {
             x if x == Ix::VaultDepositV3 as u8 => instructions::vault_deposit_v3::process(program_id, accounts, rest),
             x if x == Ix::VaultWithdrawV3 as u8 => instructions::vault_withdraw_v3::process(program_id, accounts, rest),
             x if x == Ix::SettleVaultPerfFeeV3 as u8 => instructions::settle_vault_perf_fee_v3::process(program_id, accounts, rest),
+            x if x == Ix::VaultPlaceOrderV3 as u8 => instructions::vault_place_order_v3::process(program_id, accounts, rest),
+            x if x == Ix::VaultCancelOrderV3 as u8 => instructions::vault_cancel_order_v3::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
