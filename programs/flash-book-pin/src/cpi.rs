@@ -23,6 +23,13 @@ pub const TOKEN_PROGRAM_ID: [u8; 32] = [
     95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
 ];
 
+/// Associated-Token-Account program id
+/// (`ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`). Base58 round-trip verified.
+pub const ATA_PROGRAM_ID: [u8; 32] = [
+    0x8C, 0x97, 0x25, 0x8F, 0x4E, 0x24, 0x89, 0xF1, 0xBB, 0x3D, 0x10, 0x29, 0x14, 0x8E, 0x0D, 0x83,
+    0x0B, 0x5A, 0x13, 0x99, 0xDA, 0xFF, 0x10, 0x84, 0x04, 0x8E, 0x7B, 0xD8, 0xDB, 0xE9, 0xF8, 0x59,
+];
+
 // ─────────────────────────── instruction-data encoders ─────────────────────
 // Pure, host-testable. These are the stable on-chain wire formats.
 
@@ -137,7 +144,7 @@ mod amount_tests {
 mod sol {
     use super::{
         allocate_data, assign_data, create_account_data, init_account3_data, system_transfer_data,
-        transfer_data, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID,
+        transfer_data, ATA_PROGRAM_ID, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID,
     };
     use pinocchio::{
         account_info::AccountInfo,
@@ -280,6 +287,45 @@ mod sol {
             data: &data,
         };
         slice_invoke(&ix, &[account, mint, token_program])
+    }
+
+    /// Create the wallet's associated token account for `mint` via the ATA
+    /// program's `CreateIdempotent` (tag byte `1`; a no-op if the ATA already
+    /// exists). `payer` signs as a normal tx signer and funds the rent. NO tokens
+    /// move — this creates an EMPTY token account. The `ata` address must be the
+    /// canonical ATA the program derives; the ATA program rejects a mismatch.
+    pub fn create_idempotent_ata(
+        ata_program: &AccountInfo,
+        payer: &AccountInfo,
+        ata: &AccountInfo,
+        wallet: &AccountInfo,
+        mint: &AccountInfo,
+        system_program: &AccountInfo,
+        token_program: &AccountInfo,
+    ) -> ProgramResult {
+        if ata_program.key() != &ATA_PROGRAM_ID
+            || system_program.key() != &SYSTEM_PROGRAM_ID
+            || token_program.key() != &TOKEN_PROGRAM_ID
+        {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+        let metas = [
+            AccountMeta::new(payer.key(), true, true),
+            AccountMeta::new(ata.key(), true, false),
+            AccountMeta::new(wallet.key(), false, false),
+            AccountMeta::new(mint.key(), false, false),
+            AccountMeta::new(system_program.key(), false, false),
+            AccountMeta::new(token_program.key(), false, false),
+        ];
+        let ix = Instruction {
+            program_id: &ATA_PROGRAM_ID,
+            accounts: &metas,
+            data: &[1u8], // AssociatedTokenAccountInstruction::CreateIdempotent
+        };
+        slice_invoke(
+            &ix,
+            &[payer, ata, wallet, mint, system_program, token_program, ata_program],
+        )
     }
 
     fn transfer_inner(
