@@ -51,3 +51,6 @@ pub const VAULT_SEED: &[u8] = b"vault_v3";
 
 /// `[b"haircut", market]` — a market's haircut (positive-PnL warmup) state.
 pub const HAIRCUT_SEED: &[u8] = b"haircut";
+
+/// `[b"position_haircut", market, position]` — a position's haircut state.
+pub const POSITION_HAIRCUT_SEED: &[u8] = b"position_haircut";
