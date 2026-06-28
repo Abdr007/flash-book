@@ -10,5 +10,9 @@ pub const VPIN_FIXED_ONE: u64 = 1u64 << VPIN_FRACTIONAL_BITS;
 /// auto-pauses it. Mirrors the anchor `MARK_STALENESS_MAX_SLOTS`.
 pub const MARK_STALENESS_MAX_SLOTS: u64 = 150;
 
+/// Max bps a resting limit may deviate from the mark before it is rejected as
+/// anti-stuffing (far-from-market spam). Mirrors anchor (50%).
+pub const MAX_RESTING_ORDER_DEVIATION_BPS: u32 = 5_000;
+
 /// Max taker fee / |maker rebate| a fee tier may set (bps). Mirrors anchor.
 pub const MAX_FEE_TIER_BPS: u32 = 1_000;
