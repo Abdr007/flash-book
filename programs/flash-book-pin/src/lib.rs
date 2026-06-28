@@ -175,6 +175,7 @@ mod program {
         RecordFlpFillV3 = 86,
         ExpandMarketBook = 87,
         ReapExpiredOrders = 88,
+        AutoDeleverage = 89,
     }
 
     #[inline(always)]
@@ -270,6 +271,7 @@ mod program {
             x if x == Ix::RecordFlpFillV3 as u8 => instructions::record_flp_fill_v3::process(program_id, accounts, rest),
             x if x == Ix::ExpandMarketBook as u8 => instructions::expand_market_book::process(program_id, accounts, rest),
             x if x == Ix::ReapExpiredOrders as u8 => instructions::reap_expired_orders::process(program_id, accounts, rest),
+            x if x == Ix::AutoDeleverage as u8 => instructions::auto_deleverage::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
