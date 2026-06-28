@@ -269,13 +269,56 @@ pub fn health_price_with_staleness(
     }
 }
 
+/// The synthetic liquidation close price in ticks — the oracle moved by the
+/// liquidation penalty, ALWAYS against the liquidated trader. `close_side` is
+/// the side the position is closed ON (the opposite of the position side):
+/// closing a LONG sells (close_side = short = 1) at `oracle − penalty`; closing
+/// a SHORT buys (close_side = long = 0) at `oracle + penalty`. `penalty_delta =
+/// oracle · penalty_bps / 10_000`. Saturating; clamped to `u64::MAX`. Faithful
+/// port of the `liquidate_position_v2` synthetic-limit math. (The JIT auction
+/// may only IMPROVE on this price — never worsen it.)
+#[inline]
+pub fn liquidation_penalty_price(close_side: u8, oracle_ticks: u64, penalty_bps: u32) -> u64 {
+    let oracle = oracle_ticks as u128;
+    let penalty_delta = (oracle * penalty_bps as u128) / (BPS_DENOM as u128);
+    let v = if close_side == 1 {
+        // closing a long (selling) — push the fill price DOWN.
+        oracle.saturating_sub(penalty_delta)
+    } else {
+        // closing a short (buying) — push the fill price UP.
+        oracle.saturating_add(penalty_delta)
+    };
+    if v > u64::MAX as u128 { u64::MAX } else { v as u64 }
+}
+
 /// FV: machine-checked correctness of the dual-source health price (Kani,
 /// comparison-only → fast). The health price is always the WORSE of the two
 /// real sources for the position's side, never understates risk, never invents
 /// a price; a stale mark is never used. Mirrors the Anchor proofs verbatim.
 #[cfg(kani)]
 mod health_price_kani_proofs {
-    use super::{health_price_with_staleness, worse_of_health_price, HP_SOURCE_ORACLE_ONLY};
+    use super::{
+        health_price_with_staleness, liquidation_penalty_price, worse_of_health_price,
+        HP_SOURCE_ORACLE_ONLY,
+    };
+
+    /// The liquidation penalty always moves the close price AGAINST the trader:
+    /// closing a long fills at ≤ oracle, closing a short at ≥ oracle. Bounded to
+    /// u32 so `oracle · penalty_bps` stays well within u128 (no symbolic blowup).
+    #[kani::proof]
+    fn penalty_price_is_adverse() {
+        let oracle = kani::any::<u32>() as u64;
+        let penalty_bps: u32 = kani::any();
+        kani::assume(penalty_bps <= 10_000); // config-bounded (≤ 100%)
+        let close_side: u8 = kani::any();
+        kani::assume(close_side <= 1);
+        let px = liquidation_penalty_price(close_side, oracle, penalty_bps);
+        if close_side == 1 {
+            assert!(px <= oracle); // closing a long fills no higher than oracle
+        } else {
+            assert!(px >= oracle); // closing a short fills no lower than oracle
+        }
+    }
 
     /// LONG: health price ≤ mark and ≤ a live oracle (the worse/lower of the two).
     #[kani::proof]
@@ -338,7 +381,23 @@ mod health_price_kani_proofs {
 
 #[cfg(test)]
 mod health_price_tests {
-    use super::{health_price_with_staleness, worse_of_health_price, HP_SOURCE_ORACLE_ONLY};
+    use super::{
+        health_price_with_staleness, liquidation_penalty_price, worse_of_health_price,
+        HP_SOURCE_ORACLE_ONLY,
+    };
+
+    #[test]
+    fn penalty_price_moves_against_the_trader() {
+        // Closing a LONG (close_side = short = 1): oracle 100, 1% penalty → 99.
+        assert_eq!(liquidation_penalty_price(1, 100, 100), 99);
+        // Closing a SHORT (close_side = long = 0): oracle 100, 1% penalty → 101.
+        assert_eq!(liquidation_penalty_price(0, 100, 100), 101);
+        // Zero penalty ⇒ exactly the oracle, either side.
+        assert_eq!(liquidation_penalty_price(1, 100, 0), 100);
+        assert_eq!(liquidation_penalty_price(0, 100, 0), 100);
+        // Penalty larger than the oracle saturates the long-close to 0 (never wraps).
+        assert_eq!(liquidation_penalty_price(1, 100, 20_000), 0);
+    }
 
     #[test]
     fn long_takes_lower_short_takes_higher() {
