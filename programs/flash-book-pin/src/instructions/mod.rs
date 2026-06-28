@@ -49,6 +49,7 @@ pub mod close_trader_ata;
 pub mod attest_er_reserved_margin;
 pub mod create_session_token;
 pub mod revoke_session_token;
+pub mod verify_session_active;
 pub mod verify_haircut_invariants;
 pub mod create_vault;
 pub mod init_market_leverage_tiers;
