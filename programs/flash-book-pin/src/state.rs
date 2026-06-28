@@ -509,6 +509,23 @@ impl FlpExposurePerMarketV3 {
             s as u64
         }
     }
+
+    /// Quote-lots returned for burning `shares_to_burn` of `total_shares`, priced
+    /// on `total_capital`. Pure + host-tested. `None` if `total_shares == 0`.
+    /// Clamped to `u64::MAX` (anchor v3 parity; capital-based, not NAV-based).
+    #[inline]
+    pub fn amount_for_shares_v3(
+        shares_to_burn: u64,
+        total_capital: u64,
+        total_shares: u64,
+    ) -> Option<u64> {
+        if total_shares == 0 {
+            return None;
+        }
+        let a = (shares_to_burn as u128).saturating_mul(total_capital as u128)
+            / (total_shares as u128);
+        Some(if a > u64::MAX as u128 { u64::MAX } else { a as u64 })
+    }
 }
 
 const _: () = assert!(core::mem::size_of::<FlpPositionV3>() == 104);
@@ -721,6 +738,23 @@ mod tests {
         assert_eq!(
             FlpExposurePerMarketV3::shares_for_deposit_v3(u64::MAX, u64::MAX, 1),
             u64::MAX
+        );
+    }
+
+    #[test]
+    fn flp_v3_amount_for_shares_pricing_and_guards() {
+        // zero outstanding → None.
+        assert_eq!(FlpExposurePerMarketV3::amount_for_shares_v3(10, 100, 0), None);
+        // pro-rata: burn 200 of 1000 shares on 500 capital → 100.
+        assert_eq!(FlpExposurePerMarketV3::amount_for_shares_v3(200, 500, 1_000), Some(100));
+        // burn all → all capital.
+        assert_eq!(FlpExposurePerMarketV3::amount_for_shares_v3(1_000, 500, 1_000), Some(500));
+        // dust burn that rounds to 0.
+        assert_eq!(FlpExposurePerMarketV3::amount_for_shares_v3(1, 1, 1_000), Some(0));
+        // clamp, no overflow.
+        assert_eq!(
+            FlpExposurePerMarketV3::amount_for_shares_v3(u64::MAX, u64::MAX, 1),
+            Some(u64::MAX)
         );
     }
 
