@@ -648,3 +648,101 @@ async fn jit_offer_cancel_closes_and_refunds() {
     let after = banks.get_account(jit_offer).await.unwrap();
     assert!(after.is_none() || after.unwrap().lamports == 0, "offer closed, rent refunded");
 }
+
+// ─── JIT auction consumption e2e (liquidate uses the best offer) ───
+const JIT_REMAINING_OFF: usize = 128; // remaining_size_lots offset
+
+fn jit_offer_acct(pid: Pubkey, market: Pubkey, side: u8, price: u64, remaining: u64) -> Account {
+    let mut d = vec![0u8; 152];
+    d[0..8].copy_from_slice(&flash_book_pin::state::JIT_LIQ_OFFER_DISC);
+    d[9] = side; // closes positions of this side
+    put_key(&mut d, 16, &market); // market @ 16
+    // maker @ 48, target_trader @ 80 (zero = wildcard) — left zero
+    put_u64(&mut d, 112, price); // offer_price_ticks
+    put_u64(&mut d, 120, remaining); // max_size_lots
+    put_u64(&mut d, JIT_REMAINING_OFF, remaining); // remaining_size_lots
+    rent_account(d, pid)
+}
+
+/// liquidate_position_v2 with a JIT offer in remaining_accounts: the offer (side
+/// 0 = closes longs, price 100 > synthetic 99) BEATS the synthetic limit, so the
+/// liquidation injects at the offer price and reserves the offer's commitment.
+/// Asserts the offer's remaining decrements by the closed size.
+#[tokio::test]
+async fn liquidate_position_v2_consumes_jit_offer() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let caller = Keypair::new();
+    let base_mint = Pubkey::new_unique();
+    let quote_mint = Pubkey::new_unique();
+    let (market, _) = Pubkey::find_program_address(
+        &[MARKET_SEED, &base_mint.to_bytes(), &quote_mint.to_bytes()], &pid);
+    let (market_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+    let liq_trader = Pubkey::new_unique();
+    let liq_ts = Pubkey::new_unique();
+    let liq_position = Pubkey::new_unique();
+    let (position_liq, _) = Pubkey::find_program_address(
+        &[POSITION_LIQ_STATE_SEED, &market.to_bytes(), &liq_position.to_bytes()], &pid);
+    let caller_ts = Pubkey::new_unique();
+    let jit_offer = Pubkey::new_unique();
+
+    let mut market_acct = market_full(pid, 100, 1, 500, 0, 0);
+    put_key(&mut market_acct.data, MKT_AUTHORITY, &authority.pubkey());
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_acct);
+    pt.add_account(market_book, init_book(pid, market, base_mint, quote_mint, book_bump));
+    pt.add_account(position_liq, position_liq_acct(pid, market, liq_position));
+    pt.add_account(liq_ts, trader_state(pid, liq_trader, 0, 1));
+    pt.add_account(liq_position, position(pid, liq_trader, market, 0, 10, 200, 100)); // long, isolated 100
+    pt.add_account(caller_ts, trader_state(pid, caller.pubkey(), 0, 0));
+    // a JIT offer that closes longs (side 0) at 100 > synthetic (mark 100 − 1% = 99).
+    pt.add_account(jit_offer, jit_offer_acct(pid, market, 0, 100, 50));
+    let (banks, payer, bh) = pt.start().await;
+
+    // penalty 100bps, no reward (so the assertion isolates the JIT path)
+    let mut sp = vec![IX_SET_LIQ_PARAMS];
+    sp.extend_from_slice(&100u32.to_le_bytes());
+    sp.extend_from_slice(&0u32.to_le_bytes());
+    sp.extend_from_slice(&0u64.to_le_bytes());
+    sp.extend_from_slice(&0u64.to_le_bytes());
+    let ix_p = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new(market, false),
+        ],
+        data: sp,
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix_p], Some(&payer.pubkey()), &[&payer, &authority], bh))
+        .await
+        .unwrap();
+
+    let mut ld = vec![IX_LIQUIDATE_V2];
+    ld.extend_from_slice(&5u64.to_le_bytes());
+    let ix_liq = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(liq_ts, false),
+            AccountMeta::new(caller_ts, false),
+            AccountMeta::new(liq_position, false),
+            AccountMeta::new(position_liq, false),
+            AccountMeta::new(jit_offer, false), // remaining_accounts: the JIT offer
+        ],
+        data: ld,
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix_liq], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await
+        .unwrap();
+
+    let o = banks.get_account(jit_offer).await.unwrap().unwrap();
+    assert_eq!(get_u64(&o.data, JIT_REMAINING_OFF), 45, "offer remaining 50 − closed 5 (JIT auction fired)");
+}
