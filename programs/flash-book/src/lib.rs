@@ -6904,9 +6904,23 @@ pub mod flash_book {
             cum_funding_index_at_entry: underwater.cum_funding_index(),
             collateral_quote_lots: underwater.collateral_quote_lots,
         };
+        // AUDIT (re-audit) M-1: gate the ADL health assessment on the SAME
+        // mark-staleness / oracle-freshness logic the two liquidate_* paths use.
+        // Without this, a frozen-and-adverse mark during an ER stall could report
+        // a healthy position as unhealthy (the ±30% stress is measured off the
+        // stale baseline) and wrongfully deleverage it. `effective_health_mark`
+        // degrades a stale mark to a provably-fresh oracle, or reverts
+        // (`MarkTooStale`) — fail-safe, identical to liquidate_position_v2 /
+        // liquidate_portfolio_v2.
+        let adl_clock = Clock::get()?;
+        let health_mark = effective_health_mark(
+            market,
+            adl_clock.unix_timestamp.max(0) as u64,
+            adl_clock.slot,
+        )?;
         let market_snap = RiskMarketSnap {
             market: market.key(),
-            mark_price: Ticks(market.mark_price_ticks),
+            mark_price: Ticks(health_mark),
             cum_funding_index: market.cum_funding_index,
             maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
             tick_size: market.params.tick_size,
@@ -9294,6 +9308,12 @@ pub mod flash_book {
             FlashBookError::Unauthorized,
         );
         require!(max_staleness_seconds > 0, FlashBookError::OutOfRange);
+        // AUDIT F-2 (re-audit): same range-bound as init_market_oracle_config, so
+        // the F-1 confidence gate has a sane ceiling.
+        require!(
+            max_confidence_bps > 0 && max_confidence_bps <= 1000,
+            FlashBookError::OutOfRange
+        );
 
         let cfg = &mut ctx.accounts.oracle_config;
         cfg.bump = ctx.bumps.oracle_config;
@@ -9459,6 +9479,25 @@ pub mod flash_book {
         let px = lazer_oracle::parse_lazer_price(&payload, feed_id)
             .map_err(|_| error!(FlashBookError::OracleTooStale))?;
         require!(px.price > 0, FlashBookError::ZeroPrice);
+
+        // AUDIT F-1 (re-audit): enforce the confidence-interval gate the Pyth and
+        // trusted paths apply. A genuinely Lazer-signed but wide-confidence
+        // (uncertain) tick — the JELLY/POPCAT-class signal this gate exists to
+        // reject — would otherwise be written to the mark/liq price. The envelope
+        // bounds the per-slot RATE of change, not the uncertainty of an in-band
+        // value, so this is the only check that rejects a low-quality print.
+        let max_conf = cfg.max_confidence_bps;
+        if max_conf > 0 {
+            let conf_bps = (px.confidence as u128)
+                .checked_mul(constants::BPS_DENOM as u128)
+                .ok_or(error!(FlashBookError::ArithmeticOverflow))?
+                .checked_div(px.price as u128) // px.price > 0 asserted above
+                .ok_or(error!(FlashBookError::DivisionByZero))?;
+            require!(
+                conf_bps <= max_conf as u128,
+                FlashBookError::OracleConfidenceTooWide
+            );
+        }
 
         // 3. Convert: ticks = price * 10^(exponent + tick_decimals).
         let scale_exp: i32 = px.exponent as i32 + tick_decimals as i32;
