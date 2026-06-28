@@ -42,3 +42,6 @@ pub const ENVELOPE_CONFIG_SEED: &[u8] = b"envelope";
 
 /// `[b"oracle_config", market]` — a market's oracle config account.
 pub const ORACLE_CONFIG_SEED: &[u8] = b"oracle_config";
+
+/// `[b"side_accrual", market]` — a market's side-accrual (ADL) state account.
+pub const SIDE_ACCRUAL_SEED: &[u8] = b"side_accrual";
