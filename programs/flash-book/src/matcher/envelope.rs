@@ -190,7 +190,9 @@ pub fn prove_envelope(params: &EnvelopeParams) -> Result<(), EnvelopeError> {
             / (BPS_DENOM as u128);
         let mm_req = mm_floor.max(params.min_nonzero_mm_req_lots as u128);
 
-        if price_funding_loss + liq_fee > mm_req {
+        // AUDIT (re-audit, Arith INFO): checked_add for consistency with the rest
+        // of the module (unreachable with realistic params, but no raw u128 +).
+        if price_funding_loss.checked_add(liq_fee).ok_or(EnvelopeError::Overflow)? > mm_req {
             return Err(EnvelopeError::EnvelopeViolated {
                 n,
                 loss: price_funding_loss,
