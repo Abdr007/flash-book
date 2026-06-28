@@ -493,7 +493,45 @@ async fn setup_market(
         .await
         .unwrap();
 
+    disarm_fill_commitment(ctx, market).await;
     (protocol, market, order_buffer, base_mint, quote_mint)
+}
+
+/// §3.2 P2: production markets are fill-commitment-MANDATORY by default
+/// (`initialize_market_inner` sets `fill_commitment_required = true`), so a
+/// compromised sequencer can never settle a fabricated fill on an un-armed
+/// market. The authenticity path has dedicated coverage
+/// (`fill_commitment_honest_path_taker_cross_then_apply_fill`,
+/// `apply_fill_rejects_fabricated_fill_when_armed`,
+/// `armed_apply_fill_rejects_when_commitment_account_omitted`). Every OTHER
+/// settlement test exercises orthogonal logic (PnL/OI/margin/liquidation/funding)
+/// and would otherwise have to seed a matching commitment for each setup fill;
+/// instead they run against the (valid) un-armed config by flipping the flag back
+/// off here. `fill_commitment_required` is a real per-market field, so this is a
+/// legitimate test configuration, not a runtime bypass.
+async fn disarm_fill_commitment(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    market: Pubkey,
+) {
+    use solana_sdk::account::Account as SolAccount;
+    let acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
+    let mut m =
+        flash_book::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    m.fill_commitment_required = false;
+    let mut data = Vec::new();
+    m.try_serialize(&mut data).unwrap();
+    data.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &market,
+        &SolAccount {
+            lamports: acc.lamports,
+            data,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
 }
 
 /// Initialize an additional market on an already-initialized protocol.
@@ -551,6 +589,7 @@ async fn setup_additional_market(
         .await
         .unwrap();
 
+    disarm_fill_commitment(ctx, market).await; // §3.2 P2 — see helper doc
     (market, order_buffer, base_mint, quote_mint)
 }
 
@@ -4187,7 +4226,10 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             metas,
         )
     };
-    let cu_taker_unarmed = cu_of(&mut ctx, taker_ix(false), &payer.pubkey(), &[&payer, &taker]).await;
+    // §3.2 / H-2: a taker that CROSSES on an ARMED market MUST carry the ring
+    // (the producer pushes one commitment per fill), so the former "unarmed cross
+    // on an armed market" measurement is no longer a legal operation — we measure
+    // only the armed path, which is the production path on every settled market.
     let cu_taker_armed = cu_of(&mut ctx, taker_ix(true), &payer.pubkey(), &[&payer, &taker]).await;
 
     println!("\n=== Flash Book CU benchmark (settlement + risk paths) ===");
@@ -4195,11 +4237,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
     println!("apply_fill (close, realize PnL)   : {cu_apply_fill_close:>7} CU");
     println!("partial_withdraw (1 pos, lattice) : {cu_partial_withdraw:>7} CU");
     println!("place_limit_v2 (#36 band check)   : {cu_place_limit:>7} CU");
-    println!("place_taker_v2 (unarmed)          : {cu_taker_unarmed:>7} CU");
-    println!(
-        "place_taker_v2 (armed, #35 commit): {cu_taker_armed:>7} CU  (+{} keccak commitment)",
-        cu_taker_armed.saturating_sub(cu_taker_unarmed)
-    );
+    println!("place_taker_v2 (armed, #35 commit): {cu_taker_armed:>7} CU");
     println!("(200k default per-ix budget; 1.4M max/tx)\n");
 
     // Guardrail: these must comfortably fit the default per-ix budget.

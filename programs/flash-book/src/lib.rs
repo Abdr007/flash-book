@@ -10697,6 +10697,13 @@ fn initialize_market_inner(
     // via `set_market_sequencer` before burning authority so fills keep
     // settling after decentralization.
     market.sequencer = ctx.accounts.authority.key();
+    // §3.2 P2: fill-commitment authenticity is MANDATORY by default. A new market
+    // is fail-closed — `apply_fill` / `place_taker_order_v2` reject any settlement
+    // until the market is armed with a ring (`init_fill_commitment`), so a
+    // compromised sequencer can never fabricate fills on an "un-armed" market. The
+    // flag is sticky (only ever set true); the operator arms each market before
+    // enabling settlement.
+    market.fill_commitment_required = true;
 
     emit!(MarketInitializedEvent {
         market: market.key(),
