@@ -4529,6 +4529,90 @@
       ]
     },
     {
+      "name": "init_lazer_oracle_config",
+      "docs": [
+        "Initialize the per-market Pyth oracle config PDA. After this is",
+        "initialized, `update_oracle_from_pyth` can be called by anyone to",
+        "pull a fresh price from the on-chain `PriceUpdateV2` account",
+        "posted by the Pyth Solana Receiver.",
+        "",
+        "Authority-gated: only `market.authority` may install/rotate the",
+        "feed binding (a malicious wrong feed would break the market)."
+      ],
+      "discriminator": [
+        192,
+        53,
+        210,
+        16,
+        91,
+        6,
+        205,
+        163
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "oracle_config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "lazer_feed_id",
+          "type": "u32"
+        },
+        {
+          "name": "max_staleness_seconds",
+          "type": "u32"
+        },
+        {
+          "name": "max_confidence_bps",
+          "type": "u32"
+        },
+        {
+          "name": "tick_decimals",
+          "type": "i8"
+        }
+      ]
+    },
+    {
       "name": "init_position_haircut_state",
       "docs": [
         "Permissionless: lazy-init a per-position `PositionHaircutStateAccount`.",
@@ -10368,7 +10452,6 @@
             "`UpdateOracle`. When omitted: legacy Pyth-pull behavior."
           ],
           "writable": true,
-          "optional": true,
           "pda": {
             "seeds": [
               {
@@ -17918,9 +18001,13 @@
             "type": {
               "array": [
                 "u8",
-                6
+                2
               ]
             }
+          },
+          {
+            "name": "lazer_feed_id",
+            "type": "u32"
           },
           {
             "name": "market",
