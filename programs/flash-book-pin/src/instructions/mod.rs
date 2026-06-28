@@ -26,6 +26,7 @@ pub mod set_market_maintenance_margin;
 pub mod set_market_risk_params;
 pub mod set_envelope_config;
 pub mod verify_envelope_config;
+pub mod gate_envelope_price_move;
 pub mod set_market_max_leverage;
 pub mod set_position_leverage;
 pub mod deposit_flp_capital;

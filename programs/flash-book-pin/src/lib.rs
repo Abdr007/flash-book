@@ -155,6 +155,7 @@ mod program {
         AttestErReservedMargin = 67,
         MaturePosition = 68,
         SeedResidual = 69,
+        GateEnvelopePriceMove = 70,
     }
 
     #[inline(always)]
@@ -231,6 +232,7 @@ mod program {
             x if x == Ix::AttestErReservedMargin as u8 => instructions::attest_er_reserved_margin::process(program_id, accounts, rest),
             x if x == Ix::MaturePosition as u8 => instructions::mature_position::process(program_id, accounts, rest),
             x if x == Ix::SeedResidual as u8 => instructions::seed_residual::process(program_id, accounts, rest),
+            x if x == Ix::GateEnvelopePriceMove as u8 => instructions::gate_envelope_price_move::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
