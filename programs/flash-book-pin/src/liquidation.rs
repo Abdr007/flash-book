@@ -83,9 +83,32 @@ pub fn compute_shortfall(
     }
 }
 
+/// Insurance-fund payout for a liquidation shortfall (bad debt): pay up to
+/// `shortfall` from `balance`, returning `(covered, remaining)`. `covered =
+/// min(shortfall, balance)`; `remaining > 0` ⇒ the fund is EXHAUSTED and the
+/// rest must be socialized via ADL (`auto_deleverage`). Pure transcription of
+/// `matcher/insurance.rs::cover_shortfall` (the caller applies `balance −=
+/// covered` and `total_payouts += covered`).
+#[inline]
+pub fn cover_shortfall(balance: u64, shortfall: u64) -> (u64, u64) {
+    let covered = shortfall.min(balance);
+    (covered, shortfall - covered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cover_shortfall_pays_up_to_balance() {
+        // Fund covers it fully when balance ≥ shortfall.
+        assert_eq!(cover_shortfall(1_000, 300), (300, 0));
+        // Fund exhausted: pays its whole balance, the rest is the ADL remainder.
+        assert_eq!(cover_shortfall(200, 500), (200, 300));
+        // Nothing owed, or an empty fund.
+        assert_eq!(cover_shortfall(1_000, 0), (0, 0));
+        assert_eq!(cover_shortfall(0, 500), (0, 500));
+    }
 
     const MKT: crate::state::Pubkey = [9u8; 32];
 
@@ -337,9 +360,22 @@ pub fn liquidator_reward_lots(
 #[cfg(kani)]
 mod health_price_kani_proofs {
     use super::{
-        health_price_with_staleness, liquidation_penalty_price, worse_of_health_price,
-        HP_SOURCE_ORACLE_ONLY,
+        cover_shortfall, health_price_with_staleness, liquidation_penalty_price,
+        worse_of_health_price, HP_SOURCE_ORACLE_ONLY,
     };
+
+    /// The insurance draw conserves value and never overpays: `covered +
+    /// remaining == shortfall`, the fund pays no more than its balance, and no
+    /// more than the shortfall. Comparison-only ⇒ fast.
+    #[kani::proof]
+    fn cover_shortfall_conserves() {
+        let balance: u64 = kani::any();
+        let shortfall: u64 = kani::any();
+        let (covered, remaining) = cover_shortfall(balance, shortfall);
+        assert!(covered <= balance);
+        assert!(covered <= shortfall);
+        assert!(covered + remaining == shortfall); // no overflow: covered ≤ shortfall
+    }
 
     // NOTE: `reward_bps_effective`'s `eff ≤ reward_bps` invariant is covered by
     // the host test below, NOT a Kani proof: its `min(e,d)·BPS / duration`

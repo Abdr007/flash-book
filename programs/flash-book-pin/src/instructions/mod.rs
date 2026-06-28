@@ -18,6 +18,7 @@ pub mod auto_deleverage;
 pub mod init_position_liquidation_state;
 pub mod set_market_liquidation_params;
 pub mod liquidate_position_v2;
+pub mod cover_bad_debt;
 pub mod withdraw_collateral;
 pub mod open_trader_sub_account;
 pub mod transfer_collateral;
