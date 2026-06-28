@@ -146,6 +146,7 @@ mod program {
         InitMarketOracleConfig = 58,
         InitializeSideAccrual = 59,
         CreateVault = 60,
+        InitializeHaircutState = 61,
     }
 
     #[inline(always)]
@@ -213,6 +214,7 @@ mod program {
             x if x == Ix::InitMarketOracleConfig as u8 => instructions::init_market_oracle_config::process(program_id, accounts, rest),
             x if x == Ix::InitializeSideAccrual as u8 => instructions::initialize_side_accrual::process(program_id, accounts, rest),
             x if x == Ix::CreateVault as u8 => instructions::create_vault::process(program_id, accounts, rest),
+            x if x == Ix::InitializeHaircutState as u8 => instructions::initialize_haircut_state::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

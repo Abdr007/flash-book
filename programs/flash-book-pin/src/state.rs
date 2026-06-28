@@ -87,7 +87,11 @@ pub struct Market {
     /// position's `leverage_cap` against it. `0` = unset (no max enforced).
     /// 4-aligned. Carved from `_reserved`; size unchanged (1152 bytes).
     pub max_leverage: u32,
-    pub _reserved: [u8; 952],
+    /// 1 once `initialize_haircut_state` has enabled the haircut engine on this
+    /// market (sticky). The consuming settlement check is a later batch. `u8`
+    /// (align 1) carved from `_reserved`; size unchanged (1152 bytes).
+    pub haircut_enabled: u8,
+    pub _reserved: [u8; 951],
 }
 
 /// Market trading-status values.
@@ -485,6 +489,34 @@ const _: () = assert!(core::mem::size_of::<MarketLeverageTiers>() == 176);
 const _: () = assert!(core::mem::size_of::<FlpExposurePerMarketV3>() == 136);
 const _: () = assert!(core::mem::size_of::<FlpPositionV3>() == 104);
 const _: () = assert!(core::mem::size_of::<LpPosition>() == 104);
+
+pub const HAIRCUT_STATE_DISC: [u8; 8] = [0x4A, 0x12, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// Per-market haircut (positive-PnL warmup) state. The four 128-bit accumulators
+/// are stored as `[u8; 16]` LE byte arrays (read via `u128::from_le_bytes`), NOT
+/// native `u128`, so the zero-copy account needs no 16-byte alignment — same as
+/// `MarketSideAccrual`. Grouped-by-alignment, padding-free `repr(C)` at 208
+/// bytes. Feeds the host-tested `haircut` math (`compute_h`, etc.).
+#[repr(C)]
+pub struct MarketHaircutState {
+    pub disc: [u8; 8],
+    pub market: Pubkey,
+    // ── u64 group ──────────────────────────────────────────────────────
+    pub h_min_slots: u64,
+    pub h_max_slots: u64,
+    pub h_scaled_cached: u64,
+    pub h_cached_at_slot: u64,
+    // ── u8 + pad ───────────────────────────────────────────────────────
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    // ── 128-bit accumulators as LE bytes (align 1) ─────────────────────
+    pub residual_quote_lots: [u8; 16],
+    pub matured_pos_total_quote_lots: [u8; 16],
+    pub realized_loss_total_quote_lots: [u8; 16],
+    pub dust_accrued_quote_lots: [u8; 16],
+    pub _reserved: [u8; 64],
+}
+const _: () = assert!(core::mem::size_of::<MarketHaircutState>() == 208);
 
 pub const SIDE_ACCRUAL_DISC: [u8; 8] = [0x51, 0xDE, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
 
