@@ -170,6 +170,7 @@ mod program {
         ConvertPosition = 82,
         ReleaseGainToHaircut = 83,
         FlpDepositV3 = 84,
+        FlpWithdrawV3 = 85,
     }
 
     #[inline(always)]
@@ -261,6 +262,7 @@ mod program {
             x if x == Ix::ConvertPosition as u8 => instructions::convert_position::process(program_id, accounts, rest),
             x if x == Ix::ReleaseGainToHaircut as u8 => instructions::release_gain_to_haircut::process(program_id, accounts, rest),
             x if x == Ix::FlpDepositV3 as u8 => instructions::flp_deposit_v3::process(program_id, accounts, rest),
+            x if x == Ix::FlpWithdrawV3 as u8 => instructions::flp_withdraw_v3::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
