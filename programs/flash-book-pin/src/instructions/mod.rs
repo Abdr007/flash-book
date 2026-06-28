@@ -47,6 +47,7 @@ pub mod init_position_haircut_state;
 pub mod verify_position_haircut;
 pub mod mature_position;
 pub mod convert_position;
+pub mod release_gain_to_haircut;
 pub mod seed_residual;
 pub mod init_er_margin_attestation;
 pub mod init_trader_ata;

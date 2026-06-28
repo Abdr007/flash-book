@@ -168,6 +168,7 @@ mod program {
         FlushHaircutDust = 80,
         InitMarketBook = 81,
         ConvertPosition = 82,
+        ReleaseGainToHaircut = 83,
     }
 
     #[inline(always)]
@@ -257,6 +258,7 @@ mod program {
             x if x == Ix::FlushHaircutDust as u8 => instructions::flush_haircut_dust::process(program_id, accounts, rest),
             x if x == Ix::InitMarketBook as u8 => instructions::init_market_book::process(program_id, accounts, rest),
             x if x == Ix::ConvertPosition as u8 => instructions::convert_position::process(program_id, accounts, rest),
+            x if x == Ix::ReleaseGainToHaircut as u8 => instructions::release_gain_to_haircut::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
