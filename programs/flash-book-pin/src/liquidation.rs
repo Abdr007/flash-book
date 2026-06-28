@@ -168,6 +168,49 @@ mod tests {
         assert_eq!(r.collateral_recovered_quote_lots, 0);
         assert_eq!(r.liquidation_penalty_quote_lots, 5);
     }
+
+    /// Bankruptcy-resolution contract fuzz: across 50k random closes, the result
+    /// must satisfy `compute_shortfall`'s invariants — recovered and shortfall
+    /// are MUTUALLY EXCLUSIVE (a closed position either returns value OR is
+    /// bankrupt, never both), a recovery never exceeds the funds at hand
+    /// (collateral + penalty headroom), and the call NEVER panics/overflows
+    /// (saturation is the designed failure mode). Deterministic LCG.
+    #[test]
+    fn compute_shortfall_invariants_fuzz() {
+        let mut seed: u64 = 0xB16B_00B5_DEAD_BEEF;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let m = mkt();
+        for _ in 0..50_000 {
+            let side = if next() % 2 == 0 { Side::Long } else { Side::Short };
+            let size = 1 + next() % 1_000;
+            let entry = 1 + next() % 10_000;
+            let fill = 1 + next() % 10_000;
+            let collateral = next() % 1_000_000;
+            let penalty_bps = (next() % 2_000) as u32; // 0 ..= ~20%
+            let r = compute_shortfall(&pos(side, size, entry), Ticks(fill), collateral, &m, penalty_bps)
+                .unwrap();
+            // Mutually exclusive: never both recovered AND short.
+            assert!(
+                !(r.shortfall_quote_lots > 0 && r.collateral_recovered_quote_lots > 0),
+                "recovered and shortfall both > 0"
+            );
+            // A recovery is bounded by collateral + the realized gain, and the
+            // gain can never exceed `size · max(entry, fill) · tick` (the
+            // largest possible price move, for either side) — a real ceiling
+            // that catches any sign/accounting blow-up.
+            let max_px = entry.max(fill);
+            let gain_ceiling = size.saturating_mul(max_px).saturating_mul(m.tick_size);
+            assert!(
+                r.collateral_recovered_quote_lots <= collateral.saturating_add(gain_ceiling),
+                "recovery exceeds collateral + max-gain ceiling"
+            );
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
