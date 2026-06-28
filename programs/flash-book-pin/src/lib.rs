@@ -176,6 +176,7 @@ mod program {
         ExpandMarketBook = 87,
         ReapExpiredOrders = 88,
         AutoDeleverage = 89,
+        InitPositionLiquidationState = 90,
     }
 
     #[inline(always)]
@@ -272,6 +273,7 @@ mod program {
             x if x == Ix::ExpandMarketBook as u8 => instructions::expand_market_book::process(program_id, accounts, rest),
             x if x == Ix::ReapExpiredOrders as u8 => instructions::reap_expired_orders::process(program_id, accounts, rest),
             x if x == Ix::AutoDeleverage as u8 => instructions::auto_deleverage::process(program_id, accounts, rest),
+            x if x == Ix::InitPositionLiquidationState as u8 => instructions::init_position_liquidation_state::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

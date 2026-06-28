@@ -659,6 +659,28 @@ pub struct PositionHaircutState {
 }
 const _: () = assert!(core::mem::size_of::<PositionHaircutState>() == 136);
 
+pub const POSITION_LIQ_STATE_DISC: [u8; 8] = [0x5C, 0x10, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// Per-position liquidation state — the timestamps `liquidate_position_v2`
+/// needs that don't fit in the full 128-byte `Position`. `unhealthy_since_slot`
+/// drives the Dutch-auction liquidator reward (linear ramp since the position
+/// first became unhealthy); `last_liquidated_at_slot` is the re-liquidation
+/// cooldown anchor. A fresh port-only PDA `[b"position_liq", market, position]`;
+/// padding-free `repr(C)` at 120 bytes. Mirrors the `PositionHaircutState`
+/// per-position-state pattern.
+#[repr(C)]
+pub struct PositionLiquidationState {
+    pub disc: [u8; 8],
+    pub market: Pubkey,
+    pub position: Pubkey,
+    pub unhealthy_since_slot: u64,
+    pub last_liquidated_at_slot: u64,
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub _reserved: [u8; 24],
+}
+const _: () = assert!(core::mem::size_of::<PositionLiquidationState>() == 120);
+
 pub const SIDE_ACCRUAL_DISC: [u8; 8] = [0x51, 0xDE, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
 
 /// Per-market side-accrual (ADL) state — long + short sides packed. The 128-bit
