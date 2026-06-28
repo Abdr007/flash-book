@@ -45,3 +45,6 @@ pub const ORACLE_CONFIG_SEED: &[u8] = b"oracle_config";
 
 /// `[b"side_accrual", market]` — a market's side-accrual (ADL) state account.
 pub const SIDE_ACCRUAL_SEED: &[u8] = b"side_accrual";
+
+/// `[b"vault_v3", strategist, vault_id]` — a v3 strategist vault account.
+pub const VAULT_SEED: &[u8] = b"vault_v3";
