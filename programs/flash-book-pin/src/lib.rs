@@ -149,6 +149,8 @@ mod program {
         InitializeHaircutState = 61,
         VerifyHaircutInvariants = 62,
         InitPositionHaircutState = 63,
+        CreateSessionToken = 64,
+        RevokeSessionToken = 65,
     }
 
     #[inline(always)]
@@ -219,6 +221,8 @@ mod program {
             x if x == Ix::InitializeHaircutState as u8 => instructions::initialize_haircut_state::process(program_id, accounts, rest),
             x if x == Ix::VerifyHaircutInvariants as u8 => instructions::verify_haircut_invariants::process(program_id, accounts, rest),
             x if x == Ix::InitPositionHaircutState as u8 => instructions::init_position_haircut_state::process(program_id, accounts, rest),
+            x if x == Ix::CreateSessionToken as u8 => instructions::create_session_token::process(program_id, accounts, rest),
+            x if x == Ix::RevokeSessionToken as u8 => instructions::revoke_session_token::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
