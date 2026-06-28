@@ -34,6 +34,7 @@ pub mod verify_protocol_solvency;
 pub mod er_heartbeat;
 pub mod init_fee_tiers;
 pub mod update_fee_tiers;
+pub mod verify_fee_tiers;
 pub mod init_market_oracle_config;
 pub mod verify_oracle_config;
 pub mod initialize_side_accrual;
