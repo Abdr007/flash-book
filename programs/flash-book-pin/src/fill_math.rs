@@ -110,6 +110,95 @@ pub fn oi_after_flp_fill(
     (new_long, new_short)
 }
 
+// ── Kani proofs: open-interest conservation ──────────────────────────────
+// The matcher invariant `verify_market_invariants` enforces is `long_oi ==
+// short_oi` (every long lot is matched by a short). These harnesses prove that
+// a single balanced fill — the apply_fill two-leg case and the apply_flp_fill
+// FLP-maker case — changes `long_oi` and `short_oi` by the SAME amount, so the
+// equality is preserved inductively. All values are bounded to `u32` (cast to
+// u64) so there is no `u128` symbolic mul/div (which Kani cannot terminate on)
+// and the `saturating_*` / `.max(0)` clamps provably never fire under the
+// realistic precondition that a position's old size is part of its side's OI.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Size/side-only transition mirroring `apply_to_position` (no price/PnL):
+    /// open from flat / add same-side / reduce-or-close / flip. This is exactly
+    /// the OI-relevant part of a fill leg.
+    fn leg_transition(old_side: u8, old_size: u64, fill_side: u8, fill_size: u64) -> (u8, u64) {
+        if old_size == 0 {
+            (fill_side, fill_size)
+        } else if old_side == fill_side {
+            (old_side, old_size + fill_size)
+        } else if fill_size <= old_size {
+            (old_side, old_size - fill_size) // reduce (==0 ⇒ size 0, side irrelevant)
+        } else {
+            (fill_side, fill_size - old_size) // flip
+        }
+    }
+
+    /// apply_fill: a balanced fill (taker on `taker_side` + maker on the
+    /// opposite side, both by `size`) changes long_oi and short_oi equally, so
+    /// `long_oi == short_oi` is preserved.
+    #[kani::proof]
+    fn proof_fill_two_leg_oi_balanced() {
+        let long = kani::any::<u32>() as u64;
+        let short = kani::any::<u32>() as u64;
+        let size = kani::any::<u32>() as u64;
+        kani::assume(size > 0);
+        let taker_side = kani::any::<u8>();
+        kani::assume(taker_side <= 1);
+        let maker_side = 1 - taker_side;
+        let t_old_side = kani::any::<u8>();
+        kani::assume(t_old_side <= 1);
+        let m_old_side = kani::any::<u8>();
+        kani::assume(m_old_side <= 1);
+        let t_old_size = kani::any::<u32>() as u64;
+        let m_old_size = kani::any::<u32>() as u64;
+        // Precondition: each leg's OLD size is part of its side's OI, so removal
+        // never saturates. Account for both legs sharing a side.
+        let long_used =
+            (if t_old_side == 0 { t_old_size } else { 0 }) + (if m_old_side == 0 { m_old_size } else { 0 });
+        let short_used =
+            (if t_old_side == 1 { t_old_size } else { 0 }) + (if m_old_side == 1 { m_old_size } else { 0 });
+        kani::assume(long >= long_used);
+        kani::assume(short >= short_used);
+
+        let (t_ns, t_nz) = leg_transition(t_old_side, t_old_size, taker_side, size);
+        let (m_ns, m_nz) = leg_transition(m_old_side, m_old_size, maker_side, size);
+        let (l1, s1) = oi_after_leg(long, short, t_old_side, t_old_size, t_ns, t_nz);
+        let (l2, s2) = oi_after_leg(l1, s1, m_old_side, m_old_size, m_ns, m_nz);
+        // Δlong == Δshort ⇒ equality preserved (if long==short before, after too).
+        assert_eq!(l2 as i128 - long as i128, s2 as i128 - short as i128);
+    }
+
+    /// apply_flp_fill: starting from the conservation invariant `long == short`,
+    /// the taker leg plus the pool's mirror counter-leg keep `long_oi ==
+    /// short_oi`. (The mirror gives both sides the same raw value `l1 + s1 −
+    /// long`, so equality holds whether or not the i128→u64 `.max(0)` clamp
+    /// fires — the precondition is the invariant the matcher maintains.)
+    #[kani::proof]
+    fn proof_flp_fill_oi_balanced() {
+        let long = kani::any::<u32>() as u64;
+        let short = kani::any::<u32>() as u64;
+        kani::assume(long == short); // invariant holds before the fill
+        let size = kani::any::<u32>() as u64;
+        kani::assume(size > 0);
+        let taker_side = kani::any::<u8>();
+        kani::assume(taker_side <= 1);
+        let t_old_side = kani::any::<u8>();
+        kani::assume(t_old_side <= 1);
+        let t_old_size = kani::any::<u32>() as u64;
+        // The taker's old size is part of its side's OI (removal never saturates).
+        kani::assume(if t_old_side == 0 { t_old_size <= long } else { t_old_size <= short });
+
+        let (t_ns, t_nz) = leg_transition(t_old_side, t_old_size, taker_side, size);
+        let (nl, ns) = oi_after_flp_fill(long, short, t_old_side, t_old_size, t_ns, t_nz);
+        assert_eq!(nl, ns); // invariant preserved
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
