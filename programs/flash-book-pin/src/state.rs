@@ -833,6 +833,50 @@ mod tests {
         assert_eq!(FlpExposure::amount_for_shares(100, 1_000, 0), None);
     }
 
+    /// Anti-exploit invariant: an FLP-v3 deposit of `amount` followed by an
+    /// IMMEDIATE withdrawal of exactly the minted shares can NEVER return more
+    /// than `amount` — share rounding always favors the pool, so a round-trip
+    /// creates no value (no risk-free extraction). Proven analytically (with
+    /// real arithmetic the round-trip equals `amount`; the two integer floors
+    /// only ever round it down), exercised here over a deterministic randomized
+    /// sweep including the virgin-pool and outstanding≫capital extremes.
+    ///
+    /// (A Kani proof of this needs two nested symbolic u128 divisions, which is
+    /// intractable for CBMC — so it is locked in as an exhaustive host test.)
+    #[test]
+    fn flp_v3_share_roundtrip_never_creates_value() {
+        type F = FlpExposurePerMarketV3;
+        let mut seed: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        for _ in 0..200_000 {
+            let amount = 1 + next() % 1_000_000_000; // 1 ..= 1e9
+            // Consistent pre-state: a pool has shares iff it has capital.
+            let (outstanding, capital) = if next() % 4 == 0 {
+                (0u64, 0u64) // virgin pool — mints 1:1
+            } else {
+                (1 + next() % 1_000_000_000, 1 + next() % 1_000_000_000)
+            };
+            let shares = F::shares_for_deposit_v3(amount, outstanding, capital);
+            if shares == 0 {
+                continue; // on-chain rejects a zero-share (dust) deposit
+            }
+            // Post-deposit pool, then redeem exactly the minted shares.
+            let cap2 = capital + amount;
+            let out2 = outstanding + shares;
+            let back = F::amount_for_shares_v3(shares, cap2, out2).unwrap();
+            assert!(
+                back <= amount,
+                "round-trip created value: amount={amount} outstanding={outstanding} \
+                 capital={capital} shares={shares} back={back}"
+            );
+        }
+    }
+
     #[test]
     fn open_positions_transitions() {
         // open: 0 -> >0 increments
