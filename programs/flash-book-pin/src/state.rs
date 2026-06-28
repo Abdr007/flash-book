@@ -518,6 +518,26 @@ pub struct MarketHaircutState {
 }
 const _: () = assert!(core::mem::size_of::<MarketHaircutState>() == 208);
 
+pub const POSITION_HAIRCUT_DISC: [u8; 8] = [0x4A, 0x13, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// Per-position haircut (positive-PnL warmup) state. All `u64` (no 128-bit
+/// fields), padding-free `repr(C)` at 136 bytes. Feeds the host-tested `haircut`
+/// maturation math (`apply_mature`).
+#[repr(C)]
+pub struct PositionHaircutState {
+    pub disc: [u8; 8],
+    pub market: Pubkey,
+    pub position: Pubkey,
+    pub released_reserve_quote_lots: u64,
+    pub released_attached_at_slot: u64,
+    pub matured_pos_quote_lots: u64,
+    pub original_reserve_at_attach: u64,
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub _reserved: [u8; 24],
+}
+const _: () = assert!(core::mem::size_of::<PositionHaircutState>() == 136);
+
 pub const SIDE_ACCRUAL_DISC: [u8; 8] = [0x51, 0xDE, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
 
 /// Per-market side-accrual (ADL) state — long + short sides packed. The 128-bit
