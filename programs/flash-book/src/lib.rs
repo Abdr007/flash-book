@@ -1117,12 +1117,17 @@ pub mod flash_book {
         // and any overflow spills onto the heap via Vec's grow path.
         // Stack-allocated fixed arrays aren't viable here: at 256-cap
         // × 60 B per tuple the array exceeds BPF's 4 KB stack frame.
-        const TYPICAL_WALK_DEPTH: usize = 16;
-        // (data_idx, maker_order_id, fill_size_lots, fill_price_ticks,
-        //  maker_pubkey, maker_sub_index) — Phase 2e adds maker_sub_index
-        // so the emitted FillEntry carries it for the sequencer.
+        let walk_limit = MAX_BATCH_ORDERS_PER_SIDE_V2;
+        // HEAP-FRUGAL (deep-book fix): pre-size `matches` to the walk cap so it
+        // allocates EXACTLY ONCE and never reallocates. The SBF bump allocator
+        // never frees, so a Vec that doubled 16→32→…→cap would LEAK every
+        // intermediate buffer (Σ ≈ 2×cap entries of dead heap) — the dominant
+        // heap cost of a deep sweep and the cause of the OOM-panic past ~100
+        // crossed levels. (data_idx, maker_order_id, fill_size_lots,
+        // fill_price_ticks, maker_pubkey, maker_sub_index) — Phase 2e adds
+        // maker_sub_index so the emitted FillEntry carries it for the sequencer.
         let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey, u8)> =
-            Vec::with_capacity(TYPICAL_WALK_DEPTH);
+            Vec::with_capacity(walk_limit);
         let mut stp_cancels: Vec<hypertree::DataIndex> = Vec::new();
         let mut stp_aborted = false;
         // M1 (audit 2026-06): set when the walk stops because it hit `walk_limit`
@@ -1130,7 +1135,6 @@ pub mod flash_book {
         // crossing orders may remain on the book, so the residual must NOT rest at
         // `limit_ticks` (it would cross the book). See the residual-rest guard.
         let mut walk_truncated = false;
-        let walk_limit = MAX_BATCH_ORDERS_PER_SIDE_V2;
 
         // Always walk to detect crossings. post_only check happens
         // AFTER — if matches were found, the order would cross, so
@@ -13613,7 +13617,14 @@ pub const BOOK_DEPTH_LEVELS: usize = 4;
 /// `place_taker_order_v2` ix. Bounded by the BPF compute budget — at
 /// 256 the worst-case walk consumes ~50K CU, well within the per-tx
 /// 200K default and the 1.4M maximum.
-pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 256;
+// HEAP-FRUGAL (deep-book fix): the matcher holds three N-sized heap buffers at
+// once — `matches` (pre-sized to this cap, no doubling leak), the `fills` Vec, and
+// the serialized FillBatchEvent — so peak ≈ cap × ~175 B must fit the 32 KiB SBF
+// heap. 96 keeps the matcher.s 3 simultaneous heap buffers (matches+fills+event) safely under
+// the 32 KiB SBF heap (empirically 128 OOMs, 64 is safe; 96 leaves margin), still crossing 96 levels per tx; deeper crossings truncate GRACEFULLY (the `walk_limit`
+// path drops the residual) instead of OOM-panicking, which is what 256 did past
+// ~100 levels. The fill-commitment ring cap (256) stays ≥ this, as M-2 requires.
+pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 96;
 
 /// HL withdrawal floor — wave 20b. When a trader pulls collateral from
 /// `partial_withdraw_collateral` with positions still open, the remaining

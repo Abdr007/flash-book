@@ -32,16 +32,17 @@ insertion *at depth*, not just on an empty book.
 | levels crossed | CU | CU/level |
 |---------------:|------:|---------:|
 | 1 | 15,951 | 15,951 |
-| 2 | 16,268 | 8,134 |
-| 4 | 18,816 | 4,704 |
 | 8 | 23,754 | 2,969 |
 | 16 | 33,293 | 2,080 |
-| 32 | 52,655 | 1,645 |
-| 64 | 91,121 | 1,423 |
+| 32 | 52,559 | 1,642 |
+| 64 | 90,929 | 1,420 |
+| **96 (cap)** | **129,120** | **1,345** |
+| 384 (request) | 129,200 | — truncated to 96 |
 
-**Fixed base ≈ 14.7k CU; marginal ≈ 1,193 CU per additional level** crossed,
-*including* the §3.2 per-fill anti-fabrication keccak commitment. A 64-level
-single-tx sweep = **91k CU**.
+**Fixed base ≈ 14.7k CU; marginal ≈ 1,191 CU per additional level** crossed,
+*including* the §3.2 per-fill anti-fabrication keccak commitment. A full **96-level
+single-tx sweep = 129k CU in the DEFAULT 32 KiB heap** (no heap-frame request). A
+384-level request **truncates gracefully to the 96 cap** — no OOM-panic.
 
 ### Comparison (real mainnet competitor txns)
 
@@ -50,24 +51,28 @@ single-tx sweep = **91k CU**.
 | Place order | ~13.3k (flat to 511 deep) | Phoenix place/cancel batch 93k–182k |
 | Sweep N levels | ~14.7k + 1.2k·N | Drift place-and-make budget 400k–800k |
 
-## Honest finding (surfaced by this benchmark)
+## Finding → fix (heap-frugal matcher)
 
-A single taker's `fills` Vec plus the `FillBatchEvent` clone exhaust the **default
-32 KiB SBF heap at ~100 crossed levels** — the matcher OOM-panics — *below*
-`MAX_BATCH_ORDERS_PER_SIDE_V2 = 256`. So the practical single-tx sweep ceiling is
-**heap-bound**, not the 256 batch cap.
+The first version of this benchmark surfaced a **reachable OOM panic**: a single
+taker's three simultaneous heap buffers — the `matches` Vec, the `fills` Vec, and
+the serialized `FillBatchEvent` — exhausted the **default 32 KiB SBF heap at ~100
+crossed levels**, *below* the old `MAX_BATCH_ORDERS_PER_SIDE_V2 = 256`. The SBF
+**bump allocator never frees**, so a doubling `matches` Vec also leaked every
+intermediate buffer.
 
-- `solana-program-test` does **not** honor a `RequestHeapFrame` ix, so the harness
-  ceiling is ~64 levels (what's measured above).
-- On the live runtime a client can request up to a 256 KiB heap frame, which
-  should lift the ceiling toward the batch cap — **to be confirmed on the live
-  runtime** (the test harness cannot).
-- Recommended hardening (team decision): either lower the matcher `walk_limit` so
-  deep crosses **truncate gracefully** (the audit's `walk_truncated` path) instead
-  of OOM-panicking under the default heap, or make the matcher heap-frugal (avoid
-  cloning all fills into the event) to keep the 256 cap usable without a heap
-  request. Either removes a reachable panic; the latter preserves throughput.
+**Fixed** (commit in this branch):
+1. **Pre-size `matches` to the cap** — one exact allocation, no doubling-realloc
+   leak (the dominant heap cost of a deep sweep).
+2. **Lower `MAX_BATCH_ORDERS_PER_SIDE_V2` to 96** so the three buffers
+   (96 × ~175 B ≈ 25 KiB) fit the 32 KiB heap with margin.
 
-This is reported, not hidden: a taker on a very deep book that doesn't request a
-heap frame and tries to cross >~100 levels will fail. Most crosses are 1–5 levels,
-so day-to-day impact is nil, but it's a real edge a deep-book reviewer should know.
+Result: a taker crosses up to **96 levels in one tx in the default heap with no
+heap-frame request**, and a deeper request **truncates gracefully** (the existing
+`walk_truncated` path drops the residual) instead of OOM-panicking. The
+fill-commitment ring cap (256) stays ≥ the batch cap, as M-2 requires. Deeper
+single-tx crossings (toward 256) would need a heap-frame request *and* a
+heap-frugal event (e.g. chunked emission) — a future optimization; 96 levels/tx is
+ample (most crosses are 1–5).
+
+Verified by `deep_book_matching_cu_curve` (the 384-level graceful-truncation case
+is asserted). 435 lib + 67 integration tests pass.

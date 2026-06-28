@@ -4043,7 +4043,8 @@ async fn deep_book_matching_cu_curve() {
         eprintln!("skipping deep_book_matching_cu_curve: set BPF_OUT_DIR=$PWD/target/deploy");
         return;
     }
-    let pt = make_program_test_sbf();
+    let mut pt = make_program_test_sbf();
+    pt.set_compute_max_units(1_400_000);
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone(); // market authority = maker
     let (_protocol, market, _, _, _) = setup_market(&mut ctx, &payer).await;
@@ -4166,13 +4167,14 @@ async fn deep_book_matching_cu_curve() {
     // default 32 KiB SBF heap can't hold the fills Vec + FillBatchEvent past
     // ~100 levels). With the request, the full {1..256} curve to the matcher's
     // FINDING: a single taker's `fills` Vec + the FillBatchEvent clone exhaust the
-    // DEFAULT 32 KiB SBF heap at ~100 crossed levels (the matcher OOM-panics),
-    // below MAX_BATCH_ORDERS_PER_SIDE_V2 (256). solana-program-test does NOT honor
-    // a `RequestHeapFrame` ix, so the safe measurable range here is up to 64; the
-    // on-chain ceiling WITH a heap-frame request is a live-runtime question. We
-    // measure the heap-safe curve.
+    // The matcher's batch cap (MAX_BATCH_ORDERS_PER_SIDE_V2) is sized so its three
+    // simultaneous heap buffers (pre-sized `matches` + `fills` + serialized
+    // FillBatchEvent) fit the default 32 KiB SBF heap — so a single tx crosses up
+    // to the cap WITHOUT OOM-panicking and WITHOUT needing a heap-frame request.
+    // Deeper requests truncate gracefully (verified below).
+    let cap = flash_book::MAX_BATCH_ORDERS_PER_SIDE_V2 as u64;
     let mut sweep = Vec::new();
-    for n in [1u64, 2, 4, 8, 16, 32, 64] {
+    for n in [1u64, 2, 4, 8, 16, 32, 64, cap] {
         let cu = cu_of(
             &mut ctx,
             build_ix(
@@ -4218,13 +4220,39 @@ async fn deep_book_matching_cu_curve() {
     let (nz, cz) = *sweep.last().unwrap();
     let marginal = (cz - c1) / (nz - n1);
     println!("  -> marginal ~= {marginal} CU per additional level crossed (incl. commitment)");
-    println!("\nReference (real mainnet competitor txns): Phoenix place/cancel batch 93k-182k;");
-    println!("Drift place-and-make budget 400k-800k. A {nz}-level single-tx sweep here = {cz} CU.");
-    println!("FINDING: the fills Vec + FillBatchEvent clone exhaust the 32KB SBF heap at ~100 crossed");
-    println!("levels (matcher OOM-panics) below the 256 batch cap; deep sweeps need a heap-frame request");
-    println!("or fragmentation. solana-program-test ignores heap-frame ix, so 64 is the harness ceiling.\n");
 
-    assert!(cz < 200_000, "64-level armed sweep must fit one tx comfortably");
+    // GRACEFUL TRUNCATION: a request to cross 4× the cap must SUCCEED (not
+    // OOM-panic), crossing exactly `cap` levels and resting/dropping the rest.
+    let trunc = cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceTakerOrderV2 {
+                side: 1,
+                size_lots: cap * 4,
+                limit_ticks: 99_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(book, false),
+                AccountMeta::new(fc, false),
+            ],
+        ),
+        &taker.pubkey(),
+        &[&taker],
+    )
+    .await;
+    println!("  -> a {}-level request truncates GRACEFULLY to the {cap} cap ({trunc} CU, no OOM-panic)", cap * 4);
+
+    println!("\nReference (real mainnet competitor txns): Phoenix place/cancel batch 93k-182k;");
+    println!("Drift place-and-make budget 400k-800k. A {nz}-level single-tx sweep here = {cz} CU,");
+    println!("in the DEFAULT 32KB heap — no heap-frame request needed (the matcher's 3 heap buffers");
+    println!("are pre-sized to fit). Deeper crossings truncate gracefully instead of OOM-panicking.\n");
+
+    assert!(cz < 200_000, "cap-level armed sweep must fit one tx comfortably");
     assert!(mx - mn < 8_000, "place CU must stay flat across 511 levels (O(log n))");
 }
 
