@@ -197,6 +197,96 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// §3.2 P3 — grow an existing fill-commitment ring in place by
+    /// `additional_slots`. In the ER deployment the matcher PUSHES commitments on
+    /// the rollup but settlement only DRAINS them on L1 after
+    /// `commit_and_undelegate_fill_commitment`, so the ring grows for a whole
+    /// session and `FILL_RING_CAP` is effectively a per-session fill ceiling. This
+    /// lets the operator raise it without re-creating the account (the cap lives
+    /// in the header; nothing else changes). Authority-gated; MUST run on the BASE
+    /// LAYER with the ring UNdelegated (a delegated ring is owned by the
+    /// delegation program — realloc would corrupt its record), and the ring MUST
+    /// be EMPTY (drained): growing while entries are pending would change every
+    /// entry's `% cap` slot mapping and misread them.
+    pub fn grow_fill_commitment(
+        ctx: Context<GrowFillCommitment>,
+        additional_slots: u32,
+    ) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        require!(additional_slots > 0, FlashBookError::OutOfRange);
+
+        let fc_ai = ctx.accounts.fill_commitment.to_account_info();
+        require_keys_eq!(*fc_ai.owner, *ctx.program_id, FlashBookError::Unauthorized);
+
+        let market_bytes = ctx.accounts.market.key().to_bytes();
+        // Validate + read the current cap, and require the ring be DRAINED.
+        let old_cap = {
+            let data = fc_ai.try_borrow_data()?;
+            let cap = fc::buffer_check(&data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+            require!(
+                fc::buffer_next_index(&data) == fc::buffer_settle_index(&data),
+                FlashBookError::FillRingNotDrained
+            );
+            cap
+        };
+
+        let new_cap = old_cap
+            .checked_add(additional_slots)
+            .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+        let additional_bytes = (additional_slots as usize)
+            .checked_mul(32)
+            .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+        require!(
+            additional_bytes
+                <= anchor_lang::solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE,
+            FlashBookError::OutOfRange
+        );
+
+        let old_len = fc_ai.data_len();
+        let new_len = fc::fill_commit_account_len(new_cap as usize);
+
+        // Top up rent so the larger account stays rent-exempt.
+        let rent = Rent::get()?;
+        let new_minimum = rent.minimum_balance(new_len);
+        let cur_lamports = fc_ai.lamports();
+        if new_minimum > cur_lamports {
+            let topup = new_minimum.saturating_sub(cur_lamports);
+            anchor_lang::solana_program::program::invoke(
+                &anchor_lang::solana_program::system_instruction::transfer(
+                    &ctx.accounts.authority.key(),
+                    &fc_ai.key(),
+                    topup,
+                ),
+                &[
+                    ctx.accounts.authority.to_account_info(),
+                    fc_ai.clone(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+
+        // Grow in place (zero-inits the appended slots), stamp the new cap, and
+        // re-validate so a botched realloc fails loudly.
+        fc_ai.resize(new_len)?;
+        {
+            let mut data = fc_ai.try_borrow_mut_data()?;
+            fc::buffer_set_cap(&mut data, new_cap);
+            fc::buffer_check(&data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+        }
+
+        emit!(FillCommitmentGrownEvent {
+            market: ctx.accounts.market.key(),
+            fill_commitment: fc_ai.key(),
+            old_cap,
+            new_cap,
+            old_bytes: old_len as u32,
+            new_bytes: new_len as u32,
+        });
+        Ok(())
+    }
+
     /// Grow an existing v2 `market_book` PDA in place by `additional_nodes`
     /// hypertree slots — this is what breaks the 100-node init cap. Only the
     /// market authority may call it (same gate as `init_market_book`).
@@ -11685,6 +11775,33 @@ pub struct InitFillCommitment<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// §3.2 P3 — grow an existing fill-commitment ring. Same authority gate +
+/// raw-PDA realloc pattern as `ExpandMarketBook`; the handler re-asserts program
+/// ownership + drained-ring before resizing.
+#[derive(Accounts)]
+pub struct GrowFillCommitment<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; reallocated via `AccountInfo::resize` in the handler,
+    /// which re-asserts program ownership before growing. Bound by the seeds.
+    #[account(
+        mut,
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 /// Grow a market_book PDA in place (`expand_market_book`). Same authority
 /// gate and seed binding as `InitMarketBook`; the book is reallocated in the
 /// handler so it's `UncheckedAccount` (Anchor can't size a variable account).
@@ -13387,6 +13504,16 @@ pub struct FillCommitmentInitializedEvent {
     pub fill_commitment: Pubkey,
     pub cap: u32,
     pub total_bytes: u32,
+}
+
+#[event]
+pub struct FillCommitmentGrownEvent {
+    pub market: Pubkey,
+    pub fill_commitment: Pubkey,
+    pub old_cap: u32,
+    pub new_cap: u32,
+    pub old_bytes: u32,
+    pub new_bytes: u32,
 }
 
 #[event]

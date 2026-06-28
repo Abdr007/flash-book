@@ -265,6 +265,16 @@ pub fn buffer_settle_index(data: &[u8]) -> u64 {
     rd_u64(data, OFF_SETTLED)
 }
 
+/// §3.2 P3 — overwrite the stored capacity AFTER the account has been resized to
+/// `fill_commit_account_len(new_cap)`. The caller MUST have validated the ring is
+/// EMPTY (`buffer_next_index == buffer_settle_index`): growing while entries are
+/// pending would change every entry's `% cap` slot mapping and misread them. The
+/// produced/settled cursors are absolute counters, so once drained they keep
+/// advancing correctly under the new cap.
+pub fn buffer_set_cap(data: &mut [u8], new_cap: u32) {
+    data[OFF_CAP..OFF_CAP + 4].copy_from_slice(&new_cap.to_le_bytes());
+}
+
 fn slot_view(data: &mut [u8], cap: usize) -> &mut [FillCommit] {
     let region = &mut data[FILL_COMMIT_HEADER_LEN..FILL_COMMIT_HEADER_LEN + cap * 32];
     bytemuck::cast_slice_mut::<u8, FillCommit>(region)
@@ -525,6 +535,27 @@ mod tests {
         assert_eq!(diff, 1, "only the taker_was_jit byte should differ");
         // Domain bumped so pre-upgrade commitments can't be reinterpreted.
         assert_eq!(&p_false[0..8], b"FBfillC2");
+    }
+
+    // §3.2 P3: growing the ring resizes the account, stamps the new cap, and the
+    // header must re-validate consistently at the larger size. produced/settled
+    // (absolute cursors) are untouched, so a drained ring stays drained.
+    #[test]
+    fn buffer_grow_updates_cap_and_revalidates() {
+        let market = [9u8; 32];
+        let cap = 4u32;
+        let mut data = vec![0u8; fill_commit_account_len(cap as usize)];
+        buffer_init(&mut data, &market, cap, 1).unwrap();
+        assert_eq!(buffer_check(&data, &market).unwrap(), 4);
+        assert_eq!(buffer_next_index(&data), buffer_settle_index(&data), "fresh ring is drained");
+        // simulate the handler's realloc-to-larger then cap stamp
+        let new_cap = 10u32;
+        data.resize(fill_commit_account_len(new_cap as usize), 0);
+        // before the cap stamp the header is inconsistent (len != cap*32+hdr)
+        assert!(buffer_check(&data, &market).is_err());
+        buffer_set_cap(&mut data, new_cap);
+        assert_eq!(buffer_check(&data, &market).unwrap(), 10, "re-validates at the new cap");
+        assert_eq!(buffer_next_index(&data), buffer_settle_index(&data), "still drained");
     }
 
     #[test]

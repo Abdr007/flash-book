@@ -237,6 +237,8 @@ pub enum FlashBookError {
     ErMarginAccountMismatch = 2304,
     #[msg("Owner-initiated force-undelegate is unavailable: the upgraded MagicBlock DLP makes undelegation validator-driven. Undelegate via commit_and_undelegate_market_book on the ER (finalized by process_undelegation)")]
     OwnerForceUndelegateUnavailable = 2305,
+    #[msg("Fill-commitment ring must be fully drained (produced == settled) before it can be grown")]
+    FillRingNotDrained = 2306,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

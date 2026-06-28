@@ -4704,14 +4704,81 @@ async fn chaos_instruction_sequences_keep_book_consistent() {
     }
 }
 
+/// §3.2 P3: `grow_fill_commitment` raises a drained ring's capacity in place
+/// (the ER-session fill ceiling). Verifies the cap + account size grow and the
+/// header re-validates; and that a non-authority is rejected.
+#[tokio::test]
+async fn grow_fill_commitment_raises_ring_cap() {
+    use flash_book::matcher::fill_commitment as fc;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
+
+    // init book
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
+        &[build_ix(flash_book::instruction::InitMarketBook {}, vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(book_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ])], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+    // arm the ring
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
+        &[build_ix(flash_book::instruction::InitFillCommitment {}, vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(fc_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ])], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+
+    let d = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
+    assert_eq!(u32::from_le_bytes(d[24..28].try_into().unwrap()), fc::FILL_RING_CAP, "init cap");
+
+    // grow_ix builder (pure — no ctx borrow)
+    let grow_ix = |auth: Pubkey| build_ix(
+        flash_book::instruction::GrowFillCommitment { additional_slots: 64 },
+        vec![
+            AccountMeta::new(auth, true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(fc_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+
+    // a non-authority is rejected (Unauthorized = Custom(7100))
+    let rogue = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(&payer.pubkey(), &rogue.pubkey(), 5_000_000)],
+        Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bad = ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
+        &[grow_ix(rogue.pubkey())], Some(&rogue.pubkey()), &[&rogue], bh)).await;
+    assert!(format!("{bad:?}").contains("Custom(7100)"), "non-authority grow must be Unauthorized: {bad:?}");
+
+    // authority grows by 64
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
+        &[grow_ix(payer.pubkey())], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+    let d = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
+    let cap1 = u32::from_le_bytes(d[24..28].try_into().unwrap());
+    assert_eq!(cap1, fc::FILL_RING_CAP + 64, "cap raised by additional_slots");
+    assert_eq!(d.len(), fc::fill_commit_account_len(cap1 as usize), "account resized to match new cap");
+}
+
 /// ER-layer coverage (honest scope): a faithful delegate→commit→undelegate
 /// round-trip needs a live MagicBlock ER (the handlers CPI into the delegation
 /// program, absent here) and is a devnet lifecycle test. What IS real and
 /// testable in the unit harness is the BASE-LAYER auth gate that runs BEFORE the
 /// CPI: the `market.authority` constraint on the delegation instructions. This
 /// verifies a non-authority is rejected (Unauthorized = Anchor Custom(7100)) by
-/// `delegate_fill_commitment` and `undelegate_fill_commitment` (the #35 ER ix) —
-/// so a rogue can never delegate/undelegate a market's commitment ring.
+/// `delegate_fill_commitment` (the #35 ER ix) — so a rogue can never delegate a
+/// market's commitment ring.
 #[tokio::test]
 async fn er_delegation_rejects_non_authority() {
     let pt = make_program_test();

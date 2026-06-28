@@ -4165,6 +4165,99 @@
       "args": []
     },
     {
+      "name": "grow_fill_commitment",
+      "docs": [
+        "\u00a73.2 P3: grow a drained fill-commitment ring in place (raise the ER-session fill ceiling)."
+      ],
+      "discriminator": [
+        127,
+        204,
+        92,
+        41,
+        20,
+        212,
+        119,
+        19
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fill_commitment",
+          "docs": [
+            "byte region, sized in-handler \u2014 same reason as `market_book`). Bound by",
+            "the seed derivation below."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  105,
+                  108,
+                  108,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "additional_slots",
+          "type": "u32"
+        }
+      ]
+    },
+    {
       "name": "init_flp_per_market_v3",
       "docs": [
         "Initialize a per-market FLP exposure account. Authority-only."
@@ -14467,6 +14560,19 @@
         44,
         79
       ]
+    },
+    {
+      "name": "FillCommitmentGrownEvent",
+      "discriminator": [
+        109,
+        60,
+        142,
+        33,
+        234,
+        27,
+        232,
+        17
+      ]
     }
   ],
   "errors": [
@@ -14929,6 +15035,11 @@
       "code": 8305,
       "name": "OwnerForceUndelegateUnavailable",
       "msg": "Owner-initiated force-undelegate is unavailable: the upgraded MagicBlock DLP makes undelegation validator-driven. Undelegate via commit_and_undelegate_market_book on the ER (finalized by process_undelegation)"
+    },
+    {
+      "code": 8306,
+      "name": "FillRingNotDrained",
+      "msg": "Fill-commitment ring must be fully drained (produced == settled) before it can be grown"
     }
   ],
   "types": [
@@ -21137,6 +21248,38 @@
               "Q32.32 fixed-point VPIN value (0 = balanced, FIXED_ONE = max imbalance)."
             ],
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FillCommitmentGrownEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "fill_commitment",
+            "type": "pubkey"
+          },
+          {
+            "name": "old_cap",
+            "type": "u32"
+          },
+          {
+            "name": "new_cap",
+            "type": "u32"
+          },
+          {
+            "name": "old_bytes",
+            "type": "u32"
+          },
+          {
+            "name": "new_bytes",
+            "type": "u32"
           }
         ]
       }
