@@ -152,6 +152,7 @@ mod program {
         CreateSessionToken = 64,
         RevokeSessionToken = 65,
         InitErMarginAttestation = 66,
+        AttestErReservedMargin = 67,
     }
 
     #[inline(always)]
@@ -225,6 +226,7 @@ mod program {
             x if x == Ix::CreateSessionToken as u8 => instructions::create_session_token::process(program_id, accounts, rest),
             x if x == Ix::RevokeSessionToken as u8 => instructions::revoke_session_token::process(program_id, accounts, rest),
             x if x == Ix::InitErMarginAttestation as u8 => instructions::init_er_margin_attestation::process(program_id, accounts, rest),
+            x if x == Ix::AttestErReservedMargin as u8 => instructions::attest_er_reserved_margin::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
