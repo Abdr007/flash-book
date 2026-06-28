@@ -594,3 +594,57 @@ async fn liquidate_portfolio_v2_injects_on_unhealthy_portfolio() {
     let handle = MarketBookHandle::from_account_data(&mut bd).unwrap();
     assert_eq!(handle.header.total_orders_active, 1, "one liquidation order injected");
 }
+
+// ─── JIT liquidation offer: cancel e2e (place is build-sbf-verified; its
+// create_pda_account CPI can't be driven by solana-program-test 3.1 — the same
+// NotEnoughAccountKeys limitation that affects all create/CPI instructions in
+// the harness). cancel mutates+closes an existing account (no CPI), so its
+// positive path IS testable here. ───
+use flash_book_pin::seeds::JIT_LIQ_OFFER_SEED;
+use flash_book_pin::state::JIT_LIQ_OFFER_DISC;
+const IX_CANCEL_JIT: u8 = 98;
+const JIT_NONCE: usize = 12;
+const JIT_MARKET: usize = 16;
+const JIT_MAKER: usize = 48;
+
+/// cancel_jit_liquidation_offer: a pre-seeded offer is closed by its maker and
+/// the rent is refunded (account gone / lamports 0).
+#[tokio::test]
+async fn jit_offer_cancel_closes_and_refunds() {
+    let pid = Pubkey::new_unique();
+    let maker = Keypair::new();
+    let market = Pubkey::new_unique();
+    let nonce: u32 = 7;
+    let (jit_offer, _) = Pubkey::find_program_address(
+        &[JIT_LIQ_OFFER_SEED, &market.to_bytes(), &maker.pubkey().to_bytes(), &nonce.to_le_bytes()],
+        &pid,
+    );
+
+    // Pre-seed the offer (bound to its PDA via market/maker/nonce).
+    let mut od = vec![0u8; 152];
+    od[0..8].copy_from_slice(&JIT_LIQ_OFFER_DISC);
+    od[JIT_NONCE..JIT_NONCE + 4].copy_from_slice(&nonce.to_le_bytes());
+    put_key(&mut od, JIT_MARKET, &market);
+    put_key(&mut od, JIT_MAKER, &maker.pubkey());
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(jit_offer, rent_account(od, pid));
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(maker.pubkey(), true),
+            AccountMeta::new(jit_offer, false),
+        ],
+        data: vec![IX_CANCEL_JIT],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &maker], bh))
+        .await
+        .unwrap();
+
+    let after = banks.get_account(jit_offer).await.unwrap();
+    assert!(after.is_none() || after.unwrap().lamports == 0, "offer closed, rent refunded");
+}

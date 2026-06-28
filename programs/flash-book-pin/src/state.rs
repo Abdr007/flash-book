@@ -674,6 +674,32 @@ const _: () = assert!(core::mem::size_of::<PositionHaircutState>() == 136);
 
 pub const POSITION_LIQ_STATE_DISC: [u8; 8] = [0x5C, 0x10, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
 
+pub const JIT_LIQ_OFFER_DISC: [u8; 8] = [0x6A, 0x17, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// A maker's pre-committed JIT liquidation offer (PDA `[b"jit_liq_offer", market,
+/// maker, nonce]`). The maker promises to fill up to `remaining_size_lots` of a
+/// liquidation on `market` (optionally only for `target_trader`, default zero =
+/// any) at `offer_price_ticks` until `expires_at_slot`. No token escrow — the
+/// maker's collateral covers the fill. Padding-free `repr(C)` at 152 bytes.
+#[repr(C)]
+pub struct JitLiquidationOffer {
+    pub disc: [u8; 8],
+    pub bump: u8,
+    pub side: u8,
+    pub maker_sub_index: u8,
+    pub _pad0: [u8; 1],
+    pub nonce: u32,
+    pub market: Pubkey,
+    pub maker: Pubkey,
+    pub target_trader: Pubkey,
+    pub offer_price_ticks: u64,
+    pub max_size_lots: u64,
+    pub remaining_size_lots: u64,
+    pub created_at_slot: u64,
+    pub expires_at_slot: u64,
+}
+const _: () = assert!(core::mem::size_of::<JitLiquidationOffer>() == 152);
+
 /// Per-position liquidation state — the timestamps `liquidate_position_v2`
 /// needs that don't fit in the full 128-byte `Position`. `unhealthy_since_slot`
 /// drives the Dutch-auction liquidator reward (linear ramp since the position
