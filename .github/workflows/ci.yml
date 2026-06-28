@@ -65,7 +65,13 @@ jobs:
         run: cargo build-sbf --manifest-path programs/flash-book/Cargo.toml
       - name: Build SBF (Pinocchio migration crate, WIP)
         run: cargo build-sbf --manifest-path programs/flash-book-pin/Cargo.toml
-      - name: Test Pinocchio migration crate (host equivalence tests)
+      # Runs BOTH the host equivalence tests (--lib) AND the on-validator
+      # integration tests (tests/integration.rs), which load the .so built above
+      # into the BPF VM via solana-program-test. SBF_OUT_DIR points at the
+      # build-sbf output so ProgramTest finds `flash_book_pin.so`.
+      - name: Test Pinocchio migration crate (host + on-validator integration)
+        env:
+          SBF_OUT_DIR: ${{ github.workspace }}/programs/flash-book-pin/target/deploy
         run: cargo test --manifest-path programs/flash-book-pin/Cargo.toml
 
   kani:
