@@ -41,6 +41,7 @@ pub mod verify_oracle_config;
 pub mod initialize_side_accrual;
 pub mod verify_side_accrual_invariants;
 pub mod initialize_haircut_state;
+pub mod flush_haircut_dust;
 pub mod init_position_haircut_state;
 pub mod verify_position_haircut;
 pub mod mature_position;
