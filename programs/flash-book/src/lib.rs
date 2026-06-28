@@ -1157,9 +1157,22 @@ pub mod flash_book {
             // a different PDA than `market_book`, so this borrow does not alias
             // the live book handle.
             let fc_market_bytes = market_key.to_bytes();
-            if let Some(fc_acct) =
-                find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes)
-            {
+            let fc_opt =
+                find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes);
+            // AUDIT H-2 fix: producer-side fill-commitment symmetry. On an ARMED
+            // market (`fill_commitment_required`) the taker MUST supply the ring
+            // account so every fill the matcher just crossed is bound 1:1 to a
+            // settleable commitment. Without this a taker could omit the
+            // (optional) account, still mutate the book (consume maker
+            // liquidity), push NO commitment, and leave those fills permanently
+            // unsettleable — wedging the market's settlement pipeline and
+            // griefing makers at zero cost. Mirrors the consumer guard in
+            // `apply_fill`. `fills` is non-empty here, so a real cross occurred.
+            require!(
+                !market.fill_commitment_required || fc_opt.is_some(),
+                FlashBookError::FillCommitmentMissing
+            );
+            if let Some(fc_acct) = fc_opt {
                 use matcher::fill_commitment as fc;
                 let market_bytes = fc_market_bytes;
                 let taker_bytes = trader_pk.to_bytes();
@@ -4170,8 +4183,8 @@ pub mod flash_book {
             let taker_pos_isolated_for_pnl = taker_pos.collateral_quote_lots > 0;
             let maker_pos_isolated_for_pnl = maker_pos.collateral_quote_lots > 0;
 
-            apply_fill_to_position(&mut taker_pos, taker_side_enum, size_lots, price_ticks, funding_index)?;
-            apply_fill_to_position(&mut maker_pos, maker_side_enum, size_lots, price_ticks, funding_index)?;
+            apply_fill_to_position(&mut taker_pos, taker_side_enum, size_lots, price_ticks, funding_index, market.params.tick_size)?;
+            apply_fill_to_position(&mut maker_pos, maker_side_enum, size_lots, price_ticks, funding_index, market.params.tick_size)?;
             (
                 taker_was_open,
                 maker_was_open,
@@ -6082,7 +6095,7 @@ pub mod flash_book {
             let taker_pre_realized = taker_pos.realized_pnl_quote_lots;
             let taker_pos_isolated_for_pnl = taker_pos.collateral_quote_lots > 0;
 
-            apply_fill_to_position(&mut taker_pos, taker_side_enum, size_lots, price_ticks, funding_index)?;
+            apply_fill_to_position(&mut taker_pos, taker_side_enum, size_lots, price_ticks, funding_index, market.params.tick_size)?;
             (
                 taker_was_open,
                 taker_pre_side,
@@ -6133,9 +6146,10 @@ pub mod flash_book {
         update_oi(market, taker_pre_side, taker_pre_size, taker_post_side, taker_post_size)?;
 
         // Update FLP per-market entry on the OPPOSITE side.
+        let flp_tick_size = market.params.tick_size; // AUDIT H-1: capture before flp borrow
         let flp = &mut ctx.accounts.flp_exposure;
         let flp_pre = flp_market_pre_state(flp, market_key);
-        apply_fill_to_flp_market(flp, market_key, flp_side_enum, size_lots, price_ticks)?;
+        apply_fill_to_flp_market(flp, market_key, flp_side_enum, size_lots, price_ticks, flp_tick_size)?;
         let flp_post = flp_market_pre_state(flp, market_key);
         update_oi(market, flp_pre.0, flp_pre.1, flp_post.0, flp_post.1)?;
 
@@ -6973,11 +6987,23 @@ pub mod flash_book {
         let counter_gain_u128 = counter_gain_per_lot
             .saturating_mul(close_size_lots as u128)
             .saturating_mul(tick_size);
-        let counter_gain = if counter_gain_u128 > u64::MAX as u128 {
+        let counter_gain_uncapped = if counter_gain_u128 > u64::MAX as u128 {
             u64::MAX
         } else {
             counter_gain_u128 as u64
         };
+        // AUDIT H-3 fix: ADL must CONSERVE value. The counterparty cannot be
+        // credited more than the bankrupt forfeits (`loss_quote_lots`), or the
+        // surplus is minted into collateral with no vault backing — and the
+        // insurance fund is, by the ADL trigger condition, already below its
+        // pause threshold, so there is no backstop to draw the gap from. Capping
+        // the credit at the loss removed guarantees `credit ≤ debit`. The excess
+        // (the counter's unrealized PnL beyond the bankrupt's collateral) is
+        // haircut here — the defining property of auto-deleveraging: the
+        // deleveraged winner is closed at the bankruptcy price, not paid surplus
+        // the protocol cannot fund. Previously this surplus was an unbacked mint
+        // that eroded `vault ≥ Σ collateral + flp + insurance`.
+        let counter_gain = counter_gain_uncapped.min(loss_quote_lots);
 
         // Apply to TraderStates.
         let market_key = market.key();
@@ -9356,10 +9382,11 @@ pub mod flash_book {
             FlashBookError::OracleConfidenceTooWide,
         );
 
-        // Wave 26b — optional envelope gate on the new Pyth price.
+        // Wave 26b / AUDIT H-4: per-slot envelope gate on the new Pyth price —
+        // now MANDATORY on this permissionless path.
         let now_slot = Clock::get()?.slot;
         gate_oracle_update(
-            ctx.accounts.envelope_config.as_mut(),
+            Some(&mut ctx.accounts.envelope_config),
             new_ticks as u64,
             now_slot,
         )?;
@@ -9454,10 +9481,11 @@ pub mod flash_book {
             require!(age <= max_age, FlashBookError::OracleTooStale);
         }
 
-        // 5. Envelope per-slot move gate (same as update_oracle), then commit.
+        // 5. AUDIT H-4: per-slot envelope move gate — now MANDATORY on this
+        // permissionless Lazer path. Then commit.
         let now_slot = Clock::get()?.slot;
         gate_oracle_update(
-            ctx.accounts.envelope_config.as_mut(),
+            Some(&mut ctx.accounts.envelope_config),
             new_ticks as u64,
             now_slot,
         )?;
@@ -14743,6 +14771,7 @@ fn apply_fill_to_flp_market(
     fill_side: Side,
     fill_size_lots: u64,
     fill_price_ticks: u64,
+    tick_size: u64,
 ) -> Result<()> {
     // Find existing entry or first empty slot.
     let mut entry_idx: Option<usize> = None;
@@ -14801,10 +14830,16 @@ fn apply_fill_to_flp_market(
     let close_size = fill_size_lots.min(cur.size_lots);
     let sign: i128 = if cur_side_enum == Side::Long { 1 } else { -1 };
     let pnl_per_lot: i128 = (fill_price_ticks as i128) - (cur.entry_price_ticks as i128);
+    // AUDIT H-1 fix: realized PnL is in quote-lots = size × Δticks × tick_size,
+    // matching unrealized PnL (risk.rs), funding, fees and liquidation shortfall.
+    // The tick_size factor was previously dropped, mis-scaling settled collateral
+    // / FLP NAV by 1/tick_size on any market with tick_size > 1.
     let pnl: i128 = sign
         .checked_mul(close_size as i128)
         .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
         .checked_mul(pnl_per_lot)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+        .checked_mul(tick_size as i128)
         .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
     let pnl_clamped = if pnl > i64::MAX as i128 {
         i64::MAX
@@ -14951,6 +14986,7 @@ fn apply_fill_to_position(
     fill_size_lots: u64,
     fill_price_ticks: u64,
     funding_index_now: i128,
+    tick_size: u64,
 ) -> Result<()> {
     let cur_side = if pos.side == 0 { Side::Long } else { Side::Short };
 
@@ -14990,10 +15026,16 @@ fn apply_fill_to_position(
     let sign: i128 = if cur_side == Side::Long { 1 } else { -1 };
     let pnl_per_lot: i128 =
         (fill_price_ticks as i128) - (pos.entry_price_ticks as i128);
+    // AUDIT H-1 fix: realized PnL is in quote-lots = size × Δticks × tick_size,
+    // matching unrealized PnL (risk.rs), funding, fees and liquidation shortfall.
+    // The tick_size factor was previously dropped, mis-scaling settled collateral
+    // by 1/tick_size on any market with tick_size > 1.
     let pnl: i128 = sign
         .checked_mul(close_size as i128)
         .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
         .checked_mul(pnl_per_lot)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+        .checked_mul(tick_size as i128)
         .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
     let pnl_clamped = if pnl > i64::MAX as i128 {
         i64::MAX
@@ -15710,6 +15752,32 @@ mod adl_routing_tests {
 mod realized_pnl_routing_tests {
     use super::*;
 
+    // AUDIT H-1 regression: realized PnL settled into the position MUST scale by
+    // `tick_size`, matching every other value path (unrealized PnL, funding,
+    // fees, liquidation shortfall). Before the fix the factor was dropped, so any
+    // market with tick_size>1 mis-scaled settled collateral by 1/tick_size. No
+    // prior test covered tick_size>1 (all fixtures pin 1), which is why it shipped.
+    #[test]
+    fn realized_pnl_scales_with_tick_size_h1() {
+        let zeroed = <state::PositionAccount as bytemuck::Zeroable>::zeroed();
+
+        // Long 10 lots @ entry 100, closed by an opposite fill @ 130, tick_size 50.
+        // realized = +1 × 10 × (130-100) × 50 = 15_000 quote-lots.
+        let mut pos = state::PositionAccount { side: 0, size_lots: 10, entry_price_ticks: 100, ..zeroed };
+        apply_fill_to_position(&mut pos, Side::Short, 10, 130, 0, 50).unwrap();
+        assert_eq!(pos.realized_pnl_quote_lots, 15_000);
+
+        // tick_size = 1 reproduces the legacy value (proves no double-count).
+        let mut p1 = state::PositionAccount { side: 0, size_lots: 10, entry_price_ticks: 100, ..zeroed };
+        apply_fill_to_position(&mut p1, Side::Short, 10, 130, 0, 1).unwrap();
+        assert_eq!(p1.realized_pnl_quote_lots, 300);
+
+        // Short 4 lots @ 200 closed @ 250 on tick_size 10: -1 × 4 × 50 × 10 = -2_000.
+        let mut ps = state::PositionAccount { side: 1, size_lots: 4, entry_price_ticks: 200, ..zeroed };
+        apply_fill_to_position(&mut ps, Side::Long, 4, 250, 0, 10).unwrap();
+        assert_eq!(ps.realized_pnl_quote_lots, -2_000);
+    }
+
     #[test]
     fn zero_delta_is_no_op() {
         // Cross
@@ -16035,15 +16103,19 @@ pub struct UpdateOracleFromPyth<'info> {
     /// level, and staleness via the in-house `pyth_oracle` parser.
     pub price_update: UncheckedAccount<'info>,
 
-    /// Wave 26b — optional envelope gate. Same semantics as on
-    /// `UpdateOracle`. When omitted: legacy Pyth-pull behavior.
+    /// AUDIT H-4 fix: the per-slot price-move cap is MANDATORY on this
+    /// permissionless path. Previously `Option`, so any caller could omit the
+    /// account and write an un-capped move. The envelope is created once via
+    /// `set_envelope_config`; markets using the permissionless Pyth-pull path
+    /// must have it. (The trusted authority `update_oracle` path keeps it
+    /// optional — that caller is already trusted.)
     #[account(
         mut,
         seeds = [state_v3::MarketEnvelopeConfigAccount::SEED, market.key().as_ref()],
         bump = envelope_config.bump,
         constraint = envelope_config.market == market.key() @ FlashBookError::EnvelopePriceCapInvalid,
     )]
-    pub envelope_config: Option<Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>>,
+    pub envelope_config: Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>,
 }
 
 /// The trusted Pyth Lazer Solana signer (base58
@@ -16075,14 +16147,16 @@ pub struct UpdateOracleFromLazer<'info> {
     )]
     pub oracle_config: Box<Account<'info, state_v3::MarketOracleConfigAccount>>,
 
-    /// Optional envelope gate — same semantics as `update_oracle`.
+    /// AUDIT H-4 fix: the per-slot price-move cap is MANDATORY on this
+    /// permissionless path (previously `Option`, so the caller could omit it
+    /// and write an un-capped move). Created once via `set_envelope_config`.
     #[account(
         mut,
         seeds = [state_v3::MarketEnvelopeConfigAccount::SEED, market.key().as_ref()],
         bump = envelope_config.bump,
         constraint = envelope_config.market == market.key() @ FlashBookError::EnvelopePriceCapInvalid,
     )]
-    pub envelope_config: Option<Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>>,
+    pub envelope_config: Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>,
 
     /// CHECK: the Instructions sysvar — its key is verified to equal
     /// `lazer_oracle::INSTRUCTIONS_SYSVAR_ID` inside the handler, which then
