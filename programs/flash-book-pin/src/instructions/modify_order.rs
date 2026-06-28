@@ -4,10 +4,11 @@
 //! fresh `seq`; the original order's `sub_index` is preserved.
 //!
 //! Faithful port of the Anchor `modify_order_v2`.
-use crate::book::{self, MarketBookHandle, RestingOrderV2};
+use crate::book::{self, price_within_band, MarketBookHandle, RestingOrderV2};
+use crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS;
 use crate::guard::{assert_market, assert_market_book};
 use crate::hypertree::NIL;
-use crate::state::Market;
+use crate::state::{Market, MARKET_STATUS_ACTIVE};
 use pinocchio::{
     account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey,
     sysvars::{clock::Clock, Sysvar}, ProgramResult,
@@ -35,7 +36,14 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     if !trader.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    if side > 1 || new_size_lots == 0 || new_limit_ticks == 0 || (new_flags & !0b0111_1111) != 0 {
+    if side > 1
+        || new_size_lots == 0
+        || new_limit_ticks == 0
+        || (new_flags & !0b0111_1111) != 0
+        // H4: reduce_only (bit1) is unenforced on the v2 CLOB — reject it loudly
+        // (mirrors place_limit_order so a "protective close" can't open/flip).
+        || (new_flags & 0b0000_0010) != 0
+    {
         return Err(ProgramError::InvalidInstructionData);
     }
     let now_slot = Clock::get()?.slot;
@@ -48,11 +56,18 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     assert_market_book(&accounts[2], &accounts[1], pid)?;
     unsafe {
         let market = market_of(&accounts[1]);
+        if market.status != MARKET_STATUS_ACTIVE {
+            return Err(ProgramError::Custom(4)); // market not active
+        }
         if new_size_lots < market.min_base_lots {
             return Err(ProgramError::Custom(1)); // SizeBelowMinLot
         }
-        if market.tick_size > 0 && new_limit_ticks % market.tick_size != 0 {
+        if market.tick_size == 0 || new_limit_ticks % market.tick_size != 0 {
             return Err(ProgramError::Custom(2)); // PriceNotOnTick
+        }
+        // Anti-stuffing: the replacement must sit within the band of the mark.
+        if !price_within_band(market.mark_price_ticks, new_limit_ticks, MAX_RESTING_ORDER_DEVIATION_BPS) {
+            return Err(ProgramError::Custom(5)); // too far from mark
         }
         if market.max_oi_base_lots > 0 {
             let cur = if side == 0 { market.long_oi_lots } else { market.short_oi_lots };
@@ -63,6 +78,10 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 
         let book_data = accounts[2].borrow_mut_data_unchecked();
         let mut handle = MarketBookHandle::from_account_data(book_data)?;
+        // Bind the book to THIS market (defence beyond the PDA check).
+        if &handle.header.market_pubkey != accounts[1].key() {
+            return Err(ProgramError::InvalidArgument);
+        }
         let side_is_bid = side == 0;
 
         // Phase 1: locate + verify ownership of the old order.
