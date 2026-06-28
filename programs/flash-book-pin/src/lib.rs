@@ -192,6 +192,7 @@ mod program {
         CancelIceberg = 103,
         PlaceBracketOrder = 104,
         CreateVaultV3 = 105,
+        VaultOpenTraderStateV3 = 106,
     }
 
     #[inline(always)]
@@ -304,6 +305,7 @@ mod program {
             x if x == Ix::CancelIceberg as u8 => instructions::cancel_iceberg::process(program_id, accounts, rest),
             x if x == Ix::PlaceBracketOrder as u8 => instructions::place_bracket_order::process(program_id, accounts, rest),
             x if x == Ix::CreateVaultV3 as u8 => instructions::create_vault_v3::process(program_id, accounts, rest),
+            x if x == Ix::VaultOpenTraderStateV3 as u8 => instructions::vault_open_trader_state_v3::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

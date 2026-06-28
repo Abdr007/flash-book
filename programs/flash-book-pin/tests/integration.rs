@@ -1226,3 +1226,58 @@ async fn create_vault_rejects_perf_fee_over_cap() {
     assert!(r.is_err(), "perf fee above the 50% cap must be rejected");
     assert!(banks.get_account(vault).await.unwrap().is_none(), "vault not created on reject");
 }
+
+// ─── vault_open_trader_state_v3 auth e2e ───
+// Opening a vault's TraderState creates a PDA via the create_pda CPI (build-sbf
+// only), but the strategist-auth gate runs BEFORE the CPI: a signer who is NOT
+// the vault's strategist must be rejected with a clean InvalidArgument, and no
+// TraderState is created.
+use flash_book_pin::state::VAULT_V3_DISC;
+const IX_VAULT_OPEN_TS: u8 = 106;
+
+fn vault_acct(pid: Pubkey, strategist: Pubkey, vault_id: u8) -> Account {
+    let mut d = vec![0u8; 152];
+    d[0..8].copy_from_slice(&VAULT_V3_DISC);
+    put_key(&mut d, 8, &strategist); // strategist @ 8
+    // name @ 40, accounting (5*u64) @ 72..112, perf_fee_bps @ 112, bump @ 116
+    d[117] = vault_id; // vault_id @ 117
+    d[118] = 1; // accept_deposits @ 118
+    rent_account(d, pid)
+}
+
+#[tokio::test]
+async fn vault_open_trader_state_rejects_non_strategist() {
+    let pid = Pubkey::new_unique();
+    let real_strategist = Pubkey::new_unique();
+    let imposter = Keypair::new();
+    let vault_id = 0u8;
+    let (vault, _) = Pubkey::find_program_address(
+        &[b"vault_v3", &real_strategist.to_bytes(), &[vault_id]], &pid);
+    let (vault_ts, _) =
+        Pubkey::find_program_address(&[b"trader_state", &vault.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(vault, vault_acct(pid, real_strategist, vault_id));
+    pt.add_account(
+        imposter.pubkey(),
+        Account { lamports: 5_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(imposter.pubkey(), true), // NOT the strategist
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new(vault_ts, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8; 32]), false),
+        ],
+        data: vec![IX_VAULT_OPEN_TS],
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh))
+        .await;
+    assert!(r.is_err(), "non-strategist must be rejected");
+    assert!(banks.get_account(vault_ts).await.unwrap().is_none(), "no TraderState created on reject");
+}

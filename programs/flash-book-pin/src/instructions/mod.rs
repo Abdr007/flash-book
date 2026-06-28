@@ -31,6 +31,7 @@ pub mod replenish_iceberg;
 pub mod cancel_iceberg;
 pub mod place_bracket_order;
 pub mod create_vault_v3;
+pub mod vault_open_trader_state_v3;
 pub mod withdraw_collateral;
 pub mod open_trader_sub_account;
 pub mod transfer_collateral;
