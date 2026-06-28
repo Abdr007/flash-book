@@ -160,6 +160,7 @@ mod program {
         CloseTraderAta = 72,
         VerifySideAccrualInvariants = 73,
         VerifyOracleConfig = 74,
+        VerifyLeverageTiers = 75,
     }
 
     #[inline(always)]
@@ -241,6 +242,7 @@ mod program {
             x if x == Ix::CloseTraderAta as u8 => instructions::close_trader_ata::process(program_id, accounts, rest),
             x if x == Ix::VerifySideAccrualInvariants as u8 => instructions::verify_side_accrual_invariants::process(program_id, accounts, rest),
             x if x == Ix::VerifyOracleConfig as u8 => instructions::verify_oracle_config::process(program_id, accounts, rest),
+            x if x == Ix::VerifyLeverageTiers as u8 => instructions::verify_leverage_tiers::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
