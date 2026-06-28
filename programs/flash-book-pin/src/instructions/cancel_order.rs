@@ -18,6 +18,10 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     unsafe {
         let book_data = accounts[2].borrow_mut_data_unchecked();
         let mut handle = MarketBookHandle::from_account_data(book_data)?;
+        // Bind the book to THIS market (defence beyond the PDA check).
+        if &handle.header.market_pubkey != accounts[1].key() {
+            return Err(ProgramError::InvalidArgument);
+        }
         let side_is_bid = side == 0;
         let idx = if side_is_bid { handle.lookup_bid_by_order_id(order_id) } else { handle.lookup_ask_by_order_id(order_id) };
         if idx == NIL { return Err(ProgramError::Custom(4)); } // not found
