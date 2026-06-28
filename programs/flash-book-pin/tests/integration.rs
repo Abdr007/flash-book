@@ -1185,3 +1185,44 @@ async fn place_bracket_rejects_short_sl_below_parent() {
     let d = bracket_data(1, 0, 1, 2, 5, 100, 90, 90, 95, 95, 0);
     assert!(run_bracket(d).await.is_err(), "short sl below parent must be rejected");
 }
+
+// ─── create_vault_v3 validation e2e ───
+// create_vault creates the vault PDA via the create_pda CPI (build-sbf only),
+// but the perf-fee cap is checked BEFORE the CPI — so an over-cap fee must fail
+// with a clean InvalidArgument, never reaching account creation.
+const IX_CREATE_VAULT: u8 = 105;
+
+#[tokio::test]
+async fn create_vault_rejects_perf_fee_over_cap() {
+    let pid = Pubkey::new_unique();
+    let strategist = Keypair::new();
+    let vault_id = 0u8;
+    let (vault, _) = Pubkey::find_program_address(
+        &[b"vault_v3", &strategist.pubkey().to_bytes(), &[vault_id]], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(
+        strategist.pubkey(),
+        Account { lamports: 5_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_CREATE_VAULT, vault_id];
+    data.extend_from_slice(&6_000u32.to_le_bytes()); // perf_fee_bps 60% > 50% cap
+    data.extend_from_slice(&[0u8; 32]); // name
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(strategist.pubkey(), true),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8; 32]), false),
+        ],
+        data,
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &strategist], bh))
+        .await;
+    assert!(r.is_err(), "perf fee above the 50% cap must be rejected");
+    assert!(banks.get_account(vault).await.unwrap().is_none(), "vault not created on reject");
+}
