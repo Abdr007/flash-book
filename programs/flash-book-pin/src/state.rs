@@ -490,6 +490,27 @@ const _: () = assert!(core::mem::size_of::<VaultPositionV3>() == 120);
 const _: () = assert!(core::mem::size_of::<LeverageTier>() == 16);
 const _: () = assert!(core::mem::size_of::<MarketLeverageTiers>() == 176);
 const _: () = assert!(core::mem::size_of::<FlpExposurePerMarketV3>() == 136);
+
+impl FlpExposurePerMarketV3 {
+    /// Shares minted for a per-market FLP-v3 deposit of `amount`, priced on the
+    /// pool's pre-deposit `(lp_shares_outstanding, total_capital)`. Pure +
+    /// host-tested. First deposit (no shares or no capital) mints 1:1; otherwise
+    /// `amount · outstanding / capital`, clamped to `u64::MAX` (anchor parity —
+    /// the v3 pricing is capital-based, NOT NAV-based).
+    #[inline]
+    pub fn shares_for_deposit_v3(amount: u64, outstanding: u64, capital: u64) -> u64 {
+        if outstanding == 0 || capital == 0 {
+            return amount;
+        }
+        let s = (amount as u128).saturating_mul(outstanding as u128) / (capital as u128).max(1);
+        if s > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            s as u64
+        }
+    }
+}
+
 const _: () = assert!(core::mem::size_of::<FlpPositionV3>() == 104);
 const _: () = assert!(core::mem::size_of::<LpPosition>() == 104);
 
@@ -684,6 +705,24 @@ const _: () = assert!(core::mem::size_of::<MarketEnvelopeConfig>() == 168);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flp_v3_shares_for_deposit_pricing_and_clamp() {
+        // First deposit (no shares OR no capital) → 1:1.
+        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(100, 0, 0), 100);
+        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(100, 0, 50), 100);
+        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(100, 5, 0), 100);
+        // Priced: amount · outstanding / capital.
+        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(100, 1_000, 500), 200);
+        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(50, 1_000, 1_000), 50);
+        // Floor rounding (dust below one share → 0).
+        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(1, 1, 1_000), 0);
+        // Clamp at u64::MAX, no overflow.
+        assert_eq!(
+            FlpExposurePerMarketV3::shares_for_deposit_v3(u64::MAX, u64::MAX, 1),
+            u64::MAX
+        );
+    }
 
     #[test]
     fn flp_share_math_round_trips_and_guards() {
