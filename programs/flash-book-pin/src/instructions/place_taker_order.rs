@@ -11,7 +11,7 @@
 use crate::book::{self, MarketBookHandle, RestingOrderV2};
 use crate::guard::{assert_market, assert_market_book};
 use crate::hypertree::{DataIndex, NIL};
-use crate::state::Market;
+use crate::state::{Market, MARKET_STATUS_ACTIVE};
 use pinocchio::{
     account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey,
     sysvars::{clock::Clock, Sysvar}, ProgramResult,
@@ -51,7 +51,14 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     if !trader.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    if side > 1 || size_lots == 0 || limit_ticks == 0 || (flags & !0b0111_1111) != 0 {
+    if side > 1
+        || size_lots == 0
+        || limit_ticks == 0
+        || (flags & !0b0111_1111) != 0
+        // H4: reduce_only (bit1) is unenforced on the v2 CLOB — reject it loudly
+        // (mirrors place_limit_order / modify_order).
+        || (flags & 0b0000_0010) != 0
+    {
         return Err(ProgramError::InvalidInstructionData);
     }
     let now_slot = Clock::get()?.slot;
@@ -64,6 +71,9 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     assert_market_book(&accounts[2], &accounts[1], pid)?;
     unsafe {
         let market = market_of(&accounts[1]);
+        if market.status != MARKET_STATUS_ACTIVE {
+            return Err(ProgramError::Custom(4)); // market not active — no matching
+        }
         if size_lots < market.min_base_lots {
             return Err(ProgramError::Custom(1)); // SizeBelowMinLot
         }
@@ -82,6 +92,10 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 
         let book_data = accounts[2].borrow_mut_data_unchecked();
         let mut handle = MarketBookHandle::from_account_data(book_data)?;
+        // Bind the book to THIS market (defence beyond the PDA check).
+        if &handle.header.market_pubkey != accounts[1].key() {
+            return Err(ProgramError::InvalidArgument);
+        }
 
         let taker_seq = handle
             .header
