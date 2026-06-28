@@ -486,6 +486,45 @@ const _: () = assert!(core::mem::size_of::<FlpExposurePerMarketV3>() == 136);
 const _: () = assert!(core::mem::size_of::<FlpPositionV3>() == 104);
 const _: () = assert!(core::mem::size_of::<LpPosition>() == 104);
 
+pub const SIDE_ACCRUAL_DISC: [u8; 8] = [0x51, 0xDE, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// Per-market side-accrual (ADL) state — long + short sides packed. The 128-bit
+/// indices (`a`/`k`/`f`/`b`) are stored as `[u8; 16]` little-endian (read via
+/// `i128/u128::from_le_bytes`), NOT native `u128`, so the zero-copy account never
+/// needs 16-byte alignment (Solana account data is only 8-aligned) — the same
+/// trick as `Market::cum_funding_index`. Grouped-by-alignment, padding-free
+/// `repr(C)` at 280 bytes (a fresh port-only account). Feeds the host-tested
+/// `side_accrual` math; `a` starts at `side_accrual::ADL_ONE`.
+#[repr(C)]
+pub struct MarketSideAccrual {
+    pub disc: [u8; 8],
+    pub market: Pubkey,
+    // ── u64 group (8-aligned) ──────────────────────────────────────────
+    pub long_slot_last: u64,
+    pub long_price_last: u64,
+    pub short_slot_last: u64,
+    pub short_price_last: u64,
+    // ── u32 group ──────────────────────────────────────────────────────
+    pub long_epoch: u32,
+    pub short_epoch: u32,
+    // ── u8 group ───────────────────────────────────────────────────────
+    pub bump: u8,
+    pub long_mode: u8,
+    pub short_mode: u8,
+    pub _pad0: u8,
+    // ── 128-bit indices as LE bytes (align 1) ──────────────────────────
+    pub long_a: [u8; 16],
+    pub long_k: [u8; 16],
+    pub long_f: [u8; 16],
+    pub long_b: [u8; 16],
+    pub short_a: [u8; 16],
+    pub short_k: [u8; 16],
+    pub short_f: [u8; 16],
+    pub short_b: [u8; 16],
+    pub _reserved: [u8; 64],
+}
+const _: () = assert!(core::mem::size_of::<MarketSideAccrual>() == 280);
+
 pub const ORACLE_CONFIG_DISC: [u8; 8] = [0x09, 0xAC, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
 
 /// Per-market oracle config. `source`: 0 = trusted `update_oracle` (the simplified
