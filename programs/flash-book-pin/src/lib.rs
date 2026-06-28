@@ -172,6 +172,7 @@ mod program {
         FlpDepositV3 = 84,
         FlpWithdrawV3 = 85,
         RecordFlpFillV3 = 86,
+        ExpandMarketBook = 87,
     }
 
     #[inline(always)]
@@ -265,6 +266,7 @@ mod program {
             x if x == Ix::FlpDepositV3 as u8 => instructions::flp_deposit_v3::process(program_id, accounts, rest),
             x if x == Ix::FlpWithdrawV3 as u8 => instructions::flp_withdraw_v3::process(program_id, accounts, rest),
             x if x == Ix::RecordFlpFillV3 as u8 => instructions::record_flp_fill_v3::process(program_id, accounts, rest),
+            x if x == Ix::ExpandMarketBook as u8 => instructions::expand_market_book::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
