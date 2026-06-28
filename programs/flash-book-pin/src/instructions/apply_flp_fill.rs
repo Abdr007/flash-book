@@ -76,15 +76,27 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
 
         // Taker-leg position update (FLP is the maker — no maker leg on-chain).
         let fidx = market.cum_funding();
+        // Snapshot the taker's OLD side/size so the OI delta removes its prior
+        // contribution from the correct side (a fill may close or flip it).
+        let taker_old_side = taker_pos.side;
+        let taker_before = taker_pos.size_lots;
         crate::fill_math::apply_to_position(taker_pos, taker_side, size, price, fidx)
             .map_err(|_| ProgramError::ArithmeticOverflow)?;
 
-        // Open interest.
-        if taker_side == 0 {
-            market.long_oi_lots = market.long_oi_lots.saturating_add(size);
-        } else {
-            market.short_oi_lots = market.short_oi_lots.saturating_add(size);
-        }
+        // Open interest. The pool is the maker (no on-chain position), so OI is
+        // the taker leg plus the pool's mirror counter-leg — keeping
+        // `long_oi == short_oi`, the conservation invariant. (The prior code
+        // added `size` to ONLY the taker side, breaking it on every fill.)
+        let (long_oi, short_oi) = crate::fill_math::oi_after_flp_fill(
+            market.long_oi_lots,
+            market.short_oi_lots,
+            taker_old_side,
+            taker_before,
+            taker_pos.side,
+            taker_pos.size_lots,
+        );
+        market.long_oi_lots = long_oi;
+        market.short_oi_lots = short_oi;
 
         // Fee / rebate split. FLP-as-maker: ignore a negative maker_rebate_bps
         // (the protocol cannot charge itself a fee).
