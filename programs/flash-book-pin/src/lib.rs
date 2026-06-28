@@ -191,6 +191,7 @@ mod program {
         ReplenishIceberg = 102,
         CancelIceberg = 103,
         PlaceBracketOrder = 104,
+        CreateVaultV3 = 105,
     }
 
     #[inline(always)]
@@ -302,6 +303,7 @@ mod program {
             x if x == Ix::ReplenishIceberg as u8 => instructions::replenish_iceberg::process(program_id, accounts, rest),
             x if x == Ix::CancelIceberg as u8 => instructions::cancel_iceberg::process(program_id, accounts, rest),
             x if x == Ix::PlaceBracketOrder as u8 => instructions::place_bracket_order::process(program_id, accounts, rest),
+            x if x == Ix::CreateVaultV3 as u8 => instructions::create_vault_v3::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
