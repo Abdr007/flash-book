@@ -36,6 +36,7 @@ pub mod init_fee_tiers;
 pub mod update_fee_tiers;
 pub mod init_market_oracle_config;
 pub mod initialize_side_accrual;
+pub mod verify_side_accrual_invariants;
 pub mod initialize_haircut_state;
 pub mod init_position_haircut_state;
 pub mod mature_position;
