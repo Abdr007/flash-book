@@ -145,6 +145,7 @@ mod program {
         VerifyEnvelopeConfig = 57,
         InitMarketOracleConfig = 58,
         InitializeSideAccrual = 59,
+        CreateVault = 60,
     }
 
     #[inline(always)]
@@ -211,6 +212,7 @@ mod program {
             x if x == Ix::VerifyEnvelopeConfig as u8 => instructions::verify_envelope_config::process(program_id, accounts, rest),
             x if x == Ix::InitMarketOracleConfig as u8 => instructions::init_market_oracle_config::process(program_id, accounts, rest),
             x if x == Ix::InitializeSideAccrual as u8 => instructions::initialize_side_accrual::process(program_id, accounts, rest),
+            x if x == Ix::CreateVault as u8 => instructions::create_vault::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
