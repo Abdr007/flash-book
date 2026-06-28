@@ -235,6 +235,8 @@ pub enum FlashBookError {
     ErAttestorMismatch = 2303,
     #[msg("ER margin attestation account does not belong to this trader_state")]
     ErMarginAccountMismatch = 2304,
+    #[msg("Owner-initiated force-undelegate is unavailable: the upgraded MagicBlock DLP makes undelegation validator-driven. Undelegate via commit_and_undelegate_market_book on the ER (finalized by process_undelegation)")]
+    OwnerForceUndelegateUnavailable = 2305,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

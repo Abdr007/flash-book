@@ -5541,14 +5541,17 @@ async fn flush_haircut_dust_debits_residual_h3() {
     .await
     .unwrap();
 
-    // Lazy-init both position haircut states. New account order (Phase-2c re-key):
-    // payer, trader_state, position, haircut_state, position_haircut, system.
+    // Lazy-init both position haircut states. WAVE 24f account order:
+    // payer, trader_state, market, position, haircut_state, position_haircut, system.
+    // `market` is now explicit so the haircut can be pre-initialized for a
+    // position that does not exist yet (breaks the haircut/position deadlock).
     let init_pos_hc = |ts: Pubkey, pos: Pubkey, pos_hc: Pubkey| {
         build_ix(
             flash_book::instruction::InitPositionHaircutState {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new_readonly(ts, false),
+                AccountMeta::new_readonly(market_pda, false),
                 AccountMeta::new_readonly(pos, false),
                 AccountMeta::new_readonly(haircut_state, false),
                 AccountMeta::new(pos_hc, false),

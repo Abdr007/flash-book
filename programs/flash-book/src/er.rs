@@ -62,9 +62,9 @@ pub struct DelegateArgs {
     /// Frequency at which the validator commits the account state if the
     /// owning program doesn't trigger commits explicitly.
     pub commit_frequency_ms: u32,
-    /// Seeds used to re-derive the PDA inside the delegation program.
-    /// Must INCLUDE the bump as the final element if the PDA is
-    /// canonical-bump.
+    /// Canonical PDA seeds (WITHOUT the bump) — the delegation program
+    /// re-derives via find_program_address. The bump travels only in the
+    /// invoke_signed signer seeds, not here (WAVE 24i).
     pub seeds: Vec<Vec<u8>>,
     /// Optional validator authority. Pass None for permissionless
     /// validator selection.
@@ -126,15 +126,73 @@ pub fn cpi_delegate(
         crate::FlashBookError::Unauthorized
     );
 
-    let mut data = Vec::with_capacity(64);
-    data.push(DELEGATE_DISCRIMINATOR);
-    args.serialize(&mut data)?;
+    // WAVE 24i — the upgraded delegation program uses a "fast" delegate path
+    // (`split_at(8)` discriminator; byte[0]=Delegate=0) that requires the CALLER
+    // to stage the account into the buffer and hand its ownership to the
+    // delegation program BEFORE the CPI (the old DLP did this internally). This
+    // mirrors `ephemeral_rollups_sdk::cpi::delegate_account` byte-for-byte. The
+    // DLP copies the buffer back into the (zeroed) account during its CPI, so the
+    // round-trip is lossless. `delegated_seeds` MUST include the bump (for PDA
+    // signing); `args.seeds` MUST NOT (the DLP re-derives via find_program_address).
+    let data_len = accounts.delegated_account.data_len();
+    let (_, buffer_bump) =
+        delegate_buffer_pda(accounts.delegated_account.key, accounts.owner_program.key);
+    let buffer_bump_arr = [buffer_bump];
+    let buffer_signer: &[&[u8]] = &[
+        DELEGATE_BUFFER_TAG,
+        accounts.delegated_account.key.as_ref(),
+        &buffer_bump_arr,
+    ];
 
+    // 1. Create the buffer PDA (owned by owner_program), sized to the account.
+    create_pda(
+        &accounts.payer,
+        &accounts.delegate_buffer,
+        &accounts.system_program,
+        accounts.owner_program.key,
+        data_len,
+        &[buffer_signer],
+    )?;
+    // 2. Stage the account's data into the buffer.
+    {
+        let src = accounts.delegated_account.try_borrow_data()?;
+        let mut dst = accounts.delegate_buffer.try_borrow_mut_data()?;
+        require!(dst.len() == src.len(), crate::FlashBookError::OutOfRange);
+        dst.copy_from_slice(&src);
+    }
+    // 3. Zero the account (required before its ownership can be handed off).
+    {
+        let mut d = accounts.delegated_account.try_borrow_mut_data()?;
+        for b in d.iter_mut() {
+            *b = 0;
+        }
+    }
+    // 4. Hand ownership to the delegation program: a program may assign its own
+    //    zeroed account to System, then System re-assigns it under PDA signature.
+    if accounts.delegated_account.owner != accounts.system_program.key {
+        accounts
+            .delegated_account
+            .assign(accounts.system_program.key);
+    }
+    if accounts.delegated_account.owner != accounts.delegation_program.key {
+        invoke_signed(
+            &system_instruction::assign(accounts.delegated_account.key, &DELEGATION_PROGRAM_ID),
+            &[
+                accounts.delegated_account.clone(),
+                accounts.system_program.clone(),
+            ],
+            &[delegated_seeds],
+        )?;
+    }
+
+    // 5. CPI the delegate (8-byte discriminator + DelegateArgs).
+    let mut data = Vec::with_capacity(64);
+    data.extend_from_slice(&[DELEGATE_DISCRIMINATOR, 0, 0, 0, 0, 0, 0, 0]);
+    args.serialize(&mut data)?;
     let ix = Instruction {
         program_id: DELEGATION_PROGRAM_ID,
         accounts: vec![
             AccountMeta::new(*accounts.payer.key, true),
-            // delegated_account is signer-by-PDA via invoke_signed.
             AccountMeta::new(*accounts.delegated_account.key, true),
             AccountMeta::new_readonly(*accounts.owner_program.key, false),
             AccountMeta::new(*accounts.delegate_buffer.key, false),
@@ -144,21 +202,31 @@ pub fn cpi_delegate(
         ],
         data,
     };
-
     invoke_signed(
         &ix,
         &[
-            accounts.payer,
-            accounts.delegated_account,
-            accounts.owner_program,
-            accounts.delegate_buffer,
-            accounts.delegation_record,
-            accounts.delegation_metadata,
-            accounts.system_program,
-            accounts.delegation_program,
+            accounts.payer.clone(),
+            accounts.delegated_account.clone(),
+            accounts.owner_program.clone(),
+            accounts.delegate_buffer.clone(),
+            accounts.delegation_record.clone(),
+            accounts.delegation_metadata.clone(),
+            accounts.system_program.clone(),
+            accounts.delegation_program.clone(),
         ],
         &[delegated_seeds],
     )?;
+
+    // 6. Close the now-consumed buffer, refunding rent to the payer. Draining
+    //    its lamports to zero is sufficient — the runtime reclaims the account
+    //    at the end of the instruction.
+    let buf_lamports = accounts.delegate_buffer.lamports();
+    **accounts.payer.try_borrow_mut_lamports()? = accounts
+        .payer
+        .lamports()
+        .checked_add(buf_lamports)
+        .ok_or(crate::FlashBookError::ArithmeticOverflow)?;
+    **accounts.delegate_buffer.try_borrow_mut_lamports()? = 0;
     Ok(())
 }
 
@@ -184,7 +252,8 @@ pub fn cpi_undelegate(
         crate::FlashBookError::Unauthorized
     );
 
-    let data = vec![UNDELEGATE_DISCRIMINATOR];
+    // WAVE 24h: 8-byte discriminator prefix (see cpi_delegate); byte[0] = Undelegate.
+    let data = vec![UNDELEGATE_DISCRIMINATOR, 0, 0, 0, 0, 0, 0, 0];
 
     let ix = Instruction {
         program_id: DELEGATION_PROGRAM_ID,
