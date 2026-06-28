@@ -518,6 +518,27 @@ pub struct MarketHaircutState {
 }
 const _: () = assert!(core::mem::size_of::<MarketHaircutState>() == 208);
 
+pub const SESSION_TOKEN_DISC: [u8; 8] = [0x5E, 0x55, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// A delegated session-signing token: `session_signer` may act for `owner` until
+/// `expires_at_unix`. Padding-free `repr(C)` at 88 bytes. `revoked` (1) hard-kills
+/// it before expiry. The consuming session-auth check on trade paths is a later
+/// batch.
+#[repr(C)]
+pub struct SessionToken {
+    pub disc: [u8; 8],
+    pub owner: Pubkey,
+    pub session_signer: Pubkey,
+    pub expires_at_unix: i64,
+    pub bump: u8,
+    pub revoked: u8,
+    pub _pad: [u8; 6],
+}
+const _: () = assert!(core::mem::size_of::<SessionToken>() == 88);
+
+/// Max session lifetime (seconds): 24h. Mirrors the anchor bound.
+pub const MAX_SESSION_TTL_SECONDS: i64 = 24 * 60 * 60;
+
 pub const POSITION_HAIRCUT_DISC: [u8; 8] = [0x4A, 0x13, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
 
 /// Per-position haircut (positive-PnL warmup) state. All `u64` (no 128-bit

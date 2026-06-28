@@ -37,6 +37,8 @@ pub mod init_market_oracle_config;
 pub mod initialize_side_accrual;
 pub mod initialize_haircut_state;
 pub mod init_position_haircut_state;
+pub mod create_session_token;
+pub mod revoke_session_token;
 pub mod verify_haircut_invariants;
 pub mod create_vault;
 pub mod init_market_leverage_tiers;
