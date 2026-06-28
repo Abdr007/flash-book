@@ -526,6 +526,46 @@ impl FlpExposurePerMarketV3 {
             / (total_shares as u128);
         Some(if a > u64::MAX as u128 { u64::MAX } else { a as u64 })
     }
+
+    /// Apply a pool-as-maker fill to the exposure's net position, returning the
+    /// new `(side, size_lots, entry_price_ticks)`. `side`: 0=long, 1=short,
+    /// 255=flat. Pure + host-tested; mirrors the anchor `record_flp_fill_v3`
+    /// open / add (weighted entry) / reduce / flip transitions exactly. Callers
+    /// pass `fill_size > 0`; the same-side branch's `new_size` is therefore > 0,
+    /// so the weighted-entry division never divides by zero.
+    #[inline]
+    pub fn apply_flp_fill(
+        prev_side: u8,
+        prev_size: u64,
+        prev_entry: u64,
+        fill_side: u8,
+        fill_size: u64,
+        fill_price: u64,
+    ) -> (u8, u64, u64) {
+        if prev_size == 0 {
+            (fill_side, fill_size, fill_price)
+        } else if prev_side == fill_side {
+            let new_size = prev_size.saturating_add(fill_size);
+            let ne = (prev_entry as u128)
+                .saturating_mul(prev_size as u128)
+                .saturating_add((fill_price as u128).saturating_mul(fill_size as u128))
+                / new_size as u128;
+            (
+                prev_side,
+                new_size,
+                if ne > u64::MAX as u128 { u64::MAX } else { ne as u64 },
+            )
+        } else if fill_size <= prev_size {
+            let ns = prev_size - fill_size;
+            if ns == 0 {
+                (255, 0, 0)
+            } else {
+                (prev_side, ns, prev_entry)
+            }
+        } else {
+            (fill_side, fill_size - prev_size, fill_price)
+        }
+    }
 }
 
 const _: () = assert!(core::mem::size_of::<FlpPositionV3>() == 104);
@@ -739,6 +779,21 @@ mod tests {
             FlpExposurePerMarketV3::shares_for_deposit_v3(u64::MAX, u64::MAX, 1),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn flp_apply_fill_open_add_reduce_flip() {
+        type E = FlpExposurePerMarketV3;
+        // open from flat.
+        assert_eq!(E::apply_flp_fill(255, 0, 0, 0, 10, 100), (0, 10, 100));
+        // add same side → weighted entry: (100·10 + 200·10)/20 = 150.
+        assert_eq!(E::apply_flp_fill(0, 10, 100, 0, 10, 200), (0, 20, 150));
+        // reduce opposite (partial) → entry unchanged.
+        assert_eq!(E::apply_flp_fill(0, 20, 150, 1, 5, 999), (0, 15, 150));
+        // reduce to exactly flat → side 255, entry 0.
+        assert_eq!(E::apply_flp_fill(0, 20, 150, 1, 20, 999), (255, 0, 0));
+        // flip: opposite larger → new side, remaining size, new entry.
+        assert_eq!(E::apply_flp_fill(0, 20, 150, 1, 30, 250), (1, 10, 250));
     }
 
     #[test]
