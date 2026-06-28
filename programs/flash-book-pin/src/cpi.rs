@@ -328,6 +328,30 @@ mod sol {
         )
     }
 
+    /// System-program lamport transfer: `from` (a normal tx signer) → `to`. Used
+    /// to top up an account's rent-exempt balance when growing it.
+    pub fn system_transfer(
+        system_program: &AccountInfo,
+        from: &AccountInfo,
+        to: &AccountInfo,
+        lamports: u64,
+    ) -> ProgramResult {
+        if system_program.key() != &SYSTEM_PROGRAM_ID {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+        let data = system_transfer_data(lamports);
+        let metas = [
+            AccountMeta::new(from.key(), true, true),
+            AccountMeta::new(to.key(), true, false),
+        ];
+        let ix = Instruction {
+            program_id: &SYSTEM_PROGRAM_ID,
+            accounts: &metas,
+            data: &data,
+        };
+        slice_invoke(&ix, &[from, to, system_program])
+    }
+
     /// SPL-Token `CloseAccount` (tag byte `9`): close `account` and send its rent
     /// lamports to `destination`. `authority` (the token account's owner) signs.
     /// The token program ENFORCES that the account balance is 0 and that
