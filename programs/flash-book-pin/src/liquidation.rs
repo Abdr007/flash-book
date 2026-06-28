@@ -291,6 +291,45 @@ pub fn liquidation_penalty_price(close_side: u8, oracle_ticks: u64, penalty_bps:
     if v > u64::MAX as u128 { u64::MAX } else { v as u64 }
 }
 
+/// Dutch-auction-scaled liquidator reward bps. With `auction_duration_slots ==
+/// 0` there is no auction → the full `reward_bps`. Otherwise the reward ramps
+/// LINEARLY from 0 to `reward_bps` over the auction: `eff = reward_bps ·
+/// min(elapsed, duration) / duration` (so `elapsed == 0` ⇒ 0, capped at
+/// `reward_bps` once `elapsed ≥ duration`). Saturating. `elapsed_slots` is
+/// `now − unhealthy_since`; the caller sources it (pin's `Position` has no
+/// `unhealthy_since` field yet — the instruction passes `auction_duration = 0`,
+/// i.e. flat reward, until that field is carved). Faithful port of the
+/// `liquidate_position_v2` Dutch-auction reward.
+#[inline]
+pub fn reward_bps_effective(reward_bps: u32, elapsed_slots: u64, auction_duration_slots: u64) -> u32 {
+    if auction_duration_slots == 0 {
+        return reward_bps;
+    }
+    let scale = (elapsed_slots.min(auction_duration_slots) as u128)
+        .saturating_mul(BPS_DENOM as u128)
+        / (auction_duration_slots as u128);
+    let eff = (reward_bps as u128).saturating_mul(scale) / (BPS_DENOM as u128);
+    if eff > u32::MAX as u128 { u32::MAX } else { eff as u32 }
+}
+
+/// The liquidator reward in quote lots: `notional · reward_bps_eff / 10_000`,
+/// where `notional = close_size · price · tick`. Saturating, clamped to
+/// `u64::MAX`. (The instruction caps the PAID reward at the funding bucket's
+/// balance — this is the gross entitlement.)
+#[inline]
+pub fn liquidator_reward_lots(
+    close_size_lots: u64,
+    price_ticks: u64,
+    tick_size: u64,
+    reward_bps_eff: u32,
+) -> u64 {
+    let notional = (close_size_lots as u128)
+        .saturating_mul(price_ticks as u128)
+        .saturating_mul(tick_size as u128);
+    let v = notional.saturating_mul(reward_bps_eff as u128) / (BPS_DENOM as u128);
+    if v > u64::MAX as u128 { u64::MAX } else { v as u64 }
+}
+
 /// FV: machine-checked correctness of the dual-source health price (Kani,
 /// comparison-only → fast). The health price is always the WORSE of the two
 /// real sources for the position's side, never understates risk, never invents
@@ -301,6 +340,12 @@ mod health_price_kani_proofs {
         health_price_with_staleness, liquidation_penalty_price, worse_of_health_price,
         HP_SOURCE_ORACLE_ONLY,
     };
+
+    // NOTE: `reward_bps_effective`'s `eff ≤ reward_bps` invariant is covered by
+    // the host test below, NOT a Kani proof: its `min(e,d)·BPS / duration`
+    // divides by a SYMBOLIC divisor, which CBMC explores in ~7 min even
+    // u32-bounded — too slow for the per-PR Kani job. The host ramp test
+    // (0 / 50% / 100% / beyond) exercises the same property cheaply.
 
     /// The liquidation penalty always moves the close price AGAINST the trader:
     /// closing a long fills at ≤ oracle, closing a short at ≥ oracle. Bounded to
@@ -382,9 +427,25 @@ mod health_price_kani_proofs {
 #[cfg(test)]
 mod health_price_tests {
     use super::{
-        health_price_with_staleness, liquidation_penalty_price, worse_of_health_price,
-        HP_SOURCE_ORACLE_ONLY,
+        health_price_with_staleness, liquidation_penalty_price, liquidator_reward_lots,
+        reward_bps_effective, worse_of_health_price, HP_SOURCE_ORACLE_ONLY,
     };
+
+    #[test]
+    fn liquidator_reward_dutch_ramp_and_amount() {
+        // No auction (duration 0) ⇒ flat reward bps.
+        assert_eq!(reward_bps_effective(500, 0, 0), 500);
+        assert_eq!(reward_bps_effective(500, 9_999, 0), 500);
+        // Linear ramp: halfway through a 100-slot auction ⇒ half the reward.
+        assert_eq!(reward_bps_effective(500, 50, 100), 250);
+        // elapsed 0 ⇒ 0; elapsed ≥ duration ⇒ full reward.
+        assert_eq!(reward_bps_effective(500, 0, 100), 0);
+        assert_eq!(reward_bps_effective(500, 100, 100), 500);
+        assert_eq!(reward_bps_effective(500, 1_000, 100), 500);
+        // Amount: notional = 10·100·1 = 1000; at 500 bps (5%) → 50.
+        assert_eq!(liquidator_reward_lots(10, 100, 1, 500), 50);
+        assert_eq!(liquidator_reward_lots(10, 100, 1, 0), 0);
+    }
 
     #[test]
     fn penalty_price_moves_against_the_trader() {
