@@ -182,6 +182,7 @@ mod program {
         CoverBadDebt = 93,
         SetPositionCross = 94,
         SetPositionIsolated = 95,
+        LiquidatePortfolioV2 = 96,
     }
 
     #[inline(always)]
@@ -284,6 +285,7 @@ mod program {
             x if x == Ix::CoverBadDebt as u8 => instructions::cover_bad_debt::process(program_id, accounts, rest),
             x if x == Ix::SetPositionCross as u8 => instructions::set_position_cross::process(program_id, accounts, rest),
             x if x == Ix::SetPositionIsolated as u8 => instructions::set_position_isolated::process(program_id, accounts, rest),
+            x if x == Ix::LiquidatePortfolioV2 as u8 => instructions::liquidate_portfolio_v2::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
