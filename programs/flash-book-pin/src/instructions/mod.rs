@@ -13,6 +13,7 @@ pub mod deposit_collateral;
 pub mod initialize_market;
 pub mod init_market_book;
 pub mod expand_market_book;
+pub mod reap_expired_orders;
 pub mod withdraw_collateral;
 pub mod open_trader_sub_account;
 pub mod transfer_collateral;
