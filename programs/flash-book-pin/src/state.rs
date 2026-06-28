@@ -310,6 +310,9 @@ pub const TWAP_ORDER_V3_DISC: [u8; 8] = [0x77, 0xA9, 0x00, 0x12, 0x34, 0x56, 0x7
 /// `TwapOrderV3.flags` ACTIVE bit (set on placement, cleared when fully executed).
 pub const TWAP_FLAG_ACTIVE: u8 = 0x01;
 pub const ICEBERG_ORDER_V3_DISC: [u8; 8] = [0x1C, 0xEB, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+/// `IcebergOrderV3.flags` ACTIVE bit (set on placement, cleared when the last
+/// chunk is replenished — `remaining_lots` reaches 0).
+pub const ICEBERG_FLAG_ACTIVE: u8 = 0x01;
 
 /// V3 native trigger order. Pod mirror of `TriggerOrderAccountV3` (136 B).
 /// Fields reordered so the `repr(C)` layout has no implicit padding.
