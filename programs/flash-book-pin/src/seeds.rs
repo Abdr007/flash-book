@@ -48,3 +48,6 @@ pub const SIDE_ACCRUAL_SEED: &[u8] = b"side_accrual";
 
 /// `[b"vault_v3", strategist, vault_id]` — a v3 strategist vault account.
 pub const VAULT_SEED: &[u8] = b"vault_v3";
+
+/// `[b"haircut", market]` — a market's haircut (positive-PnL warmup) state.
+pub const HAIRCUT_SEED: &[u8] = b"haircut";
