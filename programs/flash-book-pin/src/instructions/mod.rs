@@ -11,6 +11,7 @@ pub mod initialize_insurance_fund;
 pub mod withdraw_insurance_fund;
 pub mod deposit_collateral;
 pub mod initialize_market;
+pub mod init_market_book;
 pub mod withdraw_collateral;
 pub mod open_trader_sub_account;
 pub mod transfer_collateral;
