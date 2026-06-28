@@ -196,6 +196,7 @@ mod program {
         VaultOpenTraderStateV3 = 106,
         InitVaultPositionV3 = 107,
         VaultDepositV3 = 108,
+        VaultWithdrawV3 = 109,
     }
 
     #[inline(always)]
@@ -311,6 +312,7 @@ mod program {
             x if x == Ix::VaultOpenTraderStateV3 as u8 => instructions::vault_open_trader_state_v3::process(program_id, accounts, rest),
             x if x == Ix::InitVaultPositionV3 as u8 => instructions::init_vault_position_v3::process(program_id, accounts, rest),
             x if x == Ix::VaultDepositV3 as u8 => instructions::vault_deposit_v3::process(program_id, accounts, rest),
+            x if x == Ix::VaultWithdrawV3 as u8 => instructions::vault_withdraw_v3::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
