@@ -180,6 +180,8 @@ mod program {
         SetMarketLiquidationParams = 91,
         LiquidatePositionV2 = 92,
         CoverBadDebt = 93,
+        SetPositionCross = 94,
+        SetPositionIsolated = 95,
     }
 
     #[inline(always)]
@@ -280,6 +282,8 @@ mod program {
             x if x == Ix::SetMarketLiquidationParams as u8 => instructions::set_market_liquidation_params::process(program_id, accounts, rest),
             x if x == Ix::LiquidatePositionV2 as u8 => instructions::liquidate_position_v2::process(program_id, accounts, rest),
             x if x == Ix::CoverBadDebt as u8 => instructions::cover_bad_debt::process(program_id, accounts, rest),
+            x if x == Ix::SetPositionCross as u8 => instructions::set_position_cross::process(program_id, accounts, rest),
+            x if x == Ix::SetPositionIsolated as u8 => instructions::set_position_isolated::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

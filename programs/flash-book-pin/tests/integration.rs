@@ -410,3 +410,107 @@ async fn liquidate_position_v2_injects_and_rewards() {
     assert!(get_u64(&pl.data, PL_LAST_LIQUIDATED) > 0, "last_liquidated stamped");
     assert!(get_u64(&pl.data, PL_UNHEALTHY_SINCE) > 0, "unhealthy_since stamped");
 }
+
+// ─── set_position_cross e2e ───
+const IX_SET_POSITION_CROSS: u8 = 94;
+
+/// set_position_cross e2e: a trader with an ISOLATED long (target) + a CROSS long
+/// (sibling) converts the target to cross. target isolated 100 @100/size10,
+/// sibling cross size 5 @100; mark 100 (mmr 500bps), cross pool 200. After the
+/// merge the pool is 200+100=300, required = mm_target(50)+mm_sibling(25) = 75 ≤
+/// 300 ⇒ healthy. Asserts the pool gains the returned bucket and the target is
+/// now cross (bucket 0).
+#[tokio::test]
+async fn set_position_cross_merges_bucket_and_stays_healthy() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let ts = Pubkey::new_unique();
+    let target_market = Pubkey::new_unique();
+    let target_position = Pubkey::new_unique();
+    let market2 = Pubkey::new_unique();
+    let sibling = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(ts, trader_state(pid, trader.pubkey(), 200, 2)); // cross pool 200, 2 open
+    pt.add_account(target_market, market_full(pid, 100, 1, 500, 0, 0));
+    pt.add_account(target_position, position(pid, trader.pubkey(), target_market, 0, 10, 100, 100)); // isolated 100
+    pt.add_account(market2, market_full(pid, 100, 1, 500, 0, 0));
+    pt.add_account(sibling, position(pid, trader.pubkey(), market2, 0, 5, 100, 0)); // cross sibling
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(ts, false),
+            AccountMeta::new_readonly(target_market, false),
+            AccountMeta::new(target_position, false),
+            AccountMeta::new_readonly(market2, false),
+            AccountMeta::new_readonly(sibling, false),
+        ],
+        data: vec![IX_SET_POSITION_CROSS],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &trader], bh))
+        .await
+        .unwrap();
+
+    let ts_acct = banks.get_account(ts).await.unwrap().unwrap();
+    assert_eq!(get_u64(&ts_acct.data, TS_COLLATERAL), 300, "cross pool 200 + returned 100");
+    let tp = banks.get_account(target_position).await.unwrap().unwrap();
+    assert_eq!(get_u64(&tp.data, POS_COLLATERAL), 0, "target is now cross (bucket 0)");
+}
+
+// ─── set_position_isolated e2e ───
+const IX_SET_POSITION_ISOLATED: u8 = 95;
+
+/// set_position_isolated e2e: a trader with two CROSS longs moves 100 from the
+/// cross pool into the target's isolated bucket. target cross long 10 @100,
+/// sibling cross long 5 @100; mark 100 (mmr 500bps), cross pool 200. Moving 100:
+///   (a) target isolated on 100 ⇒ required mm 50 ≤ 100 ✓
+///   (b) sibling on the reduced pool 100 ⇒ required mm 25 ≤ 100 ✓
+/// Asserts the cross pool shrinks to 100 and the target bucket becomes 100.
+#[tokio::test]
+async fn set_position_isolated_splits_collateral_and_stays_healthy() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let ts = Pubkey::new_unique();
+    let target_market = Pubkey::new_unique();
+    let target_position = Pubkey::new_unique();
+    let market2 = Pubkey::new_unique();
+    let sibling = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(ts, trader_state(pid, trader.pubkey(), 200, 2));
+    pt.add_account(target_market, market_full(pid, 100, 1, 500, 0, 0));
+    pt.add_account(target_position, position(pid, trader.pubkey(), target_market, 0, 10, 100, 0)); // cross
+    pt.add_account(market2, market_full(pid, 100, 1, 500, 0, 0));
+    pt.add_account(sibling, position(pid, trader.pubkey(), market2, 0, 5, 100, 0)); // cross sibling
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_SET_POSITION_ISOLATED];
+    data.extend_from_slice(&100u64.to_le_bytes()); // amount to isolate
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(ts, false),
+            AccountMeta::new_readonly(target_market, false),
+            AccountMeta::new(target_position, false),
+            AccountMeta::new_readonly(market2, false),
+            AccountMeta::new_readonly(sibling, false),
+        ],
+        data,
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &trader], bh))
+        .await
+        .unwrap();
+
+    let ts_acct = banks.get_account(ts).await.unwrap().unwrap();
+    assert_eq!(get_u64(&ts_acct.data, TS_COLLATERAL), 100, "cross pool 200 − isolated 100");
+    let tp = banks.get_account(target_position).await.unwrap().unwrap();
+    assert_eq!(get_u64(&tp.data, POS_COLLATERAL), 100, "target isolated bucket = 100");
+}
