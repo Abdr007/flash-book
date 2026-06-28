@@ -793,7 +793,11 @@ pub struct MarketOracleConfig {
     pub tick_decimals: i8,
     pub source: u8,
     pub bump: u8,
-    pub _pad: [u8; 5],
+    pub _pad0: u8,
+    /// Max allowed dispersion (bps) across the 3 quorum sources before the update
+    /// is rejected (0 = gate off). Carved from `_pad`; the `u32` sits at the
+    /// 4-aligned offset 84 so the `repr(C)` layout + 88-byte size are unchanged.
+    pub max_dispersion_bps: u32,
 }
 const _: () = assert!(core::mem::size_of::<MarketOracleConfig>() == 88);
 

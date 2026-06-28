@@ -1748,3 +1748,88 @@ async fn update_trailing_stop_no_progress_is_noop() {
     assert_eq!(get_u64(&t.data, 80), 950, "trigger unchanged on no progress");
     assert_eq!(get_u64(&t.data, 128), 1_000, "anchor unchanged");
 }
+
+// ─── update_oracle_quorum e2e (positive, no CPI) ───
+// Validate + median-select 3 oracle sources, then set the mark. No CPI → fully
+// e2e-testable. Gates off (limits 0) ⇒ any 3 prices accepted; median of
+// [120,100,90] = 100 becomes the mark (was 0).
+use flash_book_pin::state::ORACLE_CONFIG_DISC;
+const IX_UPDATE_ORACLE_QUORUM: u8 = 114;
+
+fn oracle_config_acct(pid: Pubkey, market: Pubkey, max_stale: u32, max_conf: u32, max_disp: u32) -> Account {
+    let mut d = vec![0u8; 88];
+    d[0..8].copy_from_slice(&ORACLE_CONFIG_DISC);
+    put_key(&mut d, 8, &market);
+    put_u32(&mut d, 72, max_stale);   // max_staleness_seconds
+    put_u32(&mut d, 76, max_conf);    // max_confidence_bps
+    put_u32(&mut d, 84, max_disp);    // max_dispersion_bps
+    rent_account(d, pid)
+}
+
+#[tokio::test]
+async fn update_oracle_quorum_sets_median_mark() {
+    let pid = Pubkey::new_unique();
+    let sequencer = Keypair::new();
+    let market = Pubkey::new_unique();
+    let oracle_config = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_account(pid, sequencer.pubkey())); // mark 0, sequencer set
+    pt.add_account(oracle_config, oracle_config_acct(pid, market, 0, 0, 0)); // gates off
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_UPDATE_ORACLE_QUORUM];
+    for p in [120u64, 100, 90] { data.extend_from_slice(&p.to_le_bytes()); }  // prices
+    for c in [0u64, 0, 0] { data.extend_from_slice(&c.to_le_bytes()); }       // confidences
+    for t in [0u64, 0, 0] { data.extend_from_slice(&t.to_le_bytes()); }       // published_at
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(sequencer.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(oracle_config, false),
+        ],
+        data,
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &sequencer], bh))
+        .await
+        .unwrap();
+
+    let m = banks.get_account(market).await.unwrap().unwrap();
+    assert_eq!(get_u64(&m.data, MKT_MARK), 100, "mark set to the median of the 3 sources");
+}
+
+#[tokio::test]
+async fn update_oracle_quorum_rejects_wide_dispersion() {
+    let pid = Pubkey::new_unique();
+    let sequencer = Keypair::new();
+    let market = Pubkey::new_unique();
+    let oracle_config = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_account(pid, sequencer.pubkey()));
+    pt.add_account(oracle_config, oracle_config_acct(pid, market, 0, 0, 1_000)); // 10% dispersion cap
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_UPDATE_ORACLE_QUORUM];
+    for p in [90u64, 100, 110] { data.extend_from_slice(&p.to_le_bytes()); } // 20% spread > cap
+    for _ in 0..6 { data.extend_from_slice(&0u64.to_le_bytes()); }
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(sequencer.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(oracle_config, false),
+        ],
+        data,
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &sequencer], bh))
+        .await;
+    assert!(r.is_err(), "dispersion beyond the cap must be rejected");
+    let m = banks.get_account(market).await.unwrap().unwrap();
+    assert_eq!(get_u64(&m.data, MKT_MARK), 0, "mark untouched on reject");
+}
