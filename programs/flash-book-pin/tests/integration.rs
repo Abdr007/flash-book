@@ -1324,3 +1324,81 @@ async fn init_vault_position_rejects_bad_vault_disc() {
     assert!(r.is_err(), "bad vault discriminator must be rejected");
     assert!(banks.get_account(position).await.unwrap().is_none(), "no position created on reject");
 }
+
+// ─── vault_deposit_v3 deposits-closed e2e ───
+// The full deposit moves tokens via an SPL CPI (build-sbf only) + mints shares
+// via the Kani-proved vault_math. But the `accept_deposits == 1` gate runs
+// BEFORE the token CPI, so a vault with deposits closed must be rejected
+// cleanly. (The share-mint correctness itself is covered by vault_math's host
+// tests + proof.)
+use flash_book_pin::seeds::{TRADER_STATE_SEED, VAULT_POSITION_SEED, VAULT_SEED};
+use flash_book_pin::state::VAULT_POSITION_V3_DISC;
+use flash_book_pin::cpi::TOKEN_PROGRAM_ID;
+const IX_VAULT_DEPOSIT: u8 = 108;
+
+fn vault_with_accept(pid: Pubkey, strategist: Pubkey, vault_id: u8, accept: u8, shares: u64) -> Account {
+    let mut d = vec![0u8; 152];
+    d[0..8].copy_from_slice(&VAULT_V3_DISC);
+    put_key(&mut d, 8, &strategist);
+    put_u64(&mut d, 72, shares); // shares_outstanding
+    d[116] = 0; // bump
+    d[117] = vault_id;
+    d[118] = accept; // accept_deposits
+    rent_account(d, pid)
+}
+
+fn vault_position(pid: Pubkey, vault: Pubkey, depositor: Pubkey) -> Account {
+    let mut d = vec![0u8; 120];
+    d[0..8].copy_from_slice(&VAULT_POSITION_V3_DISC);
+    put_key(&mut d, 8, &vault);
+    put_key(&mut d, 40, &depositor);
+    rent_account(d, pid)
+}
+
+#[tokio::test]
+async fn vault_deposit_rejects_when_deposits_closed() {
+    let pid = Pubkey::new_unique();
+    let depositor = Keypair::new();
+    let strategist = Pubkey::new_unique();
+    let vault_id = 0u8;
+    let (vault, _) = Pubkey::find_program_address(&[VAULT_SEED, &strategist.to_bytes(), &[vault_id]], &pid);
+    let (vault_ts, _) = Pubkey::find_program_address(&[TRADER_STATE_SEED, &vault.to_bytes()], &pid);
+    let (position, _) = Pubkey::find_program_address(
+        &[VAULT_POSITION_SEED, &vault.to_bytes(), &depositor.pubkey().to_bytes()], &pid);
+    let (insurance, _) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let quote_vault = Pubkey::new_unique();
+    let depositor_ata = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(vault, vault_with_accept(pid, strategist, vault_id, 0, 0)); // accept=0
+    pt.add_account(vault_ts, trader_state(pid, vault, 0, 0)); // TraderState keyed to vault
+    pt.add_account(position, vault_position(pid, vault, depositor.pubkey()));
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(
+        depositor.pubkey(),
+        Account { lamports: 5_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_VAULT_DEPOSIT];
+    data.extend_from_slice(&1_000u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(depositor.pubkey(), true),
+            AccountMeta::new(vault, false),
+            AccountMeta::new(vault_ts, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new(quote_vault, false),
+            AccountMeta::new(depositor_ata, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(TOKEN_PROGRAM_ID), false),
+        ],
+        data,
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &depositor], bh))
+        .await;
+    assert!(r.is_err(), "deposit into a closed vault must be rejected");
+}
