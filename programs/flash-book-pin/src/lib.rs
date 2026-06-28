@@ -185,6 +185,7 @@ mod program {
         LiquidatePortfolioV2 = 96,
         PlaceJitLiquidationOffer = 97,
         CancelJitLiquidationOffer = 98,
+        ExecuteTriggerOrder = 99,
     }
 
     #[inline(always)]
@@ -290,6 +291,7 @@ mod program {
             x if x == Ix::LiquidatePortfolioV2 as u8 => instructions::liquidate_portfolio_v2::process(program_id, accounts, rest),
             x if x == Ix::PlaceJitLiquidationOffer as u8 => instructions::place_jit_liquidation_offer::process(program_id, accounts, rest),
             x if x == Ix::CancelJitLiquidationOffer as u8 => instructions::cancel_jit_liquidation_offer::process(program_id, accounts, rest),
+            x if x == Ix::ExecuteTriggerOrder as u8 => instructions::execute_trigger_order::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
