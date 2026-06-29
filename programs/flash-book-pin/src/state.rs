@@ -160,7 +160,12 @@ pub struct TraderState {
     /// Max bps of net fee the builder may receive; forced to 0 when `builder` is
     /// unset. Validated `<= BPS_DENOM` on set.
     pub builder_max_fee_share_bps: u32,
-    pub _reserved: [u8; 44],
+    /// 1 once this trader has live ER-reserved margin (set by the ER attestation
+    /// path). Sticky gate: an ER-active trader MUST use the xdomain withdraw
+    /// variants (which honor the reservation); the strict path fails closed for
+    /// them. `u8` carved from `_reserved`; size unchanged (200 bytes).
+    pub er_active: u8,
+    pub _reserved: [u8; 43],
 }
 
 impl TraderState {

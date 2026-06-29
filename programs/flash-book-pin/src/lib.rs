@@ -62,6 +62,7 @@ pub mod vault_math;
 pub mod oracle_quorum;
 pub mod pyth_oracle;
 pub mod fill_commitment;
+pub mod xmargin;
 pub mod er;
 pub mod er_permission;
 pub mod leverage_tiers;
@@ -232,6 +233,7 @@ mod program {
         ViewQuoteLadder = 137,
         ViewPortfolioRisk = 138,
         SweepCollateral = 139,
+        PartialWithdrawCollateral = 140,
     }
 
     #[inline(always)]
@@ -386,6 +388,7 @@ mod program {
             x if x == Ix::ViewQuoteLadder as u8 => instructions::views::quote_ladder(program_id, accounts, rest),
             x if x == Ix::ViewPortfolioRisk as u8 => instructions::views::portfolio_risk(program_id, accounts, rest),
             x if x == Ix::SweepCollateral as u8 => instructions::sweep_collateral::process(program_id, accounts, rest),
+            x if x == Ix::PartialWithdrawCollateral as u8 => instructions::partial_withdraw::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
