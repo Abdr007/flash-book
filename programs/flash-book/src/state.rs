@@ -372,6 +372,18 @@ pub struct MarketAccount {
     /// anyone keep a dead market "alive" and block the escape. Additive-migration
     /// field: pre-existing markets read back 0.
     pub last_heartbeat_slot: u64,
+    /// Per-market matcher batch cap — the max resting levels a taker may cross in
+    /// one `place_taker_order_v2` tx. Tail-appended additive-migration field
+    /// (`size_of::<MarketAccount>()` measured at 896 B with 256 B free under
+    /// `space() = 1152`; pre-existing markets read this back as `0`). `0` is
+    /// interpreted as the global `MAX_BATCH_ORDERS_PER_SIDE_V2` (96) — the
+    /// log-safe default — so legacy markets are byte-for-byte unchanged. Raised
+    /// (≤ `FILL_RING_CAP` = 256) ONLY by `init_fill_outbox`, which simultaneously
+    /// arms the on-chain fill-outbox so the crossed fills are delivered OFF the
+    /// program log: a cap above the ~96 log-safe point without an outbox would
+    /// truncate fills in the 10 KB log and wedge settlement (the H-2 class). See
+    /// `FILL_OUTBOX_DESIGN.md`.
+    pub max_batch_orders: u16,
 }
 
 // H1: build-time guard — the struct (incl. the new nonce) must still fit the
@@ -384,6 +396,19 @@ const _: () = assert!(
 
 impl MarketAccount {
     pub const SEED: &'static [u8] = b"market";
+    /// Effective matcher batch cap. `max_batch_orders` if a market has opted into
+    /// a raised cap (always paired with an armed fill-outbox), else the global
+    /// log-safe default `MAX_BATCH_ORDERS_PER_SIDE_V2`. `0` (legacy / unset) ⇒
+    /// default. Clamped to `FILL_RING_CAP` so a corrupt field can never exceed the
+    /// commitment-ring / outbox capacity.
+    pub fn effective_batch_cap(&self) -> usize {
+        let cap = if self.max_batch_orders == 0 {
+            crate::MAX_BATCH_ORDERS_PER_SIDE_V2
+        } else {
+            self.max_batch_orders as usize
+        };
+        cap.min(crate::matcher::fill_commitment::FILL_RING_CAP as usize)
+    }
     pub fn space() -> usize {
         // 8 (anchor disc) + struct fields. Borsh-conservative bound.
         // Actual size computed via std::mem::size_of for the constant fields,
@@ -843,3 +868,4 @@ const _: Order = Order {
     post_only: false,
     stp_mode: crate::matcher::order::StpMode::CancelNewest,
 };
+

@@ -882,6 +882,244 @@ pub mod flash_book {
         )
     }
 
+    // ── Fill-Outbox (FILL_OUTBOX_DESIGN.md) ──────────────────────────────────
+    // The fill-outbox is an additive on-chain DATA mirror of the keccak
+    // commitment ring: the matcher writes each crossed fill's data into it so the
+    // sequencer reads fills via `getAccountInfo` instead of the 10 KB-bounded
+    // program log, lifting the per-tx batch cap from 96 to 256. It reuses the
+    // ring's `produced`/`settled` cursor (it has none of its own) and `apply_fill`
+    // is untouched. Lifecycle mirrors the `fill_commitment` family below.
+
+    /// Allocate the per-market `FillOutboxAccount` at `[fill_outbox, market]` and
+    /// raise the market's batch cap to `max_batch_orders`. Sized to the SAME
+    /// capacity as the commitment ring (`FILL_RING_CAP`) so the two wrap in
+    /// lockstep — the matcher enforces `outbox.cap == ring.cap`, so the ring's
+    /// backpressure protects every outbox slot from a silent overwrite. Requires
+    /// the market be ARMED (`init_fill_commitment` first): the outbox is addressed
+    /// by the ring cursor and is meaningless without it. Authority-gated;
+    /// co-delegatable with the book + ring.
+    pub fn init_fill_outbox(
+        ctx: Context<InitFillOutbox>,
+        max_batch_orders: u16,
+    ) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        use matcher::fill_outbox as fo;
+        // The outbox extends an armed market — the ring must already exist (its
+        // account is created by `init_fill_commitment`, which sets this flag).
+        require!(
+            ctx.accounts.market.fill_commitment_required,
+            FlashBookError::FillCommitmentMissing
+        );
+        // Cap must be in (0, FILL_RING_CAP]; the ring/outbox can hold no more.
+        require!(
+            max_batch_orders >= 1 && (max_batch_orders as u32) <= fc::FILL_RING_CAP,
+            FlashBookError::OutOfRange
+        );
+
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.fill_outbox;
+        // Created at the base cap (one CPI can grow an account by ≤10,240 B; a full
+        // 256-slot outbox is 24,640 B). `grow_fill_outbox` raises it to the ring
+        // cap; the matcher keeps outbox matching INERT (fail-closed) until then.
+        let cap = fo::FILL_OUTBOX_INIT_CAP;
+
+        let space = fo::fill_outbox_account_len(cap as usize);
+        let rent = Rent::get()?;
+        let lamports = rent.minimum_balance(space);
+
+        let signer_seeds: &[&[u8]] = &[fo::FILL_OUTBOX_SEED, market_key.as_ref(), &[bump]];
+        anchor_lang::solana_program::program::invoke_signed(
+            &anchor_lang::solana_program::system_instruction::create_account(
+                &ctx.accounts.authority.key(),
+                &ctx.accounts.fill_outbox.key(),
+                lamports,
+                space as u64,
+                ctx.program_id,
+            ),
+            &[
+                ctx.accounts.authority.to_account_info(),
+                ctx.accounts.fill_outbox.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            &[signer_seeds],
+        )?;
+
+        let mut data = ctx.accounts.fill_outbox.try_borrow_mut_data()?;
+        fo::outbox_init(&mut data, &market_key.to_bytes(), cap, bump)
+            .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+        drop(data);
+
+        // Raise the per-market matcher batch cap (the whole point). With the
+        // outbox armed, the matcher delivers fills off-log, so the cap is no
+        // longer pinned to the log-safe 96.
+        ctx.accounts.market.max_batch_orders = max_batch_orders;
+
+        emit!(FillOutboxInitializedEvent {
+            market: market_key,
+            fill_outbox: ctx.accounts.fill_outbox.key(),
+            cap,
+            max_batch_orders,
+            total_bytes: space as u32,
+        });
+        Ok(())
+    }
+
+    /// Grow an existing fill-outbox in place by `additional_slots`, keeping it in
+    /// lockstep with a grown ring (see `grow_fill_commitment`). Same gate +
+    /// raw-PDA realloc + drained + base-layer requirements as the ring: a delegated
+    /// or non-empty outbox cannot be safely resized (every slot's `% cap` mapping
+    /// would shift). The matcher's `outbox.cap == ring.cap` check means the two MUST
+    /// be grown together (grow the ring, then the outbox, by the same amount) or
+    /// matching halts until they match.
+    pub fn grow_fill_outbox(
+        ctx: Context<GrowFillOutbox>,
+        additional_slots: u32,
+    ) -> Result<()> {
+        use matcher::fill_outbox as fo;
+        require!(additional_slots > 0, FlashBookError::OutOfRange);
+
+        let fo_ai = ctx.accounts.fill_outbox.to_account_info();
+        require_keys_eq!(*fo_ai.owner, *ctx.program_id, FlashBookError::Unauthorized);
+
+        let market_bytes = ctx.accounts.market.key().to_bytes();
+        // Validate + read the current cap, and require the outbox be DRAINED (the
+        // mirrored cursors must be equal — same invariant as the ring grow).
+        let old_cap = {
+            let data = fo_ai.try_borrow_data()?;
+            let cap = fo::outbox_check(&data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+            cap
+        };
+
+        let new_cap = old_cap
+            .checked_add(additional_slots)
+            .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+        let additional_bytes = (additional_slots as usize)
+            .checked_mul(fo::FILL_OUTBOX_SLOT_LEN)
+            .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+        require!(
+            additional_bytes
+                <= anchor_lang::solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE,
+            FlashBookError::OutOfRange
+        );
+
+        let old_len = fo_ai.data_len();
+        let new_len = fo::fill_outbox_account_len(new_cap as usize);
+
+        // Top up rent so the larger account stays rent-exempt.
+        let rent = Rent::get()?;
+        let new_minimum = rent.minimum_balance(new_len);
+        let cur_lamports = fo_ai.lamports();
+        if new_minimum > cur_lamports {
+            let topup = new_minimum.saturating_sub(cur_lamports);
+            anchor_lang::solana_program::program::invoke(
+                &anchor_lang::solana_program::system_instruction::transfer(
+                    &ctx.accounts.authority.key(),
+                    &fo_ai.key(),
+                    topup,
+                ),
+                &[
+                    ctx.accounts.authority.to_account_info(),
+                    fo_ai.clone(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+
+        // Grow in place (zero-inits appended slots), stamp the new cap, re-validate.
+        fo_ai.resize(new_len)?;
+        {
+            let mut data = fo_ai.try_borrow_mut_data()?;
+            fo::outbox_set_cap(&mut data, new_cap);
+            fo::outbox_check(&data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+        }
+
+        emit!(FillOutboxGrownEvent {
+            market: ctx.accounts.market.key(),
+            fill_outbox: fo_ai.key(),
+            old_cap,
+            new_cap,
+            old_bytes: old_len as u32,
+            new_bytes: new_len as u32,
+        });
+        Ok(())
+    }
+
+    /// Delegate the per-market `FillOutboxAccount` to the ER. Mirrors
+    /// `delegate_fill_commitment`; delegate the book + ring + outbox together so
+    /// the matcher writes the outbox on the ER without forking state. Authority-gated.
+    pub fn delegate_fill_outbox(
+        ctx: Context<DelegateFillOutbox>,
+        commit_frequency_ms: u32,
+        validator: Option<Pubkey>,
+    ) -> Result<()> {
+        use matcher::fill_outbox as fo;
+        let market_key = ctx.accounts.market.key();
+        let bump = ctx.bumps.fill_outbox;
+
+        require_keys_eq!(
+            *ctx.accounts.fill_outbox.owner,
+            *ctx.program_id,
+            FlashBookError::Unauthorized
+        );
+
+        let seeds_for_args: Vec<Vec<u8>> =
+            vec![fo::FILL_OUTBOX_SEED.to_vec(), market_key.as_ref().to_vec()];
+        let signer_seeds: &[&[u8]] = &[fo::FILL_OUTBOX_SEED, market_key.as_ref(), &[bump]];
+
+        er::cpi_delegate(
+            er::DelegateAccounts {
+                payer: ctx.accounts.authority.to_account_info(),
+                delegated_account: ctx.accounts.fill_outbox.to_account_info(),
+                owner_program: ctx.accounts.owner_program.to_account_info(),
+                delegate_buffer: ctx.accounts.delegate_buffer.to_account_info(),
+                delegation_record: ctx.accounts.delegation_record.to_account_info(),
+                delegation_metadata: ctx.accounts.delegation_metadata.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                delegation_program: ctx.accounts.delegation_program.to_account_info(),
+            },
+            er::DelegateArgs {
+                commit_frequency_ms,
+                seeds: seeds_for_args,
+                validator,
+            },
+            signer_seeds,
+        )?;
+
+        emit!(FillOutboxDelegatedEvent {
+            market: market_key,
+            fill_outbox: ctx.accounts.fill_outbox.key(),
+            commit_frequency_ms,
+            validator: validator.unwrap_or_default(),
+        });
+        Ok(())
+    }
+
+    /// ON THE ER: snapshot the delegated `fill_outbox` back to L1 while staying
+    /// delegated (`ScheduleCommit`). Pair with `commit_fill_commitment` so L1 sees a
+    /// consistent (commitment, data) pair.
+    pub fn commit_fill_outbox(ctx: Context<CommitFillOutbox>) -> Result<()> {
+        er::cpi_commit(
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.magic_context,
+            &ctx.accounts.magic_program,
+            &[ctx.accounts.fill_outbox.to_account_info()],
+            false,
+        )
+    }
+
+    /// ON THE ER: snapshot final state AND queue undelegation of the `fill_outbox`.
+    pub fn commit_and_undelegate_fill_outbox(ctx: Context<CommitFillOutbox>) -> Result<()> {
+        er::cpi_commit(
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.magic_context,
+            &ctx.accounts.magic_program,
+            &[ctx.accounts.fill_outbox.to_account_info()],
+            true,
+        )
+    }
+
 
     /// V2 limit-order placement against the hypertree-backed orderbook.
     /// Runs ALONGSIDE the legacy `place_limit_order` for now — operators
@@ -1117,7 +1355,14 @@ pub mod flash_book {
         // and any overflow spills onto the heap via Vec's grow path.
         // Stack-allocated fixed arrays aren't viable here: at 256-cap
         // × 60 B per tuple the array exceeds BPF's 4 KB stack frame.
-        let walk_limit = MAX_BATCH_ORDERS_PER_SIDE_V2;
+        // Per-market batch cap: the global log-safe 96 by default, or up to
+        // FILL_RING_CAP (256) for a market that armed a fill-outbox via
+        // `init_fill_outbox` (which delivers crossed fills OFF the program log, so
+        // the 10 KB log ceiling no longer bounds the cap). `effective_batch_cap`
+        // clamps to the ring/outbox capacity. The fat-`FillBatchEvent` path is only
+        // taken at ≤ 96 (log-safe); above that the outbox path is mandatory (a
+        // `require!` at emit), so a deep walk never feeds the log-bounded event.
+        let walk_limit = market.effective_batch_cap();
         // HEAP-FRUGAL (deep-book fix): pre-size `matches` to the walk cap so it
         // allocates EXACTLY ONCE and never reallocates. The SBF bump allocator
         // never frees, so a Vec that doubled 16→32→…→cap would LEAK every
@@ -1220,11 +1465,15 @@ pub mod flash_book {
         }
 
         // ── Phase 2: apply each match (decrement or remove maker) ───
-        // Per-fill emit replaced with one batched FillBatchEvent at end —
-        // saves ~200 CU per fill (Borsh + sol_log_data overhead amortized
-        // over the whole walk instead of paid per-step).
-        let mut fills: Vec<FillEntry> = Vec::with_capacity(matches.len());
-        for (maker_idx, maker_id, fill_size, fill_price, maker_trader, maker_sub_idx) in &matches {
+        // Heap-frugal: `matches` (pre-sized to the per-market cap) is the SINGLE
+        // large heap buffer. We mutate the book from it directly and do NOT keep a
+        // parallel `Vec<FillEntry>` — on the outbox path no such Vec exists at all.
+        // The SBF bump allocator never frees, so a second N-sized Vec plus a
+        // serialized fat event would blow the 32 KiB heap past ~100 levels (the old
+        // OOM). See FILL_OUTBOX_DESIGN.md / DEEP_BOOK_CU.md.
+        for (maker_idx, _maker_id, fill_size, _fill_price, _maker_trader, _maker_sub_idx) in
+            &matches
+        {
             let new_size = handle.decrement_size_at(*maker_idx, *fill_size)?;
             if new_size == 0 {
                 if side_is_bid {
@@ -1233,80 +1482,167 @@ pub mod flash_book {
                     handle.remove_bid_node(*maker_idx);
                 }
             }
-            fills.push(FillEntry {
-                maker: *maker_trader,
-                size_lots: *fill_size,
-                price_ticks: *fill_price,
-                maker_id: *maker_id,
-                maker_sub_index: *maker_sub_idx,
-            });
         }
-        if !fills.is_empty() {
-            // ── H1 part B (#35): commit produced fills to the on-chain ring ──
-            // For each fill the matcher just crossed on-chain, push a keccak
-            // commitment so settlement (`apply_fill`) can prove the fill is
-            // authentic and not fabricated by a compromised sequencer. Done
-            // BEFORE the emit moves `fills`. Optional: a market not yet wired
-            // with a FillCommitmentAccount keeps legacy behaviour. The account is
-            // a different PDA than `market_book`, so this borrow does not alias
-            // the live book handle.
+        if !matches.is_empty() {
+            // ── H1 part B (#35) + fill-outbox delivery ──
+            // For each fill just crossed on-chain, push a keccak commitment to the
+            // ring so settlement (`apply_fill`) can prove authenticity, and — when
+            // the market armed a fill-outbox — write the fill's DATA into that
+            // account so the sequencer reads it OFF the program log (lifting the
+            // ~96-fill log ceiling to 256). Both PDAs are distinct from
+            // `market_book`, so these borrows do not alias the live book handle.
             let fc_market_bytes = market_key.to_bytes();
             let fc_opt =
                 find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes);
-            // AUDIT H-2 fix: producer-side fill-commitment symmetry. On an ARMED
-            // market (`fill_commitment_required`) the taker MUST supply the ring
-            // account so every fill the matcher just crossed is bound 1:1 to a
-            // settleable commitment. Without this a taker could omit the
-            // (optional) account, still mutate the book (consume maker
-            // liquidity), push NO commitment, and leave those fills permanently
-            // unsettleable — wedging the market's settlement pipeline and
-            // griefing makers at zero cost. Mirrors the consumer guard in
-            // `apply_fill`. `fills` is non-empty here, so a real cross occurred.
+            let fo_opt =
+                find_fill_outbox(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes);
+            // AUDIT H-2: armed market ⇒ the ring is MANDATORY (else a taker consumes
+            // maker liquidity, pushes NO commitment, and leaves fills unsettleable —
+            // wedging settlement, griefing makers at zero cost). Mirrors `apply_fill`.
             require!(
                 !market.fill_commitment_required || fc_opt.is_some(),
                 FlashBookError::FillCommitmentMissing
             );
+            // A cap above the log-safe 96 means the fills CANNOT fit the 10 KB
+            // program log, so the outbox account MUST be present to carry them — else
+            // the tail truncates in the log and wedges settlement (same H-2 class).
+            // `init_fill_outbox` is the only path that raises the cap and it arms the
+            // outbox, so an honest sequencer always passes it; this fails closed.
+            require!(
+                fo_opt.is_some() || walk_limit <= MAX_BATCH_ORDERS_PER_SIDE_V2,
+                FlashBookError::FillOutboxRequired
+            );
+            // The outbox slots are addressed by the ring's `produced` cursor, so an
+            // outbox is only coherent alongside the ring. Fail closed otherwise.
+            require!(
+                fo_opt.is_none() || fc_opt.is_some(),
+                FlashBookError::FillCommitmentMissing
+            );
+
+            // §3.2: commit the taker's actual JIT flag (bit3) so the sequencer
+            // cannot flip `taker_was_jit` at settlement to skim/deny the rebate.
+            let taker_was_jit = flags & (1 << 3) != 0;
+            let taker_bytes = trader_pk.to_bytes();
+            let mut produced_from: u64 = 0;
+            let mut produced_to: u64 = 0;
+
             if let Some(fc_acct) = fc_opt {
                 use matcher::fill_commitment as fc;
-                let market_bytes = fc_market_bytes;
-                let taker_bytes = trader_pk.to_bytes();
-                // §3.2: commit the taker order's actual JIT flag (bit3) so the
-                // sequencer cannot flip `taker_was_jit` at settlement to skim/deny
-                // the JIT rebate bonus. Settlement must present the same value.
-                let taker_was_jit = flags & (1 << 3) != 0;
+                use matcher::fill_outbox as fo;
                 let mut fc_data = fc_acct.try_borrow_mut_data()?;
-                for f in &fills {
+                // Borrow the outbox (a different PDA — distinct disc, so never the
+                // same account as the ring) for the whole batch; validate + read cap.
+                let mut fo_borrow = match fo_opt {
+                    Some(ai) => Some(ai.try_borrow_mut_data()?),
+                    None => None,
+                };
+                let fo_cap: u32 = match fo_borrow.as_deref() {
+                    Some(d) => fo::outbox_check(d, &fc_market_bytes)
+                        .map_err(|_| error!(FlashBookError::FillRingCorrupt))?,
+                    None => 0,
+                };
+                // Backpressure invariant (the #1 correctness property): the outbox
+                // must be at least as large as the ring (`fo_cap >= ring_cap`). The
+                // ring's `Full` stops production at `ring_cap`, so depth never
+                // exceeds `ring_cap <= fo_cap` — meaning every outbox slot reused at
+                // `idx % fo_cap` had its prior tenant settled, so a slow sequencer is
+                // given hard backpressure (the tx reverts `FillRingFull`) instead of
+                // being silently lapped. A freshly-`init`'d outbox (base 105) is < the
+                // 256 ring until grown, so this keeps outbox matching INERT —
+                // fail-closed — until `grow_fill_outbox` covers the ring.
+                if fo_borrow.is_some() {
+                    let ring_cap = fc::buffer_check(&fc_data, &fc_market_bytes)
+                        .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+                    require!(fo_cap >= ring_cap, FlashBookError::FillRingCorrupt);
+                }
+                produced_from = fc::buffer_next_index(&fc_data);
+                for (_maker_idx, maker_id, fill_size, fill_price, maker_trader, maker_sub_idx) in
+                    &matches
+                {
                     let idx = fc::buffer_next_index(&fc_data);
+                    let maker_bytes = maker_trader.to_bytes();
                     let pre = fc::fill_preimage(
-                        &market_bytes,
+                        &fc_market_bytes,
                         &taker_bytes,
-                        &f.maker.to_bytes(),
+                        &maker_bytes,
                         side,
-                        f.size_lots,
-                        f.price_ticks,
+                        *fill_size,
+                        *fill_price,
                         sub_index,
-                        f.maker_sub_index,
+                        *maker_sub_idx,
                         idx,
                         taker_was_jit,
                     );
-                    let commit =
-                        solana_keccak_hasher::hashv(&[&pre[..]]).0;
-                    fc::buffer_push(&mut fc_data, &market_bytes, commit).map_err(|e| {
-                        match e {
-                            fc::FillRingError::Full => error!(FlashBookError::FillRingFull),
-                            _ => error!(FlashBookError::FillRingCorrupt),
-                        }
+                    let commit = solana_keccak_hasher::hashv(&[&pre[..]]).0;
+                    fc::buffer_push(&mut fc_data, &fc_market_bytes, commit).map_err(|e| match e {
+                        fc::FillRingError::Full => error!(FlashBookError::FillRingFull),
+                        _ => error!(FlashBookError::FillRingCorrupt),
                     })?;
+                    // Mirror the fill DATA into outbox[idx % cap] (heap-free direct
+                    // write). The ring's backpressure (`Full` above) guarantees this
+                    // slot's prior tenant was already settled — no silent overwrite.
+                    if let Some(fo_data) = fo_borrow.as_deref_mut() {
+                        fo::outbox_write_slot(
+                            fo_data,
+                            fo_cap,
+                            idx % fo_cap as u64,
+                            &taker_bytes,
+                            &maker_bytes,
+                            *fill_size,
+                            *fill_price,
+                            *maker_id,
+                            side,
+                            sub_index,
+                            *maker_sub_idx,
+                            taker_was_jit as u8,
+                        )
+                        .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+                    }
+                }
+                produced_to = fc::buffer_next_index(&fc_data);
+                // Mirror the ring cursors into the outbox header (stream semantics +
+                // gap detection for the sequencer); apply_fill stays untouched.
+                if let Some(fo_data) = fo_borrow.as_deref_mut() {
+                    let settled = fc::buffer_settle_index(&fc_data);
+                    fo::outbox_set_cursors(fo_data, produced_to, settled);
                 }
             }
-            emit!(FillBatchEvent {
-                market: market_key,
-                taker: trader_pk,
-                taker_side: side,
-                taker_id: taker_order_id,
-                fills,
-                taker_sub_index: sub_index,
-            });
+
+            if fo_opt.is_some() {
+                // Slim, fixed-size wake-up event — the bulk fill data lives in the
+                // outbox account (read via getAccountInfo). Always log-safe at any
+                // fill count; the sequencer reads slots [produced_from, produced_to).
+                emit!(FillBatchOutboxEvent {
+                    market: market_key,
+                    taker: trader_pk,
+                    taker_side: side,
+                    taker_id: taker_order_id,
+                    taker_sub_index: sub_index,
+                    produced_from,
+                    produced_to,
+                });
+            } else {
+                // Legacy fat event — only reached at cap ≤ 96 (log-safe). Build the
+                // FillEntry Vec here (kept tiny by the cap) and emit.
+                let mut fills: Vec<FillEntry> = Vec::with_capacity(matches.len());
+                for (_i, maker_id, fill_size, fill_price, maker_trader, maker_sub_idx) in &matches {
+                    fills.push(FillEntry {
+                        maker: *maker_trader,
+                        size_lots: *fill_size,
+                        price_ticks: *fill_price,
+                        maker_id: *maker_id,
+                        maker_sub_index: *maker_sub_idx,
+                    });
+                }
+                emit!(FillBatchEvent {
+                    market: market_key,
+                    taker: trader_pk,
+                    taker_side: side,
+                    taker_id: taker_order_id,
+                    fills,
+                    taker_sub_index: sub_index,
+                });
+            }
         }
 
         // ── Phase 3: residual handling — IOC vs rest-as-limit ───────
@@ -11861,6 +12197,129 @@ pub struct CommitFillCommitment<'info> {
     pub magic_program: UncheckedAccount<'info>,
 }
 
+// ── Fill-Outbox account contexts (mirror the fill_commitment family) ─────────
+
+/// Allocate the per-market `FillOutboxAccount`. Mirrors `InitFillCommitment`
+/// with the `fill_outbox` seed; `mut` market so the handler can raise
+/// `max_batch_orders`.
+#[derive(Accounts)]
+pub struct InitFillOutbox<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; allocated via SystemProgram CPI in the handler (flat
+    /// byte region, sized in-handler — same as `fill_commitment`). Bound by seeds.
+    #[account(
+        mut,
+        seeds = [matcher::fill_outbox::FILL_OUTBOX_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_outbox: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Grow an existing fill-outbox. Mirrors `GrowFillCommitment`.
+#[derive(Accounts)]
+pub struct GrowFillOutbox<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; reallocated via `AccountInfo::resize` in the handler,
+    /// which re-asserts program ownership before growing. Bound by the seeds.
+    #[account(
+        mut,
+        seeds = [matcher::fill_outbox::FILL_OUTBOX_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_outbox: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Delegate the FillOutboxAccount to the ER. Mirrors `DelegateFillCommitment`
+/// with the `fill_outbox` seed.
+#[derive(Accounts)]
+pub struct DelegateFillOutbox<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; signed via seeds for the delegate CPI. Anchor verifies
+    /// seeds + bump; handler rechecks .owner == this program.
+    #[account(
+        mut,
+        seeds = [matcher::fill_outbox::FILL_OUTBOX_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_outbox: UncheckedAccount<'info>,
+
+    /// CHECK: this program's account info (owner_program for the delegation CPI).
+    #[account(address = crate::ID)]
+    pub owner_program: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under owner_program at [b"buffer", fill_outbox]. Initialised by
+    /// the delegation program.
+    #[account(mut)]
+    pub delegate_buffer: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID at [b"delegation", fill_outbox].
+    #[account(mut)]
+    pub delegation_record: UncheckedAccount<'info>,
+
+    /// CHECK: PDA under DELEGATION_PROGRAM_ID at [b"delegation-metadata", fill_outbox].
+    #[account(mut)]
+    pub delegation_metadata: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: MagicBlock delegation program. Address-pinned; cpi_delegate rechecks.
+    #[account(address = er::DELEGATION_PROGRAM_ID)]
+    pub delegation_program: UncheckedAccount<'info>,
+}
+
+/// ON-THE-ER commit (± undelegate) of the FillOutboxAccount. Mirrors
+/// `CommitFillCommitment`.
+#[derive(Accounts)]
+pub struct CommitFillOutbox<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: the delegated fill_outbox PDA being committed. On the ER its owner
+    /// is the delegation program; `cpi_commit` fails loudly if not delegated.
+    #[account(mut)]
+    pub fill_outbox: UncheckedAccount<'info>,
+
+    /// CHECK: MagicBlock magic context (writable). Address-pinned to MAGIC_CONTEXT_ID.
+    #[account(mut, address = er::MAGIC_CONTEXT_ID)]
+    pub magic_context: UncheckedAccount<'info>,
+
+    /// CHECK: MagicBlock magic program. Address-pinned to MAGIC_PROGRAM_ID.
+    #[account(address = er::MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
 
 /// Base-layer undelegation callback (audit ER-2). Mirrors the
 /// `ephemeral-rollups-sdk` `InitializeAfterUndelegation` account contract
@@ -13527,6 +13986,35 @@ pub struct FillCommitmentDelegatedEvent {
     pub validator: Pubkey,
 }
 
+#[event]
+pub struct FillOutboxInitializedEvent {
+    pub market: Pubkey,
+    pub fill_outbox: Pubkey,
+    pub cap: u32,
+    /// The per-market matcher batch cap this outbox unlocked.
+    pub max_batch_orders: u16,
+    pub total_bytes: u32,
+}
+
+#[event]
+pub struct FillOutboxGrownEvent {
+    pub market: Pubkey,
+    pub fill_outbox: Pubkey,
+    pub old_cap: u32,
+    pub new_cap: u32,
+    pub old_bytes: u32,
+    pub new_bytes: u32,
+}
+
+#[event]
+pub struct FillOutboxDelegatedEvent {
+    pub market: Pubkey,
+    pub fill_outbox: Pubkey,
+    pub commit_frequency_ms: u32,
+    /// Pinned ER validator pubkey, or default Pubkey if permissionless.
+    pub validator: Pubkey,
+}
+
 
 #[event]
 pub struct MarketDelegatedEvent {
@@ -13607,6 +14095,29 @@ pub struct FillBatchEvent {
     pub taker_sub_index: u8,
 }
 
+/// Slim, FIXED-SIZE wake-up event emitted by `place_taker_order_v2` when the
+/// market has an armed **fill-outbox** (see `matcher::fill_outbox`). The bulk fill
+/// DATA is NOT in this event — it lives in the on-chain outbox account, which the
+/// sequencer reads via `getAccountInfo`. This decouples fill delivery from the
+/// 10 KB program-log limit (the bound that pins the non-outbox cap at 96), letting
+/// the batch cap rise to 256. The event is a latency hint only; correctness comes
+/// from the `produced` cursor in the outbox account. The sequencer reads outbox
+/// slots `[produced_from, produced_to)` (indices into the ring/outbox cursor space,
+/// `slot = index % cap`) to reconstruct every fill, in cross order.
+#[event]
+pub struct FillBatchOutboxEvent {
+    pub market: Pubkey,
+    pub taker: Pubkey,
+    pub taker_side: u8,
+    pub taker_id: u64,
+    pub taker_sub_index: u8,
+    /// First absolute fill index this batch produced (inclusive).
+    pub produced_from: u64,
+    /// One past the last absolute fill index this batch produced (exclusive);
+    /// `produced_to - produced_from` = the number of fills in this batch.
+    pub produced_to: u64,
+}
+
 /// How many price levels per side `view_book_depth_v2` returns.
 /// Capped to keep the event log payload bounded; off-chain depth
 /// reconstruction watches `OrderPlacedV2Event` + `OrderCancelledV2Event`
@@ -13614,16 +14125,32 @@ pub struct FillBatchEvent {
 pub const BOOK_DEPTH_LEVELS: usize = 4;
 
 /// Per-side ceiling on resting orders the taker can walk in a single
-/// `place_taker_order_v2` ix. Bounded by the BPF compute budget — at
-/// 256 the worst-case walk consumes ~50K CU, well within the per-tx
-/// 200K default and the 1.4M maximum.
-// HEAP-FRUGAL (deep-book fix): the matcher holds three N-sized heap buffers at
-// once — `matches` (pre-sized to this cap, no doubling leak), the `fills` Vec, and
-// the serialized FillBatchEvent — so peak ≈ cap × ~175 B must fit the 32 KiB SBF
-// heap. 96 keeps the matcher.s 3 simultaneous heap buffers (matches+fills+event) safely under
-// the 32 KiB SBF heap (empirically 128 OOMs, 64 is safe; 96 leaves margin), still crossing 96 levels per tx; deeper crossings truncate GRACEFULLY (the `walk_limit`
-// path drops the residual) instead of OOM-panicking, which is what 256 did past
-// ~100 levels. The fill-commitment ring cap (256) stays ≥ this, as M-2 requires.
+/// `place_taker_order_v2` ix. 96 is bounded by TWO independent constraints,
+/// each of which caps the cap well below the old 256:
+///
+/// 1. **Program-log byte limit (the BINDING constraint).** Every fill's data
+///    (maker/size/price/sub) reaches the off-chain sequencer via the
+///    `FillBatchEvent` log (`sol_log_data`, base64-encoded). The Solana runtime
+///    caps *all* program-log output at `LOG_MESSAGES_BYTES_LIMIT = 10_000` bytes
+///    per tx (`solana-svm-log-collector`). One event is `86 + 57·N` raw bytes →
+///    `×1.333` base64 + framing, so the log overflows ~125 fills and SILENTLY
+///    truncates the tail. A truncated fill is still crossed on-chain (book
+///    mutated + commitment pushed to the ring) but the sequencer never sees its
+///    data → `apply_fill` can't be called → the ring slot never pops →
+///    settlement wedges (the H-2 griefing class). So the cap MUST stay
+///    log-safe. At 96: ~7.7 KB logged, ~2.3 KB headroom. Chunked emission does
+///    NOT help — it repeats the 86-byte header per chunk, using MORE log bytes.
+///    Reaching 256+ requires moving fill data off logs into an on-chain
+///    fill-outbox account (read via getAccountInfo) — a future architectural
+///    change, not a matcher tweak. See DEEP_BOOK_CU.md.
+/// 2. **32 KiB SBF heap.** `matches` is pre-sized to this cap (one alloc, no
+///    doubling-realloc leak — the SBF bump allocator never frees), and coexists
+///    with the `fills` Vec + the serialized event. Peak ≈ cap × ~175 B. The old
+///    256 OOM-panicked past ~100 crossed levels (128 OOMs, 96 leaves margin).
+///
+/// Deeper crossings truncate GRACEFULLY at the cap (the `walk_limit` path drops
+/// the residual) instead of OOM-panicking. The fill-commitment ring cap (256)
+/// stays ≥ this, as M-2 requires.
 pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 96;
 
 /// HL withdrawal floor — wave 20b. When a trader pulls collateral from
@@ -15799,6 +16326,28 @@ fn find_fill_commitment<'a, 'info>(
         if ai.owner == program_id {
             if let Ok(data) = ai.try_borrow_data() {
                 if matcher::fill_commitment::buffer_check(&data, market_bytes).is_ok() {
+                    return Some(ai);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Locate this market's `FillOutboxAccount` in `remaining_accounts` (mirrors
+/// `find_fill_commitment`). Program-owned, disc-checked, market-bound — the outbox
+/// disc (`FBoutbx\0`) is distinct from the ring disc, so this never returns the
+/// ring account (and vice-versa), guaranteeing the two borrows in
+/// `place_taker_order_v2` are on different accounts.
+fn find_fill_outbox<'a, 'info>(
+    remaining: &'a [AccountInfo<'info>],
+    program_id: &Pubkey,
+    market_bytes: &[u8; 32],
+) -> Option<&'a AccountInfo<'info>> {
+    for ai in remaining {
+        if ai.owner == program_id {
+            if let Ok(data) = ai.try_borrow_data() {
+                if matcher::fill_outbox::outbox_check(&data, market_bytes).is_ok() {
                     return Some(ai);
                 }
             }

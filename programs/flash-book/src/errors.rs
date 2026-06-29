@@ -239,6 +239,8 @@ pub enum FlashBookError {
     OwnerForceUndelegateUnavailable = 2305,
     #[msg("Fill-commitment ring must be fully drained (produced == settled) before it can be grown")]
     FillRingNotDrained = 2306,
+    #[msg("Market batch cap exceeds the log-safe limit but no fill-outbox account was supplied to carry the fills off-log")]
+    FillOutboxRequired = 2307,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

@@ -4256,6 +4256,256 @@ async fn deep_book_matching_cu_curve() {
     assert!(mx - mn < 8_000, "place CU must stay flat across 511 levels (O(log n))");
 }
 
+/// FILL-OUTBOX end-to-end (FILL_OUTBOX_DESIGN.md): a market that arms a fill-outbox
+/// and raises its batch cap to 256 crosses **256 levels in a single tx, in the
+/// DEFAULT 32 KiB heap** (no heap-frame request) — the fills are delivered through
+/// the on-chain outbox ACCOUNT, not the 10 KB-bounded program log. Asserts:
+///   (1) the 256-level sweep SUCCEEDS (no OOM, no log truncation),
+///   (2) every fill is reconstructable from the outbox account (cursor + slot data),
+///   (3) a cap-256 market HARD-REJECTS a taker that omits the outbox (FillOutboxRequired),
+///   proving the cap can't be raised past the log-safe point without off-log delivery.
+/// Run: `BPF_OUT_DIR=$PWD/target/deploy cargo test --test integration fill_outbox_deep_sweep_256 -- --nocapture`
+#[tokio::test]
+async fn fill_outbox_deep_sweep_256() {
+    use flash_book::matcher::fill_outbox as fo;
+    if std::env::var("BPF_OUT_DIR").is_err() && std::env::var("SBF_OUT_DIR").is_err() {
+        eprintln!("skipping fill_outbox_deep_sweep_256: set BPF_OUT_DIR=$PWD/target/deploy");
+        return;
+    }
+    let mut pt = make_program_test_sbf();
+    pt.set_compute_max_units(1_400_000);
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone(); // market authority = maker
+    let (_protocol, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market.as_ref()]);
+    let (fc, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market.as_ref()]);
+    let (fob, _) = pda(&[fo::FILL_OUTBOX_SEED, market.as_ref()]);
+
+    // Book + expand to hold ~300 resting bids.
+    cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new(book, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await;
+    for add in [106u32, 105, 104] {
+        cu_of(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::ExpandMarketBook { additional_nodes: add },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new(book, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            ),
+            &payer.pubkey(),
+            &[&payer],
+        )
+        .await;
+    }
+    // Arm the ring (cap 256) — outbox is meaningless without it.
+    cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitFillCommitment {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(fc, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await;
+    // Arm the OUTBOX (created at base 105 slots) and raise the batch cap to 256.
+    cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitFillOutbox { max_batch_orders: 256 },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(fob, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await;
+    // Grow the outbox to the ring cap (256) — a program CPI can grow an account by
+    // ≤10,240 B/ix, so 105 -> 211 -> 256 in two `grow_fill_outbox` calls (same
+    // create-small-then-grow pattern as the market book). Matcher matching at 256
+    // stays INERT (fail-closed) until the outbox covers the ring.
+    for add in [106u32, 45] {
+        cu_of(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::GrowFillOutbox { additional_slots: add },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new(fob, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            ),
+            &payer.pubkey(),
+            &[&payer],
+        )
+        .await;
+    }
+    // Now the outbox is a "Large" (≤64 KiB) account at the full 256 cap.
+    let fob_acct = ctx.banks_client.get_account(fob).await.unwrap().unwrap();
+    assert_eq!(
+        fob_acct.data.len(),
+        fo::fill_outbox_account_len(256),
+        "outbox grown to 256 slots = 24,640 bytes"
+    );
+
+    // Rest 260 bids at distinct descending ticks (all in oracle band [99_000,101_000]).
+    const DEPTH: usize = 260;
+    for i in 0..DEPTH {
+        let tick = 100_000 - (i as u64);
+        cu_of(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::PlaceLimitOrderV2 {
+                    side: 0,
+                    size_lots: 1,
+                    limit_ticks: tick,
+                    flags: 0,
+                    expires_at_slot: 0,
+                    sub_index: 0,
+                },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(book, false),
+                ],
+            ),
+            &payer.pubkey(),
+            &[&payer],
+        )
+        .await;
+    }
+
+    // A separate taker (no self-trade).
+    let taker = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(&payer.pubkey(), &taker.pubkey(), 100_000_000)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // (A) ERROR PATH: a cap-256 market MUST reject a taker that omits the outbox —
+    // else the >96 fills would truncate in the 10 KB log and wedge settlement.
+    let bad = build_ix(
+        flash_book::instruction::PlaceTakerOrderV2 {
+            side: 1,
+            size_lots: 5,
+            limit_ticks: 99_000,
+            flags: 0,
+            expires_at_slot: 0,
+            sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(book, false),
+            AccountMeta::new(fc, false), // ring present, but NO outbox
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let r = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[bad],
+            Some(&taker.pubkey()),
+            &[&taker],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{r:?}");
+    assert!(
+        dbg.contains("Custom(8307)"),
+        "cap-256 market must reject a taker omitting the outbox (FillOutboxRequired=2307→8307), got: {dbg}"
+    );
+
+    // (B) HAPPY PATH: cross 256 levels in ONE tx, DEFAULT heap (cu_of requests no
+    // heap frame). Pass BOTH the ring and the outbox in remaining_accounts.
+    let sweep_cu = cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceTakerOrderV2 {
+                side: 1,
+                size_lots: 256,
+                limit_ticks: 99_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(book, false),
+                AccountMeta::new(fc, false),  // ring
+                AccountMeta::new(fob, false), // outbox
+            ],
+        ),
+        &taker.pubkey(),
+        &[&taker],
+    )
+    .await;
+
+    // (C) Reconstruct every fill from the OUTBOX ACCOUNT (the authoritative feed —
+    // no logs involved).
+    let data = ctx.banks_client.get_account(fob).await.unwrap().unwrap().data;
+    let cap = fo::outbox_check(&data, &market.to_bytes()).expect("outbox valid");
+    assert_eq!(cap, 256, "outbox cap == ring cap (lockstep)");
+    let produced = fo::outbox_produced(&data);
+    assert_eq!(produced, 256, "all 256 fills recorded in the outbox cursor");
+
+    // First fill = best (highest) bid the SELL taker crossed = tick 100_000.
+    let s0 = fo::outbox_read_slot(&data, cap, 0).unwrap();
+    assert_eq!(s0.taker, taker.pubkey().to_bytes(), "slot0 taker");
+    assert_eq!(s0.maker, payer.pubkey().to_bytes(), "slot0 maker");
+    assert_eq!(s0.size_lots, 1, "slot0 size");
+    assert_eq!(s0.price_ticks, 100_000, "slot0 = best bid crossed");
+    assert_eq!(s0.taker_side, 1, "slot0 taker_side = sell");
+    // Last fill = 256th best bid = tick 100_000 - 255.
+    let s255 = fo::outbox_read_slot(&data, cap, 255).unwrap();
+    assert_eq!(s255.price_ticks, 100_000 - 255, "slot255 = 256th best bid");
+    assert_eq!(s255.taker, taker.pubkey().to_bytes(), "slot255 taker");
+
+    println!("\n========== FILL-OUTBOX DEEP SWEEP (real SBF) ==========");
+    println!("256-level single-tx sweep via on-chain outbox = {sweep_cu} CU, DEFAULT 32 KiB heap");
+    println!("(no heap-frame request, no program-log fill data — all 256 fills read from the");
+    println!("outbox account: produced cursor = {produced}, slot0 price {} … slot255 price {}).",
+        s0.price_ticks, s255.price_ticks);
+    println!("Cap raised 96 -> 256 with NO log dependency; omit-outbox path hard-rejected.\n");
+
+    // 256 levels must still fit one tx comfortably under the 1.4 M ceiling.
+    assert!(sweep_cu < 700_000, "256-level outbox sweep must fit one tx: {sweep_cu} CU");
+}
+
 /// CU benchmark for the settlement + risk instructions that
 /// `scripts/benchmark.ts` does NOT cover (it measures only place/take/
 /// cancel/modify). These are the heavy paths and the ones the C-1/C-2
