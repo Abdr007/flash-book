@@ -2181,3 +2181,113 @@ async fn set_book_privacy_rejects_too_many_members() {
         .await;
     assert!(r.is_err(), "more than MAX_PRIVACY_MEMBERS must be rejected");
 }
+
+// ─── delegate / undelegate market_book e2e ───
+// The Delegate/Undelegate CPIs hit the MagicBlock delegation program (build-sbf
+// only). The auth + ownership validation runs BEFORE the CPI and IS testable.
+const IX_DELEGATE_MARKET_BOOK: u8 = 120;
+const IX_UNDELEGATE_MARKET_BOOK: u8 = 121;
+
+fn nine_accounts(market: Pubkey, market_book: Pubkey, authority: Pubkey, pid: Pubkey) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new_readonly(authority, true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(market_book, false),
+        AccountMeta::new_readonly(pid, false),                  // owner_program
+        AccountMeta::new(Pubkey::new_unique(), false),          // delegate_buffer
+        AccountMeta::new(Pubkey::new_unique(), false),          // delegation_record
+        AccountMeta::new(Pubkey::new_unique(), false),          // delegation_metadata
+        AccountMeta::new_readonly(Pubkey::new_from_array([0u8;32]), false), // system
+        AccountMeta::new_readonly(Pubkey::new_from_array(DELEGATION_PROGRAM_ID), false),
+    ]
+}
+
+#[tokio::test]
+async fn delegate_market_book_rejects_already_delegated() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (market_book, _) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    pt.add_account(market, m);
+    // market_book already owned by the delegation program → "already delegated".
+    pt.add_account(market_book, Account { lamports: 1_000_000, data: vec![0u8; 8], owner: Pubkey::new_from_array(DELEGATION_PROGRAM_ID), executable: false, rent_epoch: 0 });
+    pt.add_account(authority.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_DELEGATE_MARKET_BOOK];
+    data.extend_from_slice(&30_000u32.to_le_bytes());
+    data.push(0); // no validator
+    let ix = Instruction { program_id: pid, accounts: nine_accounts(market, market_book, authority.pubkey(), pid), data };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &authority], bh))
+        .await;
+    assert!(r.is_err(), "delegating an already-delegated book must be rejected");
+}
+
+#[tokio::test]
+async fn delegate_market_book_rejects_wrong_authority() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let imposter = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (market_book, _) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    pt.add_account(market, m);
+    pt.add_account(market_book, Account { lamports: 1_000_000, data: vec![0u8; 8], owner: pid, executable: false, rent_epoch: 0 });
+    pt.add_account(imposter.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_DELEGATE_MARKET_BOOK];
+    data.extend_from_slice(&30_000u32.to_le_bytes());
+    data.push(0);
+    let ix = Instruction { program_id: pid, accounts: nine_accounts(market, market_book, imposter.pubkey(), pid), data };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh))
+        .await;
+    assert!(r.is_err(), "non-authority delegate must be rejected");
+}
+
+#[tokio::test]
+async fn undelegate_market_book_rejects_wrong_authority() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let imposter = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (market_book, _) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    pt.add_account(market, m);
+    pt.add_account(market_book, Account { lamports: 1_000_000, data: vec![0u8; 8], owner: Pubkey::new_from_array(DELEGATION_PROGRAM_ID), executable: false, rent_epoch: 0 });
+    pt.add_account(imposter.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(imposter.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new_readonly(pid, false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8;32]), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(DELEGATION_PROGRAM_ID), false),
+        ],
+        data: vec![IX_UNDELEGATE_MARKET_BOOK],
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh))
+        .await;
+    assert!(r.is_err(), "non-authority undelegate must be rejected");
+}
