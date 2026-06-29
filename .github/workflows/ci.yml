@@ -94,7 +94,7 @@ jobs:
           kani-version: 0.67.0
           args: '--package flash-book --features no-entrypoint'
       # The Pinocchio migration crate is its own (isolated) workspace, so its
-      # proofs need a separate invocation. 24 harnesses: haircut solvency/dust +
+      # proofs need a separate invocation. 25 harnesses: haircut solvency/dust +
       # OI conservation + vault share-mint + perf-fee + xmargin (ER floor + epoch
       # monotonic) + force-undelegate (never-fires-while-live) + the fill-commit
       # ring/nonce + order-id collision-freedom/price-priority under the seq

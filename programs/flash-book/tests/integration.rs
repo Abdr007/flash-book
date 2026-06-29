@@ -2802,10 +2802,16 @@ async fn update_oracle_rejects_wide_confidence() {
         .unwrap();
 
     // Confidence 5_000 on price 100_000 = 5% — exceeds the 1% max.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // Anchor `published_at` to the ON-CHAIN clock, not wall-clock: the test
+    // validator's `Clock` drifts from `SystemTime` during the async setup, so a
+    // wall-clock timestamp intermittently trips the `OracleTooStale` gate (flaky
+    // CI). Reading the bank's `Clock` makes the source freshness deterministic.
+    let now = ctx
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
         .unwrap()
-        .as_secs();
+        .unix_timestamp as u64;
     let bad_ix = build_ix(
         flash_book::instruction::UpdateOracle {
             price_ticks: 100_000,
@@ -2840,10 +2846,16 @@ async fn update_oracle_quorum_writes_median_with_three_close_sources() {
 
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // Anchor `published_at` to the ON-CHAIN clock, not wall-clock: the test
+    // validator's `Clock` drifts from `SystemTime` during the async setup, so a
+    // wall-clock timestamp intermittently trips the `OracleTooStale` gate (flaky
+    // CI). Reading the bank's `Clock` makes the source freshness deterministic.
+    let now = ctx
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
         .unwrap()
-        .as_secs();
+        .unix_timestamp as u64;
 
     // Three sources within tolerance: 99_950, 100_000, 100_050.
     // Median = 100_000; max-min = 100; dispersion = 100/100_000*10000 = 10 bps.
@@ -2924,10 +2936,16 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
         .await
         .unwrap();
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // Anchor `published_at` to the ON-CHAIN clock, not wall-clock: the test
+    // validator's `Clock` drifts from `SystemTime` during the async setup, so a
+    // wall-clock timestamp intermittently trips the `OracleTooStale` gate (flaky
+    // CI). Reading the bank's `Clock` makes the source freshness deterministic.
+    let now = ctx
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
         .unwrap()
-        .as_secs();
+        .unix_timestamp as u64;
 
     // 95k / 100k / 105k → max-min = 10k = 10% of median. Way over 50bps.
     let ix = build_ix(

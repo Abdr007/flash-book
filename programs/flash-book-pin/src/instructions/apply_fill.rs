@@ -2,10 +2,11 @@
 //! Pointer-casts the 6 accounts (no Borsh) and applies the fill: position
 //! update (weighted entry / realized PnL / side flip — identical math to the
 //! Anchor `apply_fill_to_position`), market OI, fee/rebate split, funding stamp.
-use crate::guard::{assert_disc, assert_owned_by};
+use crate::guard::{assert_disc, assert_owned_by, assert_pda};
+use crate::seeds::HAIRCUT_SEED;
 use crate::state::{
-    Insurance, Market, Position, TraderState, INSURANCE_DISC, MARKET_DISC, POSITION_DISC,
-    TRADER_STATE_DISC,
+    Insurance, Market, MarketHaircutState, Position, TraderState, HAIRCUT_STATE_DISC,
+    INSURANCE_DISC, MARKET_DISC, POSITION_DISC, TRADER_STATE_DISC,
 };
 use pinocchio::{
     account_info::AccountInfo,
@@ -69,8 +70,49 @@ pub(crate) fn bind_or_stamp_position(pos: &mut Position, trader: &Pubkey, market
     }
 }
 
-/// data: [size_lots u64][price_ticks u64][taker_side u8]
-/// accounts: [sequencer(signer), market, insurance, taker_ts, maker_ts, taker_pos, maker_pos]
+/// Materialize a realized-PnL `delta` into the leg's collateral bucket — the
+/// position's own collateral (`iso`) or the trader_state pool (cross), sampled
+/// pre-resize. A gain credits; a loss debits, draining the bucket to 0 and
+/// covering any shortfall from the insurance fund (then ADL for an uncovered
+/// remainder once the fund is exhausted). This is the R1 fix: without it a closed
+/// loss never debited collateral (→ bad debt) and a closed gain never credited it.
+#[inline]
+pub(crate) fn materialize_realized(
+    delta: i64,
+    iso: bool,
+    pos: &mut Position,
+    ts: &mut TraderState,
+    insurance: &mut Insurance,
+) -> ProgramResult {
+    if delta == 0 {
+        return Ok(());
+    }
+    let bucket = if iso { pos.collateral_quote_lots } else { ts.collateral_quote_lots };
+    let (new_bucket, shortfall) = crate::fill_math::route_realized_pnl(bucket, delta)
+        .map_err(|_| ProgramError::ArithmeticOverflow)?;
+    if iso {
+        pos.collateral_quote_lots = new_bucket;
+    } else {
+        ts.collateral_quote_lots = new_bucket;
+    }
+    if shortfall > 0 {
+        // Bad-debt waterfall: insurance covers up to its balance; any uncovered
+        // remainder is left for ADL (`auto_deleverage`). Same as `cover_bad_debt`.
+        let (covered, _uncovered) = crate::liquidation::cover_shortfall(insurance.balance_quote_lots, shortfall);
+        insurance.balance_quote_lots -= covered;
+        insurance.total_payouts = insurance.total_payouts.saturating_add(covered);
+    }
+    Ok(())
+}
+
+/// data: [size_lots u64][price_ticks u64][taker_side u8][fill_seq u64]
+/// accounts: [sequencer(signer), market, insurance, taker_ts, maker_ts, taker_pos,
+///            maker_pos, (haircut_state OPTIONAL)]
+/// When the trailing `haircut_state` (the market's `[b"haircut", market]` PDA) is
+/// supplied, funding is settled on each leg's PRE-trade size before the resize
+/// (R2 — stops a same-side add being charged funding for the whole prior interval);
+/// omitting it preserves the legacy 7-account behavior (funding settled lazily by
+/// the `settle_funding` crank). Mirrors anchor's `market_haircut.is_some()` gate.
 pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     // data: [size u64][price u64][taker_side u8][fill_seq u64]
     if data.len() < 25 || accounts.len() < 7 { return Err(ProgramError::InvalidInstructionData); }
@@ -105,6 +147,15 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     // the matcher's invariant (self-trades are prevented upstream).
     if accounts[3].key() == accounts[4].key() || accounts[5].key() == accounts[6].key() {
         return Err(ProgramError::InvalidArgument);
+    }
+    // Optional trailing haircut_state (R2 inline funding settle). Validate it as
+    // THIS market's canonical `[b"haircut", market]` PDA so the residual we move
+    // is the right market's accumulator, not an attacker-supplied account.
+    let has_haircut = accounts.len() > 7;
+    if has_haircut {
+        assert_owned_by(&accounts[7], pid)?;
+        assert_pda(&accounts[7], &[HAIRCUT_SEED, &accounts[1].key()[..]], pid)?;
+        assert_disc(&accounts[7], &HAIRCUT_STATE_DISC)?;
     }
 
     unsafe {
@@ -143,48 +194,23 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         bind_or_stamp_position(maker_pos, &maker_ts.trader, &mkt_key, maker_ts.sub_index)?;
 
         let fidx = market.cum_funding();
-        // Snapshot sizes so we can maintain each trader's open_positions count
-        // across the open (0 → >0) / close (>0 → 0) transitions below.
+        let tick = market.tick_size;
+        // Snapshot pre-trade sizes/sides (for open_positions + OI deltas) and
+        // sample each leg's collateral bucket — isolated = the position's own
+        // collateral, cross = the trader_state pool — BEFORE any mutation, so
+        // realized PnL routes to whichever bucket backed the position at fill time.
         let taker_before = taker_pos.size_lots;
         let maker_before = maker_pos.size_lots;
-        // Also snapshot each leg's OLD side, so the open-interest delta below
-        // removes its prior contribution from the correct side (a fill may flip).
         let taker_old_side = taker_pos.side;
         let maker_old_side = maker_pos.side;
-        // Fills update both legs with identical matcher math.
-        crate::fill_math::apply_to_position(taker_pos, taker_side, size, price, fidx).map_err(|_| ProgramError::ArithmeticOverflow)?;
-        crate::fill_math::apply_to_position(maker_pos, maker_side, size, price, fidx).map_err(|_| ProgramError::ArithmeticOverflow)?;
-        // Maintain open_positions (gates withdraw_collateral). Pure transition.
-        taker_ts.open_positions =
-            TraderState::open_positions_after(taker_ts.open_positions, taker_before, taker_pos.size_lots);
-        maker_ts.open_positions =
-            TraderState::open_positions_after(maker_ts.open_positions, maker_before, maker_pos.size_lots);
+        let taker_iso = taker_pos.collateral_quote_lots > 0;
+        let maker_iso = maker_pos.collateral_quote_lots > 0;
 
-        // Open interest. Each position contributes its `size_lots` to OI on its
-        // side; a fill changes BOTH legs (one long, one short). Remove each leg's
-        // OLD contribution and add its NEW one (host-tested `oi_after_leg`) —
-        // correct across open / close / flip, and (crucially) keeps
-        // `long_oi_lots == short_oi_lots`, the conservation invariant
-        // `verify_market_invariants` enforces. (The prior code added the fill
-        // size to ONLY the taker side, breaking the invariant on every fill.)
-        let (long_oi, short_oi) = crate::fill_math::oi_after_leg(
-            market.long_oi_lots, market.short_oi_lots,
-            taker_old_side, taker_before, taker_pos.side, taker_pos.size_lots,
-        );
-        let (long_oi, short_oi) = crate::fill_math::oi_after_leg(
-            long_oi, short_oi,
-            maker_old_side, maker_before, maker_pos.side, maker_pos.size_lots,
-        );
-        market.long_oi_lots = long_oi;
-        market.short_oi_lots = short_oi;
-
-        // Mark-freshness stamp (liveness). Monotonic guard against re-ordering.
-        if now_slot > market.last_mark_update_slot { market.last_mark_update_slot = now_slot; }
-
-        // Fee / rebate split (integer bps, like the matcher).
+        // ── Fees FIRST, before the resize (anchor order) — so a position closing
+        // at a loss still has collateral to pay its fee. ─────────────────────
         let notional = (size as u128)
             .checked_mul(price as u128).ok_or(ProgramError::ArithmeticOverflow)?
-            .checked_mul(market.tick_size as u128).ok_or(ProgramError::ArithmeticOverflow)?;
+            .checked_mul(tick as u128).ok_or(ProgramError::ArithmeticOverflow)?;
         // M-1: clamp every u128→u64 fee/rebate cast (anchor clamps to u64::MAX);
         // a raw `as u64` would WRAP mod 2^64 at extreme notional → near-zero fee.
         let clamp = |x: u128| -> u64 { x.min(u64::MAX as u128) as u64 };
@@ -204,6 +230,60 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
             .ok_or(ProgramError::Custom(249))?; // InsufficientCollateral
         maker_ts.collateral_quote_lots = maker_ts.collateral_quote_lots.saturating_add(rebate);
         insurance.balance_quote_lots = insurance.balance_quote_lots.saturating_add(fee - rebate);
+
+        // ── (R2) Settle each leg's funding on its PRE-trade size, BEFORE the
+        // resize, when the optional haircut_state is supplied. The shared helper
+        // is the SAME one `settle_funding` uses, so the inline settle and the
+        // crank can't diverge; settling here re-stamps the entry index, so a
+        // following same-side add can't be charged funding for the prior interval.
+        if has_haircut {
+            let haircut: &mut MarketHaircutState = view(&accounts[7]);
+            if &haircut.market != accounts[1].key() {
+                return Err(ProgramError::InvalidArgument);
+            }
+            let mark = market.mark_price_ticks;
+            let mut residual = u128::from_le_bytes(haircut.residual_quote_lots);
+            crate::funding::settle_position_funding(taker_pos, mark, tick, fidx, &mut taker_ts.collateral_quote_lots, &mut residual)
+                .map_err(|_| ProgramError::InvalidArgument)?;
+            crate::funding::settle_position_funding(maker_pos, mark, tick, fidx, &mut maker_ts.collateral_quote_lots, &mut residual)
+                .map_err(|_| ProgramError::InvalidArgument)?;
+            haircut.residual_quote_lots = residual.to_le_bytes();
+        }
+
+        // ── Resize each leg + capture the realized-PnL delta for this fill (R1).
+        let taker_delta = crate::fill_math::apply_to_position(taker_pos, taker_side, size, price, tick, fidx)
+            .map_err(|_| ProgramError::ArithmeticOverflow)?;
+        let maker_delta = crate::fill_math::apply_to_position(maker_pos, maker_side, size, price, tick, fidx)
+            .map_err(|_| ProgramError::ArithmeticOverflow)?;
+        // ── Materialize realized PnL into the right collateral bucket; a loss
+        // beyond the bucket drains it to 0 and draws the shortfall from insurance.
+        materialize_realized(taker_delta, taker_iso, taker_pos, taker_ts, insurance)?;
+        materialize_realized(maker_delta, maker_iso, maker_pos, maker_ts, insurance)?;
+
+        // Maintain open_positions (gates withdraw_collateral). Pure transition.
+        taker_ts.open_positions =
+            TraderState::open_positions_after(taker_ts.open_positions, taker_before, taker_pos.size_lots);
+        maker_ts.open_positions =
+            TraderState::open_positions_after(maker_ts.open_positions, maker_before, maker_pos.size_lots);
+
+        // Open interest. Each position contributes its `size_lots` to OI on its
+        // side; a fill changes BOTH legs (one long, one short). Remove each leg's
+        // OLD contribution and add its NEW one (host-tested `oi_after_leg`) —
+        // correct across open / close / flip, and (crucially) keeps
+        // `long_oi_lots == short_oi_lots`, the conservation invariant.
+        let (long_oi, short_oi) = crate::fill_math::oi_after_leg(
+            market.long_oi_lots, market.short_oi_lots,
+            taker_old_side, taker_before, taker_pos.side, taker_pos.size_lots,
+        );
+        let (long_oi, short_oi) = crate::fill_math::oi_after_leg(
+            long_oi, short_oi,
+            maker_old_side, maker_before, maker_pos.side, maker_pos.size_lots,
+        );
+        market.long_oi_lots = long_oi;
+        market.short_oi_lots = short_oi;
+
+        // Mark-freshness stamp (liveness). Monotonic guard against re-ordering.
+        if now_slot > market.last_mark_update_slot { market.last_mark_update_slot = now_slot; }
     }
     Ok(())
 }

@@ -10,11 +10,12 @@
 //! README): the FLP per-market exposure (size/entry) update, the toxicity tax
 //! (vpin is ported — wiring pending), fee-tier resolution, events, and the
 //! `init_if_needed` position-create CPI / PDA verification.
-use crate::guard::{assert_disc, assert_owned_by};
+use crate::guard::{assert_disc, assert_owned_by, assert_pda};
 use crate::instructions::apply_fill::{assert_position, bind_or_stamp_position};
+use crate::seeds::HAIRCUT_SEED;
 use crate::state::{
-    FlpExposure, Insurance, Market, Position, TraderState, FLP_EXPOSURE_DISC, INSURANCE_DISC,
-    MARKET_DISC, POSITION_DISC, TRADER_STATE_DISC,
+    FlpExposure, Insurance, Market, MarketHaircutState, Position, TraderState, FLP_EXPOSURE_DISC,
+    HAIRCUT_STATE_DISC, INSURANCE_DISC, MARKET_DISC, POSITION_DISC, TRADER_STATE_DISC,
 };
 use pinocchio::{
     account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
@@ -62,6 +63,13 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
     assert_owned_by(&accounts[3], _pid)?; assert_disc(&accounts[3], &FLP_EXPOSURE_DISC)?;
     assert_owned_by(&accounts[4], _pid)?; assert_disc(&accounts[4], &TRADER_STATE_DISC)?;
     assert_position(&accounts[5], _pid)?;
+    // Optional trailing haircut_state (R2 inline funding settle) — see apply_fill.
+    let has_haircut = accounts.len() > 6;
+    if has_haircut {
+        assert_owned_by(&accounts[6], _pid)?;
+        assert_pda(&accounts[6], &[HAIRCUT_SEED, &accounts[1].key()[..]], _pid)?;
+        assert_disc(&accounts[6], &HAIRCUT_STATE_DISC)?;
+    }
 
     unsafe {
         let market: &mut Market = view(&accounts[1]);
@@ -100,43 +108,21 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
 
         // Taker-leg position update (FLP is the maker — no maker leg on-chain).
         let fidx = market.cum_funding();
-        // Snapshot the taker's OLD side/size so the OI delta removes its prior
-        // contribution from the correct side (a fill may close or flip it).
+        let tick = market.tick_size;
+        // Snapshot the taker's OLD side/size (OI + open_positions deltas) and
+        // sample its collateral bucket (isolated vs cross) BEFORE any mutation.
         let taker_old_side = taker_pos.side;
         let taker_before = taker_pos.size_lots;
-        crate::fill_math::apply_to_position(taker_pos, taker_side, size, price, fidx)
-            .map_err(|_| ProgramError::ArithmeticOverflow)?;
-        // CRITICAL (audit 2026-06): maintain `open_positions` here too. It gates
-        // every collateral-exit (withdraw/partial/sweep); omitting it let a trader
-        // open a position against the FLP pool, keep `open_positions == 0`, and
-        // withdraw ALL collateral while fully exposed → uncovered bad debt.
-        taker_ts.open_positions =
-            TraderState::open_positions_after(taker_ts.open_positions, taker_before, taker_pos.size_lots);
+        let taker_iso = taker_pos.collateral_quote_lots > 0;
 
-        // Open interest. The pool is the maker (no on-chain position), so OI is
-        // the taker leg plus the pool's mirror counter-leg — keeping
-        // `long_oi == short_oi`, the conservation invariant. (The prior code
-        // added `size` to ONLY the taker side, breaking it on every fill.)
-        let (long_oi, short_oi) = crate::fill_math::oi_after_flp_fill(
-            market.long_oi_lots,
-            market.short_oi_lots,
-            taker_old_side,
-            taker_before,
-            taker_pos.side,
-            taker_pos.size_lots,
-        );
-        market.long_oi_lots = long_oi;
-        market.short_oi_lots = short_oi;
-
-        // Fee / rebate split. FLP-as-maker: ignore a negative maker_rebate_bps
-        // (the protocol cannot charge itself a fee).
+        // ── Fees FIRST, before the resize (anchor order). FLP-as-maker: the
+        // rebate lifts pool capital, insurance takes its cut of the net fee. ──
         let notional = (size as u128)
             .checked_mul(price as u128)
             .ok_or(ProgramError::ArithmeticOverflow)?
-            .checked_mul(market.tick_size as u128)
+            .checked_mul(tick as u128)
             .ok_or(ProgramError::ArithmeticOverflow)?;
-        // M-1: clamp u128→u64 fee/rebate casts to u64::MAX (anchor parity; a raw
-        // `as u64` wraps mod 2^64 at extreme notional → near-zero fee).
+        // M-1: clamp u128→u64 fee/rebate casts to u64::MAX (anchor parity).
         let clamp = |x: u128| -> u64 { x.min(u64::MAX as u128) as u64 };
         let fee = clamp(notional
             .checked_mul(market.taker_fee_bps as u128)
@@ -149,21 +135,58 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
             / BPS_DENOM);
         let rebate = rebate.min(fee);
         let net_fee = fee - rebate;
-
-        // H-1: debit the taker fee with checked_sub and ABORT if uncovered (anchor
-        // parity). The prior `saturating_sub` minted unbacked quote-lots into FLP
-        // capital + insurance whenever the taker's balance was below the fee.
+        // H-1: debit the taker fee with checked_sub and ABORT if uncovered.
         taker_ts.collateral_quote_lots = taker_ts.collateral_quote_lots
             .checked_sub(fee)
             .ok_or(ProgramError::Custom(249))?; // InsufficientCollateral
         flp.total_capital_quote_lots = flp.total_capital_quote_lots.saturating_add(rebate);
-
-        // Insurance takes its bps cut of the net fee; the rest is protocol revenue.
         let contribution =
             clamp((net_fee as u128) * (insurance.fee_contribution_bps as u128) / BPS_DENOM);
         insurance.balance_quote_lots = insurance.balance_quote_lots.saturating_add(contribution);
         insurance.total_contributions = insurance.total_contributions.saturating_add(contribution);
         market.total_fees_collected = market.total_fees_collected.saturating_add(net_fee);
+
+        // ── (R2) Settle the taker leg's funding on its PRE-trade size before the
+        // resize, when the optional haircut_state is supplied (same shared helper
+        // as `settle_funding` / `apply_fill`). The pool side accrues no funding.
+        if has_haircut {
+            let haircut: &mut MarketHaircutState = view(&accounts[6]);
+            if &haircut.market != accounts[1].key() {
+                return Err(ProgramError::InvalidArgument);
+            }
+            let mut residual = u128::from_le_bytes(haircut.residual_quote_lots);
+            crate::funding::settle_position_funding(taker_pos, market.mark_price_ticks, tick, fidx, &mut taker_ts.collateral_quote_lots, &mut residual)
+                .map_err(|_| ProgramError::InvalidArgument)?;
+            haircut.residual_quote_lots = residual.to_le_bytes();
+        }
+
+        // ── Resize the taker leg + capture its realized-PnL delta (R1), then
+        // materialize it into the taker's bucket (loss shortfall → insurance).
+        // The POOL side's realized PnL is tracked on its FLP exposure entry — a
+        // documented deferral in this port (pin doesn't carry the pool Position).
+        let taker_delta = crate::fill_math::apply_to_position(taker_pos, taker_side, size, price, tick, fidx)
+            .map_err(|_| ProgramError::ArithmeticOverflow)?;
+        crate::instructions::apply_fill::materialize_realized(taker_delta, taker_iso, taker_pos, taker_ts, insurance)?;
+
+        // CRITICAL (audit 2026-06): maintain `open_positions` — it gates every
+        // collateral-exit; omitting it let a trader open against the FLP pool,
+        // keep `open_positions == 0`, and withdraw ALL collateral while exposed.
+        taker_ts.open_positions =
+            TraderState::open_positions_after(taker_ts.open_positions, taker_before, taker_pos.size_lots);
+
+        // Open interest. The pool is the maker (no on-chain position), so OI is
+        // the taker leg plus the pool's mirror counter-leg — keeping
+        // `long_oi == short_oi`, the conservation invariant.
+        let (long_oi, short_oi) = crate::fill_math::oi_after_flp_fill(
+            market.long_oi_lots,
+            market.short_oi_lots,
+            taker_old_side,
+            taker_before,
+            taker_pos.side,
+            taker_pos.size_lots,
+        );
+        market.long_oi_lots = long_oi;
+        market.short_oi_lots = short_oi;
     }
     Ok(())
 }

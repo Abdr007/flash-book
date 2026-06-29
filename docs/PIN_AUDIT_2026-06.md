@@ -144,17 +144,37 @@ regressions**. Panic/DoS agent: **no reachable panic or OOB on any deployed path
 
 ### Round-3 TOP PRE-PRODUCTION BLOCKERS (documented — too large / architectural to port safely mid-audit)
 
-- **R1/R2 — settlement does not materialize realized PnL or funding into collateral.**
-  `apply_fill`/`apply_flp_fill` update `position.realized_pnl`/re-stamp `cum_funding`
-  but **never fold PnL/funding into the spendable `collateral_quote_lots`**, and there
-  is no bankrupt-close insurance waterfall. Anchor has an explicit Phase-2g
-  materialization (`lib.rs:4403-4469`). Consequences flagged by the economic agent
-  (all rooted here): **phantom funding** via same-side-add (funding charged on
-  post-add size for the whole interval — settle-before-resize missing), **per-market
-  FLP v3 par-redemption** while underwater, and the dead `compute_shortfall` /
-  `health_price_with_staleness`. **This is the #1 thing to port before any mainnet
-  consideration** — it is a multi-file settlement-completeness effort, not a one-line
-  fix, and the pin port is explicitly devnet/WIP/UNAUDITED.
+- **R1 — realized-PnL materialization — ✅ DONE (2026-06, `feat/pin-settlement-materialization`).**
+  `apply_fill`/`apply_flp_fill` now fold each fill's realized-PnL delta into the
+  correct collateral bucket (isolated = position, cross = trader_state, sampled
+  pre-resize): a gain credits, a loss debits and — when it exceeds the bucket —
+  drains it to 0 with the shortfall drawn from the insurance fund (then ADL), the
+  faithful Anchor bad-debt waterfall. Fees were reordered BEFORE the resize (anchor
+  order) so a close-at-a-loss still pays its fee. Also fixed the latent AUDIT-H-1
+  scaling bug: realized PnL now carries the `× tick_size` factor that unrealized
+  PnL + funding use (previously absent — harmless only because the field was never
+  materialized). Pure math in `fill_math` (`apply_to_position` returns the delta,
+  `route_realized_pnl` does the bucket+shortfall split); e2e-tested (gain→collateral,
+  bankrupt-loss→insurance) + Kani-proven conservation (`route_realized_pnl_conserves`,
+  the 25th pin harness).
+- **R2 — funding settle-before-resize — ✅ DONE (2026-06, `feat/pin-settlement-materialization`).**
+  `apply_fill`/`apply_flp_fill` now settle each leg's funding on its PRE-trade size
+  before the resize, gated on an OPTIONAL trailing `haircut_state` account (the
+  market's `[b"haircut", market]` PDA) — mirroring anchor's `market_haircut.is_some()`
+  gate; omitting it preserves the legacy account count + lazy `settle_funding` crank.
+  The funding math was extracted from the `settle_funding` ix into a single shared
+  `funding::settle_position_funding` helper (mark-priced notional, isolated/cross
+  bucket routing, residual move with `Δcollateral == −Δresidual`, re-stamp the entry
+  index, pay clamped to availability) — so the crank and the inline settle can never
+  diverge. Settling + re-stamping before a same-side add stops the post-add size
+  being charged funding for the prior interval (the phantom-funding bug).
+  Host-tested (`settle_position_funding_routes_and_restamps`: pay/receive/isolated/
+  cross/clamp/underflow/flat) + e2e (`apply_flp_fill_settles_funding_before_resize`:
+  funding settled on the pre-add size 10 ⇒ 100 paid, not the post-add 20 ⇒ 200;
+  residual moved by RISK-1).
+- **Other R1/R2 consequences:** the dead `compute_shortfall` / `health_price_with_staleness`
+  and per-market FLP v3 par-redemption are downstream of full settlement completeness;
+  the pin port remains devnet/WIP/UNAUDITED.
 - **Liquidation reward-from-liquidatee model** (reward skimmed from the liquidatee's
   backing, sized on leveraged notional, paid before the close settles): the stacking
   drain is closed (#24), but the single-call "reward can be ~100% of backing when
