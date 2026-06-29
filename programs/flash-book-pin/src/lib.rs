@@ -58,6 +58,13 @@ pub mod solvency;
 pub mod leverage;
 pub mod trigger_order;
 pub mod twap_order;
+pub mod vault_math;
+pub mod oracle_quorum;
+pub mod pyth_oracle;
+pub mod fill_commitment;
+pub mod xmargin;
+pub mod er;
+pub mod er_permission;
 pub mod leverage_tiers;
 pub mod fee_tiers;
 pub mod cpi;
@@ -177,10 +184,70 @@ mod program {
         ReapExpiredOrders = 88,
         AutoDeleverage = 89,
         InitPositionLiquidationState = 90,
+        SetMarketLiquidationParams = 91,
+        LiquidatePositionV2 = 92,
+        CoverBadDebt = 93,
+        SetPositionCross = 94,
+        SetPositionIsolated = 95,
+        LiquidatePortfolioV2 = 96,
+        PlaceJitLiquidationOffer = 97,
+        CancelJitLiquidationOffer = 98,
+        ExecuteTriggerOrder = 99,
+        ExecuteTwapSlice = 100,
+        PlaceIcebergOrder = 101,
+        ReplenishIceberg = 102,
+        CancelIceberg = 103,
+        PlaceBracketOrder = 104,
+        CreateVaultV3 = 105,
+        VaultOpenTraderStateV3 = 106,
+        InitVaultPositionV3 = 107,
+        VaultDepositV3 = 108,
+        VaultWithdrawV3 = 109,
+        SettleVaultPerfFeeV3 = 110,
+        VaultPlaceOrderV3 = 111,
+        VaultCancelOrderV3 = 112,
+        UpdateTrailingStop = 113,
+        UpdateOracleQuorum = 114,
+        UpdateOracleFromPyth = 115,
+        StampBookLivenessBaseline = 116,
+        InitBookPermission = 117,
+        SetBookPrivacy = 118,
+        CloseBookPermission = 119,
+        DelegateMarketBook = 120,
+        UndelegateMarketBook = 121,
+        DelegateMarket = 122,
+        UndelegateMarket = 123,
+        ForceUndelegateMarketBook = 124,
+        CommitMarketBook = 125,
+        CommitAndUndelegateMarketBook = 126,
+        InitFillCommitment = 127,
+        DelegateFillCommitment = 128,
+        CommitFillCommitment = 129,
+        CommitAndUndelegateFillCommitment = 130,
+        UndelegateFillCommitment = 131,
+        MigrateMarketToV3 = 132,
+        MigratePositionToTraderStateKey = 133,
+        ViewPredictedFunding = 134,
+        ViewTraderEffectiveTier = 135,
+        ViewBookDepthV2 = 136,
+        ViewQuoteLadder = 137,
+        ViewPortfolioRisk = 138,
+        SweepCollateral = 139,
+        PartialWithdrawCollateral = 140,
+        PartialWithdrawCollateralXdomain = 141,
+        WithdrawCollateralXdomain = 142,
+        PlaceBasketOrderV2 = 143,
+        PlaceBasketOrderNV2 = 144,
     }
 
     #[inline(always)]
     fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+        // The MagicBlock delegation program's undelegation callback CPIs back in
+        // with an 8-byte Anchor-style discriminator, NOT our 1-byte Ix tag —
+        // route it specially before the normal tag dispatch.
+        if data.len() >= 8 && data[..8] == crate::er::EXTERNAL_UNDELEGATE_DISCRIMINATOR {
+            return instructions::process_undelegation::process(program_id, accounts, &data[8..]);
+        }
         let (&tag, rest) = data.split_first().ok_or(ProgramError::InvalidInstructionData)?;
         match tag {
             x if x == Ix::ApplyFill as u8 => instructions::apply_fill::process(program_id, accounts, rest),
@@ -274,6 +341,62 @@ mod program {
             x if x == Ix::ReapExpiredOrders as u8 => instructions::reap_expired_orders::process(program_id, accounts, rest),
             x if x == Ix::AutoDeleverage as u8 => instructions::auto_deleverage::process(program_id, accounts, rest),
             x if x == Ix::InitPositionLiquidationState as u8 => instructions::init_position_liquidation_state::process(program_id, accounts, rest),
+            x if x == Ix::SetMarketLiquidationParams as u8 => instructions::set_market_liquidation_params::process(program_id, accounts, rest),
+            x if x == Ix::LiquidatePositionV2 as u8 => instructions::liquidate_position_v2::process(program_id, accounts, rest),
+            x if x == Ix::CoverBadDebt as u8 => instructions::cover_bad_debt::process(program_id, accounts, rest),
+            x if x == Ix::SetPositionCross as u8 => instructions::set_position_cross::process(program_id, accounts, rest),
+            x if x == Ix::SetPositionIsolated as u8 => instructions::set_position_isolated::process(program_id, accounts, rest),
+            x if x == Ix::LiquidatePortfolioV2 as u8 => instructions::liquidate_portfolio_v2::process(program_id, accounts, rest),
+            x if x == Ix::PlaceJitLiquidationOffer as u8 => instructions::place_jit_liquidation_offer::process(program_id, accounts, rest),
+            x if x == Ix::CancelJitLiquidationOffer as u8 => instructions::cancel_jit_liquidation_offer::process(program_id, accounts, rest),
+            x if x == Ix::ExecuteTriggerOrder as u8 => instructions::execute_trigger_order::process(program_id, accounts, rest),
+            x if x == Ix::ExecuteTwapSlice as u8 => instructions::execute_twap_slice::process(program_id, accounts, rest),
+            x if x == Ix::PlaceIcebergOrder as u8 => instructions::place_iceberg_order::process(program_id, accounts, rest),
+            x if x == Ix::ReplenishIceberg as u8 => instructions::replenish_iceberg::process(program_id, accounts, rest),
+            x if x == Ix::CancelIceberg as u8 => instructions::cancel_iceberg::process(program_id, accounts, rest),
+            x if x == Ix::PlaceBracketOrder as u8 => instructions::place_bracket_order::process(program_id, accounts, rest),
+            x if x == Ix::CreateVaultV3 as u8 => instructions::create_vault_v3::process(program_id, accounts, rest),
+            x if x == Ix::VaultOpenTraderStateV3 as u8 => instructions::vault_open_trader_state_v3::process(program_id, accounts, rest),
+            x if x == Ix::InitVaultPositionV3 as u8 => instructions::init_vault_position_v3::process(program_id, accounts, rest),
+            x if x == Ix::VaultDepositV3 as u8 => instructions::vault_deposit_v3::process(program_id, accounts, rest),
+            x if x == Ix::VaultWithdrawV3 as u8 => instructions::vault_withdraw_v3::process(program_id, accounts, rest),
+            x if x == Ix::SettleVaultPerfFeeV3 as u8 => instructions::settle_vault_perf_fee_v3::process(program_id, accounts, rest),
+            x if x == Ix::VaultPlaceOrderV3 as u8 => instructions::vault_place_order_v3::process(program_id, accounts, rest),
+            x if x == Ix::VaultCancelOrderV3 as u8 => instructions::vault_cancel_order_v3::process(program_id, accounts, rest),
+            x if x == Ix::UpdateTrailingStop as u8 => instructions::update_trailing_stop::process(program_id, accounts, rest),
+            x if x == Ix::UpdateOracleQuorum as u8 => instructions::update_oracle_quorum::process(program_id, accounts, rest),
+            x if x == Ix::UpdateOracleFromPyth as u8 => instructions::update_oracle_from_pyth::process(program_id, accounts, rest),
+            x if x == Ix::StampBookLivenessBaseline as u8 => instructions::stamp_book_liveness_baseline::process(program_id, accounts, rest),
+            x if x == Ix::InitBookPermission as u8 => instructions::book_permission::init(program_id, accounts, rest),
+            x if x == Ix::SetBookPrivacy as u8 => instructions::book_permission::set_privacy(program_id, accounts, rest),
+            x if x == Ix::CloseBookPermission as u8 => instructions::book_permission::close(program_id, accounts, rest),
+            x if x == Ix::DelegateMarketBook as u8 => instructions::delegate_market_book::process(program_id, accounts, rest),
+            x if x == Ix::UndelegateMarketBook as u8 => instructions::undelegate_market_book::process(program_id, accounts, rest),
+            x if x == Ix::DelegateMarket as u8 => instructions::delegate_market::process(program_id, accounts, rest),
+            x if x == Ix::UndelegateMarket as u8 => instructions::undelegate_market::process(program_id, accounts, rest),
+            x if x == Ix::ForceUndelegateMarketBook as u8 => instructions::force_undelegate_market_book::process(program_id, accounts, rest),
+            x if x == Ix::CommitMarketBook as u8 => instructions::commit_market_book::commit(program_id, accounts, rest),
+            x if x == Ix::CommitAndUndelegateMarketBook as u8 => instructions::commit_market_book::commit_and_undelegate(program_id, accounts, rest),
+            x if x == Ix::InitFillCommitment as u8 => instructions::init_fill_commitment::process(program_id, accounts, rest),
+            x if x == Ix::DelegateFillCommitment as u8 => instructions::delegate_fill_commitment::process(program_id, accounts, rest),
+            // commit/commit_and_undelegate are account-agnostic (they commit the
+            // PDA passed as accounts[1]) — reuse the commit_market_book handlers.
+            x if x == Ix::CommitFillCommitment as u8 => instructions::commit_market_book::commit(program_id, accounts, rest),
+            x if x == Ix::CommitAndUndelegateFillCommitment as u8 => instructions::commit_market_book::commit_and_undelegate(program_id, accounts, rest),
+            x if x == Ix::UndelegateFillCommitment as u8 => instructions::undelegate_fill_commitment::process(program_id, accounts, rest),
+            x if x == Ix::MigrateMarketToV3 as u8 => instructions::migrate_market_to_v3::process(program_id, accounts, rest),
+            x if x == Ix::MigratePositionToTraderStateKey as u8 => instructions::migrate_position_to_trader_state_key::process(program_id, accounts, rest),
+            x if x == Ix::ViewPredictedFunding as u8 => instructions::views::predicted_funding(program_id, accounts, rest),
+            x if x == Ix::ViewTraderEffectiveTier as u8 => instructions::views::trader_effective_tier(program_id, accounts, rest),
+            x if x == Ix::ViewBookDepthV2 as u8 => instructions::views::book_depth(program_id, accounts, rest),
+            x if x == Ix::ViewQuoteLadder as u8 => instructions::views::quote_ladder(program_id, accounts, rest),
+            x if x == Ix::ViewPortfolioRisk as u8 => instructions::views::portfolio_risk(program_id, accounts, rest),
+            x if x == Ix::SweepCollateral as u8 => instructions::sweep_collateral::process(program_id, accounts, rest),
+            x if x == Ix::PartialWithdrawCollateral as u8 => instructions::partial_withdraw::process(program_id, accounts, rest),
+            x if x == Ix::PartialWithdrawCollateralXdomain as u8 => instructions::partial_withdraw::xdomain(program_id, accounts, rest),
+            x if x == Ix::WithdrawCollateralXdomain as u8 => instructions::partial_withdraw::withdraw_xdomain(program_id, accounts, rest),
+            x if x == Ix::PlaceBasketOrderV2 as u8 => instructions::basket_order::v2(program_id, accounts, rest),
+            x if x == Ix::PlaceBasketOrderNV2 as u8 => instructions::basket_order::n_v2(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

@@ -40,6 +40,13 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let max_staleness_seconds = u32::from_le_bytes(data[32..36].try_into().unwrap());
     let max_confidence_bps = u32::from_le_bytes(data[36..40].try_into().unwrap());
     let tick_decimals = data[40] as i8;
+    // Optional quorum dispersion cap appended after the fixed 41 bytes; 0 / absent
+    // = dispersion gate off (backward-compatible).
+    let max_dispersion_bps = if data.len() >= 45 {
+        u32::from_le_bytes(data[41..45].try_into().unwrap())
+    } else {
+        0
+    };
 
     // Validation (anchor parity).
     if max_staleness_seconds == 0 {
@@ -96,7 +103,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         c.tick_decimals = tick_decimals;
         c.source = ORACLE_SOURCE_PYTH;
         c.bump = bump;
-        c._pad = [0u8; 5];
+        c._pad0 = 0;
+        c.max_dispersion_bps = max_dispersion_bps;
     }
     Ok(())
 }

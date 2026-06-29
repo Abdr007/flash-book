@@ -7,12 +7,17 @@ code proves.
 ## 1. Scope
 
 - **Program:** `programs/flash-book` (the deployed **Anchor 0.31.1** program,
-  ~32.9k LOC). The Pinocchio/no_std port (`programs/flash-book-pin`) is WIP and
-  **out of scope**.
+  ~32.9k LOC). The Pinocchio/no_std port (`programs/flash-book-pin`) — now a
+  **complete 134/134-instruction port** (477 host + 61 integration tests, 22 Kani
+  proofs, `build-sbf` clean) — is a **separate, devnet-only, UNAUDITED**
+  implementation and remains **out of scope** for this (Anchor-program) audit. It
+  is not deployed to mainnet; its CPI-gated instructions are `build-sbf`-verified
+  only (a test-harness limit), and it carries documented model degeneracies
+  (mark-only oracle, IM-derived-from-`max_leverage`). See §5.
 - **Review surface:** `main` HEAD. All hardening + audit-remediation work is now
   merged (PRs #34–#42); review the whole program at `main` (no review branch).
 - **Build/test gate (CI, green):** `cargo build-sbf`; `cargo test` (405 lib + 57
-  integration + full proptest/wave suites); `cargo kani` (**41 harnesses**); Lean
+  integration + full proptest/wave suites); `cargo kani` (**44 harnesses**); Lean
   `lake build` (Haircut/Funding/OiMmr, axiom-clean). See `.github/workflows/ci.yml`
   — a regression in any of these fails CI.
 
@@ -71,7 +76,7 @@ implemented (it would consume the node arena it protects — see issue #36).
 
 ## 3. Formal-verification evidence (`certora/PROPERTIES.md`, `docs/FORMAL_VERIFICATION.md`)
 
-**41 Kani harnesses + Lean (Haircut/Funding/OiMmr, axiom-clean), all CI-gated.**
+**44 Kani harnesses + Lean (Haircut/Funding/OiMmr, axiom-clean), all CI-gated.**
 Each binds to deployed code (handlers route through the proven pure function).
 2026-06 additions: C-1 stress-soundness + frame-independence, H1 seq-guard ⇔
 encoding precondition + collision-freedom, F3 force-undelegate soundness +
@@ -105,7 +110,7 @@ security gates do not threaten the CU budget.
 | #37 mediums M1–M13 / lows L1–L5 | Not yet enumerated from the review record |
 | ER commit/undelegate round-trip | ER-gated; not unit-testable without a live MagicBlock ER |
 | ER heartbeat (F2/F3) | Off-chain sequencer must call `er_heartbeat` every <150 slots; auditor: confirm the sequencer-only auth + the two-tier timeouts |
-| Pinocchio port (`flash-book-pin`) | WIP/out-of-scope; math layer parity-verified, instruction glue (account validation, replay guard, OI) not deployed |
+| Pinocchio port (`flash-book-pin`) | **Complete 134/134 port** (478 host + 65 integration + **24 Kani**, `build-sbf` clean) but **out of scope / not mainnet-deployed / UNAUDITED** — a separate implementation. **Deep adversarial audit 2026-06 (`docs/PIN_AUDIT_2026-06.md`)**: 9-reviewer pass, every finding classified port-bug vs inherited against the Anchor original. Fixed **10 port bugs** incl. a CRITICAL (`cpi.rs` PDA-signer flag bricked all withdrawals), the `er_active` strict-withdraw/sweep gate (was dead code), the `seq<=MAX_SEQ_ENCODABLE` placement ceiling (+2 Kani proofs), `apply_fill` position↔trader↔market binding, the `liquidate_portfolio` isolated-leg accounting, and basket projection funding/binding; `init_fill_commitment` no longer advertises an unenforced guarantee. CPI-gated ix (creates, token/ER/delegation CPIs) remain `build-sbf`-verified only, not positive-e2e-tested (solana-program-test 3.1 CPI harness limit); their pre-CPI validation IS e2e-tested. Inherited residuals (identical to the in-scope Anchor program, left for parity — see PIN_AUDIT §"Inherited"): basket worst-case entry, conditional-order `flags:0`, FLP residual not delta-tracked, optional envelope gate, undelegation squat DoS, vault bootstrap/perf-fee. Documented model degeneracies vs anchor: mark-only oracle (no `oracle_price_ticks`), withdraw IM derived from `max_leverage`, basket orders drop the per-trader caps / `flp_exposure` / `orders_this_batch` rate-limit; views are `sol_log_data` stubs, migrations are idempotent no-ops |
 | ~~Hypertree LLRB~~ | RESOLVED — dead/broken `LLRB` deleted (2026-06); live book uses `RedBlackTree` only |
 
 ## 6. Deployment plan (post-audit)
@@ -118,7 +123,7 @@ widen as it survives real volume. See `docs/FLASHBOOK_PRODUCTION_ROADMAP.md`.
 ## 7. Reproduce everything
 ```bash
 cargo build-sbf && cargo test                                   # build + 462 tests (405 lib + 57 integ)
-cargo kani --package flash-book --features no-entrypoint        # 41 harnesses
+cargo kani --package flash-book --features no-entrypoint        # 44 harnesses
 cd formal_verification/lean && lake build                       # Haircut/Funding/OiMmr
 BPF_OUT_DIR="$PWD/target/deploy" \
   cargo test -p flash-book --test integration cu_benchmark -- --ignored --nocapture

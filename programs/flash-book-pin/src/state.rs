@@ -22,7 +22,16 @@ pub struct Position {
     pub collateral_quote_lots: u64,
     pub realized_pnl_quote_lots: i64,
     pub side: u8, // 0 = long, 1 = short
-    pub _pad0: [u8; 3],
+    /// The trader_state SUB-ACCOUNT this position belongs to (0 = main). Stamped
+    /// from `ts.sub_index` on the first fill and asserted on every read. A wallet
+    /// owns one trader_state per sub_index (all carry `.trader = wallet`), so
+    /// `(trader, sub_index)` bijectively identifies the trader_state — exactly the
+    /// binding Anchor gets from keying the position PDA on `trader_state.key()`.
+    /// Without it, a wallet could substitute a sub-account's position into another
+    /// trader_state's cross-margin solvency gate (→ bad debt). Carved from the old
+    /// `_pad0[3]`; size unchanged (128 bytes), `leverage_cap` still 4-aligned @124.
+    pub sub_index: u8,
+    pub _pad0: [u8; 2],
     /// Per-position max-leverage cap, set by the trader via
     /// `set_position_leverage` (bounded by `Market::max_leverage`). `0` = unset.
     /// Carved from the old 7-byte pad (4-aligned at offset 124); size unchanged
@@ -87,11 +96,43 @@ pub struct Market {
     /// position's `leverage_cap` against it. `0` = unset (no max enforced).
     /// 4-aligned. Carved from `_reserved`; size unchanged (1152 bytes).
     pub max_leverage: u32,
+    /// Liquidation params, fed to `liquidate_position_v2` (all `0` =
+    /// disabled/default). `liquidation_auction_duration_slots`: the Dutch-auction
+    /// ramp length over which the liquidator reward grows from 0 to the full
+    /// `liquidator_reward_bps` (0 = flat reward, no auction).
+    /// `liquidation_cooldown_slots`: min slots between liquidations of the same
+    /// position (0 = no cooldown). `liq_penalty_bps`: the synthetic-close penalty
+    /// moving the fill against the liquidatee. `liquidator_reward_bps`: the base
+    /// reward. The two `u64`s precede the `u32`s so the carve is 8-aligned +
+    /// padding-free. Carved from `_reserved`; size unchanged (1152 bytes).
+    pub liquidation_auction_duration_slots: u64,
+    pub liquidation_cooldown_slots: u64,
+    pub liq_penalty_bps: u32,
+    pub liquidator_reward_bps: u32,
     /// 1 once `initialize_haircut_state` has enabled the haircut engine on this
     /// market (sticky). The consuming settlement check is a later batch. `u8`
     /// (align 1) carved from `_reserved`; size unchanged (1152 bytes).
     pub haircut_enabled: u8,
-    pub _reserved: [u8; 951],
+    /// Pads `book_delegated_at_slot` up to the next 8-aligned offset (232) so the
+    /// `repr(C)` layout of every preceding field — and the 1152-byte size — is
+    /// unchanged.
+    pub _pad_bdas: [u8; 7],
+    /// Slot at which this market's book was delegated to the ER (0 = not stamped).
+    /// The baseline `stamp_book_liveness_baseline` records, against which a later
+    /// force-undelegate / escape measures censorship. Carved from `_reserved`.
+    pub book_delegated_at_slot: u64,
+    /// 1 once `init_fill_commitment` has armed the settlement-authenticity ring on
+    /// this market (sticky): settlement then REQUIRES a matching committed fill.
+    /// `u8` (align 1) carved from `_reserved`; size unchanged (1152 bytes).
+    pub fill_commitment_required: u8,
+    /// Monotonic settlement nonce. Every `apply_fill` / `apply_flp_fill` must
+    /// present a `fill_seq` STRICTLY greater than this; the handler advances it
+    /// atomically with the fill. Rejects replayed / reordered settlement txs
+    /// (parity with the Anchor `Market.last_settlement_seq` + `advance_settlement_seq`).
+    /// `[u8; 8]` (align 1, LE) carved from `_reserved` at the non-8-aligned offset
+    /// 241; size unchanged (1152 bytes). Pre-field markets read 0.
+    pub last_settlement_seq: [u8; 8],
+    pub _reserved: [u8; 903],
 }
 
 /// Market trading-status values.
@@ -100,6 +141,8 @@ pub const MARKET_STATUS_PAUSED: u8 = 1;
 
 impl Market {
     #[inline] pub fn cum_funding(&self) -> i128 { i128::from_le_bytes(self.cum_funding_index) }
+    #[inline] pub fn settlement_seq(&self) -> u64 { u64::from_le_bytes(self.last_settlement_seq) }
+    #[inline] pub fn set_settlement_seq(&mut self, v: u64) { self.last_settlement_seq = v.to_le_bytes(); }
 }
 
 #[repr(C)]
@@ -135,7 +178,12 @@ pub struct TraderState {
     /// Max bps of net fee the builder may receive; forced to 0 when `builder` is
     /// unset. Validated `<= BPS_DENOM` on set.
     pub builder_max_fee_share_bps: u32,
-    pub _reserved: [u8; 44],
+    /// 1 once this trader has live ER-reserved margin (set by the ER attestation
+    /// path). Sticky gate: an ER-active trader MUST use the xdomain withdraw
+    /// variants (which honor the reservation); the strict path fails closed for
+    /// them. `u8` carved from `_reserved`; size unchanged (200 bytes).
+    pub er_active: u8,
+    pub _reserved: [u8; 43],
 }
 
 impl TraderState {
@@ -288,8 +336,18 @@ impl FlpExposure {
 }
 
 pub const TRIGGER_ORDER_V3_DISC: [u8; 8] = [0x71, 0x67, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+/// `TriggerOrderV3.flags` bits. ACTIVE is set on placement and cleared when the
+/// trigger fires (one-shot). REDUCE_ONLY marks a position-closing trigger
+/// (execution is a follow-up).
+pub const TRIGGER_FLAG_ACTIVE: u8 = 0x01;
+pub const TRIGGER_FLAG_REDUCE_ONLY: u8 = 0x02;
 pub const TWAP_ORDER_V3_DISC: [u8; 8] = [0x77, 0xA9, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+/// `TwapOrderV3.flags` ACTIVE bit (set on placement, cleared when fully executed).
+pub const TWAP_FLAG_ACTIVE: u8 = 0x01;
 pub const ICEBERG_ORDER_V3_DISC: [u8; 8] = [0x1C, 0xEB, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+/// `IcebergOrderV3.flags` ACTIVE bit (set on placement, cleared when the last
+/// chunk is replenished — `remaining_lots` reaches 0).
+pub const ICEBERG_FLAG_ACTIVE: u8 = 0x01;
 
 /// V3 native trigger order. Pod mirror of `TriggerOrderAccountV3` (136 B).
 /// Fields reordered so the `repr(C)` layout has no implicit padding.
@@ -310,7 +368,14 @@ pub struct TriggerOrderV3 {
     pub kind: u8,
     pub flags: u8,
     pub sub_index: u8,
-    pub _reserved: [u8; 10],
+    /// Trailing-stop offset in bps (0 = a plain, non-trailing trigger). Carved
+    /// from `_reserved`; `u16` first so the following `u64` stays 8-aligned and
+    /// the struct size is unchanged. Set at placement; the stop's
+    /// `trigger_price_ticks` ratchets as the mark moves via `update_trailing_stop`.
+    pub trailing_offset_bps: u16,
+    /// Running anchor (max mark for a long stop / min mark for a short stop) the
+    /// trailing trigger is measured from. 0 = unseeded.
+    pub trailing_anchor_ticks: u64,
 }
 
 /// V3 TWAP order. Pod mirror of `TwapOrderAccountV3` (152 B).
@@ -661,6 +726,32 @@ const _: () = assert!(core::mem::size_of::<PositionHaircutState>() == 136);
 
 pub const POSITION_LIQ_STATE_DISC: [u8; 8] = [0x5C, 0x10, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
 
+pub const JIT_LIQ_OFFER_DISC: [u8; 8] = [0x6A, 0x17, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
+
+/// A maker's pre-committed JIT liquidation offer (PDA `[b"jit_liq_offer", market,
+/// maker, nonce]`). The maker promises to fill up to `remaining_size_lots` of a
+/// liquidation on `market` (optionally only for `target_trader`, default zero =
+/// any) at `offer_price_ticks` until `expires_at_slot`. No token escrow — the
+/// maker's collateral covers the fill. Padding-free `repr(C)` at 152 bytes.
+#[repr(C)]
+pub struct JitLiquidationOffer {
+    pub disc: [u8; 8],
+    pub bump: u8,
+    pub side: u8,
+    pub maker_sub_index: u8,
+    pub _pad0: [u8; 1],
+    pub nonce: u32,
+    pub market: Pubkey,
+    pub maker: Pubkey,
+    pub target_trader: Pubkey,
+    pub offer_price_ticks: u64,
+    pub max_size_lots: u64,
+    pub remaining_size_lots: u64,
+    pub created_at_slot: u64,
+    pub expires_at_slot: u64,
+}
+const _: () = assert!(core::mem::size_of::<JitLiquidationOffer>() == 152);
+
 /// Per-position liquidation state — the timestamps `liquidate_position_v2`
 /// needs that don't fit in the full 128-byte `Position`. `unhealthy_since_slot`
 /// drives the Dutch-auction liquidator reward (linear ramp since the position
@@ -737,7 +828,11 @@ pub struct MarketOracleConfig {
     pub tick_decimals: i8,
     pub source: u8,
     pub bump: u8,
-    pub _pad: [u8; 5],
+    pub _pad0: u8,
+    /// Max allowed dispersion (bps) across the 3 quorum sources before the update
+    /// is rejected (0 = gate off). Carved from `_pad`; the `u32` sits at the
+    /// 4-aligned offset 84 so the `repr(C)` layout + 88-byte size are unchanged.
+    pub max_dispersion_bps: u32,
 }
 const _: () = assert!(core::mem::size_of::<MarketOracleConfig>() == 88);
 

@@ -65,7 +65,13 @@ jobs:
         run: cargo build-sbf --manifest-path programs/flash-book/Cargo.toml
       - name: Build SBF (Pinocchio migration crate, WIP)
         run: cargo build-sbf --manifest-path programs/flash-book-pin/Cargo.toml
-      - name: Test Pinocchio migration crate (host equivalence tests)
+      # Runs BOTH the host equivalence tests (--lib) AND the on-validator
+      # integration tests (tests/integration.rs), which load the .so built above
+      # into the BPF VM via solana-program-test. SBF_OUT_DIR points at the
+      # build-sbf output so ProgramTest finds `flash_book_pin.so`.
+      - name: Test Pinocchio migration crate (host + on-validator integration)
+        env:
+          SBF_OUT_DIR: ${{ github.workspace }}/programs/flash-book-pin/target/deploy
         run: cargo test --manifest-path programs/flash-book-pin/Cargo.toml
 
   kani:
@@ -75,20 +81,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Runs the ENTIRE Kani suite (no --harness filter): 31 harnesses across
-      # haircut, lib (h6/h7 solvency), risk (MMR), fill_commitment (ring + nonce),
-      # flp_quoter (price band), liquidation (worse-of), insurance (solvency) and
-      # state_v2 (order-id price-time priority). See docs/FORMAL_VERIFICATION.md +
-      # certora/PROPERTIES.md. A regression that breaks any invariant fails CI.
-      - name: Run Kani proof harnesses (all 31)
+      # Runs the ENTIRE Kani suite (no --harness filter): 44 harnesses across
+      # haircut, lib (h6/h7 solvency + the C-1 margin-frame proofs), risk (MMR),
+      # fill_commitment (ring + nonce), flp_quoter (price band), liquidation
+      # (worse-of), insurance (solvency), state_v2 (order-id price-time priority)
+      # and the ER-liveness / order-id-seq remediation proofs. See
+      # docs/FORMAL_VERIFICATION.md + certora/PROPERTIES.md. A regression that
+      # breaks any invariant fails CI.
+      - name: Run Kani proof harnesses (all 44)
         uses: model-checking/kani-github-action@v1.1
         with:
           kani-version: 0.67.0
           args: '--package flash-book --features no-entrypoint'
       # The Pinocchio migration crate is its own (isolated) workspace, so its
-      # proofs need a separate invocation. 7 harnesses: haircut solvency/dust
-      # (5) + open-interest conservation (long_oi == short_oi across the
-      # apply_fill two-leg and apply_flp_fill mirror cases, 2). Run via a plain
+      # proofs need a separate invocation. 24 harnesses: haircut solvency/dust +
+      # OI conservation + vault share-mint + perf-fee + xmargin (ER floor + epoch
+      # monotonic) + force-undelegate (never-fires-while-live) + the fill-commit
+      # ring/nonce + order-id collision-freedom/price-priority under the seq
+      # ceiling (audit 2026-06) + others across the now-complete 134/134 port.
+      # Run via a plain
       # `cargo kani` (NOT a second action invocation) so we reuse the Kani the
       # step above already installed — re-invoking the action re-runs its full
       # install (~4 min wasted). Same job ⇒ pin proofs stay part of the REQUIRED

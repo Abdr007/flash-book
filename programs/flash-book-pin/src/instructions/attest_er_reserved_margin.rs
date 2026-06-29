@@ -1,18 +1,20 @@
 //! attest_er_reserved_margin — the pinned ER attestor reports the trader's
 //! ER-reserved initial margin (and bumps the attestation epoch). Only the
 //! `attestor` recorded at init may call; the epoch is a STRICTLY-increasing
-//! replay guard, so a stale/replayed attestation is rejected. Mutates only the
-//! attestation account — NO funds, NO book. The withdraw gate that honors
-//! `reserved_margin` (and reads it directly, so no `er_active` denormalization is
-//! needed) is a later batch.
+//! replay guard, so a stale/replayed attestation is rejected. Mutates the
+//! attestation account AND denormalizes `er_active` onto the trader_state — NO
+//! funds, NO book. The strict withdraw/sweep paths fail closed for ER-active
+//! traders (forcing the `*_xdomain` variants that honor `reserved_margin`), so
+//! this flag is load-bearing: parity with the Anchor original, which sets
+//! `s.er_active = if reserved > 0 { 1 } else { 0 }` here.
 //!
 //! accounts: [attestor (signer), er_margin (PDA, program-owned, w),
-//!            trader_state (program-owned, r)]
+//!            trader_state (program-owned, w)]
 //! data: [reserved_margin_quote_lots u64][epoch u64]
 
 use crate::guard::{assert_disc, assert_owned_by, assert_pda, assert_signer};
 use crate::seeds::ER_MARGIN_SEED;
-use crate::state::{ErMarginAttestation, ER_MARGIN_DISC, TRADER_STATE_DISC};
+use crate::state::{ErMarginAttestation, TraderState, ER_MARGIN_DISC, TRADER_STATE_DISC};
 use pinocchio::{
     account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
 };
@@ -50,6 +52,14 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         }
         a.epoch = epoch;
         a.reserved_margin_quote_lots = reserved_margin_quote_lots;
+    }
+
+    // Denormalize onto the trader_state so the strict withdraw/sweep paths can
+    // fail closed without loading the attestation (parity with Anchor). The
+    // trader_state must be writable; the attestor is trusted to pass it `w`.
+    unsafe {
+        let ts = &mut *(trader_state.borrow_mut_data_unchecked().as_mut_ptr() as *mut TraderState);
+        ts.er_active = if reserved_margin_quote_lots > 0 { 1 } else { 0 };
     }
     Ok(())
 }

@@ -34,6 +34,10 @@ pub const TRIGGER_ORDER_SEED: &[u8] = b"trigger_v3";
 /// `[b"twap_v3", market, trader, twap_id]` — a v3 TWAP (time-sliced) order.
 pub const TWAP_ORDER_SEED: &[u8] = b"twap_v3";
 
+/// `[b"iceberg_v3", market, trader, iceberg_id]` — a v3 iceberg order. Only the
+/// displayed chunk rests on the book at a time; a keeper replenishes the next.
+pub const ICEBERG_ORDER_SEED: &[u8] = b"iceberg_v3";
+
 /// `[b"flp_per_market", market]` — a market-scoped FLP-v3 exposure account.
 pub const FLP_PER_MARKET_SEED: &[u8] = b"flp_per_market";
 
@@ -52,12 +56,17 @@ pub const SIDE_ACCRUAL_SEED: &[u8] = b"side_accrual";
 /// `[b"vault_v3", strategist, vault_id]` — a v3 strategist vault account.
 pub const VAULT_SEED: &[u8] = b"vault_v3";
 
+/// `[b"vault_position_v3", vault, depositor]` — a depositor's share record in a
+/// v3 vault.
+pub const VAULT_POSITION_SEED: &[u8] = b"vault_position_v3";
+
 /// `[b"haircut", market]` — a market's haircut (positive-PnL warmup) state.
 pub const HAIRCUT_SEED: &[u8] = b"haircut";
 
 /// `[b"position_haircut", market, position]` — a position's haircut state.
 pub const POSITION_HAIRCUT_SEED: &[u8] = b"position_haircut";
 pub const POSITION_LIQ_STATE_SEED: &[u8] = b"position_liq";
+pub const JIT_LIQ_OFFER_SEED: &[u8] = b"jit_liq_offer";
 
 /// `[b"session", owner, session_signer]` — a delegated session-signing token.
 pub const SESSION_SEED: &[u8] = b"session";

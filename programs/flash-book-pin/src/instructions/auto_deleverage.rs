@@ -38,7 +38,8 @@ use crate::risk::{assess_margin, StressShock};
 use crate::seeds::INSURANCE_SEED;
 use crate::state::{Insurance, Market, Position, TraderState, INSURANCE_DISC, TRADER_STATE_DISC};
 use pinocchio::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
+    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey,
+    sysvars::{clock::Clock, Sysvar}, ProgramResult,
 };
 
 #[inline(always)]
@@ -79,7 +80,7 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         ct_trader, ct_market, ct_side, ct_size, ct_entry, ct_pos_collat,
         uw_ts_trader, uw_ts_collat, uw_ts_open,
         ct_ts_trader, ct_ts_collat,
-        tick_size,
+        tick_size, adl_last_mark_update,
     ) = {
         let uwp = unsafe { &*(uw_pos.borrow_data_unchecked().as_ptr() as *const Position) };
         let ctp = unsafe { &*(ct_pos.borrow_data_unchecked().as_ptr() as *const Position) };
@@ -91,9 +92,14 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
             ctp.trader, ctp.market, ctp.side, ctp.size_lots, ctp.entry_price_ticks, ctp.collateral_quote_lots,
             uwt.trader, uwt.collateral_quote_lots, uwt.open_positions,
             ctt.trader, ctt.collateral_quote_lots,
-            m.tick_size,
+            m.tick_size, m.last_mark_update_slot,
         )
     };
+    // Mark-staleness gate (see liquidate_position_v2): an ADL forced-close also
+    // prices off the (mark-only) health price, so refuse on a stale mark.
+    if Clock::get()?.slot.saturating_sub(adl_last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS {
+        return Err(ProgramError::Custom(248)); // stale mark
+    }
 
     // ── sanity: same market, opposite sides, sizes, alignment, not self ─
     if uw_market != market_key || ct_market != market_key {

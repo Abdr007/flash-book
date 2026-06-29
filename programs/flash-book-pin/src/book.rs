@@ -528,6 +528,18 @@ impl<'a> MarketBookHandle<'a> {
     /// the bid root + best (= MIN-of-tree, which is the highest-priced
     /// bid given our inverted encoding) indices on the header.
     pub fn insert_bid(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
+        // Fail-loud seq ceiling — the single chokepoint every placement path
+        // (place_order/taker/iceberg/twap/bracket/trigger/basket/liquidate/vault)
+        // funnels through. `encode_order_id` packs `seq` into 24 bits (masking
+        // `& MAX_SEQ_ENCODABLE`); a seq above the ceiling would wrap and collide,
+        // silently breaking price-time priority and order-id uniqueness, so reject
+        // it loudly. NOTE: pin's ceiling (2^24-1 ≈ 16.7M) is FAR tighter than
+        // Anchor's `FLP_SEQ_RESERVED_OFFSET` (2^56) because pin uses a 24-bit seq
+        // field in `order_id`. `order_seq_counter` is lifetime-monotonic and never
+        // recycled, so a market reverts every resting insert after ~16.7M lifetime
+        // placements — a known operational ceiling (see AUDIT_SCOPE residuals);
+        // widening the seq field / recycling is a tracked follow-up.
+        require!(order.seq <= MAX_SEQ_ENCODABLE, errors::FlashBookError::OutOfRange);
         let idx = self.alloc_node()?;
         // O(1) cache update: capture order_id now, compare against cached
         // best AFTER tree insertion. Both sides encode best = MIN-by-order_id.
@@ -559,6 +571,10 @@ impl<'a> MarketBookHandle<'a> {
     /// "Best" = MIN of tree = lowest-priced ask (asks are NOT inverted, so
     /// natural ascending order — smallest order_id is the best ask).
     pub fn insert_ask(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
+        // Fail-loud seq ceiling — see `insert_bid`. Every placement path funnels
+        // through here; `encode_order_id` requires `seq <= MAX_SEQ_ENCODABLE` or
+        // the 24-bit packing wraps and collides.
+        require!(order.seq <= MAX_SEQ_ENCODABLE, errors::FlashBookError::OutOfRange);
         let idx = self.alloc_node()?;
         let new_order_id = order.order_id;
         let new_root;
@@ -949,6 +965,29 @@ mod tests {
         prices
     }
 
+    // Audit 2026-06 regression: the seq ceiling MUST be enforced at the insert
+    // chokepoint (every placement path funnels through insert_bid/insert_ask), or
+    // `encode_order_id`'s 24-bit `& MAX_SEQ_ENCODABLE` packing wraps and collides,
+    // silently breaking price-time priority + order-id uniqueness.
+    #[test]
+    fn insert_rejects_seq_above_encoding_ceiling() {
+        // seq == MAX_SEQ_ENCODABLE is the last encodable value ⇒ accepted.
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        assert!(handle.insert_bid(make_order(100, MAX_SEQ_ENCODABLE, true)).is_ok());
+        assert!(handle.insert_ask(make_order(100, MAX_SEQ_ENCODABLE, false)).is_ok());
+
+        // seq == MAX_SEQ_ENCODABLE + 1 would wrap to 0 under the mask ⇒ rejected
+        // fail-loud on BOTH sides.
+        let mut data2 = make_book();
+        let mut handle2 = MarketBookHandle::from_account_data(&mut data2).unwrap();
+        let over = MAX_SEQ_ENCODABLE + 1;
+        assert!(handle2.insert_bid(make_order(100, over, true)).is_err());
+        assert!(handle2.insert_ask(make_order(100, over, false)).is_err());
+        // u64::MAX is also rejected (not just the boundary).
+        assert!(handle2.insert_bid(make_order(100, u64::MAX, true)).is_err());
+    }
+
     #[test]
     fn empty_book_iterates_nothing() {
         let mut data = make_book();
@@ -1254,5 +1293,50 @@ mod tests {
         }
     }
 
+}
+
+// ── Formal verification (Kani) — order-id encoding under the seq ceiling ──────
+// Audit 2026-06: the `insert_bid`/`insert_ask` chokepoint now enforces
+// `seq <= MAX_SEQ_ENCODABLE`. These proofs are the *reason* that ceiling is the
+// right precondition — they show that UNDER it, `encode_order_id` is collision-
+// free and price-time-priority-correct (mirrors the Anchor H1 seq-guard proof).
+#[cfg(kani)]
+mod kani_proofs {
+    use super::{encode_order_id, MAX_PRICE_TICKS_ENCODABLE, MAX_SEQ_ENCODABLE, ORDER_ID_SEQ_BITS};
+
+    /// Collision-freedom: on one side, at one price, two DISTINCT in-range seqs
+    /// always produce DISTINCT order_ids. (Above the ceiling the `& MAX_SEQ`
+    /// mask wraps — exactly what the insert guard forbids.)
+    #[kani::proof]
+    fn encode_order_id_collision_free_under_ceiling() {
+        let price: u64 = kani::any();
+        let s1: u64 = kani::any();
+        let s2: u64 = kani::any();
+        kani::assume(price <= MAX_PRICE_TICKS_ENCODABLE);
+        kani::assume(s1 <= MAX_SEQ_ENCODABLE && s2 <= MAX_SEQ_ENCODABLE);
+        kani::assume(s1 != s2);
+        let bid: bool = kani::any();
+        assert!(encode_order_id(price, s1, bid) != encode_order_id(price, s2, bid));
+    }
+
+    /// Price-time priority: the seq occupies only the low `ORDER_ID_SEQ_BITS`, so
+    /// a strictly better price key always sorts ahead REGARDLESS of seq. For asks
+    /// (natural order) a lower price ⇒ smaller order_id; bids invert the price, so
+    /// a higher price ⇒ smaller order_id. We prove the ask direction here: same
+    /// side, p1 < p2 ⇒ id(p1) < id(p2) for ANY two in-range seqs.
+    #[kani::proof]
+    fn encode_order_id_price_dominates_seq_asks() {
+        let p1: u64 = kani::any();
+        let p2: u64 = kani::any();
+        let s1: u64 = kani::any();
+        let s2: u64 = kani::any();
+        kani::assume(p1 <= MAX_PRICE_TICKS_ENCODABLE && p2 <= MAX_PRICE_TICKS_ENCODABLE);
+        kani::assume(s1 <= MAX_SEQ_ENCODABLE && s2 <= MAX_SEQ_ENCODABLE);
+        kani::assume(p1 < p2);
+        // ask side (side_is_bid = false): price key is the raw price.
+        assert!(encode_order_id(p1, s1, false) < encode_order_id(p2, s2, false));
+        // sanity: the seq lives strictly below the price field.
+        assert!((1u64 << ORDER_ID_SEQ_BITS) > MAX_SEQ_ENCODABLE);
+    }
 }
 

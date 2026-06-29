@@ -115,7 +115,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         t.bump = bump;
         t.twap_id = twap_id;
         t.side = side;
-        t.flags = flags;
+        t.flags = flags | crate::state::TWAP_FLAG_ACTIVE;
         t.sub_index = sub_index;
         t._reserved = [0u8; 3];
     }
