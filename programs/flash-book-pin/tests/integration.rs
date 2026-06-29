@@ -2676,3 +2676,76 @@ async fn view_portfolio_risk_emits_and_succeeds() {
     let ix = Instruction { program_id: pid, accounts: vec![AccountMeta::new_readonly(ts, false)], data: vec![IX_VIEW_PORTFOLIO_RISK] };
     banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
 }
+
+// ─── sweep_collateral e2e (non-CPI → fully testable) ───
+const IX_SWEEP_COLLATERAL: u8 = 139;
+const TS_DELEGATE: usize = 86;
+
+#[tokio::test]
+async fn sweep_collateral_moves_between_flat_states() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let other = Pubkey::new_unique();
+    let from = Pubkey::new_unique();
+    let to = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    // from: trader == signer (authorized), flat.
+    pt.add_account(from, trader_state(pid, authority.pubkey(), 1_000, 0));
+    // to: different trader, but signer is its delegate (authorized), flat.
+    let mut to_ts = trader_state(pid, other, 500, 0);
+    put_key(&mut to_ts.data, TS_DELEGATE, &authority.pubkey());
+    pt.add_account(to, to_ts);
+    pt.add_account(authority.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_SWEEP_COLLATERAL];
+    data.extend_from_slice(&300u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new(from, false),
+            AccountMeta::new(to, false),
+        ],
+        data,
+    };
+    banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &authority], bh)).await.unwrap();
+
+    let f = banks.get_account(from).await.unwrap().unwrap();
+    let t = banks.get_account(to).await.unwrap().unwrap();
+    assert_eq!(get_u64(&f.data, TS_COLLATERAL), 700, "source debited");
+    assert_eq!(get_u64(&t.data, TS_COLLATERAL), 800, "dest credited");
+}
+
+#[tokio::test]
+async fn sweep_collateral_rejects_unauthorized() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let imposter = Keypair::new();
+    let other = Pubkey::new_unique();
+    let from = Pubkey::new_unique();
+    let to = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(from, trader_state(pid, authority.pubkey(), 1_000, 0)); // owned by authority, NOT imposter
+    let mut to_ts = trader_state(pid, other, 500, 0);
+    put_key(&mut to_ts.data, TS_DELEGATE, &authority.pubkey());
+    pt.add_account(to, to_ts);
+    pt.add_account(imposter.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_SWEEP_COLLATERAL];
+    data.extend_from_slice(&300u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(imposter.pubkey(), true), // not authorized for `from`
+            AccountMeta::new(from, false),
+            AccountMeta::new(to, false),
+        ],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh)).await;
+    assert!(r.is_err(), "unauthorized sweep must be rejected");
+}
