@@ -17,9 +17,12 @@ use crate::cpi::{token_transfer_signed, TOKEN_PROGRAM_ID};
 use crate::guard::{assert_disc, assert_owned_by, assert_pda, assert_signer};
 use crate::instructions::margin_probe::build_snapshot;
 use crate::risk::{assess_margin, MarketSnapshot, PositionSnapshot, StressShock};
-use crate::seeds::INSURANCE_SEED;
-use crate::state::{Insurance, Market, TraderState, INSURANCE_DISC, TRADER_STATE_DISC};
-use crate::xmargin::required_collateral_with_er;
+use crate::seeds::{ER_MARGIN_SEED, INSURANCE_SEED};
+use crate::state::{
+    ErMarginAttestation, Insurance, Market, TraderState, ER_MARGIN_DISC, INSURANCE_DISC,
+    TRADER_STATE_DISC,
+};
+use crate::xmargin::{check_simple_withdraw, required_collateral_with_er};
 use pinocchio::{
     account_info::AccountInfo,
     instruction::{Seed, Signer},
@@ -205,4 +208,110 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         pid, trader, trader_state, insurance, quote_vault, trader_quote_ata, token_program, pairs,
         amount, 0,
     )
+}
+
+
+/// Read + bind the trader's ER reserved-margin attestation, returning the
+/// reserved margin. The attestation MUST be the canonical PDA for THIS
+/// trader_state (blocks substituting another trader's / a stale one to
+/// understate the reservation).
+fn read_er_reserved(
+    pid: &Pubkey,
+    er_margin: &AccountInfo,
+    trader_state_key: &Pubkey,
+) -> Result<u64, ProgramError> {
+    assert_owned_by(er_margin, pid)?;
+    assert_disc(er_margin, &ER_MARGIN_DISC)?;
+    assert_pda(er_margin, &[ER_MARGIN_SEED, &trader_state_key[..]], pid)?;
+    let d = er_margin.try_borrow_data()?;
+    let a = unsafe { &*(d.as_ptr() as *const ErMarginAttestation) };
+    if &a.trader_state != trader_state_key {
+        return Err(ProgramError::InvalidArgument);
+    }
+    Ok(a.reserved_margin_quote_lots)
+}
+
+/// Cross-domain PARTIAL withdraw — identical to the strict path but honors the
+/// trader's ER reserved margin (the variant ER-active traders MUST use). Reuses
+/// `partial_withdraw_core` with `er_reserved` from the attestation.
+///
+/// accounts: [trader (signer), trader_state (w), insurance, quote_vault (w),
+///            trader_quote_ata (w), token_program, er_margin, (market, position)*]
+pub fn xdomain(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [trader, trader_state, insurance, quote_vault, trader_quote_ata, token_program, er_margin, pairs @ ..] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if data.len() < 8 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let er_reserved = read_er_reserved(pid, er_margin, trader_state.key())?;
+    partial_withdraw_core(
+        pid, trader, trader_state, insurance, quote_vault, trader_quote_ata, token_program, pairs,
+        amount, er_reserved,
+    )
+}
+
+/// Cross-domain FULL withdraw — the trader is FLAT (no filled positions), so only
+/// the ER reserved-margin floor applies (`check_simple_withdraw`). Faithful port
+/// of the Anchor `withdraw_collateral_xdomain`.
+///
+/// accounts: [trader (signer), trader_state (w), insurance, quote_vault (w),
+///            trader_quote_ata (w), token_program, er_margin]
+pub fn withdraw_xdomain(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [trader, trader_state, insurance, quote_vault, trader_quote_ata, token_program, er_margin, ..] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if data.len() < 8 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    if amount == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if token_program.key() != &TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    assert_signer(trader)?;
+    assert_owned_by(trader_state, pid)?;
+    assert_disc(trader_state, &TRADER_STATE_DISC)?;
+    assert_owned_by(insurance, pid)?;
+    let ins_bump = assert_pda(insurance, &[INSURANCE_SEED], pid)?;
+    assert_disc(insurance, &INSURANCE_DISC)?;
+
+    let er_reserved = read_er_reserved(pid, er_margin, trader_state.key())?;
+
+    let collateral = {
+        let d = trader_state.try_borrow_data()?;
+        let s = unsafe { &*(d.as_ptr() as *const TraderState) };
+        if &s.trader != trader.key() {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if s.open_positions != 0 {
+            return Err(ProgramError::Custom(242)); // full withdraw requires flat
+        }
+        s.collateral_quote_lots
+    };
+    {
+        let d = insurance.try_borrow_data()?;
+        let ins = unsafe { &*(d.as_ptr() as *const Insurance) };
+        if &ins.quote_vault != quote_vault.key() {
+            return Err(ProgramError::InvalidArgument);
+        }
+    }
+    // Post-withdraw collateral must still cover the ER reservation.
+    check_simple_withdraw(collateral, amount, er_reserved).map_err(|_| ProgramError::Custom(240))?;
+
+    unsafe {
+        let s = &mut *(trader_state.borrow_mut_data_unchecked().as_mut_ptr() as *mut TraderState);
+        s.collateral_quote_lots = collateral - amount;
+    }
+    let bump_arr = [ins_bump];
+    let seeds = [Seed::from(INSURANCE_SEED), Seed::from(&bump_arr[..])];
+    let signer = [Signer::from(&seeds[..])];
+    token_transfer_signed(token_program, quote_vault, trader_quote_ata, insurance, amount, &signer)
 }

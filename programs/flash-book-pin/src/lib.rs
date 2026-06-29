@@ -234,6 +234,8 @@ mod program {
         ViewPortfolioRisk = 138,
         SweepCollateral = 139,
         PartialWithdrawCollateral = 140,
+        PartialWithdrawCollateralXdomain = 141,
+        WithdrawCollateralXdomain = 142,
     }
 
     #[inline(always)]
@@ -389,6 +391,8 @@ mod program {
             x if x == Ix::ViewPortfolioRisk as u8 => instructions::views::portfolio_risk(program_id, accounts, rest),
             x if x == Ix::SweepCollateral as u8 => instructions::sweep_collateral::process(program_id, accounts, rest),
             x if x == Ix::PartialWithdrawCollateral as u8 => instructions::partial_withdraw::process(program_id, accounts, rest),
+            x if x == Ix::PartialWithdrawCollateralXdomain as u8 => instructions::partial_withdraw::xdomain(program_id, accounts, rest),
+            x if x == Ix::WithdrawCollateralXdomain as u8 => instructions::partial_withdraw::withdraw_xdomain(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

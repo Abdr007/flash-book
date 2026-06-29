@@ -2809,3 +2809,87 @@ async fn partial_withdraw_rejects_zero_amount() {
     let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
     assert!(r.is_err(), "zero amount rejected");
 }
+
+// ─── xdomain withdraw e2e (attestation bind + flat gate, before CPI) ───
+use flash_book_pin::seeds::ER_MARGIN_SEED;
+use flash_book_pin::state::ER_MARGIN_DISC;
+const IX_PARTIAL_WITHDRAW_XDOMAIN: u8 = 141;
+const IX_WITHDRAW_XDOMAIN: u8 = 142;
+
+fn er_margin_acct(pid: Pubkey, bound_ts: Pubkey) -> Account {
+    let mut d = vec![0u8; 96];
+    d[0..8].copy_from_slice(&ER_MARGIN_DISC);
+    put_key(&mut d, 8, &bound_ts); // trader_state @ 8
+    rent_account(d, pid)
+}
+
+#[tokio::test]
+async fn withdraw_xdomain_rejects_not_flat() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let ts = Pubkey::new_unique();
+    let (er_margin, _) = Pubkey::find_program_address(&[ER_MARGIN_SEED, &ts.to_bytes()], &pid);
+    let (insurance, _) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let d = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(ts, trader_state(pid, trader.pubkey(), 1_000, 1)); // open_positions = 1
+    pt.add_account(er_margin, er_margin_acct(pid, ts));
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(d, Account { lamports: 1, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    pt.add_account(trader.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_WITHDRAW_XDOMAIN];
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(ts, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new(d, false), AccountMeta::new(d, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(flash_book_pin::cpi::TOKEN_PROGRAM_ID), false),
+            AccountMeta::new_readonly(er_margin, false),
+        ],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
+    assert!(r.is_err(), "full xdomain withdraw requires flat");
+}
+
+#[tokio::test]
+async fn partial_withdraw_xdomain_rejects_attestation_mismatch() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let ts = Pubkey::new_unique();
+    let (er_margin, _) = Pubkey::find_program_address(&[ER_MARGIN_SEED, &ts.to_bytes()], &pid);
+    let (insurance, _) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let d = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(ts, trader_state(pid, trader.pubkey(), 1_000, 0));
+    // er_margin at the right PDA but BOUND to a different trader_state.
+    pt.add_account(er_margin, er_margin_acct(pid, Pubkey::new_unique()));
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(d, Account { lamports: 1, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    pt.add_account(trader.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_PARTIAL_WITHDRAW_XDOMAIN];
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(ts, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new(d, false), AccountMeta::new(d, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(flash_book_pin::cpi::TOKEN_PROGRAM_ID), false),
+            AccountMeta::new_readonly(er_margin, false),
+        ],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
+    assert!(r.is_err(), "attestation bound to a different trader_state must be rejected");
+}
