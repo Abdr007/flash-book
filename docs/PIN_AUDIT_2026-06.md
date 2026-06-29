@@ -124,6 +124,58 @@ isolated-substitution sub-case; the cross sub-account substitution needs the mod
 
 ---
 
+## Round 3 — "every angle" pass (6 reviewers: regression, arithmetic, panic/DoS, account-model, economic/MEV, position-binding design)
+
+Regression agent re-verified all round-2 fixes (recomputed the `Market` layout
+byte-by-byte; place_taker walk + borrow-check; liquidation guards) — **no
+regressions**. Panic/DoS agent: **no reachable panic or OOB on any deployed path**
+(STP fix confirmed; findings were CU-DoS amplifiers). New fixes:
+
+| # | Sev | Location | Bug | Fix |
+|---|-----|----------|-----|-----|
+| 22 | **CRITICAL** | `state.rs` + `margin_probe.rs` + `apply_fill`/`apply_flp_fill` + `liquidate_position_v2` + `basket_order` | **Position↔trader_state binding (systemic).** Positions bound only by `(wallet, market)`; every sub-account carries `.trader=wallet`, so a wallet substitutes a 1-lot sub-account position into the MAIN account's solvency walk → **`partial_withdraw` collateral theft**, wrongful liquidation, under-margined cross (3 agents converged; the round-2 documented HIGH, now FIXED). | Carve `Position.sub_index` from `_pad0` (stays 128B), stamp from `ts.sub_index` in `bind_or_stamp_position`, assert `p.sub_index==ts.sub_index` in `build_snapshot` (covers all 5 walks) + single-position handlers. Identity-equivalent to anchor's per-trader_state position PDA. Regression test added. |
+| 23 | HIGH | `apply_fill.rs` + `apply_flp_fill.rs` | Taker fee debited with `saturating_sub` → when a taker can't cover the fee, maker/insurance/FLP still get the FULL credit → **quote-lots minted from nothing** (anchor uses `checked_sub`+abort). | `checked_sub` + abort (`Custom(249)`). |
+| 24 | CRITICAL→fixed | `liquidate_position_v2.rs` | Reward paid on injection + close settles later; same-slot guard only blocked intra-slot, cooldown defaults to 0 → adjacent-slot **reward-stacking drain**. | Port the portfolio path's type-3 dup-order scan: refuse a second forced-liq order while one rests (`Custom(140)`). |
+| 25 | MED | `apply_fill`/`apply_flp_fill` | `u128→u64` fee/rebate cast wraps mod 2^64 at extreme notional → near-zero fee. | Clamp to `u64::MAX` (anchor parity). |
+| 26 | MED | `apply_fill.rs` `assert_position` | Disc gate admitted a fresh **zero-disc 8-byte** account → OOB read/write on the `Position` cast. | Require `data_len() >= size_of::<Position>()`. |
+| 27 | MED | `place_iceberg_order.rs` | Iceberg skipped the anti-stuffing band every other resting path enforces. | Band vs mark (`MAX_RESTING_ORDER_DEVIATION_BPS`). |
+| 28 | MED | `apply_fill.rs` | No settlement price band (a compromised sequencer could move collateral between legs at any price). | Band vs mark (`Custom(247)`). |
+| 29 | MED | `vault_deposit_v3.rs` | No flat gate (withdraw side has one) → deposit while the vault holds an ITM position skims original LPs' unrealized gains. | Require `open_positions==0`. |
+
+### Round-3 TOP PRE-PRODUCTION BLOCKERS (documented — too large / architectural to port safely mid-audit)
+
+- **R1/R2 — settlement does not materialize realized PnL or funding into collateral.**
+  `apply_fill`/`apply_flp_fill` update `position.realized_pnl`/re-stamp `cum_funding`
+  but **never fold PnL/funding into the spendable `collateral_quote_lots`**, and there
+  is no bankrupt-close insurance waterfall. Anchor has an explicit Phase-2g
+  materialization (`lib.rs:4403-4469`). Consequences flagged by the economic agent
+  (all rooted here): **phantom funding** via same-side-add (funding charged on
+  post-add size for the whole interval — settle-before-resize missing), **per-market
+  FLP v3 par-redemption** while underwater, and the dead `compute_shortfall` /
+  `health_price_with_staleness`. **This is the #1 thing to port before any mainnet
+  consideration** — it is a multi-file settlement-completeness effort, not a one-line
+  fix, and the pin port is explicitly devnet/WIP/UNAUDITED.
+- **Liquidation reward-from-liquidatee model** (reward skimmed from the liquidatee's
+  backing, sized on leveraged notional, paid before the close settles): the stacking
+  drain is closed (#24), but the single-call "reward can be ~100% of backing when
+  `reward_bps>maintenance_bps`" and the second-wallet self-liquidation remain economic
+  concerns of the model. Anchor pays from the same bucket; needs an escrow-to-settlement
+  redesign for full safety.
+- **JIT liquidation offers** are unescrowed + price-unbounded (the maker-commitment
+  follow-up is unimplemented in both pin and anchor) → can stall a liquidation. Safe
+  subset: ignore offers until escrow lands.
+- **Envelope mark-move cap is OPTIONAL** (`update_oracle` branches on the account being
+  passed) — inherited from anchor; make it mandatory on envelope-configured markets.
+- **CU-DoS amplifiers (inherited):** `vpin::record_fill` unbounded bucket loop and the
+  book-walk visit count (bounded by depth, not the match cap) can abort shared/keeper
+  paths. Cap both.
+- **`side_accrual` latent** (unwired Wave-25): funding sign double-applied for shorts;
+  fix before wiring.
+- **2^24 lifetime seq ceiling**, **per-market FLP v3 realized-PnL** (inert), **vault
+  `nav==0` bootstrap** (tail) — inherited, documented above/round-2.
+
+---
+
 ## Verified SOUND (high-signal negatives)
 
 Pure-math core (haircut, vault_math, fill_math, funding, peg, concentration,
