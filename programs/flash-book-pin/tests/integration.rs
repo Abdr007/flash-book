@@ -2893,3 +2893,95 @@ async fn partial_withdraw_xdomain_rejects_attestation_mismatch() {
     let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
     assert!(r.is_err(), "attestation bound to a different trader_state must be rejected");
 }
+
+// ─── place_basket_order_v2 e2e (non-CPI → fully testable) ───
+const IX_BASKET_V2: u8 = 143;
+
+fn basket_v2_setup(pid: Pubkey, trader: Pubkey, collateral: u64)
+    -> (Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, ProgramTest)
+{
+    // (ts, mkt_a, book_a, pos_a, mkt_b, book_b, pos_b)
+    let ts = Pubkey::new_unique();
+    let mkt_a = Pubkey::new_unique();
+    let mkt_b = Pubkey::new_unique();
+    let (book_a, ba) = Pubkey::find_program_address(&[MARKET_BOOK_SEED, &mkt_a.to_bytes()], &pid);
+    let (book_b, bb) = Pubkey::find_program_address(&[MARKET_BOOK_SEED, &mkt_b.to_bytes()], &pid);
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let pos_a = Pubkey::new_unique();
+    let pos_b = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(ts, trader_state(pid, trader, collateral, 0));
+    pt.add_account(mkt_a, market_full(pid, 100, 1, 500, 0, 0)); // 5% MMR, status Active(0), min_lot 0
+    pt.add_account(mkt_b, market_full(pid, 100, 1, 500, 0, 0));
+    pt.add_account(book_a, init_book(pid, mkt_a, base, quote, ba));
+    pt.add_account(book_b, init_book(pid, mkt_b, base, quote, bb));
+    pt.add_account(pos_a, position(pid, trader, mkt_a, 0, 0, 0, 0)); // flat
+    pt.add_account(pos_b, position(pid, trader, mkt_b, 0, 0, 0, 0));
+    (ts, mkt_a, book_a, pos_a, mkt_b, book_b, pos_b, pt)
+}
+
+fn basket_leg(side: u8, size: u64, limit: u64) -> Vec<u8> {
+    let mut d = vec![side];
+    d.extend_from_slice(&size.to_le_bytes());
+    d.extend_from_slice(&limit.to_le_bytes());
+    d.push(0); // post_only
+    d
+}
+
+#[tokio::test]
+async fn basket_v2_places_both_legs_when_healthy() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let (ts, mkt_a, book_a, pos_a, mkt_b, book_b, pos_b, mut pt) =
+        basket_v2_setup(pid, trader.pubkey(), 1_000_000); // ample collateral
+    pt.add_account(trader.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_BASKET_V2];
+    data.extend_from_slice(&basket_leg(0, 5, 100)); // leg a: bid
+    data.extend_from_slice(&basket_leg(1, 5, 100)); // leg b: ask (diff market)
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new_readonly(ts, false),
+            AccountMeta::new_readonly(mkt_a, false), AccountMeta::new(book_a, false), AccountMeta::new_readonly(pos_a, false),
+            AccountMeta::new_readonly(mkt_b, false), AccountMeta::new(book_b, false), AccountMeta::new_readonly(pos_b, false),
+        ],
+        data,
+    };
+    banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await.unwrap();
+
+    let mut da = banks.get_account(book_a).await.unwrap().unwrap().data;
+    let mut db = banks.get_account(book_b).await.unwrap().unwrap().data;
+    assert_eq!(MarketBookHandle::from_account_data(&mut da).unwrap().header.total_orders_active, 1, "leg a rested");
+    assert_eq!(MarketBookHandle::from_account_data(&mut db).unwrap().header.total_orders_active, 1, "leg b rested");
+}
+
+#[tokio::test]
+async fn basket_v2_rejects_underwater_projection() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let (ts, mkt_a, book_a, pos_a, mkt_b, book_b, pos_b, mut pt) =
+        basket_v2_setup(pid, trader.pubkey(), 1); // ~zero collateral → IM breached
+    pt.add_account(trader.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_BASKET_V2];
+    data.extend_from_slice(&basket_leg(0, 100, 100)); // large legs
+    data.extend_from_slice(&basket_leg(1, 100, 100));
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new_readonly(ts, false),
+            AccountMeta::new_readonly(mkt_a, false), AccountMeta::new(book_a, false), AccountMeta::new_readonly(pos_a, false),
+            AccountMeta::new_readonly(mkt_b, false), AccountMeta::new(book_b, false), AccountMeta::new_readonly(pos_b, false),
+        ],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
+    assert!(r.is_err(), "underwater basket projection must be rejected");
+}
