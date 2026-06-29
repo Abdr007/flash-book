@@ -220,6 +220,10 @@ mod program {
         CommitMarketBook = 125,
         CommitAndUndelegateMarketBook = 126,
         InitFillCommitment = 127,
+        DelegateFillCommitment = 128,
+        CommitFillCommitment = 129,
+        CommitAndUndelegateFillCommitment = 130,
+        UndelegateFillCommitment = 131,
     }
 
     #[inline(always)]
@@ -360,6 +364,12 @@ mod program {
             x if x == Ix::CommitMarketBook as u8 => instructions::commit_market_book::commit(program_id, accounts, rest),
             x if x == Ix::CommitAndUndelegateMarketBook as u8 => instructions::commit_market_book::commit_and_undelegate(program_id, accounts, rest),
             x if x == Ix::InitFillCommitment as u8 => instructions::init_fill_commitment::process(program_id, accounts, rest),
+            x if x == Ix::DelegateFillCommitment as u8 => instructions::delegate_fill_commitment::process(program_id, accounts, rest),
+            // commit/commit_and_undelegate are account-agnostic (they commit the
+            // PDA passed as accounts[1]) — reuse the commit_market_book handlers.
+            x if x == Ix::CommitFillCommitment as u8 => instructions::commit_market_book::commit(program_id, accounts, rest),
+            x if x == Ix::CommitAndUndelegateFillCommitment as u8 => instructions::commit_market_book::commit_and_undelegate(program_id, accounts, rest),
+            x if x == Ix::UndelegateFillCommitment as u8 => instructions::undelegate_fill_commitment::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

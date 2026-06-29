@@ -2531,3 +2531,78 @@ async fn init_fill_commitment_rejects_wrong_authority() {
         .await;
     assert!(r.is_err(), "non-authority init_fill_commitment must be rejected");
 }
+
+// ─── delegate / undelegate fill_commitment e2e ───
+const IX_DELEGATE_FILL: u8 = 128;
+const IX_UNDELEGATE_FILL: u8 = 131;
+
+#[tokio::test]
+async fn delegate_fill_commitment_rejects_already_delegated() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (fc, _) = Pubkey::find_program_address(&[FILL_COMMIT_SEED, &market.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    pt.add_account(market, m);
+    // ring already delegated → owned by the delegation program.
+    pt.add_account(fc, Account { lamports: 1_000_000, data: vec![0u8; 64], owner: Pubkey::new_from_array(DELEGATION_PROGRAM_ID), executable: false, rent_epoch: 0 });
+    pt.add_account(authority.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_DELEGATE_FILL];
+    data.extend_from_slice(&30_000u32.to_le_bytes());
+    data.push(0);
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(fc, false),
+            AccountMeta::new_readonly(pid, false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8;32]), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(DELEGATION_PROGRAM_ID), false),
+        ],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &authority], bh)).await;
+    assert!(r.is_err(), "delegating an already-delegated ring must be rejected");
+}
+
+#[tokio::test]
+async fn undelegate_fill_commitment_rejects_wrong_authority() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let imposter = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (fc, _) = Pubkey::find_program_address(&[FILL_COMMIT_SEED, &market.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    pt.add_account(market, m);
+    pt.add_account(fc, Account { lamports: 1_000_000, data: vec![0u8; 64], owner: Pubkey::new_from_array(DELEGATION_PROGRAM_ID), executable: false, rent_epoch: 0 });
+    pt.add_account(imposter.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(imposter.pubkey(), true), // not the authority
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(fc, false),
+            AccountMeta::new_readonly(pid, false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8;32]), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(DELEGATION_PROGRAM_ID), false),
+        ],
+        data: vec![IX_UNDELEGATE_FILL],
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh)).await;
+    assert!(r.is_err(), "non-authority undelegate must be rejected");
+}

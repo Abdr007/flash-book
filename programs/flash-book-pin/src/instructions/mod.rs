@@ -51,6 +51,8 @@ pub mod force_undelegate_market_book;
 pub mod commit_market_book;
 pub mod process_undelegation;
 pub mod init_fill_commitment;
+pub mod delegate_fill_commitment;
+pub mod undelegate_fill_commitment;
 pub mod withdraw_collateral;
 pub mod open_trader_sub_account;
 pub mod transfer_collateral;
