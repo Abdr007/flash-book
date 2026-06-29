@@ -2879,6 +2879,16 @@ pub mod flash_book {
         amount: u64,
     ) -> Result<()> {
         require!(amount > 0, FlashBookError::ZeroSize);
+        // Legibility / defense-in-depth (audit 2026-06): reject from==to at the
+        // ACCOUNT level up front. The `from.trader != to.trader` content check below
+        // and the later `load_mut` aliasing-borrow failure already cover this, but an
+        // explicit key guard states the no-self-sweep intent at the top of the handler
+        // rather than leaving it to be inferred from a downstream borrow conflict.
+        require_keys_neq!(
+            ctx.accounts.from_state.key(),
+            ctx.accounts.to_state.key(),
+            FlashBookError::OutOfRange
+        );
         let signer = ctx.accounts.authority.key();
         let (from_trader, from_open_positions, from_collateral) = {
             let from = ctx.accounts.from_state.load()?;
@@ -3953,6 +3963,17 @@ pub mod flash_book {
                 fill_seq,
             )
             .map_err(|_| error!(FlashBookError::FillSeqReplay))?;
+
+        // Legibility / defense-in-depth (audit 2026-06): taker and maker MUST be
+        // distinct position accounts. A self-fill (same account passed twice) would
+        // already fail closed at the `load_mut`/`load_mut` aliasing borrow below, but
+        // stating it explicitly here documents the no-wash-settlement intent and fails
+        // fast before any state is touched, rather than mid-settlement on a borrow.
+        require_keys_neq!(
+            ctx.accounts.taker_position.key(),
+            ctx.accounts.maker_position.key(),
+            FlashBookError::OutOfRange
+        );
 
         // ── Phase 2i sub-account PDA verification ───────────────────
         // Closes the 1-byte routing-attack surface left open by Phase 2d.
@@ -6801,6 +6822,19 @@ pub mod flash_book {
                 now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
             require!(oracle_age <= oracle_max_age, FlashBookError::OracleTooStale);
         }
+        // O-3 (audit 2026-06): the worse-of below may only fold in an oracle that
+        // is actually TRUSTWORTHY for health. On the fresh-mark path the oracle is
+        // freshness-validated ONLY when staleness is configured (the gate above runs
+        // `if oracle_max_age > 0 && published_at > 0`). With staleness DISABLED
+        // (`oracle_max_age == 0`) or a never-stamped publish time, a stale adverse
+        // oracle reading is never rejected — feeding it into worse-of could wrongfully
+        // liquidate a trader who is healthy at the live mark. So when the oracle isn't
+        // validatable, treat it as untrusted for health (pass 0 ⇒ worse-of ignores it
+        // and prices off the mark alone). No effect on the stale-mark branch above,
+        // which already MANDATES a configured + fresh + published oracle.
+        let oracle_trusted_for_health =
+            oracle_max_age > 0 && market.oracle_published_at_unix_seconds > 0;
+        let oracle_for_health = if oracle_trusted_for_health { oracle_t } else { 0 };
         // P-LIQ-1/2 via the Kani-proven pure helper: worse-of(mark, oracle) when
         // the mark is fresh; oracle-only when it's stale; None when neither
         // source is trustworthy (stale mark + dead oracle) ⇒ refuse to
@@ -6808,7 +6842,7 @@ pub mod flash_book {
         let (health_price_ticks, hp_source) =
             match matcher::liquidation::health_price_with_staleness(
                 mark_t,
-                oracle_t,
+                oracle_for_health,
                 mark_stale,
                 matches!(pos_side, Side::Long),
             ) {
