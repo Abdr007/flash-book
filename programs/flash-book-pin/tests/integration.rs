@@ -2448,3 +2448,48 @@ async fn commit_market_book_rejects_wrong_magic_program() {
         .await;
     assert!(r.is_err(), "commit with a wrong magic program must be rejected");
 }
+
+// ─── process_undelegation e2e (8-byte dispatch + buffer guard, before CPI) ───
+// The delegation program CPIs this back with an 8-byte discriminator (not a
+// 1-byte tag); the entrypoint routes it to process_undelegation. The buffer must
+// be the delegation program's SIGNER — a non-signer buffer is rejected before
+// the re-open CPI. Exercises the special dispatch path + the guard.
+use flash_book_pin::er::EXTERNAL_UNDELEGATE_DISCRIMINATOR;
+
+#[tokio::test]
+async fn process_undelegation_rejects_non_signer_buffer() {
+    let pid = Pubkey::new_unique();
+    let payer_signer = Keypair::new();
+    let delegated = Pubkey::new_unique();
+    let buffer = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(payer_signer.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    pt.add_account(delegated, Account { lamports: 1_000_000, data: vec![0u8; 8], owner: pid, executable: false, rent_epoch: 0 });
+    // buffer owned by the delegation program but NOT passed as a signer.
+    pt.add_account(buffer, Account { lamports: 1_000_000, data: vec![0u8; 8], owner: Pubkey::new_from_array(DELEGATION_PROGRAM_ID), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    // data = 8-byte callback disc ++ borsh Vec<Vec<u8>> seeds (2 seeds).
+    let mut data = EXTERNAL_UNDELEGATE_DISCRIMINATOR.to_vec();
+    data.extend_from_slice(&2u32.to_le_bytes());
+    data.extend_from_slice(&4u32.to_le_bytes());
+    data.extend_from_slice(b"book");
+    data.extend_from_slice(&2u32.to_le_bytes());
+    data.extend_from_slice(&[0xAA, 0xBB]);
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(delegated, false),
+            AccountMeta::new(buffer, false), // NOT a signer
+            AccountMeta::new(payer_signer.pubkey(), true),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8;32]), false),
+        ],
+        data,
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &payer_signer], bh))
+        .await;
+    assert!(r.is_err(), "a non-signer buffer must be rejected (only the delegation program may finalize)");
+}
