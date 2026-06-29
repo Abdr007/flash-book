@@ -240,11 +240,27 @@ log-safe at 96; a market with one can run up to 256. No global flag day.
 
 ## 10. ER / delegation
 
+> **CONSTRAINT — verified on the live MagicBlock devnet ER (2026-06-29, the
+> `er-acceptance/` suite): a 256-slot (24,640 B) outbox CANNOT be delegated to the
+> ER.** `delegate_fill_outbox` → `cpi_delegate` creates the delegate-buffer at the
+> full account size via one `create_account` CPI (`er.rs::create_pda`), which hits
+> the same 10,240 B/ix BPF-loader cap (`DelegateFillOutbox` reverts "Failed to
+> reallocate account data"). Because the matcher requires `fo_cap >= ring_cap`
+> (256), the deep outbox is therefore **L1-only** under the current ring cap — book
+> + ring delegate fine (both < 10,240 B) and the §3.2 authenticity round-trip works
+> on the ER, but the 256-cap deep-sweep is an **L1 feature**. To run a deep outbox
+> *on* the ER would need either (a) a chunked delegate-buffer staging (create small
+> + grow + stage + delegate across ixs — a new delegate flow), or (b) a smaller
+> per-market ring+outbox cap (≤106 slots, both one-CPI-delegatable). Decision
+> pending; the L1 256 path is unaffected. The unit/integration suite never caught
+> this (it doesn't delegate); only the live-ER suite did — the Tier-2 value.
+
 The outbox mirrors the ring's ER lifecycle: `delegate_fill_outbox` /
 `commit_fill_outbox` / `commit_and_undelegate_fill_outbox` (copy-adapted from the
-`fill_commitment` versions, `DELEGATION_PROGRAM_ID` / `Magic111…` rails). Delegate
-the ring and the outbox together; commit them together so L1 sees a consistent
-`(commit, data)` pair. The mirrored `produced`/`settled` in the outbox header let a
+`fill_commitment` versions, `DELEGATION_PROGRAM_ID` / `Magic111…` rails) — usable
+once the buffer-create constraint above is resolved. Delegate the ring and the
+outbox together; commit them together so L1 sees a consistent `(commit, data)` pair.
+The mirrored `produced`/`settled` in the outbox header let a
 commit-time assertion catch any ring/outbox cursor divergence (defense-in-depth;
 they advance in the same tx so they cannot legitimately differ).
 

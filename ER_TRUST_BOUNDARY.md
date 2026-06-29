@@ -73,11 +73,23 @@ that is validated on devnet, not asserted in CI.
 
 ## 3. How Tier 2 is validated today (and how to make it rigorous)
 
-Currently Tier 2 is exercised by **devnet ER replays** (`scratchpad/replay/15_delegate`,
-`17_smoke_force`, `18_wait_force`) and the live V2 ER census — real, but ad-hoc and
-not a gating acceptance suite. **Closure:** a reproducible **live-ER acceptance test**
-run against a devnet ER endpoint (not the unit harness), asserting one full
-round-trip per delegated account type:
+**BUILT (2026-06-29): `er-acceptance/`** — a reproducible, `ER_RPC`-gated live-ER
+acceptance suite (skips cleanly without `ER_RPC`, like the SBF benches without
+`BPF_OUT_DIR`). Its first run against the devnet MagicBlock ER
+(`magicblock-core 0.13.2`) **validated the delegate-CPI round-trip for the book +
+§3.2 ring** and immediately found two integration facts no unit/integration test
+could (they don't delegate): **(1)** the 256-slot outbox CANNOT be ER-delegated —
+the delegate-buffer is created at the full 24,640 B in one CPI, over the 10,240 B/ix
+cap, so the deep outbox is **L1-only** under the current ring cap (book + ring
+delegate fine, so §3.2 authenticity round-trips on the ER); **(2)** routing —
+`null`-validator delegation must be transacted against the validator that claimed
+the account (or the MagicBlock router), else the ER match returns
+`InvalidWritableAccount`. This is precisely the Tier-2 value: real CPI-surface
+findings the harness structurally cannot produce.
+
+Prior to this it was only **devnet ER replays** (`scratchpad/replay/15_delegate`,
+`17_smoke_force`, `18_wait_force`) and the live V2 ER census — ad-hoc. The suite
+asserts one full round-trip per delegated account type:
 
 ```
 delegate_market_book + delegate_fill_commitment + delegate_fill_outbox (together)
