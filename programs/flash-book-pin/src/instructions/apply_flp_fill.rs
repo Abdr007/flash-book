@@ -142,10 +142,20 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
             / BPS_DENOM);
         let rebate = rebate.min(fee);
         let net_fee = fee - rebate;
+        // Fee routing (re-audit 2026-06-30, anchor parity): debit the taker fee from
+        // the ISOLATED position bucket when the taker leg is isolated, else the cross
+        // pool — sampled BEFORE the funding settle. Pin previously always used cross,
+        // blocking an isolated taker with an empty cross pool. The FLP-as-maker rebate
+        // lifts pool capital (no maker position). Conservation unchanged.
+        let taker_fee_iso = taker_pos.collateral_quote_lots > 0;
         // H-1: debit the taker fee with checked_sub and ABORT if uncovered.
-        taker_ts.collateral_quote_lots = taker_ts.collateral_quote_lots
-            .checked_sub(fee)
-            .ok_or(ProgramError::Custom(249))?; // InsufficientCollateral
+        if taker_fee_iso {
+            taker_pos.collateral_quote_lots = taker_pos.collateral_quote_lots
+                .checked_sub(fee).ok_or(ProgramError::Custom(249))?;
+        } else {
+            taker_ts.collateral_quote_lots = taker_ts.collateral_quote_lots
+                .checked_sub(fee).ok_or(ProgramError::Custom(249))?;
+        }
         flp.total_capital_quote_lots = flp.total_capital_quote_lots.saturating_add(rebate);
         let contribution =
             clamp((net_fee as u128) * (insurance.fee_contribution_bps as u128) / BPS_DENOM);

@@ -57,6 +57,25 @@ pub fn validate_trigger_params(
     Ok(())
 }
 
+/// Wave 27a slippage cap (re-audit 2026-06-30): `true` if the cap is breached at
+/// EXECUTION time (the keeper must refuse to fire — the trader's stored
+/// `acceptable_price` protects them from firing into a gap). `acceptable == 0` =
+/// no cap. Long (side 0): breached if `mark > acceptable` (would buy too high);
+/// short (side 1): breached if `mark < acceptable` (would sell too low). Pin is
+/// mark-only, so `mark` plays the role of anchor's oracle. Verbatim port of anchor
+/// `TriggerOrderAccountV3::slippage_cap_breached`.
+#[inline]
+pub fn slippage_cap_breached(acceptable_price_ticks: u64, side: u8, mark: u64) -> bool {
+    if acceptable_price_ticks == 0 {
+        return false;
+    }
+    match side {
+        0 => mark > acceptable_price_ticks,
+        1 => mark < acceptable_price_ticks,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +85,20 @@ mod tests {
 
     fn call(t: (u8, u8, u64, u64, u64, u64, u64, u64)) -> Result<(), ()> {
         validate_trigger_params(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7)
+    }
+
+    #[test]
+    fn slippage_cap_breached_semantics() {
+        // No cap → never breached.
+        assert!(!slippage_cap_breached(0, 0, 999_999));
+        // Long (side 0): cap = max admissible buy price; breached when mark exceeds it.
+        assert!(!slippage_cap_breached(1_000, 0, 1_000)); // at the cap, OK
+        assert!(!slippage_cap_breached(1_000, 0, 990)); // below cap, OK
+        assert!(slippage_cap_breached(1_000, 0, 1_001)); // above cap, breached
+        // Short (side 1): cap = min admissible sell price; breached when mark below it.
+        assert!(!slippage_cap_breached(1_000, 1, 1_000)); // at the cap, OK
+        assert!(!slippage_cap_breached(1_000, 1, 1_010)); // above cap, OK
+        assert!(slippage_cap_breached(1_000, 1, 999)); // below cap, breached
     }
 
     #[test]

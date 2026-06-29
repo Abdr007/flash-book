@@ -438,7 +438,79 @@ impl<'a> MarketBookHandle<'a> {
         );
         let (header_bytes, dyn_data) = data[8..].split_at_mut(256);
         let header: &mut MarketBookHeader = bytemuck::from_bytes_mut(header_bytes);
+        // AUDIT (re-audit 2026-06-30, ER L-2): bounds-check the header's 6 node
+        // indices against the slab. A structurally-invalid book — e.g. one committed
+        // by a malicious/buggy ER validator across an undelegate, or any tampered
+        // account — could otherwise drive the raw `get_helper` slab accessor out of
+        // bounds (panic/DoS) or misread an in-bounds-but-bogus node. `NIL` is the
+        // valid empty sentinel; a well-formed book's roots/best/free-list are always
+        // node-aligned offsets whose whole node fits the slab, so this NEVER rejects
+        // a valid book — it fails closed only on corruption. `DataIndex` is a BYTE
+        // OFFSET (`get_helper` indexes `data[idx..idx+size]`). Internal RBT links are
+        // NOT walked here (O(capacity) on the hot path) — they are validated once on
+        // undelegate via `validate_node_links` (AUDIT O-1).
+        let slab_len = dyn_data.len();
+        for idx in [
+            header.bids_root_index,
+            header.bids_best_index,
+            header.asks_root_index,
+            header.asks_best_index,
+            header.claimed_seats_root_index,
+            header.free_list_head_index,
+        ] {
+            let off = idx as usize;
+            require!(
+                idx == crate::hypertree::NIL
+                    || (off % NODE_TOTAL_BYTES == 0
+                        && off.checked_add(NODE_TOTAL_BYTES).is_some_and(|end| end <= slab_len)),
+                errors::FlashBookError::OutOfRange
+            );
+        }
         Ok(MarketBookHandle { header, data: dyn_data })
+    }
+
+    /// AUDIT O-1 (re-audit 2026-06-30) — validate every node's INTERNAL RBT links
+    /// (`left`/`right`/`parent`), not just the 6 header roots `from_account_data`
+    /// checks. The hot traversal accessors use the unchecked `get_helper`, so a book
+    /// carrying an out-of-range child pointer would panic-DoS the FIRST L1 traversal
+    /// and brick the market (no reset ix). A well-formed book can only be produced by
+    /// this program's own RBT writes, so the ONLY way a corrupt book can reach L1 is a
+    /// malicious-/buggy-ER commit that is then undelegated — therefore this is called
+    /// EXACTLY ONCE, from `process_undelegation`, NOT on the per-op hot path. Cost:
+    /// O(capacity) once per undelegate (rare); ZERO added CU on place/cancel/match. A
+    /// corrupt book fails CLOSED here (`OutOfRange` → the undelegate reverts; the book
+    /// never lands corrupt on L1). `#[repr(C)] RBNode<V>` lays out `left`/`right`/
+    /// `parent` as its first three `DataIndex` (u32 LE) fields at byte offsets 0/4/8
+    /// of every `NODE_TOTAL_BYTES` slot regardless of payload — pinned by the compile
+    /// asserts below so a field reorder fails the build, not silently validates wrong.
+    pub fn validate_node_links(account_data: &[u8]) -> Result<()> {
+        const _: () = assert!(core::mem::offset_of!(crate::hypertree::RBNode<RestingOrderV2>, left) == 0);
+        const _: () = assert!(core::mem::offset_of!(crate::hypertree::RBNode<RestingOrderV2>, right) == 4);
+        const _: () = assert!(core::mem::offset_of!(crate::hypertree::RBNode<RestingOrderV2>, parent) == 8);
+        require!(
+            account_data.len() >= MARKET_BOOK_PREFIX_BYTES,
+            errors::FlashBookError::OutOfRange
+        );
+        let slab = &account_data[MARKET_BOOK_PREFIX_BYTES..];
+        let slab_len = slab.len();
+        require!(slab_len % NODE_TOTAL_BYTES == 0, errors::FlashBookError::OutOfRange);
+        let node_count = slab_len / NODE_TOTAL_BYTES;
+        for i in 0..node_count {
+            let base = i * NODE_TOTAL_BYTES;
+            for link_off in [0usize, 4, 8] {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&slab[base + link_off..base + link_off + 4]);
+                let off = u32::from_le_bytes(b);
+                let offu = off as usize;
+                require!(
+                    off == crate::hypertree::NIL
+                        || (offu % NODE_TOTAL_BYTES == 0
+                            && offu.checked_add(NODE_TOTAL_BYTES).is_some_and(|end| end <= slab_len)),
+                    errors::FlashBookError::OutOfRange
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Stamp the discriminator + zero-init the header + data. Call this
@@ -920,6 +992,33 @@ mod tests {
         )
         .expect("init header");
         data
+    }
+
+    // Re-audit 2026-06-30 (HIGH): the ER-undelegate book-corruption guards.
+    #[test]
+    fn book_validation_accepts_clean_rejects_corruption() {
+        let data = make_book();
+        // A freshly-initialised book validates clean on both guards.
+        assert!(MarketBookHandle::validate_node_links(&data).is_ok());
+        {
+            let mut d = data.clone();
+            assert!(MarketBookHandle::from_account_data(&mut d).is_ok());
+        }
+        // (1) Corrupt a HEADER node index (bids_root_index @ header off 104 → byte
+        //     8+104=112) to an out-of-range, non-aligned value → from_account_data rejects.
+        {
+            let mut d = data.clone();
+            d[112..116].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+            assert!(MarketBookHandle::from_account_data(&mut d).is_err());
+        }
+        // (2) Corrupt a NODE's internal `left` link (first slab node, offset 0) to a
+        //     non-node-aligned in-range value → validate_node_links rejects.
+        {
+            let mut d = data.clone();
+            let base = MARKET_BOOK_PREFIX_BYTES;
+            d[base..base + 4].copy_from_slice(&1u32.to_le_bytes()); // 1 not % 96
+            assert!(MarketBookHandle::validate_node_links(&d).is_err());
+        }
     }
 
     fn make_order(price: u64, seq: u64, side_is_bid: bool) -> RestingOrderV2 {

@@ -5,8 +5,10 @@
 //! insurance hits its target balance. Keeps insurance solvent without
 //! manual operator intervention.
 //!
-//! Pure math. Wave 38b wires this into the fee-accrual path inside
-//! `apply_fill`.
+//! Pure math, host-tested. NOTE (re-audit 2026-06-30): this helper is NOT yet
+//! wired into `apply_fill` — auto-replenish does not run on the deployed surface
+//! (no security impact; insurance is still funded by the per-fill contribution
+//! split). Wiring it into the fee-accrual path is a documented follow-up.
 
 use crate::constants::BPS_DENOM;
 

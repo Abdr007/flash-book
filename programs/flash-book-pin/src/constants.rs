@@ -23,6 +23,11 @@ pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 300;
 /// Max taker fee / |maker rebate| a fee tier may set (bps). Mirrors anchor.
 pub const MAX_FEE_TIER_BPS: u32 = 1_000;
 
+/// Min slots a singleton-FLP LP must hold before withdrawing (Wave 57 JIT-LP
+/// defense). Blocks a flash deposit-before-a-fee-event / withdraw-after that skims
+/// honest LPs' fee revenue. Mirrors anchor `FLP_MIN_HOLD_SLOTS`.
+pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
+
 /// Slots of total ER silence (no fill / heartbeat / delegation signal) before the
 /// permissionless `force_undelegate_market_book` escape opens. Mirrors anchor.
 pub const FORCE_UNDELEGATE_TIMEOUT_SLOTS: u64 = 750;

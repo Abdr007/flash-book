@@ -298,6 +298,20 @@ impl FlpExposure {
         (self.total_capital_quote_lots as i128) + (self.realized_pnl as i128)
     }
 
+    /// NAV used to PRICE deposits/withdrawals: `min(nav, capital)` — bear realized
+    /// losses, ignore un-crystallized gains. Re-audit 2026-06-30 (LOW, defensive):
+    /// mirrors the per-market v3 `nav_for_pricing` (#188). Today the singleton's
+    /// `realized_pnl` is never advanced so `nav == capital` and this is a no-op, but
+    /// pricing both sides on it pre-empts the v3 deposit/withdraw asymmetry should
+    /// singleton realized-PnL ever be wired (deposit at raw nav + withdraw capped at
+    /// capital would otherwise lock gains / let an early LP skim a late depositor).
+    #[inline]
+    pub fn nav_for_pricing(&self) -> i128 {
+        let cap = self.total_capital_quote_lots as i128;
+        let nav = self.nav();
+        if nav < cap { nav } else { cap }
+    }
+
     /// LP shares minted for a deposit of `amount` quote-lots into a pool with
     /// `outstanding` shares and `nav`. First deposit (outstanding == 0) mints
     /// 1:1. `None` if the pool has shares but non-positive NAV (insolvent —
@@ -556,7 +570,13 @@ pub struct LpPosition {
     pub total_deposited_quote_lots: u64,
     pub total_withdrawn_quote_lots: u64,
     pub bump: u8,
-    pub _reserved: [u8; 39],
+    /// JIT-LP min-hold anchor (Wave 57 / re-audit 2026-06-30): the slot of the most
+    /// recent deposit, stored LE (align 1) carved from `_reserved` so the 104-byte
+    /// layout is unchanged. `0` = legacy account (deposited "at genesis") ⇒ the
+    /// min-hold has long elapsed ⇒ withdrawal allowed, so existing positions are
+    /// unaffected. Withdrawal gates on `jit_lp_defense::can_withdraw`.
+    pub deposited_at_slot: [u8; 8],
+    pub _reserved: [u8; 31],
 }
 
 // Compile-time size checks (8-aligned, sized to the real accounts).

@@ -80,7 +80,8 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
     // Dual-source health price via `health_price_with_staleness` (see
     // liquidate_position_v2): mark-only ⇒ `(mark, _)` on a fresh mark, `None`
     // (refuse) on a stale one with no oracle fallback. Feeds the penalty price.
-    let mark_stale = Clock::get()?.slot.saturating_sub(exec_last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS;
+    let now_slot = Clock::get()?.slot;
+    let mark_stale = now_slot.saturating_sub(exec_last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS;
     let (health_price, _hp_src) = crate::liquidation::health_price_with_staleness(mark, 0, mark_stale, ex_side == 0)
         .ok_or(ProgramError::Custom(248))?; // stale mark, no oracle ⇒ refuse
 
@@ -136,6 +137,18 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         else {
             return Err(ProgramError::InvalidArgument);
         };
+        // Re-audit 2026-06-30 (HIGH): staleness-gate EACH sibling leg's mark, not
+        // just the exec market (line ~83). A frozen sibling mark (an illiquid market
+        // during an ER stall) would otherwise feed an adverse stale price into
+        // assess_margin → inflate the portfolio loss → wrongfully liquidate a
+        // portfolio-healthy trader. Anchor passes every leg through
+        // effective_health_mark, which reverts MarkTooStale; mirror that here.
+        let sib_last_update = unsafe {
+            (*(m_ai.borrow_data_unchecked().as_ptr() as *const Market)).last_mark_update_slot
+        };
+        if now_slot.saturating_sub(sib_last_update) > crate::constants::MARK_STALENESS_MAX_SLOTS {
+            return Err(ProgramError::Custom(248)); // stale sibling mark
+        }
         if pos_snap.collateral_quote_lots != 0 {
             return Err(ProgramError::InvalidArgument); // isolated sibling — cross walk only
         }

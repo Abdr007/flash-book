@@ -24,6 +24,7 @@ use pinocchio::{
     instruction::{Seed, Signer},
     program_error::ProgramError,
     pubkey::Pubkey,
+    sysvars::{clock::Clock, Sysvar},
     ProgramResult,
 };
 
@@ -74,7 +75,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         if shares_to_burn > f.lp_shares_outstanding {
             return Err(ProgramError::InvalidArgument);
         }
-        let a = FlpExposure::amount_for_shares(shares_to_burn, f.lp_shares_outstanding, f.nav())
+        // Price on `min(nav, capital)` (re-audit 2026-06-30): symmetric with deposit.
+        let a = FlpExposure::amount_for_shares(shares_to_burn, f.lp_shares_outstanding, f.nav_for_pricing())
             .ok_or(ProgramError::InvalidArgument)?;
         if a > f.total_capital_quote_lots {
             return Err(ProgramError::InsufficientFunds);
@@ -82,7 +84,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         a
     };
 
-    // ── the LP must actually hold the shares ────────────────────────────
+    // ── the LP must actually hold the shares + clear the min-hold lock ──
     {
         let d = lp_position.try_borrow_data()?;
         let p = unsafe { &*(d.as_ptr() as *const LpPosition) };
@@ -91,6 +93,15 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         }
         if p.shares < shares_to_burn {
             return Err(ProgramError::InsufficientFunds);
+        }
+        // Re-audit 2026-06-30 (MED): JIT-LP min-hold. Block a withdrawal within
+        // FLP_MIN_HOLD_SLOTS of the most recent deposit, defeating a flash
+        // deposit-before-a-fee-event / withdraw-after skim of honest LPs' revenue.
+        // Legacy positions have deposited_at_slot == 0 ⇒ the hold long elapsed ⇒ OK.
+        let dep = u64::from_le_bytes(p.deposited_at_slot);
+        let now_slot = Clock::get()?.slot;
+        if !crate::jit_lp_defense::can_withdraw(dep, now_slot, crate::constants::FLP_MIN_HOLD_SLOTS) {
+            return Err(ProgramError::Custom(57)); // FLP min-hold not elapsed
         }
     }
 

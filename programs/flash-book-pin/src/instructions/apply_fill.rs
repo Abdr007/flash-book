@@ -231,14 +231,29 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
             clamp(notional.checked_mul(market.maker_rebate_bps as u128).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM)
         } else { 0 };
         let rebate = rebate.min(fee);
-        // H-1: debit the taker fee with checked_sub and ABORT the fill if they
-        // can't cover it (anchor parity). The prior `saturating_sub` floored the
-        // taker's debit at their balance while still crediting the maker the FULL
-        // rebate + insurance the FULL net fee → quote-lots minted from nothing.
-        taker_ts.collateral_quote_lots = taker_ts.collateral_quote_lots
-            .checked_sub(fee)
-            .ok_or(ProgramError::Custom(249))?; // InsufficientCollateral
-        maker_ts.collateral_quote_lots = maker_ts.collateral_quote_lots.saturating_add(rebate);
+        // Fee/rebate bucket routing (re-audit 2026-06-30, anchor parity): debit the
+        // taker fee FROM / credit the maker rebate TO the ISOLATED position bucket
+        // when that leg is isolated, else the cross pool. Sample BEFORE the funding
+        // settle (fees precede funding, anchor order). Pin previously ALWAYS used the
+        // cross pool → an isolated trader with an empty cross pool could not settle a
+        // fill (the H-1 checked_sub aborted), and the cross silently subsidized an
+        // isolated position's fee burden. Conservation is unchanged (same amounts).
+        let taker_fee_iso = taker_pos.collateral_quote_lots > 0;
+        let maker_fee_iso = maker_pos.collateral_quote_lots > 0;
+        // H-1: debit the taker fee with checked_sub and ABORT the fill if the chosen
+        // bucket can't cover it (anchor parity; the prior `saturating_sub` minted).
+        if taker_fee_iso {
+            taker_pos.collateral_quote_lots = taker_pos.collateral_quote_lots
+                .checked_sub(fee).ok_or(ProgramError::Custom(249))?;
+        } else {
+            taker_ts.collateral_quote_lots = taker_ts.collateral_quote_lots
+                .checked_sub(fee).ok_or(ProgramError::Custom(249))?;
+        }
+        if maker_fee_iso {
+            maker_pos.collateral_quote_lots = maker_pos.collateral_quote_lots.saturating_add(rebate);
+        } else {
+            maker_ts.collateral_quote_lots = maker_ts.collateral_quote_lots.saturating_add(rebate);
+        }
         insurance.balance_quote_lots = insurance.balance_quote_lots.saturating_add(fee - rebate);
 
         // ── (R2) Settle each leg's funding on its PRE-trade size, BEFORE the

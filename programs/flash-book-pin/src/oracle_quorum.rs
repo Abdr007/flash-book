@@ -36,6 +36,15 @@ pub fn aggregate_median(
             return Err(QuorumErr::ZeroPrice);
         }
     }
+    // Re-audit 2026-06-30 (LOW parity): reject a FUTURE-dated source. The staleness
+    // gate below uses `now.saturating_sub(t)`, which clamps a future timestamp to
+    // age 0 and would slip it — the same bug class the Pyth path fixed (O-2). Anchor
+    // future-rejects each source (`require!(t <= now)`).
+    for &t in &published_at {
+        if t > now_unix {
+            return Err(QuorumErr::Stale);
+        }
+    }
     if max_staleness_seconds > 0 {
         for &t in &published_at {
             if now_unix.saturating_sub(t) > max_staleness_seconds as u64 {

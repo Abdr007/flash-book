@@ -38,11 +38,11 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
     assert_owned_by(trigger_order, pid)?;
     assert_disc(trigger_order, &TRIGGER_ORDER_V3_DISC)?;
 
-    let (t_trader, t_market, t_size, t_trigger_price, t_limit, t_expires, t_side, t_kind, t_flags, t_sub) = {
+    let (t_trader, t_market, t_size, t_trigger_price, t_limit, t_expires, t_side, t_kind, t_flags, t_sub, t_acceptable) = {
         let t = unsafe { &*(trigger_order.borrow_data_unchecked().as_ptr() as *const TriggerOrderV3) };
         (
             t.trader, t.market, t.size_lots, t.trigger_price_ticks, t.limit_price_ticks,
-            t.expires_at_slot, t.side, t.kind, t.flags, t.sub_index,
+            t.expires_at_slot, t.side, t.kind, t.flags, t.sub_index, t.acceptable_price_ticks,
         )
     };
 
@@ -58,7 +58,11 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         let position = rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
         assert_position(position, pid)?;
         let p = unsafe { &*(position.borrow_data_unchecked().as_ptr() as *const Position) };
-        if p.trader != t_trader || p.market != *market.key() {
+        // Re-audit 2026-06-30 (PORT BUG): bind the position's sub_index to the
+        // trigger's `t_sub` (the injected order routes to t_sub). Without it a
+        // "reduce-only" trigger could validate against sub-A's opposite position
+        // while the fill opens/increases exposure on sub-B.
+        if p.trader != t_trader || p.market != *market.key() || p.sub_index != t_sub {
             return Err(ProgramError::InvalidArgument);
         }
         if p.size_lots == 0 || p.side == t_side || t_size > p.size_lots {
@@ -74,14 +78,27 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         return Err(ProgramError::Custom(152)); // expired
     }
 
-    let mark = {
+    let (mark, last_mark_update) = {
         let d = market.try_borrow_data()?;
-        unsafe { (*(d.as_ptr() as *const Market)).mark_price_ticks }
+        let m = unsafe { &*(d.as_ptr() as *const Market) };
+        (m.mark_price_ticks, m.last_mark_update_slot)
     };
+    // Re-audit 2026-06-30 (LOW): refuse to fire on a STALE mark — a frozen mark that
+    // happens to sit across the trigger would otherwise fire it at an outdated price.
+    if now.saturating_sub(last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS {
+        return Err(ProgramError::Custom(248)); // stale mark
+    }
     // Fired? kind 0 = mark crossed DOWN to/through the trigger; kind 1 = UP.
     let fired = if t_kind == 0 { mark <= t_trigger_price } else { mark >= t_trigger_price };
     if !fired {
         return Err(ProgramError::Custom(153)); // condition not met
+    }
+    // Re-audit 2026-06-30 (MED): enforce the trader's slippage cap at FIRE time. If
+    // the mark gapped past `acceptable_price`, refuse to fire (the trader's stored
+    // cap is meaningless if only validated at placement) — anchor deactivates/skips
+    // on breach; refusing reverts the fire so it can't execute at the bad price.
+    if crate::trigger_order::slippage_cap_breached(t_acceptable, t_side, mark) {
+        return Err(ProgramError::Custom(154)); // TriggerSlippageExceeded
     }
 
     // ── inject the trigger's order (a normal limit, order_type 0) ───────
