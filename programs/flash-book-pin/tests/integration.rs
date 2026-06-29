@@ -3073,6 +3073,24 @@ fn flp_fill_ix(pid: Pubkey, seq: Pubkey, market: Pubkey, insurance: Pubkey, flp:
     ], data }
 }
 
+// Generalized: explicit taker_side + size (for closing fills that realize PnL).
+#[allow(clippy::too_many_arguments)]
+fn flp_close_ix(pid: Pubkey, seq: Pubkey, market: Pubkey, insurance: Pubkey, flp: Pubkey, ts: Pubkey, pos: Pubkey, taker_side: u8, size: u64, price: u64, fill_seq: u64) -> Instruction {
+    let mut data = vec![IX_APPLY_FLP_FILL];
+    data.extend_from_slice(&size.to_le_bytes());
+    data.extend_from_slice(&price.to_le_bytes());
+    data.push(taker_side);
+    data.extend_from_slice(&fill_seq.to_le_bytes());
+    Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(seq, true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(insurance, false),
+        AccountMeta::new(flp, false),
+        AccountMeta::new(ts, false),
+        AccountMeta::new(pos, false),
+    ], data }
+}
+
 #[tokio::test]
 async fn apply_flp_fill_maintains_open_positions() {
     let pid = Pubkey::new_unique();
@@ -3130,4 +3148,64 @@ async fn apply_flp_fill_rejects_cross_subaccount_position() {
     let ix = flp_fill_ix(pid, seq.pubkey(), market, insurance, flp, ts, pos, 1_000, 1);
     let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
     assert!(r.is_err(), "a sub_index-mismatched position must be rejected (cross-sub-account substitution)");
+}
+
+// Audit R1 — realized-PnL MATERIALIZATION e2e via apply_flp_fill: a closing fill
+// must fold realized PnL into the trader's spendable collateral, and a loss
+// exceeding the bucket must drain it to 0 and draw the shortfall from insurance.
+#[tokio::test]
+async fn apply_flp_fill_materializes_realized_gain_into_collateral() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let taker = Pubkey::new_unique();
+    let (market, insurance, flp, ts, pos) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut mkt = market_full(pid, 1_000, 1, 500, 10, 10); // mark 1000, tick 1, OI 10/10
+    put_key(&mut mkt.data, 8, &seq.pubkey());
+    pt.add_account(market, mkt);
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(flp, flp_exposure_acct(pid));
+    pt.add_account(ts, trader_state(pid, taker, 5_000, 1)); // cross pool 5000, 1 open
+    // pre-opened LONG 10 @ entry 1000 (cross: position collateral 0).
+    pt.add_account(pos, position(pid, taker, market, 0, 10, 1_000, 0));
+    pt.add_account(seq.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    // CLOSE the long: taker_side = short (1), size 10, price 1100 (in 3% band? 1100 vs 1000 = +10% — OUT of FLP band 300bps).
+    // Use price 1020 (+2%, within 3% band): realized = +10·(1020−1000)·1 = +200.
+    let ix = flp_close_ix(pid, seq.pubkey(), market, insurance, flp, ts, pos, 1, 10, 1_020, 1);
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    assert!(r.is_ok(), "closing fill should settle: {r:?}");
+    let ts_after = banks.get_account(ts).await.unwrap().unwrap();
+    // taker_fee_bps = 0 ⇒ no fee; realized +200 folded into the cross pool.
+    assert_eq!(get_u64(&ts_after.data, TS_COLLATERAL), 5_200, "realized gain materialized into collateral");
+    assert_eq!(ts_after.data[TS_OPEN_POSITIONS], 0, "position fully closed");
+}
+
+#[tokio::test]
+async fn apply_flp_fill_bankrupt_loss_drains_bucket_and_insurance() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let taker = Pubkey::new_unique();
+    let (market, insurance, flp, ts, pos) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut mkt = market_full(pid, 1_000, 1, 500, 10, 10);
+    put_key(&mut mkt.data, 8, &seq.pubkey());
+    pt.add_account(market, mkt);
+    pt.add_account(insurance, insurance_full(pid, 100, 0)); // insurance fund = 100
+    pt.add_account(flp, flp_exposure_acct(pid));
+    pt.add_account(ts, trader_state(pid, taker, 150, 1)); // cross pool only 150
+    pt.add_account(pos, position(pid, taker, market, 0, 10, 1_000, 0)); // long 10 @ 1000
+    pt.add_account(seq.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    // CLOSE at 980 (−2%, in band): realized = +10·(980−1000)·1 = −200 loss.
+    // bucket 150 drained to 0, shortfall 50 → insurance (100) covers 50 → ins 50.
+    let ix = flp_close_ix(pid, seq.pubkey(), market, insurance, flp, ts, pos, 1, 10, 980, 1);
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    assert!(r.is_ok(), "bankrupt close should still settle (loss socialized): {r:?}");
+    let ts_after = banks.get_account(ts).await.unwrap().unwrap();
+    let ins_after = banks.get_account(insurance).await.unwrap().unwrap();
+    assert_eq!(get_u64(&ts_after.data, TS_COLLATERAL), 0, "loss drained the bucket to 0");
+    assert_eq!(get_u64(&ins_after.data, INS_BALANCE), 50, "insurance covered the 50 shortfall (100−50)");
 }

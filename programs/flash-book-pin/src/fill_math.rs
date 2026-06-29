@@ -8,13 +8,26 @@ pub enum FillErr { Overflow }
 
 /// Apply one fill leg to a position: open / weighted-avg increase / realize
 /// PnL on close / side flip. Identical semantics to the Anchor version.
-pub fn apply_to_position(pos: &mut Position, fill_side: u8, fill_size: u64, fill_price: u64, fidx: i128) -> Result<(), FillErr> {
+///
+/// Returns the **realized-PnL delta for THIS fill** (quote-lots, signed): 0 for
+/// open-from-flat and same-side add; on a reduce / full-close / flip it is the
+/// PnL realized on the closed portion. The caller (`apply_fill`/`apply_flp_fill`)
+/// MATERIALIZES this delta into the trader's collateral bucket — see
+/// `route_realized_pnl`. The running `pos.realized_pnl_quote_lots` is also
+/// accrued (a stat), but the spendable balance change is the returned delta.
+///
+/// `tick_size` is REQUIRED and load-bearing: realized PnL is
+/// `sign · close · (fill_price − entry) · tick_size`, the same scaling the risk
+/// engine's UNREALIZED PnL (`risk::unrealized_pnl_quote_lots`) and funding
+/// notional use. Without it realized PnL mis-scales by `1/tick_size` versus every
+/// other money quantity (Anchor AUDIT H-1).
+pub fn apply_to_position(pos: &mut Position, fill_side: u8, fill_size: u64, fill_price: u64, tick_size: u64, fidx: i128) -> Result<i64, FillErr> {
     if pos.size_lots == 0 {
         pos.side = fill_side;
         pos.size_lots = fill_size;
         pos.entry_price_ticks = fill_price;
         pos.set_cum_funding(fidx);
-        return Ok(());
+        return Ok(0);
     }
     if pos.side == fill_side {
         let new_size = pos.size_lots.checked_add(fill_size).ok_or(FillErr::Overflow)?;
@@ -25,13 +38,14 @@ pub fn apply_to_position(pos: &mut Position, fill_side: u8, fill_size: u64, fill
             / new_size as u128;
         pos.entry_price_ticks = weighted as u64;
         pos.size_lots = new_size;
-        return Ok(());
+        return Ok(0);
     }
     let close = fill_size.min(pos.size_lots);
     let sign: i128 = if pos.side == 0 { 1 } else { -1 };
     let pnl = sign
         .checked_mul(close as i128).ok_or(FillErr::Overflow)?
-        .checked_mul((fill_price as i128) - (pos.entry_price_ticks as i128)).ok_or(FillErr::Overflow)?;
+        .checked_mul((fill_price as i128) - (pos.entry_price_ticks as i128)).ok_or(FillErr::Overflow)?
+        .checked_mul(tick_size as i128).ok_or(FillErr::Overflow)?;
     let pnl_c = if pnl > i64::MAX as i128 { i64::MAX } else if pnl < i64::MIN as i128 { i64::MIN } else { pnl as i64 };
     pos.realized_pnl_quote_lots = pos.realized_pnl_quote_lots.checked_add(pnl_c).ok_or(FillErr::Overflow)?;
     if fill_size <= pos.size_lots {
@@ -43,7 +57,27 @@ pub fn apply_to_position(pos: &mut Position, fill_side: u8, fill_size: u64, fill
         pos.entry_price_ticks = fill_price;
         pos.set_cum_funding(fidx);
     }
-    Ok(())
+    Ok(pnl_c)
+}
+
+/// Fold a realized-PnL `delta` (from `apply_to_position`) into a collateral
+/// `bucket`. Returns `(new_bucket, shortfall)`:
+///   - gain (`delta ≥ 0`): added to the bucket (checked); shortfall 0.
+///   - loss (`delta < 0`): subtracted, DRAINING the bucket to 0; the uncovered
+///     remainder is returned as `shortfall` for the caller to draw from the
+///     insurance fund (then ADL).
+/// Mirrors Anchor's `compute_realized_pnl_routing` + `cross_loss_shortfall`
+/// (isolated and cross both drain-to-0-then-socialize per AUDIT R-2). The caller
+/// picks `bucket` = the position's own collateral (isolated) or the trader_state
+/// pool (cross), sampled BEFORE the resize.
+pub fn route_realized_pnl(bucket: u64, delta: i64) -> Result<(u64, u64), FillErr> {
+    if delta >= 0 {
+        Ok((bucket.checked_add(delta as u64).ok_or(FillErr::Overflow)?, 0))
+    } else {
+        let debit = (delta as i128).unsigned_abs() as u64;
+        let covered = debit.min(bucket);
+        Ok((bucket - covered, debit - covered))
+    }
 }
 
 /// Update `(long_oi, short_oi)` for ONE position leg transitioning from
@@ -197,6 +231,31 @@ mod kani_proofs {
         let (nl, ns) = oi_after_flp_fill(long, short, t_old_side, t_old_size, t_ns, t_nz);
         assert_eq!(nl, ns); // invariant preserved
     }
+
+    /// R1 materialization conserves value: a realized loss is split into exactly
+    /// `removed` (drawn from the bucket) + `shortfall` (drawn from insurance/ADL)
+    /// with `removed + shortfall == |loss|` and `removed ≤ |loss|` (the bucket
+    /// never over-drains, the shortfall never over-credits — anchor's H6/H7
+    /// `cross_loss_shortfall` invariant); a gain credits the bucket exactly.
+    #[kani::proof]
+    fn route_realized_pnl_conserves() {
+        let bucket: u64 = kani::any();
+        let delta: i64 = kani::any();
+        if delta >= 0 {
+            // Stay off the checked-add overflow path (the Err case is its own guard).
+            kani::assume((bucket as u128) + (delta as u128) <= u64::MAX as u128);
+            let (nb, sf) = route_realized_pnl(bucket, delta).unwrap();
+            assert!(nb == bucket + delta as u64); // gain credited exactly
+            assert!(sf == 0);
+        } else {
+            let (nb, sf) = route_realized_pnl(bucket, delta).unwrap();
+            let debit = (delta as i128).unsigned_abs() as u64; // |loss|
+            let removed = bucket - nb;
+            assert!(nb <= bucket); // bucket never grows on a loss
+            assert!(removed <= debit); // never over-removes
+            assert!(removed + sf == debit); // CONSERVATION: covered + shortfall = loss
+        }
+    }
 }
 
 #[cfg(test)]
@@ -255,18 +314,51 @@ mod position_tests {
         Position { disc:[0;8], cum_funding_index:[0;16], trader:[0;32], market:[0;32],
             size_lots:size, entry_price_ticks:entry, collateral_quote_lots:0, realized_pnl_quote_lots:0, side, sub_index:0, _pad0:[0;2], leverage_cap:0 }
     }
-    #[test] fn open() { let mut x=p(0,0,0); apply_to_position(&mut x,1,10,200,7).unwrap();
+    #[test] fn open() { let mut x=p(0,0,0); apply_to_position(&mut x,1,10,200,1,7).unwrap();
         assert_eq!((x.side,x.size_lots,x.entry_price_ticks,x.cum_funding()),(1,10,200,7)); }
-    #[test] fn increase_weighted_entry() { let mut x=p(0,10,100); apply_to_position(&mut x,0,10,200,0).unwrap();
+    #[test] fn increase_weighted_entry() { let mut x=p(0,10,100); apply_to_position(&mut x,0,10,200,1,0).unwrap();
         assert_eq!((x.size_lots,x.entry_price_ticks),(20,150)); }
-    #[test] fn partial_close_long() { let mut x=p(0,10,100); apply_to_position(&mut x,1,4,150,0).unwrap();
+    #[test] fn partial_close_long() { let mut x=p(0,10,100); apply_to_position(&mut x,1,4,150,1,0).unwrap();
         assert_eq!((x.size_lots,x.entry_price_ticks,x.realized_pnl_quote_lots),(6,100,200)); }
-    #[test] fn full_close_long() { let mut x=p(0,10,100); apply_to_position(&mut x,1,10,150,9).unwrap();
+    #[test] fn full_close_long() { let mut x=p(0,10,100); apply_to_position(&mut x,1,10,150,1,9).unwrap();
         assert_eq!((x.size_lots,x.entry_price_ticks,x.realized_pnl_quote_lots,x.cum_funding()),(0,0,500,9)); }
-    #[test] fn flip_long_to_short() { let mut x=p(0,10,100); apply_to_position(&mut x,1,15,150,3).unwrap();
+    #[test] fn flip_long_to_short() { let mut x=p(0,10,100); apply_to_position(&mut x,1,15,150,1,3).unwrap();
         assert_eq!((x.side,x.size_lots,x.entry_price_ticks,x.realized_pnl_quote_lots,x.cum_funding()),(1,5,150,500,3)); }
-    #[test] fn short_realizes_on_drop() { let mut x=p(1,10,100); apply_to_position(&mut x,0,10,80,0).unwrap();
+    #[test] fn short_realizes_on_drop() { let mut x=p(1,10,100); apply_to_position(&mut x,0,10,80,1,0).unwrap();
         assert_eq!((x.size_lots,x.realized_pnl_quote_lots),(0,200)); }
+
+    // ── R1 materialization: realized-PnL scaling + collateral routing ────────
+    #[test] fn realized_pnl_returns_delta_and_scales_with_tick() {
+        // long 10 @100, close 10 @150: base pnl = 10·(150−100) = 500.
+        let mut a = p(0, 10, 100);
+        assert_eq!(apply_to_position(&mut a, 1, 10, 150, 1, 0).unwrap(), 500); // tick 1
+        // tick_size = 3 ⇒ realized PnL ×3 (consistency with unrealized PnL/funding).
+        let mut b = p(0, 10, 100);
+        assert_eq!(apply_to_position(&mut b, 1, 10, 150, 3, 0).unwrap(), 1500);
+        // open / same-side add realize nothing.
+        let mut c = p(0, 0, 0);
+        assert_eq!(apply_to_position(&mut c, 0, 5, 100, 7, 0).unwrap(), 0); // open
+        assert_eq!(apply_to_position(&mut c, 0, 5, 200, 7, 0).unwrap(), 0); // add
+        // a loss returns a negative delta.
+        let mut d = p(0, 10, 100);
+        assert_eq!(apply_to_position(&mut d, 1, 10, 80, 1, 0).unwrap(), -200);
+    }
+
+    #[test] fn route_realized_pnl_gain_loss_and_bankruptcy() {
+        // gain credits the bucket, no shortfall.
+        assert_eq!(route_realized_pnl(1_000, 500).unwrap(), (1_500, 0));
+        // loss within the bucket: debited, no shortfall.
+        assert_eq!(route_realized_pnl(1_000, -400).unwrap(), (600, 0));
+        // loss exactly draining the bucket.
+        assert_eq!(route_realized_pnl(1_000, -1_000).unwrap(), (0, 0));
+        // BANKRUPT loss: bucket drained to 0, the remainder is the shortfall the
+        // caller covers from insurance (then ADL).
+        assert_eq!(route_realized_pnl(1_000, -1_500).unwrap(), (0, 500));
+        // zero delta is a no-op.
+        assert_eq!(route_realized_pnl(42, 0).unwrap(), (42, 0));
+        // gain overflow is a checked error (never silent wrap).
+        assert!(route_realized_pnl(u64::MAX, 1).is_err());
+    }
 
     /// State-contract fuzz for the core settlement fn: drive 20k random fills
     /// through ONE position and assert the invariants `apply_fill` and the OI /
@@ -290,7 +382,7 @@ mod position_tests {
             let fill_size = 1 + next() % 100;
             let fill_price = 1 + next() % 10_000;
             let (old_side, old_size, old_entry) = (x.side, x.size_lots, x.entry_price_ticks);
-            apply_to_position(&mut x, fill_side, fill_size, fill_price, 0).unwrap();
+            apply_to_position(&mut x, fill_side, fill_size, fill_price, 1, 0).unwrap();
 
             assert!(x.side <= 1, "side out of range");
             if x.size_lots == 0 {
@@ -349,14 +441,14 @@ mod position_tests {
 
             // Taker leg (snapshot old side/size first, exactly like apply_fill).
             let (t_os, t_oz) = (book[t].side, book[t].size_lots);
-            apply_to_position(&mut book[t], taker_side, size, price, 0).unwrap();
+            apply_to_position(&mut book[t], taker_side, size, price, 1, 0).unwrap();
             let (l, s) =
                 oi_after_leg(long_oi, short_oi, t_os, t_oz, book[t].side, book[t].size_lots);
             long_oi = l;
             short_oi = s;
             // Maker leg — opposite side, same size.
             let (m_os, m_oz) = (book[m].side, book[m].size_lots);
-            apply_to_position(&mut book[m], maker_side, size, price, 0).unwrap();
+            apply_to_position(&mut book[m], maker_side, size, price, 1, 0).unwrap();
             let (l, s) =
                 oi_after_leg(long_oi, short_oi, m_os, m_oz, book[m].side, book[m].size_lots);
             long_oi = l;
