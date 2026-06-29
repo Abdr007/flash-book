@@ -231,6 +231,7 @@ mod program {
         ViewBookDepthV2 = 136,
         ViewQuoteLadder = 137,
         ViewPortfolioRisk = 138,
+        SweepCollateral = 139,
     }
 
     #[inline(always)]
@@ -384,6 +385,7 @@ mod program {
             x if x == Ix::ViewBookDepthV2 as u8 => instructions::views::book_depth(program_id, accounts, rest),
             x if x == Ix::ViewQuoteLadder as u8 => instructions::views::quote_ladder(program_id, accounts, rest),
             x if x == Ix::ViewPortfolioRisk as u8 => instructions::views::portfolio_risk(program_id, accounts, rest),
+            x if x == Ix::SweepCollateral as u8 => instructions::sweep_collateral::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
