@@ -46,6 +46,13 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         if &ts.trader != wallet.key() {
             return Err(ProgramError::InvalidArgument);
         }
+        // ER-active sources fail closed (parity with withdraw_collateral /
+        // sweep_collateral): the per-trader_state ER `reserved_margin` backs
+        // resting orders OUTSIDE `open_positions`, so moving the source's
+        // collateral to a sibling leaves those orders unbacked → bad debt.
+        if ts.er_active != 0 {
+            return Err(ProgramError::Custom(241));
+        }
         if ts.open_positions != 0 {
             return Err(ProgramError::InvalidArgument);
         }

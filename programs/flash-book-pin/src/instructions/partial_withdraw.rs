@@ -35,7 +35,7 @@ const MAX_PORTFOLIO: usize = 8;
 const STRESS_BPS: [i32; 10] = [-3000, -2000, -1000, -500, -200, 200, 500, 1000, 2000, 3000];
 
 /// Initial-margin bps for the withdraw gate: max(maintenance, BPS_DENOM/max_lev).
-fn im_bps(maintenance_bps: u32, max_leverage: u32) -> u32 {
+pub(crate) fn im_bps(maintenance_bps: u32, max_leverage: u32) -> u32 {
     if max_leverage == 0 {
         return maintenance_bps;
     }

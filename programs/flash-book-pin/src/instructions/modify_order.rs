@@ -98,6 +98,12 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
             if order.trader != trader_pk {
                 return Err(ProgramError::Custom(1100)); // wrong trader
             }
+            // A forced-liquidation order (type 3) must not be modifiable by the
+            // liquidatee (it carries their trader key) — else they reprice it
+            // unfillable and evade liquidation. See cancel_order.
+            if order.order_type == 3 {
+                return Err(ProgramError::Custom(1101));
+            }
             order.sub_index
         };
 

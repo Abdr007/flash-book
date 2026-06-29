@@ -175,7 +175,7 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         let mut dup = false;
         {
             let mut scan = |_idx: DataIndex, o: &RestingOrderV2| -> bool {
-                if o.order_type == 3 && o.trader == ex_trader {
+                if o.order_type == 3 && o.trader == ex_trader && o.sub_index == ts_sub {
                     dup = true;
                     return false;
                 }

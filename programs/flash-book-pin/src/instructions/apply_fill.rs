@@ -164,6 +164,16 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         if market.sequencer != *sequencer.key() { return Err(ProgramError::IllegalOwner); }
         // Paused markets settle no fills.
         if market.status == crate::state::MARKET_STATUS_PAUSED { return Err(ProgramError::InvalidArgument); }
+        // M-2: on a haircut-enabled market the trailing haircut_state is MANDATORY
+        // — without it the inline funding settle is skipped and the closed
+        // portion's funding is silently dropped (the R2 leak), and the residual is
+        // left unmaintained. The sequencer chooses the account list, so enforce it.
+        if market.haircut_enabled != 0 && !has_haircut {
+            return Err(ProgramError::InvalidArgument);
+        }
+        // A market with no mark posted (mark == 0) makes `price_within_band`
+        // accept ANY price; refuse settlement until the first mark update.
+        if market.mark_price_ticks == 0 { return Err(ProgramError::InvalidArgument); }
         // Settlement price band: both legs' resting limits are within the
         // anti-stuffing band of the mark, so a legitimate cross is too. Reject a
         // sequencer-supplied price outside it — bounds how far a compromised
@@ -182,6 +192,11 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         let insurance: &mut Insurance = view(&accounts[2]);
         let taker_ts: &mut TraderState = view(&accounts[3]);
         let maker_ts: &mut TraderState = view(&accounts[4]);
+        // On-chain self-trade reject: the two legs must be different WALLETS. A
+        // same-wallet (two sub-accounts) fill lets a compromised sequencer
+        // self-settle one leg to a gain and the other to a loss-into-insurance,
+        // draining the fund. (Pin has no off-chain self-trade enforcement here.)
+        if taker_ts.trader == maker_ts.trader { return Err(ProgramError::InvalidArgument); }
         ensure_pos_disc(&accounts[5]);
         ensure_pos_disc(&accounts[6]);
         let taker_pos: &mut Position = view(&accounts[5]);
@@ -195,16 +210,11 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 
         let fidx = market.cum_funding();
         let tick = market.tick_size;
-        // Snapshot pre-trade sizes/sides (for open_positions + OI deltas) and
-        // sample each leg's collateral bucket — isolated = the position's own
-        // collateral, cross = the trader_state pool — BEFORE any mutation, so
-        // realized PnL routes to whichever bucket backed the position at fill time.
+        // Snapshot pre-trade sizes/sides for the open_positions + OI deltas.
         let taker_before = taker_pos.size_lots;
         let maker_before = maker_pos.size_lots;
         let taker_old_side = taker_pos.side;
         let maker_old_side = maker_pos.side;
-        let taker_iso = taker_pos.collateral_quote_lots > 0;
-        let maker_iso = maker_pos.collateral_quote_lots > 0;
 
         // ── Fees FIRST, before the resize (anchor order) — so a position closing
         // at a loss still has collateral to pay its fee. ─────────────────────
@@ -249,6 +259,14 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
                 .map_err(|_| ProgramError::InvalidArgument)?;
             haircut.residual_quote_lots = residual.to_le_bytes();
         }
+
+        // M-1: sample the collateral bucket AFTER the funding settle. An isolated
+        // position whose accrued funding just drained its own bucket to 0 must
+        // route a subsequent realized LOSS to the CROSS pool (charge the trader),
+        // not the now-empty isolated bucket — else the loss is wrongly socialized
+        // to the insurance fund. Matches anchor's post-funding sampling.
+        let taker_iso = taker_pos.collateral_quote_lots > 0;
+        let maker_iso = maker_pos.collateral_quote_lots > 0;
 
         // ── Resize each leg + capture the realized-PnL delta for this fill (R1).
         let taker_delta = crate::fill_math::apply_to_position(taker_pos, taker_side, size, price, tick, fidx)

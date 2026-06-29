@@ -44,11 +44,13 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
     // ── read + bind everything (immutable), then compute, then write ────
     let ts_trader;
     let ts_delegate;
+    let ts_sub;
     {
         let d = trader_state.try_borrow_data()?;
         let ts = unsafe { &*(d.as_ptr() as *const TraderState) };
         ts_trader = ts.trader;
         ts_delegate = ts.delegate;
+        ts_sub = ts.sub_index;
     }
     // H9 auth: keeper is the trader or the (non-zero) delegate. The zero key can
     // never sign, so an unset delegate grants nothing.
@@ -59,7 +61,10 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
     let (pos_market, pos_isolated) = {
         let d = position.try_borrow_data()?;
         let p = unsafe { &*(d.as_ptr() as *const Position) };
-        if p.trader != ts_trader {
+        // Bind by sub_index too (not just wallet): else a trader routes a
+        // sub-account's matured gain into a DIFFERENT same-wallet pool, evading
+        // the per-sub solvency-gated withdraw. Parity with build_snapshot/anchor.
+        if p.trader != ts_trader || p.sub_index != ts_sub {
             return Err(ProgramError::InvalidArgument);
         }
         (p.market, p.collateral_quote_lots > 0)

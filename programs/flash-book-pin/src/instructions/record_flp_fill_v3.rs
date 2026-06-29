@@ -4,18 +4,18 @@
 //! funds move, NO book — this is the FLP's position bookkeeping, the mirror of
 //! `apply_fill`'s position update for a trader.
 //!
-//! accounts: [authority (signer), exposure (PDA, owned, w)]
+//! accounts: [authority (signer), exposure (PDA, owned, w), market (owned, r)]
 //! data: [size_lots u64][price_ticks u64][side u8][realized_pnl_delta i64]  — 25 bytes
 
-use crate::guard::{assert_disc, assert_owned_by, assert_pda, assert_signer};
+use crate::guard::{assert_disc, assert_market, assert_owned_by, assert_pda, assert_signer};
 use crate::seeds::FLP_PER_MARKET_SEED;
-use crate::state::{FlpExposurePerMarketV3, FLP_PER_MARKET_V3_DISC};
+use crate::state::{FlpExposurePerMarketV3, Market, FLP_PER_MARKET_V3_DISC};
 use pinocchio::{
     account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
 };
 
 pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [authority, exposure, ..] = accounts else {
+    let [authority, exposure, market_ai, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     if data.len() < 25 {
@@ -33,16 +33,27 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     assert_signer(authority)?;
     assert_owned_by(exposure, program_id)?;
     assert_disc(exposure, &FLP_PER_MARKET_V3_DISC)?;
-    // Auth + canonical-PDA binding BEFORE any mutation.
+    assert_market(market_ai, program_id)?;
+    // Bind the exposure to its market + canonical PDA BEFORE any mutation.
     let market = {
         let d = exposure.try_borrow_data()?;
         let e = unsafe { &*(d.as_ptr() as *const FlpExposurePerMarketV3) };
-        if &e.authority != authority.key() {
-            return Err(ProgramError::IllegalOwner);
-        }
         e.market
     };
+    if &market != market_ai.key() {
+        return Err(ProgramError::InvalidArgument);
+    }
     assert_pda(exposure, &[FLP_PER_MARKET_SEED, &market[..]], program_id)?;
+    // Gate on the market's LIVE sequencer, not the snapshotted `e.authority`: the
+    // sequencer recorded at init is stale after `set_market_sequencer` rotation
+    // (which typically happens because the old key was compromised) — that old key
+    // must NOT keep injecting `realized_pnl`, which now drives NAV / redemption.
+    let live_sequencer = unsafe {
+        (*(market_ai.borrow_data_unchecked().as_ptr() as *const Market)).sequencer
+    };
+    if authority.key() != &live_sequencer {
+        return Err(ProgramError::IllegalOwner);
+    }
 
     unsafe {
         let e = &mut *(exposure.borrow_mut_data_unchecked().as_mut_ptr()

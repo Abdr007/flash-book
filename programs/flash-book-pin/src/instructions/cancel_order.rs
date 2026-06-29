@@ -26,6 +26,11 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         let idx = if side_is_bid { handle.lookup_bid_by_order_id(order_id) } else { handle.lookup_ask_by_order_id(order_id) };
         if idx == NIL { return Err(ProgramError::Custom(4)); } // not found
         if handle.order_at(idx).trader != *trader.key() { return Err(ProgramError::Custom(1100)); } // wrong trader
+        // A forced-liquidation order (order_type 3) carries the LIQUIDATEE's
+        // trader pubkey, so without this an underwater trader could cancel their
+        // own liquidation order before the sequencer settles it and evade
+        // liquidation entirely. Only the matcher/settlement removes type-3 orders.
+        if handle.order_at(idx).order_type == 3 { return Err(ProgramError::Custom(1101)); }
         if side_is_bid { handle.remove_bid_node(idx); } else { handle.remove_ask_node(idx); }
     }
     Ok(())

@@ -45,9 +45,15 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         if position.size_lots == 0 { position.set_cum_funding(cum_now); return Ok(()); }
         // Bind the position to THIS trader_state + market — settle is
         // permissionless, so without this anyone could apply one trader's
-        // funding against another trader's collateral.
+        // funding against another trader's collateral. Bind by `sub_index` too
+        // (not just the wallet `.trader`): otherwise a cross trader passes a
+        // funded position + a DIFFERENT empty sub-account's trader_state, so the
+        // clamp-pay debits 0 yet `cum_funding` is re-stamped — ERASING the funding
+        // obligation without payment and drifting the solvency residual into bad
+        // debt. Parity with apply_fill's bind + anchor's per-trader_state position PDA.
         if position.trader != trader_state.trader { return Err(ProgramError::InvalidArgument); }
         if position.market != *accounts[0].key() { return Err(ProgramError::InvalidArgument); }
+        if position.sub_index != trader_state.sub_index { return Err(ProgramError::InvalidArgument); }
         // Shared funding-settle math (the SAME helper apply_fill/apply_flp_fill
         // use inline before a resize): settle on the current size against
         // `cum_now`, fold into the isolated/cross bucket, move the residual

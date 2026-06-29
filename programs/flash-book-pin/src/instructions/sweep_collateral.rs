@@ -117,12 +117,21 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         for i in 0..expected {
             let m_ai = &pairs[2 * i];
             let p_ai = &pairs[2 * i + 1];
-            let Some((pos, mkt, _c)) = build_snapshot(pid, m_ai, from_state, p_ai, &[])? else {
+            let Some((pos, mut mkt, _c)) = build_snapshot(pid, m_ai, from_state, p_ai, &[])? else {
                 return Err(ProgramError::InvalidArgument);
             };
             if seen[..i].iter().any(|k| k == m_ai.key()) {
                 return Err(ProgramError::InvalidArgument); // duplicate market
             }
+            // Withdraw-style gate ⇒ assess against INITIAL margin, not maintenance
+            // (parity with partial_withdraw). `build_snapshot` fills the MAINTENANCE
+            // MMR; override it so a sweep can't strip the IM buffer down to the
+            // liquidation line and then exit the (now-flat) sibling via withdraw.
+            let max_lev = unsafe {
+                (*(m_ai.borrow_data_unchecked().as_ptr() as *const crate::state::Market)).max_leverage
+            };
+            mkt.maintenance_margin_bps =
+                crate::instructions::partial_withdraw::im_bps(mkt.maintenance_margin_bps, max_lev);
             seen[i] = *m_ai.key();
             positions[i] = pos;
             markets[i] = mkt;

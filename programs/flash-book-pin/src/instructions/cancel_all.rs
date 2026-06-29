@@ -45,7 +45,7 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
                 if n_bid + n_ask >= MAX_CANCELS_PER_IX {
                     return false;
                 }
-                if o.trader == trader_pk {
+                if o.trader == trader_pk && o.order_type != 3 { // skip forced-liq (type 3)
                     bid_idx[n_bid] = idx;
                     n_bid += 1;
                 }
@@ -58,7 +58,7 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
                 if n_bid + n_ask >= MAX_CANCELS_PER_IX {
                     return false;
                 }
-                if o.trader == trader_pk {
+                if o.trader == trader_pk && o.order_type != 3 { // skip forced-liq (type 3)
                     ask_idx[n_ask] = idx;
                     n_ask += 1;
                 }

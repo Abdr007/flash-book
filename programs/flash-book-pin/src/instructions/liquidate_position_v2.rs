@@ -231,6 +231,15 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
             continue;
         }
         let price = o.offer_price_ticks;
+        // H-2: bound the offer to the anti-stuffing band of the mark. The offer may
+        // only IMPROVE the close price for the liquidatee, but an UNBOUNDED "better"
+        // price (e.g. ~u64::MAX for a long close) would inject an order that rests
+        // un-fillable forever — freezing the liquidation (the dup-scan then blocks
+        // re-liquidation) while the caller has already skimmed the reward. Reject
+        // any offer outside the band so the injected order stays marketable.
+        if !crate::book::price_within_band(mark, price, crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS) {
+            continue;
+        }
         let beats = if close_side == 1 { price > synthetic } else { price < synthetic };
         if !beats {
             continue;
@@ -288,7 +297,7 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         let mut dup = false;
         {
             let mut scan = |_idx: crate::hypertree::DataIndex, o: &RestingOrderV2| -> bool {
-                if o.order_type == 3 && o.trader == pos_trader {
+                if o.order_type == 3 && o.trader == pos_trader && o.sub_index == ts_sub {
                     dup = true;
                     return false;
                 }

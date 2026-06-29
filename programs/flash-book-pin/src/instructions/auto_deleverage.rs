@@ -76,10 +76,10 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 
     // ── snapshot both positions + trader states (Copy scalars) ──────────
     let (
-        uw_trader, uw_market, uw_side, uw_size, uw_entry, uw_pos_collat,
-        ct_trader, ct_market, ct_side, ct_size, ct_entry, ct_pos_collat,
-        uw_ts_trader, uw_ts_collat, uw_ts_open,
-        ct_ts_trader, ct_ts_collat,
+        uw_trader, uw_market, uw_side, uw_size, uw_entry, uw_pos_collat, uw_pos_sub,
+        ct_trader, ct_market, ct_side, ct_size, ct_entry, ct_pos_collat, ct_pos_sub,
+        uw_ts_trader, uw_ts_collat, uw_ts_open, uw_ts_sub,
+        ct_ts_trader, ct_ts_collat, ct_ts_sub,
         tick_size, adl_last_mark_update,
     ) = {
         let uwp = unsafe { &*(uw_pos.borrow_data_unchecked().as_ptr() as *const Position) };
@@ -88,10 +88,10 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         let ctt = unsafe { &*(ct_ts.borrow_data_unchecked().as_ptr() as *const TraderState) };
         let m = unsafe { &*(market.borrow_data_unchecked().as_ptr() as *const Market) };
         (
-            uwp.trader, uwp.market, uwp.side, uwp.size_lots, uwp.entry_price_ticks, uwp.collateral_quote_lots,
-            ctp.trader, ctp.market, ctp.side, ctp.size_lots, ctp.entry_price_ticks, ctp.collateral_quote_lots,
-            uwt.trader, uwt.collateral_quote_lots, uwt.open_positions,
-            ctt.trader, ctt.collateral_quote_lots,
+            uwp.trader, uwp.market, uwp.side, uwp.size_lots, uwp.entry_price_ticks, uwp.collateral_quote_lots, uwp.sub_index,
+            ctp.trader, ctp.market, ctp.side, ctp.size_lots, ctp.entry_price_ticks, ctp.collateral_quote_lots, ctp.sub_index,
+            uwt.trader, uwt.collateral_quote_lots, uwt.open_positions, uwt.sub_index,
+            ctt.trader, ctt.collateral_quote_lots, ctt.sub_index,
             m.tick_size, m.last_mark_update_slot,
         )
     };
@@ -114,7 +114,14 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     if close_size_lots > uw_size || close_size_lots > ct_size {
         return Err(ProgramError::InvalidArgument);
     }
-    if uw_trader != uw_ts_trader || ct_trader != ct_ts_trader {
+    // Bind BOTH legs to their trader_state by (trader, sub_index) — not just the
+    // wallet. The counter leg in particular was wallet-only: a wallet could pass
+    // ct_pos (sub-A) + ct_ts (sub-B), so the `open_positions` decrement landed on
+    // the WRONG sub-account, desyncing the counter that gates withdraw_collateral /
+    // the portfolio-coverage walks → withdraw-while-exposed / wrongful liquidation.
+    if uw_trader != uw_ts_trader || uw_pos_sub != uw_ts_sub
+        || ct_trader != ct_ts_trader || ct_pos_sub != ct_ts_sub
+    {
         return Err(ProgramError::InvalidArgument);
     }
     // Cannot ADL yourself — also rules out aliasing uw_pos/ct_pos & uw_ts/ct_ts

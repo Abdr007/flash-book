@@ -14,6 +14,10 @@ pub enum VaultMathErr {
     ZeroShares,
     Overflow,
     InsufficientShares,
+    /// Shares are outstanding but NAV is 0 (vault realized to nothing) — the pool
+    /// is insolvent and can't be priced; a 1:1 deposit would dilute the depositor
+    /// into worthless legacy shares. Matches the FLP twin's `None`.
+    Insolvent,
 }
 
 /// Shares to mint for a deposit of `amount` into a vault whose NAV *before* this
@@ -30,8 +34,12 @@ pub fn shares_to_mint(
     if amount == 0 {
         return Err(VaultMathErr::ZeroAmount);
     }
-    let shares = if shares_outstanding == 0 || pre_deposit_nav == 0 {
-        amount
+    let shares = if shares_outstanding == 0 {
+        amount // genuine first deposit ⇒ 1:1 bootstrap
+    } else if pre_deposit_nav == 0 {
+        // Shares outstanding but NAV 0 ⇒ insolvent; reject (was: minted 1:1,
+        // letting the deposit's value accrue to the dead legacy shares).
+        return Err(VaultMathErr::Insolvent);
     } else {
         let prod = (amount as u128)
             .checked_mul(shares_outstanding as u128)
@@ -124,8 +132,9 @@ mod tests {
     #[test]
     fn first_deposit_mints_one_to_one() {
         assert_eq!(shares_to_mint(1_000, 0, 0), Ok(1_000));
-        // NAV wiped (e.g. vault drew down to 0) → also bootstrap 1:1.
-        assert_eq!(shares_to_mint(500, 1_000, 0), Ok(500));
+        // Shares outstanding but NAV wiped to 0 ⇒ insolvent, REJECTED (was: minted
+        // 1:1, diluting the depositor into the dead legacy shares).
+        assert_eq!(shares_to_mint(500, 1_000, 0), Err(VaultMathErr::Insolvent));
     }
 
     #[test]
@@ -275,8 +284,11 @@ mod proofs {
         let shares: u64 = kani::any();
         let nav: u64 = kani::any();
         let r = shares_to_mint(amount, shares, nav);
-        if amount != 0 && (shares == 0 || nav == 0) {
-            assert!(r == Ok(amount));
+        if amount != 0 && shares == 0 {
+            assert!(r == Ok(amount)); // genuine first deposit bootstraps 1:1
+        }
+        if amount != 0 && shares != 0 && nav == 0 {
+            assert!(r == Err(VaultMathErr::Insolvent)); // insolvent pool rejected
         }
         // For any inputs the call returns without panicking; on success the
         // result is non-zero by construction.

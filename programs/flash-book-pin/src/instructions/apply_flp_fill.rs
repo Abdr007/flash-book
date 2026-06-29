@@ -81,6 +81,14 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         if market.status == crate::state::MARKET_STATUS_PAUSED {
             return Err(ProgramError::InvalidArgument);
         }
+        // M-2: haircut_state mandatory on a haircut-enabled market (see apply_fill).
+        if market.haircut_enabled != 0 && !has_haircut {
+            return Err(ProgramError::InvalidArgument);
+        }
+        // Refuse settlement before the first mark is posted (mark == 0 opens the band).
+        if market.mark_price_ticks == 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
         // Price band: the FLP pool is the maker, with NO opposing trader to
         // consent to the price, so a fill outside FLP_MAX_FILL_DEVIATION_BPS of the
         // mark is rejected — stops a compromised sequencer settling far from the

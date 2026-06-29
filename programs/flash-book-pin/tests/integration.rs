@@ -3338,3 +3338,94 @@ async fn view_liquidation_preview_runs_compute_shortfall() {
     };
     banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
 }
+
+// ─── Re-audit 2026-06 regressions ───────────────────────────────────────────
+use flash_book_pin::book::RestingOrderV2; // encode_order_id already imported above
+const IX_SETTLE_FUNDING: u8 = 1;
+const IX_CANCEL_ORDER: u8 = 3;
+const IX_TRANSFER_COLLATERAL: u8 = 17;
+
+// HIGH: settle_funding must bind the position to the trader_state by sub_index —
+// else a cross trader erases a funded position's funding via an empty sibling.
+#[tokio::test]
+async fn settle_funding_rejects_sub_index_mismatch() {
+    let pid = Pubkey::new_unique();
+    let trader = Pubkey::new_unique();
+    let (market, ts, pos) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let (haircut, _) = Pubkey::find_program_address(&[HAIRCUT_SEED, &market.to_bytes()], &pid);
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 1_000, 1, 500, 0, 0));
+    pt.add_account(ts, trader_state(pid, trader, 5_000, 1)); // ts.sub_index = 0
+    let mut pos_acct = position(pid, trader, market, 0, 10, 1_000, 0); // open long (size>0)
+    pos_acct.data[POS_SUB_INDEX] = 2; // a sub-account position — must NOT bind to sub-0 ts
+    pt.add_account(pos, pos_acct);
+    pt.add_account(haircut, haircut_acct(pid, market, 100_000));
+    let (banks, payer, bh) = pt.start().await;
+    let ix = Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(market, false),
+        AccountMeta::new(ts, false),
+        AccountMeta::new(pos, false),
+        AccountMeta::new(haircut, false),
+    ], data: vec![IX_SETTLE_FUNDING] };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).await;
+    assert!(r.is_err(), "sub_index-mismatched position must be rejected by settle_funding");
+}
+
+// F-2: transfer_collateral must fail closed for an ER-active source.
+#[tokio::test]
+async fn transfer_collateral_rejects_er_active() {
+    let pid = Pubkey::new_unique();
+    let wallet = Keypair::new();
+    let (from, to) = (Pubkey::new_unique(), Pubkey::new_unique());
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut from_acct = trader_state(pid, wallet.pubkey(), 1_000, 0);
+    from_acct.data[TS_ER_ACTIVE] = 1; // ER-active ⇒ reserved margin backs resting orders
+    pt.add_account(from, from_acct);
+    pt.add_account(to, trader_state(pid, wallet.pubkey(), 0, 0));
+    pt.add_account(wallet.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let mut data = vec![IX_TRANSFER_COLLATERAL];
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let ix = Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(wallet.pubkey(), true),
+        AccountMeta::new(from, false),
+        AccountMeta::new(to, false),
+    ], data };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &wallet], bh)).await;
+    let err = format!("{:?}", r.expect_err("ER-active transfer must be rejected"));
+    assert!(err.contains("Custom(241)"), "expected Custom(241), got: {err}");
+}
+
+// H-1: a trader must NOT be able to cancel their own forced-liquidation (type-3) order.
+#[tokio::test]
+async fn cancel_order_rejects_forced_liquidation_type3() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (book_pda, book_bump) = Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+    let mut book = init_book(pid, market, Pubkey::new_unique(), Pubkey::new_unique(), book_bump);
+    let oid = encode_order_id(1_000, 1, false); // ask side
+    {
+        let mut h = MarketBookHandle::from_account_data(&mut book.data).unwrap();
+        h.insert_ask(RestingOrderV2 {
+            order_id: oid, seq: 1, price_ticks: 1_000, size_lots: 10, expires_at_slot: 0,
+            trader: trader.pubkey().to_bytes(), last_valid_slot: 0, side: 1, order_type: 3,
+            flags: 0, sub_index: 0,
+        }).unwrap();
+    }
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 1_000, 1, 500, 0, 0));
+    pt.add_account(book_pda, book);
+    pt.add_account(trader.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let mut data = vec![IX_CANCEL_ORDER, 1u8]; // side = ask
+    data.extend_from_slice(&oid.to_le_bytes());
+    let ix = Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(trader.pubkey(), true),
+        AccountMeta::new_readonly(market, false),
+        AccountMeta::new(book_pda, false),
+    ], data };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
+    let err = format!("{:?}", r.expect_err("liquidatee must not cancel their type-3 order"));
+    assert!(err.contains("Custom(1101)"), "expected Custom(1101), got: {err}");
+}
