@@ -9,6 +9,7 @@
 //!   * fills are applied silently — the Pinocchio port does not emit events yet
 //!     (mirrors the ported `place`/`cancel`).
 use crate::book::{self, MarketBookHandle, RestingOrderV2};
+use crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS;
 use crate::guard::{assert_market, assert_market_book};
 use crate::hypertree::{DataIndex, NIL};
 use crate::state::{Market, MARKET_STATUS_ACTIVE};
@@ -89,6 +90,7 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
             }
         }
         let min_base_lots = market.min_base_lots;
+        let mark_price_ticks = market.mark_price_ticks;
 
         let book_data = accounts[2].borrow_mut_data_unchecked();
         let mut handle = MarketBookHandle::from_account_data(book_data)?;
@@ -122,10 +124,20 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         let mut n_stp: usize = 0;
         let mut remaining = size_lots;
         let mut stp_aborted = false;
+        // Set true if the walk stops because a fixed-size match/STP buffer filled
+        // (NOT because the order fully filled). Crossing liquidity may then remain
+        // on the book, so the residual must NOT rest (it would cross → locked book).
+        let mut walk_truncated = false;
 
         {
             let mut walk = |idx: DataIndex, o: &RestingOrderV2| -> bool {
-                if n_matches >= MAX_TAKER_MATCHES || remaining == 0 {
+                if remaining == 0 {
+                    return false; // fully filled — clean stop, not a truncation
+                }
+                // L-1: bound BOTH buffers. STP_CANCEL_OLDEST pushes into a separate
+                // fixed array, so cap on n_stp too or a >64-self-match overruns it.
+                if n_matches >= MAX_TAKER_MATCHES || n_stp >= MAX_TAKER_MATCHES {
+                    walk_truncated = true;
                     return false;
                 }
                 // Cross check: a bid takes asks at price ≤ limit; an ask takes
@@ -202,8 +214,17 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         }
 
         // ── Phase 3: residual — IOC drops it; else rest as a limit order, but
-        // only if it still meets the per-market minimum lot (MATCH-H2: no dust).
-        if remaining > 0 && !ioc && remaining >= min_base_lots {
+        // only if: it meets the per-market minimum lot (MATCH-H2: no dust); the
+        // walk was NOT truncated (H-1: else crossing liquidity may remain and the
+        // residual would lock the book); and the price is within the anti-stuffing
+        // band (M-1: else place_taker becomes a band-bypass vs place/modify). Drop
+        // the residual silently in those cases (parity — not an error).
+        if remaining > 0
+            && !ioc
+            && !walk_truncated
+            && remaining >= min_base_lots
+            && book::price_within_band(mark_price_ticks, limit_ticks, MAX_RESTING_ORDER_DEVIATION_BPS)
+        {
             let order = RestingOrderV2 {
                 order_id: taker_order_id,
                 seq: taker_seq,

@@ -53,16 +53,22 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if displayed_size_lots > total_size_lots || limit_ticks == 0 {
         return Err(ProgramError::InvalidArgument);
     }
-    let (min_base_lots, tick_size) = {
+    let (min_base_lots, tick_size, mark_price_ticks) = {
         let d = market.try_borrow_data()?;
         let m = unsafe { &*(d.as_ptr() as *const Market) };
-        (m.min_base_lots, m.tick_size)
+        (m.min_base_lots, m.tick_size, m.mark_price_ticks)
     };
     if displayed_size_lots < min_base_lots {
         return Err(ProgramError::InvalidArgument); // size below min lot
     }
     if tick_size == 0 || limit_ticks % tick_size != 0 {
         return Err(ProgramError::InvalidArgument); // price not on tick
+    }
+    // Anti-stuffing band — every other resting path (place/modify/taker-residual/
+    // vault) enforces it; iceberg dropped it, letting a trader plant arbitrarily-
+    // priced resting liquidity (poisoned depth / off-book TWAP feed). Parity fix.
+    if !crate::book::price_within_band(mark_price_ticks, limit_ticks, crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS) {
+        return Err(ProgramError::InvalidArgument); // price outside anti-stuffing band
     }
 
     let now = Clock::get()?.slot;

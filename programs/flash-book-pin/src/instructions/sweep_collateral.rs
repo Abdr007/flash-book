@@ -78,6 +78,16 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         if !is_authorized(s, authority.key()) {
             return Err(ProgramError::IllegalOwner);
         }
+        // ER-active sources are fail-closed: their attested `reserved_margin`
+        // backs resting orders held in the ER, which do NOT appear in the
+        // `open_positions` portfolio walk below — so the stress gate cannot see
+        // (and the `from_open == 0` branch entirely skips) that reservation. A
+        // sweep would relocate the backing collateral with zero ER awareness,
+        // exactly the move the strict withdraw gate forbids. Force the ER trader
+        // to settle/withdraw via the xdomain path first.
+        if s.er_active != 0 {
+            return Err(ProgramError::Custom(241)); // resolve ER reservation first
+        }
         (s.trader, s.open_positions, s.collateral_quote_lots)
     };
     {

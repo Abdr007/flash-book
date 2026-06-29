@@ -73,10 +73,15 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         let ts = unsafe { &*(trader_state.borrow_data_unchecked().as_ptr() as *const TraderState) };
         (ts.trader, ts.collateral_quote_lots, ts.open_positions, ts.sub_index)
     };
-    let (mark, penalty_bps) = {
+    let (mark, penalty_bps, exec_last_mark_update) = {
         let m = unsafe { &*(exec_market.borrow_data_unchecked().as_ptr() as *const Market) };
-        (m.mark_price_ticks, m.liq_penalty_bps)
+        (m.mark_price_ticks, m.liq_penalty_bps, m.last_mark_update_slot)
     };
+    // Mark-staleness gate on the exec market (see liquidate_position_v2): refuse to
+    // liquidate against a frozen mark if the sequencer stalled.
+    if Clock::get()?.slot.saturating_sub(exec_last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS {
+        return Err(ProgramError::Custom(248)); // stale mark
+    }
 
     if ex_size == 0 || ex_trader != ts_trader || ex_market != exec_market_key {
         return Err(ProgramError::InvalidArgument);
@@ -108,6 +113,16 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
     else {
         return Err(ProgramError::InvalidArgument);
     };
+    // CROSS-only: this walk credits a SINGLE pooled collateral (`ts_collat`) but
+    // sums every leg's maintenance margin, so an ISOLATED leg (its own
+    // `collateral_quote_lots != 0`, backed by a separate bucket) would have its
+    // MM charged here while its backing is silently excluded → wrongful
+    // liquidation. Anchor structurally excludes isolated legs because positions
+    // are PDA-keyed to the cross trader_state; pin is field-bound, so reject them
+    // explicitly (isolated positions liquidate via the single-position path).
+    if ex_pos_snap.collateral_quote_lots != 0 {
+        return Err(ProgramError::InvalidArgument); // isolated leg — wrong path
+    }
     positions[n] = ex_pos_snap;
     markets[n] = ex_mkt_snap;
     seen[n] = exec_market_key;
@@ -120,6 +135,9 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         else {
             return Err(ProgramError::InvalidArgument);
         };
+        if pos_snap.collateral_quote_lots != 0 {
+            return Err(ProgramError::InvalidArgument); // isolated sibling — cross walk only
+        }
         if seen[..n].iter().any(|k| k == m_ai.key()) {
             return Err(ProgramError::InvalidArgument); // duplicate (incl. exec market)
         }

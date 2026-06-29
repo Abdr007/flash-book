@@ -19,7 +19,11 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         return Err(ProgramError::InvalidInstructionData);
     }
     let maintenance_margin_bps = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    if maintenance_margin_bps == 0 || maintenance_margin_bps >= crate::constants::BPS_DENOM {
+    // 5000 bps (50%) is a generous ceiling — well above any plausible MMR — and
+    // matches the Anchor audit cap (`maintenance_margin_ratio_bps < 5_000`). A
+    // higher value would let the authority set an MMR that liquidates solvent
+    // positions; reject it as a fat-finger / sanity bound.
+    if maintenance_margin_bps == 0 || maintenance_margin_bps >= 5_000 {
         return Err(ProgramError::InvalidArgument);
     }
 

@@ -22,7 +22,16 @@ pub struct Position {
     pub collateral_quote_lots: u64,
     pub realized_pnl_quote_lots: i64,
     pub side: u8, // 0 = long, 1 = short
-    pub _pad0: [u8; 3],
+    /// The trader_state SUB-ACCOUNT this position belongs to (0 = main). Stamped
+    /// from `ts.sub_index` on the first fill and asserted on every read. A wallet
+    /// owns one trader_state per sub_index (all carry `.trader = wallet`), so
+    /// `(trader, sub_index)` bijectively identifies the trader_state — exactly the
+    /// binding Anchor gets from keying the position PDA on `trader_state.key()`.
+    /// Without it, a wallet could substitute a sub-account's position into another
+    /// trader_state's cross-margin solvency gate (→ bad debt). Carved from the old
+    /// `_pad0[3]`; size unchanged (128 bytes), `leverage_cap` still 4-aligned @124.
+    pub sub_index: u8,
+    pub _pad0: [u8; 2],
     /// Per-position max-leverage cap, set by the trader via
     /// `set_position_leverage` (bounded by `Market::max_leverage`). `0` = unset.
     /// Carved from the old 7-byte pad (4-aligned at offset 124); size unchanged
@@ -116,7 +125,14 @@ pub struct Market {
     /// this market (sticky): settlement then REQUIRES a matching committed fill.
     /// `u8` (align 1) carved from `_reserved`; size unchanged (1152 bytes).
     pub fill_commitment_required: u8,
-    pub _reserved: [u8; 911],
+    /// Monotonic settlement nonce. Every `apply_fill` / `apply_flp_fill` must
+    /// present a `fill_seq` STRICTLY greater than this; the handler advances it
+    /// atomically with the fill. Rejects replayed / reordered settlement txs
+    /// (parity with the Anchor `Market.last_settlement_seq` + `advance_settlement_seq`).
+    /// `[u8; 8]` (align 1, LE) carved from `_reserved` at the non-8-aligned offset
+    /// 241; size unchanged (1152 bytes). Pre-field markets read 0.
+    pub last_settlement_seq: [u8; 8],
+    pub _reserved: [u8; 903],
 }
 
 /// Market trading-status values.
@@ -125,6 +141,8 @@ pub const MARKET_STATUS_PAUSED: u8 = 1;
 
 impl Market {
     #[inline] pub fn cum_funding(&self) -> i128 { i128::from_le_bytes(self.cum_funding_index) }
+    #[inline] pub fn settlement_seq(&self) -> u64 { u64::from_le_bytes(self.last_settlement_seq) }
+    #[inline] pub fn set_settlement_seq(&mut self, v: u64) { self.last_settlement_seq = v.to_le_bytes(); }
 }
 
 #[repr(C)]

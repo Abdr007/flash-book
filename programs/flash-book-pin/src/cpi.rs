@@ -394,7 +394,13 @@ mod sol {
         let metas = [
             AccountMeta::new(source.key(), true, false),
             AccountMeta::new(destination.key(), true, false),
-            AccountMeta::new(authority.key(), false, signer_seeds.is_empty()),
+            // The SPL Token transfer authority is ALWAYS a signer — a real wallet
+            // (unsigned `slice_invoke` path) or a PDA vouched-for by `signer_seeds`
+            // (`slice_invoke_signed`). The runtime forwards this `is_signer` flag to
+            // the callee; the seeds only authorize a PDA already marked here as a
+            // signer. Marking it `false` on the PDA path makes SPL Token reject with
+            // MissingRequiredSignature → every vault payout reverts (funds frozen).
+            AccountMeta::new(authority.key(), false, true),
         ];
         let ix = Instruction {
             program_id: &TOKEN_PROGRAM_ID,

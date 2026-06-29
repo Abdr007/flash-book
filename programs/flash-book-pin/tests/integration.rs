@@ -2783,6 +2783,49 @@ async fn partial_withdraw_rejects_er_active_trader() {
     assert!(r.is_err(), "ER-active trader must use xdomain withdraw (strict rejected)");
 }
 
+// Audit 2026-06 regression: the STRICT full `withdraw_collateral` (ix 12) must
+// ALSO fail closed for an ER-active trader (parity with the Anchor
+// `require!(s.er_active == 0, UseXDomainWithdraw)`). Before the fix it had no ER
+// check at all, so an ER-active trader with 0 mainnet `open_positions` could pull
+// collateral that backs their ER resting orders → ER bad debt.
+const IX_WITHDRAW_COLLATERAL: u8 = 12;
+#[tokio::test]
+async fn withdraw_collateral_rejects_er_active_trader() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let ts = Pubkey::new_unique();
+    let (insurance, _) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let d = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut ts_acct = trader_state(pid, trader.pubkey(), 1_000, 0); // flat (open=0)
+    ts_acct.data[TS_ER_ACTIVE] = 1; // but ER-active ⇒ must route via xdomain
+    pt.add_account(ts, ts_acct);
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(d, Account { lamports: 1, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    pt.add_account(trader.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let mut data = vec![IX_WITHDRAW_COLLATERAL];
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid,
+        // [trader(signer), trader_state, insurance, quote_vault, trader_ata, token_program]
+        accounts: vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(ts, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new(d, false), AccountMeta::new(d, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(flash_book_pin::cpi::TOKEN_PROGRAM_ID), false),
+        ],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
+    let err = format!("{:?}", r.expect_err("ER-active trader must not use the strict full withdraw"));
+    // Custom(241) = "use xdomain withdraw" — proves the er_active gate (which runs
+    // BEFORE the vault-binding check) is what rejected, not some later failure.
+    assert!(err.contains("Custom(241)"), "expected er_active gate Custom(241), got: {err}");
+}
+
 #[tokio::test]
 async fn partial_withdraw_rejects_zero_amount() {
     let pid = Pubkey::new_unique();
@@ -2984,4 +3027,107 @@ async fn basket_v2_rejects_underwater_projection() {
     };
     let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
     assert!(r.is_err(), "underwater basket projection must be rejected");
+}
+
+// ─── apply_flp_fill e2e (audit 2026-06 — CRITICAL open_positions + H-2 band) ───
+use flash_book_pin::state::FLP_EXPOSURE_DISC;
+const IX_APPLY_FLP_FILL: u8 = 7;
+// TS_OPEN_POSITIONS (= 52) is already defined near the top of this file.
+
+fn flp_exposure_acct(pid: Pubkey) -> Account {
+    let mut d = vec![0u8; 968];
+    d[0..8].copy_from_slice(&FLP_EXPOSURE_DISC);
+    rent_account(d, pid)
+}
+
+fn flp_fill_setup(pid: Pubkey, seq: &Keypair)
+    -> (ProgramTest, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey) {
+    let taker = Pubkey::new_unique();
+    let (market, insurance, flp, ts, pos) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut mkt = market_full(pid, 1_000, 1, 500, 0, 0); // mark=1000, tick=1
+    put_key(&mut mkt.data, 8, &seq.pubkey()); // Market.sequencer @ 8
+    pt.add_account(market, mkt);
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(flp, flp_exposure_acct(pid));
+    pt.add_account(ts, trader_state(pid, taker, 1_000_000, 0)); // flat: open_positions = 0
+    pt.add_account(pos, position(pid, taker, market, 0, 0, 0, 0)); // bound to (taker, market)
+    pt.add_account(seq.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    (pt, market, insurance, flp, ts, pos)
+}
+
+fn flp_fill_ix(pid: Pubkey, seq: Pubkey, market: Pubkey, insurance: Pubkey, flp: Pubkey, ts: Pubkey, pos: Pubkey, price: u64, fill_seq: u64) -> Instruction {
+    let mut data = vec![IX_APPLY_FLP_FILL];
+    data.extend_from_slice(&10u64.to_le_bytes());   // size
+    data.extend_from_slice(&price.to_le_bytes());   // price
+    data.push(0u8);                                  // taker_side = long
+    data.extend_from_slice(&fill_seq.to_le_bytes()); // fill_seq
+    Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(seq, true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(insurance, false),
+        AccountMeta::new(flp, false),
+        AccountMeta::new(ts, false),
+        AccountMeta::new(pos, false),
+    ], data }
+}
+
+#[tokio::test]
+async fn apply_flp_fill_maintains_open_positions() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let (pt, market, insurance, flp, ts, pos) = flp_fill_setup(pid, &seq);
+    let (banks, payer, bh) = pt.start().await;
+    // in-band price (== mark), fresh fill_seq.
+    let ix = flp_fill_ix(pid, seq.pubkey(), market, insurance, flp, ts, pos, 1_000, 1);
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    assert!(r.is_ok(), "apply_flp_fill should settle: {r:?}");
+    let ts_after = banks.get_account(ts).await.unwrap().unwrap();
+    // CRITICAL regression: open_positions must go 0 -> 1, else the taker could
+    // withdraw all collateral while holding this FLP-matched position.
+    assert_eq!(ts_after.data[TS_OPEN_POSITIONS], 1, "open_positions must be incremented");
+}
+
+#[tokio::test]
+async fn apply_flp_fill_rejects_out_of_band_price() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let (pt, market, insurance, flp, ts, pos) = flp_fill_setup(pid, &seq);
+    let (banks, payer, bh) = pt.start().await;
+    // price 2000 is +100% vs mark 1000 — far outside FLP_MAX_FILL_DEVIATION_BPS (3%).
+    let ix = flp_fill_ix(pid, seq.pubkey(), market, insurance, flp, ts, pos, 2_000, 1);
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    let err = format!("{:?}", r.expect_err("out-of-band FLP fill must be rejected"));
+    assert!(err.contains("Custom(247)"), "expected band reject Custom(247), got: {err}");
+}
+
+// Audit round 3 — the position sub_index binding (CRITICAL: a wallet's sub-account
+// position must not be substitutable into the MAIN account's settlement / solvency
+// gate). bind_or_stamp_position requires `pos.sub_index == ts.sub_index`.
+const POS_SUB_INDEX: usize = 121; // disc8+cum16+trader32+market32+size8+entry8+collat8+realized8+side1
+#[tokio::test]
+async fn apply_flp_fill_rejects_cross_subaccount_position() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let taker = Pubkey::new_unique();
+    let (market, insurance, flp, ts, pos) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut mkt = market_full(pid, 1_000, 1, 500, 0, 0);
+    put_key(&mut mkt.data, 8, &seq.pubkey());
+    pt.add_account(market, mkt);
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(flp, flp_exposure_acct(pid));
+    pt.add_account(ts, trader_state(pid, taker, 1_000_000, 0)); // ts.sub_index = 0 (main)
+    // An ALREADY-OPEN position (size>0 ⇒ bind must MATCH, not stamp) whose
+    // sub_index byte = 2 (a sub-account) — i.e. substituted into the main account.
+    let mut pos_acct = position(pid, taker, market, 0, 5, 1_000, 0);
+    pos_acct.data[POS_SUB_INDEX] = 2;
+    pt.add_account(pos, pos_acct);
+    pt.add_account(seq.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let ix = flp_fill_ix(pid, seq.pubkey(), market, insurance, flp, ts, pos, 1_000, 1);
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    assert!(r.is_err(), "a sub_index-mismatched position must be rejected (cross-sub-account substitution)");
 }
