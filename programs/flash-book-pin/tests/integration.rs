@@ -3655,3 +3655,133 @@ async fn cancel_order_rejects_forced_liquidation_type3() {
     let err = format!("{:?}", r.expect_err("liquidatee must not cancel their type-3 order"));
     assert!(err.contains("Custom(1101)"), "expected Custom(1101), got: {err}");
 }
+
+// ─── funding-rate engine e2e (Wave 25b/37) ───
+const IX_ADVANCE_FUNDING: u8 = 146;
+const IX_SET_FUNDING_PARAMS: u8 = 147;
+const MKT_STATUS: usize = 156;
+const MKT_LAST_MARK_UPDATE: usize = 160;
+// MKT_CUM_FUNDING (= 40) is defined earlier alongside the view tests.
+const MKT_LAST_FUNDING: usize = 257; // u64 LE
+const MKT_FUNDING_SKEW: usize = 265; // u32 LE
+const MKT_FUNDING_VELOCITY: usize = 269; // u32 LE
+const MKT_FUNDING_MAXRATE: usize = 273; // u32 LE
+
+fn get_i128(d: &[u8], off: usize) -> i128 {
+    i128::from_le_bytes(d[off..off + 16].try_into().unwrap())
+}
+
+// A long-heavy market with funding enabled accrues a POSITIVE cum_funding_index
+// (longs pay shorts). Needs a slot warp so dt > 0, so it uses start_with_context.
+#[tokio::test]
+async fn advance_funding_accrues_index_on_positive_skew() {
+    let pid = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+
+    // long_oi 1000 > short_oi 0 ⇒ positive skew; status active (0); mark fresh.
+    let mut m = market_full(pid, 100, 1, 500, 1_000, 0);
+    put_u64(&mut m.data, MKT_LAST_MARK_UPDATE, 50); // fresh vs the warp target (100)
+    put_u64(&mut m.data, MKT_LAST_FUNDING, 10); // past baseline ⇒ dt > 0 (not the first-call path)
+    put_u32(&mut m.data, MKT_FUNDING_SKEW, 1_000_000); // K (e9)
+    put_u32(&mut m.data, MKT_FUNDING_VELOCITY, 1_000_000); // velocity (e9/slot)
+    put_u32(&mut m.data, MKT_FUNDING_MAXRATE, 1_000_000); // cap (e9)
+    assert_eq!(m.data[MKT_STATUS], 0, "market is active");
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, m);
+    let mut ctx = pt.start_with_context().await;
+    ctx.warp_to_slot(100).unwrap();
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(ctx.payer.pubkey(), true), // permissionless caller
+            AccountMeta::new(market, false),
+        ],
+        data: vec![IX_ADVANCE_FUNDING],
+    };
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&ctx.payer.pubkey()), &[&ctx.payer], ctx.last_blockhash);
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let m2 = ctx.banks_client.get_account(market).await.unwrap().unwrap();
+    let cum = get_i128(&m2.data, MKT_CUM_FUNDING);
+    assert!(cum > 0, "long-heavy skew must raise cum_funding_index (longs pay), got {cum}");
+    // last_funding advanced to the crank slot.
+    assert_eq!(get_u64(&m2.data, MKT_LAST_FUNDING), 100, "last_funding stamped to now");
+}
+
+// Funding stays inert when the market never enabled it (all params 0) — the
+// carved-default backward-compat guarantee.
+#[tokio::test]
+async fn advance_funding_inert_when_unconfigured() {
+    let pid = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let mut m = market_full(pid, 100, 1, 500, 1_000, 0); // skew, but NO funding params
+    put_u64(&mut m.data, MKT_LAST_MARK_UPDATE, 50);
+    put_u64(&mut m.data, MKT_LAST_FUNDING, 10);
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, m);
+    let mut ctx = pt.start_with_context().await;
+    ctx.warp_to_slot(100).unwrap();
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(ctx.payer.pubkey(), true),
+            AccountMeta::new(market, false),
+        ],
+        data: vec![IX_ADVANCE_FUNDING],
+    };
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&ctx.payer.pubkey()), &[&ctx.payer], ctx.last_blockhash);
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let m2 = ctx.banks_client.get_account(market).await.unwrap().unwrap();
+    assert_eq!(get_i128(&m2.data, MKT_CUM_FUNDING), 0, "unconfigured market accrues no funding");
+}
+
+#[tokio::test]
+async fn set_funding_params_rejects_non_authority() {
+    let pid = Pubkey::new_unique();
+    let authority = Pubkey::new_unique();
+    let imposter = Keypair::new();
+    let market = Pubkey::new_unique();
+    let mut m = market_full(pid, 100, 1, 500, 0, 0);
+    put_key(&mut m.data, MKT_AUTHORITY, &authority);
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, m);
+    pt.add_account(imposter.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let mut data = vec![IX_SET_FUNDING_PARAMS];
+    data.extend_from_slice(&1_000u32.to_le_bytes());
+    data.extend_from_slice(&1_000u32.to_le_bytes());
+    data.extend_from_slice(&1_000u32.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![AccountMeta::new_readonly(imposter.pubkey(), true), AccountMeta::new(market, false)],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh)).await;
+    assert!(r.is_err(), "non-authority set_funding_params must be rejected");
+}
+
+#[tokio::test]
+async fn set_funding_params_rejects_over_cap() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let market = Pubkey::new_unique();
+    let mut m = market_full(pid, 100, 1, 500, 0, 0);
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, m);
+    pt.add_account(authority.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let mut data = vec![IX_SET_FUNDING_PARAMS];
+    data.extend_from_slice(&1_000u32.to_le_bytes());
+    data.extend_from_slice(&1_000u32.to_le_bytes());
+    data.extend_from_slice(&999_999_999u32.to_le_bytes()); // max_rate > MAX_FUNDING_RATE_E9 (1e7)
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![AccountMeta::new_readonly(authority.pubkey(), true), AccountMeta::new(market, false)],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &authority], bh)).await;
+    assert!(r.is_err(), "an over-cap funding rate must be rejected");
+}

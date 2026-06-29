@@ -132,7 +132,18 @@ pub struct Market {
     /// `[u8; 8]` (align 1, LE) carved from `_reserved` at the non-8-aligned offset
     /// 241; size unchanged (1152 bytes). Pre-field markets read 0.
     pub last_settlement_seq: [u8; 8],
-    pub _reserved: [u8; 903],
+    /// Funding-rate engine state (Wave 25b/37, re-audit 2026-06-30). Stored LE
+    /// (align 1) carved from `_reserved` so the 1152-byte layout is unchanged; all
+    /// `0` on a pre-field market ⇒ funding stays INERT (skew_factor 0 ⇒ target 0,
+    /// velocity 0 ⇒ rate pinned, max_rate 0 ⇒ no accrual — existing behaviour).
+    /// `advance_funding` ramps `funding_rate_e9` toward the OI-skew target and
+    /// accrues it into `cum_funding_index`; `set_funding_params` (admin) turns it on.
+    pub funding_rate_e9: [u8; 8],        // i64 LE — current funding rate (e9, per slot)
+    pub last_funding_slot: [u8; 8],      // u64 LE — last advance (0 = unstamped baseline)
+    pub funding_skew_factor_e9: [u8; 4], // u32 LE — K: e9 funding per unit normalized skew
+    pub funding_velocity_e9: [u8; 4],    // u32 LE — max rate change per slot (ramp velocity)
+    pub max_funding_rate_e9: [u8; 4],    // u32 LE — saturating cap on |rate|
+    pub _reserved: [u8; 875],
 }
 
 /// Market trading-status values.
@@ -141,8 +152,17 @@ pub const MARKET_STATUS_PAUSED: u8 = 1;
 
 impl Market {
     #[inline] pub fn cum_funding(&self) -> i128 { i128::from_le_bytes(self.cum_funding_index) }
+    #[inline] pub fn set_cum_funding(&mut self, v: i128) { self.cum_funding_index = v.to_le_bytes(); }
     #[inline] pub fn settlement_seq(&self) -> u64 { u64::from_le_bytes(self.last_settlement_seq) }
     #[inline] pub fn set_settlement_seq(&mut self, v: u64) { self.last_settlement_seq = v.to_le_bytes(); }
+    // ── funding-rate engine accessors ───────────────────────────────────────
+    #[inline] pub fn funding_rate(&self) -> i64 { i64::from_le_bytes(self.funding_rate_e9) }
+    #[inline] pub fn set_funding_rate(&mut self, v: i64) { self.funding_rate_e9 = v.to_le_bytes(); }
+    #[inline] pub fn last_funding(&self) -> u64 { u64::from_le_bytes(self.last_funding_slot) }
+    #[inline] pub fn set_last_funding(&mut self, v: u64) { self.last_funding_slot = v.to_le_bytes(); }
+    #[inline] pub fn funding_skew_factor(&self) -> u32 { u32::from_le_bytes(self.funding_skew_factor_e9) }
+    #[inline] pub fn funding_velocity(&self) -> u32 { u32::from_le_bytes(self.funding_velocity_e9) }
+    #[inline] pub fn max_funding_rate(&self) -> u32 { u32::from_le_bytes(self.max_funding_rate_e9) }
 }
 
 #[repr(C)]
