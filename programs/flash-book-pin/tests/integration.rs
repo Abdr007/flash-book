@@ -2291,3 +2291,83 @@ async fn undelegate_market_book_rejects_wrong_authority() {
         .await;
     assert!(r.is_err(), "non-authority undelegate must be rejected");
 }
+
+// ─── delegate / undelegate market e2e ───
+const IX_DELEGATE_MARKET: u8 = 122;
+const IX_UNDELEGATE_MARKET: u8 = 123;
+
+#[tokio::test]
+async fn delegate_market_rejects_already_delegated() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let base_mint = Pubkey::new_unique();
+    let quote_mint = Pubkey::new_unique();
+    let (market, _) = Pubkey::find_program_address(&[b"market", &base_mint.to_bytes(), &quote_mint.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    // market owned by the delegation program → assert_owned_by(pid) fails.
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    m.owner = Pubkey::new_from_array(DELEGATION_PROGRAM_ID);
+    pt.add_account(market, m);
+    pt.add_account(authority.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_DELEGATE_MARKET];
+    data.extend_from_slice(&30_000u32.to_le_bytes());
+    data.push(0);
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(pid, false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8;32]), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(DELEGATION_PROGRAM_ID), false),
+        ],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &authority], bh)).await;
+    assert!(r.is_err(), "delegating an already-delegated market must be rejected");
+}
+
+#[tokio::test]
+async fn undelegate_market_rejects_wrong_authority() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let imposter = Keypair::new();
+    let base_mint = Pubkey::new_unique();
+    let quote_mint = Pubkey::new_unique();
+    let (market, _) = Pubkey::find_program_address(&[b"market", &base_mint.to_bytes(), &quote_mint.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    // delegated market: owned by the delegation program, data preserved (authority @ 124).
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    m.owner = Pubkey::new_from_array(DELEGATION_PROGRAM_ID);
+    pt.add_account(market, m);
+    pt.add_account(imposter.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(imposter.pubkey(), true), // not the authority
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(pid, false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8;32]), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(DELEGATION_PROGRAM_ID), false),
+        ],
+        data: vec![IX_UNDELEGATE_MARKET],
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh)).await;
+    assert!(r.is_err(), "non-authority undelegate must be rejected");
+}

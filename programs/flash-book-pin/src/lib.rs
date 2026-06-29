@@ -213,6 +213,8 @@ mod program {
         CloseBookPermission = 119,
         DelegateMarketBook = 120,
         UndelegateMarketBook = 121,
+        DelegateMarket = 122,
+        UndelegateMarket = 123,
     }
 
     #[inline(always)]
@@ -341,6 +343,8 @@ mod program {
             x if x == Ix::CloseBookPermission as u8 => instructions::book_permission::close(program_id, accounts, rest),
             x if x == Ix::DelegateMarketBook as u8 => instructions::delegate_market_book::process(program_id, accounts, rest),
             x if x == Ix::UndelegateMarketBook as u8 => instructions::undelegate_market_book::process(program_id, accounts, rest),
+            x if x == Ix::DelegateMarket as u8 => instructions::delegate_market::process(program_id, accounts, rest),
+            x if x == Ix::UndelegateMarket as u8 => instructions::undelegate_market::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
