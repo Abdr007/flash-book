@@ -24,7 +24,7 @@ use crate::guard::{assert_disc, assert_market, assert_market_book, assert_owned_
 use crate::instructions::apply_fill::assert_position;
 use crate::instructions::margin_probe::build_snapshot;
 use crate::liquidation::{
-    liquidation_penalty_price, liquidator_reward_lots, reward_bps_effective,
+    health_price_with_staleness, liquidation_penalty_price, liquidator_reward_lots, reward_bps_effective,
 };
 use crate::risk::{assess_margin, StressShock};
 use crate::seeds::POSITION_LIQ_STATE_SEED;
@@ -133,13 +133,15 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 
     let now = Clock::get()?.slot;
 
-    // Mark-staleness gate: pin is mark-only, but if the sequencer stalls the mark
-    // freezes at its last (possibly adverse) value and a permissionless caller
-    // could liquidate against a stale price. Refuse when the mark is older than
-    // MARK_STALENESS_MAX_SLOTS (the mark half of Anchor's F4 freshness gate).
-    if now.saturating_sub(last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS {
-        return Err(ProgramError::Custom(248)); // stale mark — refuse to liquidate
-    }
+    // Dual-source health price via the proven `health_price_with_staleness`
+    // helper (the mark half of Anchor's F4 freshness gate). pin is mark-only
+    // (oracle == 0), so on a FRESH mark this returns `(mark, _)`; on a STALE mark
+    // (sequencer stalled) there is no oracle fallback, so it returns `None` and we
+    // refuse — a permissionless caller can't liquidate against a frozen adverse
+    // mark. `is_long = pos_side == 0`. The returned price feeds the penalty price.
+    let mark_stale = now.saturating_sub(last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS;
+    let (health_price, _hp_src) = health_price_with_staleness(mark, 0, mark_stale, pos_side == 0)
+        .ok_or(ProgramError::Custom(248))?; // stale mark, no oracle ⇒ refuse
 
     // ── re-liquidation cooldown ─────────────────────────────────────────
     let (unhealthy_since, last_liquidated) = {
@@ -190,7 +192,9 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 
     // ── synthetic close price ───────────────────────────────────────────
     let close_side = 1 - pos_side;
-    let synthetic = liquidation_penalty_price(close_side, mark, penalty_bps);
+    // Penalty price off the staleness-checked health price (== mark in the
+    // mark-only model, but routed through the proven helper / oracle-ready).
+    let synthetic = liquidation_penalty_price(close_side, health_price, penalty_bps);
     if synthetic == 0 {
         return Err(ProgramError::InvalidArgument); // degenerate price
     }

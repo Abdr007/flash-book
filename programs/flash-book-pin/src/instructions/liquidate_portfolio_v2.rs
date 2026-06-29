@@ -77,11 +77,12 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         let m = unsafe { &*(exec_market.borrow_data_unchecked().as_ptr() as *const Market) };
         (m.mark_price_ticks, m.liq_penalty_bps, m.last_mark_update_slot)
     };
-    // Mark-staleness gate on the exec market (see liquidate_position_v2): refuse to
-    // liquidate against a frozen mark if the sequencer stalled.
-    if Clock::get()?.slot.saturating_sub(exec_last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS {
-        return Err(ProgramError::Custom(248)); // stale mark
-    }
+    // Dual-source health price via `health_price_with_staleness` (see
+    // liquidate_position_v2): mark-only ⇒ `(mark, _)` on a fresh mark, `None`
+    // (refuse) on a stale one with no oracle fallback. Feeds the penalty price.
+    let mark_stale = Clock::get()?.slot.saturating_sub(exec_last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS;
+    let (health_price, _hp_src) = crate::liquidation::health_price_with_staleness(mark, 0, mark_stale, ex_side == 0)
+        .ok_or(ProgramError::Custom(248))?; // stale mark, no oracle ⇒ refuse
 
     if ex_size == 0 || ex_trader != ts_trader || ex_market != exec_market_key {
         return Err(ProgramError::InvalidArgument);
@@ -157,7 +158,7 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
 
     // ── synthetic close price + inject the full-size liquidation order ──
     let close_side = 1 - ex_side;
-    let limit = crate::liquidation::liquidation_penalty_price(close_side, mark, penalty_bps);
+    let limit = crate::liquidation::liquidation_penalty_price(close_side, health_price, penalty_bps);
     if limit == 0 {
         return Err(ProgramError::InvalidArgument);
     }

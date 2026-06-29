@@ -1,4 +1,6 @@
-//! view_* — read-only "view" instructions, ported for anchor parity (134/134).
+//! view_* — read-only "view" instructions. The first five are anchor parity
+//! (134/134); `view_liquidation_preview` (Ix 145) is a pin addition that surfaces
+//! `compute_shortfall` (a previously-dead-but-proven helper).
 //!
 //! In Anchor these emit events that off-chain UIs decode via the IDL. pin has no
 //! Anchor event/IDL machinery, so each computes the values its inputs make
@@ -24,6 +26,7 @@ const TAG_TRADER_TIER: u8 = 0xF1;
 const TAG_BOOK_DEPTH: u8 = 0xF2;
 const TAG_QUOTE_LADDER: u8 = 0xF3;
 const TAG_PORTFOLIO_RISK: u8 = 0xF4;
+const TAG_LIQ_PREVIEW: u8 = 0xF5;
 
 /// view_predicted_funding — emits mark + cum-funding. premium/rate are 0: pin is
 /// mark-only (the sequencer sets mark directly; there is no oracle-mark spread).
@@ -141,6 +144,53 @@ pub fn portfolio_risk(pid: &Pubkey, accounts: &[AccountInfo], _d: &[u8]) -> Prog
     buf[1..33].copy_from_slice(&trader);
     buf[33..41].copy_from_slice(&collateral.to_le_bytes());
     buf[41] = open;
+    sol_log_data(&[&buf]);
+    Ok(())
+}
+
+/// view_liquidation_preview — read-only preview of a position's liquidation
+/// BANKRUPTCY RESOLUTION via the proven `compute_shortfall`: the liquidation
+/// penalty, the insurance-fund shortfall (bad debt), and the recovered
+/// collateral, computed at the (mark-only) health price + the market's
+/// `liq_penalty_bps`. This is exactly the resolution the
+/// injection→`apply_fill` (R1) settlement produces — surfaced here for keepers /
+/// UIs to size insurance/ADL before acting. Changes NO state; a flat position
+/// emits zeros (nothing to liquidate).
+/// accounts: [market, trader_state, position] (all program-owned)
+pub fn liquidation_preview(pid: &Pubkey, accounts: &[AccountInfo], _d: &[u8]) -> ProgramResult {
+    let [market, trader_state, position, ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let penalty_bps = {
+        assert_owned_by(market, pid)?;
+        assert_disc(market, &MARKET_DISC)?;
+        let d = market.try_borrow_data()?;
+        let m = unsafe { &*(d.as_ptr() as *const Market) };
+        m.liq_penalty_bps
+    };
+    // [tag][position(32)][penalty u64][shortfall u64][recovered u64]
+    let mut buf = [0u8; 1 + 32 + 8 + 8 + 8];
+    buf[0] = TAG_LIQ_PREVIEW;
+    buf[1..33].copy_from_slice(position.key());
+    // `build_snapshot` validates (market, trader_state, position) + prices at the
+    // mark; `None` ⇒ a flat position (nothing to liquidate, leave zeros).
+    if let Some((pos_snap, mkt_snap, ts_collat)) =
+        crate::instructions::margin_probe::build_snapshot(pid, market, trader_state, position, &[])?
+    {
+        // Isolated positions are backed by their own bucket; cross by the pool.
+        let collateral = if pos_snap.collateral_quote_lots > 0 {
+            pos_snap.collateral_quote_lots
+        } else {
+            ts_collat
+        };
+        let res = crate::liquidation::compute_shortfall(
+            &pos_snap, mkt_snap.mark_price, collateral, &mkt_snap, penalty_bps,
+        )
+        .map_err(|_| ProgramError::ArithmeticOverflow)?;
+        buf[33..41].copy_from_slice(&res.liquidation_penalty_quote_lots.to_le_bytes());
+        buf[41..49].copy_from_slice(&res.shortfall_quote_lots.to_le_bytes());
+        buf[49..57].copy_from_slice(&res.collateral_recovered_quote_lots.to_le_bytes());
+    }
     sol_log_data(&[&buf]);
     Ok(())
 }

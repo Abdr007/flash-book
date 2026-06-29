@@ -180,9 +180,17 @@ regressions**. Panic/DoS agent: **no reachable panic or OOB on any deployed path
   cross/clamp/underflow/flat) + e2e (`apply_flp_fill_settles_funding_before_resize`:
   funding settled on the pre-add size 10 ⇒ 100 paid, not the post-add 20 ⇒ 200;
   residual moved by RISK-1).
-- **Other R1/R2 consequences:** the dead `compute_shortfall` / `health_price_with_staleness`
-  and per-market FLP v3 par-redemption are downstream of full settlement completeness;
-  the pin port remains devnet/WIP/UNAUDITED.
+- **Dead `compute_shortfall` / `health_price_with_staleness` — ✅ WIRED (2026-06).**
+  `health_price_with_staleness` now drives the staleness-checked health/penalty
+  price in `liquidate_position_v2` + `liquidate_portfolio_v2` (replacing the inline
+  mark + round-2 staleness gate; behavior-identical in the mark-only model — fresh
+  ⇒ `(mark,_)`, stale-with-no-oracle ⇒ refuse — and oracle-ready). `compute_shortfall`
+  is wired into a new read-only `view_liquidation_preview` (Ix 145) that emits a
+  position's liquidation bankruptcy resolution (penalty / insurance shortfall /
+  recovered) — exactly the resolution the injection→`apply_fill` (R1) settlement
+  produces, surfaced for keepers/UIs. Both helpers were already host-tested + (for
+  the liquidation core) Kani-proven; this makes them live. Per-market FLP v3
+  par-redemption is itself fixed (above). The pin port remains devnet/WIP/UNAUDITED.
 - **Liquidation reward-from-liquidatee model** (reward skimmed from the liquidatee's
   backing, sized on leveraged notional, paid before the close settles): the stacking
   drain is closed (#24), but the single-call "reward can be ~100% of backing when

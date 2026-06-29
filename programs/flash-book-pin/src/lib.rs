@@ -238,6 +238,10 @@ mod program {
         WithdrawCollateralXdomain = 142,
         PlaceBasketOrderV2 = 143,
         PlaceBasketOrderNV2 = 144,
+        /// Read-only preview of a position's liquidation bankruptcy resolution
+        /// (penalty / insurance shortfall / recovered collateral) via the proven
+        /// `compute_shortfall`. pin addition beyond the 134/134 anchor parity set.
+        ViewLiquidationPreview = 145,
     }
 
     #[inline(always)]
@@ -391,6 +395,7 @@ mod program {
             x if x == Ix::ViewBookDepthV2 as u8 => instructions::views::book_depth(program_id, accounts, rest),
             x if x == Ix::ViewQuoteLadder as u8 => instructions::views::quote_ladder(program_id, accounts, rest),
             x if x == Ix::ViewPortfolioRisk as u8 => instructions::views::portfolio_risk(program_id, accounts, rest),
+            x if x == Ix::ViewLiquidationPreview as u8 => instructions::views::liquidation_preview(program_id, accounts, rest),
             x if x == Ix::SweepCollateral as u8 => instructions::sweep_collateral::process(program_id, accounts, rest),
             x if x == Ix::PartialWithdrawCollateral as u8 => instructions::partial_withdraw::process(program_id, accounts, rest),
             x if x == Ix::PartialWithdrawCollateralXdomain as u8 => instructions::partial_withdraw::xdomain(program_id, accounts, rest),
