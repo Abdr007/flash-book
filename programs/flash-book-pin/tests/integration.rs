@@ -3785,3 +3785,188 @@ async fn set_funding_params_rejects_over_cap() {
     let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &authority], bh)).await;
     assert!(r.is_err(), "an over-cap funding rate must be rejected");
 }
+
+// ─── commit-reveal fill authenticity (consumer / apply_fill) ───
+const IX_APPLY_FILL: u8 = 0;
+const MKT_FILL_COMMIT_REQUIRED: usize = 240;
+use flash_book_pin::fill_commitment::{
+    buffer_init as fc_buffer_init, buffer_push as fc_buffer_push,
+    fill_commit_account_len, fill_preimage as fc_preimage, FILL_RING_CAP,
+};
+
+// An ARMED market (fill_commitment_required = 1) whose ring already holds the
+// commitment for a long 10 @ 1000 fill between `taker` and `maker` at index 0 —
+// exactly what an honest matcher would have pushed. Returns the account keys.
+fn armed_fill_setup(
+    pid: Pubkey,
+    seq: &Keypair,
+) -> (ProgramTest, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey) {
+    let taker = Pubkey::new_unique();
+    let maker = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let (insurance, _) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let (taker_ts, maker_ts, taker_pos, maker_pos) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+
+    let mut mkt = market_full(pid, 1_000, 1, 500, 0, 0); // mark 1000, tick 1, taker_fee 0
+    put_key(&mut mkt.data, 8, &seq.pubkey()); // sequencer
+    mkt.data[MKT_FILL_COMMIT_REQUIRED] = 1; // ARMED
+
+    // Ring at the canonical PDA, pre-loaded with the honest commitment for the fill.
+    let (ring, ring_bump) = Pubkey::find_program_address(&[FILL_COMMIT_SEED, &market.to_bytes()], &pid);
+    let mut ring_data = vec![0u8; fill_commit_account_len(FILL_RING_CAP as usize)];
+    fc_buffer_init(&mut ring_data, &market.to_bytes(), FILL_RING_CAP, ring_bump).unwrap();
+    let pre = fc_preimage(&market.to_bytes(), &taker.to_bytes(), &maker.to_bytes(), 0, 10, 1_000, 0, 0, 0);
+    let commit = solana_sdk::keccak::hashv(&[&pre[..]]).to_bytes();
+    fc_buffer_push(&mut ring_data, &market.to_bytes(), commit).unwrap();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, mkt);
+    pt.add_account(insurance, insurance_full(pid, 1_000_000, 0));
+    pt.add_account(taker_ts, trader_state(pid, taker, 1_000_000, 0));
+    pt.add_account(maker_ts, trader_state(pid, maker, 1_000_000, 0));
+    pt.add_account(taker_pos, position(pid, taker, market, 0, 0, 0, 0));
+    pt.add_account(maker_pos, position(pid, maker, market, 1, 0, 0, 0));
+    pt.add_account(ring, rent_account(ring_data, pid));
+    pt.add_account(seq.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 });
+    (pt, market, insurance, taker_ts, maker_ts, taker_pos, maker_pos, ring, taker, maker)
+}
+
+fn apply_fill_ix(pid: Pubkey, seq: Pubkey, market: Pubkey, insurance: Pubkey, taker_ts: Pubkey, maker_ts: Pubkey, taker_pos: Pubkey, maker_pos: Pubkey, ring: Pubkey, size: u64, price: u64) -> Instruction {
+    let mut data = vec![IX_APPLY_FILL];
+    data.extend_from_slice(&size.to_le_bytes());
+    data.extend_from_slice(&price.to_le_bytes());
+    data.push(0u8); // taker_side = long
+    data.extend_from_slice(&1u64.to_le_bytes()); // fill_seq
+    Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(seq, true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(insurance, false),
+        AccountMeta::new(taker_ts, false),
+        AccountMeta::new(maker_ts, false),
+        AccountMeta::new(taker_pos, false),
+        AccountMeta::new(maker_pos, false),
+        AccountMeta::new(ring, false), // fill-commitment ring (found by PDA+disc)
+    ], data }
+}
+
+// The committed fill settles AND advances the ring (settle_index 0 -> 1).
+#[tokio::test]
+async fn apply_fill_settles_committed_fill() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let (pt, market, insurance, taker_ts, maker_ts, taker_pos, maker_pos, ring, _t, _m) = armed_fill_setup(pid, &seq);
+    let (banks, payer, bh) = pt.start().await;
+    let ix = apply_fill_ix(pid, seq.pubkey(), market, insurance, taker_ts, maker_ts, taker_pos, maker_pos, ring, 10, 1_000);
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    assert!(r.is_ok(), "the committed fill must settle: {r:?}");
+    // Ring advanced: settle_index (u64 @ header OFF_SETTLED = 16) == 1.
+    let ring_after = banks.get_account(ring).await.unwrap().unwrap();
+    assert_eq!(get_u64(&ring_after.data, 16), 1, "ring settle_index must advance to 1");
+}
+
+// A FABRICATED fill (wrong size) on an armed market is rejected — the recomputed
+// keccak differs from the matcher's pushed commit -> FillNotCommitted (Custom 1102).
+#[tokio::test]
+async fn apply_fill_rejects_fabricated_fill_when_armed() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let (pt, market, insurance, taker_ts, maker_ts, taker_pos, maker_pos, ring, _t, _m) = armed_fill_setup(pid, &seq);
+    let (banks, payer, bh) = pt.start().await;
+    // size 99 != the committed 10 -> the recomputed commitment won't match.
+    let ix = apply_fill_ix(pid, seq.pubkey(), market, insurance, taker_ts, maker_ts, taker_pos, maker_pos, ring, 99, 1_000);
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    let err = format!("{:?}", r.expect_err("a fabricated fill must be rejected on an armed market"));
+    assert!(err.contains("Custom(1102)"), "expected Custom(1102) FillNotCommitted, got: {err}");
+}
+
+// On an armed market, settlement MUST carry the ring — omitting it is rejected.
+#[tokio::test]
+async fn apply_fill_requires_ring_when_armed() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let (pt, market, insurance, taker_ts, maker_ts, taker_pos, maker_pos, _ring, _t, _m) = armed_fill_setup(pid, &seq);
+    let (banks, payer, bh) = pt.start().await;
+    // Build the ix WITHOUT the ring account (7 accounts only).
+    let mut data = vec![IX_APPLY_FILL];
+    data.extend_from_slice(&10u64.to_le_bytes());
+    data.extend_from_slice(&1_000u64.to_le_bytes());
+    data.push(0u8);
+    data.extend_from_slice(&1u64.to_le_bytes());
+    let ix = Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(seq.pubkey(), true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(insurance, false),
+        AccountMeta::new(taker_ts, false),
+        AccountMeta::new(maker_ts, false),
+        AccountMeta::new(taker_pos, false),
+        AccountMeta::new(maker_pos, false),
+    ], data };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    let err = format!("{:?}", r.expect_err("armed settlement without the ring must be rejected"));
+    assert!(err.contains("Custom(1103)"), "expected Custom(1103) FillCommitmentMissing, got: {err}");
+}
+
+// PRODUCER: an armed market's matcher PUSHES the exact keccak commitment a long
+// taker's crossing fill produces — byte-identical to what apply_fill recomputes
+// at settle (the full commit-reveal round-trip).
+#[tokio::test]
+async fn place_taker_order_pushes_commitment_when_armed() {
+    const IX_PLACE_TAKER: u8 = 4;
+    let pid = Pubkey::new_unique();
+    let taker = Keypair::new();
+    let maker = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let (book_pda, book_bump) = Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+    let (ring, ring_bump) = Pubkey::find_program_address(&[FILL_COMMIT_SEED, &market.to_bytes()], &pid);
+
+    let mut mkt = market_full(pid, 1_000, 1, 500, 0, 0); // mark 1000, tick 1, active
+    mkt.data[MKT_FILL_COMMIT_REQUIRED] = 1; // ARMED
+
+    // A resting ASK (maker, sub 0) at 1000 × 10 for the long taker to cross.
+    let mut book = init_book(pid, market, base, quote, book_bump);
+    {
+        let mut h = MarketBookHandle::from_account_data(&mut book.data).unwrap();
+        let oid = encode_order_id(1_000, 1, false);
+        h.insert_ask(RestingOrderV2 {
+            order_id: oid, seq: 1, price_ticks: 1_000, size_lots: 10, expires_at_slot: 0,
+            trader: maker.to_bytes(), last_valid_slot: 0, side: 1, order_type: 0, flags: 0, sub_index: 0,
+        }).unwrap();
+    }
+
+    let mut ring_data = vec![0u8; fill_commit_account_len(FILL_RING_CAP as usize)];
+    fc_buffer_init(&mut ring_data, &market.to_bytes(), FILL_RING_CAP, ring_bump).unwrap();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, mkt);
+    pt.add_account(book_pda, book);
+    pt.add_account(ring, rent_account(ring_data, pid));
+    pt.add_account(taker.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    // place_taker_order: bid (side 0), size 10, limit 1000 — crosses the ask.
+    let mut data = vec![IX_PLACE_TAKER, 0u8];
+    data.extend_from_slice(&10u64.to_le_bytes()); // size
+    data.extend_from_slice(&1_000u64.to_le_bytes()); // limit
+    data.extend_from_slice(&0u64.to_le_bytes()); // expires
+    data.push(0u8); // flags
+    data.push(0u8); // sub_index
+    let ix = Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(taker.pubkey(), true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(book_pda, false),
+        AccountMeta::new(ring, false), // fill-commitment ring
+    ], data };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &taker], bh)).await;
+    assert!(r.is_ok(), "armed taker cross must push a commitment: {r:?}");
+
+    let ring_after = banks.get_account(ring).await.unwrap().unwrap();
+    // produced (OFF_PRODUCED = 8) advanced to 1.
+    assert_eq!(get_u64(&ring_after.data, 8), 1, "matcher pushed exactly one commitment");
+    // The pushed commit (slot 0 @ header end = 64) == the keccak the CONSUMER recomputes.
+    let pre = fc_preimage(&market.to_bytes(), &taker.pubkey().to_bytes(), &maker.to_bytes(), 0, 10, 1_000, 0, 0, 0);
+    let expected = solana_sdk::keccak::hashv(&[&pre[..]]).to_bytes();
+    assert_eq!(&ring_after.data[64..96], &expected[..], "pushed commit must equal the round-trip keccak");
+}

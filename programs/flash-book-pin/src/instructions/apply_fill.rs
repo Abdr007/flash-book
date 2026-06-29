@@ -148,15 +148,27 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     if accounts[3].key() == accounts[4].key() || accounts[5].key() == accounts[6].key() {
         return Err(ProgramError::InvalidArgument);
     }
-    // Optional trailing haircut_state (R2 inline funding settle). Validate it as
-    // THIS market's canonical `[b"haircut", market]` PDA so the residual we move
-    // is the right market's accumulator, not an attacker-supplied account.
-    let has_haircut = accounts.len() > 7;
+    // Optional trailing haircut_state (R2 inline funding settle). Identify it by its
+    // DISCRIMINATOR, not just position: the fill-commitment ring is ALSO a trailing
+    // optional account (found below by find_fill_commitment), so a market that passes
+    // only the ring would otherwise have it mis-validated as the haircut PDA
+    // (InvalidSeeds). Validate the haircut as THIS market's canonical
+    // `[b"haircut", market]` PDA so the residual we move is the right accumulator.
+    let has_haircut = accounts.len() > 7
+        && accounts[7].is_owned_by(pid)
+        && accounts[7]
+            .try_borrow_data()
+            .map(|d| d.len() >= 8 && d[0..8] == HAIRCUT_STATE_DISC)
+            .unwrap_or(false);
     if has_haircut {
-        assert_owned_by(&accounts[7], pid)?;
         assert_pda(&accounts[7], &[HAIRCUT_SEED, &accounts[1].key()[..]], pid)?;
-        assert_disc(&accounts[7], &HAIRCUT_STATE_DISC)?;
     }
+    // Commit-reveal: locate this market's (optional) fill-commitment ring among the
+    // trailing accounts. When the market is ARMED, settlement RECOMPUTES this fill's
+    // keccak commitment and settles it FIFO against the ring (below), so a
+    // sequencer-fabricated fill (different economic content) won't match the
+    // matcher's pushed commit. Scanned by canonical PDA + disc (no fake account).
+    let fc_opt = crate::fill_commitment::find_fill_commitment(accounts, pid, accounts[1].key());
 
     unsafe {
         let market: &mut Market = view(&accounts[1]);
@@ -207,6 +219,28 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         let mkt_key = *accounts[1].key();
         bind_or_stamp_position(taker_pos, &taker_ts.trader, &mkt_key, taker_ts.sub_index)?;
         bind_or_stamp_position(maker_pos, &maker_ts.trader, &mkt_key, maker_ts.sub_index)?;
+
+        // ── Commit-reveal settle (authenticity gate, BEFORE any value moves) ──
+        // ARMED market ⇒ the ring is MANDATORY (the sequencer builds the account
+        // list; without this a compromised sequencer would omit it and settle
+        // fabricated fills unguarded). Recompute keccak(fill_preimage) from THIS
+        // fill's economic content and settle it FIFO against the matcher-pushed
+        // commit — a fabricated/reordered fill yields FillNotCommitted and reverts
+        // atomically (the ring advance is undone with the rest of the tx).
+        if market.fill_commitment_required != 0 && fc_opt.is_none() {
+            return Err(ProgramError::Custom(1103)); // FillCommitmentMissing
+        }
+        if let Some(fc) = fc_opt {
+            let mut fc_data = fc.try_borrow_mut_data()?;
+            let idx = crate::fill_commitment::buffer_settle_index(&fc_data);
+            let pre = crate::fill_commitment::fill_preimage(
+                &mkt_key, &taker_ts.trader, &maker_ts.trader, taker_side, size, price,
+                taker_ts.sub_index, maker_ts.sub_index, idx,
+            );
+            let commit = crate::fill_commitment::keccak256(&[&pre[..]]);
+            crate::fill_commitment::buffer_settle(&mut fc_data, &mkt_key, commit)
+                .map_err(|_| ProgramError::Custom(1102))?; // FillNotCommitted / ring error
+        }
 
         let fidx = market.cum_funding();
         let tick = market.tick_size;

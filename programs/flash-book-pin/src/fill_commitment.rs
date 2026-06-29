@@ -220,6 +220,71 @@ pub fn advance_settlement_seq(current: u64, fill_seq: u64) -> Result<u64, ()> {
     }
 }
 
+// ── on-chain keccak + ring lookup (the wired producer/consumer call these) ────
+
+/// `keccak256` of the concatenated `slices` via the Solana `sol_keccak256`
+/// syscall. The producer (`place_taker_order`) and consumer (`apply_fill`) call
+/// this on the SAME `fill_preimage`, so the hashes match IFF the fill's economic
+/// content matches — the settlement-authenticity guarantee. SBF-only (the
+/// syscall); the host build stubs it (the producer/consumer run on-chain; host
+/// unit tests use synthetic commits). Identical hash to anchor's
+/// `solana_keccak_hasher::hashv`, so the commitment format is wire-compatible.
+#[cfg(target_os = "solana")]
+pub fn keccak256(slices: &[&[u8]]) -> FillCommit {
+    extern "C" {
+        fn sol_keccak256(vals: *const u8, val_len: u64, hash_result: *mut u8) -> u64;
+    }
+    let mut out = [0u8; 32];
+    // `slices` is `&[&[u8]]`; each `&[u8]` is a `{ptr, len}` pair, exactly the
+    // `SolBytes` array the syscall expects.
+    unsafe {
+        sol_keccak256(slices.as_ptr() as *const u8, slices.len() as u64, out.as_mut_ptr());
+    }
+    out
+}
+
+#[cfg(not(target_os = "solana"))]
+pub fn keccak256(_slices: &[&[u8]]) -> FillCommit {
+    [0u8; 32] // host stub — never on the settlement path in host unit tests
+}
+
+/// Locate this market's canonical fill-commitment ring among `accounts`: the
+/// program-owned account at the `[FILL_COMMIT_SEED, market]` PDA carrying
+/// `FILL_COMMIT_DISC`. `None` if absent. A fake account can't pass (only this
+/// program writes that disc at that PDA). Used to find the (optional) ring on the
+/// producer/consumer paths.
+#[cfg(target_os = "solana")]
+pub fn find_fill_commitment<'a>(
+    accounts: &'a [pinocchio::account_info::AccountInfo],
+    pid: &pinocchio::pubkey::Pubkey,
+    market: &[u8; 32],
+) -> Option<&'a pinocchio::account_info::AccountInfo> {
+    let (expected, _) =
+        pinocchio::pubkey::find_program_address(&[FILL_COMMIT_SEED, &market[..]], pid);
+    for a in accounts {
+        if a.key() == &expected && a.is_owned_by(pid) && a.data_len() >= FILL_COMMIT_HEADER_LEN {
+            if let Ok(d) = a.try_borrow_data() {
+                if d[0..8] == FILL_COMMIT_DISC {
+                    return Some(a);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Host compile-stub: the producer/consumer that call this run on-chain (the ring
+/// is exercised on the SBF target / in integration tests); host unit tests drive
+/// the ring primitives directly.
+#[cfg(not(target_os = "solana"))]
+pub fn find_fill_commitment<'a>(
+    _accounts: &'a [pinocchio::account_info::AccountInfo],
+    _pid: &pinocchio::pubkey::Pubkey,
+    _market: &[u8; 32],
+) -> Option<&'a pinocchio::account_info::AccountInfo> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

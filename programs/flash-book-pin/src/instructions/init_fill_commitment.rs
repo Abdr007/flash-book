@@ -2,18 +2,15 @@
 //! ring (`[b"fill_commit", market]`). Authority-gated. Port of the Anchor
 //! `init_fill_commitment`.
 //!
-//! HONEST-ENFORCEMENT NOTE (audit 2026-06): the Anchor original ALSO flips the
-//! sticky `Market.fill_commitment_required = 1` here, because Anchor's matcher
-//! (`place_taker_order_v2`) `buffer_push`es a keccak commit per crossed fill and
-//! `apply_fill` `buffer_settle`s it under that flag. The Pinocchio port does NOT
-//! YET wire the producer/consumer (the matcher pushes nothing; `apply_fill`
-//! settles nothing) — and pin has no keccak in the SBF runtime to recompute the
-//! preimage. Arming the flag would advertise a settlement-authenticity guarantee
-//! the program does not enforce. So this port allocates+initializes the ring but
-//! LEAVES THE FLAG UNSET until the matcher push + `apply_fill` settle (with a
-//! byte-exact producer==consumer preimage e2e test, mirroring Anchor's) land.
-//! See AUDIT_SCOPE residuals. The ring primitives (`fill_commitment.rs`) are
-//! Kani-proven and ready; only the two hot-path call sites + keccak remain.
+//! ARMS the market (re-audit 2026-06-30): now that the producer (`place_taker_order`
+//! pushes a keccak commit per crossed fill) and consumer (`apply_fill` recomputes +
+//! `buffer_settle`s it) are wired — with the `sol_keccak256` syscall recomputing the
+//! same `fill_preimage` on both sides — this sets the sticky
+//! `Market.fill_commitment_required = 1`. Settlement on this market then REQUIRES the
+//! ring + a matching commitment: a sequencer-fabricated fill yields `FillNotCommitted`.
+//! Opt-in per market (calling this IS the opt-in); the operator must run the
+//! commit-reveal flow (takers cross via `place_taker_order`, the sequencer settles
+//! FIFO via `apply_fill`). The ring primitives (`fill_commitment.rs`) are Kani-proven.
 //!
 //! accounts: [authority (signer, payer), market (program-owned, w),
 //!            fill_commitment (PDA, w, uninit), system_program]
@@ -73,14 +70,12 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         buffer_init(&mut d, market.key(), FILL_RING_CAP, bump).map_err(|_| ProgramError::InvalidAccountData)?;
     }
 
-    // DO NOT arm the sticky flag yet: no settlement path consumes the ring in
-    // this port, and pin has no in-SBF keccak to recompute the commit, so arming
-    // it would advertise an unenforced guarantee (see the module note). Leave
-    // `fill_commitment_required = 0`. Defensive: ensure it is explicitly cleared
-    // (the account is freshly zero-initialized, but make the intent loud).
+    // ARM the sticky flag: the producer (`place_taker_order`) + consumer
+    // (`apply_fill`) are wired and keccak is available, so settlement on this market
+    // now enforces commit-reveal authenticity (a fabricated fill → FillNotCommitted).
     unsafe {
         let m = market.borrow_mut_data_unchecked();
-        m[MKT_FILL_COMMIT_REQUIRED] = 0;
+        m[MKT_FILL_COMMIT_REQUIRED] = 1;
     }
     Ok(())
 }

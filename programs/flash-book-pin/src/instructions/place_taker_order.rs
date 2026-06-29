@@ -70,8 +70,13 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 
     assert_market(&accounts[1], pid)?;
     assert_market_book(&accounts[2], &accounts[1], pid)?;
+    // Commit-reveal PRODUCER: locate this market's (optional) fill-commitment ring.
+    // When the market is ARMED, the matcher PUSHES a keccak commitment for every
+    // fill it crosses (below), so settlement (`apply_fill`) can prove authenticity.
+    let fc_opt = crate::fill_commitment::find_fill_commitment(accounts, pid, accounts[1].key());
     unsafe {
         let market = market_of(&accounts[1]);
+        let fill_commitment_armed = market.fill_commitment_required != 0;
         if market.status != MARKET_STATUS_ACTIVE {
             return Err(ProgramError::Custom(4)); // market not active — no matching
         }
@@ -209,8 +214,37 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
             return Err(ProgramError::Custom(12)); // FillOrKillNotFilled
         }
 
-        // ── Phase 2: apply each match (decrement, remove if fully consumed) ──
+        // H-2: an ARMED market with crossing fills MUST carry the ring — else the
+        // taker consumes maker liquidity, pushes NO commitment, and leaves those
+        // fills unsettleable (wedging settlement / griefing makers at zero cost).
+        if n_matches > 0 && fill_commitment_armed && fc_opt.is_none() {
+            return Err(ProgramError::Custom(1103)); // FillCommitmentMissing
+        }
+        // ── Phase 2: apply each match (push a commitment, then decrement/remove) ──
+        let mut fc_borrow = match fc_opt {
+            Some(fc) => Some(fc.try_borrow_mut_data()?),
+            None => None,
+        };
+        let market_key = accounts[1].key();
         for i in 0..n_matches {
+            // PRODUCER push: commit the fill BEFORE consuming it. Read the maker's
+            // (trader, sub, price) from the resting order, then push keccak(preimage)
+            // bound to the ring's next produced index — the exact preimage
+            // `apply_fill` recomputes at settle time.
+            if let Some(fc_data) = fc_borrow.as_deref_mut() {
+                let (maker, maker_sub, maker_price) = {
+                    let o = handle.order_at(match_idx[i]);
+                    (o.trader, o.sub_index, o.price_ticks)
+                };
+                let pidx = crate::fill_commitment::buffer_next_index(fc_data);
+                let pre = crate::fill_commitment::fill_preimage(
+                    market_key, &trader_pk, &maker, side, match_fill[i], maker_price,
+                    sub_index, maker_sub, pidx,
+                );
+                let commit = crate::fill_commitment::keccak256(&[&pre[..]]);
+                crate::fill_commitment::buffer_push(fc_data, market_key, commit)
+                    .map_err(|_| ProgramError::Custom(1104))?; // FillRingFull / Corrupt
+            }
             let new_size = handle.decrement_size_at(match_idx[i], match_fill[i])?;
             if new_size == 0 {
                 if side_is_bid {
