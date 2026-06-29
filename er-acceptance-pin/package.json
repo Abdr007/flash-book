@@ -1,0 +1,13 @@
+{
+  "name": "flash-book-pin-er-acceptance",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Live-ER (MagicBlock) acceptance harness for the Pinocchio port — the CPI delegation round-trip solana-program-test can't cover (PR #190).",
+  "scripts": {
+    "acceptance": "node er_acceptance_pin.mjs"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0"
+  }
+}
