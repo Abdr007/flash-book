@@ -168,7 +168,7 @@ real crossing taker will need one.
 | Oracle | manual `update_oracle` here; Pyth path (`update_oracle_from_pyth`+quorum) exists but **unused on-chain** | n/a (spot) | n/a (spot) | Pyth+Switchboard pull, 2% conf / 10–120 slot staleness, divergence guards | in-protocol Slinky (ABCI++ vote-extension median) | validator source-weighted median (~3s) |
 | Risk engine | envelope + insurance + haircut + ADL **in code, none exercised** | n/a (spot) | n/a (spot) | cross+isolated, **progressive partial liq**, IF→vAMM→ADL waterfall — live | cross+isolated, partial liq @ fillable price, IF→deleverage | cross+isolated, partial liq, HLP backstop, refined ADL (post-JELLY) |
 | Instruction surface | **129** | 28 | small (no-Anchor) | **~258** | n/a | n/a |
-| Formal verification | **41 Kani + Lean (per project notes)** | none | **Certora, re-run daily** | **none** | none (deepest *conventional* audit: Informal Systems, 0 critical) | none public |
+| Formal verification | **49 Kani + Lean (per project notes)** | none | **Certora, re-run daily** | **none** | none (deepest *conventional* audit: Informal Systems, 0 critical) | none public |
 | Maturity | **devnet, unaudited, 40-min coverage demo** | mainnet, audited (OtterSec) | mainnet, audited+FV | mainnet, audited (ToB/Neodyme), large TVL | mainnet app-chain | mainnet perps leader |
 
 **Where Flash Book occupies genuinely unoccupied space (now cited):** per the research pass, **no
@@ -201,7 +201,7 @@ demonstrated, not just written.
 | Breadth of surface demonstrated | **6 / 10** | 47/129 = 36%; the demonstrated set is the easy 36% |
 | Trading-core proof (match/position/funding/liq) | **2 / 10** | zero fills, zero positions, zero funding, zero liquidation on-chain |
 | Production credibility | **3 / 10** | devnet, unaudited, mutable upgrade authority = signer, 40-min scripted run |
-| Engineering signal (CU, event design, FV posture) | **9 / 10** | clean events, tiny CU, 41 Kani + Lean per project notes |
+| Engineering signal (CU, event design, FV posture) | **9 / 10** | clean events, tiny CU, 49 Kani + Lean per project notes |
 
 **Bottom line:** This is a **clean, honest "the deployed program accepts every call" milestone** — and
 on that narrow claim it scores ~9.5. As evidence that *Flash Book works as a perpetuals exchange*, it

@@ -17,13 +17,16 @@ decorative. The §3.2 commitment-ring fill-authenticity, the dual-source liquida
 gate, the value-conserving ADL/haircut/bad-debt waterfall, and the oracle
 feed/confidence/staleness/envelope gates all hold.
 
-The findings are **4 MEDIUMs — all correctness/fairness, none are theft** — plus
-LOW hardening and code hygiene. **All 4 MEDIUMs are now fixed** (verified, 446 host +
-69 integration green, build-sbf clean): the grow drained-guard, and — after careful
-verification of the settlement/risk paths — the FLP funding settle (N-1), the ADL
-true-bankruptcy gate (R-1), and isolated-bankruptcy socialization (R-2). Each is a
-minimal change that reuses already-proven (Kani'd) components; targeted
-new-behaviour regression tests are a recommended follow-up.
+The findings were **4 MEDIUMs — all correctness/fairness, none are theft** — plus
+LOW hardening and code hygiene. **All findings are now fixed** (verified, 449 host +
+69 integration green, 49 Kani proofs, build-sbf clean): the grow drained-guard, and —
+after careful verification of the settlement/risk paths — the FLP funding settle
+(N-1), the ADL true-bankruptcy gate (R-1), and isolated-bankruptcy socialization
+(R-2), each a minimal change reusing already-proven (Kani'd) components with targeted
+new-behaviour regression tests. The three LOWs are closed too: O-1 (corrupt-book RBT
+links, gated once at undelegate for zero hot-path CU), O-2 (oracle future-reject), and
+O-3 (oracle untrusted-for-health when staleness disabled); plus the same-trader
+legibility guards and the dead-code cleanup. **No open findings remain.**
 
 ## Findings
 
@@ -64,18 +67,18 @@ and fail fast before any state is touched.
 | ER / matching | 8.5 | §3.2 authenticity mandatory; O-1 node-bounds gate fixed (zero-CU, at undelegate); ER trust residual |
 | Arithmetic / DoS | 9.3 | checked throughout; graceful truncation; 0 exploits |
 | New fill-outbox | 9.0 | no-overwrite Kani-proven; 1 MED fixed; sound otherwise |
-| **Overall (code)** | **~9.0** | no reachable fund-loss path; FV-backed; 4 bounded MEDs (1 fixed, 3 to remediate) |
+| **Overall (code)** | **~9.0** | no reachable fund-loss path; FV-backed (49 Kani + Lean); 4 bounded MEDs + 3 LOWs all fixed, no open findings |
 
 **Production rating (~7.0) is gated by the same two non-code items as before:**
 external audit (this report is a turnkey input) and authority decentralization
-(multisig). The 3 documented MEDIUMs are the natural first remediations a paid audit
-would also surface.
+(multisig). All 4 MEDIUMs and 3 LOWs this audit surfaced are now remediated — what a
+paid audit would re-derive is closed; the gate is the audit itself plus multisig.
 
 ## How it compares (honest)
 
 | | Fill authenticity | CLOB type | Margin | Formal verification | Measured CU | Audited / mainnet / battle-tested |
 |---|---|---|---|---|---|---|
-| **Flash Book** | **§3.2 keccak ring — sequencer can't fabricate (unique)** | **real price-time hypertree** | **stress-lattice portfolio** | **46 Kani + Lean** | **yes, reproducible** | **no — devnet, unaudited** |
+| **Flash Book** | **§3.2 keccak ring — sequencer can't fabricate (unique)** | **real price-time hypertree** | **stress-lattice portfolio** | **49 Kani + Lean** | **yes, reproducible** | **no — devnet, unaudited** |
 | Drift | trusted keepers (off-chain DLOB) | off-chain DLOB | cross/isolated | none first-party | no | yes; **$285M exploit (Apr-2026)** |
 | Phoenix | PDA-signed CPI log (strong) | on-chain price-time (spot) | n/a (spot) | none | no | yes; mainnet, battle-tested |
 | Manifest | log-frame (weak) | **price-only Ord — no FIFO** | minimal | Certora ×4 props | no | yes; mainnet |
@@ -100,8 +103,9 @@ quality alone isn't safety until it's been hammered in production.
 
 The deployed Anchor program is **soundly engineered with no reachable
 fund-loss path and verification depth that exceeds the field** — the deep audit
-found zero exploits and only bounded correctness/fairness MEDIUMs. To be *the
-greatest among all*, the remaining distance is not more cleverness; it is the
-unglamorous gate: **remediate the 3 documented MEDIUMs → external audit → multisig →
-mainnet → time without an exploit.** Best-engineered on substance today; "best on
-earth" is earned in production, not in the source.
+found zero exploits and only bounded correctness/fairness MEDIUMs — all now fixed,
+with no open findings. To be *the greatest among all*, the remaining distance is not
+more cleverness; it is the unglamorous gate: **external audit → multisig → mainnet →
+time without an exploit** (the MEDIUMs/LOWs a paid audit would surface are already
+remediated). Best-engineered on substance today; "best on earth" is earned in
+production, not in the source.

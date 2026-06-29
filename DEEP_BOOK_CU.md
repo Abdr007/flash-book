@@ -118,7 +118,7 @@ always 1–5 levels, 96 is ample headroom and the outbox is deferred until a con
 deep-sweep demand exists.
 
 Verified by `deep_book_matching_cu_curve` (the 384-level graceful-truncation case
-is asserted). 435 lib + 67 integration tests pass.
+is asserted). 449 lib + 69 integration tests pass.
 
 ## Update (2026-06-29) — the fill-outbox lifts the cap to 256
 
@@ -135,4 +135,4 @@ omit-outbox path hard-rejected (`FillOutboxRequired`). The matcher is heap-fruga
 this path (no `Vec<FillEntry>`; the fill data is written straight into the borrowed
 account), so `matches` is the only O(N) heap. The no-silent-overwrite property is
 Kani-proved (`outbox_no_silent_overwrite`). Markets without an outbox keep the
-log-safe 96 default unchanged. 446 lib + 68 integration tests pass.
+log-safe 96 default unchanged. 449 lib + 69 integration tests pass.

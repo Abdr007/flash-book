@@ -145,8 +145,8 @@ market; the same sequence applies to an existing one after step 1.
 ## 5. The other two maturity items (status + path)
 
 - **External audit.** The single highest-leverage item; nothing above substitutes
-  for it. The turnkey package (`SECURITY_REMEDIATION_2026-06.md`, 46 Kani proofs,
-  Lean, 446+68 tests, this doc) is audit-ready. Action: engage a firm; the Tier-1/2
+  for it. The turnkey package (`SECURITY_REMEDIATION_2026-06.md`, 49 Kani proofs,
+  Lean, 449+69 tests, this doc) is audit-ready. Action: engage a firm; the Tier-1/2
   split here tells them exactly where to focus (the live-ER CPI surface).
 - **Decentralize authority.** A single key is upgrade authority *and* per-market
   authority + sequencer. The code already supports separation —

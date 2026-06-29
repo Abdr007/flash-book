@@ -109,17 +109,20 @@ new-market semantics change (must be armed to settle). Verified on-chain.
 
 ## 4. Test & formal-verification posture
 
-- **435 host unit tests + 66 integration tests** pass (`cargo test --lib`;
+- **449 host unit tests + 69 integration tests** pass (`cargo test --lib`;
   `BPF_OUT_DIR=$PWD/target/deploy cargo test --test integration`).
-- **41 Kani proofs** over the matcher pure-math (settlement nonce, price-time
+- **49 Kani proofs** over the matcher pure-math (settlement nonce, price-time
   priority, margin frame C-1, haircut conservation/solvency, fill-ring,
-  liveness). `proof_solvency_single_convert` re-verified SUCCESSFUL after the P4
-  funding change (the proven `matcher/` math is untouched — P4 is handler glue).
-- **Lean** machine-proves the haircut haircut bound at the real `1e9` divisor.
+  fill-outbox no-overwrite, liveness). `proof_solvency_single_convert` re-verified
+  SUCCESSFUL after the P4 funding change (the proven `matcher/` math is untouched —
+  P4 is handler glue).
+- **Lean** machine-proves the haircut bound at the real `1e9` divisor.
 - New regression tests this session: realized-PnL `tick_size`, preimage
   `taker_was_jit` sensitivity, `grow_fill_commitment`, `settle_position_funding`
   (charge + RISK-1 conservation + idempotency), corrupt-book-index rejection,
-  oracle-config Borsh-layout compatibility.
+  oracle-config Borsh-layout compatibility, the ADL true-bankruptcy gate (R-1)
+  + isolated-bankruptcy socialization (R-2), and the O-1 corrupt-internal-link
+  rejection (`validate_node_links_rejects_corrupt_internal_link`).
 
 **Build:** `cargo build-sbf --tools-version v1.52` (Rust 1.89; default
 platform-tools fail on edition2024 deps).

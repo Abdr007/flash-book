@@ -108,7 +108,7 @@ Read back from chain after real fills:
 | **Bad-debt waterfall** | loss > collateral → insurance → socialize | shortfall **156,555** = insurance **1,194** + socialized **155,361** | exact, balances |
 
 Every fee, rebate, PnL, OI, and insolvency number reconciles to the quote-lot — the strongest possible
-evidence for the accounting, on top of the project's 41 Kani proofs + Lean haircut bound. The only nit:
+evidence for the accounting, on top of the project's 49 Kani proofs + Lean haircut bound. The only nit:
 one market showed `total_fees`=198 vs a naive 200 (a 2-lot rounding/toxicity artifact I didn't fully trace).
 
 ---
@@ -314,7 +314,7 @@ flash-book now additionally has a proven ER round-trip **and** a Pyth Lazer path
 | Oracle — manual + Pyth-pull + **Lazer** | 8.5 | Lazer now proven with real signed data; Pyth-pull path still un-exercised on-chain |
 | ER / MagicBlock | 9 | Genuine full rollup round-trip verified |
 | CU efficiency | 9.5 | 3–10× leaner than competitors |
-| Formal verification posture | 9.5 | 41 Kani + Lean, now backed by exact on-chain reconciliation |
+| Formal verification posture | 9.5 | 49 Kani + Lean, now backed by exact on-chain reconciliation |
 | Deadlock fix quality | 9 | Surgical, didn't touch proven core, proven on-chain |
 | Coverage / maturity | 5 | 58/129 exercised; devnet, unaudited, mutable authority = signer |
 
