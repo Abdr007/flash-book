@@ -556,7 +556,61 @@ impl<'a> MarketBookHandle<'a> {
                 crate::errors::FlashBookError::OutOfRange
             );
         }
+        // NOTE: internal RBT node-links (left/right/parent) are NOT walked here — that
+        // would add O(capacity) CU to EVERY book op on the hot path. Instead they are
+        // validated ONCE, when a book re-enters L1 via `process_undelegation` (the
+        // only point a malicious-ER-committed book can arrive), by
+        // `MarketBookHandle::validate_node_links` below. Zero hot-path cost (AUDIT O-1).
         Ok(MarketBookHandle { header, data: dyn_data })
+    }
+
+    /// AUDIT O-1 (2026-06 deep audit) — validate every node's INTERNAL RBT links
+    /// (`left`/`right`/`parent`), not just the 6 header roots `from_account_data`
+    /// checks. The hot traversal accessors use the unchecked `get_helper`, so a book
+    /// carrying an out-of-range child pointer would panic-DoS the FIRST L1 traversal
+    /// and brick the market (no reset ix). A well-formed book can only be produced by
+    /// this program's own (Kani-proven) RBT writes, so the ONLY way a corrupt book can
+    /// reach L1 is a malicious-/buggy-ER commit that is then undelegated — therefore
+    /// this is called EXACTLY ONCE, from `process_undelegation` (the single choke
+    /// point a returning book passes through), NOT on the per-op `from_account_data`
+    /// hot path. Cost: O(capacity) once per undelegate (a rare op); ZERO added CU on
+    /// place/cancel/match. A corrupt book fails CLOSED here (`OutOfRange` → the
+    /// undelegate reverts, the book never lands corrupt on L1) instead of panicking
+    /// later — with no change to the proven RBT internals.
+    ///
+    /// `#[repr(C)] RBNode<V>` lays out `left`/`right`/`parent` as its first three
+    /// `DataIndex` (= u32 LE) fields, so they sit at byte offsets 0/4/8 of every
+    /// `NODE_TOTAL_BYTES` slot regardless of the payload `V`. Pinned by compile-time
+    /// asserts so a field reorder fails the build, not silently validates wrong bytes.
+    pub fn validate_node_links(account_data: &[u8]) -> Result<()> {
+        const _: () = assert!(core::mem::offset_of!(RBNode<RestingOrderV2>, left) == 0);
+        const _: () = assert!(core::mem::offset_of!(RBNode<RestingOrderV2>, right) == 4);
+        const _: () = assert!(core::mem::offset_of!(RBNode<RestingOrderV2>, parent) == 8);
+        require!(
+            account_data.len() >= MARKET_BOOK_PREFIX_BYTES,
+            crate::errors::FlashBookError::OutOfRange
+        );
+        let slab = &account_data[MARKET_BOOK_PREFIX_BYTES..];
+        let slab_len = slab.len();
+        require!(slab_len % NODE_TOTAL_BYTES == 0, crate::errors::FlashBookError::OutOfRange);
+        let node_count = slab_len / NODE_TOTAL_BYTES;
+        for i in 0..node_count {
+            let base = i * NODE_TOTAL_BYTES;
+            for link_off in [0usize, 4, 8] {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&slab[base + link_off..base + link_off + 4]);
+                let off = u32::from_le_bytes(b) as usize;
+                require!(
+                    off == NIL as usize
+                        || (off % NODE_TOTAL_BYTES == 0
+                            && off
+                                .checked_add(NODE_TOTAL_BYTES)
+                                .is_some_and(|end| end <= slab_len)),
+                    crate::errors::FlashBookError::OutOfRange
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Stamp the discriminator + zero-init the header + data. Call this
@@ -1385,6 +1439,39 @@ mod tests {
             MarketBookHandle::from_account_data(&mut data).is_ok(),
             "valid book must still load"
         );
+    }
+
+    // AUDIT O-1 (2026-06 deep audit): from_account_data must also reject a corrupt
+    // INTERNAL node link (left/right/parent), not just the header roots — a
+    // malicious-ER-committed book with an OOB child pointer would otherwise panic
+    // the first L1 traversal (book DoS). `#[repr(C)] RBNode` puts left/right/parent
+    // at byte offsets 0/4/8 of node 0 (the first slab slot).
+    // AUDIT O-1: `validate_node_links` is the once-per-undelegate corruption gate
+    // (called from `process_undelegation`, NOT the per-op hot path). It must reject an
+    // out-of-range or misaligned internal RBT link and pass a well-formed book.
+    #[test]
+    fn validate_node_links_rejects_corrupt_internal_link() {
+        let p = MARKET_BOOK_PREFIX_BYTES; // node 0 starts here; its `left` is at +0
+        // OOB internal left-link
+        let mut data = make_book();
+        data[p..p + 4].copy_from_slice(&9_999_999u32.to_le_bytes());
+        assert!(
+            MarketBookHandle::validate_node_links(&data).is_err(),
+            "OOB internal left-link must be rejected"
+        );
+        // in-bounds but misaligned internal parent-link (node 0, offset +8)
+        let mut data = make_book();
+        data[p + 8..p + 12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(
+            MarketBookHandle::validate_node_links(&data).is_err(),
+            "misaligned internal parent-link must be rejected"
+        );
+        // a valid book (free-list links are all node-aligned or NIL) passes
+        let data = make_book();
+        assert!(MarketBookHandle::validate_node_links(&data).is_ok());
+        // and the per-op hot path still loads it (no link walk there now)
+        let mut data = make_book();
+        assert!(MarketBookHandle::from_account_data(&mut data).is_ok());
     }
 
     #[test]

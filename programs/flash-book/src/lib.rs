@@ -806,7 +806,25 @@ pub mod flash_book {
             &ctx.accounts.payer,
             &ctx.accounts.system_program,
             account_seeds,
-        )
+        )?;
+
+        // AUDIT O-1 (2026-06): a market_book carries unchecked RBT child links
+        // (`get_helper`), so a malicious-/buggy-ER commit with an out-of-range link
+        // would panic-DoS the first L1 traversal and brick the market. This callback
+        // is the SINGLE choke point a returning book passes through, so validate the
+        // internal links HERE — exactly once — instead of on the per-op book hot path
+        // (which would cost O(capacity) CU on every place/cancel/match). A corrupt
+        // book fails CLOSED: the undelegate reverts and it never lands on L1. Other
+        // delegated accounts (ring/outbox/market) are flat arrays already covered by
+        // their own disc/cap checks — only the book has traversal links, so the
+        // discriminator gate skips them at ~O(1) cost.
+        let data = ctx.accounts.delegated_account.try_borrow_data()?;
+        if data.len() >= state_v2::MARKET_BOOK_DISC_BYTES
+            && data[..state_v2::MARKET_BOOK_DISC_BYTES] == state_v2::MARKET_BOOK_DISC
+        {
+            state_v2::MarketBookHandle::validate_node_links(&data)?;
+        }
+        Ok(())
     }
 
     // ── #35 / H1 part B: ER delegation of the FillCommitmentAccount ──────────
