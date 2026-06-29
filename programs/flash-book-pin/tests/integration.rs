@@ -2487,6 +2487,37 @@ async fn undelegate_market_book_rejects_wrong_authority() {
     assert!(r.is_err(), "non-authority undelegate must be rejected");
 }
 
+// Re-audit 2026-06-30: the L1-initiated undelegate is no longer a valid DLP
+// entrypoint (anchor removed it) — the correct authority is directed to the ER path
+// (commit_and_undelegate → process_undelegation) via Custom(221), NOT a phantom CPI.
+#[tokio::test]
+async fn undelegate_market_book_directs_to_er_path() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let market = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    pt.add_account(market, m);
+    pt.add_account(authority.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new(market, false),
+        ],
+        data: vec![IX_UNDELEGATE_MARKET_BOOK],
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &authority], bh))
+        .await;
+    let err = format!("{:?}", r.expect_err("L1 undelegate is unavailable; use the ER path"));
+    assert!(err.contains("Custom(221)"), "expected Custom(221) (use the ER path), got: {err}");
+}
+
 // ─── delegate / undelegate market e2e ───
 const IX_DELEGATE_MARKET: u8 = 122;
 const IX_UNDELEGATE_MARKET: u8 = 123;

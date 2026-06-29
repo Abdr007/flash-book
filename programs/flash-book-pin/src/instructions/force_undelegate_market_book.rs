@@ -12,16 +12,14 @@
 //!            system_program, delegation_program]
 //! data: (none)
 
-use crate::book::MARKET_BOOK_SEED;
 use crate::constants::{CENSORSHIP_ESCAPE_TIMEOUT_SLOTS, FORCE_UNDELEGATE_TIMEOUT_SLOTS};
-use crate::er::{cpi_undelegate, force_undelegate_allowed, UndelegateAccounts, DELEGATE_BUFFER_TAG};
-use crate::guard::{assert_disc, assert_owned_by, assert_pda, assert_signer};
+use crate::er::force_undelegate_allowed;
+use crate::guard::{assert_disc, assert_owned_by, assert_signer};
 use crate::state::{Market, MARKET_DISC};
 use pinocchio::{
     account_info::AccountInfo,
-    instruction::{Seed, Signer},
     program_error::ProgramError,
-    pubkey::{find_program_address, Pubkey},
+    pubkey::Pubkey,
     sysvars::{clock::Clock, Sysvar},
     ProgramResult,
 };
@@ -57,33 +55,12 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         return Err(ProgramError::Custom(220)); // ER still live
     }
 
-    // Bind the delegated book PDA (owned by the delegation program) + buffer.
-    let bump = assert_pda(market_book, &[MARKET_BOOK_SEED, &market.key()[..]], pid)?;
-    if owner_program.key() != pid {
-        return Err(ProgramError::InvalidArgument);
-    }
-    if delegate_buffer.key()
-        != &find_program_address(&[DELEGATE_BUFFER_TAG, &market_book.key()[..]], pid).0
-    {
-        return Err(ProgramError::InvalidArgument);
-    }
-
-    let bump_arr = [bump];
-    let seeds = [
-        Seed::from(MARKET_BOOK_SEED),
-        Seed::from(&market.key()[..]),
-        Seed::from(&bump_arr[..]),
-    ];
-    let signer = [Signer::from(&seeds[..])];
-    cpi_undelegate(
-        &UndelegateAccounts {
-            payer,
-            delegated_account: market_book,
-            owner_program,
-            buffer: delegate_buffer,
-            system_program,
-            delegation_program,
-        },
-        &signer,
-    )
+    // Re-audit 2026-06-30: the ER is provably stalled/censoring — but the upgraded
+    // DLP makes undelegation VALIDATOR-driven; a program-initiated Undelegate CPI is
+    // no longer a valid entrypoint (it would fail). Mirror the Anchor reference:
+    // confirm eligibility above, then surface OwnerForceUndelegateUnavailable.
+    // Recovery flows through the ER (`commit_and_undelegate_market_book`) → the DLP's
+    // `process_undelegation` callback on the base layer.
+    let _ = (payer, market_book, owner_program, delegate_buffer, system_program, delegation_program);
+    Err(ProgramError::Custom(221)) // OwnerForceUndelegateUnavailable
 }

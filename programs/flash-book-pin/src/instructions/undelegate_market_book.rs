@@ -8,22 +8,14 @@
 //!            delegate_buffer, system_program, delegation_program]
 //! data: (none)
 
-use crate::book::MARKET_BOOK_SEED;
-use crate::er::{cpi_undelegate, UndelegateAccounts, DELEGATE_BUFFER_TAG};
-use crate::guard::{assert_disc, assert_owned_by, assert_pda, assert_signer};
+use crate::guard::{assert_disc, assert_owned_by, assert_signer};
 use crate::state::{Market, MARKET_DISC};
 use pinocchio::{
-    account_info::AccountInfo,
-    instruction::{Seed, Signer},
-    program_error::ProgramError,
-    pubkey::{find_program_address, Pubkey},
-    ProgramResult,
+    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
 };
 
 pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramResult {
-    let [authority, market, market_book, owner_program, delegate_buffer, system_program, delegation_program, ..] =
-        accounts
-    else {
+    let [authority, market, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
@@ -38,34 +30,10 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         }
     }
 
-    // Bind the book PDA by seed (it is currently delegated → owned by the
-    // delegation program, so we don't check our ownership here) and the buffer.
-    let bump = assert_pda(market_book, &[MARKET_BOOK_SEED, &market.key()[..]], pid)?;
-    if owner_program.key() != pid {
-        return Err(ProgramError::InvalidArgument);
-    }
-    if delegate_buffer.key()
-        != &find_program_address(&[DELEGATE_BUFFER_TAG, &market_book.key()[..]], pid).0
-    {
-        return Err(ProgramError::InvalidArgument);
-    }
-
-    let bump_arr = [bump];
-    let seeds = [
-        Seed::from(MARKET_BOOK_SEED),
-        Seed::from(&market.key()[..]),
-        Seed::from(&bump_arr[..]),
-    ];
-    let signer = [Signer::from(&seeds[..])];
-    cpi_undelegate(
-        &UndelegateAccounts {
-            payer: authority,
-            delegated_account: market_book,
-            owner_program,
-            buffer: delegate_buffer,
-            system_program,
-            delegation_program,
-        },
-        &signer,
-    )
+    // Re-audit 2026-06-30: an L1-initiated Undelegate CPI is no longer a valid DLP
+    // entrypoint (the upgraded DLP makes undelegation VALIDATOR-driven); the Anchor
+    // reference removed this ix. Undelegate via the ER: `commit_and_undelegate_market_book`
+    // (`cpi_commit(allow_undelegation=true)`) → the DLP's `process_undelegation`
+    // callback on the base layer. Fail closed rather than issue a phantom CPI.
+    Err(ProgramError::Custom(221)) // OwnerForceUndelegateUnavailable — use the ER path
 }
