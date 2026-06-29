@@ -920,22 +920,6 @@ impl<'a> MarketBookHandle<'a> {
         tree.lookup_index::<RestingOrderV2>(&probe)
     }
 
-    /// Insert a claimed seat into the seats RBT.
-    pub fn insert_seat(&mut self, seat: ClaimedSeatV2) -> Result<DataIndex> {
-        let idx = self.alloc_node()?;
-        let new_root;
-        {
-            let mut tree = RedBlackTree::<ClaimedSeatV2>::new(
-                self.data,
-                self.header.claimed_seats_root_index,
-                NIL,
-            );
-            tree.insert(idx, seat);
-            new_root = tree.get_root_index();
-        }
-        self.header.claimed_seats_root_index = new_root;
-        Ok(idx)
-    }
 }
 
 /// 92-byte payload for the FreeList — pure padding. Sized so that
@@ -984,16 +968,6 @@ fn leftmost_descendant<V: Payload>(
         }
         idx = left;
     }
-}
-
-/// Find the MIN (leftmost) node of an RBT given its root. Returns `NIL`
-/// if the tree is empty. O(log n).
-pub fn lookup_min_index<V: Payload>(data: &[u8], root: DataIndex) -> DataIndex {
-    if root == NIL {
-        return NIL;
-    }
-    let tree = RedBlackTreeReadOnly::<V>::new(data, root, NIL);
-    leftmost_descendant::<V>(&tree, root)
 }
 
 /// In-order successor in an RBT view. General-purpose (handles both the

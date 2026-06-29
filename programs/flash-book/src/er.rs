@@ -52,8 +52,6 @@ pub const DELEGATION_METADATA_TAG: &[u8] = b"delegation-metadata";
 
 /// Discriminator for the `Delegate` instruction.
 const DELEGATE_DISCRIMINATOR: u8 = 0;
-/// Discriminator for the `Undelegate` instruction.
-const UNDELEGATE_DISCRIMINATOR: u8 = 3;
 
 /// Borsh-serialized argument struct for the Delegate ix. Layout matches
 /// `magicblock-delegation-program-api::args::DelegateArgs` byte-for-byte.
@@ -223,57 +221,11 @@ pub fn cpi_delegate(
     Ok(())
 }
 
-/// Account list for the Undelegate CPI.
-pub struct UndelegateAccounts<'info> {
-    pub payer: AccountInfo<'info>,
-    pub delegated_account: AccountInfo<'info>,
-    pub owner_program: AccountInfo<'info>,
-    pub buffer: AccountInfo<'info>,
-    pub system_program: AccountInfo<'info>,
-    pub delegation_program: AccountInfo<'info>,
-}
-
-/// Build + invoke the Undelegate instruction. Returns control of the PDA
-/// from the ER back to the owner program.
-pub fn cpi_undelegate(
-    accounts: UndelegateAccounts<'_>,
-    delegated_seeds: &[&[u8]],
-) -> Result<()> {
-    require_keys_eq!(
-        *accounts.delegation_program.key,
-        DELEGATION_PROGRAM_ID,
-        crate::FlashBookError::Unauthorized
-    );
-
-    // WAVE 24h: 8-byte discriminator prefix (see cpi_delegate); byte[0] = Undelegate.
-    let data = vec![UNDELEGATE_DISCRIMINATOR, 0, 0, 0, 0, 0, 0, 0];
-
-    let ix = Instruction {
-        program_id: DELEGATION_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new(*accounts.payer.key, true),
-            AccountMeta::new(*accounts.delegated_account.key, true),
-            AccountMeta::new_readonly(*accounts.owner_program.key, false),
-            AccountMeta::new(*accounts.buffer.key, false),
-            AccountMeta::new_readonly(*accounts.system_program.key, false),
-        ],
-        data,
-    };
-
-    invoke_signed(
-        &ix,
-        &[
-            accounts.payer,
-            accounts.delegated_account,
-            accounts.owner_program,
-            accounts.buffer,
-            accounts.system_program,
-            accounts.delegation_program,
-        ],
-        &[delegated_seeds],
-    )?;
-    Ok(())
-}
+// NOTE: the program-initiated `cpi_undelegate` (+ its `UndelegateAccounts` /
+// `UNDELEGATE_DISCRIMINATOR`) was removed in the 2026-06 dead-code cleanup. Real
+// undelegation is driven by the MagicBlock delegation program calling back into
+// `process_undelegation` → `process_external_undelegate` (the EXTERNAL_UNDELEGATE
+// path below); the program never issues an Undelegate CPI itself.
 
 /// Pure decision for the permissionless force-undelegate timeout gate
 /// (`force_undelegate_market_book`). Returns true iff the ER has been silent for
