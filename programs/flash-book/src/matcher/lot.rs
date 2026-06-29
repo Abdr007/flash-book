@@ -43,9 +43,6 @@ impl BaseLots {
     pub fn min(self, other: Self) -> Self {
         Self(self.0.min(other.0))
     }
-    pub fn is_zero(self) -> bool {
-        self.0 == 0
-    }
 }
 
 impl QuoteLots {
@@ -55,9 +52,6 @@ impl QuoteLots {
     }
     pub fn checked_sub(self, other: Self) -> Result<Self> {
         self.0.checked_sub(other.0).map(Self).or_underflow()
-    }
-    pub fn is_zero(self) -> bool {
-        self.0 == 0
     }
 }
 
@@ -73,19 +67,6 @@ impl Ticks {
 
 impl Bps {
     pub const ZERO: Self = Self(0);
-    /// Apply this bps value to a price in ticks: `price * (1 ± bps/10_000)`.
-    /// Returns the additive delta — caller adds or subtracts as needed.
-    /// Uses u128 intermediate to avoid overflow on `price * bps`.
-    pub fn ticks_delta(self, price: Ticks) -> Result<Ticks> {
-        let prod = (price.0 as u128)
-            .checked_mul(self.0 as u128)
-            .or_overflow()?;
-        let delta = prod.checked_div(crate::constants::BPS_DENOM as u128).or_div_zero()?;
-        if delta > u64::MAX as u128 {
-            return Err(error!(FlashBookError::ArithmeticOverflow));
-        }
-        Ok(Ticks(delta as u64))
-    }
 }
 
 /// Compute notional in quote-lots from base-lots × ticks.

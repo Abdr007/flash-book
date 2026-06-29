@@ -1,9 +1,8 @@
 //! Compile-time constants. Anything tunable per-market lives in
 //! `MarketParams` instead.
 
-/// USD values use 6 decimals throughout — matches Flash V2's existing
-/// convention. Token decimals are *separate* and per-mint.
-pub const USD_DECIMALS: u8 = 6;
+/// USD values use 6 decimals; `USD_UNIT = 10^USD_DECIMALS`. Token decimals are
+/// *separate* and per-mint.
 pub const USD_UNIT: u64 = 1_000_000;
 
 /// Basis points denominator. 1 bp = 1/10_000.
@@ -70,9 +69,6 @@ pub const FUNDING_INDEX_FRACTIONAL_BITS: u32 = 64;
 /// VPIN EMA uses fixed-point Q32.32.
 pub const VPIN_FRACTIONAL_BITS: u32 = 32;
 pub const VPIN_FIXED_ONE: u64 = 1u64 << VPIN_FRACTIONAL_BITS;
-
-/// Lot epsilon — sizes below this are treated as zero (rounding noise).
-pub const LOT_EPSILON: u64 = 1;
 
 /// Reserved sequence-number range for synthesized FLP virtual orders.
 /// User-submitted orders use [0, FLP_SEQ_RESERVED_OFFSET); FLP virtual

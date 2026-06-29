@@ -87,13 +87,6 @@ pub fn delegation_record_pda(delegated: &Pubkey) -> (Pubkey, u8) {
     )
 }
 
-/// Derive the delegation metadata PDA. Lives under the delegation program.
-pub fn delegation_metadata_pda(delegated: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[DELEGATION_METADATA_TAG, delegated.as_ref()],
-        &DELEGATION_PROGRAM_ID,
-    )
-}
 
 /// Account list for the Delegate CPI.
 pub struct DelegateAccounts<'info> {

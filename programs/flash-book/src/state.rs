@@ -633,9 +633,6 @@ impl PositionAccount {
     pub fn set_cum_funding_index(&mut self, v: i128) {
         self.cum_funding_index_at_entry = v.to_le_bytes();
     }
-    pub fn side_enum(&self) -> Side {
-        if self.side == 0 { Side::Long } else { Side::Short }
-    }
 }
 
 #[account]

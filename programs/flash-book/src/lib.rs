@@ -9971,6 +9971,10 @@ pub mod flash_book {
         let max_age = ctx.accounts.oracle_config.max_staleness_seconds as i64;
         if max_age > 0 {
             let now_unix = Clock::get()?.unix_timestamp;
+            // AUDIT O-2 (2026-06): reject FUTURE-dated timestamps — `saturating_sub`
+            // clamps a future age to 0 and would defeat the staleness gate (and store
+            // it as "fresh"). Parity with the authority + Pyth paths.
+            require!(published_unix as i64 <= now_unix, FlashBookError::OracleTooStale);
             let age = now_unix.saturating_sub(published_unix as i64);
             require!(age <= max_age, FlashBookError::OracleTooStale);
         }

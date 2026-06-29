@@ -78,6 +78,11 @@ pub fn get_price_no_older_than_full(
     let exponent = i32::from_le_bytes(data[m + 48..m + 52].try_into().unwrap());
     let publish_time = i64::from_le_bytes(data[m + 52..m + 60].try_into().unwrap());
 
+    // AUDIT O-2 (2026-06): reject a FUTURE-dated publish_time. `age` uses
+    // `saturating_sub`, which clamps a future timestamp's age to 0 and would slip it
+    // past the staleness gate (then be stored as "fresh"). Parity with the authority
+    // `update_oracle` path, which already future-rejects.
+    require!(publish_time <= now_unix, FlashBookError::OracleTooStale);
     let age = now_unix.saturating_sub(publish_time);
     require!(age <= max_age_seconds as i64, FlashBookError::OracleTooStale);
 
