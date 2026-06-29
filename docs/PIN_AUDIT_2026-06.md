@@ -367,14 +367,26 @@ vault round-trip, ADL #188 cap+gate, FLP/vault #188 fixes), funding/haircut (fai
 inert-but-symmetric), the dispatch (collision-free), the guard layer, and account
 aliasing/binding were all independently re-verified sound.
 
-### HONESTLY DEFERRED — not fixed (requires the live MagicBlock DLP)
-- **ER delegate `cpi_delegate` ABI** (finding #1: 1-byte vs 8-byte discriminator + the
-  missing 5-step buffer staging) and **the retained `cpi_undelegate`** (finding #3,
-  which Anchor deleted). These are the **multi-week ER-delegation plumbing** the project
-  memory already scopes as deferred — they are ER-only-validatable (no live DLP in this
-  environment), and blindly porting the staging CPI would risk shipping confident-but-
-  broken code. The pin port is NOT deployed (the Anchor program is), so this affects no
-  live system. The internally-verifiable ER bug (#2 bump-seeds) IS fixed above.
+### ER delegation port — DONE (2026-06-30, pending live-ER acceptance)
+Finding #1 (ABI) and #3 (`cpi_undelegate`) are now **ported faithfully against the
+Anchor `er.rs`** (a follow-up to this audit):
+- **`cpi_delegate`** now does the full WAVE-24i fast-path staging: 8-byte
+  discriminator (`write_delegate_data`); create the owner-program buffer PDA → copy
+  the account in → zero it → `assign` it to System then `System::assign` → the DLP
+  under the PDA seeds → CPI Delegate → close the buffer (refund rent). Byte-for-byte
+  the Anchor sequence, in pinocchio (`create_pda_account`, `unsafe assign`,
+  `borrow_mut_lamports_unchecked`). Compiles under **build-sbf** (real CPI codegen).
+- **`cpi_undelegate` REMOVED** (Anchor deleted it). `force_undelegate_market_book` now
+  returns `OwnerForceUndelegateUnavailable` (Custom 221) after its liveness gate, and
+  the L1 `undelegate_market_book`/`_market`/`_fill_commitment` handlers fail closed with
+  the same code, directing callers to the ER path (`commit_and_undelegate_*` →
+  `process_undelegation`). Regression test `undelegate_market_book_directs_to_er_path`.
+- **CAVEAT (honest):** the delegation round-trip is **ER-only-validatable** — building +
+  the L1 reject/redirect tests pass, but the actual stage→delegate→commit→undelegate
+  cycle MUST be confirmed on the live MagicBlock devnet ER (an `er-acceptance` run)
+  before relying on it. The pin port is not deployed, so nothing live depends on it yet.
+
+### HONESTLY DEFERRED — features, not bugs
 - **commit-reveal fill authenticity** (ring unwired), **haircut junior-claim engine**
   (unwired, fails closed), **funding accrual inert** (symmetric), **leverage/position/
   concentration caps unwired**, **VPIN tax / FLP-exposure tracking** — all as documented
