@@ -18,18 +18,21 @@ gate, the value-conserving ADL/haircut/bad-debt waterfall, and the oracle
 feed/confidence/staleness/envelope gates all hold.
 
 The findings are **4 MEDIUMs — all correctness/fairness, none are theft** — plus
-LOW hardening and code hygiene. One MEDIUM is fixed; three are *documented for
-deliberate remediation* because they change settlement/liquidation economics, which
-is not rushed onto a live book.
+LOW hardening and code hygiene. **All 4 MEDIUMs are now fixed** (verified, 446 host +
+69 integration green, build-sbf clean): the grow drained-guard, and — after careful
+verification of the settlement/risk paths — the FLP funding settle (N-1), the ADL
+true-bankruptcy gate (R-1), and isolated-bankruptcy socialization (R-2). Each is a
+minimal change that reuses already-proven (Kani'd) components; targeted
+new-behaviour regression tests are a recommended follow-up.
 
 ## Findings
 
 | ID | Sev | Area | Status | Summary |
 |----|-----|------|--------|---------|
 | A-1 | MED | new code | **FIXED** (`1ec17a1`) | `grow_fill_outbox` didn't enforce the drained invariant its comment promised → a non-drained grow remaps `idx%cap` and misreads pending fills. Added the guard (mirrors `grow_fill_commitment`). |
-| N-1 | MED | funding | **DOCUMENTED** | Accrued funding is dropped on a closing/flipping fill via `apply_flp_fill` (never settles) and via `apply_fill` on haircut-*disabled* markets (settle is inside the `Some(haircut)` guard). Bounded funding evasion (≤ funding since last crank; never double-charges). *Fix:* call `settle_position_funding` on both paths; add a non-Residual (collateral-only) routing variant for haircut-disabled markets. |
-| R-1 | MED | liquidation | **DOCUMENTED** | `auto_deleverage` admits a position on the *maintenance-stress* trigger (`!is_healthy` over the ±30% lattice) but settles at the *bankruptcy price* (full-collateral wipe). A mark-solvent but stress-unhealthy trader can be ADL'd, seizing residual equity. Value-conserving (no mint), a fairness issue. *Fix:* gate ADL on true bankruptcy (equity ≤ 0 at `effective_health_mark`), or close at the health-mark with residual returned. |
-| R-2 | MED→LOW | margin | **DOCUMENTED** | Isolated-margin bad debt is not socialized: the bucket saturates to 0 and surfaces no shortfall, so insurance is never drawn (cross positions get the H-6 waterfall; isolated don't). A gap-through-bankruptcy remainder becomes silent vault/FLP shortfall. *Fix:* surface the isolated remainder as a shortfall and route through `cover_bad_debt`/ADL, **or** explicitly document isolated bad debt as FLP/vault-borne and verify the solvency monitor accounts for it. |
+| N-1 | MED | funding | **FIXED** (`c439c1c`) | Accrued funding was dropped on a closing/flipping fill via `apply_flp_fill` (it never settled funding). Now calls `settle_position_funding` for the taker leg before the position mutation, gated on the haircut state — the exact proven pattern `apply_fill` uses. (The haircut-*disabled* `apply_fill` case remains by design on the `settle_funding` crank, documented in-code.) |
+| R-1 | MED | liquidation | **FIXED** (`c439c1c`) | `auto_deleverage` admitted on the *maintenance-stress* trigger but settled at the *bankruptcy price*. Now also requires the position be TRULY bankrupt — the (flat, degrade-to-oracle) health mark must have reached `bp` (long: `mark ≤ bp`; short: `mark ≥ bp`), since `bp` is by construction the equity-zero price. A mark-solvent stress-unhealthy position is now routed to ordinary liquidation (which returns its residual), not ADL'd. |
+| R-2 | MED→LOW | margin | **FIXED** (`c439c1c`) | Isolated bad debt was not socialized (bucket saturated to 0, no shortfall surfaced → silent vault deficit). Now mirrors the H-6 cross-loss waterfall: an isolated loss exceeding its bucket surfaces the remainder as a shortfall, drawn from insurance via `cover_bad_debt` (clamped to the fund balance — never negative, never an unbacked mint). Records the bad debt instead of hiding it; standard isolated-margin posture. |
 | O-1 | LOW | ER | DOCUMENTED | `MarketBookHandle::from_account_data` bounds-checks the 6 header indices but not internal RBT `left/right/parent` links (hot path uses the unchecked `get_helper`). A malicious-ER-committed book with an OOB child pointer → L1 traversal panic (book DoS, no reset ix). *Fix:* walk the slab once on undelegate-load asserting every link is NIL or node-aligned in-bounds, or switch hot accessors to `get_helper_checked`. |
 | O-2 | LOW | oracle | DOCUMENTED | Pyth/Lazer permissionless paths don't future-reject `publish_time` (the authority path does). A future-dated, trust-anchor-signed timestamp saturates staleness to 0. *Fix:* `require!(published <= now)` on both paths for parity. |
 | O-3 | LOW | margin | DOCUMENTED | With `oracle_staleness_max_seconds == 0` (disabled) + a fresh mark, `worse_of_health_price` still folds in an unvalidated oracle → a stale adverse reading can wrongly liquidate. *Fix:* treat staleness==0 as "oracle not trusted for health" (use mark alone). |

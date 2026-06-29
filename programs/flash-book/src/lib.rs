@@ -6510,6 +6510,28 @@ pub mod flash_book {
             let taker_pre_realized = taker_pos.realized_pnl_quote_lots;
             let taker_pos_isolated_for_pnl = taker_pos.collateral_quote_lots > 0;
 
+            // AUDIT N-1 (2026-06 deep audit): settle accrued funding BEFORE the fill
+            // mutates the position. `apply_fill_to_position` resets the funding
+            // anchor to "now" on a full close or a side flip, so any funding accrued
+            // since the last crank would otherwise be silently dropped — a bounded
+            // funding-evasion leak when a taker closes/flips against the FLP pool.
+            // Mirrors `apply_fill`'s settle (same shared, Kani-proven helper). The
+            // FLP "maker" is the pool, whose funding is tracked on its exposure
+            // entry, so only the taker leg settles here. Gated on the haircut state
+            // (mandatory when `haircut_enabled`), exactly as `apply_fill`.
+            if let Some(mh) = ctx.accounts.market_haircut.as_mut() {
+                let res = &mut mh.residual_quote_lots;
+                let mut tts = ctx.accounts.taker_trader_state.load_mut()?;
+                settle_position_funding(
+                    funding_index,
+                    market.mark_price_ticks,
+                    market.params.tick_size,
+                    &mut taker_pos,
+                    &mut tts,
+                    res,
+                )?;
+            }
+
             apply_fill_to_position(&mut taker_pos, taker_side_enum, size_lots, price_ticks, funding_index, market.params.tick_size)?;
             (
                 taker_was_open,
@@ -7384,6 +7406,25 @@ pub mod flash_book {
                 .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
         };
         let bp_ticks = if bp_u128 > u64::MAX as u128 { u64::MAX } else { bp_u128 as u64 };
+
+        // ── AUDIT R-1 (2026-06 deep audit): gate ADL on TRUE bankruptcy ──
+        // ADL settles the underwater leg at `bp` (a full-collateral wipe: loss =
+        // collateral × close/size). `bp` is by construction the price where the
+        // position's equity is exactly zero, so the position is genuinely bankrupt
+        // ONLY when the (flat, degrade-to-oracle) health mark has reached `bp`:
+        //   long  → health_mark ≤ bp   (price fell to/below bankruptcy)
+        //   short → health_mark ≥ bp   (price rose to/above bankruptcy)
+        // Without this, the looser ±30% stress trigger (`!is_healthy` above) would
+        // admit a position that is merely stress-unhealthy but still MARK-SOLVENT
+        // (equity > 0), and ADL'ing it at `bp` would seize the trader's residual
+        // equity and hand it (capped) to the counterparty. Stress-unhealthy-but-
+        // solvent positions are handled by ordinary liquidation, which closes near
+        // the mark and returns the residual; ADL is reserved for actual bankruptcy.
+        if underwater.side == 0 {
+            require!(health_mark <= bp_ticks, FlashBookError::NotLiquidatable);
+        } else {
+            require!(health_mark >= bp_ticks, FlashBookError::NotLiquidatable);
+        }
 
         // Counter-eligibility: counter must have POSITIVE PnL at bp.
         //   Long counter:  pnl = (bp - entry_c) × close × tick > 0  → bp > entry_c
@@ -16179,6 +16220,25 @@ fn apply_realized_pnl_delta<'info>(
             trader_state.load_mut()?.collateral_quote_lots = new_cross; // == 0
             // removed = the whole pool; the uncovered remainder is `shortfall`.
             return Ok((shortfall, cross_collateral));
+        }
+    }
+    // ── AUDIT R-2 (2026-06 deep audit): socialize ISOLATED bankruptcy too ──
+    // Previously an isolated loss exceeding its bucket saturated the bucket to 0 and
+    // surfaced NO shortfall ("bucket-only risk by design"). But the counterparty's
+    // gain is credited in full from the shared vault, so the uncovered remainder
+    // became a SILENT vault deficit. Mirror the H6 cross-loss waterfall: surface the
+    // remainder so the caller draws it from insurance (`cover_bad_debt`, clamped to
+    // the fund balance — never negative, never an unbacked mint), RECORDING the bad
+    // debt instead of hiding it. This is the standard isolated-margin posture and is
+    // strictly safer than the prior silent drain. Same pure `cross_loss_shortfall`
+    // (it operates on any bucket). Only the genuine-bankruptcy case changes; a
+    // within-bucket isolated loss still falls through unchanged.
+    if delta < 0 && isolated {
+        let debit = if delta < -(u64::MAX as i128) { u64::MAX } else { (-delta) as u64 };
+        if debit > iso_collateral {
+            let (new_iso, shortfall) = cross_loss_shortfall(debit, iso_collateral);
+            position.load_mut()?.collateral_quote_lots = new_iso; // == 0
+            return Ok((shortfall, iso_collateral));
         }
     }
     let (new_iso, new_cross) = compute_realized_pnl_routing(
