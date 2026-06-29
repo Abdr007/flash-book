@@ -85,9 +85,6 @@ impl<'a> Cursor<'a> {
     fn u8(&mut self) -> LzResult<u8> {
         Ok(self.take(1)?[0])
     }
-    fn u16(&mut self) -> LzResult<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
     fn i16(&mut self) -> LzResult<i16> {
         Ok(i16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }

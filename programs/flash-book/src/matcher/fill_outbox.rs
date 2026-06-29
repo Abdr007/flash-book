@@ -199,6 +199,16 @@ pub fn outbox_produced(data: &[u8]) -> u64 {
     u64::from_le_bytes(b)
 }
 
+/// Read back the mirrored `settled` cursor. Used by `grow_fill_outbox` to enforce
+/// the drained invariant (a non-drained grow would remap every slot's `idx % cap`
+/// position and misread pending fills), mirroring `grow_fill_commitment`.
+#[inline]
+pub fn outbox_settled(data: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&data[OFF_SETTLED..OFF_SETTLED + 8]);
+    u64::from_le_bytes(b)
+}
+
 /// Write one fill's data into slot `slot_index` (`= produced % cap`). Heap-free —
 /// a handful of `copy_from_slice`s into the borrowed account window, no `Vec` and
 /// no serialization. `slot_index` MUST be `< cap` (enforced — a tampered cap that

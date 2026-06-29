@@ -246,6 +246,8 @@ pub mod flash_book {
         let new_cap = old_cap
             .checked_add(additional_slots)
             .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+        // NOTE: grow intentionally raises the ring past `FILL_RING_CAP` (the init
+        // default) — it is the per-ER-session fill ceiling; no upper bound here.
         let additional_bytes = (additional_slots as usize)
             .checked_mul(32)
             .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
@@ -999,17 +1001,30 @@ pub mod flash_book {
 
         let market_bytes = ctx.accounts.market.key().to_bytes();
         // Validate + read the current cap, and require the outbox be DRAINED (the
-        // mirrored cursors must be equal — same invariant as the ring grow).
+        // mirrored cursors must be equal — same invariant as the ring grow). AUDIT
+        // (2026-06 deep audit, MEDIUM): this guard was documented but missing — a
+        // non-drained grow remaps every slot's `idx % cap` position, so the sequencer
+        // would misread pending fills. Mirrors `grow_fill_commitment`'s drained gate.
         let old_cap = {
             let data = fo_ai.try_borrow_data()?;
             let cap = fo::outbox_check(&data, &market_bytes)
                 .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+            require!(
+                fo::outbox_produced(&data) == fo::outbox_settled(&data),
+                FlashBookError::FillRingNotDrained
+            );
             cap
         };
 
         let new_cap = old_cap
             .checked_add(additional_slots)
             .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+        // NOTE: the ring/outbox can grow PAST `FILL_RING_CAP` by design —
+        // `FILL_RING_CAP` is the init default, and grow raises the per-ER-session
+        // fill ceiling (the matcher clamps `walk_limit` to `FILL_RING_CAP`
+        // independently via `effective_batch_cap`). The Kani proofs are
+        // cap-agnostic, so no upper bound applies here. (Audit LOW #2 was a
+        // false positive — verified by the deep-book tests that grow to 512.)
         let additional_bytes = (additional_slots as usize)
             .checked_mul(fo::FILL_OUTBOX_SLOT_LEN)
             .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
@@ -4102,11 +4117,16 @@ pub mod flash_book {
             notional_u128.saturating_mul(taker_taker_fee_bps as u128) / constants::BPS_DENOM as u128;
         // Apply taker's per-trader fee tier discount.
         //   discount ≤ 10_000 (100%) → standard discount, fee ≥ 0
-        //   discount ∈ (10_000, 12_000] → NEGATIVE fee (rebate to taker)
-        // Capped at MAX_FEE_DISCOUNT_BPS = 12_000 (120%). Negative fee
-        // resolves to a credit on taker collateral; the rebate is sourced
-        // from the protocol's insurance contribution downstream so it
-        // can't push the insurance fund negative.
+        //   discount ∈ (10_000, MAX]  → NEGATIVE fee (rebate to taker)
+        // AUDIT (2026-06): the negative-fee tier is currently DISABLED —
+        // `MAX_FEE_DISCOUNT_BPS == BPS_DENOM == 10_000`, so `discount_bps` is
+        // always ≤ 10_000 and the `else` branch below is UNREACHABLE
+        // (`taker_negative_rebate_u128` is always 0). To enable it, raise
+        // `MAX_FEE_DISCOUNT_BPS` above 10_000 — at which point the negative fee
+        // resolves to a credit on taker collateral, sourced from the protocol's
+        // insurance contribution downstream so it can't push the fund negative.
+        // (An earlier comment claimed a 12_000 cap that does not exist — do not
+        // trust it; the constant is the source of truth.)
         let discount_bps_full = ctx.accounts.taker_trader_state.load()?.fee_discount_bps as u128;
         let discount_bps = discount_bps_full.min(constants::MAX_FEE_DISCOUNT_BPS as u128);
         let mut taker_fee_u128 = base_taker_fee_u128;
