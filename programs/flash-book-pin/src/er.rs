@@ -337,3 +337,155 @@ mod force_undelegate_proofs {
         }
     }
 }
+
+
+/// Max PDA seeds the undelegation callback handles (market = 3, book = 2).
+pub const MAX_UNDELEGATE_SEEDS: usize = 4;
+
+/// 8-byte discriminator the MagicBlock delegation program sends when it CPIs BACK
+/// into this program to finalize an undelegation: `sha256("global:process_undelegation")[..8]`.
+/// pin's entrypoint detects this prefix and routes to process_undelegation.
+pub const EXTERNAL_UNDELEGATE_DISCRIMINATOR: [u8; 8] = [196, 28, 41, 206, 48, 37, 51, 167];
+
+/// Parse a borsh `Vec<Vec<u8>>` (the delegated account's PDA seeds) from `data`
+/// into `out` (slices borrow `data`). Layout: `[count u32 LE]` then each
+/// `[len u32 LE][bytes]`. Returns the seed count, or None on malformed / too many.
+pub fn parse_undelegate_seeds<'a>(
+    data: &'a [u8],
+    out: &mut [&'a [u8]; MAX_UNDELEGATE_SEEDS],
+) -> Option<usize> {
+    if data.len() < 4 {
+        return None;
+    }
+    let count = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    if count > MAX_UNDELEGATE_SEEDS {
+        return None;
+    }
+    let mut o = 4usize;
+    for slot in out.iter_mut().take(count) {
+        if data.len() < o + 4 {
+            return None;
+        }
+        let len = u32::from_le_bytes(data[o..o + 4].try_into().ok()?) as usize;
+        o += 4;
+        if data.len() < o + len {
+            return None;
+        }
+        *slot = &data[o..o + len];
+        o += len;
+    }
+    Some(count)
+}
+
+#[cfg(test)]
+mod undelegate_seed_tests {
+    use super::*;
+
+    #[test]
+    fn parses_two_seeds() {
+        // count=2; seed0 = b"book" (4); seed1 = [0xAA;3].
+        let mut d = Vec::new();
+        d.extend_from_slice(&2u32.to_le_bytes());
+        d.extend_from_slice(&4u32.to_le_bytes());
+        d.extend_from_slice(b"book");
+        d.extend_from_slice(&3u32.to_le_bytes());
+        d.extend_from_slice(&[0xAA; 3]);
+        let mut out: [&[u8]; MAX_UNDELEGATE_SEEDS] = [&[]; MAX_UNDELEGATE_SEEDS];
+        assert_eq!(parse_undelegate_seeds(&d, &mut out), Some(2));
+        assert_eq!(out[0], b"book");
+        assert_eq!(out[1], &[0xAA, 0xAA, 0xAA]);
+    }
+
+    #[test]
+    fn rejects_too_many_seeds() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&5u32.to_le_bytes()); // 5 > MAX 4
+        assert_eq!(parse_undelegate_seeds(&d, &mut [&[]; MAX_UNDELEGATE_SEEDS]), None);
+    }
+
+    #[test]
+    fn rejects_truncated() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(&10u32.to_le_bytes()); // claims 10 bytes, none follow
+        assert_eq!(parse_undelegate_seeds(&d, &mut [&[]; MAX_UNDELEGATE_SEEDS]), None);
+    }
+
+    #[test]
+    fn disc_matches_anchor() {
+        // sha256("global:process_undelegation")[..8]
+        assert_eq!(EXTERNAL_UNDELEGATE_DISCRIMINATOR, [196, 28, 41, 206, 48, 37, 51, 167]);
+    }
+}
+
+
+/// Finalize an undelegation initiated on the ER. Re-opens the delegated PDA under
+/// THIS program (sized to the committed buffer) and copies the committed state
+/// back. Faithful port of the Anchor `er::process_external_undelegate`.
+///
+/// Only the delegation program's SIGNED buffer may drive this (it is the signer
+/// + owned by the delegation program). The target PDA is re-derived from the
+/// passed seeds under our program and must match the account.
+///
+/// `solana`-only: it uses the create-account CPI (not available on the host
+/// target where the unit tests run).
+#[cfg(target_os = "solana")]
+pub fn process_external_undelegate(
+    pid: &pinocchio::pubkey::Pubkey,
+    delegated: &AccountInfo,
+    buffer: &AccountInfo,
+    payer: &AccountInfo,
+    system_program: &AccountInfo,
+    seeds: &[&[u8]],
+) -> ProgramResult {
+    use crate::cpi::create_pda_account;
+    use pinocchio::instruction::Seed;
+    use pinocchio::pubkey::find_program_address;
+    use pinocchio::sysvars::{rent::Rent, Sysvar};
+    if !buffer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if !buffer.is_owned_by(&DELEGATION_PROGRAM_ID) {
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    let (derived, bump) = find_program_address(seeds, pid);
+    if delegated.key() != &derived {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let space = buffer.data_len();
+    let lamports = Rent::get()?.minimum_balance(space);
+    let bump_arr = [bump];
+
+    // Re-open the PDA program-owned, signed by its own seeds + canonical bump.
+    // Only the 2-seed (book) and 3-seed (market) PDAs are delegated, so handle
+    // those explicitly (avoids a Copy-bound repeat-init of `Seed`).
+    match seeds.len() {
+        2 => {
+            let s = [Seed::from(seeds[0]), Seed::from(seeds[1]), Seed::from(&bump_arr[..])];
+            let signer = [Signer::from(&s[..])];
+            create_pda_account(payer, delegated, system_program, lamports, space as u64, pid, &signer)?;
+        }
+        3 => {
+            let s = [
+                Seed::from(seeds[0]),
+                Seed::from(seeds[1]),
+                Seed::from(seeds[2]),
+                Seed::from(&bump_arr[..]),
+            ];
+            let signer = [Signer::from(&s[..])];
+            create_pda_account(payer, delegated, system_program, lamports, space as u64, pid, &signer)?;
+        }
+        _ => return Err(ProgramError::InvalidArgument),
+    }
+
+    // Copy committed state back (sizes match by construction; guard anyway).
+    let src = buffer.try_borrow_data()?;
+    let mut dst = delegated.try_borrow_mut_data()?;
+    if dst.len() != src.len() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    dst.copy_from_slice(&src);
+    Ok(())
+}

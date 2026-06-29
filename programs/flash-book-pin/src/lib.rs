@@ -222,6 +222,12 @@ mod program {
 
     #[inline(always)]
     fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+        // The MagicBlock delegation program's undelegation callback CPIs back in
+        // with an 8-byte Anchor-style discriminator, NOT our 1-byte Ix tag —
+        // route it specially before the normal tag dispatch.
+        if data.len() >= 8 && data[..8] == crate::er::EXTERNAL_UNDELEGATE_DISCRIMINATOR {
+            return instructions::process_undelegation::process(program_id, accounts, &data[8..]);
+        }
         let (&tag, rest) = data.split_first().ok_or(ProgramError::InvalidInstructionData)?;
         match tag {
             x if x == Ix::ApplyFill as u8 => instructions::apply_fill::process(program_id, accounts, rest),
