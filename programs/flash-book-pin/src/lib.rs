@@ -236,6 +236,8 @@ mod program {
         PartialWithdrawCollateral = 140,
         PartialWithdrawCollateralXdomain = 141,
         WithdrawCollateralXdomain = 142,
+        PlaceBasketOrderV2 = 143,
+        PlaceBasketOrderNV2 = 144,
     }
 
     #[inline(always)]
@@ -393,6 +395,8 @@ mod program {
             x if x == Ix::PartialWithdrawCollateral as u8 => instructions::partial_withdraw::process(program_id, accounts, rest),
             x if x == Ix::PartialWithdrawCollateralXdomain as u8 => instructions::partial_withdraw::xdomain(program_id, accounts, rest),
             x if x == Ix::WithdrawCollateralXdomain as u8 => instructions::partial_withdraw::withdraw_xdomain(program_id, accounts, rest),
+            x if x == Ix::PlaceBasketOrderV2 as u8 => instructions::basket_order::v2(program_id, accounts, rest),
+            x if x == Ix::PlaceBasketOrderNV2 as u8 => instructions::basket_order::n_v2(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
