@@ -2045,3 +2045,139 @@ async fn stamp_liveness_rejects_undelegated_book() {
     let m = banks.get_account(market).await.unwrap().unwrap();
     assert_eq!(get_u64(&m.data, MKT_BOOK_DELEGATED_AT), 0, "no baseline on reject");
 }
+
+// ─── book_permission e2e ───
+// init/set/close call the MagicBlock permission CPI (build-sbf only). But the
+// account validation + the idempotent-init no-op run BEFORE any CPI, so those
+// paths ARE e2e-testable: full validation passes and init returns cleanly when
+// the permission already exists (no CPI hit).
+use flash_book_pin::er_permission::{
+    EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID, PERMISSION_PROGRAM_ID, PERMISSION_SEED,
+};
+const IX_INIT_BOOK_PERM: u8 = 117;
+const IX_SET_BOOK_PRIVACY: u8 = 118;
+
+fn book_perm_accounts(
+    pid: Pubkey,
+    authority: Pubkey,
+    perm_lamports: u64,
+) -> (Pubkey, Pubkey, Pubkey) {
+    // returns (market, market_book, permission)
+    let market = Pubkey::new_unique();
+    let (market_book, _) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+    let (permission, _) = Pubkey::find_program_address(
+        &[PERMISSION_SEED, &market_book.to_bytes()],
+        &Pubkey::new_from_array(PERMISSION_PROGRAM_ID),
+    );
+    let _ = (authority, perm_lamports);
+    (market, market_book, permission)
+}
+
+#[tokio::test]
+async fn init_book_permission_idempotent_noop_when_exists() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let (market, market_book, permission) = book_perm_accounts(pid, authority.pubkey(), 1);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    pt.add_account(market, m);
+    pt.add_account(market_book, Account { lamports: 1_000_000, data: vec![0u8; 8], owner: pid, executable: false, rent_epoch: 0 });
+    // permission ALREADY exists (lamports > 0) → init is a no-op (no CPI).
+    pt.add_account(permission, Account { lamports: 1_000_000, data: vec![], owner: Pubkey::new_from_array(PERMISSION_PROGRAM_ID), executable: false, rent_epoch: 0 });
+    pt.add_account(Pubkey::new_from_array(EPHEMERAL_VAULT_ID), Account { lamports: 1, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    pt.add_account(Pubkey::new_from_array(MAGIC_PROGRAM_ID), Account { lamports: 1, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: true, rent_epoch: 0 });
+    pt.add_account(Pubkey::new_from_array(PERMISSION_PROGRAM_ID), Account { lamports: 1, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: true, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(permission, false),
+            AccountMeta::new(Pubkey::new_from_array(EPHEMERAL_VAULT_ID), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(MAGIC_PROGRAM_ID), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(PERMISSION_PROGRAM_ID), false),
+        ],
+        data: vec![IX_INIT_BOOK_PERM],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &authority], bh))
+        .await
+        .unwrap(); // succeeds via the idempotent no-op, no CPI
+}
+
+#[tokio::test]
+async fn init_book_permission_rejects_wrong_authority() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let imposter = Keypair::new();
+    let (market, market_book, permission) = book_perm_accounts(pid, authority.pubkey(), 1);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey()); // real authority
+    pt.add_account(market, m);
+    pt.add_account(market_book, Account { lamports: 1_000_000, data: vec![0u8; 8], owner: pid, executable: false, rent_epoch: 0 });
+    pt.add_account(permission, Account { lamports: 1_000_000, data: vec![], owner: Pubkey::new_from_array(PERMISSION_PROGRAM_ID), executable: false, rent_epoch: 0 });
+    pt.add_account(imposter.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(imposter.pubkey(), true), // NOT the market authority
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(permission, false),
+            AccountMeta::new(Pubkey::new_from_array(EPHEMERAL_VAULT_ID), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(MAGIC_PROGRAM_ID), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(PERMISSION_PROGRAM_ID), false),
+        ],
+        data: vec![IX_INIT_BOOK_PERM],
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh))
+        .await;
+    assert!(r.is_err(), "non-authority must be rejected");
+}
+
+#[tokio::test]
+async fn set_book_privacy_rejects_too_many_members() {
+    // n_members = 33 > MAX (32) is rejected at data-parse, before any account work.
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let market = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(authority.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    pt.add_account(market, market_account(pid, Pubkey::new_unique()));
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_SET_BOOK_PRIVACY, 1, 33]; // is_private=1, n=33
+    data.extend_from_slice(&[0u8; 33 * 32]); // 33 pubkeys
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market, false), // placeholders; rejected before use
+            AccountMeta::new(market, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(market, false),
+        ],
+        data,
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &authority], bh))
+        .await;
+    assert!(r.is_err(), "more than MAX_PRIVACY_MEMBERS must be rejected");
+}
