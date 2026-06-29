@@ -181,3 +181,115 @@ pub fn cpi_undelegate(a: &UndelegateAccounts, signer: &[Signer]) -> ProgramResul
         signer,
     )
 }
+
+
+#[inline]
+fn max3(a: u64, b: u64, c: u64) -> u64 {
+    let ab = if a > b { a } else { b };
+    if ab > c { ab } else { c }
+}
+
+/// Whether the permissionless force-undelegate escape may fire. Faithful port of
+/// the Anchor `er::force_undelegate_allowed` (Kani-proven F2/F3). Opens when:
+///   • FAST: the most recent ER liveness signal of ANY kind (committed fill /
+///     heartbeat / delegation baseline) is older than `stall_timeout_slots` — a
+///     dead ER. Heartbeat-aware, so a quiet-but-heartbeating market isn't griefed.
+///   • BACKSTOP: SETTLEMENT (a committed fill) has not advanced for the much
+///     longer `censorship_timeout_slots`, IGNORING heartbeats — catches an
+///     alive-but-censoring sequencer that heartbeats but settles nothing.
+/// A zero baseline (never delegated via the upgraded path / never stamped) is
+/// never escapable.
+#[inline]
+pub fn force_undelegate_allowed(
+    current_slot: u64,
+    last_mark_update_slot: u64,
+    last_heartbeat_slot: u64,
+    book_delegated_at_slot: u64,
+    stall_timeout_slots: u64,
+    censorship_timeout_slots: u64,
+) -> bool {
+    let er_baseline = max3(last_mark_update_slot, last_heartbeat_slot, book_delegated_at_slot);
+    let er_stalled =
+        er_baseline != 0 && current_slot.saturating_sub(er_baseline) > stall_timeout_slots;
+
+    let settle_baseline = if last_mark_update_slot > book_delegated_at_slot {
+        last_mark_update_slot
+    } else {
+        book_delegated_at_slot
+    };
+    let censored = settle_baseline != 0
+        && current_slot.saturating_sub(settle_baseline) > censorship_timeout_slots;
+
+    er_stalled || censored
+}
+
+#[cfg(test)]
+mod force_undelegate_tests {
+    use super::*;
+
+    const STALL: u64 = 750;
+    const CENSOR: u64 = 9_000;
+
+    #[test]
+    fn live_er_cannot_be_force_undelegated() {
+        // delegated at 1000, a fill 50 slots ago (current 1100) → live → false.
+        assert!(!force_undelegate_allowed(1_100, 1_050, 0, 1_000, STALL, CENSOR));
+        // heartbeating but no fills, within stall → still false (not griefable).
+        assert!(!force_undelegate_allowed(1_500, 0, 1_400, 1_000, STALL, CENSOR));
+    }
+
+    #[test]
+    fn dead_er_opens_after_stall_timeout() {
+        // delegated at 1000, no liveness; current = 1000 + 751 → stalled → true.
+        assert!(force_undelegate_allowed(1_751, 0, 0, 1_000, STALL, CENSOR));
+        // exactly at the timeout (not strictly greater) → still false.
+        assert!(!force_undelegate_allowed(1_750, 0, 0, 1_000, STALL, CENSOR));
+    }
+
+    #[test]
+    fn censoring_sequencer_opens_via_backstop() {
+        // Heartbeats keep er_baseline fresh (no fast-path), but settlement
+        // (last_mark_update) stalled past the censorship backstop → true.
+        let delegated = 1_000;
+        let current = delegated + CENSOR + 1;
+        // Fresh heartbeat (1 slot ago) keeps the fast path closed, but settlement
+        // (last_mark_update == delegated baseline) is stale past the censorship
+        // backstop → the escape still opens.
+        assert!(force_undelegate_allowed(current, delegated, current - 1, delegated, STALL, CENSOR));
+    }
+
+    #[test]
+    fn zero_baseline_never_escapable() {
+        assert!(!force_undelegate_allowed(1_000_000, 0, 0, 0, STALL, CENSOR));
+    }
+}
+
+#[cfg(kani)]
+mod force_undelegate_proofs {
+    use super::*;
+
+    /// F2/F3: the escape NEVER fires while the ER is live — if the most recent
+    /// liveness signal is within the stall window AND settlement is within the
+    /// censorship window, the gate stays closed. So a stalled/censoring ER is a
+    /// necessary precondition; a healthy venue cannot be griefed.
+    #[kani::proof]
+    fn proof_never_fires_while_live() {
+        let current: u64 = kani::any();
+        let fill: u64 = kani::any();
+        let heartbeat: u64 = kani::any();
+        let delegated: u64 = kani::any();
+        let stall: u64 = kani::any();
+        let censor: u64 = kani::any();
+
+        let er_baseline = max3(fill, heartbeat, delegated);
+        let settle_baseline = if fill > delegated { fill } else { delegated };
+
+        // "Live": most recent signal within stall AND settlement within censorship.
+        let live = current.saturating_sub(er_baseline) <= stall
+            && current.saturating_sub(settle_baseline) <= censor;
+
+        if live {
+            assert!(!force_undelegate_allowed(current, fill, heartbeat, delegated, stall, censor));
+        }
+    }
+}

@@ -2371,3 +2371,46 @@ async fn undelegate_market_rejects_wrong_authority() {
     let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh)).await;
     assert!(r.is_err(), "non-authority undelegate must be rejected");
 }
+
+// ─── force_undelegate_market_book e2e (liveness gate, no CPI) ───
+// Permissionless escape: the liveness gate runs BEFORE the undelegate CPI, so a
+// premature force-undelegate (ER still live) is cleanly rejected. A recently
+// delegated book (book_delegated_at_slot ≈ current slot) is "live".
+const IX_FORCE_UNDELEGATE: u8 = 124;
+
+#[tokio::test]
+async fn force_undelegate_rejects_while_live() {
+    let pid = Pubkey::new_unique();
+    let payer_signer = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (market_book, _) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    // market owned by us; book delegated recently (slot 1) → within the stall
+    // window vs the test validator's low current slot → "live" → reject.
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_u64(&mut m.data, MKT_BOOK_DELEGATED_AT, 1);
+    pt.add_account(market, m);
+    pt.add_account(market_book, Account { lamports: 1_000_000, data: vec![0u8; 8], owner: Pubkey::new_from_array(DELEGATION_PROGRAM_ID), executable: false, rent_epoch: 0 });
+    pt.add_account(payer_signer.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(payer_signer.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new_readonly(pid, false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8;32]), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(DELEGATION_PROGRAM_ID), false),
+        ],
+        data: vec![IX_FORCE_UNDELEGATE],
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &payer_signer], bh))
+        .await;
+    assert!(r.is_err(), "force-undelegate must be rejected while the ER is live");
+}
