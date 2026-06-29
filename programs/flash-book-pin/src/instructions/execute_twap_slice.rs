@@ -30,12 +30,12 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
     assert_owned_by(twap_order, pid)?;
     assert_disc(twap_order, &TWAP_ORDER_V3_DISC)?;
 
-    let (t_trader, t_market, t_slice, t_total, t_executed, t_limit, t_interval, t_end, t_last, t_side, t_flags, t_sub) = {
+    let (t_trader, t_market, t_slice, t_total, t_executed, t_limit, t_interval, t_end, t_last, t_side, t_flags, t_sub, t_acceptable) = {
         let t = unsafe { &*(twap_order.borrow_data_unchecked().as_ptr() as *const TwapOrderV3) };
         (
             t.trader, t.market, t.slice_size_lots, t.total_size_lots, t.size_executed_lots,
             t.limit_price_ticks, t.slot_interval, t.end_slot, t.last_slice_at_slot, t.side,
-            t.flags, t.sub_index,
+            t.flags, t.sub_index, t.acceptable_price_ticks,
         )
     };
 
@@ -64,10 +64,22 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         return Err(ProgramError::Custom(163)); // fully executed
     }
     let slice = t_slice.min(remaining);
-    let min_base = {
+    let (min_base, mark, last_mark_update) = {
         let d = market.try_borrow_data()?;
-        unsafe { (*(d.as_ptr() as *const Market)).min_base_lots }
+        let m = unsafe { &*(d.as_ptr() as *const Market) };
+        (m.min_base_lots, m.mark_price_ticks, m.last_mark_update_slot)
     };
+    // Re-audit 2026-06-30 (LOW): refuse to execute a slice on a STALE mark.
+    if now.saturating_sub(last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS {
+        return Err(ProgramError::Custom(248)); // stale mark
+    }
+    // Re-audit 2026-06-30 (MED): enforce the trader's slippage cap on each slice. If
+    // the mark gapped past `acceptable_price`, skip this slice (refuse) — anchor
+    // skips-but-keeps-active on breach; reverting leaves the TWAP active to retry the
+    // next interval at an acceptable price, protecting the trader from a gap fill.
+    if crate::trigger_order::slippage_cap_breached(t_acceptable, t_side, mark) {
+        return Err(ProgramError::Custom(165)); // TwapSlippageExceeded
+    }
     // No dust: a slice must meet the market minimum unless it is the final remnant.
     if slice < min_base && slice != remaining {
         return Err(ProgramError::Custom(164));

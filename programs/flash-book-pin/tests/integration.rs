@@ -1867,8 +1867,26 @@ async fn update_trailing_stop_no_progress_is_noop() {
 // Validate + median-select 3 oracle sources, then set the mark. No CPI → fully
 // e2e-testable. Gates off (limits 0) ⇒ any 3 prices accepted; median of
 // [120,100,90] = 100 becomes the mark (was 0).
-use flash_book_pin::state::ORACLE_CONFIG_DISC;
+use flash_book_pin::state::{ENVELOPE_CONFIG_DISC, ORACLE_CONFIG_DISC};
+use flash_book_pin::seeds::{ENVELOPE_CONFIG_SEED, ORACLE_CONFIG_SEED};
 const IX_UPDATE_ORACLE_QUORUM: u8 = 114;
+
+// Canonical oracle_config PDA (re-audit 2026-06-30: the handlers now assert_pda it).
+fn oracle_config_pda(pid: Pubkey, market: Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[ORACLE_CONFIG_SEED, &market.to_bytes()], &pid).0
+}
+// A MarketEnvelopeConfig at its canonical PDA (the Pyth path now requires it). The
+// cap is irrelevant when old_mark == 0 (first update admits any move).
+fn envelope_config_acct(pid: Pubkey, market: Pubkey) -> Account {
+    let mut d = vec![0u8; 168];
+    d[0..8].copy_from_slice(&ENVELOPE_CONFIG_DISC);
+    put_key(&mut d, 8, &market);
+    put_u32(&mut d, 112, 10_000); // max_price_move_bps_per_slot
+    rent_account(d, pid)
+}
+fn envelope_config_pda(pid: Pubkey, market: Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[ENVELOPE_CONFIG_SEED, &market.to_bytes()], &pid).0
+}
 
 fn oracle_config_acct(pid: Pubkey, market: Pubkey, max_stale: u32, max_conf: u32, max_disp: u32) -> Account {
     let mut d = vec![0u8; 88];
@@ -1885,7 +1903,7 @@ async fn update_oracle_quorum_sets_median_mark() {
     let pid = Pubkey::new_unique();
     let sequencer = Keypair::new();
     let market = Pubkey::new_unique();
-    let oracle_config = Pubkey::new_unique();
+    let oracle_config = oracle_config_pda(pid, market);
 
     let mut pt = ProgramTest::new("flash_book_pin", pid, None);
     pt.add_account(market, market_account(pid, sequencer.pubkey())); // mark 0, sequencer set
@@ -1920,7 +1938,7 @@ async fn update_oracle_quorum_rejects_wide_dispersion() {
     let pid = Pubkey::new_unique();
     let sequencer = Keypair::new();
     let market = Pubkey::new_unique();
-    let oracle_config = Pubkey::new_unique();
+    let oracle_config = oracle_config_pda(pid, market);
 
     let mut pt = ProgramTest::new("flash_book_pin", pid, None);
     pt.add_account(market, market_account(pid, sequencer.pubkey()));
@@ -1985,12 +2003,14 @@ async fn update_oracle_from_pyth_sets_converted_mark() {
     let pid = Pubkey::new_unique();
     let caller = Keypair::new();
     let market = Pubkey::new_unique();
-    let oracle_config = Pubkey::new_unique();
+    let oracle_config = oracle_config_pda(pid, market);
+    let envelope_config = envelope_config_pda(pid, market);
     let price_update = Pubkey::new_unique();
 
     let mut pt = ProgramTest::new("flash_book_pin", pid, None);
     pt.add_account(market, market_account(pid, Pubkey::new_unique())); // mark 0
     pt.add_account(oracle_config, pyth_oracle_config(pid, market, 6));
+    pt.add_account(envelope_config, envelope_config_acct(pid, market)); // now MANDATORY
     // Pyth price account: the real fixture, owned by the Pyth receiver program.
     pt.add_account(
         price_update,
@@ -2011,6 +2031,7 @@ async fn update_oracle_from_pyth_sets_converted_mark() {
             AccountMeta::new(market, false),
             AccountMeta::new_readonly(oracle_config, false),
             AccountMeta::new_readonly(price_update, false),
+            AccountMeta::new_readonly(envelope_config, false), // mandatory (H-4)
         ],
         data: vec![IX_UPDATE_ORACLE_FROM_PYTH],
     };
@@ -2029,12 +2050,14 @@ async fn update_oracle_from_pyth_rejects_wrong_owner() {
     let pid = Pubkey::new_unique();
     let caller = Keypair::new();
     let market = Pubkey::new_unique();
-    let oracle_config = Pubkey::new_unique();
+    let oracle_config = oracle_config_pda(pid, market);
+    let envelope_config = envelope_config_pda(pid, market);
     let price_update = Pubkey::new_unique();
 
     let mut pt = ProgramTest::new("flash_book_pin", pid, None);
     pt.add_account(market, market_account(pid, Pubkey::new_unique()));
     pt.add_account(oracle_config, pyth_oracle_config(pid, market, 6));
+    pt.add_account(envelope_config, envelope_config_acct(pid, market));
     // Same fixture but owned by a RANDOM program → must be rejected.
     pt.add_account(
         price_update,
@@ -2055,6 +2078,7 @@ async fn update_oracle_from_pyth_rejects_wrong_owner() {
             AccountMeta::new(market, false),
             AccountMeta::new_readonly(oracle_config, false),
             AccountMeta::new_readonly(price_update, false),
+            AccountMeta::new_readonly(envelope_config, false), // mandatory (H-4)
         ],
         data: vec![IX_UPDATE_ORACLE_FROM_PYTH],
     };
@@ -2065,6 +2089,63 @@ async fn update_oracle_from_pyth_rejects_wrong_owner() {
     assert!(r.is_err(), "a non-Pyth-owned price account must be rejected");
     let m = banks.get_account(market).await.unwrap().unwrap();
     assert_eq!(get_u64(&m.data, MKT_MARK), 0, "mark untouched on reject");
+}
+
+// AUDIT CR-1 (re-audit 2026-06-30): market creation MUST be gated to the protocol
+// authority (the insurance-fund initializer). A non-authority creating a market
+// would become its sequencer and could fabricate fills draining the shared vault.
+// The gate rejects BEFORE the create_pda CPI (which solana-program-test can't drive),
+// matching every other create-pda reject test here.
+const IX_INIT_MARKET: u8 = 11;
+const INS_AUTHORITY: usize = 92;
+
+#[tokio::test]
+async fn initialize_market_rejects_non_authority() {
+    let pid = Pubkey::new_unique();
+    let real_auth = Pubkey::new_unique();
+    let imposter = Keypair::new();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let (insurance, _) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let (market, _) =
+        Pubkey::find_program_address(&[MARKET_SEED, &base.to_bytes(), &quote.to_bytes()], &pid);
+
+    let mut ins = vec![0u8; INSURANCE_LEN];
+    ins[0..8].copy_from_slice(&INSURANCE_DISC);
+    put_key(&mut ins, INS_AUTHORITY, &real_auth); // authority = real_auth (NOT the imposter)
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(insurance, rent_account(ins, pid));
+    pt.add_account(market, Account { lamports: 0, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 });
+    pt.add_account(imposter.pubkey(), Account { lamports: 5_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_INIT_MARKET];
+    data.extend_from_slice(&1u64.to_le_bytes()); // tick_size
+    data.extend_from_slice(&100u64.to_le_bytes()); // mark_price_ticks
+    data.extend_from_slice(&10u32.to_le_bytes()); // taker_fee_bps
+    data.extend_from_slice(&0i32.to_le_bytes()); // maker_rebate_bps
+    data.extend_from_slice(&1u64.to_le_bytes()); // min_base_lots
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // max_oi_base_lots
+    data.extend_from_slice(&500u32.to_le_bytes()); // maintenance_margin_bps
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(imposter.pubkey(), true), // authority (impersonating)
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(base, false),
+            AccountMeta::new_readonly(quote, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8; 32]), false), // system
+        ],
+        data,
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh))
+        .await;
+    let err = format!("{:?}", r.expect_err("non-authority must not create a market (CR-1)"));
+    assert!(err.contains("Custom(7100)"), "expected Custom(7100) Unauthorized, got: {err}");
 }
 
 // ─── stamp_book_liveness_baseline e2e (positive + negative, no CPI) ───

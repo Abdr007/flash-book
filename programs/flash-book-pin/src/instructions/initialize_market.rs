@@ -8,15 +8,15 @@
 //! will rotate it.
 //!
 //! accounts: [authority (signer, payer, w), market (PDA, w),
-//!            base_mint (r), quote_mint (r), system_program]
+//!            base_mint (r), quote_mint (r), insurance (PDA, r), system_program]
 //! data (40 bytes LE):
 //!   tick_size: u64, mark_price_ticks: u64, taker_fee_bps: u32,
 //!   maker_rebate_bps: i32, min_base_lots: u64, max_oi_base_lots: u64
 
 use crate::cpi::create_pda_account;
-use crate::guard::{assert_pda, assert_signer, assert_uninitialized};
-use crate::seeds::MARKET_SEED;
-use crate::state::{Market, MARKET_DISC};
+use crate::guard::{assert_disc, assert_owned_by, assert_pda, assert_signer, assert_uninitialized};
+use crate::seeds::{INSURANCE_SEED, MARKET_SEED};
+use crate::state::{Insurance, Market, INSURANCE_DISC, MARKET_DISC};
 use pinocchio::{
     account_info::AccountInfo,
     instruction::{Seed, Signer},
@@ -29,7 +29,7 @@ use pinocchio::{
 const MARKET_LEN: usize = core::mem::size_of::<Market>();
 
 pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [authority, market, base_mint, quote_mint, system_program, ..] = accounts else {
+    let [authority, market, base_mint, quote_mint, insurance, system_program, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     if data.len() < 44 {
@@ -68,6 +68,24 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     // ── guards ──────────────────────────────────────────────────────────
     assert_signer(authority)?;
     assert_uninitialized(market)?;
+    // AUDIT CR-1 (re-audit 2026-06-30): market creation MUST be gated to the
+    // protocol authority (the insurance-fund initializer). Without this, ANY
+    // signer could create a market — becoming its `sequencer` (set below) — then
+    // fabricate fills via the sequencer-gated `apply_fill` that force a bad-debt
+    // shortfall covered by the SHARED insurance fund and credited to the attacker,
+    // who withdraws it: a permissionless drain of the shared vault. Bind the
+    // canonical singleton insurance PDA and require `insurance.authority ==
+    // authority` (parity with anchor `InitializeMarket`'s CR-1 constraint).
+    assert_owned_by(insurance, program_id)?;
+    assert_pda(insurance, &[INSURANCE_SEED], program_id)?;
+    assert_disc(insurance, &INSURANCE_DISC)?;
+    {
+        let d = insurance.try_borrow_data()?;
+        let f = unsafe { &*(d.as_ptr() as *const Insurance) };
+        if &f.authority != authority.key() {
+            return Err(ProgramError::Custom(7100)); // Unauthorized (CR-1)
+        }
+    }
     let bump = assert_pda(
         market,
         &[MARKET_SEED, &base_mint.key()[..], &quote_mint.key()[..]],

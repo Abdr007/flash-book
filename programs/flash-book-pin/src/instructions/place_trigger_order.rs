@@ -106,6 +106,11 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     )?;
 
     let created_at_slot = Clock::get()?.slot;
+    // Re-audit 2026-06-30 (LOW parity): reject a dead-on-arrival expiry at placement
+    // (anchor validates it here; the whole tx reverts so no rent is wasted).
+    if expires_at_slot != 0 && expires_at_slot <= created_at_slot {
+        return Err(ProgramError::InvalidArgument);
+    }
     unsafe {
         let t = &mut *(trigger_order.borrow_mut_data_unchecked().as_mut_ptr() as *mut TriggerOrderV3);
         t.disc = TRIGGER_ORDER_V3_DISC;
@@ -121,7 +126,11 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         t.trigger_id = trigger_id;
         t.side = side;
         t.kind = kind;
-        t.flags = flags | crate::state::TRIGGER_FLAG_ACTIVE;
+        // Re-audit 2026-06-30 (LOW parity): mask the caller's flags to the only
+        // meaningful settable bit (REDUCE_ONLY) before OR-ing ACTIVE, so arbitrary
+        // bits can't be stored (fragile if new flag bits gain meaning). Anchor only
+        // ever sets ACTIVE | (reduce_only? REDUCE_ONLY).
+        t.flags = (flags & crate::state::TRIGGER_FLAG_REDUCE_ONLY) | crate::state::TRIGGER_FLAG_ACTIVE;
         t.sub_index = sub_index;
         t.trailing_offset_bps = trailing_offset_bps;
         t.trailing_anchor_ticks = 0; // seeded on the first update_trailing_stop

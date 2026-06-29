@@ -17,7 +17,8 @@ use crate::state::{
     FlpExposure, Insurance, LpPosition, FLP_EXPOSURE_DISC, INSURANCE_DISC, LP_POSITION_DISC,
 };
 use pinocchio::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
+    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey,
+    sysvars::{clock::Clock, Sysvar}, ProgramResult,
 };
 
 pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -65,11 +66,11 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         }
     }
 
-    // ── price the deposit at current NAV ────────────────────────────────
+    // ── price the deposit at `min(nav, capital)` (re-audit 2026-06-30) ──
     let shares = {
         let d = flp_exposure.try_borrow_data()?;
         let f = unsafe { &*(d.as_ptr() as *const FlpExposure) };
-        FlpExposure::shares_for_deposit(amount, f.lp_shares_outstanding, f.nav())
+        FlpExposure::shares_for_deposit(amount, f.lp_shares_outstanding, f.nav_for_pricing())
     }
     .ok_or(ProgramError::InvalidArgument)?;
     if shares == 0 {
@@ -91,6 +92,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             .checked_add(shares)
             .ok_or(ProgramError::ArithmeticOverflow)?;
     }
+    let now_slot = Clock::get()?.slot;
     unsafe {
         let p = &mut *(lp_position.borrow_mut_data_unchecked().as_mut_ptr() as *mut LpPosition);
         p.shares = p
@@ -101,6 +103,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             .total_deposited_quote_lots
             .checked_add(amount)
             .ok_or(ProgramError::ArithmeticOverflow)?;
+        // Re-audit 2026-06-30 (MED): (re)stamp the JIT-LP min-hold anchor to NOW —
+        // any top-up extends the lock, blocking a flash deposit-before-a-fee-event /
+        // withdraw-after skim of honest LPs' rebate revenue (Wave 57).
+        p.deposited_at_slot = now_slot.to_le_bytes();
     }
     Ok(())
 }

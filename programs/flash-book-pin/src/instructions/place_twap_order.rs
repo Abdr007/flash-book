@@ -115,7 +115,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         t.bump = bump;
         t.twap_id = twap_id;
         t.side = side;
-        t.flags = flags | crate::state::TWAP_FLAG_ACTIVE;
+        // Re-audit 2026-06-30 (LOW parity): TWAP has only the program-set ACTIVE bit;
+        // ignore the caller's flag byte entirely so no arbitrary bits are stored.
+        let _ = flags;
+        t.flags = crate::state::TWAP_FLAG_ACTIVE;
         t.sub_index = sub_index;
         t._reserved = [0u8; 3];
     }

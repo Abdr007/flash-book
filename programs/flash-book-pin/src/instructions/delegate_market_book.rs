@@ -84,7 +84,13 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     let len = write_delegate_data(
         &mut buf,
         commit_frequency_ms,
-        &[MARKET_BOOK_SEED, &market.key()[..], &bump_arr[..]],
+        // Re-audit 2026-06-30 (HIGH): args.seeds must NOT include the bump. The DLP
+        // echoes them to the undelegate callback, which re-derives the PDA via
+        // find_program_address (adding the bump itself); a bump here yields a wrong
+        // address → the account can NEVER be undelegated (state/funds trapped on ER).
+        // The bump travels only in the invoke_signed Signer seeds below. Matches the
+        // anchor 2026-06-28 fix; pin's process_external_undelegate expects book=2 seeds.
+        &[MARKET_BOOK_SEED, &market.key()[..]],
         if has_validator { Some(&validator) } else { None },
     );
     let seeds = [

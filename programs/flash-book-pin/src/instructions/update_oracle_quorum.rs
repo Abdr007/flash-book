@@ -17,7 +17,7 @@
 use crate::envelope::gate_price_move;
 use crate::guard::{assert_disc, assert_owned_by, assert_pda, assert_signer};
 use crate::oracle_quorum::aggregate_median;
-use crate::seeds::ENVELOPE_CONFIG_SEED;
+use crate::seeds::{ENVELOPE_CONFIG_SEED, ORACLE_CONFIG_SEED};
 use crate::state::{
     Market, MarketEnvelopeConfig, MarketOracleConfig, ENVELOPE_CONFIG_DISC, MARKET_DISC,
     ORACLE_CONFIG_DISC,
@@ -69,6 +69,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     // Per-market quorum limits.
     assert_owned_by(oracle_config, program_id)?;
     assert_disc(oracle_config, &ORACLE_CONFIG_DISC)?;
+    // Re-audit 2026-06-30 (LOW parity): bind the canonical oracle_config PDA.
+    assert_pda(oracle_config, &[ORACLE_CONFIG_SEED, &market.key()[..]], program_id)?;
     let (max_staleness, max_confidence, max_dispersion) = {
         let d = oracle_config.try_borrow_data()?;
         let c = unsafe { &*(d.as_ptr() as *const MarketOracleConfig) };

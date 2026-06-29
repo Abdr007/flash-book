@@ -333,6 +333,59 @@ build-sbf clean.
 
 ---
 
+## Third full external re-audit — EXHAUSTIVE 12-agent line-by-line (2026-06-30)
+
+After two thematic rounds (#187 sub_index, #188 ADL/FLP) kept surfacing a different
+LAYER each time, this pass switched method: **12 agents, every instruction diffed
+line-by-line against its Anchor original**, plus dedicated arithmetic/cast and
+global-invariant/race sweeps, plus **adversarial verification** of each finding
+against both sources before any fix. It found a **CRITICAL the thematic rounds
+missed** (a cross-cutting init-gate × settlement-drain chain) and a spread of
+HIGH/MED/LOW port bugs. All L1-validatable findings fixed + regression-tested.
+
+| Sev | Finding | Fix |
+|-----|---------|-----|
+| **CRITICAL** | **CR-1**: `initialize_market` is PERMISSIONLESS (no insurance-authority gate; doesn't even take the insurance account) and sets the creator as `sequencer`. Anyone creates a market → as its sequencer fabricates a fill (within the ±50% band, at a mark they also set) forcing wallet B a loss far exceeding B's collateral → the shortfall is drawn from the SHARED insurance fund and credited to wallet A → A withdraws → permissionless drain of the shared vault. Conserves `collateral+insurance` (why the invariant sweep waved it through) but drains the fund. Anchor has the CR-1 gate (`insurance_fund.authority == authority`); never ported to pin. | bind the canonical insurance PDA + require `insurance.authority == authority` (Custom 7100). Regression test `initialize_market_rejects_non_authority`. |
+| **HIGH** | `book.rs::from_account_data` had only length+disc, **no header node-index bounds loop**, and `process_undelegation` ran **no `validate_node_links`** (Anchor AUDIT O-1 / ER L-2). A malicious/buggy ER validator commits a book with out-of-range RBT indices → persisted unvalidated on undelegate → next op panic-DoS (permanent brick) or in-bounds-misaligned tree corruption. | port the 6-index header bounds loop into `from_account_data` + `validate_node_links` called once from `process_undelegation` (fails closed). Test `book_validation_accepts_clean_rejects_corruption`. |
+| **HIGH** | `update_oracle_from_pyth` envelope cap OPTIONAL on the **permissionless** path (Anchor H-4 makes it MANDATORY) → any keeper omits it → unbounded one-slot mark jump to a large Pyth move → mass-liquidate past the lattice budget. | make `envelope_config` a required account (revert to H-4). |
+| **HIGH** | `liquidate_portfolio_v2` staleness-gated only the EXEC market; **sibling legs' marks unchecked** → a frozen sibling mark (illiquid market in an ER stall) inflates the portfolio loss → wrongful liquidation of a portfolio-healthy trader. Anchor passes every leg through `effective_health_mark`. | per-sibling `last_mark_update_slot` staleness gate. |
+| **HIGH** | ER delegate handlers pass `args.seeds` **with the bump**; the undelegate callback re-derives via `find_program_address` (no bump) and matches `seeds.len()` as book=2/market=3 → a delegated account can NEVER be undelegated (funds trapped on ER). Self-inconsistent with pin's own `process_external_undelegate`. Matches the anchor 2026-06-28 fix. | drop the bump from `args.seeds` in all 3 delegate handlers (kept in the Signer seeds). |
+| **MED** | fee/rebate ALWAYS debited from / credited to the CROSS pool, never the isolated bucket (anchor routes to the iso bucket when the leg is isolated) → an isolated trader with an empty cross pool could NOT settle a fill (H-1 checked_sub aborted) — a liveness bug. | route the taker fee / maker rebate to the iso bucket when isolated (sampled pre-funding); conservation unchanged. (`apply_fill` + `apply_flp_fill`.) |
+| **MED** | trigger/TWAP slippage cap (`acceptable_price_ticks`) validated at PLACEMENT but **never at execution** → a keeper fires the order into a gap past the trader's cap. | port `slippage_cap_breached`; refuse to fire on breach (`execute_trigger_order` + `execute_twap_slice`). Test `slippage_cap_breached_semantics`. |
+| **MED** | JIT liquidation offer admitted any price within the ±50% band → an "improving" offer PAST mark (ask above / bid below) rests un-fillable → dup-scan + `position_liq` stamp then block re-liquidation → position frozen open while the caller already skimmed the reward. | clamp the close `limit` to the marketable side of mark (close-ask ≤ mark / close-bid ≥ mark). |
+| **MED** | singleton FLP (`deposit_flp_capital`/`withdraw_flp_capital`) dropped Anchor's H8 JIT-LP min-hold lock (`LpPosition` had no `deposited_at_slot`; `jit_lp_defense` wired to nothing) → flash deposit-before-a-rebate-event / withdraw-after skims honest LPs' revenue. | carve `deposited_at_slot` into `LpPosition` (104-byte layout preserved), stamp on deposit, gate withdraw via `can_withdraw(FLP_MIN_HOLD_SLOTS=150)`. |
+| **LOW** | `execute_trigger_order` reduce-only gate omitted `sub_index` → a "reduce-only" trigger could increase exposure on a DIFFERENT sub. `verify_leverage_cap` omitted `sub_index` (monitor false-negative). `verify_portfolio_solvency`/`_stress` assessed isolated legs as cross (false-negative). `update_oracle_quorum`/`_from_pyth` oracle_config not PDA-bound. quorum didn't future-reject `published_at`. singleton-FLP `nav_for_pricing` (latent v3 asymmetry). trigger flag-mask / expiry-at-placement / mark-staleness-at-fire / TWAP flag-mask. | all fixed for parity. |
+
+Suite after: **485 host + 76 integration + 26 Kani**, build-sbf clean. New tests:
+`initialize_market_rejects_non_authority`, `book_validation_accepts_clean_rejects_corruption`,
+`slippage_cap_breached_semantics`, `flp_v3_nav_for_pricing_*` (carried).
+
+### Verified CLEAN by this pass (high-signal negatives)
+The money-path arithmetic (every truncating `as` cast guarded; the #188 `shocked_price`
+fix confirmed), the proven core (OI/PnL/funding/shortfall conservation, C-1 margin,
+vault round-trip, ADL #188 cap+gate, FLP/vault #188 fixes), funding/haircut (faithful,
+inert-but-symmetric), the dispatch (collision-free), the guard layer, and account
+aliasing/binding were all independently re-verified sound.
+
+### HONESTLY DEFERRED — not fixed (requires the live MagicBlock DLP)
+- **ER delegate `cpi_delegate` ABI** (finding #1: 1-byte vs 8-byte discriminator + the
+  missing 5-step buffer staging) and **the retained `cpi_undelegate`** (finding #3,
+  which Anchor deleted). These are the **multi-week ER-delegation plumbing** the project
+  memory already scopes as deferred — they are ER-only-validatable (no live DLP in this
+  environment), and blindly porting the staging CPI would risk shipping confident-but-
+  broken code. The pin port is NOT deployed (the Anchor program is), so this affects no
+  live system. The internally-verifiable ER bug (#2 bump-seeds) IS fixed above.
+- **commit-reveal fill authenticity** (ring unwired), **haircut junior-claim engine**
+  (unwired, fails closed), **funding accrual inert** (symmetric), **leverage/position/
+  concentration caps unwired**, **VPIN tax / FLP-exposure tracking** — all as documented
+  in the prior rounds; feature-wiring, not exploitable-today bugs.
+- **`position_liq` timestamps not reset on close** (benign: over-reward capped at backing,
+  self-affecting, and the cooldown defaults to 0); **`apply_flp_fill` rebate/insurance
+  `saturating_add`** (deliberate liveness choice at an unreachable u64 balance — `checked_add`
+  there would DoS settlement).
+
+---
+
 ## Verified SOUND (high-signal negatives)
 
 Pure-math core (haircut, vault_math, fill_math, funding, peg, concentration,

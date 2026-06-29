@@ -83,7 +83,10 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     let len = write_delegate_data(
         &mut buf,
         commit_frequency_ms,
-        &[MARKET_SEED, &base_mint.key()[..], &quote_mint.key()[..], &bump_arr[..]],
+        // Re-audit 2026-06-30 (HIGH): args.seeds must NOT include the bump (the
+        // undelegate callback re-derives via find_program_address). Bump travels only
+        // in the Signer seeds below; market = 3 seeds, no bump. See delegate_market_book.
+        &[MARKET_SEED, &base_mint.key()[..], &quote_mint.key()[..]],
         if has_validator { Some(&validator) } else { None },
     );
     let seeds = [

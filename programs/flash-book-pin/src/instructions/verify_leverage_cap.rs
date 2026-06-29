@@ -37,8 +37,12 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         if p.size_lots == 0 || p.leverage_cap == 0 {
             return Ok(());
         }
-        // Bind the position to THIS trader_state + market.
-        if p.trader != ts.trader || p.market != *market.key() {
+        // Bind the position to THIS trader_state + market + sub_index. Re-audit
+        // 2026-06-30 (LOW parity): without the sub_index bind, a wallet could pair an
+        // over-leveraged sub-A position with sub-B's richer trader_state (both carry
+        // the same `.trader`) → notional measured against B's collateral → an
+        // over-cap position reads in-cap (monitor false-negative). Matches build_snapshot.
+        if p.trader != ts.trader || p.market != *market.key() || p.sub_index != ts.sub_index {
             return Err(ProgramError::InvalidArgument);
         }
 

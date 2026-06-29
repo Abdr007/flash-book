@@ -19,7 +19,7 @@ use crate::constants::BPS_DENOM;
 use crate::envelope::gate_price_move;
 use crate::guard::{assert_disc, assert_owned_by, assert_pda, assert_signer};
 use crate::pyth_oracle::{get_price_no_older_than_full, pyth_price_to_ticks, PYTH_RECEIVER_PROGRAM_ID};
-use crate::seeds::ENVELOPE_CONFIG_SEED;
+use crate::seeds::{ENVELOPE_CONFIG_SEED, ORACLE_CONFIG_SEED};
 use crate::state::{
     Market, MarketEnvelopeConfig, MarketOracleConfig, ENVELOPE_CONFIG_DISC, MARKET_DISC,
     ORACLE_CONFIG_DISC, ORACLE_SOURCE_PYTH,
@@ -33,7 +33,13 @@ use pinocchio::{
 };
 
 pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramResult {
-    let [caller, market, oracle_config, price_update, rest @ ..] = accounts else {
+    // AUDIT H-4 (re-audit 2026-06-30): `envelope_config` is MANDATORY on this
+    // PERMISSIONLESS path — the per-slot move cap is the only runtime enforcement
+    // of the init-time `prove_envelope` solvency proof. Anchor makes it a required
+    // account here (`Some(&mut ..)`); pin previously made it optional, so any keeper
+    // could omit it and snap the mark to a large Pyth jump in one slot, mass-
+    // liquidating accounts past the lattice-sized maintenance budget. Required now.
+    let [caller, market, oracle_config, price_update, envelope_config, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
@@ -52,6 +58,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> P
     // Oracle config must select Pyth + carry the feed id / freshness / conf caps.
     assert_owned_by(oracle_config, program_id)?;
     assert_disc(oracle_config, &ORACLE_CONFIG_DISC)?;
+    // Re-audit 2026-06-30 (LOW parity): bind the canonical oracle_config PDA (the
+    // envelope_config in this same handler is already assert_pda'd). Disc+market
+    // already uniquely identify it today, but re-derive for defense-in-depth.
+    assert_pda(oracle_config, &[ORACLE_CONFIG_SEED, &market.key()[..]], program_id)?;
     let (feed_id, max_staleness, max_confidence, tick_decimals) = {
         let d = oracle_config.try_borrow_data()?;
         let c = unsafe { &*(d.as_ptr() as *const MarketOracleConfig) };
@@ -91,8 +101,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> P
         }
     }
 
-    // ── OPTIONAL envelope gate on the new price (as in update_oracle) ───
-    if let [envelope_config, ..] = rest {
+    // ── MANDATORY envelope gate on the new price (AUDIT H-4) ────────────
+    {
         assert_owned_by(envelope_config, program_id)?;
         assert_pda(envelope_config, &[ENVELOPE_CONFIG_SEED, &market.key()[..]], program_id)?;
         assert_disc(envelope_config, &ENVELOPE_CONFIG_DISC)?;

@@ -29,7 +29,23 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         payer,
         system_program,
         &seed_slots[..count],
-    )
+    )?;
+
+    // AUDIT O-1 (re-audit 2026-06-30): a returning book is the ONLY way a corrupt
+    // (malicious-/buggy-ER-committed) book with out-of-range RBT links can reach
+    // L1. Validate every node's internal left/right/parent links ONCE, here, after
+    // the committed bytes are copied back program-owned — a corrupt book fails
+    // CLOSED (the undelegate reverts) instead of panic-DoS'ing the first L1 op and
+    // bricking the market. Gated on the book discriminator at ~O(1); the ring /
+    // market / outbox are flat arrays covered by their own disc/length checks.
+    {
+        let d = delegated_account.try_borrow_data()?;
+        if d.len() >= 8 && d[..8] == crate::book::MARKET_BOOK_DISC {
+            crate::book::MarketBookHandle::validate_node_links(&d)
+                .map_err(|_| ProgramError::Custom(255))?; // OutOfRange — corrupt book
+        }
+    }
+    Ok(())
 }
 
 // ── entrypoint dispatch change (apply in src/lib.rs `process`, BEFORE the

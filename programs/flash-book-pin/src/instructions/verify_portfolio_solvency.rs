@@ -80,6 +80,15 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         if let Some((pos_snap, mkt_snap, c)) =
             build_snapshot(pid, market, trader_state, position, &[])?
         {
+            // Re-audit 2026-06-30 (LOW parity): this cross walk credits ONE pooled
+            // collateral but sums every leg's MM, so an ISOLATED leg (its own bucket)
+            // would have its MM charged here while its backing is excluded → a
+            // false-negative (reports healthy while the iso leg is liquidatable).
+            // Reject isolated legs (they verify via the single-position path), exactly
+            // as liquidate_portfolio_v2 does.
+            if pos_snap.collateral_quote_lots != 0 {
+                return Err(ProgramError::InvalidArgument); // isolated leg — wrong probe
+            }
             positions[n] = pos_snap;
             markets[n] = mkt_snap;
             collateral = c; // identical across pairs (same trader_state)

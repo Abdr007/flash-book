@@ -255,6 +255,15 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         }
     }
     let limit = best_price.unwrap_or(synthetic);
+    // Re-audit 2026-06-30 (MED): clamp the close price to the MARKETABLE side of
+    // mark so the injected forced-liq order actually crosses resting liquidity. A
+    // JIT offer can "improve" the close PAST mark (ask above mark / bid below mark)
+    // to a price that rests un-fillable forever — and the dup-scan + position_liq
+    // stamp then block re-liquidation, freezing the position open while the caller
+    // already skimmed the reward. The H-2 band alone permits this (±50% of mark);
+    // clamp to mark. `synthetic` (penalty against the trader) is already on the
+    // marketable side, so this only ever tightens an over-aggressive JIT offer.
+    let limit = if close_side == 1 { limit.min(mark) } else { limit.max(mark) };
     let elapsed = if unhealthy_since > 0 { now.saturating_sub(unhealthy_since) } else { 0 };
     let reward_bps_eff = reward_bps_effective(reward_bps, elapsed, auction_dur);
     let gross_reward = liquidator_reward_lots(close_size, mark, tick, reward_bps_eff);
