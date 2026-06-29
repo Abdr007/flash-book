@@ -121,7 +121,6 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         // sample its collateral bucket (isolated vs cross) BEFORE any mutation.
         let taker_old_side = taker_pos.side;
         let taker_before = taker_pos.size_lots;
-        let taker_iso = taker_pos.collateral_quote_lots > 0;
 
         // ── Fees FIRST, before the resize (anchor order). FLP-as-maker: the
         // rebate lifts pool capital, insurance takes its cut of the net fee. ──
@@ -167,6 +166,12 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
                 .map_err(|_| ProgramError::InvalidArgument)?;
             haircut.residual_quote_lots = residual.to_le_bytes();
         }
+
+        // M-1 (re-audit 2026-06, parity with apply_fill): sample the isolated/cross
+        // bucket AFTER the funding settle — an isolated bucket that funding drained
+        // to 0 must route the subsequent realized loss to the cross pool, not
+        // mis-socialize it to insurance as if still isolated.
+        let taker_iso = taker_pos.collateral_quote_lots > 0;
 
         // ── Resize the taker leg + capture its realized-PnL delta (R1), then
         // materialize it into the taker's bucket (loss shortfall → insurance).

@@ -270,6 +270,14 @@ fn shocked_price(price: Ticks, shock_bps: i32) -> Result<Ticks> {
     if r <= 0 {
         return Ok(Ticks(0));
     }
+    // Re-audit 2026-06 (LOW): reject (not silently wrap) an out-of-u64 stressed
+    // price. `r as u64` is a cast — `overflow-checks` does NOT catch it — so on a
+    // large positive governance shock where `r > u64::MAX` the price would wrap to a
+    // small value, understating a short's scenario loss → under-margining. Anchor
+    // uses a checked `u64::try_from`; match that reject discipline.
+    if r > u64::MAX as i128 {
+        return Err(crate::error::FlashBookError::ArithmeticOverflow);
+    }
     Ok(Ticks(r as u64))
 }
 

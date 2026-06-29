@@ -5,11 +5,16 @@
 //!
 //! Defense in depth: an OPTIONAL `envelope_config` account (mirroring anchor
 //! `update_oracle`'s optional envelope gate) bounds the per-update mark move to
-//! the market's configured `max_price_move_bps_per_slot × elapsed_slots`. With
-//! it supplied, even a buggy/compromised sequencer cannot jump the mark far
-//! enough in one update to mass-liquidate the book or drain via funding — the
-//! move is rate-limited. Omitted ⇒ unchanged behavior (the sequencer is the
-//! trusted price authority).
+//! the market's configured `max_price_move_bps_per_slot × elapsed_slots`. When it
+//! is supplied the move is rate-limited.
+//!
+//! HONEST LIMITATION (re-audit 2026-06): the envelope is OPTIONAL and the
+//! sequencer builds the transaction, so a compromised sequencer simply omits the
+//! account to bypass the cap — this gate constrains a BUGGY sequencer, NOT a
+//! compromised one. In pin's model the sequencer IS the trusted price authority
+//! (it sets `mark_price_ticks` directly here, where anchor stages an
+//! authority-gated oracle bridged by a separate rate-limited `settle_mark`). A
+//! mandatory-envelope arming flag is a deferred hardening — see docs/PIN_AUDIT.
 //!
 //! Setting the mark is also a mark-freshness event: it stamps
 //! `last_mark_update_slot`, the mark half of the ER-liveness signal that

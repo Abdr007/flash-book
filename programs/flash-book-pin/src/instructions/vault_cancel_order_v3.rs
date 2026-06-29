@@ -62,6 +62,13 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         if handle.order_at(idx).trader != vault_pk {
             return Err(ProgramError::Custom(1100)); // wrong trader
         }
+        // Re-audit 2026-06 (MED): a forced-liquidation order (type 3) carries the
+        // vault's trader when the vault's own position is liquidated; the strategist
+        // must not be able to cancel it (liquidation evasion). Mirror cancel_order's
+        // #187 type-3 guard on this vault-order path.
+        if handle.order_at(idx).order_type == 3 {
+            return Err(ProgramError::Custom(1101)); // cannot cancel forced-liquidation
+        }
         if side_is_bid {
             handle.remove_bid_node(idx);
         } else {

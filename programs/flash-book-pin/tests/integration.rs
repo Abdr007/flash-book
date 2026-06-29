@@ -241,9 +241,12 @@ fn position(pid: Pubkey, trader: Pubkey, market: Pubkey, side: u8, size: u64, en
 /// auto_deleverage end-to-end: an UNHEALTHY isolated long is force-closed against
 /// a profitable short counter at the bankruptcy price. Underwater long 10 @200,
 /// isolated collateral 100; mark 100 (mmr 500bps) ⇒ available 100 < required 1050
-/// ⇒ unhealthy. bp = 200 − 100/(10·1) = 190; short counter @250 (> 190) is
-/// eligible. Closing 5: uw loss 100·5/10 = 50 (collat 100→50); ct gain
-/// (250−190)·5 = 300 (cross pool 1000→1300); both sizes 10→5; OI 10→5 each.
+/// ⇒ unhealthy. mark 100 ≤ bp 190 ⇒ genuinely bankrupt (R-1 gate passes). bp =
+/// 200 − 100/(10·1) = 190; short counter @250 (> 190) is eligible. Closing 5: uw
+/// loss 100·5/10 = 50 (collat 100→50). Counter's UNCAPPED gain is (250−190)·5 =
+/// 300, but the H-3 conservation cap bounds the credit at the loss removed (50),
+/// so the cross pool goes 1000→1050 — a credit can never exceed the debit (no
+/// unbacked mint). Both sizes 10→5; OI 10→5 each.
 #[tokio::test]
 async fn auto_deleverage_settles_underwater_vs_counter() {
     let pid = Pubkey::new_unique();
@@ -288,12 +291,65 @@ async fn auto_deleverage_settles_underwater_vs_counter() {
     assert_eq!(get_u64(&uwp.data, POS_COLLATERAL), 50, "uw isolated bucket 100 − loss 50");
     assert_eq!(get_u64(&uwp.data, POS_SIZE), 5, "uw size 10 − 5");
     let ctt = banks.get_account(ct_ts).await.unwrap().unwrap();
-    assert_eq!(get_u64(&ctt.data, TS_COLLATERAL), 1_300, "ct cross pool 1000 + gain 300");
+    assert_eq!(get_u64(&ctt.data, TS_COLLATERAL), 1_050, "ct cross pool 1000 + capped gain 50 (== uw loss; H-3 conservation)");
     let ctp = banks.get_account(ct_pos).await.unwrap().unwrap();
     assert_eq!(get_u64(&ctp.data, POS_SIZE), 5, "ct size 10 − 5");
     let m = banks.get_account(market).await.unwrap().unwrap();
     assert_eq!(get_u64(&m.data, MKT_LONG_OI), 5, "long_oi 10 − 5");
     assert_eq!(get_u64(&m.data, MKT_SHORT_OI), 5, "short_oi 10 − 5 (long==short preserved)");
+}
+
+/// Re-audit 2026-06 (HIGH, R-1 gate): a position that is stress/maintenance-
+/// unhealthy but still MARK-SOLVENT (mark above its bankruptcy price for a long)
+/// must NOT be ADL'd — ADL settles at `bp` (a full collateral wipe) and would
+/// seize the trader's residual equity. Same long 10 @200, isolated collateral 100
+/// ⇒ bp = 190, but mark is 195 (> bp). It is unhealthy (equity 50 < maintenance
+/// ~97 at 500bps) so it passes the maintenance gate, yet `adl_bankruptcy_reached`
+/// (195 ≤ 190 is false) refuses it. Before the fix this was a wrongful ADL.
+#[tokio::test]
+async fn auto_deleverage_rejects_mark_solvent_position() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (insurance, _b) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let uw_trader = Pubkey::new_unique();
+    let ct_trader = Pubkey::new_unique();
+    let uw_ts = Pubkey::new_unique();
+    let uw_pos = Pubkey::new_unique();
+    let ct_ts = Pubkey::new_unique();
+    let ct_pos = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 195, 1, 500, 10, 10)); // mark 195 > bp 190
+    pt.add_account(insurance, insurance_full(pid, 100, 1_000)); // ADL-eligible (balance < threshold)
+    pt.add_account(uw_ts, trader_state(pid, uw_trader, 0, 1));
+    pt.add_account(uw_pos, position(pid, uw_trader, market, 0, 10, 200, 100)); // long, isolated 100, bp=190
+    pt.add_account(ct_ts, trader_state(pid, ct_trader, 1_000, 1));
+    pt.add_account(ct_pos, position(pid, ct_trader, market, 1, 10, 250, 0));
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut data = vec![IX_AUTO_DELEVERAGE];
+    data.extend_from_slice(&5u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new(uw_ts, false),
+            AccountMeta::new(uw_pos, false),
+            AccountMeta::new(ct_ts, false),
+            AccountMeta::new(ct_pos, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &caller], bh);
+    let r = banks.process_transaction(tx).await;
+    assert!(r.is_err(), "a mark-solvent position must not be auto-deleveraged");
+    // Untouched: collateral and size unchanged (no settlement happened).
+    let uwp = banks.get_account(uw_pos).await.unwrap().unwrap();
+    assert_eq!(get_u64(&uwp.data, POS_COLLATERAL), 100, "uw collateral untouched");
+    assert_eq!(get_u64(&uwp.data, POS_SIZE), 10, "uw size untouched");
 }
 
 // ─── liquidate_position_v2 e2e (pre-seeds a valid book — no create_pda CPI) ───
@@ -1663,6 +1719,64 @@ async fn vault_place_rejects_non_strategist() {
             &[place], Some(&payer.pubkey()), &[&payer, &imposter], bh))
         .await;
     assert!(r.is_err(), "non-strategist place must be rejected");
+}
+
+// Re-audit 2026-06 (MED): the strategist must NOT cancel the vault's own
+// forced-liquidation (type-3) order — that would be liquidation evasion for the
+// vault. Mirrors cancel_order's #187 type-3 guard, on the vault-order path.
+#[tokio::test]
+async fn vault_cancel_rejects_forced_liquidation_type3() {
+    let pid = Pubkey::new_unique();
+    let strategist = Keypair::new();
+    let vault_id = 0u8;
+    let (vault, _) = Pubkey::find_program_address(
+        &[VAULT_SEED, &strategist.pubkey().to_bytes(), &[vault_id]], &pid);
+    let market = Pubkey::new_unique();
+    let base = Pubkey::new_unique();
+    let quote = Pubkey::new_unique();
+    let (market_book, book_bump) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+
+    // A type-3 order owned by the VAULT PDA, as a forced liquidation would inject.
+    let mut book = init_book(pid, market, base, quote, book_bump);
+    let oid = encode_order_id(100, 1, false); // ask side
+    {
+        let mut h = MarketBookHandle::from_account_data(&mut book.data).unwrap();
+        h.insert_ask(RestingOrderV2 {
+            order_id: oid, seq: 1, price_ticks: 100, size_lots: 10, expires_at_slot: 0,
+            trader: vault.to_bytes(), last_valid_slot: 0, side: 1, order_type: 3,
+            flags: 0, sub_index: 0,
+        }).unwrap();
+    }
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(vault, vault_with_accept(pid, strategist.pubkey(), vault_id, 1, 0));
+    pt.add_account(market, market_full(pid, 100, 1, 500, 0, 0));
+    pt.add_account(market_book, book);
+    pt.add_account(
+        strategist.pubkey(),
+        Account { lamports: 5_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let mut cdata = vec![IX_VAULT_CANCEL, 1u8]; // side = ask
+    cdata.extend_from_slice(&oid.to_le_bytes());
+    let cancel = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(strategist.pubkey(), true),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_book, false),
+        ],
+        data: cdata,
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[cancel], Some(&payer.pubkey()), &[&payer, &strategist], bh))
+        .await;
+    let err = format!("{:?}", r.expect_err("strategist must not cancel a type-3 order"));
+    assert!(err.contains("Custom(1101)"), "expected Custom(1101), got: {err}");
 }
 
 // ─── update_trailing_stop e2e (positive, no CPI) ───

@@ -173,13 +173,33 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     // ── bankruptcy price + counter eligibility (pure, proven) ───────────
     let bp = crate::adl::bankruptcy_price(uw_side, uw_entry, backing, uw_size, tick_size)
         .ok_or(ProgramError::InvalidArgument)?; // size·tick == 0
+    // AUDIT R-1 (re-audit 2026-06): gate on TRUE bankruptcy, not merely the
+    // (looser) maintenance gate above. The `assess_margin` check admits a
+    // position with `0 < equity < maintenance` — MARK-SOLVENT but stress-unhealthy
+    // — which ordinary liquidation (close near mark, return residual) handles. ADL
+    // settles at `bp` (a full collateral wipe), so without this gate it would seize
+    // that residual equity and hand it (capped) to the counter. The mark is fresh
+    // (staleness gate above), so the health mark IS the current mark price.
+    let health_mark = mkt_snap.mark_price.0;
+    if !crate::adl::adl_bankruptcy_reached(uw_side, health_mark, bp) {
+        return Err(ProgramError::InvalidArgument); // NotLiquidatable — not bankrupt
+    }
     if !crate::adl::counter_eligible_at_bp(ct_side, ct_entry, bp) {
         return Err(ProgramError::InvalidArgument); // AdlNotEligible
     }
 
     // ── settle: underwater loss + counter gain (pure, proven) ───────────
     let loss = crate::adl::adl_underwater_loss(backing, close_size_lots, uw_size);
-    let gain = crate::adl::adl_counter_gain(ct_side, ct_entry, bp, close_size_lots, tick_size);
+    // AUDIT H-3 (re-audit 2026-06): ADL must CONSERVE value — the counter cannot be
+    // credited more than the bankrupt forfeits (`loss`), or the surplus is minted
+    // into collateral with NO vault backing (and insurance is, by the ADL trigger,
+    // already below its pause threshold, so there is no backstop). Cap the credit at
+    // the loss removed → `credit ≤ debit`. The excess (the counter's unrealized PnL
+    // beyond the bankrupt's collateral) is haircut here — the defining property of
+    // auto-deleveraging: the deleveraged winner is closed at the bankruptcy price,
+    // not paid surplus the protocol cannot fund.
+    let gain = crate::adl::adl_counter_gain(ct_side, ct_entry, bp, close_size_lots, tick_size)
+        .min(loss);
     let ct_isolated = ct_pos_collat > 0;
 
     let (uw_new_pos_collat, uw_new_ts_collat) =

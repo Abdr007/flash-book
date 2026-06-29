@@ -139,11 +139,32 @@ pub fn counter_eligible_at_bp(counter_side: u8, counter_entry: u64, bp_ticks: u6
     }
 }
 
+/// AUDIT R-1: TRUE-bankruptcy gate. ADL settles the underwater leg at its
+/// bankruptcy price `bp` (a full proportional collateral wipe), so it must only
+/// fire once the (staleness-degraded) health mark has actually REACHED `bp`:
+///   long  → health_mark ≤ bp   (price fell to/below bankruptcy);
+///   short → health_mark ≥ bp   (price rose to/above bankruptcy).
+/// Without it, the looser stress/maintenance trigger admits a position that is
+/// merely unhealthy but still MARK-SOLVENT (equity > 0); ADL'ing it at `bp` would
+/// seize its residual equity and hand it to the counter. Such positions belong to
+/// ordinary liquidation (which closes near the mark and returns the residual);
+/// ADL is reserved for actual bankruptcy. Verbatim port of anchor
+/// `adl_bankruptcy_reached`.
+#[inline]
+pub fn adl_bankruptcy_reached(side: u8, health_mark: u64, bp_ticks: u64) -> bool {
+    if side == 0 {
+        health_mark <= bp_ticks
+    } else {
+        health_mark >= bp_ticks
+    }
+}
+
 /// FV: machine-checked I-3 insulation (Kani, comparison/add-only → fast).
 #[cfg(kani)]
 mod kani_proofs {
     use super::{
-        adl_counter_gain, counter_eligible_at_bp, route_adl_gain, route_adl_loss,
+        adl_bankruptcy_reached, adl_counter_gain, counter_eligible_at_bp, route_adl_gain,
+        route_adl_loss,
     };
 
     /// An ADL loss moves ONLY the routed bucket: the other is byte-for-byte
@@ -204,13 +225,36 @@ mod kani_proofs {
             assert!(gain == 0); // per-lot diff saturates to 0
         }
     }
+
+    /// The bankruptcy gate is monotone in the health mark and side-symmetric:
+    /// a long is bankrupt exactly at/below `bp`, a short exactly at/above `bp`.
+    #[kani::proof]
+    fn bankruptcy_gate_brackets_bp() {
+        let side: u8 = kani::any();
+        kani::assume(side <= 1);
+        let hm: u64 = kani::any();
+        let bp: u64 = kani::any();
+        let reached = adl_bankruptcy_reached(side, hm, bp);
+        if side == 0 {
+            assert!(reached == (hm <= bp));
+        } else {
+            assert!(reached == (hm >= bp));
+        }
+        // Strictly-solvent side of `bp` is never bankrupt (the value ADL protects).
+        if side == 0 && hm > bp {
+            assert!(!reached);
+        }
+        if side == 1 && hm < bp {
+            assert!(!reached);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        adl_counter_gain, adl_underwater_loss, bankruptcy_price, counter_eligible_at_bp,
-        route_adl_gain, route_adl_loss,
+        adl_bankruptcy_reached, adl_counter_gain, adl_underwater_loss, bankruptcy_price,
+        counter_eligible_at_bp, route_adl_gain, route_adl_loss,
     };
 
     // ── loss side ───────────────────────────────────────────────────────
@@ -316,5 +360,17 @@ mod tests {
         assert!(!counter_eligible_at_bp(0, 95, 95));
         assert_eq!(adl_counter_gain(0, 95, 95, 4, 1), 0);
         assert_eq!(adl_counter_gain(0, 100, 95, 4, 1), 0);
+    }
+
+    #[test]
+    fn bankruptcy_reached_blocks_mark_solvent_positions() {
+        // long: bankrupt at/below bp, solvent above.
+        assert!(adl_bankruptcy_reached(0, 90, 90), "long AT bp → bankrupt");
+        assert!(adl_bankruptcy_reached(0, 89, 90), "long BELOW bp → bankrupt");
+        assert!(!adl_bankruptcy_reached(0, 91, 90), "long ABOVE bp → solvent, NOT ADL-able");
+        // short: bankrupt at/above bp, solvent below.
+        assert!(adl_bankruptcy_reached(1, 110, 110), "short AT bp → bankrupt");
+        assert!(adl_bankruptcy_reached(1, 111, 110), "short ABOVE bp → bankrupt");
+        assert!(!adl_bankruptcy_reached(1, 109, 110), "short BELOW bp → solvent, NOT ADL-able");
     }
 }

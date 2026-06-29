@@ -46,7 +46,11 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let (exp_market, capital, nav, total_shares, pool_size) = {
         let d = exposure.try_borrow_data()?;
         let e = unsafe { &*(d.as_ptr() as *const FlpExposurePerMarketV3) };
-        (e.market, e.total_capital_quote_lots, e.nav(), e.lp_shares_outstanding, e.size_lots)
+        // Price on `min(nav, capital)` (re-audit 2026-06, HIGH): symmetric with the
+        // deposit side. A realized GAIN no longer makes `amount = shares·nav/total`
+        // exceed `capital` (which rejected EVERY full redemption → locked gains);
+        // a realized LOSS still discounts the payout (LPs bear it).
+        (e.market, e.total_capital_quote_lots, e.nav_for_pricing(), e.lp_shares_outstanding, e.size_lots)
     };
     // Flat-gate (parity with vault_withdraw_v3 / the singleton FLP, audit H-6):
     // NAV = capital + REALIZED pnl excludes the pool's OPEN-position unrealized

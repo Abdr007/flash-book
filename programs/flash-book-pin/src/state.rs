@@ -508,6 +508,27 @@ impl FlpExposurePerMarketV3 {
     pub fn nav(&self) -> i128 {
         (self.total_capital_quote_lots as i128) + (self.realized_pnl as i128)
     }
+
+    /// NAV used to PRICE deposits and withdrawals: `capital + min(realized_pnl, 0)`
+    /// = `min(nav, capital)`. Re-audit 2026-06 (HIGH): pricing both sides on the raw
+    /// `nav` was ASYMMETRIC — deposits paid for a realized GAIN (`nav > capital`)
+    /// that withdrawals could never return (the payout is capped at `capital`, and a
+    /// full redemption priced at `nav > capital` is rejected outright → the gain is
+    /// locked AND extractable by an early LP from a later depositor). Pricing both
+    /// sides on `min(nav, capital)` is symmetric: a realized LOSS still discounts
+    /// both (LPs bear it — pin's H-6 hardening, stricter than anchor's capital-only
+    /// pricing), while an un-crystallized GAIN is ignored for share pricing and
+    /// stays as a vault buffer (matching anchor, which never distributes it).
+    #[inline]
+    pub fn nav_for_pricing(&self) -> i128 {
+        let cap = self.total_capital_quote_lots as i128;
+        let nav = self.nav();
+        if nav < cap {
+            nav
+        } else {
+            cap
+        }
+    }
 }
 
 pub const FLP_POSITION_V3_DISC: [u8; 8] = [0xF1, 0x90, 0x00, 0x12, 0x34, 0x56, 0x78, 0x03];
@@ -905,6 +926,44 @@ mod tests {
         assert_eq!(E::shares_for_deposit_v3(1, 1, 1_000), Some(0));
         // Overflow ⇒ None (checked, never a silent wrap).
         assert_eq!(E::shares_for_deposit_v3(u64::MAX, u64::MAX, 1), None);
+    }
+
+    #[test]
+    fn flp_v3_nav_for_pricing_is_min_nav_capital() {
+        // Re-audit 2026-06 (HIGH): deposit & withdraw must price on the SAME
+        // `min(nav, capital)` — bear realized losses, ignore un-crystallized gains.
+        let mut e = FlpExposurePerMarketV3 {
+            disc: FLP_PER_MARKET_V3_DISC,
+            market: [0u8; 32],
+            authority: [0u8; 32],
+            size_lots: 0,
+            entry_price_ticks: 0,
+            total_capital_quote_lots: 1_000,
+            realized_pnl: 0,
+            lp_shares_outstanding: 1_000,
+            bump: 0,
+            side: 255,
+            _reserved: [0u8; 22],
+        };
+        // Flat PnL: nav == capital.
+        assert_eq!(e.nav_for_pricing(), 1_000);
+        // Realized GAIN: nav (1_300) > capital ⇒ priced at capital (gain ignored,
+        // stays a vault buffer; this is what stops the late-depositor trap).
+        e.realized_pnl = 300;
+        assert_eq!(e.nav(), 1_300);
+        assert_eq!(e.nav_for_pricing(), 1_000);
+        // Realized LOSS: nav (700) < capital ⇒ priced at nav (LPs bear it).
+        e.realized_pnl = -300;
+        assert_eq!(e.nav_for_pricing(), 700);
+        // A full redemption now never exceeds capital (the old `nav` priced a gain
+        // above capital → every full burn was rejected, locking the gain).
+        e.realized_pnl = 300;
+        let payout = FlpExposurePerMarketV3::amount_for_shares_v3(
+            e.lp_shares_outstanding, e.nav_for_pricing(), e.lp_shares_outstanding,
+        )
+        .unwrap();
+        assert!(payout <= e.total_capital_quote_lots, "full burn must fit capital");
+        assert_eq!(payout, 1_000);
     }
 
     #[test]
