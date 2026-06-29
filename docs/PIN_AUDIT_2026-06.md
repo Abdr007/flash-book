@@ -401,11 +401,30 @@ Carved 28 bytes from `Market._reserved` (1152-byte layout unchanged). Proven e2e
 (`advance_funding_accrues_index_on_positive_skew`: positive skew → index rises → longs
 pay) + `inert_when_unconfigured`. Sign: positive skew ⇒ `funding_owed(long) > 0`.
 
+### Commit-reveal fill authenticity — WIRED (2026-06-30)
+The ring primitives existed but nothing pushed/settled it and `fill_commitment_required`
+was never read (the HIGH "compromised sequencer can fabricate fills within the ±50%
+band"). Now fully wired with on-chain keccak (the `sol_keccak256` syscall, zero-dep):
+- **Producer** — `place_taker_order` pushes `keccak(fill_preimage(market, taker, maker,
+  side, size, price, subs, produced_index))` for every fill it crosses (when the market
+  carries the ring); ARMED-market-with-fills MUST carry the ring (H-2, else fills are
+  unsettleable).
+- **Consumer** — `apply_fill` recomputes the same keccak from the settled fill and
+  `buffer_settle`s it FIFO; a sequencer-fabricated/reordered fill → `FillNotCommitted`
+  (Custom 1102) and reverts atomically. ARMED ⇒ the ring is MANDATORY (Custom 1103).
+- **`init_fill_commitment`** now ARMS the market (`fill_commitment_required = 1`),
+  matching Anchor; opt-in per market, OFF for all existing markets (no behaviour change).
+- The haircut (also a trailing optional account) is now identified by DISC, not
+  position, so it and the ring can't be confused.
+Proven e2e: `place_taker_order_pushes_commitment_when_armed` (producer pushes the
+byte-exact commit), `apply_fill_settles_committed_fill` (round-trip: on-chain
+`sol_keccak256` == off-chain `solana_sdk::keccak`), `apply_fill_rejects_fabricated_fill_
+when_armed` (Custom 1102), `apply_fill_requires_ring_when_armed` (Custom 1103).
+
 ### HONESTLY DEFERRED — features, not bugs
-- **commit-reveal fill authenticity** (ring unwired), **haircut junior-claim engine**
-  (unwired, fails closed), **leverage/position/concentration caps unwired**, **VPIN tax /
-  FLP-exposure tracking** — all as documented in the prior rounds; feature-wiring, not
-  exploitable-today bugs.
+- **haircut junior-claim engine** (unwired, fails closed), **leverage/position/
+  concentration caps unwired**, **VPIN tax / FLP-exposure tracking** — all as documented
+  in the prior rounds; feature-wiring, not exploitable-today bugs.
 - **`position_liq` timestamps not reset on close** (benign: over-reward capped at backing,
   self-affecting, and the cooldown defaults to 0); **`apply_flp_fill` rebate/insurance
   `saturating_add`** (deliberate liveness choice at an unreachable u64 balance — `checked_add`
