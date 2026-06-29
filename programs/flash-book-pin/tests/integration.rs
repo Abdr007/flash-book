@@ -2414,3 +2414,37 @@ async fn force_undelegate_rejects_while_live() {
         .await;
     assert!(r.is_err(), "force-undelegate must be rejected while the ER is live");
 }
+
+// ─── commit_market_book e2e (magic-program pin, before CPI) ───
+// The commit ScheduleCommit CPI hits the magic program (build-sbf only). The
+// magic_program / magic_context address pins run before the invoke, so a wrong
+// magic program is cleanly rejected.
+use flash_book_pin::er::MAGIC_CONTEXT_ID;
+const IX_COMMIT_MARKET_BOOK: u8 = 125;
+
+#[tokio::test]
+async fn commit_market_book_rejects_wrong_magic_program() {
+    let pid = Pubkey::new_unique();
+    let payer_signer = Keypair::new();
+    let market_book = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(payer_signer.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    pt.add_account(market_book, Account { lamports: 1_000_000, data: vec![0u8; 8], owner: Pubkey::new_from_array(DELEGATION_PROGRAM_ID), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(payer_signer.pubkey(), true),
+            AccountMeta::new(market_book, false),
+            AccountMeta::new(Pubkey::new_from_array(MAGIC_CONTEXT_ID), false),
+            AccountMeta::new_readonly(Pubkey::new_unique(), false), // WRONG magic program
+        ],
+        data: vec![IX_COMMIT_MARKET_BOOK],
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &payer_signer], bh))
+        .await;
+    assert!(r.is_err(), "commit with a wrong magic program must be rejected");
+}

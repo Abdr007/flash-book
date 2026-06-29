@@ -7,11 +7,55 @@
 
 use pinocchio::{
     account_info::AccountInfo,
-    cpi::slice_invoke_signed,
+    cpi::{slice_invoke, slice_invoke_signed},
     instruction::{AccountMeta, Instruction, Signer},
     program_error::ProgramError,
     ProgramResult,
 };
+
+/// MagicBlock Magic (validator) program — runs ON the ER (same id as the
+/// permission module's). The commit CPIs target this program.
+pub use crate::er_permission::MAGIC_PROGRAM_ID;
+
+/// MagicBlock Magic context account (`MagicContext111…`, writable; collects
+/// scheduled commits). Round-trip-verified.
+pub const MAGIC_CONTEXT_ID: [u8; 32] = [
+    5, 69, 180, 36, 196, 165, 40, 191, 95, 180, 3, 47, 68, 82, 130, 142, 187, 56, 171, 193, 210,
+    220, 151, 247, 63, 139, 148, 84, 128, 0, 0, 0,
+];
+
+/// `MagicBlockInstruction` enum tags (bincode u32 LE).
+const SCHEDULE_COMMIT: [u8; 4] = [1, 0, 0, 0];
+const SCHEDULE_COMMIT_AND_UNDELEGATE: [u8; 4] = [2, 0, 0, 0];
+
+/// ON-THE-ER: schedule a commit of the `committed` account's state back to the
+/// base layer; if `allow_undelegation`, also queue undelegation
+/// (`ScheduleCommitAndUndelegate`). Faithful port of the Anchor `er::cpi_commit`
+/// for a single committed account (our only use). Plain `invoke` — the payer
+/// signs; no PDA seeds. Account order: `[payer(s,w), magic_context(w), committed]`.
+pub fn cpi_commit(
+    payer: &AccountInfo,
+    magic_context: &AccountInfo,
+    magic_program: &AccountInfo,
+    committed: &AccountInfo,
+    allow_undelegation: bool,
+) -> ProgramResult {
+    if magic_program.key() != &MAGIC_PROGRAM_ID || magic_context.key() != &MAGIC_CONTEXT_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    let data = if allow_undelegation {
+        SCHEDULE_COMMIT_AND_UNDELEGATE
+    } else {
+        SCHEDULE_COMMIT
+    };
+    let metas = [
+        AccountMeta::new(payer.key(), true, true),
+        AccountMeta::new(magic_context.key(), true, false),
+        AccountMeta::new(committed.key(), committed.is_writable(), committed.is_signer()),
+    ];
+    let ix = Instruction { program_id: &MAGIC_PROGRAM_ID, accounts: &metas, data: &data };
+    slice_invoke(&ix, &[payer, magic_context, committed, magic_program])
+}
 
 /// The MagicBlock delegation program (base58
 /// `DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh`). A delegated account is
