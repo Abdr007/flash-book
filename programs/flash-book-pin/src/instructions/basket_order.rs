@@ -111,13 +111,13 @@ fn run(pid: &Pubkey, accounts: &[AccountInfo], legs: &[BasketLeg]) -> ProgramRes
     assert_signer(trader)?;
     assert_owned_by(trader_state, pid)?;
     assert_disc(trader_state, &TRADER_STATE_DISC)?;
-    let (trader_pk, collateral) = {
+    let (trader_pk, collateral, trader_sub) = {
         let d = trader_state.try_borrow_data()?;
         let s = unsafe { &*(d.as_ptr() as *const TraderState) };
         if &s.trader != trader.key() {
             return Err(ProgramError::InvalidArgument);
         }
-        (s.trader, s.collateral_quote_lots)
+        (s.trader, s.collateral_quote_lots, s.sub_index)
     };
 
     let now_slot = Clock::get()?.slot;
@@ -163,8 +163,8 @@ fn run(pid: &Pubkey, accounts: &[AccountInfo], legs: &[BasketLeg]) -> ProgramRes
             // position in this market could pass a foreign/other-market flat
             // position to hide it from the single joint gate (the C-2 omit-a-
             // risky-position defeat the withdraw/sweep walks already block).
-            if &p.trader != &trader_pk || &p.market != market.key() {
-                return Err(ProgramError::InvalidArgument);
+            if &p.trader != &trader_pk || &p.market != market.key() || p.sub_index != trader_sub {
+                return Err(ProgramError::InvalidArgument); // bind to THIS sub-account
             }
             positions[i] = project_post_leg(p, leg, market.key(), cum_funding);
         }

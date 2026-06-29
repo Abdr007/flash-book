@@ -86,7 +86,7 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 
     // ── snapshot position / trader_state / market params / liq state ────
     let (
-        pos_trader, pos_market, pos_side, pos_size, pos_collat,
+        pos_trader, pos_market, pos_sub, pos_side, pos_size, pos_collat,
         ts_trader, ts_collat, ts_open, ts_sub,
         mark, tick, penalty_bps, reward_bps, auction_dur, cooldown, last_mark_update,
     ) = {
@@ -94,7 +94,7 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         let ts = unsafe { &*(trader_state.borrow_data_unchecked().as_ptr() as *const TraderState) };
         let m = unsafe { &*(market.borrow_data_unchecked().as_ptr() as *const Market) };
         (
-            p.trader, p.market, p.side, p.size_lots, p.collateral_quote_lots,
+            p.trader, p.market, p.sub_index, p.side, p.size_lots, p.collateral_quote_lots,
             ts.trader, ts.collateral_quote_lots, ts.open_positions, ts.sub_index,
             m.mark_price_ticks, m.tick_size, m.liq_penalty_bps, m.liquidator_reward_bps,
             m.liquidation_auction_duration_slots, m.liquidation_cooldown_slots, m.last_mark_update_slot,
@@ -105,8 +105,8 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     if pos_size == 0 {
         return Err(ProgramError::InvalidArgument); // nothing to liquidate
     }
-    if pos_trader != ts_trader || pos_market != market_key {
-        return Err(ProgramError::InvalidArgument);
+    if pos_trader != ts_trader || pos_market != market_key || pos_sub != ts_sub {
+        return Err(ProgramError::InvalidArgument); // position must belong to THIS sub-account
     }
     if pos_side > 1 {
         return Err(ProgramError::InvalidArgument);
@@ -273,6 +273,31 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         let mut handle = MarketBookHandle::from_account_data(book_data)?;
         if &handle.header.market_pubkey != market.key() {
             return Err(ProgramError::InvalidArgument);
+        }
+        // Anti-stacking (port of the portfolio path's H3 scan): if a forced-
+        // liquidation order (type 3) for this trader already rests on the close
+        // side, the position is already being liquidated — refuse to inject a
+        // second one. The reward is paid on INJECTION and the close only settles
+        // later via apply_fill, so without this an attacker could stack N adjacent-
+        // slot liquidations (the same-slot guard only blocks intra-slot; cooldown
+        // defaults to 0) and skim the reward N times, draining the liquidatee.
+        let mut dup = false;
+        {
+            let mut scan = |_idx: crate::hypertree::DataIndex, o: &RestingOrderV2| -> bool {
+                if o.order_type == 3 && o.trader == pos_trader {
+                    dup = true;
+                    return false;
+                }
+                true
+            };
+            if close_side == 0 {
+                handle.for_each_bid_best_first(&mut scan);
+            } else {
+                handle.for_each_ask_best_first(&mut scan);
+            }
+        }
+        if dup {
+            return Err(ProgramError::Custom(140)); // already being liquidated
         }
         let seq = handle
             .header

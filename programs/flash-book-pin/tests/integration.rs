@@ -3101,3 +3101,33 @@ async fn apply_flp_fill_rejects_out_of_band_price() {
     let err = format!("{:?}", r.expect_err("out-of-band FLP fill must be rejected"));
     assert!(err.contains("Custom(247)"), "expected band reject Custom(247), got: {err}");
 }
+
+// Audit round 3 — the position sub_index binding (CRITICAL: a wallet's sub-account
+// position must not be substitutable into the MAIN account's settlement / solvency
+// gate). bind_or_stamp_position requires `pos.sub_index == ts.sub_index`.
+const POS_SUB_INDEX: usize = 121; // disc8+cum16+trader32+market32+size8+entry8+collat8+realized8+side1
+#[tokio::test]
+async fn apply_flp_fill_rejects_cross_subaccount_position() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let taker = Pubkey::new_unique();
+    let (market, insurance, flp, ts, pos) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut mkt = market_full(pid, 1_000, 1, 500, 0, 0);
+    put_key(&mut mkt.data, 8, &seq.pubkey());
+    pt.add_account(market, mkt);
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(flp, flp_exposure_acct(pid));
+    pt.add_account(ts, trader_state(pid, taker, 1_000_000, 0)); // ts.sub_index = 0 (main)
+    // An ALREADY-OPEN position (size>0 ⇒ bind must MATCH, not stamp) whose
+    // sub_index byte = 2 (a sub-account) — i.e. substituted into the main account.
+    let mut pos_acct = position(pid, taker, market, 0, 5, 1_000, 0);
+    pos_acct.data[POS_SUB_INDEX] = 2;
+    pt.add_account(pos, pos_acct);
+    pt.add_account(seq.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let ix = flp_fill_ix(pid, seq.pubkey(), market, insurance, flp, ts, pos, 1_000, 1);
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    assert!(r.is_err(), "a sub_index-mismatched position must be rejected (cross-sub-account substitution)");
+}

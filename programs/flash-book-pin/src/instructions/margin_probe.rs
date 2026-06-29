@@ -54,7 +54,17 @@ pub(crate) fn build_snapshot(
         if p.size_lots == 0 {
             return Ok(None); // flat — trivially solvent
         }
-        if p.trader != ts.trader || p.market != *market.key() {
+        // Bind the position to THIS trader_state, not merely the wallet. Every one
+        // of a wallet's trader_states (main + each sub-account) stores the same
+        // `.trader = wallet`, so `p.trader == ts.trader` alone lets a wallet
+        // substitute a tiny sub-account position into another trader_state's joint
+        // solvency gate — the CRITICAL `partial_withdraw`/`sweep` collateral-theft
+        // and the wrongful/under-margined `liquidate_portfolio`/`set_position_*`
+        // walks. `(trader, sub_index)` bijectively identifies the trader_state
+        // (the field-bound equivalent of Anchor's per-trader_state position PDA).
+        // This single clause covers EVERY cross-portfolio walk, since they all
+        // funnel position validation through `build_snapshot`.
+        if p.trader != ts.trader || p.market != *market.key() || p.sub_index != ts.sub_index {
             return Err(ProgramError::InvalidArgument);
         }
 

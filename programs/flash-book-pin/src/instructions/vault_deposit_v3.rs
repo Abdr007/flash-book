@@ -71,6 +71,14 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         if &ts.trader != vault.key() {
             return Err(ProgramError::InvalidArgument);
         }
+        // Flat gate (parity with the withdraw side, vault_withdraw_v3): NAV here is
+        // collateral only and EXCLUDES the mark-PnL of any open vault position. If
+        // deposits were allowed while the vault holds an in-the-money position, a
+        // depositor would mint at an understated NAV and skim the original LPs'
+        // unrealized gains on the next close — a one-sided free option. Require flat.
+        if ts.open_positions != 0 {
+            return Err(ProgramError::InvalidArgument); // vault must be flat to accept deposits
+        }
         ts.collateral_quote_lots
     };
     // the position record must bind (vault, depositor).

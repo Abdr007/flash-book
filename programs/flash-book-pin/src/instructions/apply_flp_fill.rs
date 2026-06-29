@@ -96,7 +96,7 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         // Bind/stamp the taker position's (trader, market) identity BEFORE any
         // mutation — the sequencer cannot settle onto a mismatched/foreign
         // position (parity with apply_fill).
-        bind_or_stamp_position(taker_pos, &taker_ts.trader, accounts[1].key())?;
+        bind_or_stamp_position(taker_pos, &taker_ts.trader, accounts[1].key(), taker_ts.sub_index)?;
 
         // Taker-leg position update (FLP is the maker — no maker leg on-chain).
         let fidx = market.cum_funding();
@@ -135,25 +135,32 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
             .ok_or(ProgramError::ArithmeticOverflow)?
             .checked_mul(market.tick_size as u128)
             .ok_or(ProgramError::ArithmeticOverflow)?;
-        let fee = (notional
+        // M-1: clamp u128→u64 fee/rebate casts to u64::MAX (anchor parity; a raw
+        // `as u64` wraps mod 2^64 at extreme notional → near-zero fee).
+        let clamp = |x: u128| -> u64 { x.min(u64::MAX as u128) as u64 };
+        let fee = clamp(notional
             .checked_mul(market.taker_fee_bps as u128)
             .ok_or(ProgramError::ArithmeticOverflow)?
-            / BPS_DENOM) as u64;
+            / BPS_DENOM);
         let rebate_bps = if market.maker_rebate_bps > 0 { market.maker_rebate_bps as u128 } else { 0 };
-        let rebate = (notional
+        let rebate = clamp(notional
             .checked_mul(rebate_bps)
             .ok_or(ProgramError::ArithmeticOverflow)?
-            / BPS_DENOM) as u64;
+            / BPS_DENOM);
         let rebate = rebate.min(fee);
         let net_fee = fee - rebate;
 
-        // Taker pays the fee; rebate lifts FLP capital (NAV/share for all LPs).
-        taker_ts.collateral_quote_lots = taker_ts.collateral_quote_lots.saturating_sub(fee);
+        // H-1: debit the taker fee with checked_sub and ABORT if uncovered (anchor
+        // parity). The prior `saturating_sub` minted unbacked quote-lots into FLP
+        // capital + insurance whenever the taker's balance was below the fee.
+        taker_ts.collateral_quote_lots = taker_ts.collateral_quote_lots
+            .checked_sub(fee)
+            .ok_or(ProgramError::Custom(249))?; // InsufficientCollateral
         flp.total_capital_quote_lots = flp.total_capital_quote_lots.saturating_add(rebate);
 
         // Insurance takes its bps cut of the net fee; the rest is protocol revenue.
         let contribution =
-            ((net_fee as u128) * (insurance.fee_contribution_bps as u128) / BPS_DENOM) as u64;
+            clamp((net_fee as u128) * (insurance.fee_contribution_bps as u128) / BPS_DENOM);
         insurance.balance_quote_lots = insurance.balance_quote_lots.saturating_add(contribution);
         insurance.total_contributions = insurance.total_contributions.saturating_add(contribution);
         market.total_fees_collected = market.total_fees_collected.saturating_add(net_fee);

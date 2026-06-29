@@ -21,7 +21,11 @@ use pinocchio::{
 pub(crate) fn assert_position(ai: &AccountInfo, pid: &Pubkey) -> ProgramResult {
     assert_owned_by(ai, pid)?;
     let d = ai.try_borrow_data()?;
-    if d.len() < 8 {
+    // Require the FULL struct length before any `*const/*mut Position` cast — the
+    // disc gate alone admits a fresh ZERO-disc account, which an attacker can
+    // create program-owned at only 8 bytes (System CreateAccount). Casting it and
+    // reading `size_lots`@88 / writing through 128 would be an OOB read/write.
+    if d.len() < core::mem::size_of::<Position>() {
         return Err(ProgramError::InvalidAccountData);
     }
     if d[..8] != [0u8; 8] && d[..8] != POSITION_DISC {
@@ -52,12 +56,13 @@ unsafe fn ensure_pos_disc(ai: &AccountInfo) {
 /// accounting — parity with the Anchor `position.trader == trader_state.trader`
 /// binding (Anchor additionally derives the position by PDA; pin is field-bound).
 #[inline]
-pub(crate) fn bind_or_stamp_position(pos: &mut Position, trader: &Pubkey, market: &Pubkey) -> ProgramResult {
+pub(crate) fn bind_or_stamp_position(pos: &mut Position, trader: &Pubkey, market: &Pubkey, sub_index: u8) -> ProgramResult {
     if pos.trader == [0u8; 32] && pos.size_lots == 0 {
         pos.trader = *trader;
         pos.market = *market;
+        pos.sub_index = sub_index; // bind to the trader_state sub-account
         Ok(())
-    } else if &pos.trader != trader || &pos.market != market {
+    } else if &pos.trader != trader || &pos.market != market || pos.sub_index != sub_index {
         Err(ProgramError::InvalidArgument)
     } else {
         Ok(())
@@ -108,6 +113,14 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         if market.sequencer != *sequencer.key() { return Err(ProgramError::IllegalOwner); }
         // Paused markets settle no fills.
         if market.status == crate::state::MARKET_STATUS_PAUSED { return Err(ProgramError::InvalidArgument); }
+        // Settlement price band: both legs' resting limits are within the
+        // anti-stuffing band of the mark, so a legitimate cross is too. Reject a
+        // sequencer-supplied price outside it — bounds how far a compromised
+        // sequencer can move collateral between the two legs (apply_flp_fill has
+        // the tighter FLP band; trader-vs-trader uses the resting band).
+        if !crate::book::price_within_band(market.mark_price_ticks, price, crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS) {
+            return Err(ProgramError::Custom(247)); // fill price out of band
+        }
         // Replay/reorder guard: `fill_seq` must STRICTLY exceed the market's
         // settlement nonce; advance it atomically with the fill. A re-submitted or
         // reordered sequencer-signed settlement is rejected before any mutation
@@ -126,8 +139,8 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         // Bind/stamp each leg's (trader, market) identity BEFORE any mutation, so
         // a mismatched position is rejected atomically with no state change.
         let mkt_key = *accounts[1].key();
-        bind_or_stamp_position(taker_pos, &taker_ts.trader, &mkt_key)?;
-        bind_or_stamp_position(maker_pos, &maker_ts.trader, &mkt_key)?;
+        bind_or_stamp_position(taker_pos, &taker_ts.trader, &mkt_key, taker_ts.sub_index)?;
+        bind_or_stamp_position(maker_pos, &maker_ts.trader, &mkt_key, maker_ts.sub_index)?;
 
         let fidx = market.cum_funding();
         // Snapshot sizes so we can maintain each trader's open_positions count
@@ -172,14 +185,23 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         let notional = (size as u128)
             .checked_mul(price as u128).ok_or(ProgramError::ArithmeticOverflow)?
             .checked_mul(market.tick_size as u128).ok_or(ProgramError::ArithmeticOverflow)?;
-        let gross_fee = (notional.checked_mul(market.taker_fee_bps as u128).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM) as u64;
+        // M-1: clamp every u128→u64 fee/rebate cast (anchor clamps to u64::MAX);
+        // a raw `as u64` would WRAP mod 2^64 at extreme notional → near-zero fee.
+        let clamp = |x: u128| -> u64 { x.min(u64::MAX as u128) as u64 };
+        let gross_fee = clamp(notional.checked_mul(market.taker_fee_bps as u128).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM);
         // Apply the taker's per-trader fee discount (0 by default ⇒ no change).
         let fee = crate::fees::discounted_fee(gross_fee, taker_ts.fee_discount_bps);
         let rebate = if market.maker_rebate_bps > 0 {
-            (notional.checked_mul(market.maker_rebate_bps as u128).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM) as u64
+            clamp(notional.checked_mul(market.maker_rebate_bps as u128).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM)
         } else { 0 };
         let rebate = rebate.min(fee);
-        taker_ts.collateral_quote_lots = taker_ts.collateral_quote_lots.saturating_sub(fee);
+        // H-1: debit the taker fee with checked_sub and ABORT the fill if they
+        // can't cover it (anchor parity). The prior `saturating_sub` floored the
+        // taker's debit at their balance while still crediting the maker the FULL
+        // rebate + insurance the FULL net fee → quote-lots minted from nothing.
+        taker_ts.collateral_quote_lots = taker_ts.collateral_quote_lots
+            .checked_sub(fee)
+            .ok_or(ProgramError::Custom(249))?; // InsufficientCollateral
         maker_ts.collateral_quote_lots = maker_ts.collateral_quote_lots.saturating_add(rebate);
         insurance.balance_quote_lots = insurance.balance_quote_lots.saturating_add(fee - rebate);
     }

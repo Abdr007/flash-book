@@ -22,7 +22,16 @@ pub struct Position {
     pub collateral_quote_lots: u64,
     pub realized_pnl_quote_lots: i64,
     pub side: u8, // 0 = long, 1 = short
-    pub _pad0: [u8; 3],
+    /// The trader_state SUB-ACCOUNT this position belongs to (0 = main). Stamped
+    /// from `ts.sub_index` on the first fill and asserted on every read. A wallet
+    /// owns one trader_state per sub_index (all carry `.trader = wallet`), so
+    /// `(trader, sub_index)` bijectively identifies the trader_state — exactly the
+    /// binding Anchor gets from keying the position PDA on `trader_state.key()`.
+    /// Without it, a wallet could substitute a sub-account's position into another
+    /// trader_state's cross-margin solvency gate (→ bad debt). Carved from the old
+    /// `_pad0[3]`; size unchanged (128 bytes), `leverage_cap` still 4-aligned @124.
+    pub sub_index: u8,
+    pub _pad0: [u8; 2],
     /// Per-position max-leverage cap, set by the trader via
     /// `set_position_leverage` (bounded by `Market::max_leverage`). `0` = unset.
     /// Carved from the old 7-byte pad (4-aligned at offset 124); size unchanged
