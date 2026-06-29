@@ -60,6 +60,7 @@ pub mod trigger_order;
 pub mod twap_order;
 pub mod vault_math;
 pub mod oracle_quorum;
+pub mod pyth_oracle;
 pub mod leverage_tiers;
 pub mod fee_tiers;
 pub mod cpi;
@@ -203,6 +204,7 @@ mod program {
         VaultCancelOrderV3 = 112,
         UpdateTrailingStop = 113,
         UpdateOracleQuorum = 114,
+        UpdateOracleFromPyth = 115,
     }
 
     #[inline(always)]
@@ -324,6 +326,7 @@ mod program {
             x if x == Ix::VaultCancelOrderV3 as u8 => instructions::vault_cancel_order_v3::process(program_id, accounts, rest),
             x if x == Ix::UpdateTrailingStop as u8 => instructions::update_trailing_stop::process(program_id, accounts, rest),
             x if x == Ix::UpdateOracleQuorum as u8 => instructions::update_oracle_quorum::process(program_id, accounts, rest),
+            x if x == Ix::UpdateOracleFromPyth as u8 => instructions::update_oracle_from_pyth::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

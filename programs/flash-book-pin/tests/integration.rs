@@ -1833,3 +1833,122 @@ async fn update_oracle_quorum_rejects_wide_dispersion() {
     let m = banks.get_account(market).await.unwrap().unwrap();
     assert_eq!(get_u64(&m.data, MKT_MARK), 0, "mark untouched on reject");
 }
+
+// ─── update_oracle_from_pyth e2e (positive, real fixture) ───
+// Feeds the REAL captured PriceUpdateV2 fixture (price 6_500_123, exp -8) through
+// the parser + conversion. tick_decimals 6 ⇒ scale -2 ⇒ mark = 6_500_123/100 =
+// 65_001. The price account is owned by the Pyth receiver program. No CPI →
+// fully e2e-testable.
+const IX_UPDATE_ORACLE_FROM_PYTH: u8 = 115;
+const PYTH_RECEIVER_ID: [u8; 32] = [
+    12, 183, 250, 187, 82, 247, 166, 72, 187, 91, 49, 125, 154, 1, 139, 144, 87, 203, 2, 71, 116,
+    250, 254, 1, 230, 196, 223, 152, 204, 56, 88, 129,
+];
+const PYTH_FIXTURE: [u8; 133] = [
+    34, 241, 35, 99, 157, 126, 244, 205, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171,
+    171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171,
+    171, 171, 1, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
+    17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 27, 47, 99, 0, 0, 0, 0, 0, 146, 16, 0, 0, 0, 0, 0,
+    0, 248, 255, 255, 255, 128, 225, 78, 104, 0, 0, 0, 0, 127, 225, 78, 104, 0, 0, 0, 0, 184, 42,
+    99, 0, 0, 0, 0, 0, 204, 16, 0, 0, 0, 0, 0, 0, 99, 0, 0, 0, 0, 0, 0, 0,
+];
+
+// oracle_config with source=Pyth, feed=[0x11;32], huge staleness, conf gate off.
+fn pyth_oracle_config(pid: Pubkey, market: Pubkey, tick_decimals: i8) -> Account {
+    let mut d = vec![0u8; 88];
+    d[0..8].copy_from_slice(&ORACLE_CONFIG_DISC);
+    put_key(&mut d, 8, &market);
+    d[40..72].copy_from_slice(&[0x11u8; 32]); // pyth_price_feed_id
+    put_u32(&mut d, 72, u32::MAX); // max_staleness_seconds (robust vs test clock)
+    put_u32(&mut d, 76, 0); // max_confidence_bps = 0 (gate off)
+    d[80] = tick_decimals as u8; // tick_decimals @ 80
+    d[81] = 1; // source = Pyth
+    rent_account(d, pid)
+}
+
+#[tokio::test]
+async fn update_oracle_from_pyth_sets_converted_mark() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let market = Pubkey::new_unique();
+    let oracle_config = Pubkey::new_unique();
+    let price_update = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_account(pid, Pubkey::new_unique())); // mark 0
+    pt.add_account(oracle_config, pyth_oracle_config(pid, market, 6));
+    // Pyth price account: the real fixture, owned by the Pyth receiver program.
+    pt.add_account(
+        price_update,
+        Account {
+            lamports: 1_000_000,
+            data: PYTH_FIXTURE.to_vec(),
+            owner: Pubkey::new_from_array(PYTH_RECEIVER_ID),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(oracle_config, false),
+            AccountMeta::new_readonly(price_update, false),
+        ],
+        data: vec![IX_UPDATE_ORACLE_FROM_PYTH],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await
+        .unwrap();
+
+    let m = banks.get_account(market).await.unwrap().unwrap();
+    assert_eq!(get_u64(&m.data, MKT_MARK), 65_001, "mark = pyth price 6_500_123 * 10^(-8+6)");
+}
+
+#[tokio::test]
+async fn update_oracle_from_pyth_rejects_wrong_owner() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let market = Pubkey::new_unique();
+    let oracle_config = Pubkey::new_unique();
+    let price_update = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_account(pid, Pubkey::new_unique()));
+    pt.add_account(oracle_config, pyth_oracle_config(pid, market, 6));
+    // Same fixture but owned by a RANDOM program → must be rejected.
+    pt.add_account(
+        price_update,
+        Account {
+            lamports: 1_000_000,
+            data: PYTH_FIXTURE.to_vec(),
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(oracle_config, false),
+            AccountMeta::new_readonly(price_update, false),
+        ],
+        data: vec![IX_UPDATE_ORACLE_FROM_PYTH],
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &caller], bh))
+        .await;
+    assert!(r.is_err(), "a non-Pyth-owned price account must be rejected");
+    let m = banks.get_account(market).await.unwrap().unwrap();
+    assert_eq!(get_u64(&m.data, MKT_MARK), 0, "mark untouched on reject");
+}
