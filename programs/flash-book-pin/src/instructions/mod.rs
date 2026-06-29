@@ -43,6 +43,8 @@ pub mod update_oracle_quorum;
 pub mod update_oracle_from_pyth;
 pub mod stamp_book_liveness_baseline;
 pub mod book_permission;
+pub mod delegate_market_book;
+pub mod undelegate_market_book;
 pub mod withdraw_collateral;
 pub mod open_trader_sub_account;
 pub mod transfer_collateral;

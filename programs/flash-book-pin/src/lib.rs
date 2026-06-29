@@ -211,6 +211,8 @@ mod program {
         InitBookPermission = 117,
         SetBookPrivacy = 118,
         CloseBookPermission = 119,
+        DelegateMarketBook = 120,
+        UndelegateMarketBook = 121,
     }
 
     #[inline(always)]
@@ -337,6 +339,8 @@ mod program {
             x if x == Ix::InitBookPermission as u8 => instructions::book_permission::init(program_id, accounts, rest),
             x if x == Ix::SetBookPrivacy as u8 => instructions::book_permission::set_privacy(program_id, accounts, rest),
             x if x == Ix::CloseBookPermission as u8 => instructions::book_permission::close(program_id, accounts, rest),
+            x if x == Ix::DelegateMarketBook as u8 => instructions::delegate_market_book::process(program_id, accounts, rest),
+            x if x == Ix::UndelegateMarketBook as u8 => instructions::undelegate_market_book::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
