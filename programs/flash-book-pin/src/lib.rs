@@ -224,6 +224,13 @@ mod program {
         CommitFillCommitment = 129,
         CommitAndUndelegateFillCommitment = 130,
         UndelegateFillCommitment = 131,
+        MigrateMarketToV3 = 132,
+        MigratePositionToTraderStateKey = 133,
+        ViewPredictedFunding = 134,
+        ViewTraderEffectiveTier = 135,
+        ViewBookDepthV2 = 136,
+        ViewQuoteLadder = 137,
+        ViewPortfolioRisk = 138,
     }
 
     #[inline(always)]
@@ -370,6 +377,13 @@ mod program {
             x if x == Ix::CommitFillCommitment as u8 => instructions::commit_market_book::commit(program_id, accounts, rest),
             x if x == Ix::CommitAndUndelegateFillCommitment as u8 => instructions::commit_market_book::commit_and_undelegate(program_id, accounts, rest),
             x if x == Ix::UndelegateFillCommitment as u8 => instructions::undelegate_fill_commitment::process(program_id, accounts, rest),
+            x if x == Ix::MigrateMarketToV3 as u8 => instructions::migrate_market_to_v3::process(program_id, accounts, rest),
+            x if x == Ix::MigratePositionToTraderStateKey as u8 => instructions::migrate_position_to_trader_state_key::process(program_id, accounts, rest),
+            x if x == Ix::ViewPredictedFunding as u8 => instructions::views::predicted_funding(program_id, accounts, rest),
+            x if x == Ix::ViewTraderEffectiveTier as u8 => instructions::views::trader_effective_tier(program_id, accounts, rest),
+            x if x == Ix::ViewBookDepthV2 as u8 => instructions::views::book_depth(program_id, accounts, rest),
+            x if x == Ix::ViewQuoteLadder as u8 => instructions::views::quote_ladder(program_id, accounts, rest),
+            x if x == Ix::ViewPortfolioRisk as u8 => instructions::views::portfolio_risk(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

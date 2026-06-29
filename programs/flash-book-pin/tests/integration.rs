@@ -2606,3 +2606,73 @@ async fn undelegate_fill_commitment_rejects_wrong_authority() {
     let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh)).await;
     assert!(r.is_err(), "non-authority undelegate must be rejected");
 }
+
+// ─── migrations + views e2e (no CPI → fully testable) ───
+const IX_MIGRATE_MARKET: u8 = 132;
+const IX_VIEW_PREDICTED_FUNDING: u8 = 134;
+const IX_VIEW_PORTFOLIO_RISK: u8 = 138;
+
+#[tokio::test]
+async fn migrate_market_to_v3_is_noop_on_canonical_account() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let market = Pubkey::new_unique();
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    pt.add_account(market, m);
+    pt.add_account(authority.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![AccountMeta::new_readonly(authority.pubkey(), true), AccountMeta::new(market, false)],
+        data: vec![IX_MIGRATE_MARKET],
+    };
+    banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &authority], bh)).await.unwrap();
+}
+
+#[tokio::test]
+async fn migrate_market_to_v3_rejects_wrong_authority() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let imposter = Keypair::new();
+    let market = Pubkey::new_unique();
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey());
+    pt.add_account(market, m);
+    pt.add_account(imposter.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![AccountMeta::new_readonly(imposter.pubkey(), true), AccountMeta::new(market, false)],
+        data: vec![IX_MIGRATE_MARKET],
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh)).await;
+    assert!(r.is_err(), "wrong authority rejected");
+}
+
+#[tokio::test]
+async fn view_predicted_funding_emits_and_succeeds() {
+    let pid = Pubkey::new_unique();
+    let caller = Keypair::new();
+    let market = Pubkey::new_unique();
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_full(pid, 1_234, 1, 500, 0, 0));
+    pt.add_account(caller.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let ix = Instruction { program_id: pid, accounts: vec![AccountMeta::new_readonly(market, false)], data: vec![IX_VIEW_PREDICTED_FUNDING] };
+    banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+}
+
+#[tokio::test]
+async fn view_portfolio_risk_emits_and_succeeds() {
+    let pid = Pubkey::new_unique();
+    let trader = Pubkey::new_unique();
+    let ts = Pubkey::new_unique();
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(ts, trader_state(pid, trader, 5_000, 2));
+    let (banks, payer, bh) = pt.start().await;
+    let ix = Instruction { program_id: pid, accounts: vec![AccountMeta::new_readonly(ts, false)], data: vec![IX_VIEW_PORTFOLIO_RISK] };
+    banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+}
