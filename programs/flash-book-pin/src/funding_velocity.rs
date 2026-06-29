@@ -85,6 +85,22 @@ pub fn target_rate_from_skew_e9(
     }
 }
 
+/// The Q64.64 cumulative-funding-index delta for accruing `rate_e9` (per-slot, e9
+/// fixed-point) over `dt_slots`. The cumulative rate fraction is `rate_e9·dt/1e9`;
+/// scaled into Q64.64 that is `·2^64`, i.e. `ΔI = rate_e9·dt·2^64 / 1e9`. Checked
+/// (overflow → `None`). Sign-preserving: a positive rate (long-heavy skew) raises
+/// the index so `funding_owed(long)` is positive (longs pay), matching
+/// `settle_position_funding`. Pure + host-tested.
+#[inline]
+pub fn funding_index_delta_q64(rate_e9: i64, dt_slots: u64) -> Option<i128> {
+    const Q: i128 = 1i128 << 64;
+    const E9: i128 = 1_000_000_000;
+    (rate_e9 as i128)
+        .checked_mul(dt_slots as i128)?
+        .checked_mul(Q)?
+        .checked_div(E9)
+}
+
 #[inline]
 fn clamp_to_max(rate: i64, max: u32) -> i64 {
     let m = max as i64;
@@ -154,6 +170,22 @@ mod tests {
         // Tiny denom, large skew → would exceed max.
         assert_eq!(target_rate_from_skew_e9(100_000, 1, 10_000, 5_000), 5_000);
         assert_eq!(target_rate_from_skew_e9(-100_000, 1, 10_000, 5_000), -5_000);
+    }
+
+    #[test]
+    fn index_delta_sign_and_scale() {
+        const Q: i128 = 1i128 << 64;
+        // rate 1e9 (= 1.0/slot) over 1 slot ⇒ ΔI = 1.0 in Q64.64 = 2^64.
+        assert_eq!(funding_index_delta_q64(1_000_000_000, 1), Some(Q));
+        // half rate over 2 slots ⇒ same 1.0.
+        assert_eq!(funding_index_delta_q64(500_000_000, 2), Some(Q));
+        // zero rate or zero dt ⇒ no move.
+        assert_eq!(funding_index_delta_q64(0, 100), Some(0));
+        assert_eq!(funding_index_delta_q64(1_000_000, 0), Some(0));
+        // NEGATIVE rate (short-heavy skew) ⇒ index FALLS (shorts pay / longs receive).
+        assert_eq!(funding_index_delta_q64(-1_000_000_000, 1), Some(-Q));
+        // bounded inputs (cap × max dt) never overflow i128.
+        assert!(funding_index_delta_q64(crate::constants::MAX_FUNDING_RATE_E9 as i64, crate::constants::MAX_FUNDING_DT_SLOTS).is_some());
     }
 
     #[test]

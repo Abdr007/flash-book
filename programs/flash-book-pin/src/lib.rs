@@ -242,6 +242,12 @@ mod program {
         /// (penalty / insurance shortfall / recovered collateral) via the proven
         /// `compute_shortfall`. pin addition beyond the 134/134 anchor parity set.
         ViewLiquidationPreview = 145,
+        /// Permissionless crank: advance the market's funding rate + cumulative
+        /// funding index from the on-chain OI skew (GMX-V2 velocity-smoothed).
+        AdvanceFunding = 146,
+        /// Market-authority: configure the funding-rate engine (skew K / velocity /
+        /// rate cap). All-0 keeps funding inert (the carved default).
+        SetFundingParams = 147,
     }
 
     #[inline(always)]
@@ -396,6 +402,8 @@ mod program {
             x if x == Ix::ViewQuoteLadder as u8 => instructions::views::quote_ladder(program_id, accounts, rest),
             x if x == Ix::ViewPortfolioRisk as u8 => instructions::views::portfolio_risk(program_id, accounts, rest),
             x if x == Ix::ViewLiquidationPreview as u8 => instructions::views::liquidation_preview(program_id, accounts, rest),
+            x if x == Ix::AdvanceFunding as u8 => instructions::advance_funding::process(program_id, accounts, rest),
+            x if x == Ix::SetFundingParams as u8 => instructions::set_funding_params::process(program_id, accounts, rest),
             x if x == Ix::SweepCollateral as u8 => instructions::sweep_collateral::process(program_id, accounts, rest),
             x if x == Ix::PartialWithdrawCollateral as u8 => instructions::partial_withdraw::process(program_id, accounts, rest),
             x if x == Ix::PartialWithdrawCollateralXdomain as u8 => instructions::partial_withdraw::xdomain(program_id, accounts, rest),

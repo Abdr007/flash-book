@@ -386,11 +386,26 @@ Anchor `er.rs`** (a follow-up to this audit):
   cycle MUST be confirmed on the live MagicBlock devnet ER (an `er-acceptance` run)
   before relying on it. The pin port is not deployed, so nothing live depends on it yet.
 
+### Funding-rate engine — WIRED (2026-06-30)
+`cum_funding_index` was never advanced (funding inert in both crates). Now wired with
+pin's mark-only-friendly **skew-velocity** model (GMX-V2), separate from Anchor's
+premium model: a new permissionless `advance_funding` crank reads the on-chain OI
+skew (`long_oi − short_oi`), ramps `Market.funding_rate_e9` toward the skew target at a
+bounded velocity (`funding_velocity`), and accrues the trapezoidal-average rate into
+`cum_funding_index` (Q64.64) — which `settle_position_funding` already applies to every
+position on fill / `settle_funding`. `set_funding_params` (market-authority) turns it on
+per market (skew K / velocity / rate cap); all-`0` (the carved default) keeps it INERT,
+so existing markets are unchanged. Fail-safe: no-op on a paused or stale-mark market;
+per-crank `dt` clamped to `MAX_FUNDING_DT_SLOTS`; config bounded by `MAX_FUNDING_RATE_E9`.
+Carved 28 bytes from `Market._reserved` (1152-byte layout unchanged). Proven e2e
+(`advance_funding_accrues_index_on_positive_skew`: positive skew → index rises → longs
+pay) + `inert_when_unconfigured`. Sign: positive skew ⇒ `funding_owed(long) > 0`.
+
 ### HONESTLY DEFERRED — features, not bugs
 - **commit-reveal fill authenticity** (ring unwired), **haircut junior-claim engine**
-  (unwired, fails closed), **funding accrual inert** (symmetric), **leverage/position/
-  concentration caps unwired**, **VPIN tax / FLP-exposure tracking** — all as documented
-  in the prior rounds; feature-wiring, not exploitable-today bugs.
+  (unwired, fails closed), **leverage/position/concentration caps unwired**, **VPIN tax /
+  FLP-exposure tracking** — all as documented in the prior rounds; feature-wiring, not
+  exploitable-today bugs.
 - **`position_liq` timestamps not reset on close** (benign: over-reward capped at backing,
   self-affecting, and the cooldown defaults to 0); **`apply_flp_fill` rebate/insurance
   `saturating_add`** (deliberate liveness choice at an unreachable u64 balance — `checked_add`

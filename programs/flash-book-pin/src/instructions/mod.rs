@@ -1,4 +1,6 @@
+pub mod advance_funding;
 pub mod apply_fill;
+pub mod set_funding_params;
 pub mod settle_funding;
 pub mod place_order;
 pub mod cancel_order;

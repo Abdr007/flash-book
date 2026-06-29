@@ -28,6 +28,17 @@ pub const MAX_FEE_TIER_BPS: u32 = 1_000;
 /// honest LPs' fee revenue. Mirrors anchor `FLP_MIN_HOLD_SLOTS`.
 pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
 
+/// Max slots of funding `advance_funding` accrues in a single crank. Bounds the
+/// per-crank `cum_funding_index` jump after a long silence (the rate ramp limits
+/// how fast the rate moves, but `rate × dt` is otherwise unbounded in `dt`).
+pub const MAX_FUNDING_DT_SLOTS: u64 = 9_000;
+
+/// Hard ceiling on a market's configurable `max_funding_rate_e9` / velocity (e9
+/// fixed-point, per slot). 1e7 = 1% per slot — already an extreme funding rate;
+/// `set_funding_params` rejects anything above this so a mis-set market can't
+/// accrue runaway funding.
+pub const MAX_FUNDING_RATE_E9: u32 = 10_000_000;
+
 /// Slots of total ER silence (no fill / heartbeat / delegation signal) before the
 /// permissionless `force_undelegate_market_book` escape opens. Mirrors anchor.
 pub const FORCE_UNDELEGATE_TIMEOUT_SLOTS: u64 = 750;
