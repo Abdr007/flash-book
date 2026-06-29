@@ -62,6 +62,7 @@ pub mod vault_math;
 pub mod oracle_quorum;
 pub mod pyth_oracle;
 pub mod er;
+pub mod er_permission;
 pub mod leverage_tiers;
 pub mod fee_tiers;
 pub mod cpi;
@@ -207,6 +208,9 @@ mod program {
         UpdateOracleQuorum = 114,
         UpdateOracleFromPyth = 115,
         StampBookLivenessBaseline = 116,
+        InitBookPermission = 117,
+        SetBookPrivacy = 118,
+        CloseBookPermission = 119,
     }
 
     #[inline(always)]
@@ -330,6 +334,9 @@ mod program {
             x if x == Ix::UpdateOracleQuorum as u8 => instructions::update_oracle_quorum::process(program_id, accounts, rest),
             x if x == Ix::UpdateOracleFromPyth as u8 => instructions::update_oracle_from_pyth::process(program_id, accounts, rest),
             x if x == Ix::StampBookLivenessBaseline as u8 => instructions::stamp_book_liveness_baseline::process(program_id, accounts, rest),
+            x if x == Ix::InitBookPermission as u8 => instructions::book_permission::init(program_id, accounts, rest),
+            x if x == Ix::SetBookPrivacy as u8 => instructions::book_permission::set_privacy(program_id, accounts, rest),
+            x if x == Ix::CloseBookPermission as u8 => instructions::book_permission::close(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
