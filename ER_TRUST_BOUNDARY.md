@@ -73,23 +73,29 @@ that is validated on devnet, not asserted in CI.
 
 ## 3. How Tier 2 is validated today (and how to make it rigorous)
 
-**BUILT (2026-06-29): `er-acceptance/`** — a reproducible, `ER_RPC`-gated live-ER
-acceptance suite (skips cleanly without `ER_RPC`, like the SBF benches without
-`BPF_OUT_DIR`). Its first run against the devnet MagicBlock ER
-(`magicblock-core 0.13.2`) **validated the delegate-CPI round-trip for the book +
-§3.2 ring** and immediately found two integration facts no unit/integration test
-could (they don't delegate): **(1)** the 256-slot outbox CANNOT be ER-delegated —
-the delegate-buffer is created at the full 24,640 B in one CPI, over the 10,240 B/ix
-cap, so the deep outbox is **L1-only** under the current ring cap (book + ring
-delegate fine, so §3.2 authenticity round-trips on the ER); **(2)** routing —
-`null`-validator delegation must be transacted against the validator that claimed
-the account (or the MagicBlock router), else the ER match returns
-`InvalidWritableAccount`. This is precisely the Tier-2 value: real CPI-surface
-findings the harness structurally cannot produce.
+**BUILT + GREEN (2026-06-29): `er-acceptance/`** — a reproducible, `ER_RPC`-gated
+live-ER acceptance suite (skips cleanly without `ER_RPC`, like the SBF benches
+without `BPF_OUT_DIR`). It runs the **full round-trip GREEN (7/7 stages) against the
+live MagicBlock devnet ER** (`magicblock-core 0.13.2`): delegate (market + book +
+§3.2 ring + outbox) → match on the rollup (commitments + outbox written ON the ER) →
+`commit_*` → assert the ring + outbox cursors survived → `commit_and_undelegate_*` →
+`process_undelegation` → assert all back under the program and
+`from_account_data`-valid. **The entire off-log fill-outbox pipeline is now
+validated on the live ER** at cap 105.
 
-Prior to this it was only **devnet ER replays** (`scratchpad/replay/15_delegate`,
-`17_smoke_force`, `18_wait_force`) and the live V2 ER census — ad-hoc. The suite
-asserts one full round-trip per delegated account type:
+Getting there surfaced three integration facts no unit/integration test could
+produce (they don't delegate) — the Tier-2 value:
+- **256-slot outbox can't be ER-delegated** (delegate-buffer create > 10,240 B/ix)
+  → resolved by the **versatile per-market cap** (≤105 is fully ER-capable; up to
+  256 is L1 deep-sweep).
+- **Validator pinning** — `null` leaves the owning validator ambiguous; pin
+  `MAS1Dt9…` (the devnet ER) and transact against its endpoint
+  (`devnet-as.magicblock.app`) or the Magic Router (`devnet-rpc.magicblock.app`).
+- **The `market` account must be delegated** alongside book/ring/outbox — it's a
+  writable account (OI), and the ER rejects a delegated/undelegated writable mix.
+
+Prior to this it was only ad-hoc **devnet ER replays**. The suite asserts one full
+round-trip per delegated account type:
 
 ```
 delegate_market_book + delegate_fill_commitment + delegate_fill_outbox (together)

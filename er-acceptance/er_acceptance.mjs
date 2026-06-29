@@ -25,7 +25,7 @@ const { AnchorProvider, Program, Wallet, BN } = anchor;
 // ── gate ──────────────────────────────────────────────────────────────────────
 const ER_RPC = process.env.ER_RPC;
 if (!ER_RPC) {
-  console.log("SKIP live-ER acceptance: set ER_RPC=<MagicBlock ER endpoint> (e.g. https://devnet.magicblock.app) to run.");
+  console.log("SKIP live-ER acceptance: set ER_RPC=<MagicBlock ER endpoint> (the ER_VALIDATOR's endpoint, e.g. https://devnet-as.magicblock.app, or the Magic Router https://devnet-rpc.magicblock.app) to run.");
   process.exit(0);
 }
 const L1_RPC = process.env.L1_RPC || "https://api.devnet.solana.com";
@@ -34,6 +34,12 @@ const L1_RPC = process.env.L1_RPC || "https://api.devnet.solana.com";
 const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
 const PID = new PublicKey(IDL.address);
 const DELEG = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
+// Pin the ER validator that will own the delegated accounts, so the ER match stage
+// transacts against the validator that actually holds them (deterministic — no
+// `null`-validator routing ambiguity). Default = the MagicBlock devnet ER validator
+// (identity MAS1Dt9…, FQDN https://devnet-as.magicblock.app); override via ER_VALIDATOR.
+// Set ER_RPC to THAT validator's endpoint (or the Magic Router devnet-rpc.magicblock.app).
+const ER_VALIDATOR = new PublicKey(process.env.ER_VALIDATOR || "MAS1Dt9qreoRMQ14YQuhg8UTZMMzDdKhmkZMECCzk57");
 const MAGIC_PROGRAM = new PublicKey("Magic11111111111111111111111111111111111111");
 const MAGIC_CONTEXT = new PublicKey("MagicContext1111111111111111111111111111111");
 const sys = SystemProgram.programId;
@@ -106,13 +112,19 @@ try {
     rec: pda(["delegation", acct], DELEG),
     meta: pda(["delegation-metadata", acct], DELEG),
   });
-  await stage("L1 delegate book + ring + OUTBOX → DLP (versatile: outbox now delegates)", async () => {
+  await stage("L1 delegate market + book + ring + OUTBOX → DLP (full writable set)", async () => {
+    // book/ring/outbox first (they read the market for auth while it's still
+    // program-owned), then the MARKET last (place_limit writes its OI, so the ER
+    // needs every writable account delegated — else a delegated/undelegated mix
+    // is rejected `InvalidWritableAccount`). All pinned to ER_VALIDATOR.
     const b = delegArgs(BOOK);
-    await send(l1, await program.methods.delegateMarketBook(30000, null).accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, ownerProgram: PID, delegateBuffer: b.buf, delegationRecord: b.rec, delegationMetadata: b.meta, systemProgram: sys, delegationProgram: DELEG }).instruction(), []);
+    await send(l1, await program.methods.delegateMarketBook(30000, ER_VALIDATOR).accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, ownerProgram: PID, delegateBuffer: b.buf, delegationRecord: b.rec, delegationMetadata: b.meta, systemProgram: sys, delegationProgram: DELEG }).instruction(), []);
     const c = delegArgs(FC);
-    await send(l1, await program.methods.delegateFillCommitment(30000, null).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, ownerProgram: PID, delegateBuffer: c.buf, delegationRecord: c.rec, delegationMetadata: c.meta, systemProgram: sys, delegationProgram: DELEG }).instruction(), []);
+    await send(l1, await program.methods.delegateFillCommitment(30000, ER_VALIDATOR).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, ownerProgram: PID, delegateBuffer: c.buf, delegationRecord: c.rec, delegationMetadata: c.meta, systemProgram: sys, delegationProgram: DELEG }).instruction(), []);
     const o = delegArgs(FO);
-    await send(l1, await program.methods.delegateFillOutbox(30000, null).accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, ownerProgram: PID, delegateBuffer: o.buf, delegationRecord: o.rec, delegationMetadata: o.meta, systemProgram: sys, delegationProgram: DELEG }).instruction(), []);
+    await send(l1, await program.methods.delegateFillOutbox(30000, ER_VALIDATOR).accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, ownerProgram: PID, delegateBuffer: o.buf, delegationRecord: o.rec, delegationMetadata: o.meta, systemProgram: sys, delegationProgram: DELEG }).instruction(), []);
+    const m = delegArgs(M);
+    await send(l1, await program.methods.delegateMarket(30000, ER_VALIDATOR).accountsPartial({ authority: signer.publicKey, market: M, ownerProgram: PID, delegateBuffer: m.buf, delegationRecord: m.rec, delegationMetadata: m.meta, systemProgram: sys, delegationProgram: DELEG }).instruction(), []);
   });
   await sleep(4000); // let the ER validator pick up the delegated accounts
 

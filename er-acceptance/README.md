@@ -30,9 +30,13 @@ without `BPF_OUT_DIR`, so it never breaks CI):
 ```
 npm install
 L1_RPC=https://api.devnet.solana.com \
-ER_RPC=https://devnet.magicblock.app \
+ER_RPC=https://devnet-as.magicblock.app \
   npm run acceptance
 ```
+
+`ER_RPC` is the endpoint of the validator the accounts are delegated to
+(`ER_VALIDATOR`, default `MAS1Dt9…` = `https://devnet-as.magicblock.app`), or the
+Magic Router `https://devnet-rpc.magicblock.app`.
 
 Requires a funded keypair at `~/.config/solana/id.json` that is the market authority,
 and the program deployed on the target cluster. This is the **Tier-2 gate** to run
@@ -50,12 +54,19 @@ test could (they don't delegate):
    are one-CPI delegate-safe, and the suite's "delegate book + ring + OUTBOX" stage
    now **PASSES on the live ER** (verified). `cap` up to 256 is the L1 deep-sweep. So
    one mechanism serves both environments (see `../FILL_OUTBOX_DESIGN.md` §8, §10).
-2. **Routing (open):** `delegate(…, null)` assigns the account to whichever validator
-   claims it; the ER match stage must transact against *that* validator (or the
-   MagicBlock router), else it returns `InvalidWritableAccount`. Pin the validator
-   identity in the delegate calls or route through the MagicBlock router for a
-   deterministic match-stage green. The delegate-CPI round-trip is validated
-   regardless.
+2. **Routing — RESOLVED (full round-trip now GREEN, 7/7 stages).** Three pieces:
+   (a) **pin the ER validator** (`MAS1Dt9qreoRMQ14YQuhg8UTZMMzDdKhmkZMECCzk57`, the
+   MagicBlock devnet ER) at delegate time — `null` leaves the owning validator
+   ambiguous; (b) transact the ER stages against THAT validator's endpoint
+   (`https://devnet-as.magicblock.app`, or the Magic Router
+   `https://devnet-rpc.magicblock.app`); (c) **delegate the `market` account too** —
+   `place_*` writes its OI, so it's a writable account; the ER rejects a mix of
+   delegated + undelegated writable accounts (`InvalidWritableAccount`), so the
+   FULL writable set (market + book + ring + outbox) must be delegated.
 
-**Validated on the live ER:** L1 setup of the full cap-105 pipeline, and the
-**delegate CPI for book + ring + outbox** against the real DLP on devnet.
+**Validated GREEN on the live MagicBlock devnet ER (`magicblock-core 0.13.2`):** the
+complete round-trip — delegate (market+book+ring+outbox) → match on the rollup
+(commitments + outbox written ON the ER) → `commit_*` → assert ring+outbox cursors
+survived → `commit_and_undelegate_*` → `process_undelegation` → assert all back under
+the program and `from_account_data`-valid. The entire off-log fill-outbox pipeline
+runs on the ER at cap 105.

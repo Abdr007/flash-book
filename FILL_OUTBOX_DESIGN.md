@@ -4,7 +4,9 @@
 to devnet (latest sig `4oUsqBYL…`). The cap is a **per-market knob**
 (`init_fill_commitment(cap)`, `cap ∈ [96,256]`): **`cap ≤ 105` = fully ER-capable**
 (book + ring + full outbox all one-CPI delegate-safe — the live `er-acceptance/`
-suite's "delegate book + ring + OUTBOX" stage PASSES on the MagicBlock devnet ER),
+suite runs the FULL round-trip GREEN 7/7 on the MagicBlock devnet ER: delegate
+[market+book+ring+outbox] → match on the rollup → commit → undelegate → L1
+consistent),
 **`cap` up to 256 = L1 deep-sweep** (256 smoke `23_outbox_smoke.mjs` PASS — 24,640 B
 outbox, omit-outbox hard-rejected, 8 fills off-log). The outbox reads the ring cap
 (single source of truth). IDL patched (5 ix + 4 events + error + field;
