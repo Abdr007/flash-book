@@ -3272,3 +3272,39 @@ async fn apply_flp_fill_settles_funding_before_resize() {
     let res_after = u128::from_le_bytes(hc_after.data[HC_RESIDUAL..HC_RESIDUAL + 16].try_into().unwrap());
     assert_eq!(res_after, 100_100, "residual moved by the funding paid (RISK-1)");
 }
+
+// Audit FLP-v3 — init_flp_per_market must be ADMIN-GATED. Making redemption
+// NAV-based makes `realized_pnl` (set by the per-market authority via
+// record_flp_fill_v3) load-bearing, so a permissionless creator could skim LPs by
+// faking PnL. init now requires the market authority and binds the recorder to the
+// market sequencer.
+use flash_book_pin::seeds::FLP_PER_MARKET_SEED;
+const IX_INIT_FLP_PER_MARKET: u8 = 53;
+#[tokio::test]
+async fn init_flp_per_market_rejects_non_market_authority() {
+    let pid = Pubkey::new_unique();
+    let attacker = Keypair::new();
+    let admin = Pubkey::new_unique(); // the real market authority
+    let market = Pubkey::new_unique();
+    let (exposure, _b) = Pubkey::find_program_address(&[FLP_PER_MARKET_SEED, &market.to_bytes()], &pid);
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut mkt = market_full(pid, 1_000, 1, 500, 0, 0);
+    put_key(&mut mkt.data, MKT_AUTHORITY, &admin); // authority = admin, NOT attacker
+    pt.add_account(market, mkt);
+    pt.add_account(exposure, Account { lamports: 1, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    pt.add_account(attacker.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true),       // authority (signer) = attacker
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(exposure, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8;32]), false), // system program
+        ],
+        data: vec![IX_INIT_FLP_PER_MARKET],
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &attacker], bh)).await;
+    let err = format!("{:?}", r.expect_err("a non-market-authority must not create the per-market FLP pool"));
+    assert!(err.contains("IllegalOwner"), "expected IllegalOwner, got: {err}");
+}

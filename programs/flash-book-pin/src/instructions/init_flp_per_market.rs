@@ -13,7 +13,7 @@
 use crate::cpi::create_pda_account;
 use crate::guard::{assert_market, assert_pda, assert_signer, assert_uninitialized};
 use crate::seeds::FLP_PER_MARKET_SEED;
-use crate::state::{FlpExposurePerMarketV3, FLP_PER_MARKET_V3_DISC};
+use crate::state::{FlpExposurePerMarketV3, Market, FLP_PER_MARKET_V3_DISC};
 use pinocchio::{
     account_info::AccountInfo,
     instruction::{Seed, Signer},
@@ -35,6 +35,19 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> P
 
     assert_signer(authority)?;
     assert_market(market, program_id)?;
+    // Admin-gate creation, and record the SEQUENCER as the per-market recorder.
+    // `record_flp_fill_v3` lets `e.authority` move `realized_pnl`, and that now
+    // drives NAV (the redemption price), so a permissionless creator could skim
+    // LPs by faking PnL. Require the market authority to create the pool, and bind
+    // the recorder to the market's sequencer (the trusted fill-settlement key).
+    let (mkt_authority, mkt_sequencer) = {
+        let d = market.try_borrow_data()?;
+        let m = unsafe { &*(d.as_ptr() as *const Market) };
+        (m.authority, m.sequencer)
+    };
+    if authority.key() != &mkt_authority {
+        return Err(ProgramError::IllegalOwner);
+    }
     assert_uninitialized(exposure)?;
     let bump = assert_pda(exposure, &[FLP_PER_MARKET_SEED, &market.key()[..]], program_id)?;
 
@@ -61,7 +74,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> P
             as *mut FlpExposurePerMarketV3);
         e.disc = FLP_PER_MARKET_V3_DISC;
         e.market = *market.key();
-        e.authority = *authority.key();
+        e.authority = mkt_sequencer; // the trusted recorder (record_flp_fill_v3)
         e.size_lots = 0;
         e.entry_price_ticks = 0;
         e.total_capital_quote_lots = 0;
