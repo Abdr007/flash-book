@@ -43,10 +43,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     }
     assert_owned_by(exposure, program_id)?;
     assert_disc(exposure, &FLP_PER_MARKET_V3_DISC)?;
-    let (exp_market, capital, total_shares) = {
+    let (exp_market, capital, nav, total_shares) = {
         let d = exposure.try_borrow_data()?;
         let e = unsafe { &*(d.as_ptr() as *const FlpExposurePerMarketV3) };
-        (e.market, e.total_capital_quote_lots, e.lp_shares_outstanding)
+        (e.market, e.total_capital_quote_lots, e.nav(), e.lp_shares_outstanding)
     };
     assert_pda(exposure, &[FLP_PER_MARKET_SEED, &exp_market[..]], program_id)?;
 
@@ -79,11 +79,18 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         }
     }
 
-    // ── price the redemption ────────────────────────────────────────────
-    let amount = FlpExposurePerMarketV3::amount_for_shares_v3(shares_to_burn, capital, total_shares)
+    // ── price the redemption on NAV (capital + realized_pnl) ────────────
+    let amount = FlpExposurePerMarketV3::amount_for_shares_v3(shares_to_burn, nav, total_shares)
         .ok_or(ProgramError::InvalidArgument)?;
     if amount == 0 {
         return Err(ProgramError::InvalidArgument);
+    }
+    // A realized GAIN makes NAV exceed the pool's actual token capital; cap the
+    // payout at capital so the shared vault is never over-paid (the gain stays as
+    // a buffer until it's realized into capital). A loss already discounts `amount`
+    // below the capital share, so this only bites on gains. Mirrors the singleton.
+    if amount > capital {
+        return Err(ProgramError::InsufficientFunds);
     }
 
     // ── effects (debit) before interaction (payout) ─────────────────────

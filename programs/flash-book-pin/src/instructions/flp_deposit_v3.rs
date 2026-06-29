@@ -47,10 +47,11 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     }
     assert_owned_by(exposure, program_id)?;
     assert_disc(exposure, &FLP_PER_MARKET_V3_DISC)?;
-    let (exp_market, capital, outstanding) = {
+    let (exp_market, nav, outstanding) = {
         let d = exposure.try_borrow_data()?;
         let e = unsafe { &*(d.as_ptr() as *const FlpExposurePerMarketV3) };
-        (e.market, e.total_capital_quote_lots, e.lp_shares_outstanding)
+        // Price on NAV (capital + realized_pnl), not capital alone.
+        (e.market, e.nav(), e.lp_shares_outstanding)
     };
     assert_pda(exposure, &[FLP_PER_MARKET_SEED, &exp_market[..]], program_id)?;
 
@@ -65,8 +66,9 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         }
     }
 
-    // ── price the deposit on PRE-deposit state, reject dust ─────────────
-    let shares = FlpExposurePerMarketV3::shares_for_deposit_v3(amount, outstanding, capital);
+    // ── price the deposit on PRE-deposit NAV, reject dust / insolvent pool ──
+    let shares = FlpExposurePerMarketV3::shares_for_deposit_v3(amount, outstanding, nav)
+        .ok_or(ProgramError::InvalidArgument)?; // None ⇒ shares>0 but NAV ≤ 0 (insolvent)
     if shares == 0 {
         return Err(ProgramError::InvalidArgument);
     }

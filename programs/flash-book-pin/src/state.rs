@@ -558,37 +558,41 @@ const _: () = assert!(core::mem::size_of::<FlpExposurePerMarketV3>() == 136);
 
 impl FlpExposurePerMarketV3 {
     /// Shares minted for a per-market FLP-v3 deposit of `amount`, priced on the
-    /// pool's pre-deposit `(lp_shares_outstanding, total_capital)`. Pure +
-    /// host-tested. First deposit (no shares or no capital) mints 1:1; otherwise
-    /// `amount · outstanding / capital`, clamped to `u64::MAX` (anchor parity —
-    /// the v3 pricing is capital-based, NOT NAV-based).
+    /// pool's pre-deposit **NAV = max(0, capital + realized_pnl)** — NOT capital
+    /// alone. First deposit (`outstanding == 0`) mints 1:1; a pool with shares but
+    /// non-positive NAV is insolvent and can't be priced → `None`. Otherwise
+    /// `amount · outstanding / nav`, clamped to `u64::MAX`. Mirrors the singleton
+    /// `FlpExposure::shares_for_deposit`. Pricing on NAV (not capital) is the fix
+    /// that makes LPs bear the pool's realized losses instead of redeeming at par
+    /// (which socialized the loss onto the shared vault). Pure + host-tested.
     #[inline]
-    pub fn shares_for_deposit_v3(amount: u64, outstanding: u64, capital: u64) -> u64 {
-        if outstanding == 0 || capital == 0 {
-            return amount;
+    pub fn shares_for_deposit_v3(amount: u64, outstanding: u64, nav: i128) -> Option<u64> {
+        if outstanding == 0 {
+            return Some(amount);
         }
-        let s = (amount as u128).saturating_mul(outstanding as u128) / (capital as u128).max(1);
-        if s > u64::MAX as u128 {
-            u64::MAX
-        } else {
-            s as u64
+        if nav <= 0 {
+            return None;
         }
+        let s = (amount as u128).checked_mul(outstanding as u128)? / (nav as u128);
+        if s > u64::MAX as u128 { None } else { Some(s as u64) }
     }
 
     /// Quote-lots returned for burning `shares_to_burn` of `total_shares`, priced
-    /// on `total_capital`. Pure + host-tested. `None` if `total_shares == 0`.
-    /// Clamped to `u64::MAX` (anchor v3 parity; capital-based, not NAV-based).
+    /// on **NAV** (not capital). `None` if `total_shares == 0`, `nav <= 0`, or on
+    /// overflow. A realized LOSS (nav < capital) discounts the payout (LPs bear
+    /// it); a realized GAIN (nav > capital) is capped at the pool's actual capital
+    /// by the caller's `amount > total_capital` guard, so the shared vault is never
+    /// over-paid. Mirrors the singleton `FlpExposure::amount_for_shares`.
     #[inline]
     pub fn amount_for_shares_v3(
         shares_to_burn: u64,
-        total_capital: u64,
+        nav: i128,
         total_shares: u64,
     ) -> Option<u64> {
-        if total_shares == 0 {
+        if total_shares == 0 || nav <= 0 {
             return None;
         }
-        let a = (shares_to_burn as u128).saturating_mul(total_capital as u128)
-            / (total_shares as u128);
+        let a = (shares_to_burn as u128).checked_mul(nav as u128)? / (total_shares as u128);
         Some(if a > u64::MAX as u128 { u64::MAX } else { a as u64 })
     }
 
@@ -881,21 +885,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flp_v3_shares_for_deposit_pricing_and_clamp() {
-        // First deposit (no shares OR no capital) → 1:1.
-        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(100, 0, 0), 100);
-        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(100, 0, 50), 100);
-        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(100, 5, 0), 100);
-        // Priced: amount · outstanding / capital.
-        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(100, 1_000, 500), 200);
-        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(50, 1_000, 1_000), 50);
-        // Floor rounding (dust below one share → 0).
-        assert_eq!(FlpExposurePerMarketV3::shares_for_deposit_v3(1, 1, 1_000), 0);
-        // Clamp at u64::MAX, no overflow.
-        assert_eq!(
-            FlpExposurePerMarketV3::shares_for_deposit_v3(u64::MAX, u64::MAX, 1),
-            u64::MAX
-        );
+    fn flp_v3_shares_for_deposit_nav_priced() {
+        type E = FlpExposurePerMarketV3;
+        // First deposit (no shares) → 1:1 regardless of NAV.
+        assert_eq!(E::shares_for_deposit_v3(100, 0, 0), Some(100));
+        assert_eq!(E::shares_for_deposit_v3(100, 0, 50), Some(100));
+        // Priced on NAV: amount · outstanding / nav.
+        assert_eq!(E::shares_for_deposit_v3(100, 1_000, 500), Some(200));
+        assert_eq!(E::shares_for_deposit_v3(50, 1_000, 1_000), Some(50));
+        // A realized GAIN (nav 2000 > capital) ⇒ FEWER shares per lot.
+        assert_eq!(E::shares_for_deposit_v3(500, 1_000, 2_000), Some(250));
+        // A realized LOSS (nav 250 < capital) ⇒ MORE shares per lot.
+        assert_eq!(E::shares_for_deposit_v3(500, 1_000, 250), Some(2_000));
+        // Insolvent pool (shares outstanding but NAV ≤ 0) can't be priced → None
+        // (the fix: previously capital==0 minted 1:1, socializing the loss).
+        assert_eq!(E::shares_for_deposit_v3(100, 5, 0), None);
+        assert_eq!(E::shares_for_deposit_v3(100, 5, -10), None);
+        // Floor rounding (dust below one share → Some(0)).
+        assert_eq!(E::shares_for_deposit_v3(1, 1, 1_000), Some(0));
+        // Overflow ⇒ None (checked, never a silent wrap).
+        assert_eq!(E::shares_for_deposit_v3(u64::MAX, u64::MAX, 1), None);
     }
 
     #[test]
@@ -914,20 +923,25 @@ mod tests {
     }
 
     #[test]
-    fn flp_v3_amount_for_shares_pricing_and_guards() {
-        // zero outstanding → None.
-        assert_eq!(FlpExposurePerMarketV3::amount_for_shares_v3(10, 100, 0), None);
-        // pro-rata: burn 200 of 1000 shares on 500 capital → 100.
-        assert_eq!(FlpExposurePerMarketV3::amount_for_shares_v3(200, 500, 1_000), Some(100));
-        // burn all → all capital.
-        assert_eq!(FlpExposurePerMarketV3::amount_for_shares_v3(1_000, 500, 1_000), Some(500));
+    fn flp_v3_amount_for_shares_nav_priced() {
+        type E = FlpExposurePerMarketV3;
+        // zero outstanding → None; non-positive NAV → None (insolvent).
+        assert_eq!(E::amount_for_shares_v3(10, 100, 0), None);
+        assert_eq!(E::amount_for_shares_v3(10, 0, 1_000), None);
+        assert_eq!(E::amount_for_shares_v3(10, -5, 1_000), None);
+        // pro-rata on NAV: burn 200 of 1000 at nav 500 → 100.
+        assert_eq!(E::amount_for_shares_v3(200, 500, 1_000), Some(100));
+        // burn all at nav 500 → 500.
+        assert_eq!(E::amount_for_shares_v3(1_000, 500, 1_000), Some(500));
+        // a realized GAIN lifts the payout: burn all at nav 2000 / 1000 → 2000
+        // (the caller caps this at the pool's actual token capital).
+        assert_eq!(E::amount_for_shares_v3(1_000, 2_000, 1_000), Some(2_000));
+        // a realized LOSS discounts it: burn all at nav 250 / 1000 → 250.
+        assert_eq!(E::amount_for_shares_v3(1_000, 250, 1_000), Some(250));
         // dust burn that rounds to 0.
-        assert_eq!(FlpExposurePerMarketV3::amount_for_shares_v3(1, 1, 1_000), Some(0));
+        assert_eq!(E::amount_for_shares_v3(1, 1, 1_000), Some(0));
         // clamp, no overflow.
-        assert_eq!(
-            FlpExposurePerMarketV3::amount_for_shares_v3(u64::MAX, u64::MAX, 1),
-            Some(u64::MAX)
-        );
+        assert_eq!(E::amount_for_shares_v3(u64::MAX, u64::MAX as i128, 1), Some(u64::MAX));
     }
 
     #[test]
@@ -978,14 +992,17 @@ mod tests {
             } else {
                 (1 + next() % 1_000_000_000, 1 + next() % 1_000_000_000)
             };
-            let shares = F::shares_for_deposit_v3(amount, outstanding, capital);
-            if shares == 0 {
-                continue; // on-chain rejects a zero-share (dust) deposit
-            }
+            // Round-trip invariant holds at any NAV; exercise realized_pnl == 0
+            // (nav == capital) so a virgin/healthy pool is the reference case.
+            let nav = capital as i128;
+            let shares = match F::shares_for_deposit_v3(amount, outstanding, nav) {
+                Some(s) if s > 0 => s,
+                _ => continue, // on-chain rejects a zero-share / insolvent deposit
+            };
             // Post-deposit pool, then redeem exactly the minted shares.
-            let cap2 = capital + amount;
+            let nav2 = (capital + amount) as i128;
             let out2 = outstanding + shares;
-            let back = F::amount_for_shares_v3(shares, cap2, out2).unwrap();
+            let back = F::amount_for_shares_v3(shares, nav2, out2).unwrap();
             assert!(
                 back <= amount,
                 "round-trip created value: amount={amount} outstanding={outstanding} \

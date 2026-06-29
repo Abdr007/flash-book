@@ -106,10 +106,18 @@ isolated-substitution sub-case; the cross sub-account substitution needs the mod
 
 ### Round-2 inherited / low-priority (documented, not changed)
 
-- **Per-market FLP v3** (`flp_withdraw_v3`/`record_flp_fill_v3`/`init_flp_per_market`):
-  redeems on capital, never books realized PnL; permissionless recorder authority.
-  Inherited from anchor AND inert — `realized_pnl` is read by no fund-moving ix
-  (subsystem is bookkeeping-only today). Keep gated until PnL settlement lands.
+- **Per-market FLP v3 NAV-includes-PnL — ✅ DONE (2026-06).** `shares_for_deposit_v3`
+  / `amount_for_shares_v3` now price on **NAV = max(0, capital + realized_pnl)** (not
+  capital alone), mirroring the singleton `FlpExposure` — so LPs bear the pool's
+  realized losses (redeem at a discount) instead of redeeming at par and socializing
+  the loss onto the shared vault; a realized gain is capped at the pool's actual token
+  capital (`amount > total_capital` guard) so the vault is never over-paid; an
+  insolvent pool (NAV ≤ 0 with shares) is unpriceable (`None`). Because this makes
+  `realized_pnl` load-bearing, `init_flp_per_market` is now **admin-gated** (requires
+  the market authority) and binds the recorder (`record_flp_fill_v3`) to the market
+  **sequencer** — closing the former permissionless-recorder NAV-manipulation vector.
+  Host-tested (loss-discount / gain-premium / insolvency / round-trip-creates-no-value)
+  + e2e (`init_flp_per_market_rejects_non_market_authority`).
 - **Vault v3 no flat-gate on deposit/perf-fee** (NAV ignores unrealized PnL) —
   deliberate v3 relaxation, faithfully ported (the non-v3 path gates).
 - **2^24 lifetime seq ceiling** — a market reverts resting inserts after ~16.7M
