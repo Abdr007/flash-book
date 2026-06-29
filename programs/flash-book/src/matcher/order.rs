@@ -54,9 +54,6 @@ impl OrderType {
             OrderType::Limit => 4,
         }
     }
-    pub fn is_taker(self) -> bool {
-        matches!(self, OrderType::Taker | OrderType::Liquidation | OrderType::Adl)
-    }
 }
 
 /// Self-trade prevention mode. Carried per-order; the mode of the NEWER
@@ -103,8 +100,3 @@ pub struct Order {
     pub stp_mode: StpMode,
 }
 
-impl Order {
-    pub fn fifo_key(&self) -> (u8, u64) {
-        (self.order_type.priority(), self.seq)
-    }
-}

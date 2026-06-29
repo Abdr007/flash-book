@@ -52,8 +52,6 @@ pub const DELEGATION_METADATA_TAG: &[u8] = b"delegation-metadata";
 
 /// Discriminator for the `Delegate` instruction.
 const DELEGATE_DISCRIMINATOR: u8 = 0;
-/// Discriminator for the `Undelegate` instruction.
-const UNDELEGATE_DISCRIMINATOR: u8 = 3;
 
 /// Borsh-serialized argument struct for the Delegate ix. Layout matches
 /// `magicblock-delegation-program-api::args::DelegateArgs` byte-for-byte.
@@ -62,9 +60,9 @@ pub struct DelegateArgs {
     /// Frequency at which the validator commits the account state if the
     /// owning program doesn't trigger commits explicitly.
     pub commit_frequency_ms: u32,
-    /// Seeds used to re-derive the PDA inside the delegation program.
-    /// Must INCLUDE the bump as the final element if the PDA is
-    /// canonical-bump.
+    /// Canonical PDA seeds (WITHOUT the bump) — the delegation program
+    /// re-derives via find_program_address. The bump travels only in the
+    /// invoke_signed signer seeds, not here (WAVE 24i).
     pub seeds: Vec<Vec<u8>>,
     /// Optional validator authority. Pass None for permissionless
     /// validator selection.
@@ -87,13 +85,6 @@ pub fn delegation_record_pda(delegated: &Pubkey) -> (Pubkey, u8) {
     )
 }
 
-/// Derive the delegation metadata PDA. Lives under the delegation program.
-pub fn delegation_metadata_pda(delegated: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[DELEGATION_METADATA_TAG, delegated.as_ref()],
-        &DELEGATION_PROGRAM_ID,
-    )
-}
 
 /// Account list for the Delegate CPI.
 pub struct DelegateAccounts<'info> {
@@ -126,15 +117,73 @@ pub fn cpi_delegate(
         crate::FlashBookError::Unauthorized
     );
 
-    let mut data = Vec::with_capacity(64);
-    data.push(DELEGATE_DISCRIMINATOR);
-    args.serialize(&mut data)?;
+    // WAVE 24i — the upgraded delegation program uses a "fast" delegate path
+    // (`split_at(8)` discriminator; byte[0]=Delegate=0) that requires the CALLER
+    // to stage the account into the buffer and hand its ownership to the
+    // delegation program BEFORE the CPI (the old DLP did this internally). This
+    // mirrors `ephemeral_rollups_sdk::cpi::delegate_account` byte-for-byte. The
+    // DLP copies the buffer back into the (zeroed) account during its CPI, so the
+    // round-trip is lossless. `delegated_seeds` MUST include the bump (for PDA
+    // signing); `args.seeds` MUST NOT (the DLP re-derives via find_program_address).
+    let data_len = accounts.delegated_account.data_len();
+    let (_, buffer_bump) =
+        delegate_buffer_pda(accounts.delegated_account.key, accounts.owner_program.key);
+    let buffer_bump_arr = [buffer_bump];
+    let buffer_signer: &[&[u8]] = &[
+        DELEGATE_BUFFER_TAG,
+        accounts.delegated_account.key.as_ref(),
+        &buffer_bump_arr,
+    ];
 
+    // 1. Create the buffer PDA (owned by owner_program), sized to the account.
+    create_pda(
+        &accounts.payer,
+        &accounts.delegate_buffer,
+        &accounts.system_program,
+        accounts.owner_program.key,
+        data_len,
+        &[buffer_signer],
+    )?;
+    // 2. Stage the account's data into the buffer.
+    {
+        let src = accounts.delegated_account.try_borrow_data()?;
+        let mut dst = accounts.delegate_buffer.try_borrow_mut_data()?;
+        require!(dst.len() == src.len(), crate::FlashBookError::OutOfRange);
+        dst.copy_from_slice(&src);
+    }
+    // 3. Zero the account (required before its ownership can be handed off).
+    {
+        let mut d = accounts.delegated_account.try_borrow_mut_data()?;
+        for b in d.iter_mut() {
+            *b = 0;
+        }
+    }
+    // 4. Hand ownership to the delegation program: a program may assign its own
+    //    zeroed account to System, then System re-assigns it under PDA signature.
+    if accounts.delegated_account.owner != accounts.system_program.key {
+        accounts
+            .delegated_account
+            .assign(accounts.system_program.key);
+    }
+    if accounts.delegated_account.owner != accounts.delegation_program.key {
+        invoke_signed(
+            &system_instruction::assign(accounts.delegated_account.key, &DELEGATION_PROGRAM_ID),
+            &[
+                accounts.delegated_account.clone(),
+                accounts.system_program.clone(),
+            ],
+            &[delegated_seeds],
+        )?;
+    }
+
+    // 5. CPI the delegate (8-byte discriminator + DelegateArgs).
+    let mut data = Vec::with_capacity(64);
+    data.extend_from_slice(&[DELEGATE_DISCRIMINATOR, 0, 0, 0, 0, 0, 0, 0]);
+    args.serialize(&mut data)?;
     let ix = Instruction {
         program_id: DELEGATION_PROGRAM_ID,
         accounts: vec![
             AccountMeta::new(*accounts.payer.key, true),
-            // delegated_account is signer-by-PDA via invoke_signed.
             AccountMeta::new(*accounts.delegated_account.key, true),
             AccountMeta::new_readonly(*accounts.owner_program.key, false),
             AccountMeta::new(*accounts.delegate_buffer.key, false),
@@ -144,74 +193,39 @@ pub fn cpi_delegate(
         ],
         data,
     };
-
     invoke_signed(
         &ix,
         &[
-            accounts.payer,
-            accounts.delegated_account,
-            accounts.owner_program,
-            accounts.delegate_buffer,
-            accounts.delegation_record,
-            accounts.delegation_metadata,
-            accounts.system_program,
-            accounts.delegation_program,
+            accounts.payer.clone(),
+            accounts.delegated_account.clone(),
+            accounts.owner_program.clone(),
+            accounts.delegate_buffer.clone(),
+            accounts.delegation_record.clone(),
+            accounts.delegation_metadata.clone(),
+            accounts.system_program.clone(),
+            accounts.delegation_program.clone(),
         ],
         &[delegated_seeds],
     )?;
+
+    // 6. Close the now-consumed buffer, refunding rent to the payer. Draining
+    //    its lamports to zero is sufficient — the runtime reclaims the account
+    //    at the end of the instruction.
+    let buf_lamports = accounts.delegate_buffer.lamports();
+    **accounts.payer.try_borrow_mut_lamports()? = accounts
+        .payer
+        .lamports()
+        .checked_add(buf_lamports)
+        .ok_or(crate::FlashBookError::ArithmeticOverflow)?;
+    **accounts.delegate_buffer.try_borrow_mut_lamports()? = 0;
     Ok(())
 }
 
-/// Account list for the Undelegate CPI.
-pub struct UndelegateAccounts<'info> {
-    pub payer: AccountInfo<'info>,
-    pub delegated_account: AccountInfo<'info>,
-    pub owner_program: AccountInfo<'info>,
-    pub buffer: AccountInfo<'info>,
-    pub system_program: AccountInfo<'info>,
-    pub delegation_program: AccountInfo<'info>,
-}
-
-/// Build + invoke the Undelegate instruction. Returns control of the PDA
-/// from the ER back to the owner program.
-pub fn cpi_undelegate(
-    accounts: UndelegateAccounts<'_>,
-    delegated_seeds: &[&[u8]],
-) -> Result<()> {
-    require_keys_eq!(
-        *accounts.delegation_program.key,
-        DELEGATION_PROGRAM_ID,
-        crate::FlashBookError::Unauthorized
-    );
-
-    let data = vec![UNDELEGATE_DISCRIMINATOR];
-
-    let ix = Instruction {
-        program_id: DELEGATION_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new(*accounts.payer.key, true),
-            AccountMeta::new(*accounts.delegated_account.key, true),
-            AccountMeta::new_readonly(*accounts.owner_program.key, false),
-            AccountMeta::new(*accounts.buffer.key, false),
-            AccountMeta::new_readonly(*accounts.system_program.key, false),
-        ],
-        data,
-    };
-
-    invoke_signed(
-        &ix,
-        &[
-            accounts.payer,
-            accounts.delegated_account,
-            accounts.owner_program,
-            accounts.buffer,
-            accounts.system_program,
-            accounts.delegation_program,
-        ],
-        &[delegated_seeds],
-    )?;
-    Ok(())
-}
+// NOTE: the program-initiated `cpi_undelegate` (+ its `UndelegateAccounts` /
+// `UNDELEGATE_DISCRIMINATOR`) was removed in the 2026-06 dead-code cleanup. Real
+// undelegation is driven by the MagicBlock delegation program calling back into
+// `process_undelegation` → `process_external_undelegate` (the EXTERNAL_UNDELEGATE
+// path below); the program never issues an Undelegate CPI itself.
 
 /// Pure decision for the permissionless force-undelegate timeout gate
 /// (`force_undelegate_market_book`). Returns true iff the ER has been silent for

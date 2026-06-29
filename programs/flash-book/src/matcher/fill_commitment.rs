@@ -29,16 +29,23 @@ pub type FillCommit = [u8; 32];
 pub const FILL_COMMIT_SEED: &[u8] = b"fill_commit";
 
 /// Default ring capacity (pending unsettled fills a market may hold before the
-/// matcher applies backpressure). 64 covers a deep taker sweep; settlement drains
-/// it. Sized into the account at init; the account is realloc-expandable later.
-pub const FILL_RING_CAP: u32 = 64;
+/// matcher applies backpressure). Sized into the account at init; the account is
+/// realloc-expandable later.
+///
+/// AUDIT M-2 fix: this MUST be >= `MAX_BATCH_ORDERS_PER_SIDE_V2` (256, lib.rs) —
+/// `place_taker_order_v2` can cross up to that many levels and pushes one
+/// commitment per fill in a single tx before any settlement drains the ring. At
+/// 64 a legitimate taker sweep of 65–256 levels on an ARMED market unconditionally
+/// reverted (`FillRingFull`). 256 covers the full matcher batch (account =
+/// 64 + 256*32 = 8256 bytes, well within limits).
+pub const FILL_RING_CAP: u32 = 256;
 
 /// Canonical fill-commitment preimage length (see `fill_preimage`).
 pub const FILL_PREIMAGE_LEN: usize = 136;
 
 /// Domain-separation tag so a fill commitment can never collide with any other
 /// keccak preimage the program hashes.
-pub const FILL_COMMIT_DOMAIN: [u8; 8] = *b"FBfillC1";
+pub const FILL_COMMIT_DOMAIN: [u8; 8] = *b"FBfillC2";
 
 /// Pure ring-state-machine errors. The handler maps these onto `FlashBookError`
 /// (`FillRingFull`/`FillRingEmpty`/`FillNotCommitted`/`FillRingCorrupt`).
@@ -71,7 +78,18 @@ pub enum FillRingError {
 /// | 107 |   8 | size_lots         |
 /// | 115 |   8 | price_ticks       |
 /// | 123 |   8 | produced_index    |
-/// | 131 |   5 | zero pad          |
+/// | 131 |   1 | taker_was_jit     |  (AUDIT §3.2: now bound — was zero pad)
+/// | 132 |   4 | zero pad          |
+///
+/// §3.2 fill-authenticity: `taker_was_jit` drives a real value transfer at
+/// settlement (`market.params.jit_bonus_rebate_bps` added to the maker rebate),
+/// so it is part of the fill's economic content and MUST be committed. Before
+/// this it was an unbound `apply_fill` arg, letting a compromised sequencer flip
+/// it on a fully-committed fill to skim/deny the JIT bonus while the keccak still
+/// matched. The matcher commits the taker order's actual JIT flag; settlement
+/// must present the same value or the commitment fails (`FillNotCommitted`). The
+/// domain tag is bumped (C1→C2) so any pre-upgrade in-flight commitment is
+/// invalidated rather than silently reinterpreted.
 #[allow(clippy::too_many_arguments)]
 pub fn fill_preimage(
     market: &[u8; 32],
@@ -83,6 +101,7 @@ pub fn fill_preimage(
     taker_sub_index: u8,
     maker_sub_index: u8,
     produced_index: u64,
+    taker_was_jit: bool,
 ) -> [u8; FILL_PREIMAGE_LEN] {
     let mut p = [0u8; FILL_PREIMAGE_LEN];
     p[0..8].copy_from_slice(&FILL_COMMIT_DOMAIN);
@@ -95,7 +114,8 @@ pub fn fill_preimage(
     p[107..115].copy_from_slice(&size_lots.to_le_bytes());
     p[115..123].copy_from_slice(&price_ticks.to_le_bytes());
     p[123..131].copy_from_slice(&produced_index.to_le_bytes());
-    // bytes 131..136 stay zero
+    p[131] = taker_was_jit as u8;
+    // bytes 132..136 stay zero
     p
 }
 
@@ -243,6 +263,16 @@ pub fn buffer_next_index(data: &[u8]) -> u64 {
 /// Current settled cursor = the index the NEXT settled fill must carry.
 pub fn buffer_settle_index(data: &[u8]) -> u64 {
     rd_u64(data, OFF_SETTLED)
+}
+
+/// §3.2 P3 — overwrite the stored capacity AFTER the account has been resized to
+/// `fill_commit_account_len(new_cap)`. The caller MUST have validated the ring is
+/// EMPTY (`buffer_next_index == buffer_settle_index`): growing while entries are
+/// pending would change every entry's `% cap` slot mapping and misread them. The
+/// produced/settled cursors are absolute counters, so once drained they keep
+/// advancing correctly under the new cap.
+pub fn buffer_set_cap(data: &mut [u8], new_cap: u32) {
+    data[OFF_CAP..OFF_CAP + 4].copy_from_slice(&new_cap.to_le_bytes());
 }
 
 fn slot_view(data: &mut [u8], cap: usize) -> &mut [FillCommit] {
@@ -482,6 +512,50 @@ mod tests {
         let mut a = [0u8; 32];
         a[0] = n;
         a
+    }
+
+    // §3.2 regression: the commitment preimage MUST be sensitive to
+    // `taker_was_jit`. Two otherwise-identical fills differing only in that flag
+    // must produce different preimages (and thus different keccak commitments), so
+    // a sequencer that flips the flag at settlement fails the ring's recompute
+    // (`NotCommitted`). Pre-fix, byte 131 was zero pad and the flag was unbound.
+    #[test]
+    fn preimage_binds_taker_was_jit() {
+        let m = [1u8; 32];
+        let t = [2u8; 32];
+        let k = [3u8; 32];
+        let base = |jit| fill_preimage(&m, &t, &k, 0, 10, 94_000, 1, 2, 7, jit);
+        let p_false = base(false);
+        let p_true = base(true);
+        assert_ne!(p_false, p_true, "taker_was_jit must change the preimage");
+        // Exactly one byte (131) differs.
+        assert_eq!(p_false[131], 0);
+        assert_eq!(p_true[131], 1);
+        let diff = p_false.iter().zip(p_true.iter()).filter(|(a, b)| a != b).count();
+        assert_eq!(diff, 1, "only the taker_was_jit byte should differ");
+        // Domain bumped so pre-upgrade commitments can't be reinterpreted.
+        assert_eq!(&p_false[0..8], b"FBfillC2");
+    }
+
+    // §3.2 P3: growing the ring resizes the account, stamps the new cap, and the
+    // header must re-validate consistently at the larger size. produced/settled
+    // (absolute cursors) are untouched, so a drained ring stays drained.
+    #[test]
+    fn buffer_grow_updates_cap_and_revalidates() {
+        let market = [9u8; 32];
+        let cap = 4u32;
+        let mut data = vec![0u8; fill_commit_account_len(cap as usize)];
+        buffer_init(&mut data, &market, cap, 1).unwrap();
+        assert_eq!(buffer_check(&data, &market).unwrap(), 4);
+        assert_eq!(buffer_next_index(&data), buffer_settle_index(&data), "fresh ring is drained");
+        // simulate the handler's realloc-to-larger then cap stamp
+        let new_cap = 10u32;
+        data.resize(fill_commit_account_len(new_cap as usize), 0);
+        // before the cap stamp the header is inconsistent (len != cap*32+hdr)
+        assert!(buffer_check(&data, &market).is_err());
+        buffer_set_cap(&mut data, new_cap);
+        assert_eq!(buffer_check(&data, &market).unwrap(), 10, "re-validates at the new cap");
+        assert_eq!(buffer_next_index(&data), buffer_settle_index(&data), "still drained");
     }
 
     #[test]

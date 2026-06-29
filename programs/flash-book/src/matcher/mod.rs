@@ -5,6 +5,7 @@ pub mod arg;
 pub mod borrow_fee;
 pub mod envelope;
 pub mod fill_commitment;
+pub mod fill_outbox;
 pub mod flp_quoter;
 pub mod funding;
 pub mod funding_velocity;

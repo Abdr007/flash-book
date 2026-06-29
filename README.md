@@ -17,7 +17,7 @@ Everything below is reproducible from this repo with the commands shown.
 | Check | Command | Result |
 |---|---|---|
 | Build | `cargo build-sbf --manifest-path programs/flash-book/Cargo.toml` | clean |
-| Tests | `cargo test -p flash-book` | 569 pass |
+| Tests | `BPF_OUT_DIR=$PWD/target/deploy cargo test -p flash-book` | 675 pass |
 | Proofs | `cargo kani --features no-entrypoint` | 5 verified |
 | CU bench | `BPF_OUT_DIR=$PWD/target/deploy cargo test -p flash-book --test integration cu_benchmark -- --ignored --nocapture` | `apply_fill` open ≈ 42k CU |
 

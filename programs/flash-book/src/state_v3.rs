@@ -323,7 +323,12 @@ pub struct MarketOracleConfigAccount {
     /// 0 = legacy trusted `update_oracle` (devnet only). 1 = Pyth pull.
     /// Future: 2 = Switchboard, 3 = TWAP, etc.
     pub source: u8,
-    pub _pad0: [u8; 6],
+    pub _pad0: [u8; 2],
+    /// Lazer feed id, bound at config init when `source == SOURCE_LAZER`.
+    /// AUDIT CR-2 fix: carved from the former `_pad0: [u8; 6]` (now `[u8; 2]`).
+    /// Borsh field order + total size are preserved, so pre-existing configs
+    /// (which had 6 zero pad bytes here) deserialize this as 0.
+    pub lazer_feed_id: u32,
     pub market: Pubkey,
     /// The 32-byte Pyth feed identifier (e.g. SOL/USD on mainnet is
     /// `0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d`).
@@ -341,6 +346,7 @@ impl MarketOracleConfigAccount {
     pub const SEED: &'static [u8] = b"oracle_config";
     pub const SOURCE_TRUSTED: u8 = 0;
     pub const SOURCE_PYTH: u8 = 1;
+    pub const SOURCE_LAZER: u8 = 2;
     pub fn space() -> usize {
         // 8 disc
         //   + 1 bump + 1 source + 6 pad
@@ -349,6 +355,71 @@ impl MarketOracleConfigAccount {
         //   + 1 tick_decimals + 7 pad
         // = 8 + 88 = 96. Round up to 128.
         8 + 120
+    }
+}
+
+#[cfg(test)]
+mod oracle_config_layout_tests {
+    use super::*;
+    use anchor_lang::{AnchorDeserialize, AnchorSerialize};
+
+    // AUDIT CR-2 regression: `lazer_feed_id: u32` was carved out of the former
+    // `_pad0: [u8; 6]` (now `[u8; 2]`). Prove that an account serialized in the
+    // OLD layout (6 zero pad bytes after `source`) still deserializes correctly
+    // under the NEW struct, reading `lazer_feed_id == 0` and leaving every other
+    // field byte-identical. This is what guarantees existing on-chain configs
+    // are not corrupted by the field addition.
+    #[test]
+    fn old_layout_deserializes_with_zero_lazer_feed_id() {
+        let market = Pubkey::new_unique();
+        let feed = [7u8; 32];
+
+        // OLD field order: bump,source,_pad0[6],market,pyth_feed,stale,conf,tick,_pad1[7]
+        let mut old = Vec::new();
+        old.push(9u8); // bump
+        old.push(MarketOracleConfigAccount::SOURCE_PYTH); // source
+        old.extend_from_slice(&[0u8; 6]); // _pad0 (old) — real accounts have zeros here
+        old.extend_from_slice(market.as_ref());
+        old.extend_from_slice(&feed);
+        old.extend_from_slice(&123u32.to_le_bytes()); // max_staleness_seconds
+        old.extend_from_slice(&45u32.to_le_bytes()); // max_confidence_bps
+        old.push(3i8 as u8); // tick_decimals
+        old.extend_from_slice(&[0u8; 7]); // _pad1
+
+        let cfg = MarketOracleConfigAccount::try_from_slice(&old).unwrap();
+        assert_eq!(cfg.bump, 9);
+        assert_eq!(cfg.source, MarketOracleConfigAccount::SOURCE_PYTH);
+        assert_eq!(cfg.lazer_feed_id, 0, "old configs must read lazer_feed_id as 0");
+        assert_eq!(cfg.market, market);
+        assert_eq!(cfg.pyth_price_feed_id, feed);
+        assert_eq!(cfg.max_staleness_seconds, 123);
+        assert_eq!(cfg.max_confidence_bps, 45);
+        assert_eq!(cfg.tick_decimals, 3);
+        // Serialized size must be unchanged so the account still fits `space()`.
+        assert_eq!(old.len(), 88);
+    }
+
+    // A LAZER-bound config round-trips and exposes the new field.
+    #[test]
+    fn lazer_feed_id_round_trips() {
+        let cfg = MarketOracleConfigAccount {
+            bump: 1,
+            source: MarketOracleConfigAccount::SOURCE_LAZER,
+            _pad0: [0; 2],
+            lazer_feed_id: 0xDEAD_BEEF,
+            market: Pubkey::new_unique(),
+            pyth_price_feed_id: [0; 32],
+            max_staleness_seconds: 10,
+            max_confidence_bps: 50,
+            tick_decimals: -8,
+            _pad1: [0; 7],
+        };
+        let mut bytes = Vec::new();
+        AnchorSerialize::serialize(&cfg, &mut bytes).unwrap();
+        let back = MarketOracleConfigAccount::try_from_slice(&bytes).unwrap();
+        assert_eq!(back.lazer_feed_id, 0xDEAD_BEEF);
+        assert_eq!(back.source, MarketOracleConfigAccount::SOURCE_LAZER);
+        assert_eq!(bytes.len(), 88, "serialized size must stay 88 (fits space())");
     }
 }
 

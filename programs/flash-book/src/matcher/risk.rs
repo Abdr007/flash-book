@@ -388,7 +388,11 @@ fn shocked_price(price: Ticks, shock_bps: i32) -> Result<Ticks> {
     if r <= 0 {
         return Ok(Ticks(0));
     }
-    Ok(Ticks(r as u64))
+    // AUDIT (re-audit Arith L-1): reject a stressed price that overflows u64
+    // rather than silently truncating via `as u64`. Only reachable with a
+    // misconfigured (governance) shock, but matches the clamp/reject discipline
+    // used for every other narrowing cast in this module.
+    Ok(Ticks(u64::try_from(r).ok().or_overflow()?))
 }
 
 fn lookup_market<'a>(

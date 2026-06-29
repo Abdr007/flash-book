@@ -493,7 +493,45 @@ async fn setup_market(
         .await
         .unwrap();
 
+    disarm_fill_commitment(ctx, market).await;
     (protocol, market, order_buffer, base_mint, quote_mint)
+}
+
+/// §3.2 P2: production markets are fill-commitment-MANDATORY by default
+/// (`initialize_market_inner` sets `fill_commitment_required = true`), so a
+/// compromised sequencer can never settle a fabricated fill on an un-armed
+/// market. The authenticity path has dedicated coverage
+/// (`fill_commitment_honest_path_taker_cross_then_apply_fill`,
+/// `apply_fill_rejects_fabricated_fill_when_armed`,
+/// `armed_apply_fill_rejects_when_commitment_account_omitted`). Every OTHER
+/// settlement test exercises orthogonal logic (PnL/OI/margin/liquidation/funding)
+/// and would otherwise have to seed a matching commitment for each setup fill;
+/// instead they run against the (valid) un-armed config by flipping the flag back
+/// off here. `fill_commitment_required` is a real per-market field, so this is a
+/// legitimate test configuration, not a runtime bypass.
+async fn disarm_fill_commitment(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    market: Pubkey,
+) {
+    use solana_sdk::account::Account as SolAccount;
+    let acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
+    let mut m =
+        flash_book::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    m.fill_commitment_required = false;
+    let mut data = Vec::new();
+    m.try_serialize(&mut data).unwrap();
+    data.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &market,
+        &SolAccount {
+            lamports: acc.lamports,
+            data,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
 }
 
 /// Initialize an additional market on an already-initialized protocol.
@@ -551,6 +589,7 @@ async fn setup_additional_market(
         .await
         .unwrap();
 
+    disarm_fill_commitment(ctx, market).await; // §3.2 P2 — see helper doc
     (market, order_buffer, base_mint, quote_mint)
 }
 
@@ -3438,7 +3477,7 @@ async fn apply_fill_rejects_fabricated_fill_when_armed() {
         market_pda.as_ref(),
     ]);
     let init_ix = build_ix(
-        flash_book::instruction::InitFillCommitment {},
+        flash_book::instruction::InitFillCommitment { cap: 256 },
         vec![
             AccountMeta::new(payer.pubkey(), true), // authority (== market.authority)
             AccountMeta::new(market_pda, false),
@@ -3544,7 +3583,7 @@ async fn armed_apply_fill_rejects_when_commitment_account_omitted() {
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                flash_book::instruction::InitFillCommitment {},
+                flash_book::instruction::InitFillCommitment { cap: 256 },
                 vec![
                     AccountMeta::new(payer.pubkey(), true),
                     AccountMeta::new(market_pda, false),
@@ -3681,7 +3720,7 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
     send(
         &mut ctx,
         build_ix(
-            flash_book::instruction::InitFillCommitment {},
+            flash_book::instruction::InitFillCommitment { cap: 256 },
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new(market_pda, false),
@@ -3990,6 +4029,563 @@ async fn cu_of(
         .compute_units_consumed
 }
 
+/// exactly what a production client does for a deep multi-level sweep (the default
+/// 32KB SBF heap can't hold the fills Vec + FillBatchEvent past ~100 levels). The
+/// ix is hand-built so we don't need the (3.x-relocated) compute-budget crate.
+/// DEEP-BOOK matching CU under the PRODUCTION (armed, §3.2-mandatory) path — the
+/// reproducible number a fair reviewer asks for. Real SBF CU (loads the `.so`).
+/// Builds a 511-level book and measures (1) place CU vs insertion depth (O(log n)
+/// insert) and (2) taker-sweep CU vs levels crossed, incl. the per-fill keccak
+/// commitment. Run: `BPF_OUT_DIR=$PWD/target/deploy cargo test --test integration deep_book_matching_cu_curve -- --nocapture`.
+#[tokio::test]
+async fn deep_book_matching_cu_curve() {
+    if std::env::var("BPF_OUT_DIR").is_err() && std::env::var("SBF_OUT_DIR").is_err() {
+        eprintln!("skipping deep_book_matching_cu_curve: set BPF_OUT_DIR=$PWD/target/deploy");
+        return;
+    }
+    let mut pt = make_program_test_sbf();
+    pt.set_compute_max_units(1_400_000);
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone(); // market authority = maker
+    let (_protocol, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market.as_ref()]);
+    let (fc, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market.as_ref()]);
+
+    // Init the order book (100-node default).
+    cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new(book, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await;
+
+    // Expand the 100-node default book to ~620 nodes to hold 511 bids. Distinct
+    // `additional_nodes` per call so the txns don't share a signature (same
+    // blockhash within a program-test slot ⇒ AlreadyProcessed on a dup). Each
+    // ≤ 106 (MAX_PERMITTED_DATA_INCREASE / NODE_TOTAL_BYTES).
+    for add in [106u32, 105, 104, 103, 102] {
+        cu_of(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::ExpandMarketBook { additional_nodes: add },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new(book, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            ),
+            &payer.pubkey(),
+            &[&payer],
+        )
+        .await;
+    }
+    // Arm the ring (mandatory) and grow it to hold up to 511 pending fills.
+    cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitFillCommitment { cap: 256 },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(fc, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await;
+    cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::GrowFillCommitment { additional_slots: 256 },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new(fc, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await;
+
+    // (1) Rest 511 bids at distinct descending ticks (no asks ⇒ none cross).
+    const DEPTH: usize = 511;
+    let mut place_cu = Vec::with_capacity(DEPTH);
+    for i in 0..DEPTH {
+        let tick = 100_000 - (i as u64); // in oracle band [99_000,101_000]
+        let cu = cu_of(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::PlaceLimitOrderV2 {
+                    side: 0,
+                    size_lots: 1,
+                    limit_ticks: tick,
+                    flags: 0,
+                    expires_at_slot: 0,
+                    sub_index: (i % 256) as u8,
+                },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(book, false),
+                ],
+            ),
+            &payer.pubkey(),
+            &[&payer],
+        )
+        .await;
+        place_cu.push(cu);
+    }
+
+    // (2) A SEPARATE taker (no self-trade) sweeps doubling depths {1..256}.
+    let taker = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(&payer.pubkey(), &taker.pubkey(), 100_000_000)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // The taker requests a 256 KiB heap frame (standard for a deep sweep — the
+    // default 32 KiB SBF heap can't hold the fills Vec + FillBatchEvent past
+    // ~100 levels). With the request, the full {1..256} curve to the matcher's
+    // FINDING: a single taker's `fills` Vec + the FillBatchEvent clone exhaust the
+    // The matcher's batch cap (MAX_BATCH_ORDERS_PER_SIDE_V2) is sized so its three
+    // simultaneous heap buffers (pre-sized `matches` + `fills` + serialized
+    // FillBatchEvent) fit the default 32 KiB SBF heap — so a single tx crosses up
+    // to the cap WITHOUT OOM-panicking and WITHOUT needing a heap-frame request.
+    // Deeper requests truncate gracefully (verified below).
+    let cap = flash_book::MAX_BATCH_ORDERS_PER_SIDE_V2 as u64;
+    let mut sweep = Vec::new();
+    for n in [1u64, 2, 4, 8, 16, 32, 64, cap] {
+        let cu = cu_of(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::PlaceTakerOrderV2 {
+                    side: 1,
+                    size_lots: n,
+                    limit_ticks: 99_000,
+                    flags: 0,
+                    expires_at_slot: 0,
+                    sub_index: 0,
+                },
+                vec![
+                    AccountMeta::new(taker.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(book, false),
+                    AccountMeta::new(fc, false), // fill-commitment ring (remaining account)
+                ],
+            ),
+            &taker.pubkey(),
+            &[&taker],
+        )
+        .await;
+        sweep.push((n, cu));
+    }
+
+    let mn = *place_cu.iter().min().unwrap();
+    let mx = *place_cu.iter().max().unwrap();
+    println!("\n========== DEEP-BOOK MATCHING CU (real SBF, armed/production) ==========");
+    println!("book depth: {DEPTH} resting bids (book expanded to 630 nodes; ring grown to 512)");
+    println!("\nplace_limit_order_v2 — CU vs insertion depth:");
+    for &d in &[0usize, 1, 31, 63, 127, 255, 383, 510] {
+        println!("  depth {:>3}: {:>6} CU", d, place_cu[d]);
+    }
+    println!(
+        "  -> {DEPTH} inserts: min {mn}, max {mx}, spread {} CU  (flat => O(log n) hypertree)",
+        mx - mn
+    );
+    println!("\nplace_taker_order_v2 — CU vs levels crossed (armed: +1 keccak commitment / fill):");
+    for &(n, c) in &sweep {
+        println!("  cross {:>3} levels: {:>7} CU   ({:>3} CU/level)", n, c, c / n);
+    }
+    let (n1, c1) = sweep[0];
+    let (nz, cz) = *sweep.last().unwrap();
+    let marginal = (cz - c1) / (nz - n1);
+    println!("  -> marginal ~= {marginal} CU per additional level crossed (incl. commitment)");
+
+    // GRACEFUL TRUNCATION: a request to cross 4× the cap must SUCCEED (not
+    // OOM-panic), crossing exactly `cap` levels and resting/dropping the rest.
+    let trunc = cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceTakerOrderV2 {
+                side: 1,
+                size_lots: cap * 4,
+                limit_ticks: 99_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(book, false),
+                AccountMeta::new(fc, false),
+            ],
+        ),
+        &taker.pubkey(),
+        &[&taker],
+    )
+    .await;
+    println!("  -> a {}-level request truncates GRACEFULLY to the {cap} cap ({trunc} CU, no OOM-panic)", cap * 4);
+
+    println!("\nReference (real mainnet competitor txns): Phoenix place/cancel batch 93k-182k;");
+    println!("Drift place-and-make budget 400k-800k. A {nz}-level single-tx sweep here = {cz} CU,");
+    println!("in the DEFAULT 32KB heap — no heap-frame request needed (the matcher's 3 heap buffers");
+    println!("are pre-sized to fit). Deeper crossings truncate gracefully instead of OOM-panicking.\n");
+
+    assert!(cz < 200_000, "cap-level armed sweep must fit one tx comfortably");
+    assert!(mx - mn < 8_000, "place CU must stay flat across 511 levels (O(log n))");
+}
+
+/// FILL-OUTBOX end-to-end (FILL_OUTBOX_DESIGN.md): a market that arms a fill-outbox
+/// and raises its batch cap to 256 crosses **256 levels in a single tx, in the
+/// DEFAULT 32 KiB heap** (no heap-frame request) — the fills are delivered through
+/// the on-chain outbox ACCOUNT, not the 10 KB-bounded program log. Asserts:
+///   (1) the 256-level sweep SUCCEEDS (no OOM, no log truncation),
+///   (2) every fill is reconstructable from the outbox account (cursor + slot data),
+///   (3) a cap-256 market HARD-REJECTS a taker that omits the outbox (FillOutboxRequired),
+///   proving the cap can't be raised past the log-safe point without off-log delivery.
+/// Run: `BPF_OUT_DIR=$PWD/target/deploy cargo test --test integration fill_outbox_deep_sweep_256 -- --nocapture`
+#[tokio::test]
+async fn fill_outbox_deep_sweep_256() {
+    use flash_book::matcher::fill_outbox as fo;
+    if std::env::var("BPF_OUT_DIR").is_err() && std::env::var("SBF_OUT_DIR").is_err() {
+        eprintln!("skipping fill_outbox_deep_sweep_256: set BPF_OUT_DIR=$PWD/target/deploy");
+        return;
+    }
+    let mut pt = make_program_test_sbf();
+    pt.set_compute_max_units(1_400_000);
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone(); // market authority = maker
+    let (_protocol, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market.as_ref()]);
+    let (fc, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market.as_ref()]);
+    let (fob, _) = pda(&[fo::FILL_OUTBOX_SEED, market.as_ref()]);
+
+    // Book + expand to hold ~300 resting bids.
+    cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new(book, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await;
+    for add in [106u32, 105, 104] {
+        cu_of(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::ExpandMarketBook { additional_nodes: add },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new(book, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            ),
+            &payer.pubkey(),
+            &[&payer],
+        )
+        .await;
+    }
+    // Arm the ring (cap 256) — outbox is meaningless without it.
+    cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitFillCommitment { cap: 256 },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(fc, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await;
+    // Arm the OUTBOX (created at base 105 slots) and raise the batch cap to 256.
+    cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitFillOutbox {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(fob, false),
+                AccountMeta::new_readonly(fc, false), // ring — cap source of truth
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await;
+    // Grow the outbox to the ring cap (256) — a program CPI can grow an account by
+    // ≤10,240 B/ix, so 105 -> 211 -> 256 in two `grow_fill_outbox` calls (same
+    // create-small-then-grow pattern as the market book). Matcher matching at 256
+    // stays INERT (fail-closed) until the outbox covers the ring.
+    for add in [106u32, 45] {
+        cu_of(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::GrowFillOutbox { additional_slots: add },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new(fob, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            ),
+            &payer.pubkey(),
+            &[&payer],
+        )
+        .await;
+    }
+    // Now the outbox is a "Large" (≤64 KiB) account at the full 256 cap.
+    let fob_acct = ctx.banks_client.get_account(fob).await.unwrap().unwrap();
+    assert_eq!(
+        fob_acct.data.len(),
+        fo::fill_outbox_account_len(256),
+        "outbox grown to 256 slots = 24,640 bytes"
+    );
+
+    // Rest 260 bids at distinct descending ticks (all in oracle band [99_000,101_000]).
+    const DEPTH: usize = 260;
+    for i in 0..DEPTH {
+        let tick = 100_000 - (i as u64);
+        cu_of(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::PlaceLimitOrderV2 {
+                    side: 0,
+                    size_lots: 1,
+                    limit_ticks: tick,
+                    flags: 0,
+                    expires_at_slot: 0,
+                    sub_index: 0,
+                },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(book, false),
+                ],
+            ),
+            &payer.pubkey(),
+            &[&payer],
+        )
+        .await;
+    }
+
+    // A separate taker (no self-trade).
+    let taker = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(&payer.pubkey(), &taker.pubkey(), 100_000_000)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // (A) ERROR PATH: a cap-256 market MUST reject a taker that omits the outbox —
+    // else the >96 fills would truncate in the 10 KB log and wedge settlement.
+    let bad = build_ix(
+        flash_book::instruction::PlaceTakerOrderV2 {
+            side: 1,
+            size_lots: 5,
+            limit_ticks: 99_000,
+            flags: 0,
+            expires_at_slot: 0,
+            sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(book, false),
+            AccountMeta::new(fc, false), // ring present, but NO outbox
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let r = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[bad],
+            Some(&taker.pubkey()),
+            &[&taker],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{r:?}");
+    assert!(
+        dbg.contains("Custom(8307)"),
+        "cap-256 market must reject a taker omitting the outbox (FillOutboxRequired=2307→8307), got: {dbg}"
+    );
+
+    // (B) HAPPY PATH: cross 256 levels in ONE tx, DEFAULT heap (cu_of requests no
+    // heap frame). Pass BOTH the ring and the outbox in remaining_accounts.
+    let sweep_cu = cu_of(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceTakerOrderV2 {
+                side: 1,
+                size_lots: 256,
+                limit_ticks: 99_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(book, false),
+                AccountMeta::new(fc, false),  // ring
+                AccountMeta::new(fob, false), // outbox
+            ],
+        ),
+        &taker.pubkey(),
+        &[&taker],
+    )
+    .await;
+
+    // (C) Reconstruct every fill from the OUTBOX ACCOUNT (the authoritative feed —
+    // no logs involved).
+    let data = ctx.banks_client.get_account(fob).await.unwrap().unwrap().data;
+    let cap = fo::outbox_check(&data, &market.to_bytes()).expect("outbox valid");
+    assert_eq!(cap, 256, "outbox cap == ring cap (lockstep)");
+    let produced = fo::outbox_produced(&data);
+    assert_eq!(produced, 256, "all 256 fills recorded in the outbox cursor");
+
+    // First fill = best (highest) bid the SELL taker crossed = tick 100_000.
+    let s0 = fo::outbox_read_slot(&data, cap, 0).unwrap();
+    assert_eq!(s0.taker, taker.pubkey().to_bytes(), "slot0 taker");
+    assert_eq!(s0.maker, payer.pubkey().to_bytes(), "slot0 maker");
+    assert_eq!(s0.size_lots, 1, "slot0 size");
+    assert_eq!(s0.price_ticks, 100_000, "slot0 = best bid crossed");
+    assert_eq!(s0.taker_side, 1, "slot0 taker_side = sell");
+    // Last fill = 256th best bid = tick 100_000 - 255.
+    let s255 = fo::outbox_read_slot(&data, cap, 255).unwrap();
+    assert_eq!(s255.price_ticks, 100_000 - 255, "slot255 = 256th best bid");
+    assert_eq!(s255.taker, taker.pubkey().to_bytes(), "slot255 taker");
+
+    println!("\n========== FILL-OUTBOX DEEP SWEEP (real SBF) ==========");
+    println!("256-level single-tx sweep via on-chain outbox = {sweep_cu} CU, DEFAULT 32 KiB heap");
+    println!("(no heap-frame request, no program-log fill data — all 256 fills read from the");
+    println!("outbox account: produced cursor = {produced}, slot0 price {} … slot255 price {}).",
+        s0.price_ticks, s255.price_ticks);
+    println!("Cap raised 96 -> 256 with NO log dependency; omit-outbox path hard-rejected.\n");
+
+    // 256 levels must still fit one tx comfortably under the 1.4 M ceiling.
+    assert!(sweep_cu < 700_000, "256-level outbox sweep must fit one tx: {sweep_cu} CU");
+}
+
+/// VERSATILE per-market cap (the ER-capable config): `init_fill_commitment(cap=105)`
+/// → the matching `init_fill_outbox` creates the FULL 105-slot outbox in ONE CPI
+/// (10,144 B, no grow needed) and the market is immediately matchable AND
+/// one-CPI delegate-safe (ring 3,424 B + outbox 10,144 B, both < 10,240). Asserts
+/// the outbox is created at the full ring cap with no grow, and a sweep delivers
+/// fills off-log. This is the config an ER market runs.
+/// Run: `BPF_OUT_DIR=$PWD/target/deploy cargo test --test integration fill_outbox_versatile_er_cap -- --nocapture`
+#[tokio::test]
+async fn fill_outbox_versatile_er_cap() {
+    use flash_book::matcher::fill_outbox as fo;
+    if std::env::var("BPF_OUT_DIR").is_err() && std::env::var("SBF_OUT_DIR").is_err() {
+        eprintln!("skipping fill_outbox_versatile_er_cap: set BPF_OUT_DIR=$PWD/target/deploy");
+        return;
+    }
+    const CAP: u32 = 105; // ER-capable: ring + outbox both one-CPI delegate-safe
+    let mut pt = make_program_test_sbf();
+    pt.set_compute_max_units(1_400_000);
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_p, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market.as_ref()]);
+    let (fc, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market.as_ref()]);
+    let (fob, _) = pda(&[fo::FILL_OUTBOX_SEED, market.as_ref()]);
+
+    cu_of(&mut ctx, build_ix(flash_book::instruction::InitMarketBook {}, vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(market, false),
+        AccountMeta::new(book, false), AccountMeta::new_readonly(system_program::ID, false)]),
+        &payer.pubkey(), &[&payer]).await;
+    for add in [106u32, 105] {
+        cu_of(&mut ctx, build_ix(flash_book::instruction::ExpandMarketBook { additional_nodes: add }, vec![
+            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(market, false),
+            AccountMeta::new(book, false), AccountMeta::new_readonly(system_program::ID, false)]),
+            &payer.pubkey(), &[&payer]).await;
+    }
+    // Ring at the per-market cap 105 (the versatile knob).
+    cu_of(&mut ctx, build_ix(flash_book::instruction::InitFillCommitment { cap: CAP }, vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market, false),
+        AccountMeta::new(fc, false), AccountMeta::new_readonly(system_program::ID, false)]),
+        &payer.pubkey(), &[&payer]).await;
+    // Outbox reads the ring cap (105) → creates the FULL outbox in one CPI. NO grow.
+    cu_of(&mut ctx, build_ix(flash_book::instruction::InitFillOutbox {}, vec![
+        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market, false),
+        AccountMeta::new(fob, false), AccountMeta::new_readonly(fc, false),
+        AccountMeta::new_readonly(system_program::ID, false)]),
+        &payer.pubkey(), &[&payer]).await;
+
+    // Assert: outbox is already at the FULL ring cap (no grow needed) — the ER-capable property.
+    let acct = ctx.banks_client.get_account(fob).await.unwrap().unwrap();
+    assert_eq!(acct.data.len(), fo::fill_outbox_account_len(CAP as usize),
+        "outbox created at the full ring cap {CAP} in ONE ix (10,144 B ≤ 10,240 — ER-delegatable)");
+    assert!(acct.data.len() <= 10_240, "outbox is one-CPI delegate-safe");
+
+    // Rest 105 bids and sweep all of them — full-cap sweep with NO grow ever called.
+    for i in 0..CAP {
+        let tick = 100_000 - (i as u64);
+        cu_of(&mut ctx, build_ix(flash_book::instruction::PlaceLimitOrderV2 {
+            side: 0, size_lots: 1, limit_ticks: tick, flags: 0, expires_at_slot: 0, sub_index: 0 },
+            vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(book, false)]),
+            &payer.pubkey(), &[&payer]).await;
+    }
+    let taker = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(&payer.pubkey(), &taker.pubkey(), 100_000_000)],
+        Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+    cu_of(&mut ctx, build_ix(flash_book::instruction::PlaceTakerOrderV2 {
+        side: 1, size_lots: CAP as u64, limit_ticks: 99_000, flags: 0, expires_at_slot: 0, sub_index: 0 },
+        vec![AccountMeta::new(taker.pubkey(), true), AccountMeta::new(market, false),
+            AccountMeta::new(book, false), AccountMeta::new(fc, false), AccountMeta::new(fob, false)]),
+        &taker.pubkey(), &[&taker]).await;
+
+    let data = ctx.banks_client.get_account(fob).await.unwrap().unwrap().data;
+    let cap = fo::outbox_check(&data, &market.to_bytes()).expect("outbox valid");
+    assert_eq!(cap, CAP, "outbox cap == ring cap (versatile, no grow)");
+    assert_eq!(fo::outbox_produced(&data), CAP as u64, "all 105 fills delivered off-log");
+    println!("\nVERSATILE ER-cap: ring+outbox cap {CAP}, outbox {} B (one-CPI delegate-safe), {CAP} fills off-log, NO grow.",
+        fo::fill_outbox_account_len(CAP as usize));
+}
+
 /// CU benchmark for the settlement + risk instructions that
 /// `scripts/benchmark.ts` does NOT cover (it measures only place/take/
 /// cancel/modify). These are the heavy paths and the ones the C-1/C-2
@@ -4124,7 +4720,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             ],
         ),
         build_ix(
-            flash_book::instruction::InitFillCommitment {},
+            flash_book::instruction::InitFillCommitment { cap: 256 },
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new(market_pda, false),
@@ -4187,7 +4783,10 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             metas,
         )
     };
-    let cu_taker_unarmed = cu_of(&mut ctx, taker_ix(false), &payer.pubkey(), &[&payer, &taker]).await;
+    // §3.2 / H-2: a taker that CROSSES on an ARMED market MUST carry the ring
+    // (the producer pushes one commitment per fill), so the former "unarmed cross
+    // on an armed market" measurement is no longer a legal operation — we measure
+    // only the armed path, which is the production path on every settled market.
     let cu_taker_armed = cu_of(&mut ctx, taker_ix(true), &payer.pubkey(), &[&payer, &taker]).await;
 
     println!("\n=== Flash Book CU benchmark (settlement + risk paths) ===");
@@ -4195,11 +4794,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
     println!("apply_fill (close, realize PnL)   : {cu_apply_fill_close:>7} CU");
     println!("partial_withdraw (1 pos, lattice) : {cu_partial_withdraw:>7} CU");
     println!("place_limit_v2 (#36 band check)   : {cu_place_limit:>7} CU");
-    println!("place_taker_v2 (unarmed)          : {cu_taker_unarmed:>7} CU");
-    println!(
-        "place_taker_v2 (armed, #35 commit): {cu_taker_armed:>7} CU  (+{} keccak commitment)",
-        cu_taker_armed.saturating_sub(cu_taker_unarmed)
-    );
+    println!("place_taker_v2 (armed, #35 commit): {cu_taker_armed:>7} CU");
     println!("(200k default per-ix budget; 1.4M max/tx)\n");
 
     // Guardrail: these must comfortably fit the default per-ix budget.
@@ -4666,14 +5261,81 @@ async fn chaos_instruction_sequences_keep_book_consistent() {
     }
 }
 
+/// §3.2 P3: `grow_fill_commitment` raises a drained ring's capacity in place
+/// (the ER-session fill ceiling). Verifies the cap + account size grow and the
+/// header re-validates; and that a non-authority is rejected.
+#[tokio::test]
+async fn grow_fill_commitment_raises_ring_cap() {
+    use flash_book::matcher::fill_commitment as fc;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
+
+    // init book
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
+        &[build_ix(flash_book::instruction::InitMarketBook {}, vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(book_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ])], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+    // arm the ring
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
+        &[build_ix(flash_book::instruction::InitFillCommitment { cap: 256 }, vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(fc_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ])], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+
+    let d = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
+    assert_eq!(u32::from_le_bytes(d[24..28].try_into().unwrap()), fc::FILL_RING_CAP, "init cap");
+
+    // grow_ix builder (pure — no ctx borrow)
+    let grow_ix = |auth: Pubkey| build_ix(
+        flash_book::instruction::GrowFillCommitment { additional_slots: 64 },
+        vec![
+            AccountMeta::new(auth, true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(fc_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+
+    // a non-authority is rejected (Unauthorized = Custom(7100))
+    let rogue = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(&payer.pubkey(), &rogue.pubkey(), 5_000_000)],
+        Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bad = ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
+        &[grow_ix(rogue.pubkey())], Some(&rogue.pubkey()), &[&rogue], bh)).await;
+    assert!(format!("{bad:?}").contains("Custom(7100)"), "non-authority grow must be Unauthorized: {bad:?}");
+
+    // authority grows by 64
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
+        &[grow_ix(payer.pubkey())], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+    let d = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
+    let cap1 = u32::from_le_bytes(d[24..28].try_into().unwrap());
+    assert_eq!(cap1, fc::FILL_RING_CAP + 64, "cap raised by additional_slots");
+    assert_eq!(d.len(), fc::fill_commit_account_len(cap1 as usize), "account resized to match new cap");
+}
+
 /// ER-layer coverage (honest scope): a faithful delegate→commit→undelegate
 /// round-trip needs a live MagicBlock ER (the handlers CPI into the delegation
 /// program, absent here) and is a devnet lifecycle test. What IS real and
 /// testable in the unit harness is the BASE-LAYER auth gate that runs BEFORE the
 /// CPI: the `market.authority` constraint on the delegation instructions. This
 /// verifies a non-authority is rejected (Unauthorized = Anchor Custom(7100)) by
-/// `delegate_fill_commitment` and `undelegate_fill_commitment` (the #35 ER ix) —
-/// so a rogue can never delegate/undelegate a market's commitment ring.
+/// `delegate_fill_commitment` (the #35 ER ix) — so a rogue can never delegate a
+/// market's commitment ring.
 #[tokio::test]
 async fn er_delegation_rejects_non_authority() {
     let pt = make_program_test();
@@ -4689,7 +5351,7 @@ async fn er_delegation_rejects_non_authority() {
     chaos_send(
         &mut ctx,
         build_ix(
-            flash_book::instruction::InitFillCommitment {},
+            flash_book::instruction::InitFillCommitment { cap: 256 },
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new(market_pda, false),
@@ -4737,31 +5399,10 @@ async fn er_delegation_rejects_non_authority() {
         dbg.contains("Custom(7100)"),
         "delegate_fill_commitment must reject a non-authority with Unauthorized, got: {dbg}"
     );
-
-    // undelegate_fill_commitment with a ROGUE authority → same auth gate.
-    let und = chaos_send(
-        &mut ctx,
-        build_ix(
-            flash_book::instruction::UndelegateFillCommitment {},
-            vec![
-                AccountMeta::new(rogue.pubkey(), true),
-                AccountMeta::new(market_pda, false),
-                AccountMeta::new(fc_pda, false),
-                AccountMeta::new_readonly(program_id(), false),
-                AccountMeta::new(d1, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-                AccountMeta::new_readonly(to_sdk(flash_book::er::DELEGATION_PROGRAM_ID), false),
-            ],
-        ),
-        &payer.pubkey(),
-        &[&payer, &rogue],
-    )
-    .await;
-    let dbg2 = format!("{und:?}");
-    assert!(
-        dbg2.contains("Custom(7100)"),
-        "undelegate_fill_commitment must reject a non-authority with Unauthorized, got: {dbg2}"
-    );
+    // NOTE: the former `undelegate_fill_commitment` rogue-rejection sub-test was
+    // removed — that instruction was deleted in the dead-code cleanup (undelegation
+    // is validator-driven: the supported path is `commit_and_undelegate_fill_commitment`
+    // finalized by `process_undelegation`).
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -5541,14 +6182,17 @@ async fn flush_haircut_dust_debits_residual_h3() {
     .await
     .unwrap();
 
-    // Lazy-init both position haircut states. New account order (Phase-2c re-key):
-    // payer, trader_state, position, haircut_state, position_haircut, system.
+    // Lazy-init both position haircut states. WAVE 24f account order:
+    // payer, trader_state, market, position, haircut_state, position_haircut, system.
+    // `market` is now explicit so the haircut can be pre-initialized for a
+    // position that does not exist yet (breaks the haircut/position deadlock).
     let init_pos_hc = |ts: Pubkey, pos: Pubkey, pos_hc: Pubkey| {
         build_ix(
             flash_book::instruction::InitPositionHaircutState {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new_readonly(ts, false),
+                AccountMeta::new_readonly(market_pda, false),
                 AccountMeta::new_readonly(pos, false),
                 AccountMeta::new_readonly(haircut_state, false),
                 AccountMeta::new(pos_hc, false),

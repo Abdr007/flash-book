@@ -1,0 +1,14 @@
+{
+  "name": "flash-book-er-acceptance",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Live-ER (MagicBlock) Tier-2 acceptance suite — the CPI round-trip solana-program-test can't cover.",
+  "scripts": {
+    "acceptance": "node er_acceptance.mjs"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.1",
+    "@solana/web3.js": "^1.95.0"
+  }
+}

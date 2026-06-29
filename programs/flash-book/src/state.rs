@@ -372,6 +372,18 @@ pub struct MarketAccount {
     /// anyone keep a dead market "alive" and block the escape. Additive-migration
     /// field: pre-existing markets read back 0.
     pub last_heartbeat_slot: u64,
+    /// Per-market matcher batch cap — the max resting levels a taker may cross in
+    /// one `place_taker_order_v2` tx. Tail-appended additive-migration field
+    /// (`size_of::<MarketAccount>()` measured at 896 B with 256 B free under
+    /// `space() = 1152`; pre-existing markets read this back as `0`). `0` is
+    /// interpreted as the global `MAX_BATCH_ORDERS_PER_SIDE_V2` (96) — the
+    /// log-safe default — so legacy markets are byte-for-byte unchanged. Raised
+    /// (≤ `FILL_RING_CAP` = 256) ONLY by `init_fill_outbox`, which simultaneously
+    /// arms the on-chain fill-outbox so the crossed fills are delivered OFF the
+    /// program log: a cap above the ~96 log-safe point without an outbox would
+    /// truncate fills in the 10 KB log and wedge settlement (the H-2 class). See
+    /// `FILL_OUTBOX_DESIGN.md`.
+    pub max_batch_orders: u16,
 }
 
 // H1: build-time guard — the struct (incl. the new nonce) must still fit the
@@ -384,6 +396,19 @@ const _: () = assert!(
 
 impl MarketAccount {
     pub const SEED: &'static [u8] = b"market";
+    /// Effective matcher batch cap. `max_batch_orders` if a market has opted into
+    /// a raised cap (always paired with an armed fill-outbox), else the global
+    /// log-safe default `MAX_BATCH_ORDERS_PER_SIDE_V2`. `0` (legacy / unset) ⇒
+    /// default. Clamped to `FILL_RING_CAP` so a corrupt field can never exceed the
+    /// commitment-ring / outbox capacity.
+    pub fn effective_batch_cap(&self) -> usize {
+        let cap = if self.max_batch_orders == 0 {
+            crate::MAX_BATCH_ORDERS_PER_SIDE_V2
+        } else {
+            self.max_batch_orders as usize
+        };
+        cap.min(crate::matcher::fill_commitment::FILL_RING_CAP as usize)
+    }
     pub fn space() -> usize {
         // 8 (anchor disc) + struct fields. Borsh-conservative bound.
         // Actual size computed via std::mem::size_of for the constant fields,
@@ -608,9 +633,6 @@ impl PositionAccount {
     pub fn set_cum_funding_index(&mut self, v: i128) {
         self.cum_funding_index_at_entry = v.to_le_bytes();
     }
-    pub fn side_enum(&self) -> Side {
-        if self.side == 0 { Side::Long } else { Side::Short }
-    }
 }
 
 #[account]
@@ -695,184 +717,11 @@ impl FlpExposureAccount {
     }
 }
 
-/// Native on-chain trigger order — Hyperliquid pattern. The trader pre-funds
-/// rent on a `TriggerOrderAccount` PDA. Anyone (typically a keeper) can
-/// `execute_trigger_order` once the oracle crosses `trigger_price_ticks` in
-/// the configured direction; the chain inserts a regular limit order into
-/// the market's buffer. Survives bot downtime — your stop fires even if
-/// your MM bot is offline.
-///
-/// PDA seeds: [b"trigger", market, trader, trigger_id]. trigger_id is u8
-/// (0..255) so each trader gets up to 256 active triggers per market.
-#[account]
-#[derive(Debug)]
-pub struct TriggerOrderAccount {
-    pub trader: Pubkey,
-    pub market: Pubkey,
-    pub bump: u8,
-    pub trigger_id: u8,
-    /// Side of the resulting order when triggered (0 = long, 1 = short).
-    /// For closing a long position: side = 1 (short to close). For closing
-    /// a short: side = 0 (long to close).
-    pub side: u8,
-    /// `kind` encodes the comparison direction:
-    ///   0 = trigger when oracle ≤ trigger_price  (stop-loss for longs,
-    ///       take-profit for shorts)
-    ///   1 = trigger when oracle ≥ trigger_price  (take-profit for longs,
-    ///       stop-loss for shorts)
-    pub kind: u8,
-    /// Bit 0: reduce_only — execute only if the resulting order would
-    ///        shrink the trader's position (no flip).
-    /// Bit 1: active — set by `place_trigger_order`, cleared by
-    ///        `execute_trigger_order` (no double-fire).
-    pub flags: u8,
-    pub size_lots: u64,
-    /// Oracle price (in ticks) at which to fire.
-    pub trigger_price_ticks: u64,
-    /// Limit price for the resulting order. 0 = market-style (uses the
-    /// current oracle ± slippage_bps configured at execute time, but for
-    /// v1 we require an explicit non-zero limit to keep the matcher
-    /// deterministic).
-    pub limit_price_ticks: u64,
-    pub created_at_slot: u64,
-    /// 0 = never expires.
-    pub expires_at_slot: u64,
-    /// OCO (One-Cancels-the-Other) partner trigger PDA. Default = no
-    /// link. When non-default, executing OR cancelling THIS trigger
-    /// also marks the partner inactive (one fires, the other dies).
-    /// Set by `place_bracket_order` to wire a TP+SL pair atomically.
-    /// The partner account is passed via the optional `oco_pair`
-    /// account on `execute_trigger_order` / `cancel_trigger_order`.
-    pub oco_pair: Pubkey,
-    /// Trailing-stop offset in bps. 0 = static trigger (legacy). When
-    /// non-zero, the trigger price RATCHETS in the favourable direction
-    /// as the oracle moves: kind=0 (fire on ≤) tracks the oracle MAX
-    /// minus offset; kind=1 (fire on ≥) tracks oracle MIN plus offset.
-    /// Hyperliquid trailing-stop pattern. Permissionless `update_trailing_stop`
-    /// keepers ratchet the trigger price; on fire, the existing
-    /// execute_trigger_order path runs unchanged.
-    pub trailing_offset_bps: u32,
-    /// Best (most-favorable-to-trader) oracle price observed since
-    /// trigger placement. Used as the anchor for trailing math:
-    ///   kind=0 (sl-for-long): trigger = best_price × (1 - offset_bps)
-    ///   kind=1 (sl-for-short): trigger = best_price × (1 + offset_bps)
-    /// 0 = unset (first update_trailing_stop initialises from current oracle).
-    pub trailing_anchor_ticks: u64,
-    /// Phase 2f — TraderState sub-account index this trigger fires
-    /// against. Layout-compatible: pre-Phase-2f accounts read this back
-    /// as 0 (main) from the trailing zeros of the allocated `space()`.
-    /// `execute_trigger_order_v2` writes this into the synthetic
-    /// RestingOrderV2.sub_index so the resulting fill routes to the
-    /// right TraderState.
-    pub sub_index: u8,
-}
 
-impl TriggerOrderAccount {
-    pub const SEED: &'static [u8] = b"trigger";
-    pub const FLAG_REDUCE_ONLY: u8 = 1 << 0;
-    pub const FLAG_ACTIVE: u8 = 1 << 1;
-    /// Bracket leg flag — set by `place_bracket_order`. Informational;
-    /// OCO behaviour keys off `oco_pair != Pubkey::default()`.
-    pub const FLAG_BRACKET_LEG: u8 = 1 << 2;
-    pub fn space() -> usize {
-        // 8 disc + 32+32+1+1+1+1+1 + 8+8+8 + 8+8 + 32 (oco)
-        // + 4 (trailing_offset_bps) + 8 (trailing_anchor_ticks) = 161.
-        // Round to 192.
-        8 + 192
-    }
-}
 
-/// Native on-chain ICEBERG order — Hyperliquid pattern. Hides total
-/// size by displaying only `displayed_size_lots` at a time. When the
-/// visible child fills, a permissionless `replenish_iceberg` keeper
-/// inserts the next chunk of `displayed_size_lots` (or the residual)
-/// from the hidden reservoir at the same `limit_ticks`.
-///
-/// PDA seeds: [b"iceberg", market, trader, iceberg_id]. iceberg_id is
-/// u8 → up to 256 active icebergs per (trader, market) pair.
-#[account]
-#[derive(Debug)]
-pub struct IcebergOrderAccount {
-    pub trader: Pubkey,
-    pub market: Pubkey,
-    pub bump: u8,
-    pub iceberg_id: u8,
-    pub side: u8,
-    /// bit 0 = active. Cleared when remaining_lots == 0 OR cancelled.
-    pub flags: u8,
-    /// Phase 2f — repurposes the first byte of the prior `_pad0: [u8; 5]`.
-    /// Layout-compatible: pre-Phase-2f accounts have this byte as 0
-    /// (main TraderState) by virtue of the zero-initialised allocation.
-    pub sub_index: u8,
-    pub _pad0: [u8; 4],
-    pub limit_ticks: u64,
-    pub total_size_lots: u64,
-    /// Lots not yet displayed in the orderbook (the hidden reservoir).
-    pub remaining_lots: u64,
-    /// Size of each visible chunk. Last chunk may be smaller (residual).
-    pub displayed_size_lots: u64,
-    /// Sequence of the current child order in the OrderBuffer. 0 = no
-    /// active child (about to replenish or fully drained).
-    pub child_order_seq: u64,
-    pub created_at_slot: u64,
-    /// 0 = never expires.
-    pub expires_at_slot: u64,
-}
 
-impl IcebergOrderAccount {
-    pub const SEED: &'static [u8] = b"iceberg";
-    pub const FLAG_ACTIVE: u8 = 1 << 0;
-    pub fn space() -> usize {
-        // 8 disc + 32+32+1+1+1+1+5 + 8+8+8+8+8+8+8 = 137. Round to 168.
-        8 + 168
-    }
-}
 
-/// Native on-chain TWAP order — Hyperliquid pattern. The trader specifies
-/// total size + slice size + interval; anyone (typically a keeper) calls
-/// `execute_twap_slice` once per interval to insert one slice into the
-/// market's order buffer. Slices stop firing when total filled OR end_slot
-/// reached.
-///
-/// PDA seeds: [b"twap", market, trader, twap_id]. twap_id is u8 → up to
-/// 256 active TWAPs per (trader, market) pair.
-#[account]
-#[derive(Debug)]
-pub struct TwapOrderAccount {
-    pub trader: Pubkey,
-    pub market: Pubkey,
-    pub bump: u8,
-    pub twap_id: u8,
-    pub side: u8,
-    pub flags: u8, // bit 0: active
-    pub slice_size_lots: u64,
-    /// Total size to execute across slices.
-    pub total_size_lots: u64,
-    /// Cumulative size successfully sliced into the buffer so far.
-    pub size_executed_lots: u64,
-    /// Limit price applied to every slice (max price for buys, min for
-    /// sells). Slice rejects placement if exceeded.
-    pub limit_price_ticks: u64,
-    pub start_slot: u64,
-    /// Minimum slots between successive slices.
-    pub slot_interval: u64,
-    /// 0 = no end. Otherwise last slot a slice may be placed in.
-    pub end_slot: u64,
-    pub last_slice_at_slot: u64,
-    /// Phase 2f — TraderState sub-account index. Every slice's
-    /// synthetic RestingOrderV2 carries this so fills route to the
-    /// right TraderState. Layout-compatible (trailing zeros = 0 = main).
-    pub sub_index: u8,
-}
 
-impl TwapOrderAccount {
-    pub const SEED: &'static [u8] = b"twap";
-    pub const FLAG_ACTIVE: u8 = 1 << 0;
-    pub fn space() -> usize {
-        // 8 disc + 32+32+1+1+1+1 + 8+8+8+8+8+8+8+8 = 140. Round up.
-        8 + 144
-    }
-}
 
 /// Per-LP share holding. PDA seeded `[b"lp_position", lp.key()]`. Created
 /// lazily on first deposit via `init_if_needed`.
@@ -994,85 +843,9 @@ impl TraderStateAccount {
 // infrastructure. Existing on-chain accounts from prior deployments are
 // no longer touched by any instruction.
 
-/// User-managed trading vault. A strategist deploys a vault and gets
-/// trading authority over its collateral pool via the standard
-/// TraderStateAccount.delegate mechanism. Depositors mint shares at the
-/// current NAV; withdrawals burn shares for proportional NAV. The
-/// strategist earns a high-water-mark performance fee, paid in newly
-/// minted shares.
-///
-/// PDA seeds: [b"vault", strategist, vault_id]. vault_id is u8 → up to
-/// 256 vaults per strategist. The vault's TraderStateAccount lives at
-/// [b"trader_state", vault_pda] (i.e. the vault PDA is the "trader").
-/// The strategist is set as `delegate` on that TraderState so they can
-/// trade with their own keypair.
-#[account]
-#[derive(Debug)]
-pub struct VaultAccount {
-    pub strategist: Pubkey,
-    pub bump: u8,
-    pub vault_id: u8,
-    /// 1 if accepting deposits, 0 if closed (withdrawals always allowed).
-    pub accept_deposits: u8,
-    /// Reserved padding for alignment.
-    pub _pad0: u8,
-    /// The vault PDA's TraderStateAccount (where collateral lives).
-    pub trader_state: Pubkey,
-    /// Display name (UTF-8, null-padded).
-    pub name: [u8; 32],
-    /// Performance fee in bps of NAV growth above the high-water mark.
-    /// Charged on `settle_vault_perf_fee` by minting shares to the
-    /// strategist. Typical: 1000–2000 (10–20%). Capped at BPS_DENOM/2.
-    pub perf_fee_bps: u32,
-    /// Total shares outstanding (sum of all VaultPositionAccount.shares).
-    pub shares_outstanding: u64,
-    /// Q64.0 NAV-per-share at the last performance crystallization.
-    /// Stored × USD_UNIT for precision; 0 = bootstrap (perf fee not yet
-    /// settled — first settle anchors the HWM at then-current NAV/share).
-    pub hwm_nav_per_share_u64x6: u64,
-    /// Unix timestamp of the last performance settlement.
-    pub last_perf_settlement_unix: u64,
-    /// Minimum deposit in quote-lots to prevent dust attacks. 0 = none.
-    pub min_deposit_quote_lots: u64,
-    /// Cumulative quote-lots deposited across the vault's lifetime
-    /// (informational, used for ROI display).
-    pub total_deposited_quote_lots: u64,
-    /// Cumulative quote-lots withdrawn (gross, before perf fee).
-    pub total_withdrawn_quote_lots: u64,
-    /// Cumulative shares minted to the strategist as perf fee.
-    pub total_perf_shares_minted: u64,
-}
 
-impl VaultAccount {
-    pub const SEED: &'static [u8] = b"vault";
-    pub fn space() -> usize {
-        // 8 disc + 32 + 1 + 1 + 1 + 1 + 32 + 32 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 = 168
-        8 + 168
-    }
-}
 
-/// Per-depositor share holding in a vault. Created lazily on first
-/// deposit via init_if_needed.
-///
-/// PDA seeds: [b"vault_position", vault, depositor].
-#[account]
-#[derive(Debug)]
-pub struct VaultPositionAccount {
-    pub vault: Pubkey,
-    pub depositor: Pubkey,
-    pub bump: u8,
-    pub shares: u64,
-    pub total_deposited_quote_lots: u64,
-    pub total_withdrawn_quote_lots: u64,
-}
 
-impl VaultPositionAccount {
-    pub const SEED: &'static [u8] = b"vault_position";
-    pub fn space() -> usize {
-        // 8 disc + 32 + 32 + 1 + 8 + 8 + 8 = 97; round to 112.
-        8 + 112
-    }
-}
 
 const _: BaseLots = BaseLots(0);
 const _: Ticks = Ticks(0);
@@ -1092,3 +865,4 @@ const _: Order = Order {
     post_only: false,
     stp_mode: crate::matcher::order::StpMode::CancelNewest,
 };
+

@@ -69,8 +69,6 @@
 //! - All credits use `floor` (truncating integer division). Dust
 //!   accrues to the haircut state, then drains to insurance.
 
-use crate::constants::USD_UNIT;
-
 /// Fixed-point denominator for the haircut ratio. 1.000000000 = unhaircut.
 /// 9 decimals of precision — comfortably more granular than any plausible
 /// solvency gap. With `H_DENOM = 10^9` and worst-case Residual /
@@ -526,14 +524,6 @@ pub enum HaircutError {
     InvertedWindow,
     WindowTooLarge,
     ZeroGain,
-}
-
-/// Sanity helper: convert a USD-major amount to quote lots
-/// (1 USD = `USD_UNIT` lots). Used by tests and external callers; the
-/// hot path takes lots directly.
-#[inline]
-pub fn usd_to_quote_lots(usd_major: u64) -> u64 {
-    usd_major.saturating_mul(USD_UNIT)
 }
 
 /// Wave 24e — invariant report from `verify_haircut_invariants`.
