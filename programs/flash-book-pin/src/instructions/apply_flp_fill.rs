@@ -10,11 +10,12 @@
 //! README): the FLP per-market exposure (size/entry) update, the toxicity tax
 //! (vpin is ported — wiring pending), fee-tier resolution, events, and the
 //! `init_if_needed` position-create CPI / PDA verification.
-use crate::guard::{assert_disc, assert_owned_by};
+use crate::guard::{assert_disc, assert_owned_by, assert_pda};
 use crate::instructions::apply_fill::{assert_position, bind_or_stamp_position};
+use crate::seeds::HAIRCUT_SEED;
 use crate::state::{
-    FlpExposure, Insurance, Market, Position, TraderState, FLP_EXPOSURE_DISC, INSURANCE_DISC,
-    MARKET_DISC, POSITION_DISC, TRADER_STATE_DISC,
+    FlpExposure, Insurance, Market, MarketHaircutState, Position, TraderState, FLP_EXPOSURE_DISC,
+    HAIRCUT_STATE_DISC, INSURANCE_DISC, MARKET_DISC, POSITION_DISC, TRADER_STATE_DISC,
 };
 use pinocchio::{
     account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
@@ -62,6 +63,13 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
     assert_owned_by(&accounts[3], _pid)?; assert_disc(&accounts[3], &FLP_EXPOSURE_DISC)?;
     assert_owned_by(&accounts[4], _pid)?; assert_disc(&accounts[4], &TRADER_STATE_DISC)?;
     assert_position(&accounts[5], _pid)?;
+    // Optional trailing haircut_state (R2 inline funding settle) — see apply_fill.
+    let has_haircut = accounts.len() > 6;
+    if has_haircut {
+        assert_owned_by(&accounts[6], _pid)?;
+        assert_pda(&accounts[6], &[HAIRCUT_SEED, &accounts[1].key()[..]], _pid)?;
+        assert_disc(&accounts[6], &HAIRCUT_STATE_DISC)?;
+    }
 
     unsafe {
         let market: &mut Market = view(&accounts[1]);
@@ -137,6 +145,20 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         insurance.balance_quote_lots = insurance.balance_quote_lots.saturating_add(contribution);
         insurance.total_contributions = insurance.total_contributions.saturating_add(contribution);
         market.total_fees_collected = market.total_fees_collected.saturating_add(net_fee);
+
+        // ── (R2) Settle the taker leg's funding on its PRE-trade size before the
+        // resize, when the optional haircut_state is supplied (same shared helper
+        // as `settle_funding` / `apply_fill`). The pool side accrues no funding.
+        if has_haircut {
+            let haircut: &mut MarketHaircutState = view(&accounts[6]);
+            if &haircut.market != accounts[1].key() {
+                return Err(ProgramError::InvalidArgument);
+            }
+            let mut residual = u128::from_le_bytes(haircut.residual_quote_lots);
+            crate::funding::settle_position_funding(taker_pos, market.mark_price_ticks, tick, fidx, &mut taker_ts.collateral_quote_lots, &mut residual)
+                .map_err(|_| ProgramError::InvalidArgument)?;
+            haircut.residual_quote_lots = residual.to_le_bytes();
+        }
 
         // ── Resize the taker leg + capture its realized-PnL delta (R1), then
         // materialize it into the taker's bucket (loss shortfall → insurance).

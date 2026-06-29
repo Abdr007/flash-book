@@ -2,10 +2,11 @@
 //! Pointer-casts the 6 accounts (no Borsh) and applies the fill: position
 //! update (weighted entry / realized PnL / side flip — identical math to the
 //! Anchor `apply_fill_to_position`), market OI, fee/rebate split, funding stamp.
-use crate::guard::{assert_disc, assert_owned_by};
+use crate::guard::{assert_disc, assert_owned_by, assert_pda};
+use crate::seeds::HAIRCUT_SEED;
 use crate::state::{
-    Insurance, Market, Position, TraderState, INSURANCE_DISC, MARKET_DISC, POSITION_DISC,
-    TRADER_STATE_DISC,
+    Insurance, Market, MarketHaircutState, Position, TraderState, HAIRCUT_STATE_DISC,
+    INSURANCE_DISC, MARKET_DISC, POSITION_DISC, TRADER_STATE_DISC,
 };
 use pinocchio::{
     account_info::AccountInfo,
@@ -105,7 +106,13 @@ pub(crate) fn materialize_realized(
 }
 
 /// data: [size_lots u64][price_ticks u64][taker_side u8][fill_seq u64]
-/// accounts: [sequencer(signer), market, insurance, taker_ts, maker_ts, taker_pos, maker_pos]
+/// accounts: [sequencer(signer), market, insurance, taker_ts, maker_ts, taker_pos,
+///            maker_pos, (haircut_state OPTIONAL)]
+/// When the trailing `haircut_state` (the market's `[b"haircut", market]` PDA) is
+/// supplied, funding is settled on each leg's PRE-trade size before the resize
+/// (R2 — stops a same-side add being charged funding for the whole prior interval);
+/// omitting it preserves the legacy 7-account behavior (funding settled lazily by
+/// the `settle_funding` crank). Mirrors anchor's `market_haircut.is_some()` gate.
 pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     // data: [size u64][price u64][taker_side u8][fill_seq u64]
     if data.len() < 25 || accounts.len() < 7 { return Err(ProgramError::InvalidInstructionData); }
@@ -140,6 +147,15 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     // the matcher's invariant (self-trades are prevented upstream).
     if accounts[3].key() == accounts[4].key() || accounts[5].key() == accounts[6].key() {
         return Err(ProgramError::InvalidArgument);
+    }
+    // Optional trailing haircut_state (R2 inline funding settle). Validate it as
+    // THIS market's canonical `[b"haircut", market]` PDA so the residual we move
+    // is the right market's accumulator, not an attacker-supplied account.
+    let has_haircut = accounts.len() > 7;
+    if has_haircut {
+        assert_owned_by(&accounts[7], pid)?;
+        assert_pda(&accounts[7], &[HAIRCUT_SEED, &accounts[1].key()[..]], pid)?;
+        assert_disc(&accounts[7], &HAIRCUT_STATE_DISC)?;
     }
 
     unsafe {
@@ -214,6 +230,25 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
             .ok_or(ProgramError::Custom(249))?; // InsufficientCollateral
         maker_ts.collateral_quote_lots = maker_ts.collateral_quote_lots.saturating_add(rebate);
         insurance.balance_quote_lots = insurance.balance_quote_lots.saturating_add(fee - rebate);
+
+        // ── (R2) Settle each leg's funding on its PRE-trade size, BEFORE the
+        // resize, when the optional haircut_state is supplied. The shared helper
+        // is the SAME one `settle_funding` uses, so the inline settle and the
+        // crank can't diverge; settling here re-stamps the entry index, so a
+        // following same-side add can't be charged funding for the prior interval.
+        if has_haircut {
+            let haircut: &mut MarketHaircutState = view(&accounts[7]);
+            if &haircut.market != accounts[1].key() {
+                return Err(ProgramError::InvalidArgument);
+            }
+            let mark = market.mark_price_ticks;
+            let mut residual = u128::from_le_bytes(haircut.residual_quote_lots);
+            crate::funding::settle_position_funding(taker_pos, mark, tick, fidx, &mut taker_ts.collateral_quote_lots, &mut residual)
+                .map_err(|_| ProgramError::InvalidArgument)?;
+            crate::funding::settle_position_funding(maker_pos, mark, tick, fidx, &mut maker_ts.collateral_quote_lots, &mut residual)
+                .map_err(|_| ProgramError::InvalidArgument)?;
+            haircut.residual_quote_lots = residual.to_le_bytes();
+        }
 
         // ── Resize each leg + capture the realized-PnL delta for this fill (R1).
         let taker_delta = crate::fill_math::apply_to_position(taker_pos, taker_side, size, price, tick, fidx)

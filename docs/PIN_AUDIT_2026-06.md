@@ -157,15 +157,21 @@ regressions**. Panic/DoS agent: **no reachable panic or OOB on any deployed path
   `route_realized_pnl` does the bucket+shortfall split); e2e-tested (gain→collateral,
   bankrupt-loss→insurance) + Kani-proven conservation (`route_realized_pnl_conserves`,
   the 25th pin harness).
-- **R2 — funding settle-before-resize — STILL OPEN (next increment).**
-  `apply_fill` does not yet settle a position's accrued funding on its PRE-trade
-  size before a same-side add (phantom funding via the lazy `settle_funding` crank).
-  Anchor settles funding inline, gated on `market_haircut.is_some()`, moving the
-  haircut **residual** (`Δcollateral == −Δresidual`, RISK-1). The pin port already
-  has `settle_funding` (with the residual move) as a separate ix; wiring it inline
-  needs the optional `haircut_state` account added to `apply_fill`/`apply_flp_fill`
-  + the residual reconciliation — a clean follow-up. Until then funding remains
-  correct but lazily-settled (the same-side-add phantom-funding window persists).
+- **R2 — funding settle-before-resize — ✅ DONE (2026-06, `feat/pin-settlement-materialization`).**
+  `apply_fill`/`apply_flp_fill` now settle each leg's funding on its PRE-trade size
+  before the resize, gated on an OPTIONAL trailing `haircut_state` account (the
+  market's `[b"haircut", market]` PDA) — mirroring anchor's `market_haircut.is_some()`
+  gate; omitting it preserves the legacy account count + lazy `settle_funding` crank.
+  The funding math was extracted from the `settle_funding` ix into a single shared
+  `funding::settle_position_funding` helper (mark-priced notional, isolated/cross
+  bucket routing, residual move with `Δcollateral == −Δresidual`, re-stamp the entry
+  index, pay clamped to availability) — so the crank and the inline settle can never
+  diverge. Settling + re-stamping before a same-side add stops the post-add size
+  being charged funding for the prior interval (the phantom-funding bug).
+  Host-tested (`settle_position_funding_routes_and_restamps`: pay/receive/isolated/
+  cross/clamp/underflow/flat) + e2e (`apply_flp_fill_settles_funding_before_resize`:
+  funding settled on the pre-add size 10 ⇒ 100 paid, not the post-add 20 ⇒ 200;
+  residual moved by RISK-1).
 - **Other R1/R2 consequences:** the dead `compute_shortfall` / `health_price_with_staleness`
   and per-market FLP v3 par-redemption are downstream of full settlement completeness;
   the pin port remains devnet/WIP/UNAUDITED.

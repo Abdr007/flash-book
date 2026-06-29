@@ -3209,3 +3209,66 @@ async fn apply_flp_fill_bankrupt_loss_drains_bucket_and_insurance() {
     assert_eq!(get_u64(&ts_after.data, TS_COLLATERAL), 0, "loss drained the bucket to 0");
     assert_eq!(get_u64(&ins_after.data, INS_BALANCE), 50, "insurance covered the 50 shortfall (100−50)");
 }
+
+// Audit R2 — funding SETTLE-BEFORE-RESIZE e2e via apply_flp_fill + the optional
+// haircut_state. A same-side ADD must settle the existing position's funding on
+// its PRE-add size and re-stamp the index, so the post-add size is NOT charged
+// funding for the prior interval (the phantom-funding fix). Cross long, mark 10,
+// tick 1, size 10 ⇒ notional 100; index advanced +1.0 (Q64.64) ⇒ owed 100.
+use flash_book_pin::seeds::HAIRCUT_SEED;
+use flash_book_pin::state::HAIRCUT_STATE_DISC;
+const MKT_CUM_FUNDING: usize = 40;
+const HC_MARKET: usize = 8;
+const HC_RESIDUAL: usize = 80;
+fn haircut_acct(pid: Pubkey, market: Pubkey, residual: u128) -> Account {
+    let mut d = vec![0u8; 208];
+    d[0..8].copy_from_slice(&HAIRCUT_STATE_DISC);
+    put_key(&mut d, HC_MARKET, &market);
+    d[HC_RESIDUAL..HC_RESIDUAL + 16].copy_from_slice(&residual.to_le_bytes());
+    rent_account(d, pid)
+}
+#[tokio::test]
+async fn apply_flp_fill_settles_funding_before_resize() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let taker = Pubkey::new_unique();
+    let (market, insurance, flp, ts, pos) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let (haircut, _hb) = Pubkey::find_program_address(&[HAIRCUT_SEED, &market.to_bytes()], &pid);
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut mkt = market_full(pid, 10, 1, 500, 10, 10); // mark 10, tick 1
+    put_key(&mut mkt.data, 8, &seq.pubkey());
+    let q: i128 = 1 << 64; // cumulative funding index advanced by exactly +1.0
+    mkt.data[MKT_CUM_FUNDING..MKT_CUM_FUNDING + 16].copy_from_slice(&q.to_le_bytes());
+    pt.add_account(market, mkt);
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(flp, flp_exposure_acct(pid));
+    pt.add_account(ts, trader_state(pid, taker, 5_000, 1)); // cross pool 5000, 1 open
+    pt.add_account(pos, position(pid, taker, market, 0, 10, 10, 0)); // LONG 10 @10, entry funding idx 0
+    pt.add_account(haircut, haircut_acct(pid, market, 100_000));
+    pt.add_account(seq.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    // Same-side ADD: taker_side = long (0), size 10, price 10 (in band). + haircut acct[6].
+    let mut data = vec![IX_APPLY_FLP_FILL];
+    data.extend_from_slice(&10u64.to_le_bytes());
+    data.extend_from_slice(&10u64.to_le_bytes());
+    data.push(0u8);                              // taker_side = long (ADD)
+    data.extend_from_slice(&1u64.to_le_bytes()); // fill_seq
+    let ix = Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(seq.pubkey(), true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(insurance, false),
+        AccountMeta::new(flp, false),
+        AccountMeta::new(ts, false),
+        AccountMeta::new(pos, false),
+        AccountMeta::new(haircut, false), // <-- optional haircut_state ⇒ R2 inline settle
+    ], data };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    assert!(r.is_ok(), "add fill should settle: {r:?}");
+    let ts_after = banks.get_account(ts).await.unwrap().unwrap();
+    let hc_after = banks.get_account(haircut).await.unwrap().unwrap();
+    // Funding settled on the PRE-add size (10 ⇒ owed 100), NOT the post-add 20 (200).
+    assert_eq!(get_u64(&ts_after.data, TS_COLLATERAL), 4_900, "funding 100 paid on the pre-add size");
+    let res_after = u128::from_le_bytes(hc_after.data[HC_RESIDUAL..HC_RESIDUAL + 16].try_into().unwrap());
+    assert_eq!(res_after, 100_100, "residual moved by the funding paid (RISK-1)");
+}
