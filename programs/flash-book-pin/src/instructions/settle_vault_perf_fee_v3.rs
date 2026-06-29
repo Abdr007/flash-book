@@ -69,6 +69,14 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> P
         if &ts.trader != vault.key() {
             return Err(ProgramError::InvalidArgument);
         }
+        // Re-audit 2026-06 (MED): flat-gate the settle (parity with deposit/withdraw,
+        // audit H-6). NAV = `collateral_quote_lots` ignores an open position's
+        // unrealized PnL; settling a perf fee while the vault holds an open WINNING
+        // position mints fee shares against a high that a later realized loss erases,
+        // diluting the remaining depositors who also bore the fee. Require flat.
+        if ts.open_positions != 0 {
+            return Err(ProgramError::InvalidArgument); // vault has an open position
+        }
         ts.collateral_quote_lots
     };
     if nav == 0 {

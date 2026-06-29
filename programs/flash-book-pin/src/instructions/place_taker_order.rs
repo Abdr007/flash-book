@@ -154,6 +154,14 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
                     return true; // skip expired, keep walking
                 }
                 if o.trader == trader_pk {
+                    // Re-audit 2026-06 (HIGH): a forced-liquidation order (type 3)
+                    // carries the liquidatee's own trader, so STP would let them
+                    // self-cancel it — the #187 type-3 guard on cancel/modify, but
+                    // via the taker STP path. NEVER remove a type-3 via STP: leave it
+                    // resting and skip it (it is not a real self-trade to prevent).
+                    if o.order_type == 3 {
+                        return true;
+                    }
                     match stp_mode {
                         STP_CANCEL_OLDEST => {
                             stp_cancel[n_stp] = idx;

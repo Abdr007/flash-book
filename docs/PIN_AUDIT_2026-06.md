@@ -267,6 +267,72 @@ vault_math `Insolvent` (host + Kani). Suite: 481 host + 73 integration + 25 Kani
 
 ---
 
+## Second full external re-audit on `main` (2026-06) — 6 reviewers, post-#187
+
+After #187 merged, a SECOND independent 6-reviewer audit (settlement/funding,
+FLP/vault/collateral, liquidation/ADL, account-model/races, arithmetic,
+economic/MEV/sequencer-trust) was run on `main`. It went DEEPER than the surface
+sub_index sweep and found a **CRITICAL** the earlier rounds missed — an
+un-ported ADL conservation cap — plus several genuine HIGH/MED port bugs in
+handler glue. The proven pure-math core held again (OI/PnL/funding/shortfall
+conservation, C-1 margin, vault round-trip, all Kani proofs). All fixed; pin-only.
+
+| Sev | Finding | Fix |
+|-----|---------|-----|
+| **CRITICAL** | `auto_deleverage` credited the counter its FULL PnL at the bankruptcy price with **no `.min(loss)` cap** (anchor's AUDIT-H-3) → counter credited more than the bankrupt forfeits → **unbacked mint**, eroding `vault ≥ Σcollateral+flp+insurance` on *every* ADL (and insurance is, by the ADL trigger, already below pause — no backstop) | cap `gain = adl_counter_gain(..).min(loss)` |
+| **HIGH** | `auto_deleverage` missing anchor's R-1 `adl_bankruptcy_reached` gate → a merely stress-unhealthy but **mark-SOLVENT** position (0<equity<maintenance) could be ADL'd at `bp`, seizing its residual equity | port `adl_bankruptcy_reached`; gate on the fresh health mark (Kani-proven helper) |
+| **HIGH** | `basket_order` injected resting legs with `sub_index: 0` (the lone injection path not propagating the real sub) → a sub-account user passes the joint-margin gate on a funded sub while legs route fills/PnL to an empty sub 0 → unbacked, instantly-liquidatable position → bad debt | `sub_index: trader_sub` |
+| **HIGH** | a liquidatee could remove their own forced-liq (type-3) order via the **taker STP self-cancel** path (`place_taker_order`) — the #187 type-3 guard missed STP | skip type-3 in the STP self-match branch |
+| **HIGH** | FLP v3 deposit/withdraw **NAV asymmetry**: deposits priced on `nav = capital+realized_pnl` (incl. gains) but withdraws capped at `capital` → realized gains charged to depositors yet locked from ALL redeemers (full redemption *rejected*), and extractable by an early LP from a later depositor | price BOTH sides on `nav_for_pricing = min(nav, capital)` (bear losses, ignore un-crystallized gains) |
+| **MED** | a vault strategist could cancel the vault's own forced-liq (type-3) order via `vault_cancel_order_v3` (inherited gap) | mirror the #187 type-3 guard |
+| **MED** | `settle_vault_perf_fee_v3` had no flat-gate → perf fee minted against an open winning position's high, diluting depositors when the loss later realizes | gate on `open_positions == 0` (parity with deposit/withdraw) |
+| **LOW** | `risk::shocked_price` used silent `as u64` truncation (a cast `overflow-checks` does NOT catch) → an extreme positive governance shock wraps the stressed price small, under-margining a short | checked: reject when `r > u64::MAX` |
+| **LOW** | `apply_flp_fill` sampled the iso bucket BEFORE the funding settle (the #187 `apply_fill` M-1 fix, missed in the FLP path) | sample iso AFTER funding |
+
+Regression tests: `auto_deleverage_settles_underwater_vs_counter` updated to the
+**conserving** credit (counter +50 == loss, was the buggy +300 unbacked mint);
+new `auto_deleverage_rejects_mark_solvent_position`, `vault_cancel_rejects_forced_
+liquidation_type3`, `flp_v3_nav_for_pricing_is_min_nav_capital`, and a Kani proof
+`bankruptcy_gate_brackets_bp`. Suite: **483 host + 75 integration + 26 Kani**,
+build-sbf clean.
+
+### Documented as deferred (features / inherited / within-trust — NOT fixed)
+- **Commit-reveal fill authenticity is fully dead** (HIGH, deliberate): pin neither
+  pushes (matcher) nor settles (`buffer_settle`) the `fill_commitment` ring, and
+  `fill_commitment_required` is never read. A *compromised* sequencer can fabricate
+  a fill between a victim's real position and its own wallet within the ±50% band.
+  Wiring matcher `buffer_push` + handler `buffer_settle` + keccak is a multi-week
+  feature; until then the trader-vs-trader band is the only bound.
+- **Sequencer sets the mark directly** (HIGH, within pin's stated trust model): pin
+  folds oracle→mark into one sequencer-gated write where anchor stages an
+  authority-gated oracle bridged by a rate-limited `settle_mark`. The misleading
+  "even a compromised sequencer cannot jump the mark" doc claim in `update_oracle`
+  was corrected to an honest limitation.
+- **Envelope mark-move cap is optional / sequencer-bypassable** (MED, inherited):
+  the sequencer omits the account to skip the cap. A mandatory-envelope arming flag
+  (carved from `Market._reserved`, set at envelope init) is a deferred hardening.
+- **Quorum oracle is sequencer-supplied/unattested**, **±50% trader band is loose**
+  (LOW, inherited) — both within the sequencer trust boundary.
+- **Haircut junior-claim engine unwired** (MED): realized gains credit collateral in
+  full and losses don't accrue to the market residual (anchor routes via
+  `apply_realized_pnl_delta_v2` / `accrue_haircut_loss`). Fails CLOSED (no theft,
+  no mint; `convert_position` can't over-pay) — a missing protection layer, not a
+  hole. Requires passing the per-position haircut accounts through the hot path.
+- **Funding accrual still inert** (INFO, inherited): `cum_funding_index` never
+  advanced in EITHER program → all funding moves 0, **symmetric** (no one-sided
+  free-carry). Benign; wiring the rate engine is the top remaining feature.
+- **`set_position_leverage` / `verify_leverage_cap` omit the sub_index bind** (LOW):
+  self-scoped / read-only and `leverage_cap` enforcement is currently inert; the
+  fix needs an ABI change (add `trader_state`) — deferred over churning the
+  interface for an inert, no-fund-impact gap.
+- **ADL `position_liq` timestamps not reset after an ADL close** (LOW, benign);
+  **fee/rebate not routed to the isolated bucket** (LOW parity, no leak);
+  **withdraw destination ATA not authority-constrained** (parity, not theft);
+  **`execute_trigger_order` reduce-only soft-gate omits sub_index** (inherited
+  schema limit; the injected order still carries the right sub).
+
+---
+
 ## Verified SOUND (high-signal negatives)
 
 Pure-math core (haircut, vault_math, fill_math, funding, peg, concentration,

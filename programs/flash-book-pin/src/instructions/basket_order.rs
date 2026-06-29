@@ -220,7 +220,13 @@ fn run(pid: &Pubkey, accounts: &[AccountInfo], legs: &[BasketLeg]) -> ProgramRes
                 side: leg.side,
                 order_type: 0,
                 flags: leg.flags,
-                sub_index: 0,
+                // Propagate the REAL sub-account (re-audit 2026-06, HIGH): every
+                // other injection path carries the trader's sub_index; hardcoding 0
+                // here let a sub-account user pass the joint margin gate against a
+                // funded sub (validated at :166 with `trader_sub`) while the legs
+                // rested under sub 0 and routed fills/PnL there — an unbacked,
+                // instantly-liquidatable position the gate was meant to forbid.
+                sub_index: trader_sub,
             };
             if side_is_bid { handle.insert_bid(order)?; } else { handle.insert_ask(order)?; }
         }

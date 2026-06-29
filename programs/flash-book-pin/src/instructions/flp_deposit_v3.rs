@@ -50,8 +50,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let (exp_market, nav, outstanding, pool_size) = {
         let d = exposure.try_borrow_data()?;
         let e = unsafe { &*(d.as_ptr() as *const FlpExposurePerMarketV3) };
-        // Price on NAV (capital + realized_pnl), not capital alone.
-        (e.market, e.nav(), e.lp_shares_outstanding, e.size_lots)
+        // Price on `min(nav, capital)` (re-audit 2026-06, HIGH): bear realized
+        // losses, ignore un-crystallized gains — symmetric with the withdraw side,
+        // so a depositor never pays for a gain redemptions can't return.
+        (e.market, e.nav_for_pricing(), e.lp_shares_outstanding, e.size_lots)
     };
     // Flat-gate (see flp_withdraw_v3): NAV omits the pool's open-position
     // unrealized PnL, so a deposit while the pool is non-flat misprices vs the
