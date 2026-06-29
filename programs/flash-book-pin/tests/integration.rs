@@ -2493,3 +2493,41 @@ async fn process_undelegation_rejects_non_signer_buffer() {
         .await;
     assert!(r.is_err(), "a non-signer buffer must be rejected (only the delegation program may finalize)");
 }
+
+// ─── init_fill_commitment e2e (auth gate, before CPI) ───
+// Creates the ring PDA via create_pda CPI (build-sbf only); the market-authority
+// gate runs before the CPI, so a wrong authority is cleanly rejected.
+use flash_book_pin::fill_commitment::FILL_COMMIT_SEED;
+const IX_INIT_FILL_COMMITMENT: u8 = 127;
+
+#[tokio::test]
+async fn init_fill_commitment_rejects_wrong_authority() {
+    let pid = Pubkey::new_unique();
+    let authority = Keypair::new();
+    let imposter = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (fill_commit, _) =
+        Pubkey::find_program_address(&[FILL_COMMIT_SEED, &market.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut m = market_account(pid, Pubkey::new_unique());
+    put_key(&mut m.data, MKT_AUTHORITY, &authority.pubkey()); // real authority
+    pt.add_account(market, m);
+    pt.add_account(imposter.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new(imposter.pubkey(), true), // NOT the market authority
+            AccountMeta::new(market, false),
+            AccountMeta::new(fill_commit, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array([0u8;32]), false),
+        ],
+        data: vec![IX_INIT_FILL_COMMITMENT],
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh))
+        .await;
+    assert!(r.is_err(), "non-authority init_fill_commitment must be rejected");
+}

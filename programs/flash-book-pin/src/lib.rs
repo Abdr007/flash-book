@@ -61,6 +61,7 @@ pub mod twap_order;
 pub mod vault_math;
 pub mod oracle_quorum;
 pub mod pyth_oracle;
+pub mod fill_commitment;
 pub mod er;
 pub mod er_permission;
 pub mod leverage_tiers;
@@ -218,6 +219,7 @@ mod program {
         ForceUndelegateMarketBook = 124,
         CommitMarketBook = 125,
         CommitAndUndelegateMarketBook = 126,
+        InitFillCommitment = 127,
     }
 
     #[inline(always)]
@@ -357,6 +359,7 @@ mod program {
             x if x == Ix::ForceUndelegateMarketBook as u8 => instructions::force_undelegate_market_book::process(program_id, accounts, rest),
             x if x == Ix::CommitMarketBook as u8 => instructions::commit_market_book::commit(program_id, accounts, rest),
             x if x == Ix::CommitAndUndelegateMarketBook as u8 => instructions::commit_market_book::commit_and_undelegate(program_id, accounts, rest),
+            x if x == Ix::InitFillCommitment as u8 => instructions::init_fill_commitment::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
