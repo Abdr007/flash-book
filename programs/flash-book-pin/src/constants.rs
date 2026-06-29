@@ -23,3 +23,7 @@ pub const FORCE_UNDELEGATE_TIMEOUT_SLOTS: u64 = 750;
 /// Slots of settlement silence (committed fills only, heartbeat ignored) before
 /// the censorship backstop opens — catches an alive-but-censoring sequencer.
 pub const CENSORSHIP_ESCAPE_TIMEOUT_SLOTS: u64 = 9_000;
+
+/// Hyperliquid-style partial-withdraw floor: post-withdraw collateral must be at
+/// least this fraction (bps) of total open notional, on top of the stress IM.
+pub const WITHDRAWAL_FLOOR_BPS: u32 = 1_000; // 10%

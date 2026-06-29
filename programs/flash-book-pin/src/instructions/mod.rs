@@ -57,6 +57,7 @@ pub mod migrate_market_to_v3;
 pub mod migrate_position_to_trader_state_key;
 pub mod views;
 pub mod sweep_collateral;
+pub mod partial_withdraw;
 pub mod withdraw_collateral;
 pub mod open_trader_sub_account;
 pub mod transfer_collateral;

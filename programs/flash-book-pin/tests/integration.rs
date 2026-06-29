@@ -2749,3 +2749,63 @@ async fn sweep_collateral_rejects_unauthorized() {
     let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &imposter], bh)).await;
     assert!(r.is_err(), "unauthorized sweep must be rejected");
 }
+
+// ─── partial_withdraw_collateral e2e (strict gate + core entry, before CPI) ───
+const IX_PARTIAL_WITHDRAW: u8 = 140;
+const TS_ER_ACTIVE: usize = 156;
+
+#[tokio::test]
+async fn partial_withdraw_rejects_er_active_trader() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let ts = Pubkey::new_unique();
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut ts_acct = trader_state(pid, trader.pubkey(), 1_000, 0);
+    ts_acct.data[TS_ER_ACTIVE] = 1; // ER-active → strict path fails closed
+    pt.add_account(ts, ts_acct);
+    pt.add_account(trader.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let d = Pubkey::new_unique();
+    pt.add_account(d, Account { lamports: 1, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let mut data = vec![IX_PARTIAL_WITHDRAW];
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(ts, false),
+            AccountMeta::new_readonly(d, false), AccountMeta::new(d, false), AccountMeta::new(d, false),
+            AccountMeta::new_readonly(d, false),
+        ],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
+    assert!(r.is_err(), "ER-active trader must use xdomain withdraw (strict rejected)");
+}
+
+#[tokio::test]
+async fn partial_withdraw_rejects_zero_amount() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let ts = Pubkey::new_unique();
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(ts, trader_state(pid, trader.pubkey(), 1_000, 0)); // er_active = 0
+    pt.add_account(trader.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let d = Pubkey::new_unique();
+    pt.add_account(d, Account { lamports: 1, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let mut data = vec![IX_PARTIAL_WITHDRAW];
+    data.extend_from_slice(&0u64.to_le_bytes()); // zero amount
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(ts, false),
+            AccountMeta::new_readonly(d, false), AccountMeta::new(d, false), AccountMeta::new(d, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(flash_book_pin::cpi::TOKEN_PROGRAM_ID), false),
+        ],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
+    assert!(r.is_err(), "zero amount rejected");
+}
