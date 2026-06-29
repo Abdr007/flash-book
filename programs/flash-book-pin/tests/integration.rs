@@ -1952,3 +1952,96 @@ async fn update_oracle_from_pyth_rejects_wrong_owner() {
     let m = banks.get_account(market).await.unwrap().unwrap();
     assert_eq!(get_u64(&m.data, MKT_MARK), 0, "mark untouched on reject");
 }
+
+// ─── stamp_book_liveness_baseline e2e (positive + negative, no CPI) ───
+// Stamps the slot at which a DELEGATED book started running on the ER. No CPI —
+// it only reads the book's owner (must be the delegation program) and writes the
+// market. book_delegated_at_slot lives at Market offset 232.
+use flash_book_pin::er::DELEGATION_PROGRAM_ID;
+const IX_STAMP_LIVENESS: u8 = 116;
+const MKT_BOOK_DELEGATED_AT: usize = 232;
+
+#[tokio::test]
+async fn stamp_liveness_records_baseline_for_delegated_book() {
+    let pid = Pubkey::new_unique();
+    let payer_signer = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (market_book, _) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_account(pid, Pubkey::new_unique())); // book_delegated_at_slot 0
+    // The book PDA, currently DELEGATED → owned by the delegation program.
+    pt.add_account(
+        market_book,
+        Account {
+            lamports: 1_000_000,
+            data: vec![0u8; 16],
+            owner: Pubkey::new_from_array(DELEGATION_PROGRAM_ID),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    pt.add_account(
+        payer_signer.pubkey(),
+        Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(payer_signer.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(market_book, false),
+        ],
+        data: vec![IX_STAMP_LIVENESS],
+    };
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &payer_signer], bh))
+        .await
+        .unwrap();
+
+    let m = banks.get_account(market).await.unwrap().unwrap();
+    assert_ne!(get_u64(&m.data, MKT_BOOK_DELEGATED_AT), 0, "baseline slot stamped");
+}
+
+#[tokio::test]
+async fn stamp_liveness_rejects_undelegated_book() {
+    let pid = Pubkey::new_unique();
+    let payer_signer = Keypair::new();
+    let market = Pubkey::new_unique();
+    let (market_book, _) =
+        Pubkey::find_program_address(&[MARKET_BOOK_SEED, &market.to_bytes()], &pid);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, market_account(pid, Pubkey::new_unique()));
+    // Book owned by OUR program (i.e. NOT delegated) → no clock to start.
+    pt.add_account(
+        market_book,
+        Account { lamports: 1_000_000, data: vec![0u8; 16], owner: pid, executable: false, rent_epoch: 0 },
+    );
+    pt.add_account(
+        payer_signer.pubkey(),
+        Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 },
+    );
+    let (banks, payer, bh) = pt.start().await;
+
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(payer_signer.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(market_book, false),
+        ],
+        data: vec![IX_STAMP_LIVENESS],
+    };
+    let r = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[&payer, &payer_signer], bh))
+        .await;
+    assert!(r.is_err(), "an undelegated book must be rejected");
+    let m = banks.get_account(market).await.unwrap().unwrap();
+    assert_eq!(get_u64(&m.data, MKT_BOOK_DELEGATED_AT), 0, "no baseline on reject");
+}

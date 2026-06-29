@@ -104,7 +104,15 @@ pub struct Market {
     /// market (sticky). The consuming settlement check is a later batch. `u8`
     /// (align 1) carved from `_reserved`; size unchanged (1152 bytes).
     pub haircut_enabled: u8,
-    pub _reserved: [u8; 927],
+    /// Pads `book_delegated_at_slot` up to the next 8-aligned offset (232) so the
+    /// `repr(C)` layout of every preceding field — and the 1152-byte size — is
+    /// unchanged.
+    pub _pad_bdas: [u8; 7],
+    /// Slot at which this market's book was delegated to the ER (0 = not stamped).
+    /// The baseline `stamp_book_liveness_baseline` records, against which a later
+    /// force-undelegate / escape measures censorship. Carved from `_reserved`.
+    pub book_delegated_at_slot: u64,
+    pub _reserved: [u8; 912],
 }
 
 /// Market trading-status values.
