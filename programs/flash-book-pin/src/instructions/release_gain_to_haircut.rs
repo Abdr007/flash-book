@@ -64,14 +64,17 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
             return Err(ProgramError::IllegalOwner);
         }
     }
-    let ts_trader = {
+    let (ts_trader, ts_sub) = {
         let d = trader_state.try_borrow_data()?;
-        unsafe { (*(d.as_ptr() as *const TraderState)).trader }
+        let ts = unsafe { &*(d.as_ptr() as *const TraderState) };
+        (ts.trader, ts.sub_index)
     };
     let isolated = {
         let d = position.try_borrow_data()?;
         let p = unsafe { &*(d.as_ptr() as *const Position) };
-        if p.trader != ts_trader || p.market != market_key {
+        // Bind by sub_index too (see convert_position) — defence-in-depth even
+        // though this ix is market-authority gated.
+        if p.trader != ts_trader || p.market != market_key || p.sub_index != ts_sub {
             return Err(ProgramError::InvalidArgument);
         }
         p.collateral_quote_lots > 0

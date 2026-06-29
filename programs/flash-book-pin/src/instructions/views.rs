@@ -183,8 +183,13 @@ pub fn liquidation_preview(pid: &Pubkey, accounts: &[AccountInfo], _d: &[u8]) ->
         } else {
             ts_collat
         };
+        // Price at the SYNTHETIC close price (mark moved by the penalty, against
+        // the trader) — what settlement actually fills the injected order at — not
+        // the raw mark, so the preview matches the real bankruptcy resolution.
+        let close_side: u8 = if pos_snap.side == crate::order::Side::Long { 1 } else { 0 };
+        let fill = crate::liquidation::liquidation_penalty_price(close_side, mkt_snap.mark_price.0, penalty_bps);
         let res = crate::liquidation::compute_shortfall(
-            &pos_snap, mkt_snap.mark_price, collateral, &mkt_snap, penalty_bps,
+            &pos_snap, crate::lot::Ticks(fill), collateral, &mkt_snap, penalty_bps,
         )
         .map_err(|_| ProgramError::ArithmeticOverflow)?;
         buf[33..41].copy_from_slice(&res.liquidation_penalty_quote_lots.to_le_bytes());

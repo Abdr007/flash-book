@@ -43,11 +43,19 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     }
     assert_owned_by(exposure, program_id)?;
     assert_disc(exposure, &FLP_PER_MARKET_V3_DISC)?;
-    let (exp_market, capital, nav, total_shares) = {
+    let (exp_market, capital, nav, total_shares, pool_size) = {
         let d = exposure.try_borrow_data()?;
         let e = unsafe { &*(d.as_ptr() as *const FlpExposurePerMarketV3) };
-        (e.market, e.total_capital_quote_lots, e.nav(), e.lp_shares_outstanding)
+        (e.market, e.total_capital_quote_lots, e.nav(), e.lp_shares_outstanding, e.size_lots)
     };
+    // Flat-gate (parity with vault_withdraw_v3 / the singleton FLP, audit H-6):
+    // NAV = capital + REALIZED pnl excludes the pool's OPEN-position unrealized
+    // mark PnL. Redeeming while the pool holds an open inventory position lets the
+    // first LP exit at the stale NAV before a pending loss is realized, dumping it
+    // on the remaining LPs / shared vault. Require the pool flat to redeem.
+    if pool_size != 0 {
+        return Err(ProgramError::InvalidArgument); // pool has an open position
+    }
     assert_pda(exposure, &[FLP_PER_MARKET_SEED, &exp_market[..]], program_id)?;
 
     assert_owned_by(position, program_id)?;

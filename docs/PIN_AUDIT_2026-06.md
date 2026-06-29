@@ -212,6 +212,61 @@ regressions**. Panic/DoS agent: **no reachable panic or OOB on any deployed path
 
 ---
 
+## Full external re-audit on `main` (2026-06) — 6 reviewers, post-everything
+
+After R1/R2 + FLP-v3 + the dead-helper wiring all merged, a fresh 6-reviewer
+external audit (settlement, FLP/vault/collateral, liquidation/ADL, account-model/
+races, arithmetic, economic/MEV) was run on `main`. The proven pure-math core held
+(OI/PnL/funding/shortfall conservation, C-1 margin fix, vault round-trip). **Every
+exploitable finding was in handler glue** — chiefly a recurring `sub_index`-binding
+gap (round-3 added the binding to most paths but missed several) and the
+liquidation-order lifecycle. All fixed:
+
+| Sev | Finding | Fix |
+|-----|---------|-----|
+| **HIGH** | `settle_funding` bound by wallet not `sub_index` → funding-evasion erases the obligation → bad debt | `p.sub_index == ts.sub_index` |
+| **HIGH** | A trader can `cancel_order`/`cancel_all`/`modify_order` their OWN forced-liquidation (type-3) order → liquidation evasion | reject `order_type == 3` in all three |
+| **HIGH** | `auto_deleverage` counter leg not `sub_index`-bound → ADL gain to wrong sub-account + `open_positions` desync → withdraw-while-exposed | bind both legs by `sub_index` |
+| **HIGH** | Unbounded JIT offer price → injected order rests unfillable → permanent liquidation DoS + reward skim | clamp accepted JIT price to the mark band |
+| **HIGH** | FLP v3 no flat-gate → LP escapes the pool's open-position unrealized loss | reject deposit/withdraw when `size_lots != 0` |
+| **MED** | `sweep_collateral` gated on MAINTENANCE not INITIAL margin → bypasses the IM withdraw floor | `im_bps()` override (parity with `partial_withdraw`) |
+| **MED** | `apply_fill` sampled the iso bucket BEFORE the funding settle → a funding-drained isolated loss mis-socialized to insurance | sample iso AFTER funding (anchor order) |
+| **MED** | `apply_fill`/`apply_flp_fill` gated funding on the account being passed, not `market.haircut_enabled` → sequencer omits it to drop funding | require `haircut_state` when `haircut_enabled` |
+| **MED** | `vault_deposit_v3` minted 1:1 into a NAV-0-with-shares vault → depositor diluted into dead shares | `vault_math` rejects (`Insolvent`), Kani-updated |
+| **MED** | `transfer_collateral` missing `er_active` gate | fail-closed `Custom(241)` |
+| **MED** | `record_flp_fill_v3` trusted the snapshotted sequencer (stale after rotation) | check the LIVE `market.sequencer` (market acct added) |
+| **MED** | on-chain self-trade not rejected (`apply_fill` only checked distinct accounts) → seq self-settle drains insurance | reject `taker_ts.trader == maker_ts.trader` |
+| **LOW** | `convert_position` / `release_gain_to_haircut` `sub_index`; settlement `mark==0` band-open; liq dup-scan `sub_index`; `view_liquidation_preview` priced at mark not synthetic | all fixed |
+
+Regression tests: `settle_funding_rejects_sub_index_mismatch`,
+`cancel_order_rejects_forced_liquidation_type3`, `transfer_collateral_rejects_er_active`,
+vault_math `Insolvent` (host + Kani). Suite: 481 host + 73 integration + 25 Kani.
+
+### Documented as deferred (features / inherited — NOT exploitable-today bugs)
+- **Funding accrual is inert** (economic C-1): `Market.cum_funding_index` is never
+  ADVANCED — the velocity/skew engines (`funding_velocity`/`side_accrual`) are
+  unwired, so `cum_now ≡ 0` and all funding moves 0. **Fail-safe** (no funding =
+  no funding-flow attack), but it means the perp has no funding tether. Wiring the
+  rate engine into a sequencer ix is the next feature (the funding-flow attacks
+  above were fixed so they're safe WHEN it's wired). **Top remaining feature.**
+- **`margin_mode` flag** (economic M-5): iso/cross is inferred from
+  `collateral_quote_lots > 0`; a bucket drained to exactly 0 is indistinguishable
+  from cross. The `apply_fill` iso-after-funding fix is the anchor-parity remedy;
+  an explicit `Position.margin_mode` byte (carved from `_pad0`) would close it
+  fully — a hardening BEYOND anchor, deferred.
+- **ADL victim selection** (M-3, off-chain (pnl×lev) rank) and **ADL global
+  conservation leg** (M-4) — inherited; need on-chain ranking + an insurance/FLP
+  settlement leg.
+- **Envelope mark-move cap optional** (S-1) + **trader-vs-trader 50% band** +
+  **`fill_commitment` unwired** (S-2) — sequencer-trust-boundary hardening,
+  inherited/documented; the self-trade half is now fixed on-chain.
+- **FLP `realized_pnl` not crystallized into `capital`** (H-5) — the flat-gate
+  (above) closes the exploit; folding realized PnL into capital is bookkeeping.
+- **Double insurance-draw** (`apply_fill::materialize_realized` + `cover_bad_debt`
+  for the same shortfall) — sequencer-coordination; reconcile the two paths.
+
+---
+
 ## Verified SOUND (high-signal negatives)
 
 Pure-math core (haircut, vault_math, fill_math, funding, peg, concentration,

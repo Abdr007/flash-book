@@ -47,12 +47,18 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     }
     assert_owned_by(exposure, program_id)?;
     assert_disc(exposure, &FLP_PER_MARKET_V3_DISC)?;
-    let (exp_market, nav, outstanding) = {
+    let (exp_market, nav, outstanding, pool_size) = {
         let d = exposure.try_borrow_data()?;
         let e = unsafe { &*(d.as_ptr() as *const FlpExposurePerMarketV3) };
         // Price on NAV (capital + realized_pnl), not capital alone.
-        (e.market, e.nav(), e.lp_shares_outstanding)
+        (e.market, e.nav(), e.lp_shares_outstanding, e.size_lots)
     };
+    // Flat-gate (see flp_withdraw_v3): NAV omits the pool's open-position
+    // unrealized PnL, so a deposit while the pool is non-flat misprices vs the
+    // pending mark move. Require the pool flat to accept capital.
+    if pool_size != 0 {
+        return Err(ProgramError::InvalidArgument); // pool has an open position
+    }
     assert_pda(exposure, &[FLP_PER_MARKET_SEED, &exp_market[..]], program_id)?;
 
     assert_owned_by(insurance, program_id)?;
