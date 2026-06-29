@@ -7420,11 +7420,10 @@ pub mod flash_book {
         // equity and hand it (capped) to the counterparty. Stress-unhealthy-but-
         // solvent positions are handled by ordinary liquidation, which closes near
         // the mark and returns the residual; ADL is reserved for actual bankruptcy.
-        if underwater.side == 0 {
-            require!(health_mark <= bp_ticks, FlashBookError::NotLiquidatable);
-        } else {
-            require!(health_mark >= bp_ticks, FlashBookError::NotLiquidatable);
-        }
+        require!(
+            adl_bankruptcy_reached(underwater.side, health_mark, bp_ticks),
+            FlashBookError::NotLiquidatable
+        );
 
         // Counter-eligibility: counter must have POSITIVE PnL at bp.
         //   Long counter:  pnl = (bp - entry_c) × close × tick > 0  → bp > entry_c
@@ -15777,6 +15776,22 @@ fn route_funding(
     }
 }
 
+/// AUDIT R-1 (2026-06): true iff the (flat, degrade-to-oracle) health-mark price has
+/// reached the bankruptcy price `bp` — i.e. the position's equity is ≤ 0. `bp` is by
+/// construction the equity-zero price (long: below entry, short: above), so a long is
+/// bankrupt at `mark ≤ bp` and a short at `mark ≥ bp`. `auto_deleverage` settles at
+/// `bp` (a full-collateral wipe), so it may fire ONLY on a truly-bankrupt position;
+/// a mark-solvent (equity > 0) one is handled by ordinary liquidation, which returns
+/// the residual. Pure + host-tested so the invariant can't silently regress.
+#[inline]
+fn adl_bankruptcy_reached(side: u8, health_mark: u64, bp_ticks: u64) -> bool {
+    if side == 0 {
+        health_mark <= bp_ticks // long: price fell to/below bankruptcy
+    } else {
+        health_mark >= bp_ticks // short: price rose to/above bankruptcy
+    }
+}
+
 fn settle_position_funding(
     market_cum_funding_index: i128,
     mark_price_ticks: u64,
@@ -16857,6 +16872,47 @@ mod realized_pnl_routing_tests {
         let (new_cross, shortfall) = cross_loss_shortfall(800, 0);
         assert_eq!(new_cross, 0);
         assert_eq!(shortfall, 800);
+    }
+
+    // ── AUDIT R-1 regression (2026-06): ADL fires ONLY on a truly-bankrupt
+    // position. `bp` is the equity-zero price, so a mark-solvent position (long
+    // above bp / short below bp) must be REJECTED by the gate and routed to
+    // ordinary liquidation instead of being wiped at `bp`. Guards the exact helper
+    // `auto_deleverage` now requires.
+    #[test]
+    fn adl_bankruptcy_reached_blocks_mark_solvent_positions() {
+        // LONG bankrupt iff health_mark <= bp:
+        assert!(adl_bankruptcy_reached(0, 90_000, 90_000), "long AT bp → bankrupt");
+        assert!(adl_bankruptcy_reached(0, 89_999, 90_000), "long BELOW bp → bankrupt");
+        assert!(
+            !adl_bankruptcy_reached(0, 90_001, 90_000),
+            "long ABOVE bp → mark-solvent → ADL must be BLOCKED (R-1)"
+        );
+        // SHORT bankrupt iff health_mark >= bp:
+        assert!(adl_bankruptcy_reached(1, 110_000, 110_000), "short AT bp → bankrupt");
+        assert!(adl_bankruptcy_reached(1, 110_001, 110_000), "short ABOVE bp → bankrupt");
+        assert!(
+            !adl_bankruptcy_reached(1, 109_999, 110_000),
+            "short BELOW bp → mark-solvent → ADL must be BLOCKED (R-1)"
+        );
+    }
+
+    // ── AUDIT R-2 regression (2026-06): an isolated loss EXCEEDING its bucket now
+    // surfaces the uncovered remainder as a shortfall (socialized to insurance via
+    // cover_bad_debt) instead of leaving a silent vault deficit. `apply_realized_pnl_
+    // delta`'s isolated branch routes through this same Kani-proven `cross_loss_
+    // shortfall` (now applied to the per-position bucket), identical to the H6 cross
+    // waterfall. This pins the value-conserving math; the apply_fill/apply_flp_fill
+    // end-to-end (insurance actually drawn) is an integration follow-up.
+    #[test]
+    fn isolated_bankruptcy_surfaces_shortfall_for_socialization() {
+        let iso_bucket = 5_000u64;
+        let (new_iso, shortfall) = cross_loss_shortfall(7_000, iso_bucket);
+        assert_eq!(new_iso, 0, "isolated bucket saturates to 0, never negative");
+        assert_eq!(
+            shortfall, 2_000,
+            "uncovered remainder is surfaced for insurance, not a silent vault deficit"
+        );
     }
 
     #[test]
