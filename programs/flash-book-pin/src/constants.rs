@@ -16,3 +16,10 @@ pub const MAX_RESTING_ORDER_DEVIATION_BPS: u32 = 5_000;
 
 /// Max taker fee / |maker rebate| a fee tier may set (bps). Mirrors anchor.
 pub const MAX_FEE_TIER_BPS: u32 = 1_000;
+
+/// Slots of total ER silence (no fill / heartbeat / delegation signal) before the
+/// permissionless `force_undelegate_market_book` escape opens. Mirrors anchor.
+pub const FORCE_UNDELEGATE_TIMEOUT_SLOTS: u64 = 750;
+/// Slots of settlement silence (committed fills only, heartbeat ignored) before
+/// the censorship backstop opens — catches an alive-but-censoring sequencer.
+pub const CENSORSHIP_ESCAPE_TIMEOUT_SLOTS: u64 = 9_000;

@@ -215,6 +215,7 @@ mod program {
         UndelegateMarketBook = 121,
         DelegateMarket = 122,
         UndelegateMarket = 123,
+        ForceUndelegateMarketBook = 124,
     }
 
     #[inline(always)]
@@ -345,6 +346,7 @@ mod program {
             x if x == Ix::UndelegateMarketBook as u8 => instructions::undelegate_market_book::process(program_id, accounts, rest),
             x if x == Ix::DelegateMarket as u8 => instructions::delegate_market::process(program_id, accounts, rest),
             x if x == Ix::UndelegateMarket as u8 => instructions::undelegate_market::process(program_id, accounts, rest),
+            x if x == Ix::ForceUndelegateMarketBook as u8 => instructions::force_undelegate_market_book::process(program_id, accounts, rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
