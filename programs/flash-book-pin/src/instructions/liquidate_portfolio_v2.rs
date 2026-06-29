@@ -73,10 +73,15 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramR
         let ts = unsafe { &*(trader_state.borrow_data_unchecked().as_ptr() as *const TraderState) };
         (ts.trader, ts.collateral_quote_lots, ts.open_positions, ts.sub_index)
     };
-    let (mark, penalty_bps) = {
+    let (mark, penalty_bps, exec_last_mark_update) = {
         let m = unsafe { &*(exec_market.borrow_data_unchecked().as_ptr() as *const Market) };
-        (m.mark_price_ticks, m.liq_penalty_bps)
+        (m.mark_price_ticks, m.liq_penalty_bps, m.last_mark_update_slot)
     };
+    // Mark-staleness gate on the exec market (see liquidate_position_v2): refuse to
+    // liquidate against a frozen mark if the sequencer stalled.
+    if Clock::get()?.slot.saturating_sub(exec_last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS {
+        return Err(ProgramError::Custom(248)); // stale mark
+    }
 
     if ex_size == 0 || ex_trader != ts_trader || ex_market != exec_market_key {
         return Err(ProgramError::InvalidArgument);

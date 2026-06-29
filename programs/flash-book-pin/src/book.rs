@@ -532,9 +532,13 @@ impl<'a> MarketBookHandle<'a> {
         // (place_order/taker/iceberg/twap/bracket/trigger/basket/liquidate/vault)
         // funnels through. `encode_order_id` packs `seq` into 24 bits (masking
         // `& MAX_SEQ_ENCODABLE`); a seq above the ceiling would wrap and collide,
-        // silently breaking price-time priority and order-id uniqueness. Anchor
-        // enforces the equivalent `next_seq < FLP_SEQ_RESERVED_OFFSET` at every
-        // injector; centralizing it here covers all of them. (~2^24 placements.)
+        // silently breaking price-time priority and order-id uniqueness, so reject
+        // it loudly. NOTE: pin's ceiling (2^24-1 ≈ 16.7M) is FAR tighter than
+        // Anchor's `FLP_SEQ_RESERVED_OFFSET` (2^56) because pin uses a 24-bit seq
+        // field in `order_id`. `order_seq_counter` is lifetime-monotonic and never
+        // recycled, so a market reverts every resting insert after ~16.7M lifetime
+        // placements — a known operational ceiling (see AUDIT_SCOPE residuals);
+        // widening the seq field / recycling is a tracked follow-up.
         require!(order.seq <= MAX_SEQ_ENCODABLE, errors::FlashBookError::OutOfRange);
         let idx = self.alloc_node()?;
         // O(1) cache update: capture order_id now, compare against cached

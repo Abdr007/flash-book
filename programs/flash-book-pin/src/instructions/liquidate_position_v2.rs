@@ -69,11 +69,26 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     let market_key = *market.key();
     let caller_key = *caller.key();
 
+    // L-1: the caller's reward account must be DISTINCT from the liquidatee's
+    // trader_state — both are taken as `&mut` (view_mut) when the reward is moved,
+    // and aliasing one allocation is UB — and it must belong to the caller (the
+    // reward is credited to it). `borrow_mut_data_unchecked` bypasses the RefCell
+    // guard that would otherwise catch the alias, so check explicitly.
+    if caller_trader_state.key() == trader_state.key() {
+        return Err(ProgramError::InvalidArgument);
+    }
+    {
+        let cts = unsafe { &*(caller_trader_state.borrow_data_unchecked().as_ptr() as *const TraderState) };
+        if cts.trader != caller_key {
+            return Err(ProgramError::InvalidArgument);
+        }
+    }
+
     // ── snapshot position / trader_state / market params / liq state ────
     let (
         pos_trader, pos_market, pos_side, pos_size, pos_collat,
         ts_trader, ts_collat, ts_open, ts_sub,
-        mark, tick, penalty_bps, reward_bps, auction_dur, cooldown,
+        mark, tick, penalty_bps, reward_bps, auction_dur, cooldown, last_mark_update,
     ) = {
         let p = unsafe { &*(position.borrow_data_unchecked().as_ptr() as *const Position) };
         let ts = unsafe { &*(trader_state.borrow_data_unchecked().as_ptr() as *const TraderState) };
@@ -82,7 +97,7 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
             p.trader, p.market, p.side, p.size_lots, p.collateral_quote_lots,
             ts.trader, ts.collateral_quote_lots, ts.open_positions, ts.sub_index,
             m.mark_price_ticks, m.tick_size, m.liq_penalty_bps, m.liquidator_reward_bps,
-            m.liquidation_auction_duration_slots, m.liquidation_cooldown_slots,
+            m.liquidation_auction_duration_slots, m.liquidation_cooldown_slots, m.last_mark_update_slot,
         )
     };
 
@@ -118,6 +133,14 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 
     let now = Clock::get()?.slot;
 
+    // Mark-staleness gate: pin is mark-only, but if the sequencer stalls the mark
+    // freezes at its last (possibly adverse) value and a permissionless caller
+    // could liquidate against a stale price. Refuse when the mark is older than
+    // MARK_STALENESS_MAX_SLOTS (the mark half of Anchor's F4 freshness gate).
+    if now.saturating_sub(last_mark_update) > crate::constants::MARK_STALENESS_MAX_SLOTS {
+        return Err(ProgramError::Custom(248)); // stale mark — refuse to liquidate
+    }
+
     // ── re-liquidation cooldown ─────────────────────────────────────────
     let (unhealthy_since, last_liquidated) = {
         assert_owned_by(position_liq, pid)?;
@@ -137,6 +160,14 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     };
     if cooldown > 0 && last_liquidated > 0 && now.saturating_sub(last_liquidated) < cooldown {
         return Err(ProgramError::InvalidArgument); // RateLimited
+    }
+    // Unconditional same-slot guard (independent of the configurable cooldown,
+    // which defaults to 0): the reward is paid on order INJECTION, and the close
+    // only settles later via apply_fill, so within one slot the position stays
+    // full-size + unhealthy. Without this, N stacked LiquidatePositionV2 calls in
+    // one tx each skim `reward.min(backing)` and drain the liquidatee's bucket.
+    if last_liquidated == now {
+        return Err(ProgramError::InvalidArgument); // already liquidated this slot
     }
 
     // ── health gate: must be UNHEALTHY at base maintenance ──────────────

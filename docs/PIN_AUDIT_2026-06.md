@@ -64,6 +64,66 @@ audited original.
 - **`gate_price_move` doesn't clamp `dt_slots` to `max_accrual_dt_slots`** —
   oracle envelope hardening, applies to both.
 
+---
+
+## Round 2 — re-audit of the fixes + everything round 1 under-covered
+
+A second 6-reviewer pass: (1) adversarial review of the round-1 fixes, (2) cross-
+instruction / race / TOCTOU, (3) matcher + order lifecycle, (4) vault + session +
+FLP v3, (5) completeness critic over all 145 dispatch arms. The fix-review agent
+confirmed **all 10 round-1 fixes correct — no new bug, off-by-one, aliasing, or
+type-confusion introduced.** New port bugs found in files round 1 didn't touch:
+
+| # | Sev | Location | Bug | Fix |
+|---|-----|----------|-----|-----|
+| 11 | **CRITICAL** | `apply_flp_fill.rs` | Never maintained `open_positions` (anchor does at lib.rs:6943). A trader filling against the FLP pool got a live position while `open_positions` stayed 0 → withdrew **all** collateral while fully exposed → uncovered bad debt. | Maintain `open_positions_after` (parity with `apply_fill`). E2e test `apply_flp_fill_maintains_open_positions`. |
+| 12 | HIGH | `place_taker_order.rs` | Rested the residual into a **crossed/locked book** when the walk truncated at `MAX_TAKER_MATCHES` (anchor guards with `!walk_truncated`, comment lib.rs:1127). | Track `walk_truncated`; don't rest the residual when set. |
+| 13 | HIGH | `apply_fill.rs` + `apply_flp_fill.rs` | No `fill_seq` / `last_settlement_seq` monotonic guard → a replayed/reordered sequencer settlement re-applies the fill (double fees/PnL/OI). Anchor uses `advance_settlement_seq`. | Carve `Market.last_settlement_seq`; require strictly-increasing `fill_seq` (`Custom(246)`) before mutating, in both handlers. |
+| 14 | MED | `apply_flp_fill.rs` | No price band — a compromised sequencer could settle an FLP fill far from the mark to drain pool capital (pool is the maker, no opposing consent). | Band vs mark at `FLP_MAX_FILL_DEVIATION_BPS=300` (`Custom(247)`). E2e test `apply_flp_fill_rejects_out_of_band_price`. |
+| 15 | MED | `apply_flp_fill.rs` | No `(trader, market)` position binding (apply_fill has it). | `bind_or_stamp_position` (shared with apply_fill). |
+| 16 | MED | `place_taker_order.rs` | Residual rested bypassing the anti-stuffing band that `place`/`modify` enforce. | Band vs mark at `MAX_RESTING_ORDER_DEVIATION_BPS` on the residual. |
+| 17 | MED | liquidation (`liquidate_position_v2`/`liquidate_portfolio_v2`/`auto_deleverage`) | Liquidated/ADL'd against an unfreshness-checked mark — a stalled sequencer freezes the mark and a permissionless caller liquidates on it. | Mark-staleness gate (`now - last_mark_update_slot > MARK_STALENESS_MAX_SLOTS` → `Custom(248)`), the mark half of anchor's F4. |
+| 18 | LOW | `place_taker_order.rs` | STP cap checked only `n_matches`, not `n_stp` → `stp_cancel[64]` overrun panic on >64 self-matches. | Cap on both buffers. |
+| 19 | LOW | `liquidate_position_v2.rs` | `caller_trader_state` not distinct from / bound to the liquidatee → `&mut` aliasing UB. | Reject alias + require `cts.trader == caller`. |
+| 20 | LOW | `liquidate_position_v2.rs` | Re-liquidation guard disabled when `cooldown==0` (the default) → same-tx stacked liquidations each skim reward, draining the liquidatee. | Unconditional same-slot guard (`last_liquidated == now`). |
+| 21 | MED | `set_market_maintenance_margin.rs` | Allowed MMR up to `BPS_DENOM`; anchor caps `< 5000`. | Tighten to `< 5_000`. |
+
+### Round-2 HIGH left as a documented residual (needs a model change, NOT hastily patched)
+
+**Position ↔ trader_state binding (systemic).** Pin positions are bound only by
+`(wallet, market)` — there is no position PDA keyed to the trader_state (anchor
+uses `verify_position_pda`). A wallet with sub-accounts can therefore **substitute
+siblings** in every cross-portfolio walk (`liquidate_portfolio_v2`,
+`set_position_cross`/`set_position_isolated`, `sweep_collateral`,
+`partial_withdraw`) to defeat the joint solvency gate → protocol bad debt. The
+correct fix is to PDA-key positions to the trader_state and re-derive+assert that
+PDA for the target and every sibling — a position-identity **model change**
+touching every position-creation and snapshot site plus the `Position` layout. It
+is too invasive to land safely mid-audit without risking regressions; a partial
+patch would give false assurance. **This is the top follow-up before external
+audit sign-off.** (The round-1 `liquidate_portfolio` isolated-leg reject closes the
+isolated-substitution sub-case; the cross sub-account substitution needs the model fix.)
+
+### Round-2 inherited / low-priority (documented, not changed)
+
+- **Per-market FLP v3** (`flp_withdraw_v3`/`record_flp_fill_v3`/`init_flp_per_market`):
+  redeems on capital, never books realized PnL; permissionless recorder authority.
+  Inherited from anchor AND inert — `realized_pnl` is read by no fund-moving ix
+  (subsystem is bookkeeping-only today). Keep gated until PnL settlement lands.
+- **Vault v3 no flat-gate on deposit/perf-fee** (NAV ignores unrealized PnL) —
+  deliberate v3 relaxation, faithfully ported (the non-v3 path gates).
+- **2^24 lifetime seq ceiling** — a market reverts resting inserts after ~16.7M
+  lifetime placements (24-bit `order_id` seq). Fail-loud guard is correct; widening
+  the field / recycling seqs is a follow-up.
+- **Admin-input sanity bounds** (`set_market_max_leverage`, `set_market_sequencer`
+  zero-brick, `set_position_leverage` zero-escape, `set_market_liquidation_params`
+  reward≤penalty, `set_market_risk_params` joint-MMR cap) — admin-trusted; low impact.
+- **6 risk gates ported-but-unwired** (`daily_loss_limit`, `volume_rate_limit`,
+  `min_fill_size`, `peg_pricing`, `borrow_fee`, `pro_rata`) — live in anchor, dead
+  in the port (consistent with WIP plumbing).
+
+---
+
 ## Verified SOUND (high-signal negatives)
 
 Pure-math core (haircut, vault_math, fill_math, funding, peg, concentration,

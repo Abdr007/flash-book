@@ -52,7 +52,7 @@ unsafe fn ensure_pos_disc(ai: &AccountInfo) {
 /// accounting — parity with the Anchor `position.trader == trader_state.trader`
 /// binding (Anchor additionally derives the position by PDA; pin is field-bound).
 #[inline]
-fn bind_or_stamp_position(pos: &mut Position, trader: &Pubkey, market: &Pubkey) -> ProgramResult {
+pub(crate) fn bind_or_stamp_position(pos: &mut Position, trader: &Pubkey, market: &Pubkey) -> ProgramResult {
     if pos.trader == [0u8; 32] && pos.size_lots == 0 {
         pos.trader = *trader;
         pos.market = *market;
@@ -67,10 +67,12 @@ fn bind_or_stamp_position(pos: &mut Position, trader: &Pubkey, market: &Pubkey) 
 /// data: [size_lots u64][price_ticks u64][taker_side u8]
 /// accounts: [sequencer(signer), market, insurance, taker_ts, maker_ts, taker_pos, maker_pos]
 pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    if data.len() < 17 || accounts.len() < 7 { return Err(ProgramError::InvalidInstructionData); }
+    // data: [size u64][price u64][taker_side u8][fill_seq u64]
+    if data.len() < 25 || accounts.len() < 7 { return Err(ProgramError::InvalidInstructionData); }
     let size = u64::from_le_bytes(data[0..8].try_into().unwrap());
     let price = u64::from_le_bytes(data[8..16].try_into().unwrap());
     let taker_side = data[16];
+    let fill_seq = u64::from_le_bytes(data[17..25].try_into().unwrap());
     if taker_side > 1 { return Err(ProgramError::InvalidInstructionData); }
     let maker_side = 1 - taker_side;
 
@@ -106,6 +108,13 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         if market.sequencer != *sequencer.key() { return Err(ProgramError::IllegalOwner); }
         // Paused markets settle no fills.
         if market.status == crate::state::MARKET_STATUS_PAUSED { return Err(ProgramError::InvalidArgument); }
+        // Replay/reorder guard: `fill_seq` must STRICTLY exceed the market's
+        // settlement nonce; advance it atomically with the fill. A re-submitted or
+        // reordered sequencer-signed settlement is rejected before any mutation
+        // (parity with Anchor `advance_settlement_seq` / FillSeqReplay).
+        let next_seq = crate::fill_commitment::advance_settlement_seq(market.settlement_seq(), fill_seq)
+            .map_err(|_| ProgramError::Custom(246))?;
+        market.set_settlement_seq(next_seq);
         let insurance: &mut Insurance = view(&accounts[2]);
         let taker_ts: &mut TraderState = view(&accounts[3]);
         let maker_ts: &mut TraderState = view(&accounts[4]);

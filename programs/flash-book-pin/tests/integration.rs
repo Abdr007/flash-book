@@ -3028,3 +3028,76 @@ async fn basket_v2_rejects_underwater_projection() {
     let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
     assert!(r.is_err(), "underwater basket projection must be rejected");
 }
+
+// ─── apply_flp_fill e2e (audit 2026-06 — CRITICAL open_positions + H-2 band) ───
+use flash_book_pin::state::FLP_EXPOSURE_DISC;
+const IX_APPLY_FLP_FILL: u8 = 7;
+// TS_OPEN_POSITIONS (= 52) is already defined near the top of this file.
+
+fn flp_exposure_acct(pid: Pubkey) -> Account {
+    let mut d = vec![0u8; 968];
+    d[0..8].copy_from_slice(&FLP_EXPOSURE_DISC);
+    rent_account(d, pid)
+}
+
+fn flp_fill_setup(pid: Pubkey, seq: &Keypair)
+    -> (ProgramTest, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey) {
+    let taker = Pubkey::new_unique();
+    let (market, insurance, flp, ts, pos) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut mkt = market_full(pid, 1_000, 1, 500, 0, 0); // mark=1000, tick=1
+    put_key(&mut mkt.data, 8, &seq.pubkey()); // Market.sequencer @ 8
+    pt.add_account(market, mkt);
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(flp, flp_exposure_acct(pid));
+    pt.add_account(ts, trader_state(pid, taker, 1_000_000, 0)); // flat: open_positions = 0
+    pt.add_account(pos, position(pid, taker, market, 0, 0, 0, 0)); // bound to (taker, market)
+    pt.add_account(seq.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    (pt, market, insurance, flp, ts, pos)
+}
+
+fn flp_fill_ix(pid: Pubkey, seq: Pubkey, market: Pubkey, insurance: Pubkey, flp: Pubkey, ts: Pubkey, pos: Pubkey, price: u64, fill_seq: u64) -> Instruction {
+    let mut data = vec![IX_APPLY_FLP_FILL];
+    data.extend_from_slice(&10u64.to_le_bytes());   // size
+    data.extend_from_slice(&price.to_le_bytes());   // price
+    data.push(0u8);                                  // taker_side = long
+    data.extend_from_slice(&fill_seq.to_le_bytes()); // fill_seq
+    Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(seq, true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(insurance, false),
+        AccountMeta::new(flp, false),
+        AccountMeta::new(ts, false),
+        AccountMeta::new(pos, false),
+    ], data }
+}
+
+#[tokio::test]
+async fn apply_flp_fill_maintains_open_positions() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let (pt, market, insurance, flp, ts, pos) = flp_fill_setup(pid, &seq);
+    let (banks, payer, bh) = pt.start().await;
+    // in-band price (== mark), fresh fill_seq.
+    let ix = flp_fill_ix(pid, seq.pubkey(), market, insurance, flp, ts, pos, 1_000, 1);
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    assert!(r.is_ok(), "apply_flp_fill should settle: {r:?}");
+    let ts_after = banks.get_account(ts).await.unwrap().unwrap();
+    // CRITICAL regression: open_positions must go 0 -> 1, else the taker could
+    // withdraw all collateral while holding this FLP-matched position.
+    assert_eq!(ts_after.data[TS_OPEN_POSITIONS], 1, "open_positions must be incremented");
+}
+
+#[tokio::test]
+async fn apply_flp_fill_rejects_out_of_band_price() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let (pt, market, insurance, flp, ts, pos) = flp_fill_setup(pid, &seq);
+    let (banks, payer, bh) = pt.start().await;
+    // price 2000 is +100% vs mark 1000 — far outside FLP_MAX_FILL_DEVIATION_BPS (3%).
+    let ix = flp_fill_ix(pid, seq.pubkey(), market, insurance, flp, ts, pos, 2_000, 1);
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    let err = format!("{:?}", r.expect_err("out-of-band FLP fill must be rejected"));
+    assert!(err.contains("Custom(247)"), "expected band reject Custom(247), got: {err}");
+}
