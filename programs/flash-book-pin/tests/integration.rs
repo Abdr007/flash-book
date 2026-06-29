@@ -3308,3 +3308,33 @@ async fn init_flp_per_market_rejects_non_market_authority() {
     let err = format!("{:?}", r.expect_err("a non-market-authority must not create the per-market FLP pool"));
     assert!(err.contains("IllegalOwner"), "expected IllegalOwner, got: {err}");
 }
+
+// Audit — wire compute_shortfall via view_liquidation_preview (Ix 145): read-only
+// preview of a position's liquidation bankruptcy resolution. Exercises the
+// build_snapshot → compute_shortfall path end-to-end (a bankrupt long: pnl −1000,
+// penalty 450, collateral 100 ⇒ shortfall 1350). The math itself is host-tested.
+const IX_VIEW_LIQUIDATION_PREVIEW: u8 = 145;
+const MKT_LIQ_PENALTY: usize = 216;
+#[tokio::test]
+async fn view_liquidation_preview_runs_compute_shortfall() {
+    let pid = Pubkey::new_unique();
+    let trader = Pubkey::new_unique();
+    let (market, ts, pos) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut mkt = market_full(pid, 900, 1, 500, 10, 10); // mark 900 — underwater for a long @1000
+    put_u32(&mut mkt.data, MKT_LIQ_PENALTY, 500);         // 5% liquidation penalty
+    pt.add_account(market, mkt);
+    pt.add_account(ts, trader_state(pid, trader, 100, 1)); // thin cross collateral
+    pt.add_account(pos, position(pid, trader, market, 0, 10, 1_000, 0)); // long 10 @ 1000
+    let (banks, payer, bh) = pt.start().await;
+    let ix = Instruction {
+        program_id: pid,
+        accounts: vec![
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(ts, false),
+            AccountMeta::new_readonly(pos, false),
+        ],
+        data: vec![IX_VIEW_LIQUIDATION_PREVIEW],
+    };
+    banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+}
