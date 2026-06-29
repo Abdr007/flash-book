@@ -45,6 +45,25 @@ unsafe fn ensure_pos_disc(ai: &AccountInfo) {
     if d[..8] == [0u8; 8] { d[..8].copy_from_slice(&POSITION_DISC); }
 }
 
+/// Bind a settlement position to its `(trader, market)` identity. A FRESH
+/// position (zero identity, flat) is STAMPED on its first fill; an existing one
+/// must MATCH. Without this, a (trusted-but-buggy/compromised) sequencer could
+/// settle a fill onto a mismatched or foreign position and corrupt collateral/OI
+/// accounting — parity with the Anchor `position.trader == trader_state.trader`
+/// binding (Anchor additionally derives the position by PDA; pin is field-bound).
+#[inline]
+fn bind_or_stamp_position(pos: &mut Position, trader: &Pubkey, market: &Pubkey) -> ProgramResult {
+    if pos.trader == [0u8; 32] && pos.size_lots == 0 {
+        pos.trader = *trader;
+        pos.market = *market;
+        Ok(())
+    } else if &pos.trader != trader || &pos.market != market {
+        Err(ProgramError::InvalidArgument)
+    } else {
+        Ok(())
+    }
+}
+
 /// data: [size_lots u64][price_ticks u64][taker_side u8]
 /// accounts: [sequencer(signer), market, insurance, taker_ts, maker_ts, taker_pos, maker_pos]
 pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -73,6 +92,13 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     assert_owned_by(&accounts[4], pid)?; assert_disc(&accounts[4], &TRADER_STATE_DISC)?;
     assert_position(&accounts[5], pid)?;
     assert_position(&accounts[6], pid)?;
+    // The two legs MUST be distinct accounts. Both trader_states and both
+    // positions are taken as `&mut` via `view()`; aliasing either pair would be
+    // two simultaneous `&mut` to one allocation (UB). Distinct traders is also
+    // the matcher's invariant (self-trades are prevented upstream).
+    if accounts[3].key() == accounts[4].key() || accounts[5].key() == accounts[6].key() {
+        return Err(ProgramError::InvalidArgument);
+    }
 
     unsafe {
         let market: &mut Market = view(&accounts[1]);
@@ -87,6 +113,12 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         ensure_pos_disc(&accounts[6]);
         let taker_pos: &mut Position = view(&accounts[5]);
         let maker_pos: &mut Position = view(&accounts[6]);
+
+        // Bind/stamp each leg's (trader, market) identity BEFORE any mutation, so
+        // a mismatched position is rejected atomically with no state change.
+        let mkt_key = *accounts[1].key();
+        bind_or_stamp_position(taker_pos, &taker_ts.trader, &mkt_key)?;
+        bind_or_stamp_position(maker_pos, &maker_ts.trader, &mkt_key)?;
 
         let fidx = market.cum_funding();
         // Snapshot sizes so we can maintain each trader's open_positions count

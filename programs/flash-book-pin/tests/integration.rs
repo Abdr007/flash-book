@@ -2783,6 +2783,49 @@ async fn partial_withdraw_rejects_er_active_trader() {
     assert!(r.is_err(), "ER-active trader must use xdomain withdraw (strict rejected)");
 }
 
+// Audit 2026-06 regression: the STRICT full `withdraw_collateral` (ix 12) must
+// ALSO fail closed for an ER-active trader (parity with the Anchor
+// `require!(s.er_active == 0, UseXDomainWithdraw)`). Before the fix it had no ER
+// check at all, so an ER-active trader with 0 mainnet `open_positions` could pull
+// collateral that backs their ER resting orders → ER bad debt.
+const IX_WITHDRAW_COLLATERAL: u8 = 12;
+#[tokio::test]
+async fn withdraw_collateral_rejects_er_active_trader() {
+    let pid = Pubkey::new_unique();
+    let trader = Keypair::new();
+    let ts = Pubkey::new_unique();
+    let (insurance, _) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let d = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    let mut ts_acct = trader_state(pid, trader.pubkey(), 1_000, 0); // flat (open=0)
+    ts_acct.data[TS_ER_ACTIVE] = 1; // but ER-active ⇒ must route via xdomain
+    pt.add_account(ts, ts_acct);
+    pt.add_account(insurance, insurance_full(pid, 0, 0));
+    pt.add_account(d, Account { lamports: 1, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    pt.add_account(trader.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8;32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+    let mut data = vec![IX_WITHDRAW_COLLATERAL];
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid,
+        // [trader(signer), trader_state, insurance, quote_vault, trader_ata, token_program]
+        accounts: vec![
+            AccountMeta::new_readonly(trader.pubkey(), true),
+            AccountMeta::new(ts, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new(d, false), AccountMeta::new(d, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(flash_book_pin::cpi::TOKEN_PROGRAM_ID), false),
+        ],
+        data,
+    };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &trader], bh)).await;
+    let err = format!("{:?}", r.expect_err("ER-active trader must not use the strict full withdraw"));
+    // Custom(241) = "use xdomain withdraw" — proves the er_active gate (which runs
+    // BEFORE the vault-binding check) is what rejected, not some later failure.
+    assert!(err.contains("Custom(241)"), "expected er_active gate Custom(241), got: {err}");
+}
+
 #[tokio::test]
 async fn partial_withdraw_rejects_zero_amount() {
     let pid = Pubkey::new_unique();

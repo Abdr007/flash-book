@@ -60,6 +60,13 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         if &ts.trader != trader.key() {
             return Err(ProgramError::InvalidArgument);
         }
+        // ER-active traders (attested ER-reserved margin backing resting orders
+        // that live OUTSIDE `open_positions`) MUST withdraw via the xdomain
+        // variant that honors `reserved_margin`. Fail closed here — parity with
+        // the Anchor strict path (`require!(s.er_active == 0, UseXDomainWithdraw)`).
+        if ts.er_active != 0 {
+            return Err(ProgramError::Custom(241)); // use xdomain withdraw
+        }
         // Position-safe: must be flat to withdraw (collateral may back positions).
         if ts.open_positions != 0 {
             return Err(ProgramError::InvalidArgument);

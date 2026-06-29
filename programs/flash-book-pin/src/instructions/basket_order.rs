@@ -60,14 +60,22 @@ fn im_bps(maintenance_bps: u32, max_leverage: u32) -> u32 {
 }
 
 /// Project a position's worst-case post-leg state for the joint margin check.
-fn project_post_leg(pos: &Position, leg: &BasketLeg, market_key: &Pubkey) -> PositionSnapshot {
+/// `market_cum_funding` is the market's CURRENT cumulative funding index; a fresh
+/// leg opens at it (so its projected funding delta is 0), matching the Anchor
+/// original (`cum_funding_index_at_entry: market.cum_funding_index`).
+fn project_post_leg(
+    pos: &Position,
+    leg: &BasketLeg,
+    market_key: &Pubkey,
+    market_cum_funding: i128,
+) -> PositionSnapshot {
     if pos.size_lots == 0 {
         return PositionSnapshot {
             market: *market_key,
             side: if leg.side == 0 { Side::Long } else { Side::Short },
             size_lots: leg.size_lots,
             entry_price: Ticks(leg.limit_ticks),
-            cum_funding_index_at_entry: i128::from_le_bytes(pos.cum_funding_index),
+            cum_funding_index_at_entry: market_cum_funding,
             collateral_quote_lots: pos.collateral_quote_lots,
         };
     }
@@ -131,10 +139,10 @@ fn run(pid: &Pubkey, accounts: &[AccountInfo], legs: &[BasketLeg]) -> ProgramRes
         }
         seen[i] = *market.key();
 
-        let (mark, tick, min_lot, status, maint, max_lev) = {
+        let (mark, tick, min_lot, status, maint, max_lev, cum_funding) = {
             let d = market.try_borrow_data()?;
             let m = unsafe { &*(d.as_ptr() as *const Market) };
-            (m.mark_price_ticks, m.tick_size, m.min_base_lots, m.status, m.maintenance_margin_bps, m.max_leverage)
+            (m.mark_price_ticks, m.tick_size, m.min_base_lots, m.status, m.maintenance_margin_bps, m.max_leverage, m.cum_funding())
         };
         // validate_leg_intake
         if leg.side > 1 || leg.size_lots == 0 || leg.limit_ticks == 0 || status != MARKET_STATUS_ACTIVE {
@@ -149,15 +157,21 @@ fn run(pid: &Pubkey, accounts: &[AccountInfo], legs: &[BasketLeg]) -> ProgramRes
         {
             let d = position.try_borrow_data()?;
             let p = unsafe { &*(d.as_ptr() as *const Position) };
-            if (p.size_lots != 0) && (&p.trader != &trader_pk || &p.market != market.key()) {
+            // `assert_disc(POSITION_DISC)` above already required an INITIALIZED
+            // position account, so bind it to (trader, market) UNCONDITIONALLY —
+            // even when flat. Otherwise a trader holding a real (e.g. underwater)
+            // position in this market could pass a foreign/other-market flat
+            // position to hide it from the single joint gate (the C-2 omit-a-
+            // risky-position defeat the withdraw/sweep walks already block).
+            if &p.trader != &trader_pk || &p.market != market.key() {
                 return Err(ProgramError::InvalidArgument);
             }
-            positions[i] = project_post_leg(p, leg, market.key());
+            positions[i] = project_post_leg(p, leg, market.key(), cum_funding);
         }
         markets[i] = MarketSnapshot {
             market: *market.key(),
             mark_price: Ticks(mark),
-            cum_funding_index: 0,
+            cum_funding_index: cum_funding,
             maintenance_margin_bps: im_bps(maint, max_lev), // RISK-2: initial margin
             tick_size: tick,
             concentration_threshold_lots: 0,
