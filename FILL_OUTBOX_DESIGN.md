@@ -1,12 +1,16 @@
 # Fill-Outbox — design scope
 
-**Status: IMPLEMENTED + DEPLOYED + DEVNET-SMOKED (2026-06-29).** Deployed to devnet
-(upgrade sig `5tXKx9DPtTqb…`); smoke `23_outbox_smoke.mjs` PASSED on the live
-cluster — `init_fill_outbox` + `grow_fill_outbox`×2 → 24,640 B account at cap 256;
-a cap-256 market hard-rejected an omit-outbox taker (`FillOutboxRequired`); an
-8-level sweep delivered all fills off-log (outbox cursor = 8, every fill read from
-the account). IDL patched (5 new ix + 4 events + error + field). **P-A→P-C on-chain,
-all tests green.** New module
+**Status: IMPLEMENTED + DEPLOYED + DEVNET-SMOKED + VERSATILE (2026-06-29).** Deployed
+to devnet (latest sig `4oUsqBYL…`). The cap is a **per-market knob**
+(`init_fill_commitment(cap)`, `cap ∈ [96,256]`): **`cap ≤ 105` = fully ER-capable**
+(book + ring + full outbox all one-CPI delegate-safe — the live `er-acceptance/`
+suite's "delegate book + ring + OUTBOX" stage PASSES on the MagicBlock devnet ER),
+**`cap` up to 256 = L1 deep-sweep** (256 smoke `23_outbox_smoke.mjs` PASS — 24,640 B
+outbox, omit-outbox hard-rejected, 8 fills off-log). The outbox reads the ring cap
+(single source of truth). IDL patched (5 ix + 4 events + error + field;
+`init_fill_commitment` gains `cap`, `init_fill_outbox` reads the ring). **P-A→P-C
+on-chain, all tests green** (447 host + 69 integration incl. `fill_outbox_versatile_er_cap`).
+New module
 `matcher/fill_outbox.rs` (11 host tests) + `init/grow/delegate/commit_fill_outbox`
 instructions + `max_batch_orders` field + heap-frugal matcher write + slim
 `FillBatchOutboxEvent`. Proven end-to-end by `fill_outbox_deep_sweep_256`:
@@ -210,9 +214,16 @@ from a `_pad` field (the struct has none). **Verified headroom:**
 build-time `assert!(size_of ≤ 1152)` guards it. Pre-existing markets read the tail
 field back as `0` (trailing-zero convention); the walk treats **`0` ⇒ the 96
 default**, so `0` is never a real cap and migration needs no backfill.
-`init_fill_outbox` is the **only** path allowed to raise it (≤ `FILL_RING_CAP`
-= 256, and only when ring `cap` ≥ the new value). A market without an outbox stays
-log-safe at 96; a market with one can run up to 256. No global flag day.
+
+**The cap is the versatile per-market knob.** It is chosen ONCE at
+`init_fill_commitment(cap)` (cap ∈ `[96, 256]` — `≥ MAX_BATCH_ORDERS_PER_SIDE_V2`
+so a log-mode market can't overflow the ring, `≤ FILL_RING_CAP`). The ring is the
+single source of truth: `init_fill_outbox` (no arg) **reads the ring cap** and sizes
+the outbox + `market.max_batch_orders` to match, so `fo_cap >= ring_cap` holds by
+construction (no operator footgun). A market without an outbox stays log-safe at 96;
+a market with one runs up to its cap. **`cap ≤ 105` is fully ER-capable** (ring +
+full outbox both one-CPI delegate-safe — verified on the live ER); **`cap` up to 256
+is the L1 deep-sweep** (§10). No global flag day.
 
 ## 9. Capacity / rent / CU
 
@@ -240,20 +251,20 @@ log-safe at 96; a market with one can run up to 256. No global flag day.
 
 ## 10. ER / delegation
 
-> **CONSTRAINT — verified on the live MagicBlock devnet ER (2026-06-29, the
-> `er-acceptance/` suite): a 256-slot (24,640 B) outbox CANNOT be delegated to the
-> ER.** `delegate_fill_outbox` → `cpi_delegate` creates the delegate-buffer at the
-> full account size via one `create_account` CPI (`er.rs::create_pda`), which hits
-> the same 10,240 B/ix BPF-loader cap (`DelegateFillOutbox` reverts "Failed to
-> reallocate account data"). Because the matcher requires `fo_cap >= ring_cap`
-> (256), the deep outbox is therefore **L1-only** under the current ring cap — book
-> + ring delegate fine (both < 10,240 B) and the §3.2 authenticity round-trip works
-> on the ER, but the 256-cap deep-sweep is an **L1 feature**. To run a deep outbox
-> *on* the ER would need either (a) a chunked delegate-buffer staging (create small
-> + grow + stage + delegate across ixs — a new delegate flow), or (b) a smaller
-> per-market ring+outbox cap (≤106 slots, both one-CPI-delegatable). Decision
-> pending; the L1 256 path is unaffected. The unit/integration suite never caught
-> this (it doesn't delegate); only the live-ER suite did — the Tier-2 value.
+> **VERSATILE — resolved via a per-market cap (2026-06-29, live-ER verified).** The
+> cap is the per-market knob set at `init_fill_commitment(cap)`; the outbox reads
+> the ring cap and sizes to match. **`cap <= 105`** keeps BOTH the ring (≤3,424 B)
+> and the FULL outbox (≤10,144 B) one-CPI delegate-safe → the **entire off-log
+> pipeline (book + ring + outbox) delegates to the ER** (verified: the
+> `er-acceptance/` suite's "delegate book + ring + OUTBOX" stage PASSES at cap 105 on
+> the live MagicBlock devnet). **`cap` up to 256** is the L1 deep-sweep (a 24,640 B
+> outbox cannot be ER-delegated — `cpi_delegate` creates the delegate-buffer at the
+> full account size in one CPI, over the 10,240 B/ix BPF-loader cap). So one
+> mechanism serves both: an ER market picks `cap ≤ 105` (off-log delivery on the
+> rollup), an L1 market picks up to 256. Only the live-ER suite caught the
+> delegate-buffer limit (the unit/integration suite doesn't delegate) — the Tier-2
+> value. (A deep outbox *on* the ER would additionally need a chunked
+> delegate-buffer staging — deferred; cap ≤105 covers the ER need.)
 
 The outbox mirrors the ring's ER lifecycle: `delegate_fill_outbox` /
 `commit_fill_outbox` / `commit_and_undelegate_fill_outbox` (copy-adapted from the

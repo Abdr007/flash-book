@@ -4162,7 +4162,12 @@
           "address": "11111111111111111111111111111111"
         }
       ],
-      "args": []
+      "args": [
+        {
+          "name": "cap",
+          "type": "u32"
+        }
+      ]
     },
     {
       "name": "grow_fill_commitment",
@@ -12855,16 +12860,38 @@
           }
         },
         {
+          "name": "fill_commitment",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  105,
+                  108,
+                  108,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
           "name": "system_program",
           "address": "11111111111111111111111111111111"
         }
       ],
-      "args": [
-        {
-          "name": "max_batch_orders",
-          "type": "u16"
-        }
-      ]
+      "args": []
     },
     {
       "name": "grow_fill_outbox",

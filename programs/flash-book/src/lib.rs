@@ -153,11 +153,23 @@ pub mod flash_book {
     /// compromised sequencer cannot fabricate fills. `UncheckedAccount` for the
     /// same reason as `market_book` (flat byte region, sized in the handler).
     /// Permissioned to the market authority. Co-delegatable with the book.
-    pub fn init_fill_commitment(ctx: Context<InitFillCommitment>) -> Result<()> {
+    pub fn init_fill_commitment(ctx: Context<InitFillCommitment>, cap: u32) -> Result<()> {
         use matcher::fill_commitment as fc;
+        // Per-market ring cap — the versatile knob. Bounds:
+        //   * `>= MAX_BATCH_ORDERS_PER_SIDE_V2` (96): a log-mode market with no
+        //     outbox can walk up to the global default, which a smaller ring would
+        //     overflow (`FillRingFull`).
+        //   * `<= FILL_RING_CAP` (256): the account-size + Kani-proof bound.
+        // A cap `<= 105` keeps BOTH the ring (≤3,424 B) and a matching outbox
+        // (≤10,144 B) one-CPI delegate-safe → the whole off-log pipeline runs ON the
+        // ER. Up to 256 is the L1 deep-sweep (the outbox can't be ER-delegated past
+        // ~105 — the 10,240 B/ix buffer-create cap; see FILL_OUTBOX_DESIGN.md §10).
+        require!(
+            cap >= MAX_BATCH_ORDERS_PER_SIDE_V2 as u32 && cap <= fc::FILL_RING_CAP,
+            FlashBookError::OutOfRange
+        );
         let market_key = ctx.accounts.market.key();
         let bump = ctx.bumps.fill_commitment;
-        let cap = fc::FILL_RING_CAP;
 
         let space = fc::fill_commit_account_len(cap as usize);
         let rent = Rent::get()?;
@@ -898,10 +910,7 @@ pub mod flash_book {
     /// the market be ARMED (`init_fill_commitment` first): the outbox is addressed
     /// by the ring cursor and is meaningless without it. Authority-gated;
     /// co-delegatable with the book + ring.
-    pub fn init_fill_outbox(
-        ctx: Context<InitFillOutbox>,
-        max_batch_orders: u16,
-    ) -> Result<()> {
+    pub fn init_fill_outbox(ctx: Context<InitFillOutbox>) -> Result<()> {
         use matcher::fill_commitment as fc;
         use matcher::fill_outbox as fo;
         // The outbox extends an armed market — the ring must already exist (its
@@ -910,18 +919,24 @@ pub mod flash_book {
             ctx.accounts.market.fill_commitment_required,
             FlashBookError::FillCommitmentMissing
         );
-        // Cap must be in (0, FILL_RING_CAP]; the ring/outbox can hold no more.
-        require!(
-            max_batch_orders >= 1 && (max_batch_orders as u32) <= fc::FILL_RING_CAP,
-            FlashBookError::OutOfRange
-        );
-
         let market_key = ctx.accounts.market.key();
+        // The RING is the single source of truth for the cap — read it and size the
+        // outbox + the market batch cap to MATCH, so `fo_cap >= ring_cap` holds by
+        // construction (no operator footgun, no cap param to mismatch).
+        let ring_cap = {
+            let rd = ctx.accounts.fill_commitment.try_borrow_data()?;
+            fc::buffer_check(&rd, &market_key.to_bytes())
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?
+        };
+
         let bump = ctx.bumps.fill_outbox;
-        // Created at the base cap (one CPI can grow an account by ≤10,240 B; a full
-        // 256-slot outbox is 24,640 B). `grow_fill_outbox` raises it to the ring
-        // cap; the matcher keeps outbox matching INERT (fail-closed) until then.
-        let cap = fo::FILL_OUTBOX_INIT_CAP;
+        // Create at `min(ring_cap, FILL_OUTBOX_INIT_CAP)`. For a ring_cap <= 105 the
+        // FULL outbox fits one CPI (≤10,144 B) — created complete and immediately
+        // ER-delegatable (the whole off-log pipeline runs on the ER). For a larger
+        // (L1) ring_cap the outbox is created at the base and `grow_fill_outbox`
+        // raises it to `ring_cap`; the matcher keeps outbox matching INERT
+        // (fail-closed) until then.
+        let cap = ring_cap.min(fo::FILL_OUTBOX_INIT_CAP);
 
         let space = fo::fill_outbox_account_len(cap as usize);
         let rent = Rent::get()?;
@@ -949,16 +964,17 @@ pub mod flash_book {
             .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
         drop(data);
 
-        // Raise the per-market matcher batch cap (the whole point). With the
-        // outbox armed, the matcher delivers fills off-log, so the cap is no
-        // longer pinned to the log-safe 96.
-        ctx.accounts.market.max_batch_orders = max_batch_orders;
+        // Raise the per-market matcher batch cap to the ring cap (the whole point).
+        // With the outbox armed, the matcher delivers fills off-log, so the cap is no
+        // longer pinned to the log-safe 96. Matching stays inert until the outbox is
+        // grown to cover `ring_cap` (a no-op when ring_cap <= the one-CPI base).
+        ctx.accounts.market.max_batch_orders = ring_cap as u16;
 
         emit!(FillOutboxInitializedEvent {
             market: market_key,
             fill_outbox: ctx.accounts.fill_outbox.key(),
             cap,
-            max_batch_orders,
+            max_batch_orders: ring_cap as u16,
             total_bytes: space as u32,
         });
         Ok(())
@@ -12223,6 +12239,14 @@ pub struct InitFillOutbox<'info> {
         bump,
     )]
     pub fill_outbox: UncheckedAccount<'info>,
+
+    /// CHECK: the per-market commitment ring — READ to source the cap (single
+    /// source of truth). Bound by the seed derivation; handler `buffer_check`s it.
+    #[account(
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }

@@ -80,50 +80,49 @@ const FC = pda(["fill_commit", M]);
 const FO = pda(["fill_outbox", M]);
 console.log("market", M.toBase58());
 
-// NOTE (finding from this suite's first run): the 256-slot fill-outbox (24,640 B)
-// CANNOT be ER-delegated — `cpi_delegate` creates the delegate-buffer at the full
-// account size via one `create_account` CPI, which exceeds the 10,240 B/ix BPF
-// loader limit. Since the matcher requires `fo_cap >= ring_cap` (256), the deep
-// outbox is therefore **L1-only** under the current ring cap. So the ER round-trip
-// here covers the supported ER config — book + the §3.2 commitment ring (96-cap,
-// the path flash.trade runs) — which is the security-critical claim: the
-// fill-authenticity ring survives delegate → match → commit → undelegate. The
-// outbox's ER constraint is probed + recorded as a known limitation at the end.
+// VERSATILE config: a per-market cap of 105 keeps BOTH the ring (3,424 B) and the
+// FULL outbox (10,144 B) one-CPI delegate-safe (< 10,240 B), so the entire off-log
+// pipeline — book + §3.2 ring + fill-outbox — delegates to the ER. (At cap 256 the
+// outbox can't be ER-delegated; that's the L1 deep-sweep config. See
+// FILL_OUTBOX_DESIGN.md §10.) This round-trip therefore covers the FULL ER pipeline.
+const CAP = 105;
 
 try {
   const ref = await program.account.marketAccount.fetch(REF_MARKET);
 
-  // ── L1: build a fresh 96-cap market (book + §3.2 ring; NO outbox in the loop) ──
-  await stage("L1 init_market + book + ring (96-cap)", async () => {
+  // ── L1: build a fresh cap-105 market (book + ring + FULL outbox, no grow) ──
+  await stage(`L1 init_market + book + ring + outbox (cap ${CAP}, ER-capable)`, async () => {
     await send(l1, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [base]);
     await send(l1, await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction(), []);
-    await send(l1, await program.methods.initFillCommitment().accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction(), []);
+    await send(l1, await program.methods.initFillCommitment(CAP).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction(), []);
+    await send(l1, await program.methods.initFillOutbox().accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, fillCommitment: FC, systemProgram: sys }).instruction(), []);
+    const fo = await l1.getAccountInfo(FO);
+    if (decodeOutbox(fo.data).cap !== CAP) throw new Error(`outbox not full ${CAP} in one ix`);
   });
 
-  // ── L1: delegate book + ring to the ER (the CPI round-trip start) ──
+  // ── L1: delegate book + ring + OUTBOX to the ER (all one-CPI-safe at cap 105) ──
   const delegArgs = (acct) => ({
     buf: pda(["buffer", acct]),
     rec: pda(["delegation", acct], DELEG),
     meta: pda(["delegation-metadata", acct], DELEG),
   });
-  await stage("L1 delegate book + ring → DLP", async () => {
+  await stage("L1 delegate book + ring + OUTBOX → DLP (versatile: outbox now delegates)", async () => {
     const b = delegArgs(BOOK);
     await send(l1, await program.methods.delegateMarketBook(30000, null).accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, ownerProgram: PID, delegateBuffer: b.buf, delegationRecord: b.rec, delegationMetadata: b.meta, systemProgram: sys, delegationProgram: DELEG }).instruction(), []);
     const c = delegArgs(FC);
     await send(l1, await program.methods.delegateFillCommitment(30000, null).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, ownerProgram: PID, delegateBuffer: c.buf, delegationRecord: c.rec, delegationMetadata: c.meta, systemProgram: sys, delegationProgram: DELEG }).instruction(), []);
+    const o = delegArgs(FO);
+    await send(l1, await program.methods.delegateFillOutbox(30000, null).accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, ownerProgram: PID, delegateBuffer: o.buf, delegationRecord: o.rec, delegationMetadata: o.meta, systemProgram: sys, delegationProgram: DELEG }).instruction(), []);
   });
   await sleep(4000); // let the ER validator pick up the delegated accounts
 
-  // ── ER: match a taker against rested bids on the rollup (commitments pushed on ER) ──
-  // ROUTING (finding from the first run): the delegated accounts must be on the
-  // validator behind ER_RPC. With `null` validator the DLP assigns them to whichever
-  // validator claims them, so a bare public endpoint may return InvalidWritableAccount
-  // ("this account isn't delegated to me"). For a deterministic green here, delegate
-  // to the ER_RPC endpoint's validator identity (replace `null` in the delegate calls
-  // with its pubkey) or send through the MagicBlock router that forwards to the owner.
-  // The delegate-CPI itself (book + ring) is already validated above.
+  // ── ER: match a taker on the rollup (commitments pushed + outbox written ON the ER) ──
+  // ROUTING: with `null` validator the DLP assigns the accounts to whichever validator
+  // claims them; the ER match must transact against THAT validator (or the MagicBlock
+  // router), else it returns InvalidWritableAccount. Pin the validator identity in the
+  // delegate calls, or route through the MagicBlock router, for a deterministic green.
   const taker = Keypair.generate();
-  await stage("ER rest bids + taker sweep (4 fills, ring commitments on the ER)", async () => {
+  await stage("ER rest bids + taker sweep (4 fills; commitments + outbox on the ER)", async () => {
     await send(l1, SystemProgram.transfer({ fromPubkey: signer.publicKey, toPubkey: taker.publicKey, lamports: 30_000_000 }), []);
     for (let i = 0; i < 4; i++) {
       const tick = 90000 - i * 10;
@@ -131,54 +130,40 @@ try {
     }
     await send(er, await program.methods.placeTakerOrderV2(1, new BN(4), new BN(1), 0, new BN(0), 0)
       .accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK })
-      .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
+      .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
   });
 
-  // ── ER: commit the (book, ring) snapshot to L1 ──
+  // ── ER: commit the (book, ring, outbox) snapshot to L1 ──
   await stage("ER commit_* → L1 snapshot", async () => {
     await send(er, await program.methods.commitMarketBook().accountsPartial({ payer: signer.publicKey, marketBook: BOOK, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
     await send(er, await program.methods.commitFillCommitment().accountsPartial({ payer: signer.publicKey, fillCommitment: FC, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
+    await send(er, await program.methods.commitFillOutbox().accountsPartial({ payer: signer.publicKey, fillOutbox: FO, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
   });
   await sleep(5000); // commit propagation to L1
 
-  // ── L1: assert the committed RING survived the round-trip (4 commitments produced) ──
-  await stage("L1 assert committed ring cursor == 4 (authenticity survived ER)", async () => {
-    const acct = await l1.getAccountInfo(FC);
-    if (!acct) throw new Error("ring missing on L1 after commit");
-    const r = decodeOutbox(acct.data); // same header layout (produced@8, cap@24)
-    if (r.produced !== 4) throw new Error(`expected ring produced=4, got ${r.produced}`);
+  // ── L1: assert ring + outbox both survived the round-trip (4 fills each) ──
+  await stage("L1 assert committed ring + outbox cursor == 4 (authenticity + data survived ER)", async () => {
+    const r = decodeOutbox((await l1.getAccountInfo(FC)).data);
+    if (r.produced !== 4) throw new Error(`ring produced=${r.produced}, expected 4`);
+    const o = decodeOutbox((await l1.getAccountInfo(FO)).data);
+    if (o.produced !== 4) throw new Error(`outbox produced=${o.produced}, expected 4`);
   });
 
   // ── ER: commit-and-undelegate → process_undelegation finalizes on L1 ──
   await stage("ER commit_and_undelegate_* → L1 finalize", async () => {
     await send(er, await program.methods.commitAndUndelegateMarketBook().accountsPartial({ payer: signer.publicKey, marketBook: BOOK, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
     await send(er, await program.methods.commitAndUndelegateFillCommitment().accountsPartial({ payer: signer.publicKey, fillCommitment: FC, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
+    await send(er, await program.methods.commitAndUndelegateFillOutbox().accountsPartial({ payer: signer.publicKey, fillOutbox: FO, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
   });
   await sleep(7000); // undelegation callback to L1
 
-  // ── L1: assert accounts are back under the program + valid (from_account_data accepts) ──
-  await stage("L1 assert undelegated + valid (program-owned, book + ring decode)", async () => {
-    const fc = await l1.getAccountInfo(FC);
-    if (!fc || !fc.owner.equals(PID)) throw new Error("ring not back under program after undelegate");
-    if (decodeOutbox(fc.data).cap === 0) throw new Error("ring corrupt after undelegate");
-    const book = await l1.getAccountInfo(BOOK);
-    if (!book || !book.owner.equals(PID)) throw new Error("book not back under program after undelegate");
-  });
-
-  // ── KNOWN-LIMITATION probe: the 256-outbox cannot be ER-delegated (10,240 B/ix
-  // CPI cap on the delegate-buffer create). Recorded, not a suite failure. ──
-  await stage("PROBE outbox ER-delegation is correctly blocked (L1-only at 256)", async () => {
-    await send(l1, await program.methods.initFillOutbox(256).accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, systemProgram: sys }).instruction(), []);
-    await send(l1, await program.methods.growFillOutbox(106).accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, systemProgram: sys }).instruction(), []);
-    await send(l1, await program.methods.growFillOutbox(45).accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, systemProgram: sys }).instruction(), []);
-    const o = delegArgs(FO);
-    let blocked = false;
-    try {
-      await send(l1, await program.methods.delegateFillOutbox(30000, null).accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, ownerProgram: PID, delegateBuffer: o.buf, delegationRecord: o.rec, delegationMetadata: o.meta, systemProgram: sys, delegationProgram: DELEG }).instruction(), []);
-    } catch (e) {
-      blocked = String(e.message || e).includes("reallocate") || String(e.message || e).includes("0x");
+  // ── L1: assert all three back under the program + valid (from_account_data accepts) ──
+  await stage("L1 assert undelegated + valid (book + ring + outbox program-owned, decode)", async () => {
+    for (const [name, k] of [["ring", FC], ["outbox", FO], ["book", BOOK]]) {
+      const a = await l1.getAccountInfo(k);
+      if (!a || !a.owner.equals(PID)) throw new Error(`${name} not back under program after undelegate`);
     }
-    if (!blocked) throw new Error("expected delegate_fill_outbox(256) to be blocked by the 10,240 B/ix buffer-create cap, but it succeeded");
+    if (decodeOutbox((await l1.getAccountInfo(FO)).data).cap !== CAP) throw new Error("outbox corrupt after undelegate");
   });
 } catch (e) {
   // a stage already logged the failure; fall through to the report
