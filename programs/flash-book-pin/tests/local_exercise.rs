@@ -18,9 +18,9 @@
 use flash_book_pin::book::{MARKET_BOOK_SEED, MARKET_BOOK_TOTAL_BYTES};
 use flash_book_pin::fill_commitment::FILL_COMMIT_SEED;
 use flash_book_pin::seeds::{
-    FLP_EXPOSURE_SEED, HAIRCUT_SEED, INSURANCE_SEED, LEVERAGE_TIERS_SEED, LP_POSITION_SEED,
-    MARKET_SEED, ORACLE_CONFIG_SEED, SIDE_ACCRUAL_SEED, TRADER_STATE_SEED, TRIGGER_ORDER_SEED,
-    VAULT_POSITION_SEED, VAULT_SEED,
+    ENVELOPE_CONFIG_SEED, FEE_TIERS_SEED, FLP_EXPOSURE_SEED, HAIRCUT_SEED, INSURANCE_SEED,
+    LEVERAGE_TIERS_SEED, LP_POSITION_SEED, MARKET_SEED, ORACLE_CONFIG_SEED, SESSION_SEED,
+    SIDE_ACCRUAL_SEED, TRADER_STATE_SEED, TRIGGER_ORDER_SEED, VAULT_POSITION_SEED, VAULT_SEED,
 };
 use flash_book_pin::state::{Insurance, Market, Position, TraderState};
 use solana_client::rpc_client::RpcClient;
@@ -51,6 +51,17 @@ const IX_DEPOSIT_FLP_CAPITAL: u8 = 28;
 const IX_WITHDRAW_FLP_CAPITAL: u8 = 29;
 const IX_PLACE_TRIGGER_ORDER: u8 = 49;
 const IX_CANCEL_TRIGGER_ORDER: u8 = 50;
+const IX_SET_MARKET_STATUS: u8 = 14;
+const IX_OPEN_TRADER_SUB_ACCOUNT: u8 = 16;
+const IX_TRANSFER_COLLATERAL: u8 = 17;
+const IX_CLOSE_TRADER_SUB_ACCOUNT: u8 = 18;
+const IX_SET_TRADER_FEE_TIER: u8 = 19;
+const IX_SET_MARKET_PARAMS: u8 = 20;
+const IX_INIT_FEE_TIERS: u8 = 42;
+const IX_SET_ENVELOPE_CONFIG: u8 = 56;
+const IX_CREATE_SESSION_TOKEN: u8 = 64;
+const IX_REVOKE_SESSION_TOKEN: u8 = 65;
+const IX_VERIFY_SESSION_ACTIVE: u8 = 77;
 const IX_INIT_FILL_COMMITMENT: u8 = 127;
 const IX_CREATE_VAULT_V3: u8 = 105;
 const IX_VAULT_OPEN_TRADER_STATE_V3: u8 = 106;
@@ -100,6 +111,17 @@ impl Report {
     fn fail(&mut self, label: &str, err: String) {
         eprintln!("  FAIL  {label}  -> {err}");
         self.rows.push((label.to_string(), Err(err)));
+    }
+    /// A NEGATIVE test: the ix is EXPECTED to be rejected with custom error `code`.
+    /// Passing = the program rejected with exactly that code; succeeding (or a
+    /// different error) is a failure.
+    fn expect_reject(&mut self, label: &str, code: u32, res: Result<String, String>) {
+        let want = format!("custom program error: 0x{code:x}");
+        match res {
+            Ok(sig) => self.fail(label, format!("expected reject 0x{code:x} but SUCCEEDED ({sig})")),
+            Err(e) if e.contains(&want) => self.ok(label, format!("correctly rejected 0x{code:x}")),
+            Err(e) => self.fail(label, format!("expected 0x{code:x}, got: {e}")),
+        }
     }
     fn print(&self) {
         let pass = self.rows.iter().filter(|(_, r)| r.is_ok()).count();
@@ -1123,7 +1145,299 @@ fn full_lifecycle() {
                         Ok(s) => rep.ok("apply_fill:armed_settle_commit", s),
                         Err(e) => rep.fail("apply_fill:armed_settle_commit", e),
                     }
+
+                    // NEGATIVE: the ring is now drained (produced==settled). A
+                    // second apply_fill has NO committed fill to match → the
+                    // consumer MUST reject with FillNotCommitted (1102). This
+                    // proves a fabricated/uncommitted fill cannot settle.
+                    let mut fab = vec![IX_APPLY_FILL];
+                    fab.extend_from_slice(&le8(10));
+                    fab.extend_from_slice(&le8(100_000));
+                    fab.push(0);
+                    fab.extend_from_slice(&le8(2)); // fill_seq advances past the nonce
+                    let fab_ix = Instruction {
+                        program_id: pid,
+                        accounts: vec![
+                            AccountMeta::new_readonly(payer.pubkey(), true),
+                            AccountMeta::new(market2, false),
+                            AccountMeta::new(insurance, false),
+                            AccountMeta::new(trader_state["taker"], false),
+                            AccountMeta::new(trader_state["maker"], false),
+                            AccountMeta::new(pt2.pubkey(), false),
+                            AccountMeta::new(pm2.pubkey(), false),
+                            AccountMeta::new(ring2, false),
+                        ],
+                        data: fab,
+                    };
+                    let res = send(&client, &[fab_ix], &payer, &[]);
+                    rep.expect_reject("apply_fill:fabricated_rejected", 1102, res);
                 }
+            }
+        }
+    }
+
+    // ── admin / config family (market-authority + insurance-authority gated) ─
+    {
+        // 14. set_market_status — pause then re-activate market1
+        for (st, lbl) in [(1u8, "pause"), (0u8, "active")] {
+            let ix = Instruction {
+                program_id: pid,
+                accounts: vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                data: vec![IX_SET_MARKET_STATUS, st],
+            };
+            match send(&client, &[ix], &payer, &[]) {
+                Ok(s) => rep.ok(&format!("set_market_status:{lbl}"), s),
+                Err(e) => rep.fail(&format!("set_market_status:{lbl}"), e),
+            }
+        }
+
+        // 20. set_market_params (24B: taker_fee u32, maker_rebate i32, min_base u64, max_oi u64)
+        let mut d = vec![IX_SET_MARKET_PARAMS];
+        d.extend_from_slice(&10u32.to_le_bytes());
+        d.extend_from_slice(&2i32.to_le_bytes());
+        d.extend_from_slice(&le8(1));
+        d.extend_from_slice(&le8(1_000_000_000));
+        let ix = Instruction {
+            program_id: pid,
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            data: d,
+        };
+        match send(&client, &[ix], &payer, &[]) {
+            Ok(s) => rep.ok("set_market_params", s),
+            Err(e) => rep.fail("set_market_params", e),
+        }
+
+        // 56. set_envelope_config (creates envelope PDA). Real layout is 44 bytes
+        //     (the doc header understates it): move_bps u32, dt_slots u64,
+        //     max_abs_funding_e9 i64, maintenance_bps u32, liq_fee_bps u32,
+        //     min_liq_abs_lots u64, min_nonzero_mm_req_lots u64.
+        let (envelope, _) = Pubkey::find_program_address(&[ENVELOPE_CONFIG_SEED, market.as_ref()], &pid);
+        // The envelope enforces a closed-form solvency invariant
+        // (price_funding_loss + liq_fee <= mm_req for all N), so the per-slot
+        // price budget (move_bps × dt) must stay well under the maintenance margin.
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes()); // max_price_move_bps_per_slot
+        body.extend_from_slice(&le8(1)); // max_accrual_dt_slots
+        body.extend_from_slice(&0i64.to_le_bytes()); // max_abs_funding_e9_per_slot
+        body.extend_from_slice(&500u32.to_le_bytes()); // maintenance_bps (5%)
+        body.extend_from_slice(&0u32.to_le_bytes()); // liquidation_fee_bps
+        body.extend_from_slice(&le8(0)); // min_liquidation_abs_lots
+        body.extend_from_slice(&le8(1)); // min_nonzero_mm_req_lots (floor covers small-N ceil)
+        let ix = config_ix(pid, &payer.pubkey(), market, envelope, sys, IX_SET_ENVELOPE_CONFIG, &body, false);
+        match send(&client, &[ix], &payer, &[]) {
+            Ok(s) => rep.ok("set_envelope_config", s),
+            Err(e) => rep.fail("set_envelope_config", e),
+        }
+
+        // 42. init_fee_tiers (PDA): [volume_window_slots u64][tier_count u8]
+        //     then per-tier (min_vol u64, maker_rebate i32, taker_fee u32). 1 tier.
+        let (fee_tiers, _) = Pubkey::find_program_address(&[FEE_TIERS_SEED], &pid);
+        let mut data = vec![IX_INIT_FEE_TIERS];
+        data.extend_from_slice(&le8(1_000_000)); // volume_window_slots
+        data.push(1); // tier_count
+        data.extend_from_slice(&le8(0)); // tier0 min_volume_quote_lots
+        data.extend_from_slice(&0i32.to_le_bytes()); // tier0 maker_rebate_bps
+        data.extend_from_slice(&10u32.to_le_bytes()); // tier0 taker_fee_bps
+        let ix = Instruction {
+            program_id: pid,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(fee_tiers, false),
+                AccountMeta::new_readonly(sys, false),
+            ],
+            data,
+        };
+        match send(&client, &[ix], &payer, &[]) {
+            Ok(s) => rep.ok("init_fee_tiers", s),
+            Err(e) => rep.fail("init_fee_tiers", e),
+        }
+
+        // 19. set_trader_fee_tier (insurance-authority gated) on the maker's main ts
+        let mut data = vec![IX_SET_TRADER_FEE_TIER];
+        data.extend_from_slice(&100u32.to_le_bytes()); // discount_bps
+        let ix = Instruction {
+            program_id: pid,
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(insurance, false),
+                AccountMeta::new(trader_state["maker"], false),
+            ],
+            data,
+        };
+        match send(&client, &[ix], &payer, &[]) {
+            Ok(s) => rep.ok("set_trader_fee_tier", s),
+            Err(e) => rep.fail("set_trader_fee_tier", e),
+        }
+    }
+
+    // ── sub-account family: open a sub, move collateral in+out, close it.
+    //    Uses a fresh FLAT trader (transfer_collateral rejects a source that has
+    //    open positions — the maker/taker do, from apply_fill). ────────────────
+    {
+        let sub_index: u8 = 1;
+        // fresh flat trader: open main ts + fund + deposit
+        let subby = Keypair::new();
+        airdrop(&client, &subby.pubkey(), 50_000_000_000);
+        let (main_ts, _) =
+            Pubkey::find_program_address(&[TRADER_STATE_SEED, subby.pubkey().as_ref()], &pid);
+        let stok = Keypair::new();
+        let c = create_account_ix(&client, &payer.pubkey(), &stok.pubkey(), TOKEN_ACCT_LEN, &spl);
+        let mut id = vec![SPL_INITIALIZE_ACCOUNT3];
+        id.extend_from_slice(subby.pubkey().as_ref());
+        let i = Instruction {
+            program_id: spl,
+            accounts: vec![
+                AccountMeta::new(stok.pubkey(), false),
+                AccountMeta::new_readonly(quote_mint.pubkey(), false),
+            ],
+            data: id,
+        };
+        let mut mdt = vec![SPL_MINT_TO];
+        mdt.extend_from_slice(&le8(100_000));
+        let mt = Instruction {
+            program_id: spl,
+            accounts: vec![
+                AccountMeta::new(quote_mint.pubkey(), false),
+                AccountMeta::new(stok.pubkey(), false),
+                AccountMeta::new_readonly(payer.pubkey(), true),
+            ],
+            data: mdt,
+        };
+        let open_main = Instruction {
+            program_id: pid,
+            accounts: vec![
+                AccountMeta::new(subby.pubkey(), true),
+                AccountMeta::new(main_ts, false),
+                AccountMeta::new_readonly(sys, false),
+            ],
+            data: vec![IX_OPEN_TRADER_STATE],
+        };
+        let mut dep = vec![IX_DEPOSIT_COLLATERAL];
+        dep.extend_from_slice(&le8(50_000));
+        let dep_ix = Instruction {
+            program_id: pid,
+            accounts: vec![
+                AccountMeta::new(subby.pubkey(), true),
+                AccountMeta::new(main_ts, false),
+                AccountMeta::new_readonly(insurance, false),
+                AccountMeta::new(vault.pubkey(), false),
+                AccountMeta::new(stok.pubkey(), false),
+                AccountMeta::new_readonly(spl, false),
+            ],
+            data: dep,
+        };
+        let prep_ok = send(&client, &[open_main], &subby, &[&subby]).is_ok()
+            && send(&client, &[c, i, mt], &payer, &[&stok]).is_ok()
+            && send(&client, &[dep_ix], &subby, &[&subby]).is_ok();
+        let _ = prep_ok;
+
+        let (sub_ts, _) = Pubkey::find_program_address(
+            &[TRADER_STATE_SEED, subby.pubkey().as_ref(), &[sub_index]],
+            &pid,
+        );
+        // 16. open_trader_sub_account
+        let open = Instruction {
+            program_id: pid,
+            accounts: vec![
+                AccountMeta::new(subby.pubkey(), true),
+                AccountMeta::new(sub_ts, false),
+                AccountMeta::new_readonly(sys, false),
+            ],
+            data: vec![IX_OPEN_TRADER_SUB_ACCOUNT, sub_index],
+        };
+        let opened = match send(&client, &[open], &subby, &[&subby]) {
+            Ok(s) => { rep.ok("open_trader_sub_account", s); true }
+            Err(e) => { rep.fail("open_trader_sub_account", e); false }
+        };
+        if opened {
+            // 17. transfer_collateral main → sub, then sub → main (leaves sub empty)
+            let xfer = |from: Pubkey, to: Pubkey, amt: u64| -> Instruction {
+                let mut data = vec![IX_TRANSFER_COLLATERAL];
+                data.extend_from_slice(&le8(amt));
+                Instruction {
+                    program_id: pid,
+                    accounts: vec![
+                        AccountMeta::new_readonly(subby.pubkey(), true),
+                        AccountMeta::new(from, false),
+                        AccountMeta::new(to, false),
+                    ],
+                    data,
+                }
+            };
+            match send(&client, &[xfer(main_ts, sub_ts, 1_000)], &subby, &[&subby]) {
+                Ok(s) => rep.ok("transfer_collateral:main->sub", s),
+                Err(e) => rep.fail("transfer_collateral:main->sub", e),
+            }
+            let _ = send(&client, &[xfer(sub_ts, main_ts, 1_000)], &subby, &[&subby]);
+            // 18. close_trader_sub_account (requires collateral==0 && open_positions==0)
+            let close = Instruction {
+                program_id: pid,
+                accounts: vec![
+                    AccountMeta::new(subby.pubkey(), true),
+                    AccountMeta::new(sub_ts, false),
+                ],
+                data: vec![IX_CLOSE_TRADER_SUB_ACCOUNT],
+            };
+            match send(&client, &[close], &subby, &[&subby]) {
+                Ok(s) => rep.ok("close_trader_sub_account", s),
+                Err(e) => rep.fail("close_trader_sub_account", e),
+            }
+        }
+    }
+
+    // ── session-token family: create, verify active, revoke ─────────────────
+    {
+        let session_signer = Keypair::new(); // key only (never signs)
+        let (session_token, _) = Pubkey::find_program_address(
+            &[SESSION_SEED, maker.pubkey().as_ref(), session_signer.pubkey().as_ref()],
+            &pid,
+        );
+        // 64. create_session_token: [owner(s,w), session_signer(key), token(PDA,w), system]
+        let mut data = vec![IX_CREATE_SESSION_TOKEN];
+        data.extend_from_slice(&3600i64.to_le_bytes()); // ttl_seconds
+        let create = Instruction {
+            program_id: pid,
+            accounts: vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new_readonly(session_signer.pubkey(), false),
+                AccountMeta::new(session_token, false),
+                AccountMeta::new_readonly(sys, false),
+            ],
+            data,
+        };
+        let created = match send(&client, &[create], &maker, &[&maker]) {
+            Ok(s) => { rep.ok("create_session_token", s); true }
+            Err(e) => { rep.fail("create_session_token", e); false }
+        };
+        if created {
+            // 77. verify_session_active (read-only)
+            let verify = Instruction {
+                program_id: pid,
+                accounts: vec![AccountMeta::new_readonly(session_token, false)],
+                data: vec![IX_VERIFY_SESSION_ACTIVE],
+            };
+            match send(&client, &[verify], &payer, &[]) {
+                Ok(s) => rep.ok("verify_session_active", s),
+                Err(e) => rep.fail("verify_session_active", e),
+            }
+            // 65. revoke_session_token
+            let revoke = Instruction {
+                program_id: pid,
+                accounts: vec![
+                    AccountMeta::new(maker.pubkey(), true),
+                    AccountMeta::new(session_token, false),
+                ],
+                data: vec![IX_REVOKE_SESSION_TOKEN],
+            };
+            match send(&client, &[revoke], &maker, &[&maker]) {
+                Ok(s) => rep.ok("revoke_session_token", s),
+                Err(e) => rep.fail("revoke_session_token", e),
             }
         }
     }
