@@ -189,7 +189,12 @@ mod sol {
                 accounts: &metas,
                 data: &data,
             };
-            return slice_invoke_signed(&ix, &[from, to, system_program], signer_seeds);
+            // pinocchio convention: `account_infos` corresponds 1:1 (same order)
+            // with `instruction.accounts` — the invoked program is referenced by
+            // `program_id` and MUST NOT be appended to the infos (doing so trips
+            // pinocchio 0.8.4's `accounts.len() < infos.len()` ⇒ NotEnoughAccountKeys).
+            let _ = system_program; // validated above; not an instruction account
+            return slice_invoke_signed(&ix, &[from, to], signer_seeds);
         }
 
         // Pre-funded path: top up to rent-exemption, then allocate + assign.
@@ -204,7 +209,7 @@ mod sol {
                 accounts: &metas,
                 data: &data,
             };
-            slice_invoke(&ix, &[from, to, system_program])?;
+            slice_invoke(&ix, &[from, to])?;
         }
         // Allocate `space` bytes (signed by the PDA).
         {
@@ -215,7 +220,7 @@ mod sol {
                 accounts: &metas,
                 data: &data,
             };
-            slice_invoke_signed(&ix, &[to, system_program], signer_seeds)?;
+            slice_invoke_signed(&ix, &[to], signer_seeds)?;
         }
         // Assign to `owner` (signed by the PDA).
         {
@@ -226,7 +231,7 @@ mod sol {
                 accounts: &metas,
                 data: &data,
             };
-            slice_invoke_signed(&ix, &[to, system_program], signer_seeds)?;
+            slice_invoke_signed(&ix, &[to], signer_seeds)?;
         }
         Ok(())
     }
@@ -286,7 +291,7 @@ mod sol {
             accounts: &metas,
             data: &data,
         };
-        slice_invoke(&ix, &[account, mint, token_program])
+        slice_invoke(&ix, &[account, mint])
     }
 
     /// Create the wallet's associated token account for `mint` via the ATA
@@ -324,7 +329,7 @@ mod sol {
         };
         slice_invoke(
             &ix,
-            &[payer, ata, wallet, mint, system_program, token_program, ata_program],
+            &[payer, ata, wallet, mint, system_program, token_program],
         )
     }
 
@@ -349,7 +354,8 @@ mod sol {
             accounts: &metas,
             data: &data,
         };
-        slice_invoke(&ix, &[from, to, system_program])
+        let _ = system_program; // validated above; not an instruction account
+        slice_invoke(&ix, &[from, to])
     }
 
     /// SPL-Token `CloseAccount` (tag byte `9`): close `account` and send its rent
@@ -376,7 +382,7 @@ mod sol {
             accounts: &metas,
             data: &[9u8], // SplTokenInstruction::CloseAccount
         };
-        slice_invoke(&ix, &[account, destination, authority, token_program])
+        slice_invoke(&ix, &[account, destination, authority])
     }
 
     fn transfer_inner(
@@ -407,7 +413,8 @@ mod sol {
             accounts: &metas,
             data: &data,
         };
-        let infos = [source, destination, authority, token_program];
+        let _ = token_program; // validated above; not an instruction account
+        let infos = [source, destination, authority];
         if signer_seeds.is_empty() {
             slice_invoke(&ix, &infos)
         } else {

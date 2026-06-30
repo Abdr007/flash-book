@@ -28,3 +28,10 @@ tokio = { version = "1", features = ["full"] }
 # Pin the transitive transaction-error to 3.2.0 — 3.3.0 added a variant
 # solana-runtime 3.1.12 does not match (non-exhaustive compile error).
 solana-transaction-error = "=3.2.0"
+# Blocking RpcClient for the on-validator exercise harness (tests/local_exercise.rs).
+# Drives the REAL create-PDA + token CPIs that solana-program-test (BanksClient)
+# cannot execute. Pinned to the already-locked transitive version (offline build).
+solana-client = "=3.1.12"
+solana-commitment-config = "=3.1.1"
+solana-system-interface = "=2.0.0"
+solana-sdk-ids = "=3.1.0"
