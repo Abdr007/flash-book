@@ -211,10 +211,22 @@ impl Report {
     }
     fn print(&self) {
         let pass = self.rows.iter().filter(|(_, r)| r.is_ok()).count();
-        eprintln!("\n================ LOCAL EXERCISE REPORT ================");
+        // explorer cluster suffix, derived from RPC_URL (devnet runs get clickable links)
+        let cluster: Option<String> = std::env::var("RPC_URL").ok().and_then(|u| {
+            if u.contains("devnet") { Some("?cluster=devnet".into()) }
+            else if u.contains("testnet") { Some("?cluster=testnet".into()) }
+            else if u.contains("127.0.0.1") || u.contains("localhost") { None }
+            else { Some(format!("?cluster=custom&customUrl={u}")) }
+        });
+        eprintln!("\n================ ON-VALIDATOR EXERCISE REPORT ================");
         for (label, r) in &self.rows {
             match r {
-                Ok(sig) => eprintln!("  PASS  {label}   {}", &sig[..sig.len().min(16)]),
+                // a real on-chain signature (base58, ~88 chars) → print the explorer link
+                Ok(sig) if sig.len() > 80 => match &cluster {
+                    Some(c) => eprintln!("  PASS  {label}\n        https://explorer.solana.com/tx/{sig}{c}"),
+                    None => eprintln!("  PASS  {label}   {sig}"),
+                },
+                Ok(note) => eprintln!("  PASS  {label}   ({note})"),
                 Err(e) => eprintln!("  FAIL  {label}   {e}"),
             }
         }
@@ -245,12 +257,15 @@ fn send(
         .map_err(|e| e.to_string())
 }
 
-fn airdrop(client: &RpcClient, who: &Pubkey, lamports: u64) {
-    let sig = client.request_airdrop(who, lamports).expect("airdrop");
-    let bh = client.get_latest_blockhash().unwrap();
-    client
-        .confirm_transaction_with_spinner(&sig, &bh, CommitmentConfig::confirmed())
-        .expect("confirm airdrop");
+/// Fund `who` with `lamports` from the pre-funded `payer` (a System transfer).
+/// Works on ANY cluster — unlike `request_airdrop`, which is rate-limited / tiny on
+/// devnet. This is what makes the harness runnable on devnet (set RPC_URL=devnet +
+/// KEYPAIR=<funded wallet>) to produce REAL on-chain signatures.
+fn fund(client: &RpcClient, payer: &Keypair, who: &Pubkey, lamports: u64) {
+    let ix = system_instruction::transfer(&payer.pubkey(), who, lamports);
+    let bh = client.get_latest_blockhash().expect("blockhash");
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer], bh);
+    client.send_and_confirm_transaction(&tx).expect("fund transfer");
 }
 
 /// System CreateAccount for an account owned by `owner`, signed by `new`.
@@ -352,8 +367,19 @@ fn full_lifecycle() {
     let mut rep = Report::new();
 
     // ── payer = protocol authority + mint authority + sequencer ─────────────
-    let payer = Keypair::new();
-    airdrop(&client, &payer.pubkey(), 200_000_000_000);
+    // On devnet: KEYPAIR=<path to a funded wallet>. On a local validator: generated
+    // + airdropped. All OTHER accounts are funded from this payer (so they work on
+    // devnet too, where request_airdrop is rate-limited).
+    let payer = match std::env::var("KEYPAIR") {
+        Ok(p) => solana_sdk::signature::read_keypair_file(&p).expect("read KEYPAIR file"),
+        Err(_) => {
+            let kp = Keypair::new();
+            let sig = client.request_airdrop(&kp.pubkey(), 200_000_000_000).expect("airdrop payer");
+            let bh = client.get_latest_blockhash().unwrap();
+            client.confirm_transaction_with_spinner(&sig, &bh, CommitmentConfig::confirmed()).expect("confirm payer airdrop");
+            kp
+        }
+    };
     eprintln!("payer/authority: {}", payer.pubkey());
 
     // ── create quote + base mints (SPL InitializeMint2) ─────────────────────
@@ -502,7 +528,7 @@ fn full_lifecycle() {
     let taker = Keypair::new();
     let mut trader_state = std::collections::HashMap::new();
     for (label, trader) in [("maker", &maker), ("taker", &taker)] {
-        airdrop(&client, &trader.pubkey(), 50_000_000_000);
+        fund(&client, &payer, &trader.pubkey(), 200_000_000);
         let (ts, _b) = Pubkey::find_program_address(&[TRADER_STATE_SEED, trader.pubkey().as_ref()], &pid);
         trader_state.insert(label, ts);
 
@@ -581,7 +607,7 @@ fn full_lifecycle() {
     //        vault payout (token_transfer_signed, distinct from deposit's CPI) ─
     {
         let flatty = Keypair::new();
-        airdrop(&client, &flatty.pubkey(), 50_000_000_000);
+        fund(&client, &payer, &flatty.pubkey(), 200_000_000);
         let (ts, _b) =
             Pubkey::find_program_address(&[TRADER_STATE_SEED, flatty.pubkey().as_ref()], &pid);
         let open = Instruction {
@@ -831,7 +857,7 @@ fn full_lifecycle() {
 
         // fresh LP: token acct + tokens, init_lp_position, deposit, withdraw
         let lp = Keypair::new();
-        airdrop(&client, &lp.pubkey(), 50_000_000_000);
+        fund(&client, &payer, &lp.pubkey(), 200_000_000);
         let (lp_position, _) =
             Pubkey::find_program_address(&[LP_POSITION_SEED, lp.pubkey().as_ref()], &pid);
         let lp_tok = Keypair::new();
@@ -975,7 +1001,7 @@ fn full_lifecycle() {
     //    depositor position, and token in/out (shares burned, PDA-signed out) ──
     {
         let strategist = Keypair::new();
-        airdrop(&client, &strategist.pubkey(), 50_000_000_000);
+        fund(&client, &payer, &strategist.pubkey(), 200_000_000);
         let vault_id: u8 = 1;
         let (svault, _) = Pubkey::find_program_address(
             &[VAULT_SEED, strategist.pubkey().as_ref(), &[vault_id]],
@@ -1020,7 +1046,7 @@ fn full_lifecycle() {
 
             // depositor with quote tokens
             let depositor = Keypair::new();
-            airdrop(&client, &depositor.pubkey(), 50_000_000_000);
+            fund(&client, &payer, &depositor.pubkey(), 200_000_000);
             let (vpos, _) = Pubkey::find_program_address(
                 &[VAULT_POSITION_SEED, svault.as_ref(), depositor.pubkey().as_ref()],
                 &pid,
@@ -1391,7 +1417,7 @@ fn full_lifecycle() {
         let sub_index: u8 = 1;
         // fresh flat trader: open main ts + fund + deposit
         let subby = Keypair::new();
-        airdrop(&client, &subby.pubkey(), 50_000_000_000);
+        fund(&client, &payer, &subby.pubkey(), 200_000_000);
         let (main_ts, _) =
             Pubkey::find_program_address(&[TRADER_STATE_SEED, subby.pubkey().as_ref()], &pid);
         let stok = Keypair::new();
@@ -1603,7 +1629,7 @@ fn full_lifecycle() {
         run(&mut rep, &client, "init_flp_per_market",
             &[ix(pid, IX_INIT_FLP_PER_MARKET, vec![sg(payer.pubkey()), ro(market), rw(exposure), ro(sys)], &[])], &payer, &[]);
         let lp3 = Keypair::new();
-        airdrop(&client, &lp3.pubkey(), 50_000_000_000);
+        fund(&client, &payer, &lp3.pubkey(), 200_000_000);
         let pos = Pubkey::find_program_address(&[FLP_POSITION_V3_SEED, exposure.as_ref(), lp3.pubkey().as_ref()], &pid).0;
         let tok = Keypair::new();
         let c = create_account_ix(&client, &payer.pubkey(), &tok.pubkey(), TOKEN_ACCT_LEN, &spl);
@@ -1767,7 +1793,7 @@ fn full_lifecycle() {
         // two traders V (long) + C (short), each deposits 80_000 cross collateral
         let mut mk_trader = |label: &str| -> Option<(Keypair, Pubkey)> {
             let t = Keypair::new();
-            airdrop(&client, &t.pubkey(), 50_000_000_000);
+            fund(&client, &payer, &t.pubkey(), 200_000_000);
             let ts = Pubkey::find_program_address(&[TRADER_STATE_SEED, t.pubkey().as_ref()], &pid).0;
             let tok = Keypair::new();
             let c = create_account_ix(&client, &payer.pubkey(), &tok.pubkey(), TOKEN_ACCT_LEN, &spl);
@@ -1874,7 +1900,7 @@ fn full_lifecycle() {
         // helper: fresh trader with a token acct + `deposit` cross collateral
         let mk = |deposit: u64| -> Option<(Keypair, Pubkey, Pubkey)> {
             let t = Keypair::new();
-            airdrop(&client, &t.pubkey(), 50_000_000_000);
+            fund(&client, &payer, &t.pubkey(), 200_000_000);
             let ts = Pubkey::find_program_address(&[TRADER_STATE_SEED, t.pubkey().as_ref()], &pid).0;
             let tok = Keypair::new();
             let c = create_account_ix(&client, &payer.pubkey(), &tok.pubkey(), TOKEN_ACCT_LEN, &spl);
@@ -1945,7 +1971,7 @@ fn full_lifecycle() {
         // helper: fresh trader (open + fund + deposit), no Report access
         let mktr = |deposit: u64| -> Option<(Keypair, Pubkey, Pubkey)> {
             let t = Keypair::new();
-            airdrop(&client, &t.pubkey(), 50_000_000_000);
+            fund(&client, &payer, &t.pubkey(), 200_000_000);
             let ts = Pubkey::find_program_address(&[TRADER_STATE_SEED, t.pubkey().as_ref()], &pid).0;
             let tok = Keypair::new();
             let c = create_account_ix(&client, &payer.pubkey(), &tok.pubkey(), TOKEN_ACCT_LEN, &spl);
