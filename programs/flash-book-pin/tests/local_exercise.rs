@@ -2707,7 +2707,11 @@ fn full_lifecycle() {
         run(&mut rep, &client, "verify_oracle_config", &[ix(pid, IX_VERIFY_ORACLE_CONFIG, vec![ro(market), ro(oracle_cfg)], &[])], &payer, &[]);
         run(&mut rep, &client, "verify_leverage_tiers", &[ix(pid, IX_VERIFY_LEVERAGE_TIERS, vec![ro(market), ro(lev_tiers)], &[])], &payer, &[]);
         run(&mut rep, &client, "verify_fee_tiers", &[ix(pid, IX_VERIFY_FEE_TIERS, vec![ro(fee_tiers)], &[])], &payer, &[]);
-        // verify_market_invariants LAST (it takes market WRITABLE and may auto-pause)
+        // verify_market_invariants LAST (it takes market WRITABLE and may auto-pause).
+        // Refresh the mark first: over a long (esp. devnet) run the mark goes stale
+        // (>150 slots) and the invariant check would correctly trip the liveness guard
+        // (Custom 107). Re-stamping freshness lets it exercise the healthy path.
+        let _ = send(&client, &[ix(pid, IX_UPDATE_ORACLE, vec![sgr(payer.pubkey()), rw(market)], &le8(100_000))], &payer, &[]);
         run(&mut rep, &client, "verify_market_invariants", &[ix(pid, IX_VERIFY_MARKET_INVARIANTS, vec![rw(market)], &[])], &payer, &[]);
     }
 
