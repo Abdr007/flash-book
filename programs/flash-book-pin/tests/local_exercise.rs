@@ -53,6 +53,13 @@ const IX_DEPOSIT_FLP_CAPITAL: u8 = 28;
 const IX_WITHDRAW_FLP_CAPITAL: u8 = 29;
 const IX_PLACE_TRIGGER_ORDER: u8 = 49;
 const IX_CANCEL_TRIGGER_ORDER: u8 = 50;
+const IX_APPLY_FLP_FILL: u8 = 7;
+const IX_RELEASE_GAIN_TO_HAIRCUT: u8 = 83;
+const IX_SET_POSITION_CROSS: u8 = 94;
+const IX_SET_POSITION_ISOLATED: u8 = 95;
+const IX_SWEEP_COLLATERAL: u8 = 139;
+const IX_PARTIAL_WITHDRAW: u8 = 140;
+const IX_FORCE_UNDELEGATE_MARKET_BOOK: u8 = 124;
 const IX_SETTLE_FUNDING: u8 = 1;
 const IX_CANCEL_ORDER: u8 = 3;
 const IX_MODIFY_ORDER: u8 = 5;
@@ -1795,6 +1802,10 @@ fn full_lifecycle() {
                     run(&mut rep, &client, "liquidation_preview", &[ix(pid, IX_LIQUIDATION_PREVIEW, vec![ro(market_l), ro(ts_c), ro(pc)], &[])], &payer, &[]);
                     run(&mut rep, &client, "set_position_leverage", &[ix(pid, IX_SET_POSITION_LEVERAGE, vec![sgr(c.pubkey()), ro(market_l), rw(pc)], &50u32.to_le_bytes())], &payer, &[&c]);
 
+                    // margin-mode switch: cross → isolated (60k) → back to cross
+                    run(&mut rep, &client, "set_position_isolated", &[ix(pid, IX_SET_POSITION_ISOLATED, vec![sgr(c.pubkey()), rw(ts_c), ro(market_l), rw(pc)], &le8(60_000))], &payer, &[&c]);
+                    run(&mut rep, &client, "set_position_cross", &[ix(pid, IX_SET_POSITION_CROSS, vec![sgr(c.pubkey()), rw(ts_c), ro(market_l), rw(pc)], &[])], &payer, &[&c]);
+
                     // ── cancel_order + modify_order on book_L (predictable seq) ──
                     let mut pl1 = vec![1u8]; pl1.extend_from_slice(&le8(5)); pl1.extend_from_slice(&le8(100_000)); pl1.extend_from_slice(&le8(0)); pl1.push(0); pl1.push(0);
                     if send(&client, &[ix(pid, IX_PLACE_LIMIT, vec![sgr(c.pubkey()), ro(market_l), rw(book_l)], &pl1)], &payer, &[&c]).is_ok() {
@@ -1818,6 +1829,8 @@ fn full_lifecycle() {
                     run(&mut rep, &client, "init_position_haircut_state", &[ix(pid, IX_INIT_POSITION_HAIRCUT_STATE, vec![sg(payer.pubkey()), ro(pc), ro(haircut_l), rw(ph_c), ro(sys)], &[])], &payer, &[]);
                     run(&mut rep, &client, "verify_position_haircut", &[ix(pid, IX_VERIFY_POSITION_HAIRCUT, vec![ro(ph_c)], &[])], &payer, &[]);
                     run(&mut rep, &client, "settle_funding", &[ix(pid, IX_SETTLE_FUNDING, vec![ro(market_l), ro(ts_c), rw(pc), rw(haircut_l)], &[])], &payer, &[]);
+                    // release_gain_to_haircut: defer 1000 of realized gain into the warmup reserve
+                    run(&mut rep, &client, "release_gain_to_haircut", &[ix(pid, IX_RELEASE_GAIN_TO_HAIRCUT, vec![sgr(payer.pubkey()), ro(market_l), rw(ts_c), rw(pc), rw(ph_c), ro(haircut_l)], &le8(1_000))], &payer, &[]);
 
                     // ── record_flp_fill_v3 on market1's per-market exposure ──
                     let exp1 = Pubkey::find_program_address(&[FLP_PER_MARKET_SEED, market.as_ref()], &pid).0;
@@ -1832,6 +1845,77 @@ fn full_lifecycle() {
                 }
             }
         }
+    }
+
+    // ════════ collateral-with-positions + FLP-as-maker + fail-closed force-undeleg ════════
+    {
+        let flp_single = Pubkey::find_program_address(&[FLP_EXPOSURE_SEED], &pid).0;
+        // helper: fresh trader with a token acct + `deposit` cross collateral
+        let mk = |deposit: u64| -> Option<(Keypair, Pubkey, Pubkey)> {
+            let t = Keypair::new();
+            airdrop(&client, &t.pubkey(), 50_000_000_000);
+            let ts = Pubkey::find_program_address(&[TRADER_STATE_SEED, t.pubkey().as_ref()], &pid).0;
+            let tok = Keypair::new();
+            let c = create_account_ix(&client, &payer.pubkey(), &tok.pubkey(), TOKEN_ACCT_LEN, &spl);
+            let mut idd = vec![SPL_INITIALIZE_ACCOUNT3]; idd.extend_from_slice(t.pubkey().as_ref());
+            let initt = Instruction { program_id: spl, accounts: vec![rw(tok.pubkey()), ro(quote_mint.pubkey())], data: idd };
+            let mut mdd = vec![SPL_MINT_TO]; mdd.extend_from_slice(&le8(1_000_000));
+            let mtt = Instruction { program_id: spl, accounts: vec![rw(quote_mint.pubkey()), rw(tok.pubkey()), sgr(payer.pubkey())], data: mdd };
+            let ok = send(&client, &[ix(pid, IX_OPEN_TRADER_STATE, vec![sg(t.pubkey()), rw(ts), ro(sys)], &[])], &t, &[&t]).is_ok()
+                && send(&client, &[c, initt, mtt], &payer, &[&tok]).is_ok()
+                && send(&client, &[ix(pid, IX_DEPOSIT_COLLATERAL, vec![sg(t.pubkey()), rw(ts), ro(insurance), rw(vault.pubkey()), rw(tok.pubkey()), ro(spl)], &le8(deposit))], &t, &[&t]).is_ok();
+            if ok { Some((t, ts, tok.pubkey())) } else { None }
+        };
+        // P (long) + Q (short), TINY size-1 position on market1 (notional 100k → 10% floor = 10k « 80k collateral)
+        if let (Some((p, ts_p, tok_p)), Some((q, ts_q, _))) = (mk(80_000), mk(80_000)) {
+            let pos_len = core::mem::size_of::<Position>() as u64;
+            let pos_p = Keypair::new();
+            let pos_q = Keypair::new();
+            let c1 = create_account_ix(&client, &payer.pubkey(), &pos_p.pubkey(), pos_len, &pid);
+            let c2 = create_account_ix(&client, &payer.pubkey(), &pos_q.pubkey(), pos_len, &pid);
+            if send(&client, &[c1, c2], &payer, &[&pos_p, &pos_q]).is_ok() {
+                // settlement nonce on market1: backbone used fill_seq=1 → use 2, 3 next
+                let mut af = Vec::new(); af.extend_from_slice(&le8(1)); af.extend_from_slice(&le8(100_000)); af.push(0); af.extend_from_slice(&le8(2));
+                let ok = send(&client, &[ix(pid, IX_APPLY_FILL, vec![sgr(payer.pubkey()), rw(market), rw(insurance), rw(ts_p), rw(ts_q), rw(pos_p.pubkey()), rw(pos_q.pubkey())], &af)], &payer, &[]).is_ok();
+                if ok {
+                    // 140 partial_withdraw: P pulls 1000 (stays above worst-IM + 10% floor)
+                    run(&mut rep, &client, "partial_withdraw", &[ix(pid, IX_PARTIAL_WITHDRAW,
+                        vec![sg(p.pubkey()), rw(ts_p), ro(insurance), rw(vault.pubkey()), rw(tok_p), ro(spl), ro(market), rw(pos_p.pubkey())], &le8(1_000))], &payer, &[&p]);
+                    // 139 sweep_collateral: P → Q, 1000 (P's remaining passes the stress battery)
+                    run(&mut rep, &client, "sweep_collateral", &[ix(pid, IX_SWEEP_COLLATERAL,
+                        vec![sg(p.pubkey()), rw(ts_p), rw(ts_q), ro(market), rw(pos_p.pubkey())], &le8(1_000))], &payer, &[&p]);
+                }
+            }
+            // 7 apply_flp_fill: fresh taker T vs the FLP pool on a fresh market with
+            //    NO haircut (market1/market_L have haircut enabled → would demand the
+            //    haircut + position-haircut accounts). apply_flp_fill needs no book.
+            let base_f = Keypair::new();
+            let crf = create_account_ix(&client, &payer.pubkey(), &base_f.pubkey(), MINT_LEN, &spl);
+            let mut df = vec![SPL_INITIALIZE_MINT2, 9]; df.extend_from_slice(payer.pubkey().as_ref()); df.push(0);
+            let imf = Instruction { program_id: spl, accounts: vec![rw(base_f.pubkey())], data: df };
+            let market_f = Pubkey::find_program_address(&[MARKET_SEED, base_f.pubkey().as_ref(), quote_mint.pubkey().as_ref()], &pid).0;
+            let mut mbf = Vec::new(); for v in [1u64, 100_000] { mbf.extend_from_slice(&le8(v)); }
+            mbf.extend_from_slice(&10u32.to_le_bytes()); mbf.extend_from_slice(&2i32.to_le_bytes());
+            for v in [1u64, 1_000_000_000] { mbf.extend_from_slice(&le8(v)); }
+            mbf.extend_from_slice(&500u32.to_le_bytes());
+            let mf_ok = send(&client, &[crf, imf], &payer, &[&base_f]).is_ok()
+                && send(&client, &[ix(pid, IX_INIT_MARKET, vec![sg(payer.pubkey()), rw(market_f), ro(base_f.pubkey()), ro(quote_mint.pubkey()), ro(insurance), ro(sys)], &mbf)], &payer, &[]).is_ok();
+            if mf_ok {
+                if let Some((_t, ts_t, _)) = mk(80_000) {
+                    let pos_t = Keypair::new();
+                    let ct = create_account_ix(&client, &payer.pubkey(), &pos_t.pubkey(), core::mem::size_of::<Position>() as u64, &pid);
+                    if send(&client, &[ct], &payer, &[&pos_t]).is_ok() {
+                        let mut af = Vec::new(); af.extend_from_slice(&le8(1)); af.extend_from_slice(&le8(100_000)); af.push(0); af.extend_from_slice(&le8(1));
+                        run(&mut rep, &client, "apply_flp_fill", &[ix(pid, IX_APPLY_FLP_FILL,
+                            vec![sgr(payer.pubkey()), rw(market_f), rw(insurance), rw(flp_single), rw(ts_t), rw(pos_t.pubkey())], &af)], &payer, &[]);
+                    }
+                }
+            }
+        }
+        // 124 force_undelegate_market_book: book is NOT delegated → fail-closed Custom(220)
+        let r = send(&client, &[ix(pid, IX_FORCE_UNDELEGATE_MARKET_BOOK,
+            vec![sgr(payer.pubkey()), ro(market), rw(market_book), ro(pid), rw(Keypair::new().pubkey()), ro(sys), ro(pid)], &[])], &payer, &[]);
+        rep.expect_reject("force_undelegate_market_book(failclosed)", 220, r);
     }
 
     rep.print();
