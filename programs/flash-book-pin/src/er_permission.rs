@@ -130,9 +130,11 @@ pub fn cpi_create_permission(
         AccountMeta::new(a.magic_program.key(), false, false),
     ];
     let ix = Instruction { program_id: &PERMISSION_PROGRAM_ID, accounts: &metas, data };
+    // pinocchio infos correspond 1:1 (same order) with `metas`; the invoked
+    // permission_program is referenced by program_id and must NOT be in the slice.
     slice_invoke_signed(
         &ix,
-        &[a.payer, a.permissioned_account, a.permission, a.vault, a.magic_program, a.permission_program],
+        &[a.payer, a.permissioned_account, a.permission, a.vault, a.magic_program],
         signer,
     )
 }
@@ -147,9 +149,12 @@ pub fn cpi_update_permission(
     a.check_program()?;
     let metas = update_metas(a);
     let ix = Instruction { program_id: &PERMISSION_PROGRAM_ID, accounts: &metas, data };
+    // infos must be 1:1 (same order) with `update_metas` — which lists
+    // permissioned_account TWICE (authority + member). The previous slice both
+    // omitted the duplicate AND appended the program, a positional key-mismatch.
     slice_invoke_signed(
         &ix,
-        &[a.payer, a.permissioned_account, a.permission, a.vault, a.magic_program, a.permission_program],
+        &[a.payer, a.permissioned_account, a.permissioned_account, a.permission, a.vault, a.magic_program],
         signer,
     )
 }
@@ -160,9 +165,10 @@ pub fn cpi_close_permission(a: &PermissionCpiAccounts, signer: &[Signer]) -> Pro
     let data = CLOSE_DISCRIMINATOR.to_le_bytes();
     let metas = update_metas(a);
     let ix = Instruction { program_id: &PERMISSION_PROGRAM_ID, accounts: &metas, data: &data };
+    // infos 1:1 with `update_metas` (permissioned_account appears twice).
     slice_invoke_signed(
         &ix,
-        &[a.payer, a.permissioned_account, a.permission, a.vault, a.magic_program, a.permission_program],
+        &[a.payer, a.permissioned_account, a.permissioned_account, a.permission, a.vault, a.magic_program],
         signer,
     )
 }

@@ -54,7 +54,9 @@ pub fn cpi_commit(
         AccountMeta::new(committed.key(), committed.is_writable(), committed.is_signer()),
     ];
     let ix = Instruction { program_id: &MAGIC_PROGRAM_ID, accounts: &metas, data: &data };
-    slice_invoke(&ix, &[payer, magic_context, committed, magic_program])
+    // pinocchio infos correspond 1:1 with metas; the invoked program (magic_program,
+    // checked above) is referenced by program_id and must NOT be in the infos slice.
+    slice_invoke(&ix, &[payer, magic_context, committed])
 }
 
 /// The MagicBlock delegation program (base58
@@ -247,7 +249,8 @@ pub fn cpi_delegate(a: &DelegateAccounts, data: &[u8], signer: &[Signer]) -> Pro
         let adata = assign_data(&DELEGATION_PROGRAM_ID);
         let metas = [AccountMeta::new(a.delegated_account.key(), true, true)];
         let ix = Instruction { program_id: &SYSTEM_PROGRAM_ID, accounts: &metas, data: &adata };
-        slice_invoke_signed(&ix, &[a.delegated_account, a.system_program], signer)?;
+        // infos 1:1 with metas — system_program is the invoked program, not an account.
+        slice_invoke_signed(&ix, &[a.delegated_account], signer)?;
     }
 
     // 5. CPI the Delegate ix (8-byte disc + DelegateArgs already in `data`). Account
@@ -264,7 +267,8 @@ pub fn cpi_delegate(a: &DelegateAccounts, data: &[u8], signer: &[Signer]) -> Pro
     let ix = Instruction { program_id: &DELEGATION_PROGRAM_ID, accounts: &metas, data };
     slice_invoke_signed(
         &ix,
-        &[a.payer, a.delegated_account, a.owner_program, a.delegate_buffer, a.delegation_record, a.delegation_metadata, a.system_program, a.delegation_program],
+        // infos 1:1 with metas; the invoked delegation_program is not an account param.
+        &[a.payer, a.delegated_account, a.owner_program, a.delegate_buffer, a.delegation_record, a.delegation_metadata, a.system_program],
         signer,
     )?;
 

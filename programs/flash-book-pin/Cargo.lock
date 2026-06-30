@@ -1961,8 +1961,12 @@ version = "0.0.0"
 dependencies = [
  "bytemuck",
  "pinocchio",
+ "solana-client",
+ "solana-commitment-config",
  "solana-program-test",
  "solana-sdk",
+ "solana-sdk-ids",
+ "solana-system-interface 2.0.0",
  "solana-transaction-error",
  "tokio",
 ]
