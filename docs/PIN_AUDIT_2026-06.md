@@ -421,10 +421,29 @@ byte-exact commit), `apply_fill_settles_committed_fill` (round-trip: on-chain
 `sol_keccak256` == off-chain `solana_sdk::keccak`), `apply_fill_rejects_fabricated_fill_
 when_armed` (Custom 1102), `apply_fill_requires_ring_when_armed` (Custom 1103).
 
+### Haircut junior-claim engine — WIRED (2026-06-30)
+Anchor routes realized PnL through the junior-claim engine (gains DEFER to a warmup
+reserve; losses credit the market Residual) to gate profit behind capital and keep
+`V − C − I == Σresidual`. pin credited gains to collateral in full and didn't accrue
+losses to the Residual (the audit's "fails-closed" MED). Now wired — surgically, atop
+the proven primitives, gated behind `haircut_enabled` (OFF for all existing markets):
+- A new `materialize_leg` (apply_fill + apply_flp_fill) routes per leg: an OPTED gain
+  (the per-position haircut account is present) defers to the warmup reserve via the
+  proven `haircut::apply_release` (no collateral); an opted loss debits collateral via
+  the UNCHANGED `materialize_realized` AND credits the market Residual by the removed
+  amount; a non-opted leg uses the proven path verbatim.
+- The per-position haircut accounts are MANDATORY on a haircut-enabled market (mirror
+  anchor's security gate — `Custom(244)` — so a sequencer can't omit one to route a
+  gain to senior collateral and bypass the gating); found by canonical PDA + disc. The
+  residual is loaded once / written once, shared by the funding settle + loss accrual.
+- Extraction stays gated by `convert_position`'s `compute_h(residual, matured)`, so an
+  under-fed residual just means deferred gains don't convert (fails closed; no over-pay).
+Proven e2e: `apply_fill_haircut_defers_gain_accrues_loss` (gain→reserve, loss→collateral
++Residual, conservation holds), `apply_fill_haircut_requires_position_haircuts` (Custom 244).
+
 ### HONESTLY DEFERRED — features, not bugs
-- **haircut junior-claim engine** (unwired, fails closed), **leverage/position/
-  concentration caps unwired**, **VPIN tax / FLP-exposure tracking** — all as documented
-  in the prior rounds; feature-wiring, not exploitable-today bugs.
+- **leverage/position/concentration caps unwired**, **VPIN tax / FLP-exposure tracking**
+  — feature-wiring documented in prior rounds; not exploitable-today bugs.
 - **`position_liq` timestamps not reset on close** (benign: over-reward capped at backing,
   self-affecting, and the cooldown defaults to 0); **`apply_flp_fill` rebate/insurance
   `saturating_add`** (deliberate liveness choice at an unreachable u64 balance — `checked_add`

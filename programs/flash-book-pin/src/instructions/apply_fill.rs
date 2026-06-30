@@ -105,6 +105,110 @@ pub(crate) fn materialize_realized(
     Ok(())
 }
 
+/// Locate a position's per-position haircut state `[b"position_haircut", market,
+/// position]` (program-owned, `POSITION_HAIRCUT_DISC`) among `accounts`. A position
+/// is "opted" into junior-claim profit gating iff this account is present. SBF-only
+/// (the producer/consumer run on-chain); host stub returns None.
+#[cfg(target_os = "solana")]
+pub(crate) fn find_position_haircut<'a>(
+    accounts: &'a [AccountInfo],
+    pid: &Pubkey,
+    market: &Pubkey,
+    position: &Pubkey,
+) -> Option<&'a AccountInfo> {
+    let (expected, _) = pinocchio::pubkey::find_program_address(
+        &[crate::seeds::POSITION_HAIRCUT_SEED, &market[..], &position[..]],
+        pid,
+    );
+    for a in accounts {
+        if a.key() == &expected
+            && a.is_owned_by(pid)
+            && a.data_len() >= core::mem::size_of::<crate::state::PositionHaircutState>()
+        {
+            if let Ok(d) = a.try_borrow_data() {
+                if d[0..8] == crate::state::POSITION_HAIRCUT_DISC {
+                    return Some(a);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "solana"))]
+pub(crate) fn find_position_haircut<'a>(
+    _accounts: &'a [AccountInfo],
+    _pid: &Pubkey,
+    _market: &Pubkey,
+    _position: &Pubkey,
+) -> Option<&'a AccountInfo> {
+    None
+}
+
+/// Defer a realized GAIN into a position's warmup reserve (junior claim): the gain
+/// does NOT touch collateral; it matures over the haircut window and is later
+/// extracted via `convert_position`, gated by the market Residual (`compute_h`).
+/// `gain_quote_lots > 0`. Pure-math `haircut::apply_release` does the state move.
+#[cfg(target_os = "solana")]
+unsafe fn apply_release_to(ph_ai: &AccountInfo, gain_quote_lots: u64, now_slot: u64) -> ProgramResult {
+    let ph = &mut *(ph_ai.borrow_mut_data_unchecked().as_mut_ptr()
+        as *mut crate::state::PositionHaircutState);
+    let pre = crate::haircut::PositionHaircutSnapshot {
+        released_reserve_quote_lots: ph.released_reserve_quote_lots,
+        released_attached_at_slot: ph.released_attached_at_slot,
+        matured_pos_quote_lots: ph.matured_pos_quote_lots,
+        original_reserve_at_attach: ph.original_reserve_at_attach,
+    };
+    let post = crate::haircut::apply_release(pre, gain_quote_lots, now_slot)
+        .map_err(|_| ProgramError::ArithmeticOverflow)?;
+    ph.released_reserve_quote_lots = post.released_reserve_quote_lots;
+    ph.released_attached_at_slot = post.released_attached_at_slot;
+    ph.matured_pos_quote_lots = post.matured_pos_quote_lots;
+    ph.original_reserve_at_attach = post.original_reserve_at_attach;
+    Ok(())
+}
+
+/// Materialize one leg's realized-PnL delta with junior-claim gating (Wave 24d/H7).
+/// `ph` present ⇒ the position is OPTED:
+///   * GAIN  → deferred to the warmup reserve (no collateral; gains are junior).
+///   * LOSS  → debited from collateral (existing waterfall) AND the removed amount
+///             credits the market `residual` (loss seniority feeds the junior pool,
+///             maintaining the `V − C − I == Σresidual` identity).
+/// `ph` absent (non-haircut market) ⇒ the proven `materialize_realized` unchanged.
+#[cfg(target_os = "solana")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn materialize_leg(
+    delta: i64,
+    iso: bool,
+    pos: &mut Position,
+    ts: &mut TraderState,
+    insurance: &mut Insurance,
+    ph: Option<&AccountInfo>,
+    residual: &mut u128,
+    now_slot: u64,
+) -> ProgramResult {
+    if delta == 0 {
+        return Ok(());
+    }
+    if delta > 0 {
+        if let Some(ph_ai) = ph {
+            // Junior: defer the gain to the warmup reserve, no collateral move.
+            apply_release_to(ph_ai, delta as u64, now_slot)?;
+            return Ok(());
+        }
+    }
+    // Loss, or a non-opted gain → the existing bucket/insurance routing.
+    let bucket_before = if iso { pos.collateral_quote_lots } else { ts.collateral_quote_lots };
+    materialize_realized(delta, iso, pos, ts, insurance)?;
+    if ph.is_some() && delta < 0 {
+        // H7: the collateral that actually left credits the Residual (senior loss).
+        let bucket_after = if iso { pos.collateral_quote_lots } else { ts.collateral_quote_lots };
+        let removed = (bucket_before - bucket_after) as u128;
+        *residual = residual.saturating_add(removed);
+    }
+    Ok(())
+}
+
 /// data: [size_lots u64][price_ticks u64][taker_side u8][fill_seq u64]
 /// accounts: [sequencer(signer), market, insurance, taker_ts, maker_ts, taker_pos,
 ///            maker_pos, (haircut_state OPTIONAL)]
@@ -290,23 +394,41 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         }
         insurance.balance_quote_lots = insurance.balance_quote_lots.saturating_add(fee - rebate);
 
-        // ── (R2) Settle each leg's funding on its PRE-trade size, BEFORE the
-        // resize, when the optional haircut_state is supplied. The shared helper
-        // is the SAME one `settle_funding` uses, so the inline settle and the
-        // crank can't diverge; settling here re-stamps the entry index, so a
-        // following same-side add can't be charged funding for the prior interval.
-        if has_haircut {
-            let haircut: &mut MarketHaircutState = view(&accounts[7]);
-            if &haircut.market != accounts[1].key() {
+        // ── Junior-claim haircut wiring (Wave 24d/H7). The per-position haircut
+        // accounts (warmup reserve for deferred gains) are MANDATORY on a
+        // haircut-enabled market — mirror anchor: else a compromised sequencer could
+        // OMIT one to route a realized gain to collateral (senior) instead of the
+        // junior reserve, bypassing the gating. Found by canonical PDA + disc; None
+        // on a non-haircut market ⇒ `materialize_leg` = the proven path unchanged.
+        let taker_ph = find_position_haircut(accounts, pid, &mkt_key, accounts[5].key());
+        let maker_ph = find_position_haircut(accounts, pid, &mkt_key, accounts[6].key());
+        if market.haircut_enabled != 0 && (!has_haircut || taker_ph.is_none() || maker_ph.is_none()) {
+            return Err(ProgramError::Custom(244)); // HaircutNotInitialized
+        }
+        // Haircut residual: load ONCE (when the market_haircut is present), then
+        // funding-settle + loss-accrue into it, and write back ONCE at the end.
+        // `0` and inert on a non-haircut market.
+        let mut residual: u128 = if has_haircut {
+            let h: &MarketHaircutState = &*(accounts[7].borrow_data_unchecked().as_ptr() as *const MarketHaircutState);
+            if &h.market != accounts[1].key() {
                 return Err(ProgramError::InvalidArgument);
             }
+            u128::from_le_bytes(h.residual_quote_lots)
+        } else {
+            0
+        };
+
+        // ── (R2) Settle each leg's funding on its PRE-trade size, BEFORE the resize,
+        // when the haircut state is present (the RISK-1 residual move needs it). The
+        // shared helper is the SAME one `settle_funding` uses, so the inline settle
+        // and the crank can't diverge; settling here re-stamps the entry index, so a
+        // following same-side add isn't charged funding for the prior interval.
+        if has_haircut {
             let mark = market.mark_price_ticks;
-            let mut residual = u128::from_le_bytes(haircut.residual_quote_lots);
             crate::funding::settle_position_funding(taker_pos, mark, tick, fidx, &mut taker_ts.collateral_quote_lots, &mut residual)
                 .map_err(|_| ProgramError::InvalidArgument)?;
             crate::funding::settle_position_funding(maker_pos, mark, tick, fidx, &mut maker_ts.collateral_quote_lots, &mut residual)
                 .map_err(|_| ProgramError::InvalidArgument)?;
-            haircut.residual_quote_lots = residual.to_le_bytes();
         }
 
         // M-1: sample the collateral bucket AFTER the funding settle. An isolated
@@ -322,10 +444,17 @@ pub fn process(pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
             .map_err(|_| ProgramError::ArithmeticOverflow)?;
         let maker_delta = crate::fill_math::apply_to_position(maker_pos, maker_side, size, price, tick, fidx)
             .map_err(|_| ProgramError::ArithmeticOverflow)?;
-        // ── Materialize realized PnL into the right collateral bucket; a loss
-        // beyond the bucket drains it to 0 and draws the shortfall from insurance.
-        materialize_realized(taker_delta, taker_iso, taker_pos, taker_ts, insurance)?;
-        materialize_realized(maker_delta, maker_iso, maker_pos, maker_ts, insurance)?;
+        // ── Materialize realized PnL with junior-claim routing: an OPTED gain is
+        // deferred to the warmup reserve (no collateral); an opted loss debits
+        // collateral (waterfall) AND credits the Residual; a non-opted leg uses the
+        // proven bucket/insurance path. A loss beyond the bucket draws insurance.
+        materialize_leg(taker_delta, taker_iso, taker_pos, taker_ts, insurance, taker_ph, &mut residual, now_slot)?;
+        materialize_leg(maker_delta, maker_iso, maker_pos, maker_ts, insurance, maker_ph, &mut residual, now_slot)?;
+        // Write the (funding + loss-accrued) residual back to the market_haircut once.
+        if has_haircut {
+            let h: &mut MarketHaircutState = view(&accounts[7]);
+            h.residual_quote_lots = residual.to_le_bytes();
+        }
 
         // Maintain open_positions (gates withdraw_collateral). Pure transition.
         taker_ts.open_positions =
