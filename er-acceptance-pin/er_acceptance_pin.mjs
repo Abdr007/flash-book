@@ -110,7 +110,10 @@ function ix(tag, data, keys) {
 }
 const meta = (pk, isSigner, isWritable) => ({ pubkey: pk, isSigner, isWritable });
 
-async function send(conn, instructions, cu = 400_000) {
+// 1.0M CU default (under the 1.4M/tx cap): the delegate stages copy the full ~10KB
+// book into a buffer + zero + assign + CPI Delegate, which can exceed a 400k budget.
+// A higher limit is free here (no priority price set) and avoids a CU-exhaustion fail.
+async function send(conn, instructions, cu = 1_000_000) {
   const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: cu }), ...instructions);
   return sendAndConfirmTransaction(conn, tx, [signer], { commitment: "confirmed", skipPreflight: true, maxRetries: 5 });
 }
