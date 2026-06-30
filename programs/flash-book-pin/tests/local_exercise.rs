@@ -98,8 +98,10 @@ const IX_SET_TRADER_BUILDER: u8 = 39;
 const IX_UPDATE_FEE_TIERS: u8 = 43;
 const IX_SET_MARKET_MAX_LEVERAGE: u8 = 45;
 const IX_SET_INSURANCE_PAUSE_THRESHOLD: u8 = 54;
+const IX_BURN_MARKET_AUTHORITY: u8 = 55;
 const IX_EXPAND_MARKET_BOOK: u8 = 87;
 const IX_REAP_EXPIRED_ORDERS: u8 = 88;
+const IX_AUTO_DELEVERAGE: u8 = 89;
 const IX_VERIFY_PROTOCOL_SOLVENCY: u8 = 30;
 const IX_VERIFY_MARKET_INVARIANTS: u8 = 31;
 const IX_VERIFY_COLLATERAL_SOLVENCY: u8 = 32;
@@ -137,6 +139,8 @@ const IX_ATTEST_ER_RESERVED_MARGIN: u8 = 67;
 const IX_UNDELEGATE_MARKET_BOOK: u8 = 121;
 const IX_UNDELEGATE_MARKET: u8 = 123;
 const IX_UNDELEGATE_FILL_COMMITMENT: u8 = 131;
+const IX_MIGRATE_MARKET_TO_V3: u8 = 132;
+const IX_MIGRATE_POSITION_TO_TRADER_STATE_KEY: u8 = 133;
 const IX_SET_MARKET_STATUS: u8 = 14;
 const IX_OPEN_TRADER_SUB_ACCOUNT: u8 = 16;
 const IX_TRANSFER_COLLATERAL: u8 = 17;
@@ -158,14 +162,34 @@ const IX_INIT_LEVERAGE_TIERS: u8 = 34;
 const IX_INIT_ORACLE_CONFIG: u8 = 58;
 const IX_INIT_SIDE_ACCRUAL: u8 = 59;
 const IX_INIT_HAIRCUT_STATE: u8 = 61;
+const IX_CREATE_VAULT: u8 = 60;
+const IX_INIT_TRADER_ATA: u8 = 71;
+const IX_CLOSE_TRADER_ATA: u8 = 72;
+const IX_WITHDRAW_INSURANCE_FUND: u8 = 79;
+const IX_LIQUIDATE_PORTFOLIO_V2: u8 = 96;
+const IX_EXECUTE_TRIGGER: u8 = 99;
+const IX_EXECUTE_TWAP: u8 = 100;
+const IX_UPDATE_TRAILING_STOP: u8 = 113;
+const IX_UPDATE_ORACLE_QUORUM: u8 = 114;
+const IX_UPDATE_ORACLE_FROM_PYTH: u8 = 115;
+const IX_PARTIAL_WITHDRAW_XDOMAIN: u8 = 141;
+const IX_WITHDRAW_COLLATERAL_XDOMAIN: u8 = 142;
 
 // SPL Token (classic) program id + instruction tags.
 const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const SPL_ASSOCIATED_TOKEN: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const SPL_INITIALIZE_MINT2: u8 = 20;
 const SPL_INITIALIZE_ACCOUNT3: u8 = 18;
 const SPL_MINT_TO: u8 = 7;
 const MINT_LEN: u64 = 82;
 const TOKEN_ACCT_LEN: u64 = 165;
+const TOKEN_AMOUNT_OFF: usize = 64;
+const INS_BALANCE_OFF: usize = 8;
+const MKT_LONG_OI_OFF: usize = 56;
+const MKT_SHORT_OI_OFF: usize = 64;
+const TS_COLLATERAL_OFF: usize = 40;
+const POS_SIZE_OFF: usize = 88;
+const POS_COLLATERAL_OFF: usize = 104;
 
 fn gated() -> bool {
     std::env::var("LOCAL_EXERCISE").map(|v| v == "1").unwrap_or(false)
@@ -207,6 +231,13 @@ impl Report {
             Ok(sig) => self.fail(label, format!("expected reject 0x{code:x} but SUCCEEDED ({sig})")),
             Err(e) if e.contains(&want) => self.ok(label, format!("correctly rejected 0x{code:x}")),
             Err(e) => self.fail(label, format!("expected 0x{code:x}, got: {e}")),
+        }
+    }
+    fn expect_error_contains(&mut self, label: &str, needle: &str, res: Result<String, String>) {
+        match res {
+            Ok(sig) => self.fail(label, format!("expected error containing {needle:?} but SUCCEEDED ({sig})")),
+            Err(e) if e.contains(needle) => self.ok(label, format!("correctly rejected: {needle}")),
+            Err(e) => self.fail(label, format!("expected {needle:?}, got: {e}")),
         }
     }
     fn print(&self) {
@@ -286,6 +317,26 @@ fn le8(v: u64) -> [u8; 8] {
     v.to_le_bytes()
 }
 
+fn read_account_data(client: &RpcClient, key: Pubkey) -> Result<Vec<u8>, String> {
+    client.get_account_data(&key).map_err(|e| e.to_string())
+}
+
+fn read_u64_at(client: &RpcClient, key: Pubkey, off: usize) -> Result<u64, String> {
+    let d = read_account_data(client, key)?;
+    if d.len() < off + 8 {
+        return Err(format!("{key} account too short: len={} need {}", d.len(), off + 8));
+    }
+    Ok(u64::from_le_bytes(d[off..off + 8].try_into().unwrap()))
+}
+
+/// The CLUSTER's unix timestamp, read from the Clock sysvar (unix_timestamp i64 at
+/// offset 32). A local validator's clock drifts from wall time, so quorum/oracle
+/// published_at must use THIS, not SystemTime, or sources read as future-dated.
+fn onchain_unix(client: &RpcClient) -> u64 {
+    let clock = Pubkey::from_str("SysvarC1ock11111111111111111111111111111111").unwrap();
+    read_u64_at(client, clock, 32).unwrap_or(0)
+}
+
 /// Build an instruction: 1-byte tag + body, with the given account metas.
 fn ix(pid: Pubkey, tag: u8, accounts: Vec<AccountMeta>, body: &[u8]) -> Instruction {
     let mut data = vec![tag];
@@ -340,6 +391,587 @@ fn config_ix(
     }
 }
 
+fn create_funded_token_account(
+    client: &RpcClient,
+    payer: &Keypair,
+    spl: Pubkey,
+    quote_mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+) -> Result<Keypair, String> {
+    let tok = Keypair::new();
+    let create = create_account_ix(client, &payer.pubkey(), &tok.pubkey(), TOKEN_ACCT_LEN, &spl);
+    let mut init_data = vec![SPL_INITIALIZE_ACCOUNT3];
+    init_data.extend_from_slice(owner.as_ref());
+    let init = Instruction {
+        program_id: spl,
+        accounts: vec![
+            AccountMeta::new(tok.pubkey(), false),
+            AccountMeta::new_readonly(quote_mint, false),
+        ],
+        data: init_data,
+    };
+    let mut mint_data = vec![SPL_MINT_TO];
+    mint_data.extend_from_slice(&le8(amount));
+    let mint_to = Instruction {
+        program_id: spl,
+        accounts: vec![
+            AccountMeta::new(quote_mint, false),
+            AccountMeta::new(tok.pubkey(), false),
+            AccountMeta::new_readonly(payer.pubkey(), true),
+        ],
+        data: mint_data,
+    };
+    send(client, &[create, init, mint_to], payer, &[&tok])?;
+    Ok(tok)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_and_deposit_trader(
+    client: &RpcClient,
+    pid: Pubkey,
+    payer: &Keypair,
+    spl: Pubkey,
+    sys: Pubkey,
+    insurance: Pubkey,
+    vault: Pubkey,
+    quote_mint: Pubkey,
+    amount: u64,
+) -> Result<(Keypair, Pubkey, Pubkey), String> {
+    let trader = Keypair::new();
+    fund(client, payer, &trader.pubkey(), 200_000_000);
+    let (ts, _) = Pubkey::find_program_address(&[TRADER_STATE_SEED, trader.pubkey().as_ref()], &pid);
+    let open = ix(
+        pid,
+        IX_OPEN_TRADER_STATE,
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new(ts, false),
+            AccountMeta::new_readonly(sys, false),
+        ],
+        &[],
+    );
+    send(client, &[open], payer, &[&trader])?;
+    let tok = create_funded_token_account(client, payer, spl, quote_mint, trader.pubkey(), amount)?;
+    let dep = ix(
+        pid,
+        IX_DEPOSIT_COLLATERAL,
+        vec![
+            AccountMeta::new(trader.pubkey(), true),
+            AccountMeta::new(ts, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new(tok.pubkey(), false),
+            AccountMeta::new_readonly(spl, false),
+        ],
+        &le8(amount),
+    );
+    send(client, &[dep], payer, &[&trader])?;
+    Ok((trader, ts, tok.pubkey()))
+}
+
+fn init_fresh_market(
+    client: &RpcClient,
+    pid: Pubkey,
+    payer: &Keypair,
+    spl: Pubkey,
+    sys: Pubkey,
+    insurance: Pubkey,
+    quote_mint: Pubkey,
+    mark_price: u64,
+    taker_fee_bps: u32,
+    maker_rebate_bps: i32,
+    mmr_bps: u32,
+) -> Result<(Keypair, Pubkey), String> {
+    let base_mint = Keypair::new();
+    let create = create_account_ix(client, &payer.pubkey(), &base_mint.pubkey(), MINT_LEN, &spl);
+    let mut mint_init = vec![SPL_INITIALIZE_MINT2, 9];
+    mint_init.extend_from_slice(payer.pubkey().as_ref());
+    mint_init.push(0);
+    let init_mint = Instruction {
+        program_id: spl,
+        accounts: vec![AccountMeta::new(base_mint.pubkey(), false)],
+        data: mint_init,
+    };
+    send(client, &[create, init_mint], payer, &[&base_mint])?;
+    let market = Pubkey::find_program_address(
+        &[MARKET_SEED, base_mint.pubkey().as_ref(), quote_mint.as_ref()],
+        &pid,
+    )
+    .0;
+    let mut body = Vec::new();
+    body.extend_from_slice(&le8(1)); // tick_size
+    body.extend_from_slice(&le8(mark_price));
+    body.extend_from_slice(&taker_fee_bps.to_le_bytes());
+    body.extend_from_slice(&maker_rebate_bps.to_le_bytes());
+    body.extend_from_slice(&le8(1)); // min_base_lots
+    body.extend_from_slice(&le8(1_000_000_000)); // max_oi
+    body.extend_from_slice(&mmr_bps.to_le_bytes());
+    let im = ix(
+        pid,
+        IX_INIT_MARKET,
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(base_mint.pubkey(), false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new_readonly(sys, false),
+        ],
+        &body,
+    );
+    send(client, &[im], payer, &[])?;
+    Ok((base_mint, market))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn init_fresh_market_with_book(
+    client: &RpcClient,
+    pid: Pubkey,
+    payer: &Keypair,
+    spl: Pubkey,
+    sys: Pubkey,
+    insurance: Pubkey,
+    quote_mint: Pubkey,
+    mark_price: u64,
+    taker_fee_bps: u32,
+    maker_rebate_bps: i32,
+    mmr_bps: u32,
+) -> Result<(Keypair, Pubkey, Pubkey), String> {
+    let (base_mint, market) = init_fresh_market(
+        client,
+        pid,
+        payer,
+        spl,
+        sys,
+        insurance,
+        quote_mint,
+        mark_price,
+        taker_fee_bps,
+        maker_rebate_bps,
+        mmr_bps,
+    )?;
+    let book = Pubkey::find_program_address(&[MARKET_BOOK_SEED, market.as_ref()], &pid).0;
+    let ib = ix(
+        pid,
+        IX_INIT_MARKET_BOOK,
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(base_mint.pubkey(), false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(book, false),
+            AccountMeta::new_readonly(sys, false),
+        ],
+        &[],
+    );
+    send(client, &[ib], payer, &[])?;
+    Ok((base_mint, market, book))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exercise_adl_and_migrations(
+    rep: &mut Report,
+    client: &RpcClient,
+    pid: Pubkey,
+    payer: &Keypair,
+    spl: Pubkey,
+    sys: Pubkey,
+    insurance: Pubkey,
+    vault: Pubkey,
+    quote_mint: Pubkey,
+) {
+    let (_base_adl, market_adl) = match init_fresh_market(
+        client, pid, payer, spl, sys, insurance, quote_mint, 200, 0, 0, 500,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            rep.fail("auto_deleverage:setup_market", e);
+            return;
+        }
+    };
+
+    let (uw, uw_ts, _) = match open_and_deposit_trader(
+        client, pid, payer, spl, sys, insurance, vault, quote_mint, 100,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            rep.fail("auto_deleverage:setup_underwater_trader", e);
+            return;
+        }
+    };
+    let (ct, ct_ts, _) = match open_and_deposit_trader(
+        client, pid, payer, spl, sys, insurance, vault, quote_mint, 1_000,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            rep.fail("auto_deleverage:setup_counter_trader", e);
+            return;
+        }
+    };
+    let (_aux_short, aux_short_ts, _) = match open_and_deposit_trader(
+        client, pid, payer, spl, sys, insurance, vault, quote_mint, 1_000,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            rep.fail("auto_deleverage:setup_aux_short", e);
+            return;
+        }
+    };
+    let (_aux_long, aux_long_ts, _) = match open_and_deposit_trader(
+        client, pid, payer, spl, sys, insurance, vault, quote_mint, 1_000,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            rep.fail("auto_deleverage:setup_aux_long", e);
+            return;
+        }
+    };
+
+    let pos_len = core::mem::size_of::<Position>() as u64;
+    let uw_pos = Keypair::new();
+    let ct_pos = Keypair::new();
+    let aux_short_pos = Keypair::new();
+    let aux_long_pos = Keypair::new();
+    let creates = [
+        create_account_ix(client, &payer.pubkey(), &uw_pos.pubkey(), pos_len, &pid),
+        create_account_ix(client, &payer.pubkey(), &ct_pos.pubkey(), pos_len, &pid),
+        create_account_ix(client, &payer.pubkey(), &aux_short_pos.pubkey(), pos_len, &pid),
+        create_account_ix(client, &payer.pubkey(), &aux_long_pos.pubkey(), pos_len, &pid),
+    ];
+    if let Err(e) = send(client, &creates, payer, &[&uw_pos, &ct_pos, &aux_short_pos, &aux_long_pos]) {
+        rep.fail("auto_deleverage:setup_positions", e);
+        return;
+    }
+
+    let mut fill_uw = Vec::new();
+    fill_uw.extend_from_slice(&le8(10));
+    fill_uw.extend_from_slice(&le8(200));
+    fill_uw.push(0); // taker_side bid: underwater trader opens long
+    fill_uw.extend_from_slice(&le8(1));
+    let open_uw = ix(
+        pid,
+        IX_APPLY_FILL,
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_adl, false),
+            AccountMeta::new(insurance, false),
+            AccountMeta::new(uw_ts, false),
+            AccountMeta::new(aux_short_ts, false),
+            AccountMeta::new(uw_pos.pubkey(), false),
+            AccountMeta::new(aux_short_pos.pubkey(), false),
+        ],
+        &fill_uw,
+    );
+    if let Err(e) = send(client, &[open_uw], payer, &[]) {
+        rep.fail("auto_deleverage:setup_underwater_fill", e);
+        return;
+    }
+
+    let mut fill_ct = Vec::new();
+    fill_ct.extend_from_slice(&le8(10));
+    fill_ct.extend_from_slice(&le8(250));
+    fill_ct.push(0); // aux opens long, counter is maker short @250
+    fill_ct.extend_from_slice(&le8(2));
+    let open_ct = ix(
+        pid,
+        IX_APPLY_FILL,
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_adl, false),
+            AccountMeta::new(insurance, false),
+            AccountMeta::new(aux_long_ts, false),
+            AccountMeta::new(ct_ts, false),
+            AccountMeta::new(aux_long_pos.pubkey(), false),
+            AccountMeta::new(ct_pos.pubkey(), false),
+        ],
+        &fill_ct,
+    );
+    if let Err(e) = send(client, &[open_ct], payer, &[]) {
+        rep.fail("auto_deleverage:setup_counter_fill", e);
+        return;
+    }
+
+    let isolate = ix(
+        pid,
+        IX_SET_POSITION_ISOLATED,
+        vec![
+            AccountMeta::new_readonly(uw.pubkey(), true),
+            AccountMeta::new(uw_ts, false),
+            AccountMeta::new_readonly(market_adl, false),
+            AccountMeta::new(uw_pos.pubkey(), false),
+        ],
+        &le8(100),
+    );
+    if let Err(e) = send(client, &[isolate], payer, &[&uw]) {
+        rep.fail("auto_deleverage:setup_isolated", e);
+        return;
+    }
+
+    let mark_down = ix(
+        pid,
+        IX_UPDATE_ORACLE,
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_adl, false),
+        ],
+        &le8(100),
+    );
+    if let Err(e) = send(client, &[mark_down], payer, &[]) {
+        rep.fail("auto_deleverage:setup_mark", e);
+        return;
+    }
+    let ins_balance = match read_u64_at(client, insurance, INS_BALANCE_OFF) {
+        Ok(v) => v,
+        Err(e) => {
+            rep.fail("auto_deleverage:read_insurance", e);
+            return;
+        }
+    };
+    let threshold = ix(
+        pid,
+        IX_SET_INSURANCE_PAUSE_THRESHOLD,
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(insurance, false),
+        ],
+        &le8(ins_balance.saturating_add(1)),
+    );
+    if let Err(e) = send(client, &[threshold], payer, &[]) {
+        rep.fail("auto_deleverage:setup_pause_threshold", e);
+        return;
+    }
+
+    let sum_known = |client: &RpcClient| -> Result<u128, String> {
+        let mut s = read_u64_at(client, insurance, INS_BALANCE_OFF)? as u128;
+        for (key, off) in [
+            (uw_ts, TS_COLLATERAL_OFF),
+            (ct_ts, TS_COLLATERAL_OFF),
+            (aux_short_ts, TS_COLLATERAL_OFF),
+            (aux_long_ts, TS_COLLATERAL_OFF),
+            (uw_pos.pubkey(), POS_COLLATERAL_OFF),
+            (ct_pos.pubkey(), POS_COLLATERAL_OFF),
+            (aux_short_pos.pubkey(), POS_COLLATERAL_OFF),
+            (aux_long_pos.pubkey(), POS_COLLATERAL_OFF),
+        ] {
+            s = s.saturating_add(read_u64_at(client, key, off)? as u128);
+        }
+        Ok(s)
+    };
+    let pre_vault = read_u64_at(client, vault, TOKEN_AMOUNT_OFF).unwrap_or(0);
+    let pre_sum = sum_known(client).unwrap_or(u128::MAX);
+    let adl = ix(
+        pid,
+        IX_AUTO_DELEVERAGE,
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_adl, false),
+            AccountMeta::new_readonly(insurance, false),
+            AccountMeta::new(uw_ts, false),
+            AccountMeta::new(uw_pos.pubkey(), false),
+            AccountMeta::new(ct_ts, false),
+            AccountMeta::new(ct_pos.pubkey(), false),
+        ],
+        &le8(5),
+    );
+    let adl_ok = match send(client, &[adl], payer, &[]) {
+        Ok(s) => {
+            rep.ok("auto_deleverage", s);
+            true
+        }
+        Err(e) => {
+            rep.fail("auto_deleverage", e);
+            false
+        }
+    };
+
+    if adl_ok {
+        let state = (
+            read_u64_at(client, uw_pos.pubkey(), POS_COLLATERAL_OFF),
+            read_u64_at(client, uw_pos.pubkey(), POS_SIZE_OFF),
+            read_u64_at(client, ct_ts, TS_COLLATERAL_OFF),
+            read_u64_at(client, ct_pos.pubkey(), POS_SIZE_OFF),
+            read_u64_at(client, market_adl, MKT_LONG_OI_OFF),
+            read_u64_at(client, market_adl, MKT_SHORT_OI_OFF),
+            read_u64_at(client, vault, TOKEN_AMOUNT_OFF),
+            sum_known(client),
+        );
+        match state {
+            (Ok(50), Ok(5), Ok(1_050), Ok(5), Ok(15), Ok(15), Ok(post_vault), Ok(post_sum))
+                if pre_sum == post_sum && pre_vault == post_vault && (post_vault as u128) >= post_sum =>
+            {
+                rep.ok(
+                    "auto_deleverage:post_invariant",
+                    format!("vault={post_vault} sum={post_sum} capped_counter_credit=50"),
+                );
+            }
+            other => rep.fail(
+                "auto_deleverage:post_invariant",
+                format!("unexpected post-state: pre_vault={pre_vault} pre_sum={pre_sum} state={other:?}"),
+            ),
+        }
+    }
+
+    let reset_threshold = ix(
+        pid,
+        IX_SET_INSURANCE_PAUSE_THRESHOLD,
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(insurance, false),
+        ],
+        &le8(0),
+    );
+    let _ = send(client, &[reset_threshold], payer, &[]);
+
+    run(
+        rep,
+        client,
+        "migrate_market_to_v3(already_canonical)",
+        &[ix(
+            pid,
+            IX_MIGRATE_MARKET_TO_V3,
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_adl, false),
+            ],
+            &[],
+        )],
+        payer,
+        &[],
+    );
+    run(
+        rep,
+        client,
+        "migrate_position_to_trader_state_key(already_canonical)",
+        &[ix(
+            pid,
+            IX_MIGRATE_POSITION_TO_TRADER_STATE_KEY,
+            vec![
+                AccountMeta::new_readonly(ct.pubkey(), true),
+                AccountMeta::new_readonly(ct_pos.pubkey(), false),
+            ],
+            &[],
+        )],
+        payer,
+        &[&ct],
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exercise_liquidate_portfolio_v2(
+    rep: &mut Report,
+    client: &RpcClient,
+    pid: Pubkey,
+    payer: &Keypair,
+    spl: Pubkey,
+    sys: Pubkey,
+    insurance: Pubkey,
+    vault: Pubkey,
+    quote_mint: Pubkey,
+) {
+    let (_base, market, book) = match init_fresh_market_with_book(
+        client,
+        pid,
+        payer,
+        spl,
+        sys,
+        insurance,
+        quote_mint,
+        100_000,
+        0,
+        0,
+        500,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            rep.fail("liquidate_portfolio_v2:setup_market", e);
+            return;
+        }
+    };
+    let (_victim, victim_ts, _) = match open_and_deposit_trader(
+        client, pid, payer, spl, sys, insurance, vault, quote_mint, 80_000,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            rep.fail("liquidate_portfolio_v2:setup_victim", e);
+            return;
+        }
+    };
+    let (_counter, counter_ts, _) = match open_and_deposit_trader(
+        client, pid, payer, spl, sys, insurance, vault, quote_mint, 80_000,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            rep.fail("liquidate_portfolio_v2:setup_counter", e);
+            return;
+        }
+    };
+    let pos_len = core::mem::size_of::<Position>() as u64;
+    let victim_pos = Keypair::new();
+    let counter_pos = Keypair::new();
+    let c1 = create_account_ix(client, &payer.pubkey(), &victim_pos.pubkey(), pos_len, &pid);
+    let c2 = create_account_ix(client, &payer.pubkey(), &counter_pos.pubkey(), pos_len, &pid);
+    if let Err(e) = send(client, &[c1, c2], payer, &[&victim_pos, &counter_pos]) {
+        rep.fail("liquidate_portfolio_v2:setup_positions", e);
+        return;
+    }
+    let mut fill = Vec::new();
+    fill.extend_from_slice(&le8(10));
+    fill.extend_from_slice(&le8(100_000));
+    fill.push(0);
+    fill.extend_from_slice(&le8(1));
+    let fill_ix = ix(
+        pid,
+        IX_APPLY_FILL,
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(insurance, false),
+            AccountMeta::new(victim_ts, false),
+            AccountMeta::new(counter_ts, false),
+            AccountMeta::new(victim_pos.pubkey(), false),
+            AccountMeta::new(counter_pos.pubkey(), false),
+        ],
+        &fill,
+    );
+    if let Err(e) = send(client, &[fill_ix], payer, &[]) {
+        rep.fail("liquidate_portfolio_v2:setup_fill", e);
+        return;
+    }
+    let mark_down = ix(
+        pid,
+        IX_UPDATE_ORACLE,
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market, false),
+        ],
+        &le8(80_000),
+    );
+    if let Err(e) = send(client, &[mark_down], payer, &[]) {
+        rep.fail("liquidate_portfolio_v2:setup_mark", e);
+        return;
+    }
+    run(
+        rep,
+        client,
+        "liquidate_portfolio_v2",
+        &[ix(
+            pid,
+            IX_LIQUIDATE_PORTFOLIO_V2,
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new(book, false),
+                AccountMeta::new_readonly(victim_ts, false),
+                AccountMeta::new_readonly(victim_pos.pubkey(), false),
+            ],
+            &[],
+        )],
+        payer,
+        &[],
+    );
+}
+
 #[test]
 fn smoke_connect() {
     if !gated() {
@@ -363,6 +995,7 @@ fn full_lifecycle() {
     let client = rpc();
     let pid = program_id();
     let spl = Pubkey::from_str(SPL_TOKEN).unwrap();
+    let ata_program = Pubkey::from_str(SPL_ASSOCIATED_TOKEN).unwrap();
     let sys = solana_sdk_ids::system_program::id();
     let mut rep = Report::new();
 
@@ -434,6 +1067,61 @@ fn full_lifecycle() {
                 panic!("insurance fund creation failed — backbone blocked");
             }
         }
+    }
+
+    // ── 71/72. init_trader_ata + close_trader_ata on an EMPTY associated account ─
+    {
+        let ata_trader = Keypair::new();
+        fund(&client, &payer, &ata_trader.pubkey(), 100_000_000);
+        let trader_ata = Pubkey::find_program_address(
+            &[
+                ata_trader.pubkey().as_ref(),
+                spl.as_ref(),
+                quote_mint.pubkey().as_ref(),
+            ],
+            &ata_program,
+        )
+        .0;
+        run(
+            &mut rep,
+            &client,
+            "init_trader_ata",
+            &[ix(
+                pid,
+                IX_INIT_TRADER_ATA,
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(ata_trader.pubkey(), false),
+                    AccountMeta::new_readonly(insurance, false),
+                    AccountMeta::new_readonly(quote_mint.pubkey(), false),
+                    AccountMeta::new(trader_ata, false),
+                    AccountMeta::new_readonly(sys, false),
+                    AccountMeta::new_readonly(spl, false),
+                    AccountMeta::new_readonly(ata_program, false),
+                ],
+                &[],
+            )],
+            &payer,
+            &[],
+        );
+        run(
+            &mut rep,
+            &client,
+            "close_trader_ata(empty)",
+            &[ix(
+                pid,
+                IX_CLOSE_TRADER_ATA,
+                vec![
+                    AccountMeta::new_readonly(ata_trader.pubkey(), true),
+                    AccountMeta::new(trader_ata, false),
+                    AccountMeta::new(payer.pubkey(), false),
+                    AccountMeta::new_readonly(spl, false),
+                ],
+                &[],
+            )],
+            &payer,
+            &[&ata_trader],
+        );
     }
 
     // ── 11. initialize_market (create market PDA) ───────────────────────────
@@ -522,6 +1210,29 @@ fn full_lifecycle() {
             }
         }
     }
+
+    exercise_adl_and_migrations(
+        &mut rep,
+        &client,
+        pid,
+        &payer,
+        spl,
+        sys,
+        insurance,
+        vault.pubkey(),
+        quote_mint.pubkey(),
+    );
+    exercise_liquidate_portfolio_v2(
+        &mut rep,
+        &client,
+        pid,
+        &payer,
+        spl,
+        sys,
+        insurance,
+        vault.pubkey(),
+        quote_mint.pubkey(),
+    );
 
     // ── two traders: open_trader_state + token acct + deposit_collateral ────
     let maker = Keypair::new();
@@ -780,6 +1491,49 @@ fn full_lifecycle() {
         }
     }
 
+    // ── 79. withdraw_insurance_fund — positive admin payout from real fee balance
+    {
+        let auth_tok = match create_funded_token_account(
+            &client,
+            &payer,
+            spl,
+            quote_mint.pubkey(),
+            payer.pubkey(),
+            1,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                rep.fail("withdraw_insurance_fund:setup_authority_token", e);
+                rep.print();
+                panic!("withdraw_insurance_fund setup token account failed");
+            }
+        };
+        let balance = read_u64_at(&client, insurance, INS_BALANCE_OFF).unwrap_or(0);
+        if balance >= 100 {
+            run(
+                &mut rep,
+                &client,
+                "withdraw_insurance_fund",
+                &[ix(
+                    pid,
+                    IX_WITHDRAW_INSURANCE_FUND,
+                    vec![
+                        AccountMeta::new_readonly(payer.pubkey(), true),
+                        AccountMeta::new(insurance, false),
+                        AccountMeta::new(vault.pubkey(), false),
+                        AccountMeta::new(auth_tok.pubkey(), false),
+                        AccountMeta::new_readonly(spl, false),
+                    ],
+                    &le8(100),
+                )],
+                &payer,
+                &[],
+            );
+        } else {
+            rep.fail("withdraw_insurance_fund", format!("setup fee balance too low: {balance}"));
+        }
+    }
+
     // ── config-PDA creators (all route through the now-fixed create_pda_account).
     //    Ordered so haircut (which ARMS the engine, market-writable) runs LAST. ──
     {
@@ -1000,6 +1754,37 @@ fn full_lifecycle() {
     // ── strategist-vault (v3) family: create vault + its trader_state, a
     //    depositor position, and token in/out (shares burned, PDA-signed out) ──
     {
+        // 60. create_vault legacy tag: same VaultV3 account, but data is
+        // [vault_id][name][perf_fee_bps] rather than tag-105's order.
+        let legacy_strategist = Keypair::new();
+        fund(&client, &payer, &legacy_strategist.pubkey(), 200_000_000);
+        let legacy_vault_id: u8 = 9;
+        let legacy_vault = Pubkey::find_program_address(
+            &[VAULT_SEED, legacy_strategist.pubkey().as_ref(), &[legacy_vault_id]],
+            &pid,
+        )
+        .0;
+        let mut legacy_data = vec![legacy_vault_id];
+        legacy_data.extend_from_slice(&[0u8; 32]);
+        legacy_data.extend_from_slice(&100u32.to_le_bytes());
+        run(
+            &mut rep,
+            &client,
+            "create_vault(legacy_tag_60)",
+            &[ix(
+                pid,
+                IX_CREATE_VAULT,
+                vec![
+                    AccountMeta::new(legacy_strategist.pubkey(), true),
+                    AccountMeta::new(legacy_vault, false),
+                    AccountMeta::new_readonly(sys, false),
+                ],
+                &legacy_data,
+            )],
+            &payer,
+            &[&legacy_strategist],
+        );
+
         let strategist = Keypair::new();
         fund(&client, &payer, &strategist.pubkey(), 200_000_000);
         let vault_id: u8 = 1;
@@ -1334,7 +2119,7 @@ fn full_lifecycle() {
         d.extend_from_slice(&2i32.to_le_bytes());
         d.extend_from_slice(&le8(1));
         d.extend_from_slice(&le8(1_000_000_000));
-        let ix = Instruction {
+        let set_params_ix = Instruction {
             program_id: pid,
             accounts: vec![
                 AccountMeta::new_readonly(payer.pubkey(), true),
@@ -1342,7 +2127,7 @@ fn full_lifecycle() {
             ],
             data: d,
         };
-        match send(&client, &[ix], &payer, &[]) {
+        match send(&client, &[set_params_ix], &payer, &[]) {
             Ok(s) => rep.ok("set_market_params", s),
             Err(e) => rep.fail("set_market_params", e),
         }
@@ -1363,11 +2148,60 @@ fn full_lifecycle() {
         body.extend_from_slice(&0u32.to_le_bytes()); // liquidation_fee_bps
         body.extend_from_slice(&le8(0)); // min_liquidation_abs_lots
         body.extend_from_slice(&le8(1)); // min_nonzero_mm_req_lots (floor covers small-N ceil)
-        let ix = config_ix(pid, &payer.pubkey(), market, envelope, sys, IX_SET_ENVELOPE_CONFIG, &body, false);
-        match send(&client, &[ix], &payer, &[]) {
+        let set_env_ix = config_ix(pid, &payer.pubkey(), market, envelope, sys, IX_SET_ENVELOPE_CONFIG, &body, false);
+        match send(&client, &[set_env_ix], &payer, &[]) {
             Ok(s) => rep.ok("set_envelope_config", s),
             Err(e) => rep.fail("set_envelope_config", e),
         }
+
+        // 114. update_oracle_quorum: three fresh sources, median becomes mark.
+        let oracle_cfg = Pubkey::find_program_address(&[ORACLE_CONFIG_SEED, market.as_ref()], &pid).0;
+        // published_at must use the CLUSTER clock (not wall time) and be just-past so
+        // it is neither future-dated nor stale (max_staleness=60).
+        let pub_at = onchain_unix(&client).saturating_sub(2);
+        let mut q = Vec::new();
+        for v in [100_000u64, 100_010, 99_990] { q.extend_from_slice(&le8(v)); }
+        for v in [10u64, 10, 10] { q.extend_from_slice(&le8(v)); }
+        for _ in 0..3 { q.extend_from_slice(&le8(pub_at)); }
+        run(
+            &mut rep,
+            &client,
+            "update_oracle_quorum",
+            &[ix(
+                pid,
+                IX_UPDATE_ORACLE_QUORUM,
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(oracle_cfg, false),
+                ],
+                &q,
+            )],
+            &payer,
+            &[],
+        );
+
+        // 115. update_oracle_from_pyth requires a real Pyth receiver-owned
+        // PriceUpdateV2 account. The raw local/devnet harness does not fabricate
+        // one; assert the fail-closed owner gate with a real non-Pyth account.
+        let pyth_res = send(
+            &client,
+            &[ix(
+                pid,
+                IX_UPDATE_ORACLE_FROM_PYTH,
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(oracle_cfg, false),
+                    AccountMeta::new_readonly(quote_mint.pubkey(), false),
+                    AccountMeta::new_readonly(envelope, false),
+                ],
+                &[],
+            )],
+            &payer,
+            &[],
+        );
+        rep.expect_error_contains("update_oracle_from_pyth(wrong_owner_failclosed)", "owner", pyth_res);
 
         // 42. init_fee_tiers (PDA): [volume_window_slots u64][tier_count u8]
         //     then per-tier (min_vol u64, maker_rebate i32, taker_fee u32). 1 tier.
@@ -1603,6 +2437,21 @@ fn full_lifecycle() {
         run(&mut rep, &client, "cancel_twap_order",
             &[ix(pid, IX_CANCEL_TWAP, vec![sg(taker.pubkey()), rw(twap)], &[])], &payer, &[&taker]);
 
+        // 100 execute_twap_slice: a separate active TWAP (interval 1; 0 is rejected
+        // at placement). Refresh the mark first so the slice's staleness gate passes.
+        let twap_exec = Pubkey::find_program_address(&[TWAP_ORDER_SEED, market.as_ref(), taker.pubkey().as_ref(), &[2u8]], &pid).0;
+        let mut tb = vec![2u8, 1, 0, 0]; // id, side(ask), flags, sub
+        for v in [5u64, 10, 100_000, 1, 0, 100_000] { tb.extend_from_slice(&le8(v)); }
+        let _ = send(&client, &[ix(pid, IX_UPDATE_ORACLE, vec![sgr(payer.pubkey()), rw(market)], &le8(100_000))], &payer, &[]);
+        if send(&client, &[ix(pid, IX_PLACE_TWAP, vec![sg(taker.pubkey()), ro(market), rw(twap_exec), ro(sys)], &tb)], &payer, &[&taker]).is_ok() {
+            run(&mut rep, &client, "execute_twap_slice",
+                &[ix(pid, IX_EXECUTE_TWAP, vec![sgr(payer.pubkey()), ro(market), rw(market_book), rw(twap_exec)], &[])], &payer, &[]);
+            run(&mut rep, &client, "cancel_twap_order(executed)",
+                &[ix(pid, IX_CANCEL_TWAP, vec![sg(taker.pubkey()), rw(twap_exec)], &[])], &payer, &[&taker]);
+        } else {
+            rep.fail("execute_twap_slice", "setup place_twap_order failed".into());
+        }
+
         // 101 place_iceberg + 102 replenish + 103 cancel
         let ice = Pubkey::find_program_address(&[ICEBERG_ORDER_SEED, market.as_ref(), taker.pubkey().as_ref(), &[1u8]], &pid).0;
         let mut b = vec![1u8, 1, 0]; // id, side(ask), sub
@@ -1621,6 +2470,45 @@ fn full_lifecycle() {
         for v in [10u64, 100_000, 101_000, 101_000, 99_000, 99_000, 0] { b.extend_from_slice(&le8(v)); }
         run(&mut rep, &client, "place_bracket_order",
             &[ix(pid, IX_PLACE_BRACKET, vec![sg(taker.pubkey()), ro(market), rw(market_book), rw(tp), rw(sl), ro(sys)], &b)], &payer, &[&taker]);
+
+        // 99 execute_trigger_order: condition-met kind=1 trigger injects into book.
+        let trig_exec = Pubkey::find_program_address(&[TRIGGER_ORDER_SEED, market.as_ref(), taker.pubkey().as_ref(), &[7u8]], &pid).0;
+        let mut te = vec![7u8, 0, 1, 0, 0]; // id, side(bid), kind(mark>=trigger), flags, sub
+        te.extend_from_slice(&le8(1));
+        te.extend_from_slice(&le8(100_000));
+        te.extend_from_slice(&le8(100_000));
+        te.extend_from_slice(&le8(0));
+        te.extend_from_slice(&le8(101_000));
+        // refresh the mark so the trigger's staleness gate (Custom 248) passes and the
+        // kind=1 (mark>=trigger) condition is met at 100_000.
+        let _ = send(&client, &[ix(pid, IX_UPDATE_ORACLE, vec![sgr(payer.pubkey()), rw(market)], &le8(100_000))], &payer, &[]);
+        if send(&client, &[ix(pid, IX_PLACE_TRIGGER_ORDER, vec![sg(taker.pubkey()), ro(market), rw(trig_exec), ro(sys)], &te)], &payer, &[&taker]).is_ok() {
+            run(&mut rep, &client, "execute_trigger_order",
+                &[ix(pid, IX_EXECUTE_TRIGGER, vec![sgr(payer.pubkey()), ro(market), rw(market_book), rw(trig_exec)], &[])], &payer, &[]);
+            run(&mut rep, &client, "cancel_trigger_order(executed)",
+                &[ix(pid, IX_CANCEL_TRIGGER_ORDER, vec![sg(taker.pubkey()), rw(trig_exec)], &[])], &payer, &[&taker]);
+        } else {
+            rep.fail("execute_trigger_order", "setup place_trigger_order failed".into());
+        }
+
+        // 113 update_trailing_stop: optional trailing offset extends place-trigger
+        // data to 47 bytes; first update seeds the anchor and tightens the stop.
+        let trailing = Pubkey::find_program_address(&[TRIGGER_ORDER_SEED, market.as_ref(), taker.pubkey().as_ref(), &[8u8]], &pid).0;
+        let mut tr = vec![8u8, 1, 0, 0, 0]; // id, side(ask close), kind(long SL), flags, sub
+        tr.extend_from_slice(&le8(1));
+        tr.extend_from_slice(&le8(99_000));
+        tr.extend_from_slice(&le8(99_000));
+        tr.extend_from_slice(&le8(0));
+        tr.extend_from_slice(&le8(99_000));
+        tr.extend_from_slice(&500u16.to_le_bytes());
+        if send(&client, &[ix(pid, IX_PLACE_TRIGGER_ORDER, vec![sg(taker.pubkey()), ro(market), rw(trailing), ro(sys)], &tr)], &payer, &[&taker]).is_ok() {
+            run(&mut rep, &client, "update_trailing_stop",
+                &[ix(pid, IX_UPDATE_TRAILING_STOP, vec![sgr(payer.pubkey()), ro(market), rw(trailing)], &[])], &payer, &[]);
+            run(&mut rep, &client, "cancel_trigger_order(trailing)",
+                &[ix(pid, IX_CANCEL_TRIGGER_ORDER, vec![sg(taker.pubkey()), rw(trailing)], &[])], &payer, &[&taker]);
+        } else {
+            rep.fail("update_trailing_stop", "setup trailing trigger failed".into());
+        }
     }
 
     // ── FLP v3 (per-market exposure + LP token in/out) ──────────────────────
@@ -1684,6 +2572,25 @@ fn full_lifecycle() {
         let mut uft = Vec::new(); uft.extend_from_slice(&le8(1_000_000)); uft.push(1); uft.extend_from_slice(&le8(0)); uft.extend_from_slice(&0i32.to_le_bytes()); uft.extend_from_slice(&10u32.to_le_bytes());
         run(&mut rep, &client, "update_fee_tiers",
             &[ix(pid, IX_UPDATE_FEE_TIERS, vec![sgr(payer.pubkey()), rw(fee_tiers)], &uft)], &payer, &[]);
+
+        if let Ok((_burn_base, burn_market)) = init_fresh_market(
+            &client,
+            pid,
+            &payer,
+            spl,
+            sys,
+            insurance,
+            quote_mint.pubkey(),
+            100_000,
+            0,
+            0,
+            500,
+        ) {
+            run(&mut rep, &client, "burn_market_authority",
+                &[ix(pid, IX_BURN_MARKET_AUTHORITY, vec![sgr(payer.pubkey()), rw(burn_market)], &[])], &payer, &[]);
+        } else {
+            rep.fail("burn_market_authority", "fresh market setup failed".into());
+        }
     }
 
     // ── book keeper ops ─────────────────────────────────────────────────────
@@ -1739,6 +2646,39 @@ fn full_lifecycle() {
         let mut ab = Vec::new(); ab.extend_from_slice(&le8(0)); ab.extend_from_slice(&le8(1)); // reserved=0 (er_active stays 0), epoch=1
         run(&mut rep, &client, "attest_er_reserved_margin",
             &[ix(pid, IX_ATTEST_ER_RESERVED_MARGIN, vec![sgr(payer.pubkey()), rw(er_margin), rw(maker_ts)], &ab)], &payer, &[]);
+
+        // xdomain withdraw variants: flat ER-active trader with a nonzero
+        // reservation, so both paths must honor the attested floor.
+        if let Ok((xd_trader, xd_ts, xd_tok)) = open_and_deposit_trader(
+            &client,
+            pid,
+            &payer,
+            spl,
+            sys,
+            insurance,
+            vault.pubkey(),
+            quote_mint.pubkey(),
+            300_000,
+        ) {
+            let xd_er_margin = Pubkey::find_program_address(&[ER_MARGIN_SEED, xd_ts.as_ref()], &pid).0;
+            run(&mut rep, &client, "init_er_margin_attestation(xdomain)",
+                &[ix(pid, IX_INIT_ER_MARGIN_ATTESTATION, vec![sg(payer.pubkey()), ro(insurance), ro(xd_ts), rw(xd_er_margin), ro(sys)], &payer.pubkey().to_bytes())], &payer, &[]);
+            let mut xb = Vec::new();
+            xb.extend_from_slice(&le8(50_000));
+            xb.extend_from_slice(&le8(1));
+            run(&mut rep, &client, "attest_er_reserved_margin(xdomain)",
+                &[ix(pid, IX_ATTEST_ER_RESERVED_MARGIN, vec![sgr(payer.pubkey()), rw(xd_er_margin), rw(xd_ts)], &xb)], &payer, &[]);
+            run(&mut rep, &client, "partial_withdraw_xdomain",
+                &[ix(pid, IX_PARTIAL_WITHDRAW_XDOMAIN,
+                    vec![sg(xd_trader.pubkey()), rw(xd_ts), ro(insurance), rw(vault.pubkey()), rw(xd_tok), ro(spl), ro(xd_er_margin)],
+                    &le8(100_000))], &payer, &[&xd_trader]);
+            run(&mut rep, &client, "withdraw_collateral_xdomain",
+                &[ix(pid, IX_WITHDRAW_COLLATERAL_XDOMAIN,
+                    vec![sg(xd_trader.pubkey()), rw(xd_ts), ro(insurance), rw(vault.pubkey()), rw(xd_tok), ro(spl), ro(xd_er_margin)],
+                    &le8(100_000))], &payer, &[&xd_trader]);
+        } else {
+            rep.fail("xdomain_withdraw_setup", "open/deposit failed".into());
+        }
         // fail-closed: undelegate paths reject Custom(221) without touching the DLP
         let r = send(&client, &[ix(pid, IX_UNDELEGATE_MARKET_BOOK, vec![sgr(payer.pubkey()), ro(market)], &[])], &payer, &[]);
         rep.expect_reject("undelegate_market_book(failclosed)", 221, r);
@@ -1791,7 +2731,7 @@ fn full_lifecycle() {
             && send(&client, &[ix(pid, IX_INIT_MARKET_BOOK, vec![sg(payer.pubkey()), ro(market_l), ro(base_l.pubkey()), ro(quote_mint.pubkey()), rw(book_l), ro(sys)], &[])], &payer, &[]).is_ok();
 
         // two traders V (long) + C (short), each deposits 80_000 cross collateral
-        let mut mk_trader = |label: &str| -> Option<(Keypair, Pubkey)> {
+        let mk_trader = |label: &str| -> Option<(Keypair, Pubkey)> {
             let t = Keypair::new();
             fund(&client, &payer, &t.pubkey(), 200_000_000);
             let ts = Pubkey::find_program_address(&[TRADER_STATE_SEED, t.pubkey().as_ref()], &pid).0;
@@ -1808,7 +2748,7 @@ fn full_lifecycle() {
             if ok { Some((t, ts)) } else { None }
         };
         if setup_ok {
-            if let (Some((v, ts_v)), Some((c, ts_c))) = (mk_trader("V"), mk_trader("C")) {
+            if let (Some((_v, ts_v)), Some((c, ts_c))) = (mk_trader("V"), mk_trader("C")) {
                 let pos_len = core::mem::size_of::<Position>() as u64;
                 let pos_v = Keypair::new();
                 let pos_c = Keypair::new();
@@ -1914,7 +2854,7 @@ fn full_lifecycle() {
             if ok { Some((t, ts, tok.pubkey())) } else { None }
         };
         // P (long) + Q (short), TINY size-1 position on market1 (notional 100k → 10% floor = 10k « 80k collateral)
-        if let (Some((p, ts_p, tok_p)), Some((q, ts_q, _))) = (mk(80_000), mk(80_000)) {
+        if let (Some((p, ts_p, tok_p)), Some((_q, ts_q, _))) = (mk(80_000), mk(80_000)) {
             let pos_len = core::mem::size_of::<Position>() as u64;
             let pos_p = Keypair::new();
             let pos_q = Keypair::new();
@@ -2041,7 +2981,7 @@ fn full_lifecycle() {
         if let (Some((mka, bka)), Some((mkb, bkb)), Some((b, ts_b, _))) = (mk_market(), mk_market(), mktr(400_000)) {
             if let (Some(pa), Some(pb)) = (open_long(mka, ts_b), open_long(mkb, ts_b)) {
                 // each leg 18B: side u8, size u64, limit u64, post_only u8
-                let mut leg = |side: u8| { let mut l = vec![side]; l.extend_from_slice(&le8(5)); l.extend_from_slice(&le8(100_000)); l.push(0); l };
+                let leg = |side: u8| { let mut l = vec![side]; l.extend_from_slice(&le8(5)); l.extend_from_slice(&le8(100_000)); l.push(0); l };
                 let mut d2 = leg(1); d2.extend(leg(1));
                 run(&mut rep, &client, "place_basket_order_v2", &[ix(pid, IX_PLACE_BASKET_V2,
                     vec![sgr(b.pubkey()), ro(ts_b), ro(mka), rw(bka), ro(pa), ro(mkb), rw(bkb), ro(pb)], &d2)], &payer, &[&b]);
