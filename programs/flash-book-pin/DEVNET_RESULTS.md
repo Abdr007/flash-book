@@ -214,10 +214,24 @@ Full delegate → ER-place → commit → commit-and-undelegate cycle on the **l
 | ER commit_and_undelegate_market → L1 finalize | [3EiqbSp1jwFXbK…](https://explorer.solana.com/tx/3EiqbSp1jwFXbKuBZY6jdjA8Vy63Ztkj8pg65j2aTJF74arvdoMMgxVBsfhZJMSNmUMModhxhVkM6krAbC3jDrtT?cluster=devnet) |
 | L1 assert market back program-owned | ✓  |
 
+## C. Pyth pull-oracle positive — `update_oracle_from_pyth` (115)
+
+Cranked against a **real Pyth-receiver-owned `PriceUpdateV2`** on devnet (feed `1121JSUgoCT514dycHuZRjPdDnXd1gvQ3wCixt8on1m`, owned by `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`, Full-verified). The handler verified the receiver owner + discriminator + Full level + feed-id match + freshness, converted the price to ticks, passed the mandatory envelope gate, and set the mark.
+
+| instruction | devnet tx |
+|-------------|-----------|
+| `update_oracle_from_pyth` (positive) | [4c2JHk1hwn…](https://explorer.solana.com/tx/4c2JHk1hwnBBEaYXkkAjQKDB3cVZk3Wdq89K53t5F2mTDcR8kLQ5iCZHG2q4GYkzFLGH5rGsECXYVekxuMJ7wBUN?cluster=devnet) · **Finalized** |
+
+(The fail-closed wrong-owner gate is also proven in the base-layer run. Script: `er-acceptance-pin/pyth_crank.mjs`.)
+
+## D. Not reachable on PUBLIC devnet (environment, not a program defect)
+
+- **`book_permission` 117/118/119** — the MagicBlock *permission* program (`ACLseoPoyC3cBqoUtkbjZ4aDrkurZW86v19pXz2XQnp1`) **is** deployed on devnet, but it requires the **Magic native program** (`Magic11111111111111111111111111111111111111`), which is **not on devnet base** (it lives only inside the ER) → CPI fails `UnsupportedProgramId`. The pin-side account/data encoding is verified correct; running these needs the full MagicBlock devnet stack (a validator carrying the Magic native program alongside program-owned market state). The harness skips them with that reason.
+
 ## Summary
 
 - **Base layer:** 154/155 (the miss is the correct stale-mark liveness guard, `Custom(107)`).
 - **ER round-trip:** 19/19 stages — `delegate_market_book`/`_fill_commitment`/`_market`, `place_limit_order` ON the rollup, `commit_*`, `commit_and_undelegate_*`, and `process_undelegation` (every account returned program-owned + `validate_node_links`-valid). `stamp_book_liveness_baseline` correctly rejected `Custom(201)`.
-- **Not exercised:** `book_permission` 117/118/119 (MagicBlock permission program absent on this endpoint); `update_oracle_from_pyth` positive path (needs a real Pyth PriceUpdateV2 — the fail-closed owner gate IS proven).
+- **Reachable surface fully proven on devnet** (base layer + ER round-trip + Pyth pull-oracle). The ONLY remaining gap is `book_permission` 117/118/119, blocked by the Magic native program being absent from public devnet base (section D) — not a program defect.
 
 Every signature above is independently verifiable on devnet.
