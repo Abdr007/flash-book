@@ -3970,3 +3970,146 @@ async fn place_taker_order_pushes_commitment_when_armed() {
     let expected = solana_sdk::keccak::hashv(&[&pre[..]]).to_bytes();
     assert_eq!(&ring_after.data[64..96], &expected[..], "pushed commit must equal the round-trip keccak");
 }
+
+// ─── haircut junior-claim engine e2e (apply_fill) ───
+use flash_book_pin::seeds::POSITION_HAIRCUT_SEED;
+use flash_book_pin::state::POSITION_HAIRCUT_DISC;
+const MKT_HAIRCUT_ENABLED: usize = 224;
+const MH_RESIDUAL: usize = 80; // MarketHaircutState.residual_quote_lots (u128 LE)
+const PH_RESERVE: usize = 72; // PositionHaircutState.released_reserve_quote_lots (u64 LE)
+
+fn market_haircut_acct(pid: Pubkey, market: Pubkey) -> (Pubkey, Account) {
+    let (mh, _) = Pubkey::find_program_address(&[HAIRCUT_SEED, &market.to_bytes()], &pid);
+    let mut d = vec![0u8; 208];
+    d[0..8].copy_from_slice(&HAIRCUT_STATE_DISC);
+    put_key(&mut d, 8, &market);
+    // residual @ 80 = 0; h_min/h_max left 0 (irrelevant to apply_release).
+    (mh, rent_account(d, pid))
+}
+fn position_haircut_acct(pid: Pubkey, market: Pubkey, position: Pubkey) -> (Pubkey, Account) {
+    let (ph, _) = Pubkey::find_program_address(&[POSITION_HAIRCUT_SEED, &market.to_bytes(), &position.to_bytes()], &pid);
+    let mut d = vec![0u8; 136];
+    d[0..8].copy_from_slice(&POSITION_HAIRCUT_DISC);
+    put_key(&mut d, 8, &market);
+    put_key(&mut d, 40, &position);
+    (ph, rent_account(d, pid))
+}
+
+// On a haircut-enabled market: a closing taker's realized GAIN defers to its warmup
+// reserve (NOT collateral), and the maker's realized LOSS debits collateral AND
+// credits the market Residual (loss seniority feeds the junior pool).
+#[tokio::test]
+async fn apply_fill_haircut_defers_gain_accrues_loss() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let taker = Pubkey::new_unique();
+    let maker = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let (insurance, _) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let (taker_ts, maker_ts, taker_pos, maker_pos) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+
+    let mut mkt = market_full(pid, 1_000, 1, 500, 0, 0); // mark 1000, tick 1, taker_fee 0
+    put_key(&mut mkt.data, 8, &seq.pubkey());
+    mkt.data[MKT_HAIRCUT_ENABLED] = 1; // haircut engine ON
+
+    let (mh, mh_acct) = market_haircut_acct(pid, market);
+    let (tph, tph_acct) = position_haircut_acct(pid, market, taker_pos);
+    let (mph, mph_acct) = position_haircut_acct(pid, market, maker_pos);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, mkt);
+    pt.add_account(insurance, insurance_full(pid, 1_000_000, 0));
+    pt.add_account(taker_ts, trader_state(pid, taker, 1_000_000, 1));
+    pt.add_account(maker_ts, trader_state(pid, maker, 1_000_000, 1));
+    pt.add_account(taker_pos, position(pid, taker, market, 0, 10, 900, 0)); // long 10 @ 900 (cross)
+    pt.add_account(maker_pos, position(pid, maker, market, 1, 10, 900, 0)); // short 10 @ 900 (cross)
+    pt.add_account(mh, mh_acct);
+    pt.add_account(tph, tph_acct);
+    pt.add_account(mph, mph_acct);
+    pt.add_account(seq.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    // taker_side = 1 (taker SELLS): closes the long @ 1000 → +1000 gain; the maker
+    // (buys) closes the short → −1000 loss.
+    let mut data = vec![IX_APPLY_FILL];
+    data.extend_from_slice(&10u64.to_le_bytes()); // size
+    data.extend_from_slice(&1_000u64.to_le_bytes()); // price
+    data.push(1u8); // taker_side = sell
+    data.extend_from_slice(&1u64.to_le_bytes()); // fill_seq
+    let ix = Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(seq.pubkey(), true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(insurance, false),
+        AccountMeta::new(taker_ts, false),
+        AccountMeta::new(maker_ts, false),
+        AccountMeta::new(taker_pos, false),
+        AccountMeta::new(maker_pos, false),
+        AccountMeta::new(mh, false),   // market_haircut (accounts[7], by disc)
+        AccountMeta::new(tph, false),  // taker_position_haircut (by PDA+disc)
+        AccountMeta::new(mph, false),  // maker_position_haircut
+    ], data };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    assert!(r.is_ok(), "haircut settlement must succeed: {r:?}");
+
+    // taker GAIN deferred to the warmup reserve (NOT collateral).
+    let tph_after = banks.get_account(tph).await.unwrap().unwrap();
+    assert_eq!(get_u64(&tph_after.data, PH_RESERVE), 1_000, "taker gain → warmup reserve");
+    let tts_after = banks.get_account(taker_ts).await.unwrap().unwrap();
+    assert_eq!(get_u64(&tts_after.data, TS_COLLATERAL), 1_000_000, "taker collateral unchanged (gain junior)");
+    // maker LOSS debits collateral AND credits the Residual.
+    let mts_after = banks.get_account(maker_ts).await.unwrap().unwrap();
+    assert_eq!(get_u64(&mts_after.data, TS_COLLATERAL), 999_000, "maker loss debited from collateral");
+    let mh_after = banks.get_account(mh).await.unwrap().unwrap();
+    assert_eq!(get_i128(&mh_after.data, MH_RESIDUAL), 1_000, "maker loss credited the Residual");
+}
+
+// A haircut-enabled market REQUIRES the per-position haircut accounts (else a
+// sequencer could omit them to route a gain to collateral, bypassing the gating).
+#[tokio::test]
+async fn apply_fill_haircut_requires_position_haircuts() {
+    let pid = Pubkey::new_unique();
+    let seq = Keypair::new();
+    let taker = Pubkey::new_unique();
+    let maker = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let (insurance, _) = Pubkey::find_program_address(&[INSURANCE_SEED], &pid);
+    let (taker_ts, maker_ts, taker_pos, maker_pos) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+
+    let mut mkt = market_full(pid, 1_000, 1, 500, 0, 0);
+    put_key(&mut mkt.data, 8, &seq.pubkey());
+    mkt.data[MKT_HAIRCUT_ENABLED] = 1;
+    let (mh, mh_acct) = market_haircut_acct(pid, market);
+
+    let mut pt = ProgramTest::new("flash_book_pin", pid, None);
+    pt.add_account(market, mkt);
+    pt.add_account(insurance, insurance_full(pid, 1_000_000, 0));
+    pt.add_account(taker_ts, trader_state(pid, taker, 1_000_000, 1));
+    pt.add_account(maker_ts, trader_state(pid, maker, 1_000_000, 1));
+    pt.add_account(taker_pos, position(pid, taker, market, 0, 10, 900, 0));
+    pt.add_account(maker_pos, position(pid, maker, market, 1, 10, 900, 0));
+    pt.add_account(mh, mh_acct);
+    pt.add_account(seq.pubkey(), Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::new_from_array([0u8; 32]), executable: false, rent_epoch: 0 });
+    let (banks, payer, bh) = pt.start().await;
+
+    // Omit the per-position haircuts (only the market_haircut at accounts[7]).
+    let mut data = vec![IX_APPLY_FILL];
+    data.extend_from_slice(&10u64.to_le_bytes());
+    data.extend_from_slice(&1_000u64.to_le_bytes());
+    data.push(1u8);
+    data.extend_from_slice(&1u64.to_le_bytes());
+    let ix = Instruction { program_id: pid, accounts: vec![
+        AccountMeta::new_readonly(seq.pubkey(), true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(insurance, false),
+        AccountMeta::new(taker_ts, false),
+        AccountMeta::new(maker_ts, false),
+        AccountMeta::new(taker_pos, false),
+        AccountMeta::new(maker_pos, false),
+        AccountMeta::new(mh, false),
+    ], data };
+    let r = banks.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer, &seq], bh)).await;
+    let err = format!("{:?}", r.expect_err("haircut market without per-position haircuts must be rejected"));
+    assert!(err.contains("Custom(244)"), "expected Custom(244) HaircutNotInitialized, got: {err}");
+}

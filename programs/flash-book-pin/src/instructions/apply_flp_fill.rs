@@ -18,7 +18,8 @@ use crate::state::{
     HAIRCUT_STATE_DISC, INSURANCE_DISC, MARKET_DISC, POSITION_DISC, TRADER_STATE_DISC,
 };
 use pinocchio::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
+    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey,
+    sysvars::{clock::Clock, Sysvar}, ProgramResult,
 };
 
 const BPS_DENOM: u128 = 10_000;
@@ -163,18 +164,32 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         insurance.total_contributions = insurance.total_contributions.saturating_add(contribution);
         market.total_fees_collected = market.total_fees_collected.saturating_add(net_fee);
 
-        // ── (R2) Settle the taker leg's funding on its PRE-trade size before the
-        // resize, when the optional haircut_state is supplied (same shared helper
-        // as `settle_funding` / `apply_fill`). The pool side accrues no funding.
-        if has_haircut {
-            let haircut: &mut MarketHaircutState = view(&accounts[6]);
-            if &haircut.market != accounts[1].key() {
+        // ── Junior-claim haircut wiring (taker leg only; the pool carries none).
+        // The taker's per-position haircut is MANDATORY on a haircut-enabled market
+        // (mirror apply_fill: else a gain could route to collateral instead of the
+        // junior warmup reserve, bypassing the gating). Found by canonical PDA+disc.
+        let now_slot = Clock::get()?.slot;
+        let taker_ph = crate::instructions::apply_fill::find_position_haircut(accounts, _pid, accounts[1].key(), accounts[5].key());
+        if market.haircut_enabled != 0 && taker_ph.is_none() {
+            return Err(ProgramError::Custom(244)); // HaircutNotInitialized
+        }
+        // Haircut residual: load ONCE (when present), funding-settle + loss-accrue
+        // into it, write back ONCE. `0` and inert on a non-haircut market.
+        let mut residual: u128 = if has_haircut {
+            let h: &MarketHaircutState = &*(accounts[6].borrow_data_unchecked().as_ptr() as *const MarketHaircutState);
+            if &h.market != accounts[1].key() {
                 return Err(ProgramError::InvalidArgument);
             }
-            let mut residual = u128::from_le_bytes(haircut.residual_quote_lots);
+            u128::from_le_bytes(h.residual_quote_lots)
+        } else {
+            0
+        };
+
+        // ── (R2) Settle the taker leg's funding on its PRE-trade size before the
+        // resize, when the haircut_state is present (the pool side accrues none).
+        if has_haircut {
             crate::funding::settle_position_funding(taker_pos, market.mark_price_ticks, tick, fidx, &mut taker_ts.collateral_quote_lots, &mut residual)
                 .map_err(|_| ProgramError::InvalidArgument)?;
-            haircut.residual_quote_lots = residual.to_le_bytes();
         }
 
         // M-1 (re-audit 2026-06, parity with apply_fill): sample the isolated/cross
@@ -184,12 +199,18 @@ pub fn process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         let taker_iso = taker_pos.collateral_quote_lots > 0;
 
         // ── Resize the taker leg + capture its realized-PnL delta (R1), then
-        // materialize it into the taker's bucket (loss shortfall → insurance).
+        // materialize it with junior-claim routing (opted gain → warmup reserve;
+        // opted loss → collateral + Residual; else the proven bucket/insurance path).
         // The POOL side's realized PnL is tracked on its FLP exposure entry — a
         // documented deferral in this port (pin doesn't carry the pool Position).
         let taker_delta = crate::fill_math::apply_to_position(taker_pos, taker_side, size, price, tick, fidx)
             .map_err(|_| ProgramError::ArithmeticOverflow)?;
-        crate::instructions::apply_fill::materialize_realized(taker_delta, taker_iso, taker_pos, taker_ts, insurance)?;
+        crate::instructions::apply_fill::materialize_leg(taker_delta, taker_iso, taker_pos, taker_ts, insurance, taker_ph, &mut residual, now_slot)?;
+        // Write the (funding + loss-accrued) residual back to the market_haircut once.
+        if has_haircut {
+            let h: &mut MarketHaircutState = view(&accounts[6]);
+            h.residual_quote_lots = residual.to_le_bytes();
+        }
 
         // CRITICAL (audit 2026-06): maintain `open_positions` — it gates every
         // collateral-exit; omitting it let a trader open against the FLP pool,
