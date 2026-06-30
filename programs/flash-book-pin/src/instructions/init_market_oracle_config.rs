@@ -6,7 +6,9 @@
 //!
 //! accounts: [authority (signer, payer, w), market (program-owned, r),
 //!            oracle_config (PDA, w, uninit), system_program]
-//! data: [pyth_price_feed_id [u8;32]][max_staleness_seconds u32]
+//! data (≥41 bytes): [pyth_price_feed_id [u8;32]][max_staleness_seconds u32]
+//!            [max_confidence_bps u32][tick_decimals i8]
+//!            [max_dispersion_bps u32 — OPTIONAL, appended after byte 41]
 //!       [max_confidence_bps u32][tick_decimals i8]   — 41 bytes
 
 use crate::cpi::create_pda_account;
