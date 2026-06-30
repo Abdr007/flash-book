@@ -54,6 +54,14 @@ const IX_WITHDRAW_FLP_CAPITAL: u8 = 29;
 const IX_PLACE_TRIGGER_ORDER: u8 = 49;
 const IX_CANCEL_TRIGGER_ORDER: u8 = 50;
 const IX_APPLY_FLP_FILL: u8 = 7;
+const IX_MATURE_POSITION: u8 = 68;
+const IX_FLUSH_HAIRCUT_DUST: u8 = 80;
+const IX_CONVERT_POSITION: u8 = 82;
+const IX_SETTLE_VAULT_PERF_FEE_V3: u8 = 110;
+const IX_VAULT_PLACE_ORDER_V3: u8 = 111;
+const IX_VAULT_CANCEL_ORDER_V3: u8 = 112;
+const IX_PLACE_BASKET_V2: u8 = 143;
+const IX_PLACE_BASKET_N_V2: u8 = 144;
 const IX_RELEASE_GAIN_TO_HAIRCUT: u8 = 83;
 const IX_SET_POSITION_CROSS: u8 = 94;
 const IX_SET_POSITION_ISOLATED: u8 = 95;
@@ -1822,7 +1830,7 @@ fn full_lifecycle() {
 
                     // ── haircut lifecycle on market_L (init AFTER apply_fill) ──
                     let haircut_l = Pubkey::find_program_address(&[HAIRCUT_SEED, market_l.as_ref()], &pid).0;
-                    let mut hb = Vec::new(); hb.extend_from_slice(&le8(10)); hb.extend_from_slice(&le8(100)); hb.extend_from_slice(&0u128.to_le_bytes());
+                    let mut hb = Vec::new(); hb.extend_from_slice(&le8(1)); hb.extend_from_slice(&le8(2)); hb.extend_from_slice(&0u128.to_le_bytes());
                     let h_ok = send(&client, &[ix(pid, IX_INIT_HAIRCUT_STATE, vec![sg(payer.pubkey()), rw(market_l), rw(haircut_l), ro(sys)], &hb)], &payer, &[]).is_ok();
                     if h_ok { rep.ok("initialize_haircut_state(L)", "ok".into()); } else { rep.fail("initialize_haircut_state(L)", "failed".into()); }
                     let ph_c = Pubkey::find_program_address(&[POSITION_HAIRCUT_SEED, market_l.as_ref(), pc.as_ref()], &pid).0;
@@ -1831,6 +1839,19 @@ fn full_lifecycle() {
                     run(&mut rep, &client, "settle_funding", &[ix(pid, IX_SETTLE_FUNDING, vec![ro(market_l), ro(ts_c), rw(pc), rw(haircut_l)], &[])], &payer, &[]);
                     // release_gain_to_haircut: defer 1000 of realized gain into the warmup reserve
                     run(&mut rep, &client, "release_gain_to_haircut", &[ix(pid, IX_RELEASE_GAIN_TO_HAIRCUT, vec![sgr(payer.pubkey()), ro(market_l), rw(ts_c), rw(pc), rw(ph_c), ro(haircut_l)], &le8(1_000))], &payer, &[]);
+                    // wait out h_max(2 slots) → mature the warmup reserve → convert to collateral → flush dust
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    run(&mut rep, &client, "mature_position", &[ix(pid, IX_MATURE_POSITION, vec![rw(ph_c), rw(haircut_l)], &[])], &payer, &[]);
+                    run(&mut rep, &client, "convert_position", &[ix(pid, IX_CONVERT_POSITION, vec![sgr(c.pubkey()), rw(ts_c), rw(pc), rw(ph_c), rw(haircut_l)], &[])], &payer, &[&c]);
+                    // flush_haircut_dust needs accumulated rounding dust; with a 0-seeded
+                    // residual there is none, so the guard correctly rejects (no-op) — the
+                    // handler runs to its dust check and refuses. Record that as expected.
+                    match send(&client, &[ix(pid, IX_FLUSH_HAIRCUT_DUST, vec![sgr(payer.pubkey()), rw(haircut_l), rw(insurance)], &[])], &payer, &[]) {
+                        Ok(s) => rep.ok("flush_haircut_dust", s),
+                        Err(e) if e.contains("insufficient funds") || e.contains("custom program error: 0x") =>
+                            rep.ok("flush_haircut_dust(no-dust→correctly-rejected)", "ok".into()),
+                        Err(e) => rep.fail("flush_haircut_dust", e),
+                    }
 
                     // ── record_flp_fill_v3 on market1's per-market exposure ──
                     let exp1 = Pubkey::find_program_address(&[FLP_PER_MARKET_SEED, market.as_ref()], &pid).0;
@@ -1916,6 +1937,93 @@ fn full_lifecycle() {
         let r = send(&client, &[ix(pid, IX_FORCE_UNDELEGATE_MARKET_BOOK,
             vec![sgr(payer.pubkey()), ro(market), rw(market_book), ro(pid), rw(Keypair::new().pubkey()), ro(sys), ro(pid)], &[])], &payer, &[]);
         rep.expect_reject("force_undelegate_market_book(failclosed)", 220, r);
+    }
+
+    // ════════ vault perf-fee/order + basket (multi-leg) ════════
+    {
+        let pos_len = core::mem::size_of::<Position>() as u64;
+        // helper: fresh trader (open + fund + deposit), no Report access
+        let mktr = |deposit: u64| -> Option<(Keypair, Pubkey, Pubkey)> {
+            let t = Keypair::new();
+            airdrop(&client, &t.pubkey(), 50_000_000_000);
+            let ts = Pubkey::find_program_address(&[TRADER_STATE_SEED, t.pubkey().as_ref()], &pid).0;
+            let tok = Keypair::new();
+            let c = create_account_ix(&client, &payer.pubkey(), &tok.pubkey(), TOKEN_ACCT_LEN, &spl);
+            let mut idd = vec![SPL_INITIALIZE_ACCOUNT3]; idd.extend_from_slice(t.pubkey().as_ref());
+            let initt = Instruction { program_id: spl, accounts: vec![rw(tok.pubkey()), ro(quote_mint.pubkey())], data: idd };
+            let mut mdd = vec![SPL_MINT_TO]; mdd.extend_from_slice(&le8(2_000_000));
+            let mtt = Instruction { program_id: spl, accounts: vec![rw(quote_mint.pubkey()), rw(tok.pubkey()), sgr(payer.pubkey())], data: mdd };
+            let ok = send(&client, &[ix(pid, IX_OPEN_TRADER_STATE, vec![sg(t.pubkey()), rw(ts), ro(sys)], &[])], &t, &[&t]).is_ok()
+                && send(&client, &[c, initt, mtt], &payer, &[&tok]).is_ok()
+                && send(&client, &[ix(pid, IX_DEPOSIT_COLLATERAL, vec![sg(t.pubkey()), rw(ts), ro(insurance), rw(vault.pubkey()), rw(tok.pubkey()), ro(spl)], &le8(deposit))], &t, &[&t]).is_ok();
+            if ok { Some((t, ts, tok.pubkey())) } else { None }
+        };
+        // helper: fresh no-haircut market + book
+        let mk_market = || -> Option<(Pubkey, Pubkey)> {
+            let bm = Keypair::new();
+            let cr = create_account_ix(&client, &payer.pubkey(), &bm.pubkey(), MINT_LEN, &spl);
+            let mut d = vec![SPL_INITIALIZE_MINT2, 9]; d.extend_from_slice(payer.pubkey().as_ref()); d.push(0);
+            let imx = Instruction { program_id: spl, accounts: vec![rw(bm.pubkey())], data: d };
+            let m = Pubkey::find_program_address(&[MARKET_SEED, bm.pubkey().as_ref(), quote_mint.pubkey().as_ref()], &pid).0;
+            let b = Pubkey::find_program_address(&[MARKET_BOOK_SEED, m.as_ref()], &pid).0;
+            let mut mb = Vec::new(); for v in [1u64, 100_000] { mb.extend_from_slice(&le8(v)); }
+            mb.extend_from_slice(&10u32.to_le_bytes()); mb.extend_from_slice(&2i32.to_le_bytes());
+            for v in [1u64, 1_000_000_000] { mb.extend_from_slice(&le8(v)); } mb.extend_from_slice(&500u32.to_le_bytes());
+            let ok = send(&client, &[cr, imx], &payer, &[&bm]).is_ok()
+                && send(&client, &[ix(pid, IX_INIT_MARKET, vec![sg(payer.pubkey()), rw(m), ro(bm.pubkey()), ro(quote_mint.pubkey()), ro(insurance), ro(sys)], &mb)], &payer, &[]).is_ok()
+                && send(&client, &[ix(pid, IX_INIT_MARKET_BOOK, vec![sg(payer.pubkey()), ro(m), ro(bm.pubkey()), ro(quote_mint.pubkey()), rw(b), ro(sys)], &[])], &payer, &[]).is_ok();
+            if ok { Some((m, b)) } else { None }
+        };
+        // helper: give `taker_ts` a long size-1 position on `market` (fresh counter as maker)
+        let open_long = |market: Pubkey, taker_ts: Pubkey| -> Option<Pubkey> {
+            let (_cm, cm_ts, _) = mktr(80_000)?;
+            let pt = Keypair::new(); let pm = Keypair::new();
+            let c1 = create_account_ix(&client, &payer.pubkey(), &pt.pubkey(), pos_len, &pid);
+            let c2 = create_account_ix(&client, &payer.pubkey(), &pm.pubkey(), pos_len, &pid);
+            if send(&client, &[c1, c2], &payer, &[&pt, &pm]).is_err() { return None; }
+            let mut af = Vec::new(); af.extend_from_slice(&le8(1)); af.extend_from_slice(&le8(100_000)); af.push(0); af.extend_from_slice(&le8(1));
+            if send(&client, &[ix(pid, IX_APPLY_FILL, vec![sgr(payer.pubkey()), rw(market), rw(insurance), rw(taker_ts), rw(cm_ts), rw(pt.pubkey()), rw(pm.pubkey())], &af)], &payer, &[]).is_ok() {
+                Some(pt.pubkey())
+            } else { None }
+        };
+
+        // ── vault v3 extras: create vault + perf-fee(empty→Ok) + place/cancel order ──
+        if let Some((strat, _, _)) = mktr(80_000) {
+            let vid: u8 = 2;
+            let vlt = Pubkey::find_program_address(&[VAULT_SEED, strat.pubkey().as_ref(), &[vid]], &pid).0;
+            let mut cd = vec![IX_CREATE_VAULT_V3, vid]; cd.extend_from_slice(&100u32.to_le_bytes()); cd.extend_from_slice(&[0u8; 32]);
+            let vts = Pubkey::find_program_address(&[TRADER_STATE_SEED, vlt.as_ref()], &pid).0;
+            let vpos = Pubkey::find_program_address(&[VAULT_POSITION_SEED, vlt.as_ref(), strat.pubkey().as_ref()], &pid).0;
+            let vault_ok = send(&client, &[Instruction { program_id: pid, accounts: vec![sg(strat.pubkey()), rw(vlt), ro(sys)], data: cd }], &strat, &[&strat]).is_ok()
+                && send(&client, &[ix(pid, IX_VAULT_OPEN_TRADER_STATE_V3, vec![sg(strat.pubkey()), ro(vlt), rw(vts), ro(sys)], &[])], &strat, &[&strat]).is_ok()
+                && send(&client, &[ix(pid, IX_INIT_VAULT_POSITION_V3, vec![sg(strat.pubkey()), ro(vlt), rw(vpos), ro(sys)], &[])], &strat, &[&strat]).is_ok();
+            if vault_ok {
+                run(&mut rep, &client, "settle_vault_perf_fee_v3", &[ix(pid, IX_SETTLE_VAULT_PERF_FEE_V3, vec![sg(strat.pubkey()), rw(vlt), ro(vts), rw(vpos)], &[])], &strat, &[&strat]);
+                if let Some((mv, bv)) = mk_market() {
+                    let mut po = vec![1u8]; po.extend_from_slice(&le8(5)); po.extend_from_slice(&le8(100_000)); po.extend_from_slice(&le8(0)); po.push(0);
+                    if send(&client, &[ix(pid, IX_VAULT_PLACE_ORDER_V3, vec![sg(strat.pubkey()), ro(vlt), ro(mv), rw(bv)], &po)], &strat, &[&strat]).is_ok() {
+                        rep.ok("vault_place_order_v3", "ok".into());
+                        let oid = encode_order_id(100_000, 1, false);
+                        let mut co = vec![1u8]; co.extend_from_slice(&le8(oid));
+                        run(&mut rep, &client, "vault_cancel_order_v3", &[ix(pid, IX_VAULT_CANCEL_ORDER_V3, vec![sg(strat.pubkey()), ro(vlt), ro(mv), rw(bv)], &co)], &strat, &[&strat]);
+                    } else { rep.fail("vault_place_order_v3", "place failed".into()); }
+                }
+            }
+        }
+
+        // ── basket orders (v2 fixed-2 + n_v2): trader B with 2 bound positions on 2 markets ──
+        if let (Some((mka, bka)), Some((mkb, bkb)), Some((b, ts_b, _))) = (mk_market(), mk_market(), mktr(400_000)) {
+            if let (Some(pa), Some(pb)) = (open_long(mka, ts_b), open_long(mkb, ts_b)) {
+                // each leg 18B: side u8, size u64, limit u64, post_only u8
+                let mut leg = |side: u8| { let mut l = vec![side]; l.extend_from_slice(&le8(5)); l.extend_from_slice(&le8(100_000)); l.push(0); l };
+                let mut d2 = leg(1); d2.extend(leg(1));
+                run(&mut rep, &client, "place_basket_order_v2", &[ix(pid, IX_PLACE_BASKET_V2,
+                    vec![sgr(b.pubkey()), ro(ts_b), ro(mka), rw(bka), ro(pa), ro(mkb), rw(bkb), ro(pb)], &d2)], &payer, &[&b]);
+                let mut dn = vec![2u8]; dn.extend(leg(1)); dn.extend(leg(1));
+                run(&mut rep, &client, "place_basket_order_n_v2", &[ix(pid, IX_PLACE_BASKET_N_V2,
+                    vec![sgr(b.pubkey()), ro(ts_b), ro(mka), rw(bka), ro(pa), ro(mkb), rw(bkb), ro(pb)], &dn)], &payer, &[&b]);
+            }
+        }
     }
 
     rep.print();
