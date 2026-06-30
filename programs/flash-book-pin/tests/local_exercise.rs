@@ -18,9 +18,11 @@
 use flash_book_pin::book::{MARKET_BOOK_SEED, MARKET_BOOK_TOTAL_BYTES};
 use flash_book_pin::fill_commitment::FILL_COMMIT_SEED;
 use flash_book_pin::seeds::{
-    ENVELOPE_CONFIG_SEED, FEE_TIERS_SEED, FLP_EXPOSURE_SEED, HAIRCUT_SEED, INSURANCE_SEED,
+    ENVELOPE_CONFIG_SEED, ER_MARGIN_SEED, FEE_TIERS_SEED, FLP_EXPOSURE_SEED, FLP_PER_MARKET_SEED,
+    FLP_POSITION_V3_SEED, HAIRCUT_SEED, ICEBERG_ORDER_SEED, INSURANCE_SEED, JIT_LIQ_OFFER_SEED,
     LEVERAGE_TIERS_SEED, LP_POSITION_SEED, MARKET_SEED, ORACLE_CONFIG_SEED, SESSION_SEED,
-    SIDE_ACCRUAL_SEED, TRADER_STATE_SEED, TRIGGER_ORDER_SEED, VAULT_POSITION_SEED, VAULT_SEED,
+    SIDE_ACCRUAL_SEED, TRADER_STATE_SEED, TRIGGER_ORDER_SEED, TWAP_ORDER_SEED, VAULT_POSITION_SEED,
+    VAULT_SEED,
 };
 use flash_book_pin::state::{Insurance, Market, Position, TraderState};
 use solana_client::rpc_client::RpcClient;
@@ -51,6 +53,59 @@ const IX_DEPOSIT_FLP_CAPITAL: u8 = 28;
 const IX_WITHDRAW_FLP_CAPITAL: u8 = 29;
 const IX_PLACE_TRIGGER_ORDER: u8 = 49;
 const IX_CANCEL_TRIGGER_ORDER: u8 = 50;
+const IX_CANCEL_ALL: u8 = 6;
+const IX_SET_MARKET_SEQUENCER: u8 = 13;
+const IX_TRANSFER_MARKET_AUTHORITY: u8 = 21;
+const IX_TRANSFER_INSURANCE_AUTHORITY: u8 = 22;
+const IX_SET_INSURANCE_FEE_CONTRIBUTION: u8 = 23;
+const IX_SET_MARKET_MAINTENANCE_MARGIN: u8 = 25;
+const IX_UPDATE_MARKET_LEVERAGE_TIERS: u8 = 35;
+const IX_SET_MARKET_RISK_PARAMS: u8 = 36;
+const IX_SET_TRADER_DELEGATE: u8 = 37;
+const IX_SET_TRADER_REFERRER: u8 = 38;
+const IX_SET_TRADER_BUILDER: u8 = 39;
+const IX_UPDATE_FEE_TIERS: u8 = 43;
+const IX_SET_MARKET_MAX_LEVERAGE: u8 = 45;
+const IX_SET_INSURANCE_PAUSE_THRESHOLD: u8 = 54;
+const IX_EXPAND_MARKET_BOOK: u8 = 87;
+const IX_REAP_EXPIRED_ORDERS: u8 = 88;
+const IX_VERIFY_PROTOCOL_SOLVENCY: u8 = 30;
+const IX_VERIFY_MARKET_INVARIANTS: u8 = 31;
+const IX_VERIFY_COLLATERAL_SOLVENCY: u8 = 32;
+const IX_VERIFY_ENVELOPE_CONFIG: u8 = 57;
+const IX_VERIFY_HAIRCUT_INVARIANTS: u8 = 62;
+const IX_VERIFY_SIDE_ACCRUAL: u8 = 73;
+const IX_VERIFY_ORACLE_CONFIG: u8 = 74;
+const IX_VERIFY_LEVERAGE_TIERS: u8 = 75;
+const IX_VERIFY_FEE_TIERS: u8 = 76;
+const IX_VIEW_PREDICTED_FUNDING: u8 = 134;
+const IX_VIEW_TRADER_TIER: u8 = 135;
+const IX_VIEW_BOOK_DEPTH: u8 = 136;
+const IX_VIEW_QUOTE_LADDER: u8 = 137;
+const IX_VIEW_PORTFOLIO_RISK: u8 = 138;
+const IX_ADVANCE_FUNDING: u8 = 146;
+const IX_SET_FUNDING_PARAMS: u8 = 147;
+const IX_SEED_RESIDUAL: u8 = 69;
+const IX_GATE_ENVELOPE: u8 = 70;
+const IX_PLACE_TWAP: u8 = 51;
+const IX_CANCEL_TWAP: u8 = 52;
+const IX_PLACE_ICEBERG: u8 = 101;
+const IX_REPLENISH_ICEBERG: u8 = 102;
+const IX_CANCEL_ICEBERG: u8 = 103;
+const IX_PLACE_BRACKET: u8 = 104;
+const IX_INIT_FLP_PER_MARKET: u8 = 53;
+const IX_FLP_DEPOSIT_V3: u8 = 84;
+const IX_FLP_WITHDRAW_V3: u8 = 85;
+const IX_SET_MARKET_LIQUIDATION_PARAMS: u8 = 91;
+const IX_COVER_BAD_DEBT: u8 = 93;
+const IX_PLACE_JIT_LIQ_OFFER: u8 = 97;
+const IX_CANCEL_JIT_LIQ_OFFER: u8 = 98;
+const IX_ER_HEARTBEAT: u8 = 33;
+const IX_INIT_ER_MARGIN_ATTESTATION: u8 = 66;
+const IX_ATTEST_ER_RESERVED_MARGIN: u8 = 67;
+const IX_UNDELEGATE_MARKET_BOOK: u8 = 121;
+const IX_UNDELEGATE_MARKET: u8 = 123;
+const IX_UNDELEGATE_FILL_COMMITMENT: u8 = 131;
 const IX_SET_MARKET_STATUS: u8 = 14;
 const IX_OPEN_TRADER_SUB_ACCOUNT: u8 = 16;
 const IX_TRANSFER_COLLATERAL: u8 = 17;
@@ -183,6 +238,28 @@ fn create_account_ix(
 
 fn le8(v: u64) -> [u8; 8] {
     v.to_le_bytes()
+}
+
+/// Build an instruction: 1-byte tag + body, with the given account metas.
+fn ix(pid: Pubkey, tag: u8, accounts: Vec<AccountMeta>, body: &[u8]) -> Instruction {
+    let mut data = vec![tag];
+    data.extend_from_slice(body);
+    Instruction { program_id: pid, accounts, data }
+}
+
+/// Send + record one labelled step (by-ref so it composes with the Report).
+fn run(
+    rep: &mut Report,
+    client: &RpcClient,
+    label: &str,
+    ixs: &[Instruction],
+    payer: &Keypair,
+    signers: &[&Keypair],
+) {
+    match send(client, ixs, payer, signers) {
+        Ok(s) => rep.ok(label, s),
+        Err(e) => rep.fail(label, e),
+    }
 }
 
 /// Build the common config-PDA creator ix: [authority(s,w), market, new_pda(w),
@@ -1440,6 +1517,201 @@ fn full_lifecycle() {
                 Err(e) => rep.fail("revoke_session_token", e),
             }
         }
+    }
+
+    // ════════════════ BROAD COVERAGE BATCH ════════════════
+    // PDAs created earlier (recomputed; find_program_address is cheap).
+    let envelope = Pubkey::find_program_address(&[ENVELOPE_CONFIG_SEED, market.as_ref()], &pid).0;
+    let haircut = Pubkey::find_program_address(&[HAIRCUT_SEED, market.as_ref()], &pid).0;
+    let side_accrual = Pubkey::find_program_address(&[SIDE_ACCRUAL_SEED, market.as_ref()], &pid).0;
+    let oracle_cfg = Pubkey::find_program_address(&[ORACLE_CONFIG_SEED, market.as_ref()], &pid).0;
+    let lev_tiers = Pubkey::find_program_address(&[LEVERAGE_TIERS_SEED, market.as_ref()], &pid).0;
+    let fee_tiers = Pubkey::find_program_address(&[FEE_TIERS_SEED], &pid).0;
+    let flp_single = Pubkey::find_program_address(&[FLP_EXPOSURE_SEED], &pid).0;
+    let maker_ts = trader_state["maker"];
+    let taker_ts = trader_state["taker"];
+    let rw = |k| AccountMeta::new(k, false);
+    let ro = |k| AccountMeta::new_readonly(k, false);
+    let sg = |k| AccountMeta::new(k, true);
+    let sgr = |k| AccountMeta::new_readonly(k, true);
+
+    // ── order types (need market ACTIVE — do these first) ───────────────────
+    {
+        // 51 place_twap_order + 52 cancel
+        let twap = Pubkey::find_program_address(&[TWAP_ORDER_SEED, market.as_ref(), taker.pubkey().as_ref(), &[1u8]], &pid).0;
+        let mut b = vec![1u8, 1, 0, 0]; // id, side(ask), flags, sub
+        for v in [1u64, 10, 100_000, 1, 0, 0] { b.extend_from_slice(&le8(v)); } // slice,total,limit,interval,end,acceptable
+        run(&mut rep, &client, "place_twap_order",
+            &[ix(pid, IX_PLACE_TWAP, vec![sg(taker.pubkey()), ro(market), rw(twap), ro(sys)], &b)], &payer, &[&taker]);
+        run(&mut rep, &client, "cancel_twap_order",
+            &[ix(pid, IX_CANCEL_TWAP, vec![sg(taker.pubkey()), rw(twap)], &[])], &payer, &[&taker]);
+
+        // 101 place_iceberg + 102 replenish + 103 cancel
+        let ice = Pubkey::find_program_address(&[ICEBERG_ORDER_SEED, market.as_ref(), taker.pubkey().as_ref(), &[1u8]], &pid).0;
+        let mut b = vec![1u8, 1, 0]; // id, side(ask), sub
+        for v in [10u64, 2, 100_000, 0] { b.extend_from_slice(&le8(v)); } // total, displayed, limit, expires
+        run(&mut rep, &client, "place_iceberg_order",
+            &[ix(pid, IX_PLACE_ICEBERG, vec![sg(taker.pubkey()), ro(market), rw(market_book), rw(ice), ro(sys)], &b)], &payer, &[&taker]);
+        run(&mut rep, &client, "replenish_iceberg",
+            &[ix(pid, IX_REPLENISH_ICEBERG, vec![sgr(payer.pubkey()), ro(market), rw(market_book), rw(ice)], &[])], &payer, &[]);
+        run(&mut rep, &client, "cancel_iceberg",
+            &[ix(pid, IX_CANCEL_ICEBERG, vec![sg(taker.pubkey()), rw(ice)], &[])], &payer, &[&taker]);
+
+        // 104 place_bracket_order (parent long + tp/sl reduce-only triggers)
+        let tp = Pubkey::find_program_address(&[TRIGGER_ORDER_SEED, market.as_ref(), taker.pubkey().as_ref(), &[5u8]], &pid).0;
+        let sl = Pubkey::find_program_address(&[TRIGGER_ORDER_SEED, market.as_ref(), taker.pubkey().as_ref(), &[6u8]], &pid).0;
+        let mut b = vec![0u8, 0, 5, 6]; // parent_side(long), sub, tp_id, sl_id
+        for v in [10u64, 100_000, 101_000, 101_000, 99_000, 99_000, 0] { b.extend_from_slice(&le8(v)); }
+        run(&mut rep, &client, "place_bracket_order",
+            &[ix(pid, IX_PLACE_BRACKET, vec![sg(taker.pubkey()), ro(market), rw(market_book), rw(tp), rw(sl), ro(sys)], &b)], &payer, &[&taker]);
+    }
+
+    // ── FLP v3 (per-market exposure + LP token in/out) ──────────────────────
+    {
+        let exposure = Pubkey::find_program_address(&[FLP_PER_MARKET_SEED, market.as_ref()], &pid).0;
+        run(&mut rep, &client, "init_flp_per_market",
+            &[ix(pid, IX_INIT_FLP_PER_MARKET, vec![sg(payer.pubkey()), ro(market), rw(exposure), ro(sys)], &[])], &payer, &[]);
+        let lp3 = Keypair::new();
+        airdrop(&client, &lp3.pubkey(), 50_000_000_000);
+        let pos = Pubkey::find_program_address(&[FLP_POSITION_V3_SEED, exposure.as_ref(), lp3.pubkey().as_ref()], &pid).0;
+        let tok = Keypair::new();
+        let c = create_account_ix(&client, &payer.pubkey(), &tok.pubkey(), TOKEN_ACCT_LEN, &spl);
+        let mut idd = vec![SPL_INITIALIZE_ACCOUNT3]; idd.extend_from_slice(lp3.pubkey().as_ref());
+        let initt = Instruction { program_id: spl, accounts: vec![rw(tok.pubkey()), ro(quote_mint.pubkey())], data: idd };
+        let mut mdd = vec![SPL_MINT_TO]; mdd.extend_from_slice(&le8(1_000_000));
+        let mtt = Instruction { program_id: spl, accounts: vec![rw(quote_mint.pubkey()), rw(tok.pubkey()), sgr(payer.pubkey())], data: mdd };
+        let funded = send(&client, &[c, initt, mtt], &payer, &[&tok]).is_ok();
+        if funded {
+            let dep_slot = client.get_slot().unwrap_or(0);
+            run(&mut rep, &client, "flp_deposit_v3",
+                &[ix(pid, IX_FLP_DEPOSIT_V3, vec![sg(lp3.pubkey()), rw(exposure), rw(pos), ro(insurance), rw(vault.pubkey()), rw(tok.pubkey()), ro(spl), ro(sys)], &le8(400_000))], &payer, &[&lp3]);
+            // wait out any min-hold (same JIT-LP defense as v2), then withdraw
+            let deadline = dep_slot + 152;
+            let mut w = 0;
+            while client.get_slot().unwrap_or(deadline) < deadline && w < 60 { std::thread::sleep(std::time::Duration::from_secs(2)); w += 1; }
+            run(&mut rep, &client, "flp_withdraw_v3",
+                &[ix(pid, IX_FLP_WITHDRAW_V3, vec![sg(lp3.pubkey()), rw(exposure), rw(pos), ro(insurance), rw(vault.pubkey()), rw(tok.pubkey()), ro(spl)], &le8(100_000))], &payer, &[&lp3]);
+        }
+    }
+
+    // ── admin / config setters (payer is market1 + insurance authority) ─────
+    {
+        let pk = |k: Pubkey| k.to_bytes().to_vec();
+        run(&mut rep, &client, "set_market_sequencer",
+            &[ix(pid, IX_SET_MARKET_SEQUENCER, vec![sgr(payer.pubkey()), rw(market)], &pk(payer.pubkey()))], &payer, &[]);
+        run(&mut rep, &client, "transfer_market_authority",
+            &[ix(pid, IX_TRANSFER_MARKET_AUTHORITY, vec![sgr(payer.pubkey()), rw(market)], &pk(payer.pubkey()))], &payer, &[]);
+        run(&mut rep, &client, "transfer_insurance_authority",
+            &[ix(pid, IX_TRANSFER_INSURANCE_AUTHORITY, vec![sgr(payer.pubkey()), rw(insurance)], &pk(payer.pubkey()))], &payer, &[]);
+        run(&mut rep, &client, "set_insurance_fee_contribution",
+            &[ix(pid, IX_SET_INSURANCE_FEE_CONTRIBUTION, vec![sgr(payer.pubkey()), rw(insurance)], &50u32.to_le_bytes())], &payer, &[]);
+        run(&mut rep, &client, "set_market_maintenance_margin",
+            &[ix(pid, IX_SET_MARKET_MAINTENANCE_MARGIN, vec![sgr(payer.pubkey()), rw(market)], &500u32.to_le_bytes())], &payer, &[]);
+        let mut risk = Vec::new(); risk.extend_from_slice(&le8(0)); for v in [0u32, 0, 0] { risk.extend_from_slice(&v.to_le_bytes()); }
+        run(&mut rep, &client, "set_market_risk_params",
+            &[ix(pid, IX_SET_MARKET_RISK_PARAMS, vec![sgr(payer.pubkey()), rw(market)], &risk)], &payer, &[]);
+        run(&mut rep, &client, "set_market_max_leverage",
+            &[ix(pid, IX_SET_MARKET_MAX_LEVERAGE, vec![sgr(payer.pubkey()), rw(market)], &50u32.to_le_bytes())], &payer, &[]);
+        run(&mut rep, &client, "set_insurance_pause_threshold",
+            &[ix(pid, IX_SET_INSURANCE_PAUSE_THRESHOLD, vec![sgr(payer.pubkey()), rw(insurance)], &le8(0))], &payer, &[]);
+        run(&mut rep, &client, "set_trader_delegate",
+            &[ix(pid, IX_SET_TRADER_DELEGATE, vec![sg(maker.pubkey()), rw(maker_ts)], &[0u8; 32])], &payer, &[&maker]);
+        run(&mut rep, &client, "set_trader_referrer",
+            &[ix(pid, IX_SET_TRADER_REFERRER, vec![sg(maker.pubkey()), rw(maker_ts)], &pk(Keypair::new().pubkey()))], &payer, &[&maker]);
+        let mut bld = pk(Keypair::new().pubkey()); bld.extend_from_slice(&100u32.to_le_bytes());
+        run(&mut rep, &client, "set_trader_builder",
+            &[ix(pid, IX_SET_TRADER_BUILDER, vec![sg(maker.pubkey()), rw(maker_ts)], &bld)], &payer, &[&maker]);
+        let mut ult = vec![1u8]; ult.extend_from_slice(&le8(0)); ult.extend_from_slice(&600u32.to_le_bytes());
+        run(&mut rep, &client, "update_market_leverage_tiers",
+            &[ix(pid, IX_UPDATE_MARKET_LEVERAGE_TIERS, vec![sgr(payer.pubkey()), ro(market), rw(lev_tiers)], &ult)], &payer, &[]);
+        let mut uft = Vec::new(); uft.extend_from_slice(&le8(1_000_000)); uft.push(1); uft.extend_from_slice(&le8(0)); uft.extend_from_slice(&0i32.to_le_bytes()); uft.extend_from_slice(&10u32.to_le_bytes());
+        run(&mut rep, &client, "update_fee_tiers",
+            &[ix(pid, IX_UPDATE_FEE_TIERS, vec![sgr(payer.pubkey()), rw(fee_tiers)], &uft)], &payer, &[]);
+    }
+
+    // ── book keeper ops ─────────────────────────────────────────────────────
+    {
+        run(&mut rep, &client, "expand_market_book",
+            &[ix(pid, IX_EXPAND_MARKET_BOOK, vec![sg(payer.pubkey()), ro(market), rw(market_book), ro(sys)], &8u32.to_le_bytes())], &payer, &[]);
+        let mut reap = vec![1u8]; reap.extend_from_slice(&le8(0)); // 1 id, dummy 0 (not found → skipped → Ok)
+        run(&mut rep, &client, "reap_expired_orders",
+            &[ix(pid, IX_REAP_EXPIRED_ORDERS, vec![sgr(payer.pubkey()), ro(market), rw(market_book)], &reap)], &payer, &[]);
+        // place a fresh maker order then cancel_all
+        let mut pl = vec![1u8]; pl.extend_from_slice(&le8(5)); pl.extend_from_slice(&le8(100_000)); pl.extend_from_slice(&le8(0)); pl.push(0); pl.push(0);
+        let _ = send(&client, &[ix(pid, IX_PLACE_LIMIT, vec![sgr(maker.pubkey()), ro(market), rw(market_book)], &pl)], &payer, &[&maker]);
+        run(&mut rep, &client, "cancel_all",
+            &[ix(pid, IX_CANCEL_ALL, vec![sgr(maker.pubkey()), ro(market), rw(market_book)], &[])], &payer, &[&maker]);
+    }
+
+    // ── funding / residual / envelope-gate cranks ───────────────────────────
+    {
+        run(&mut rep, &client, "advance_funding",
+            &[ix(pid, IX_ADVANCE_FUNDING, vec![sg(payer.pubkey()), rw(market)], &[])], &payer, &[]);
+        let mut fp = Vec::new(); for v in [0u32, 0, 0] { fp.extend_from_slice(&v.to_le_bytes()); }
+        run(&mut rep, &client, "set_funding_params",
+            &[ix(pid, IX_SET_FUNDING_PARAMS, vec![sg(payer.pubkey()), rw(market)], &fp)], &payer, &[]);
+        run(&mut rep, &client, "seed_residual",
+            &[ix(pid, IX_SEED_RESIDUAL, vec![sg(payer.pubkey()), ro(market), rw(haircut)], &0i128.to_le_bytes())], &payer, &[]);
+        let mut g = Vec::new(); for v in [100_000u64, 100_000, 1] { g.extend_from_slice(&le8(v)); }
+        run(&mut rep, &client, "gate_envelope_price_move",
+            &[ix(pid, IX_GATE_ENVELOPE, vec![ro(market), ro(envelope)], &g)], &payer, &[]);
+    }
+
+    // ── liquidation params / cover-bad-debt(0) / JIT offer place+cancel ─────
+    {
+        let mut lp = Vec::new(); lp.extend_from_slice(&100u32.to_le_bytes()); lp.extend_from_slice(&100u32.to_le_bytes()); lp.extend_from_slice(&le8(10)); lp.extend_from_slice(&le8(0));
+        run(&mut rep, &client, "set_market_liquidation_params",
+            &[ix(pid, IX_SET_MARKET_LIQUIDATION_PARAMS, vec![sgr(payer.pubkey()), rw(market)], &lp)], &payer, &[]);
+        run(&mut rep, &client, "cover_bad_debt(0)",
+            &[ix(pid, IX_COVER_BAD_DEBT, vec![sgr(payer.pubkey()), ro(market), rw(insurance)], &le8(0))], &payer, &[]);
+        let jit = Pubkey::find_program_address(&[JIT_LIQ_OFFER_SEED, market.as_ref(), maker.pubkey().as_ref(), &1u32.to_le_bytes()], &pid).0;
+        let mut jb = Vec::new(); jb.extend_from_slice(&1u32.to_le_bytes()); jb.extend_from_slice(&[0u8; 32]); jb.push(0); jb.extend_from_slice(&le8(100_000)); jb.extend_from_slice(&le8(10)); jb.extend_from_slice(&le8(0)); jb.push(0);
+        run(&mut rep, &client, "place_jit_liquidation_offer",
+            &[ix(pid, IX_PLACE_JIT_LIQ_OFFER, vec![sg(maker.pubkey()), ro(market), rw(jit), ro(sys)], &jb)], &payer, &[&maker]);
+        run(&mut rep, &client, "cancel_jit_liquidation_offer",
+            &[ix(pid, IX_CANCEL_JIT_LIQ_OFFER, vec![sg(maker.pubkey()), rw(jit)], &[])], &payer, &[&maker]);
+    }
+
+    // ── ER base-layer (no DLP) + fail-closed undelegate (Custom 221) ────────
+    {
+        run(&mut rep, &client, "er_heartbeat",
+            &[ix(pid, IX_ER_HEARTBEAT, vec![sgr(payer.pubkey()), rw(market)], &[])], &payer, &[]);
+        let er_margin = Pubkey::find_program_address(&[ER_MARGIN_SEED, maker_ts.as_ref()], &pid).0;
+        run(&mut rep, &client, "init_er_margin_attestation",
+            &[ix(pid, IX_INIT_ER_MARGIN_ATTESTATION, vec![sg(payer.pubkey()), ro(insurance), ro(maker_ts), rw(er_margin), ro(sys)], &payer.pubkey().to_bytes())], &payer, &[]);
+        let mut ab = Vec::new(); ab.extend_from_slice(&le8(0)); ab.extend_from_slice(&le8(1)); // reserved=0 (er_active stays 0), epoch=1
+        run(&mut rep, &client, "attest_er_reserved_margin",
+            &[ix(pid, IX_ATTEST_ER_RESERVED_MARGIN, vec![sgr(payer.pubkey()), rw(er_margin), rw(maker_ts)], &ab)], &payer, &[]);
+        // fail-closed: undelegate paths reject Custom(221) without touching the DLP
+        let r = send(&client, &[ix(pid, IX_UNDELEGATE_MARKET_BOOK, vec![sgr(payer.pubkey()), ro(market)], &[])], &payer, &[]);
+        rep.expect_reject("undelegate_market_book(failclosed)", 221, r);
+        let r = send(&client, &[ix(pid, IX_UNDELEGATE_MARKET, vec![sgr(payer.pubkey()), ro(market), ro(base_mint.pubkey()), ro(quote_mint.pubkey())], &[])], &payer, &[]);
+        rep.expect_reject("undelegate_market(failclosed)", 221, r);
+        let r = send(&client, &[ix(pid, IX_UNDELEGATE_FILL_COMMITMENT, vec![sgr(payer.pubkey()), ro(market)], &[])], &payer, &[]);
+        rep.expect_reject("undelegate_fill_commitment(failclosed)", 221, r);
+    }
+
+    // ── views (read-only logs) ──────────────────────────────────────────────
+    {
+        run(&mut rep, &client, "view_predicted_funding", &[ix(pid, IX_VIEW_PREDICTED_FUNDING, vec![ro(market)], &[])], &payer, &[]);
+        run(&mut rep, &client, "view_trader_effective_tier", &[ix(pid, IX_VIEW_TRADER_TIER, vec![ro(maker_ts)], &[])], &payer, &[]);
+        run(&mut rep, &client, "view_book_depth", &[ix(pid, IX_VIEW_BOOK_DEPTH, vec![ro(market), ro(market_book)], &[])], &payer, &[]);
+        run(&mut rep, &client, "view_quote_ladder", &[ix(pid, IX_VIEW_QUOTE_LADDER, vec![ro(market)], &[])], &payer, &[]);
+        run(&mut rep, &client, "view_portfolio_risk", &[ix(pid, IX_VIEW_PORTFOLIO_RISK, vec![ro(maker_ts)], &[])], &payer, &[]);
+    }
+
+    // ── verify_* probes (read-only; config-PDA family, no position) ─────────
+    {
+        run(&mut rep, &client, "verify_protocol_solvency", &[ix(pid, IX_VERIFY_PROTOCOL_SOLVENCY, vec![ro(vault.pubkey()), ro(insurance), ro(flp_single)], &[])], &payer, &[]);
+        run(&mut rep, &client, "verify_collateral_solvency", &[ix(pid, IX_VERIFY_COLLATERAL_SOLVENCY, vec![ro(vault.pubkey()), ro(insurance), ro(flp_single), ro(maker_ts), ro(taker_ts)], &[])], &payer, &[]);
+        run(&mut rep, &client, "verify_envelope_config", &[ix(pid, IX_VERIFY_ENVELOPE_CONFIG, vec![ro(market), ro(envelope)], &[])], &payer, &[]);
+        run(&mut rep, &client, "verify_haircut_invariants", &[ix(pid, IX_VERIFY_HAIRCUT_INVARIANTS, vec![ro(market), ro(haircut)], &[])], &payer, &[]);
+        run(&mut rep, &client, "verify_side_accrual_invariants", &[ix(pid, IX_VERIFY_SIDE_ACCRUAL, vec![ro(market), ro(side_accrual)], &[])], &payer, &[]);
+        run(&mut rep, &client, "verify_oracle_config", &[ix(pid, IX_VERIFY_ORACLE_CONFIG, vec![ro(market), ro(oracle_cfg)], &[])], &payer, &[]);
+        run(&mut rep, &client, "verify_leverage_tiers", &[ix(pid, IX_VERIFY_LEVERAGE_TIERS, vec![ro(market), ro(lev_tiers)], &[])], &payer, &[]);
+        run(&mut rep, &client, "verify_fee_tiers", &[ix(pid, IX_VERIFY_FEE_TIERS, vec![ro(fee_tiers)], &[])], &payer, &[]);
+        // verify_market_invariants LAST (it takes market WRITABLE and may auto-pause)
+        run(&mut rep, &client, "verify_market_invariants", &[ix(pid, IX_VERIFY_MARKET_INVARIANTS, vec![rw(market)], &[])], &payer, &[]);
     }
 
     rep.print();
