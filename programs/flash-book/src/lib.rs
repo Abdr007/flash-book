@@ -2134,6 +2134,21 @@ pub mod flash_book {
         ctx: Context<InitializeFlpExposure>,
         initial_capital_quote_lots: u64,
     ) -> Result<()> {
+        // AUDIT CRITICAL-1 (2026-07): this handler used to mint
+        // `initial_capital_quote_lots` LP shares 1:1 with NO token transfer, so
+        // the treasury — or a front-runner of this permissionless singleton
+        // init — held shares redeemable (via withdraw_flp_capital) against
+        // OTHER users' collateral sitting in the SHARED insurance_fund vault.
+        // Fix: (1) admin-gate via `insurance_fund.authority` in the context, and
+        // (2) forbid a non-zero endowment here. The pool is seeded through
+        // `deposit_flp_capital`, which performs the backing SPL transfer and
+        // mints shares against real tokens — so an unbacked endowment (and thus
+        // a claim on other users' funds) can no longer be created at init.
+        require!(
+            initial_capital_quote_lots == 0,
+            FlashBookError::OutOfRange
+        );
+
         let flp = &mut ctx.accounts.flp_exposure;
         flp.authority = ctx.accounts.authority.key();
         flp.bump = ctx.bumps.flp_exposure;
@@ -2187,9 +2202,17 @@ pub mod flash_book {
         let nav = flp.nav();
         let shares_outstanding = flp.lp_shares_outstanding;
 
-        // Compute shares to mint. Bootstrap (no shares yet OR NAV <= 0)
-        // mints 1:1 — first depositor sets the share price.
-        let shares_to_mint: u64 = if shares_outstanding == 0 || nav <= 0 {
+        // AUDIT M-3 (2026-07): only bootstrap 1:1 when there are genuinely NO
+        // shares yet. If shares exist but NAV has fallen <= 0 (pool insolvent
+        // after trading losses), minting 1:1 against the stale supply silently
+        // dilutes the new depositor into near-worthless legacy shares. Reject.
+        require!(
+            !(shares_outstanding > 0 && nav <= 0),
+            FlashBookError::FlpPoolInsolvent
+        );
+        // Compute shares to mint. Bootstrap (no shares yet) mints 1:1 — the
+        // first depositor sets the share price.
+        let shares_to_mint: u64 = if shares_outstanding == 0 {
             amount_quote_lots
         } else {
             let prod = (amount_quote_lots as u128)
@@ -2625,6 +2648,11 @@ pub mod flash_book {
             main.open_positions == 0,
             FlashBookError::OpenInterestCapExceeded
         );
+        // AUDIT HIGH-2 (2026-07): collateral backing live ER resting orders is
+        // locked by `er_active` on the ATTESTED account. Moving it off-account
+        // (even to a sub) would leave those orders unbacked once they fill. Fail
+        // closed exactly like `withdraw_collateral` (lib.rs) does.
+        require!(main.er_active == 0, FlashBookError::UseXDomainWithdraw);
         main.collateral_quote_lots = main
             .collateral_quote_lots
             .checked_sub(amount)
@@ -2666,6 +2694,9 @@ pub mod flash_book {
             sub.open_positions == 0,
             FlashBookError::OpenInterestCapExceeded
         );
+        // AUDIT HIGH-2 (2026-07): don't let collateral backing live ER resting
+        // orders leave the attested (sub) account. Fail closed like withdraw.
+        require!(sub.er_active == 0, FlashBookError::UseXDomainWithdraw);
         sub.collateral_quote_lots = sub
             .collateral_quote_lots
             .checked_sub(amount)
@@ -2894,8 +2925,16 @@ pub mod flash_book {
             let from = ctx.accounts.from_state.load()?;
             let to = ctx.accounts.to_state.load()?;
             require!(from.trader != to.trader, FlashBookError::OutOfRange);
-            require!(from.is_authorized(&signer), FlashBookError::Unauthorized);
+            // AUDIT HIGH-3 (2026-07): moving collateral OUT of an account is a
+            // custody action, not a trading action. Require the SOURCE account's
+            // owner (not merely a delegate) to sign — a `delegate` is scoped to
+            // trading and must never be able to drain the master's funds. The
+            // destination must still be authorized for the signer.
+            require!(signer == from.trader, FlashBookError::Unauthorized);
             require!(to.is_authorized(&signer), FlashBookError::Unauthorized);
+            // AUDIT HIGH-2 (2026-07): don't sweep collateral backing live ER
+            // resting orders off the attested account. Fail closed like withdraw.
+            require!(from.er_active == 0, FlashBookError::UseXDomainWithdraw);
             (from.trader, from.open_positions, from.collateral_quote_lots)
         };
 
@@ -5395,6 +5434,54 @@ pub mod flash_book {
             FlashBookError::OutOfRange
         );
 
+        // AUDIT M-2 (2026-07): the fee / funding / penalty fields were
+        // previously UNBOUNDED here, so a compromised authority could set a
+        // 100% taker fee or an extreme funding rate and siphon user collateral
+        // on the next fill / funding tick. Apply generous absolute ceilings —
+        // well above any real market config, tight enough to bound abuse.
+        require!(
+            new_params.taker_fee_bps <= constants::MAX_FEE_TIER_BPS,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.maker_rebate_bps.unsigned_abs() <= constants::MAX_FEE_TIER_BPS,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.toxicity_tax_max_bps <= constants::MAX_FEE_TIER_BPS,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.jit_bonus_rebate_bps <= constants::MAX_FEE_TIER_BPS,
+            FlashBookError::OutOfRange
+        );
+        // Liquidation economics: penalty ≤ 50%, and the liquidator's reward can
+        // never exceed the penalty actually charged (else it mints value).
+        require!(
+            new_params.liq_penalty_bps <= 5_000,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.liquidator_reward_bps <= new_params.liq_penalty_bps,
+            FlashBookError::OutOfRange
+        );
+        // Funding: bound both the per-second rate and the per-period clamp.
+        require!(
+            new_params.funding_rate_max_bps_per_sec <= constants::BPS_DENOM,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.funding_per_period_max_bps <= 5_000,
+            FlashBookError::OutOfRange
+        );
+        // Fee-share splits can never exceed 100% of the net fee.
+        require!(
+            new_params.referrer_share_bps <= constants::BPS_DENOM
+                && new_params.builder_share_bps <= constants::BPS_DENOM
+                && new_params.creator_share_bps <= constants::BPS_DENOM,
+            FlashBookError::OutOfRange
+        );
+
         market.params = new_params;
         emit!(MarketParamsUpdatedEvent {
             market: market.key(),
@@ -5590,12 +5677,20 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Update a trader's authority (e.g. for wallet rotation). Either the
-    /// current authority OR the trader signs.
+    /// Transfer market authority (e.g. for key rotation). Only the current
+    /// market authority may sign.
+    ///
+    /// AUDIT F4 (2026-07): rejects a transfer to the zero key — that would be
+    /// an *irreversible* authority burn masquerading as a rotation. Burning is
+    /// a deliberate, separate action (`burn_market_authority`).
     pub fn transfer_market_authority(
         ctx: Context<UpdateMarketAuthority>,
         new_authority: Pubkey,
     ) -> Result<()> {
+        require!(
+            new_authority != Pubkey::default(),
+            FlashBookError::OutOfRange
+        );
         let market = &mut ctx.accounts.market;
         require_keys_eq!(
             market.authority,
@@ -8586,6 +8681,7 @@ pub mod flash_book {
         let iceberg_id = iceberg.iceberg_id;
         let trader_pk = iceberg.trader;
         let iceberg_sub_index = iceberg.sub_index;
+        let iceberg_prev_child_seq = iceberg.child_order_seq;
         let market_key = market.key();
 
         let inserted_seq;
@@ -8596,6 +8692,25 @@ pub mod flash_book {
                 handle.header.market_pubkey == market_key,
                 FlashBookError::WrongMarket
             );
+            let side_is_bid = side == 0;
+            // AUDIT M-13 (2026-07): do NOT replenish until the previously
+            // displayed chunk has actually been consumed. Without this a caller
+            // can loop `replenish` and expose the entire hidden size at once,
+            // defeating the iceberg (forced full-size exposure). If a prior
+            // child order is still resting on the book, reject.
+            if iceberg_prev_child_seq != 0 {
+                let child_id =
+                    state_v2::encode_order_id(limit, iceberg_prev_child_seq, side_is_bid);
+                let existing = if side_is_bid {
+                    handle.lookup_bid_by_order_id(child_id)
+                } else {
+                    handle.lookup_ask_by_order_id(child_id)
+                };
+                require!(
+                    existing == crate::hypertree::NIL,
+                    FlashBookError::OutOfRange
+                );
+            }
             let seq = handle
                 .header
                 .order_seq_counter
@@ -8604,7 +8719,6 @@ pub mod flash_book {
             require!(seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
             handle.header.order_seq_counter = seq;
 
-            let side_is_bid = side == 0;
             let order = state_v2::RestingOrderV2 {
                 order_id: state_v2::encode_order_id(limit, seq, side_is_bid),
                 seq,
@@ -8942,7 +9056,14 @@ pub mod flash_book {
         let pre_deposit_nav = post_deposit_collateral.saturating_sub(amount_quote_lots);
 
         let vault = &mut ctx.accounts.vault;
-        let shares_to_mint: u64 = if vault.shares_outstanding == 0 || pre_deposit_nav == 0 {
+        // AUDIT M-3 (2026-07): bootstrap 1:1 only when there are no shares yet.
+        // Shares outstanding against a zero-NAV (fully-drained) vault would
+        // dilute the new depositor into worthless legacy shares — reject.
+        require!(
+            !(vault.shares_outstanding > 0 && pre_deposit_nav == 0),
+            FlashBookError::FlpPoolInsolvent
+        );
+        let shares_to_mint: u64 = if vault.shares_outstanding == 0 {
             amount_quote_lots
         } else {
             let prod = (amount_quote_lots as u128)
@@ -9251,6 +9372,15 @@ pub mod flash_book {
             return Ok(());
         }
 
+        // AUDIT M-4 (2026-07): NAV here is collateral-only (realized PnL). If the
+        // vault carries an open position with unrealized LOSS, its collateral is
+        // not yet reduced, so crystallizing the perf fee now over-charges it and
+        // dilutes depositors when the loss later realizes. Require the vault FLAT,
+        // exactly like `vault_withdraw_v3` (H-6).
+        require!(
+            ctx.accounts.vault_trader_state.load()?.open_positions == 0,
+            FlashBookError::SweepRequiresFlat
+        );
         let nav = ctx.accounts.vault_trader_state.load()?.collateral_quote_lots as u128;
         require!(nav > 0, FlashBookError::InsufficientCollateral);
 
@@ -11886,6 +12016,18 @@ fn gate_oracle_update<'info>(
         cfg.gate_rejects = cfg.gate_rejects.saturating_add(1);
         return Err(error!(FlashBookError::EnvelopeSameSlotMove));
     }
+    // AUDIT M-5 (2026-07): the per-slot cap is only PROVEN sound over a window
+    // of `max_accrual_dt_slots` (see `prove_envelope`). Admitting the raw dt
+    // after a crank gap (e.g. a stalled ER) would let a single update jump by
+    // cap * dt, far beyond the proven per-window loss budget — a position
+    // healthy before the gap could breach maintenance in one step. Clamp the
+    // accrual window so the admitted move saturates at the proven budget; a
+    // larger genuine move must be applied over multiple cranks.
+    let dt = if cfg.max_accrual_dt_slots > 0 {
+        dt.min(cfg.max_accrual_dt_slots)
+    } else {
+        dt
+    };
     let last_price = cfg.last_observed_price_ticks;
     matcher::envelope::gate_price_move(
         last_price,
@@ -12508,6 +12650,16 @@ pub struct InitializeFlpExposure<'info> {
     )]
     pub authority_lp_position: Box<Account<'info, state::LpPositionAccount>>,
 
+    /// AUDIT CRITICAL-1 (2026-07): admin-gate this permissionless singleton
+    /// init to the protocol authority so it cannot be front-run/captured to
+    /// mint shares against the shared vault.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+        constraint = insurance_fund.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -13045,6 +13197,17 @@ pub struct UpdateMarketLeverageTiers<'info> {
 pub struct InitFeeTiers<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
+
+    /// AUDIT M-18 (2026-07): this is a first-caller-wins singleton at a fixed
+    /// PDA. Without an authority gate an attacker could front-run genesis,
+    /// pin themselves as `fee_tiers.authority`, lock out the operator, and set
+    /// the global fee schedule. Gate on the protocol authority.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+        constraint = insurance_fund.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
 
     #[account(
         init,
@@ -15381,8 +15544,13 @@ fn validate_leverage_tiers(market: &MarketAccount, tiers: &[LeverageTier]) -> Re
             t.mmr_bps >= base_mmr,
             FlashBookError::OutOfRange
         );
+        // AUDIT admin-F3 (2026-07): cap tier MMR at the SAME < 50% ceiling
+        // `update_market_params` enforces on the baseline. The old 100% cap let
+        // the authority set a whale tier's MMR to 100% and instantly liquidate
+        // those positions to skim the penalty — the tier ladder must not be a
+        // bypass of the baseline MMR safety cap.
         require!(
-            t.mmr_bps <= constants::BPS_DENOM as u32,
+            t.mmr_bps < 5_000,
             FlashBookError::OutOfRange
         );
         if let Some(prev) = prev_min {
@@ -17743,8 +17911,23 @@ pub struct InitFlpPerMarketV3<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
-    /// CHECK: market pubkey — used as PDA seed only.
-    pub market: UncheckedAccount<'info>,
+    /// AUDIT M-18 (2026-07): gate on the protocol authority so this per-market
+    /// singleton can't be front-run/captured to control `record_flp_fill_v3`.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+        constraint = insurance_fund.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    /// AUDIT M-18 (2026-07): typed as a real MarketAccount (owner + discriminator
+    /// checked) rather than a raw UncheckedAccount, so an arbitrary 32-byte
+    /// "market" cannot be squatted as the exposure seed.
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
 
     #[account(
         init,

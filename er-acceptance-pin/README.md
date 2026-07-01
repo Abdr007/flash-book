@@ -59,8 +59,18 @@ L1_RPC=https://api.devnet.solana.com \
 ER_RPC=https://devnet-as.magicblock.app \
 PIN_PROGRAM_ID=<deployed pin program id> \
 MARKET=<initialized, active, mark-set market pubkey> \
+BASE_MINT=<the base mint used to derive MARKET> \
+QUOTE_MINT=<the quote mint used to derive MARKET> \
   npm run acceptance
 ```
+
+`BASE_MINT` + `QUOTE_MINT` are required because `delegate_market` re-derives the
+market PDA `[b"market", base_mint, quote_mint]` from them. The harness now drives the
+FULL round-trip: delegate book → assert `stamp_book_liveness_baseline` is already
+stamped (Custom 201) → `book_permission` init/set/close → delegate the fill-commitment
+ring + the market (market last, so the whole writable set is delegated together) →
+rest a bid on the ER → commit each → `commit_and_undelegate` each → assert each comes
+back program-owned. Every successful stage prints an `explorer.solana.com` link.
 
 | env | meaning | default |
 |-----|---------|---------|

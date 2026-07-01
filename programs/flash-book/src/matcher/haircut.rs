@@ -223,9 +223,26 @@ pub fn apply_release(
         // First dollar of reserve — start the warmup clock now.
         now_slot
     } else {
-        // Pre-existing reserve — keep the original attachment slot so
-        // older dollars don't get their warmup reset by new releases.
-        pre.released_attached_at_slot
+        // AUDIT HIGH-9 (2026-07): reserve-weighted attach slot. Previously the
+        // ORIGINAL (older) slot was kept, so a large gain released long after a
+        // tiny leftover reserve inherited an already-elapsed warmup clock and
+        // could mature instantly — defeating the anti-spike warmup. Blend the
+        // clocks in proportion to size so a fresh gain pulls the effective
+        // attach forward: attached' = (reserve·attached + gain·now)/(reserve+gain).
+        // `now_slot >= attached` (time only advances), so the result stays in
+        // [attached, now] — older dollars are never warmed FASTER, and new
+        // gains never start already-matured.
+        let r = pre.released_reserve_quote_lots as u128;
+        let g = gain_quote_lots as u128;
+        let a = pre.released_attached_at_slot as u128;
+        let n = now_slot as u128;
+        let numer = r
+            .checked_mul(a)
+            .ok_or(HaircutError::Overflow)?
+            .checked_add(g.checked_mul(n).ok_or(HaircutError::Overflow)?)
+            .ok_or(HaircutError::Overflow)?;
+        let denom = r.checked_add(g).ok_or(HaircutError::Overflow)?;
+        (numer / denom) as u64
     };
     // Original reserve tracks the total in this warmup window.
     // - First release (reserve was 0): start fresh at gain.
@@ -778,7 +795,11 @@ mod tests {
     }
 
     #[test]
-    fn release_does_not_reset_clock() {
+    fn release_advances_clock_reserve_weighted() {
+        // AUDIT HIGH-9 (2026-07): a fresh gain must pull the warmup clock
+        // FORWARD in proportion to its size, so a large late gain cannot inherit
+        // an already-elapsed clock and mature instantly. The OLD behavior kept
+        // the stale attach slot (10) — that was the warmup-bypass bug.
         let pre = PositionHaircutSnapshot {
             released_reserve_quote_lots: 100,
             released_attached_at_slot: 10,
@@ -787,7 +808,12 @@ mod tests {
         };
         let post = apply_release(pre, 200, 50).unwrap();
         assert_eq!(post.released_reserve_quote_lots, 300);
-        assert_eq!(post.released_attached_at_slot, 10, "older reserves keep their clock");
+        // Reserve-weighted: (100*10 + 200*50) / 300 = 11000/300 = 36 (floor).
+        assert_eq!(post.released_attached_at_slot, 36);
+        // Always within [old_attach, now]: older dollars are never warmed
+        // faster, and new gains never start already-matured.
+        assert!(post.released_attached_at_slot >= 10);
+        assert!(post.released_attached_at_slot <= 50);
     }
 
     #[test]

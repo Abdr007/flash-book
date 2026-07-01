@@ -398,14 +398,18 @@ async fn setup_protocol(
         flash_book::state::LpPositionAccount::SEED,
         payer.pubkey().as_ref(),
     ]);
+    // AUDIT CRITICAL-1 (2026-07): init no longer mints an unbacked endowment.
+    // initial_capital must be 0; the pool is seeded via deposit_flp_capital.
+    // The singleton init is now admin-gated on `insurance_fund`.
     let ix2 = build_ix(
         flash_book::instruction::InitializeFlpExposure {
-            initial_capital_quote_lots: 5_000_000,
+            initial_capital_quote_lots: 0,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new(flp_exposure, false),
             AccountMeta::new(authority_lp_position, false),
+            AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -910,36 +914,15 @@ async fn initialize_flp_exposure_writes_state_and_empty_slots() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
+    // AUDIT CRITICAL-1 (2026-07): FLP init is admin-gated and mints NO unbacked
+    // endowment — total_capital starts at 0. setup_protocol performs the gated,
+    // zero-capital init; capital is added later via deposit_flp_capital.
+    let _protocol = setup_protocol(&mut ctx, &payer).await;
+
     let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
-    let (authority_lp_position, _) = pda(&[
-        flash_book::state::LpPositionAccount::SEED,
-        payer.pubkey().as_ref(),
-    ]);
-
-    let ix = build_ix(
-        flash_book::instruction::InitializeFlpExposure {
-            initial_capital_quote_lots: 5_000_000,
-        },
-        vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(flp_exposure, false),
-            AccountMeta::new(authority_lp_position, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-    );
-
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&payer.pubkey()),
-            &[&payer],
-            ctx.last_blockhash,
-        ))
-        .await
-        .unwrap();
-
     let flp: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
-    assert_eq!(flp.total_capital_quote_lots, 5_000_000);
+    assert_eq!(flp.total_capital_quote_lots, 0);
+    assert_eq!(flp.lp_shares_outstanding, 0);
     assert_eq!(flp.realized_pnl, 0);
     assert_eq!(flp.markets_count, 0);
     // All slots should be empty (side = 255).
@@ -1539,11 +1522,13 @@ async fn deposit_flp_capital_grows_pool() {
     let payer = ctx.payer.insecure_clone();
 
     let protocol = setup_protocol(&mut ctx, &payer).await;
+    // AUDIT CRITICAL-1: seed 5M via the real backed deposit (was an unbacked
+    // endowment). Pool now starts at 5M capital / 5M shares, vault-backed.
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     let initial: FlpExposureAccount =
         fetch(&mut ctx.banks_client, protocol.flp_exposure).await;
     assert_eq!(initial.total_capital_quote_lots, 5_000_000);
-    // Authority's treasury endowment: 5M shares minted at init.
     assert_eq!(initial.lp_shares_outstanding, 5_000_000);
 
     let lp_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
@@ -1603,7 +1588,8 @@ async fn deposit_flp_capital_grows_pool() {
         &vault_after.data,
     )
     .unwrap();
-    assert_eq!(vs.amount, 1_000_000);
+    // 5M seed + 1M deposit, now fully backed in the shared vault.
+    assert_eq!(vs.amount, 6_000_000);
 }
 
 #[tokio::test]
@@ -1615,10 +1601,12 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
     let payer = ctx.payer.insecure_clone();
 
     let protocol = setup_protocol(&mut ctx, &payer).await;
+    // AUDIT CRITICAL-1: seed the 5M treasury capital via the backed path.
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     // Pre-fund the vault: deposit 1M USDC. Authority owns the LP position
     // PDA (treasury endowment lives there); after this deposit they hold
-    // 6M shares (5M init + 1M).
+    // 6M shares (5M seed + 1M).
     let lp_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
     mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp_ata, 1_000_000).await;
     let (lp_position, _) = pda(&[
@@ -1755,13 +1743,30 @@ async fn lp_deposit(
         .unwrap();
 }
 
+/// AUDIT CRITICAL-1 (2026-07): `initialize_flp_exposure` no longer mints an
+/// unbacked treasury endowment. Tests that previously assumed a 5M endowment at
+/// setup now seed the same 5M through the REAL backed deposit path (payer =
+/// treasury), so the pool starts at 5M capital / 5M shares held in the payer's
+/// LP position — now fully vault-backed. Keeps the downstream 5M-based
+/// assertions valid while exercising the correct (backed) accounting.
+async fn seed_flp_capital(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    protocol: &Protocol,
+    amount: u64,
+) {
+    let treasury = payer.insecure_clone();
+    lp_deposit(ctx, payer, &treasury, protocol, amount).await;
+}
+
 #[tokio::test]
 async fn lp_units_two_lps_split_shares_pro_rata_with_no_pnl() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let protocol = setup_protocol(&mut ctx, &payer).await;
-    // setup_protocol mints 5M shares to payer (treasury). lp_shares_outstanding=5M.
+    // AUDIT CRITICAL-1: seed 5M treasury capital via the backed path (payer).
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -1804,6 +1809,8 @@ async fn lp_units_late_depositor_pays_inflated_share_price_after_pnl() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let protocol = setup_protocol(&mut ctx, &payer).await;
+    // AUDIT CRITICAL-1: seed 5M treasury capital via the backed path (payer).
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -1849,6 +1856,8 @@ async fn lp_units_withdraw_burns_shares_and_distributes_nav() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let protocol = setup_protocol(&mut ctx, &payer).await;
+    // AUDIT CRITICAL-1: seed 5M treasury capital via the backed path (payer).
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     let alice = Keypair::new();
     lp_deposit(&mut ctx, &payer, &alice, &protocol, 2_000_000).await;
@@ -1922,6 +1931,9 @@ async fn flp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure()
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    // AUDIT CRITICAL-1: seed 5M treasury capital via the backed path so the
+    // payer holds 5M shares (as the old endowment did), now vault-backed.
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     // Inject one FLP exposure entry into per_market.
     let flp_acc = ctx.banks_client.get_account(protocol.flp_exposure).await.unwrap().unwrap();
@@ -2345,6 +2357,10 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
         market_pda.as_ref(),
         trader_state.as_ref(),
     ]);
+
+    // AUDIT CRITICAL-1: seed 5M FLP capital via the backed path (FLP must be
+    // capitalized to act as maker), replacing the old unbacked endowment.
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     // Apply a fill where trader buys 1 lot @ 100,000 from FLP.
     let (insurance_fund_pda_for_flpfill, _) = pda(&[InsuranceFundAccount::SEED]);

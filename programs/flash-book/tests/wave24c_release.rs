@@ -263,9 +263,10 @@ fn seed_residual_signed_deltas() {
 
 #[test]
 fn many_releases_share_warmup_clock() {
-    // Two gains released at different slots within the same warmup
-    // share the original attachment slot. Their combined original
-    // amount matures together.
+    // Two gains released at different slots within the same warmup combine
+    // into one reserve, and the attachment slot is pulled forward
+    // (reserve-weighted) so a late gain cannot inherit an elapsed clock
+    // (AUDIT HIGH-9). Their combined original amount matures on that clock.
     let mut market = init_market(10, 100, 100_000);
     let mut buckets = PositionBuckets {
         isolated_collateral: 5_000,
@@ -277,17 +278,20 @@ fn many_releases_share_warmup_clock() {
     assert_eq!(pos.attached_at_slot, 50);
     assert_eq!(pos.original, 1_000);
 
-    // Second release at slot 80 — same warmup. Original now 1500.
+    // AUDIT HIGH-9 (2026-07): a second release pulls the warmup clock FORWARD,
+    // reserve-weighted, so a large late gain can't inherit an already-elapsed
+    // clock and mature instantly:
+    //   attached' = (1000*50 + 500*80) / (1000+500) = 90000/1500 = 60.
     ix_release_gain_to_haircut(&mut buckets, &mut pos, 500, 80).unwrap();
-    assert_eq!(pos.attached_at_slot, 50, "clock not reset");
+    assert_eq!(pos.attached_at_slot, 60, "reserve-weighted warmup clock");
     assert_eq!(pos.original, 1_500);
     assert_eq!(pos.reserve, 1_500);
 
-    // At slot 100, elapsed since 50 = 50, fraction = (50-10)/(100-10) ≈ 0.444.
-    // Target cumulative = 1500 × 0.444 = 666.
+    // At slot 100, elapsed since 60 = 40, fraction = (40-10)/(100-10) = 1/3.
+    // Target cumulative = 1500 × 1/3 = 500.
     ix_mature(&mut pos, &mut market, 100);
-    assert_eq!(pos.matured, 666);
-    assert_eq!(pos.reserve, 1_500 - 666);
+    assert_eq!(pos.matured, 500);
+    assert_eq!(pos.reserve, 1_500 - 500);
 
     // At slot 200 (well past h_max), the rest matures.
     ix_mature(&mut pos, &mut market, 200);

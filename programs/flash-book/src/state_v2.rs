@@ -610,6 +610,67 @@ impl<'a> MarketBookHandle<'a> {
                 );
             }
         }
+
+        // AUDIT HIGH-5 (2026-07): the per-link bounds check above stops an OOB
+        // panic but NOT an infinite loop. A malicious-/buggy-ER commit can plant
+        // a book whose links are all in-bounds yet form a CYCLE (e.g. A.right=B
+        // and B.right=A). `validate` used to accept it, and the first L1
+        // traversal (lookup_max / get_next_higher — all unbounded `while` loops)
+        // would spin forever → compute-exhaustion → the market bricks (there is
+        // no reset ix). Close it with a bounded-reachability walk: DFS each tree
+        // from its root with a SHARED visited bitmap, rejecting a revisit (cycle
+        // or cross-tree aliasing) or a child whose `parent` link does not point
+        // back (broken symmetry). Verifying child→parent symmetry along an
+        // acyclic DFS also makes every parent-chain (up-walk) acyclic. Runs ONCE
+        // per undelegate, off the hot path.
+        let header: &MarketBookHeader = bytemuck::from_bytes(
+            &account_data[MARKET_BOOK_DISC_BYTES
+                ..MARKET_BOOK_DISC_BYTES + MARKET_BOOK_HEADER_BYTES],
+        );
+        let read_link = |off: usize, link_off: usize| -> u32 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&slab[off + link_off..off + link_off + 4]);
+            u32::from_le_bytes(b)
+        };
+        let mut visited = vec![false; node_count];
+        let mut stack: Vec<usize> = Vec::new();
+        for root in [
+            header.bids_root_index,
+            header.asks_root_index,
+            header.claimed_seats_root_index,
+        ] {
+            if root == NIL {
+                continue;
+            }
+            stack.push(root as usize);
+            let mut steps = 0usize;
+            while let Some(off) = stack.pop() {
+                steps += 1;
+                require!(
+                    steps <= node_count,
+                    crate::errors::FlashBookError::OutOfRange
+                );
+                let ord = off / NODE_TOTAL_BYTES;
+                require!(
+                    ord < node_count && !visited[ord],
+                    crate::errors::FlashBookError::OutOfRange
+                );
+                visited[ord] = true;
+                // left (offset 0) and right (offset 4) children.
+                for child_link_off in [0usize, 4] {
+                    let child = read_link(off, child_link_off);
+                    if child != NIL {
+                        // `child` was validated in-bounds/aligned by the loop
+                        // above; its parent (offset 8) must point back here.
+                        require!(
+                            read_link(child as usize, 8) == off as u32,
+                            crate::errors::FlashBookError::OutOfRange
+                        );
+                        stack.push(child as usize);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1390,7 +1451,7 @@ mod tests {
         // out-of-bounds byte offset
         let mut data = make_book();
         {
-            let mut h = MarketBookHandle::from_account_data(&mut data).unwrap();
+            let h = MarketBookHandle::from_account_data(&mut data).unwrap();
             h.header.bids_root_index = 9_999_999;
         }
         assert!(
@@ -1400,7 +1461,7 @@ mod tests {
         // in-bounds but not node-aligned
         let mut data = make_book();
         {
-            let mut h = MarketBookHandle::from_account_data(&mut data).unwrap();
+            let h = MarketBookHandle::from_account_data(&mut data).unwrap();
             h.header.asks_best_index = 1;
         }
         assert!(
@@ -1446,6 +1507,43 @@ mod tests {
         // and the per-op hot path still loads it (no link walk there now)
         let mut data = make_book();
         assert!(MarketBookHandle::from_account_data(&mut data).is_ok());
+    }
+
+    /// AUDIT HIGH-5 (2026-07) regression: a malicious-/buggy-ER commit can plant
+    /// a book whose links are all IN-BOUNDS yet form a CYCLE. The old per-link
+    /// bounds check accepted it and the first L1 traversal would infinite-loop
+    /// (compute-exhaustion → market brick). Build a 2-node cycle rooted at
+    /// node0 (node0.right=node1, node1.right=node0, parents point back so the
+    /// symmetry check passes) and assert the bounded-reachability walk rejects.
+    #[test]
+    fn validate_node_links_rejects_cyclic_book() {
+        // RBT indices are SLAB-relative byte offsets: node 0 = 0, node 1 = 96.
+        let n0: u32 = 0;
+        let n1: u32 = NODE_TOTAL_BYTES as u32;
+
+        let mut data = make_book();
+        {
+            let h = MarketBookHandle::from_account_data(&mut data).unwrap();
+            h.header.bids_root_index = n0; // root = node 0
+        }
+        // Byte writes are at ACCOUNT offset = PREFIX + slab_offset + link_off.
+        let write = |data: &mut [u8], slab_off: u32, link_off: usize, val: u32| {
+            let base = MARKET_BOOK_PREFIX_BYTES + slab_off as usize + link_off;
+            data[base..base + 4].copy_from_slice(&val.to_le_bytes());
+        };
+        // node0: left=NIL, right=n1, parent=n1
+        write(&mut data, n0, 0, NIL);
+        write(&mut data, n0, 4, n1);
+        write(&mut data, n0, 8, n1);
+        // node1: left=NIL, right=n0, parent=n0  → 2-cycle, symmetry satisfied
+        write(&mut data, n1, 0, NIL);
+        write(&mut data, n1, 4, n0);
+        write(&mut data, n1, 8, n0);
+
+        assert!(
+            MarketBookHandle::validate_node_links(&data).is_err(),
+            "cyclic (but in-bounds) book must be rejected by bounded reachability"
+        );
     }
 
     #[test]

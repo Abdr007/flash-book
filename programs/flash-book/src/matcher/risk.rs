@@ -454,12 +454,28 @@ pub fn assess_margin(
         .checked_sub(funding_total)
         .or_underflow()?;
 
-    // For each scenario, compute total loss + maintenance margin.
-    let mut worst_loss: u64 = 0;
+    // AUDIT HIGH-1 (2026-07): required margin must NOT grant cross-market
+    // offset. The old code took `max over scenarios` of the loss SUMMED across
+    // ALL positions, so any scenario that moves two markets together netted
+    // opposing legs (e.g. long A + short B): the uniform all-down/all-up
+    // scenarios cancelled the legs and the single-market scenarios loaded only
+    // one leg, so the true worst case "A crashes AND B rallies simultaneously"
+    // was never priced. That under-margined cross-market books by ~2x.
+    //
+    // Fix: decompose PER MARKET. For each market take the worst of its own
+    // single-market scenario losses (positions on the SAME market still net
+    // against each other under a shared shock — the documented hedge property),
+    // then SUM the per-market worst cases. This equals the perfectly-
+    // decorrelated adverse scenario and is always >= the old figure, so it is
+    // strictly more conservative and can never under-margin. For a
+    // single-market portfolio it is byte-identical to the old computation.
+    let mut market_worst: Vec<(Pubkey, i128)> = Vec::with_capacity(positions.len());
     let mut worst_idx: u32 = 0;
+    let mut worst_single: i128 = i128::MIN;
 
     for (idx, scenario) in scenarios.iter().enumerate() {
-        let mut scenario_loss_signed: i128 = 0;
+        // Per-market summed loss for THIS scenario.
+        let mut per_market: Vec<(Pubkey, i128)> = Vec::with_capacity(positions.len());
         for pos in positions {
             let m = match lookup_market(markets, &pos.market) {
                 Some(m) => m,
@@ -468,11 +484,9 @@ pub fn assess_margin(
             let shock = shock_for_market(scenario, &pos.market);
             let stressed = shocked_price(m.mark_price, shock)?;
 
-            // Loss = -unrealized at stressed price (positive = bad for trader).
+            // Loss contribution = maintenance margin − unrealized PnL, both at
+            // the stressed price (positive = bad for the trader).
             let pnl = unrealized_pnl_quote_lots(pos, stressed, m.tick_size)?;
-            scenario_loss_signed = scenario_loss_signed.checked_sub(pnl).or_underflow()?;
-
-            // Maintenance margin on stressed notional.
             let stressed_notional = (pos.size_lots as i128)
                 .checked_mul(stressed.0 as i128)
                 .or_overflow()?
@@ -484,18 +498,44 @@ pub fn assess_margin(
                 .or_overflow()?
                 .checked_div(BPS_DENOM as i128)
                 .or_div_zero()?;
-            scenario_loss_signed = scenario_loss_signed.checked_add(mm).or_overflow()?;
+            let contrib = mm.checked_sub(pnl).or_underflow()?;
+
+            match per_market.iter_mut().find(|(k, _)| *k == pos.market) {
+                Some((_, acc)) => *acc = acc.checked_add(contrib).or_overflow()?,
+                None => per_market.push((pos.market, contrib)),
+            }
         }
-        let loss_unsigned: u64 = if scenario_loss_signed <= 0 {
-            0
-        } else if scenario_loss_signed > u64::MAX as i128 {
-            u64::MAX
-        } else {
-            scenario_loss_signed as u64
-        };
-        if loss_unsigned > worst_loss {
-            worst_loss = loss_unsigned;
-            worst_idx = idx as u32;
+        // Fold this scenario's per-market losses into the running per-market
+        // worst-case; track the scenario that drove the single largest market
+        // loss for reporting.
+        for (mk, loss) in per_market {
+            if loss > worst_single {
+                worst_single = loss;
+                worst_idx = idx as u32;
+            }
+            match market_worst.iter_mut().find(|(k, _)| *k == mk) {
+                Some((_, w)) => {
+                    if loss > *w {
+                        *w = loss;
+                    }
+                }
+                None => market_worst.push((mk, loss)),
+            }
+        }
+    }
+
+    // required = Σ_market max(worst_market_loss_m, 0). A market whose worst case
+    // is still a net gain contributes 0 (never a negative that offsets another
+    // market's loss).
+    let mut worst_loss: u64 = 0;
+    for (_, w) in market_worst {
+        if w > 0 {
+            let add = if w > u64::MAX as i128 {
+                u64::MAX
+            } else {
+                w as u64
+            };
+            worst_loss = worst_loss.saturating_add(add);
         }
     }
 
@@ -1134,5 +1174,113 @@ mod assess_margin_c1_kani_proofs {
         let (h1, _) = gate(collateral, funding, pnl_stressed, mm_stressed);
         let (h2, _) = gate(collateral, funding, pnl_stressed, mm_stressed);
         assert_eq!(h1, h2);
+    }
+}
+
+#[cfg(test)]
+mod high1_cross_market_regression {
+    //! AUDIT HIGH-1 (2026-07) regression. A cross-margin portfolio that is long
+    //! market A and short market B must be margined for BOTH legs moving
+    //! adversely AT ONCE (A crashes AND B rallies). The pre-fix code took
+    //! `max over scenarios` of the loss SUMMED across positions, so the uniform
+    //! all-up/all-down scenarios netted the opposing legs and it under-margined
+    //! the book ~2x. The per-market decomposition prices each market's worst
+    //! case independently and sums them.
+    use super::*;
+
+    fn market(seed: u8, mark: u64) -> MarketSnapshot {
+        MarketSnapshot {
+            market: Pubkey::new_from_array([seed; 32]),
+            mark_price: Ticks(mark),
+            cum_funding_index: 0,
+            maintenance_margin_bps: 500, // 5%
+            tick_size: 1,
+            concentration_threshold_lots: 0,
+            concentration_extra_mmr_bps: 0,
+            side_oi_lots: 0,
+            oi_mmr_slope_bps_per_million_lots: 0,
+            oi_mmr_max_extra_bps: 0,
+        }
+    }
+
+    fn pos(mkt: Pubkey, side: Side, size: u64, entry: u64) -> PositionSnapshot {
+        PositionSnapshot {
+            market: mkt,
+            side,
+            size_lots: size,
+            entry_price: Ticks(entry),
+            cum_funding_index_at_entry: 0,
+            collateral_quote_lots: 0,
+        }
+    }
+
+    #[test]
+    fn opposing_legs_are_not_netted_across_markets() {
+        let ma = market(1, 100);
+        let mb = market(2, 100);
+        let positions = vec![
+            pos(ma.market, Side::Long, 100, 100),
+            pos(mb.market, Side::Short, 100, 100),
+        ];
+        let scenarios = default_scenarios(&[ma.market, mb.market]);
+
+        // Per-market worst case (black-swan ±30% is in the lattice):
+        //   A long  @ -30%: MM(70*100*500/1e4=350) - pnl(-3000) = 3350
+        //   B short @ +30%: MM(130*100*500/1e4=650) - pnl(-3000) = 3650
+        //   required = 3350 + 3650 = 7000  (NOT the ~3100 single-leg figure).
+        let a = assess_margin(&positions, &[ma, mb], &scenarios, 7_000).unwrap();
+        assert_eq!(
+            a.required_quote_lots, 7_000,
+            "required must sum BOTH legs' worst adverse move, not net them"
+        );
+
+        // Collateral that passed under the old netting frame (~3100) must now
+        // be flagged unhealthy — this is the fix.
+        assert!(
+            !assess_margin(&positions, &[ma, mb], &scenarios, 3_100)
+                .unwrap()
+                .is_healthy,
+            "cross portfolio under-margined by the old frame must now be unhealthy"
+        );
+
+        // Exact boundary: 7000 healthy, 6999 not.
+        assert!(assess_margin(&positions, &[ma, mb], &scenarios, 7_000)
+            .unwrap()
+            .is_healthy);
+        assert!(!assess_margin(&positions, &[ma, mb], &scenarios, 6_999)
+            .unwrap()
+            .is_healthy);
+    }
+
+    #[test]
+    fn same_market_hedge_still_nets() {
+        // Within ONE market, a long+short of equal size cancels directional
+        // risk — the decomposition must preserve this (only MM remains).
+        let m = market(1, 100);
+        let positions = vec![
+            pos(m.market, Side::Long, 100, 100),
+            pos(m.market, Side::Short, 100, 100),
+        ];
+        let scenarios = default_scenarios(&[m.market]);
+        let a = assess_margin(&positions, &[m], &scenarios, 0).unwrap();
+        // Directional PnL cancels in every shock; only the two maintenance
+        // margins remain (worst at the ±30% stressed notional).
+        // long MM + short MM at -30%: 2 * (70*100*500/1e4=350) = 700; at +30%:
+        // 2 * 650 = 1300 -> worst 1300.
+        assert_eq!(a.required_quote_lots, 1_300);
+    }
+
+    #[test]
+    fn single_market_matches_legacy_frame() {
+        // One market, one scenario: decomposition is byte-identical to the old
+        // computation. (Mirrors assess_margin_frame_tests direction 1.)
+        let m = market(1, 130);
+        let positions = vec![pos(m.market, Side::Long, 1, 100)];
+        let scenarios = vec![vec![StressShock {
+            market: m.market,
+            shock_bps: -2000,
+        }]];
+        let a = assess_margin(&positions, &[m], &scenarios, 0).unwrap();
+        assert_eq!(a.required_quote_lots, 1); // MM(5) - pnl_stressed(4)
     }
 }

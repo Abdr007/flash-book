@@ -156,7 +156,9 @@ fn opted_in_market_zero_delta_is_noop_with_or_without_haircut() {
 #[test]
 fn sequential_gains_on_opted_in_share_clock() {
     // Two consecutive fills with positive PnL on the same opted-in
-    // position share the warmup clock.
+    // position combine into one warmup pool; the attachment slot is pulled
+    // forward (reserve-weighted) so a later gain can't inherit an elapsed
+    // clock (AUDIT HIGH-9): attached = (300*10 + 700*25)/1000 = 20.
     let mut b = Buckets { iso: 1_000, cross: 0 };
     let mut ph = PosHaircut::default();
     dispatch(300, true, &mut b, Some(&mut ph), 10).unwrap();
@@ -164,7 +166,7 @@ fn sequential_gains_on_opted_in_share_clock() {
     assert_eq!(b.iso, 1_000, "collateral untouched across both fills");
     assert_eq!(ph.reserve, 1_000);
     assert_eq!(ph.original, 1_000, "subsequent gain joins warmup pool");
-    assert_eq!(ph.attached, 10, "clock anchored at first gain");
+    assert_eq!(ph.attached, 20, "reserve-weighted warmup clock");
 }
 
 #[test]
