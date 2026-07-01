@@ -241,6 +241,12 @@ pub enum FlashBookError {
     FillRingNotDrained = 2306,
     #[msg("Market batch cap exceeds the log-safe limit but no fill-outbox account was supplied to carry the fills off-log")]
     FillOutboxRequired = 2307,
+    #[msg("FLP pool is insolvent (NAV <= 0 while shares are outstanding) — deposits paused to prevent dilution of the new depositor")]
+    FlpPoolInsolvent = 2308,
+    #[msg("Stress-lattice scenario count exceeds the compute-safe maximum")]
+    TooManyStressScenarios = 2309,
+    #[msg("Order sequence counter exhausted for this market — the book must be reseated")]
+    OrderSeqExhaustedReseat = 2310,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

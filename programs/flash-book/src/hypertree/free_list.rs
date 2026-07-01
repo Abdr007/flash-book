@@ -53,6 +53,14 @@ impl<'a, T: Pod> FreeList<'a, T> {
 
     /// Free a node to the free list
     pub fn add(&mut self, index: DataIndex) {
+        // AUDIT M-17 (2026-07): guard against an immediate double-free. If
+        // `index` is already the list head, re-adding it would set the node's
+        // `next` to itself → a self-referential free list, so the SAME slot is
+        // handed out to two live allocations (use-after-free / type confusion).
+        // The node is already free, so a repeat free is a safe no-op.
+        if self.head_index == index {
+            return;
+        }
         let node: &mut FreeListNode<T> = get_mut_helper::<FreeListNode<T>>(self.data, index);
         node.node_inner = T::zeroed();
         node.next_index = self.head_index;
@@ -98,6 +106,25 @@ mod test {
 
         assert_eq!(128, free_list.remove());
         assert_eq!(64, free_list.remove());
+        assert_eq!(END, free_list.remove());
+    }
+
+    /// AUDIT M-17 (2026-07) regression: an immediate double-free of the list
+    /// head must NOT create a self-referential node (next == self), which would
+    /// hand the same slot out to two live allocations (use-after-free / type
+    /// confusion). The repeat free is a safe no-op.
+    #[test]
+    fn double_free_of_head_is_a_no_op() {
+        let mut data: [u8; 100000] = [0; 100000];
+        let mut free_list: FreeList<UnusedFreeListPadding1> = FreeList::new(&mut data, END);
+        free_list.add(64);
+        // Second free of the SAME index (still the head) must be ignored.
+        free_list.add(64);
+
+        // The slot is handed out exactly once; the list then drains to END —
+        // NOT the same slot twice (which the old self-loop would produce).
+        assert_eq!(64, free_list.remove());
+        assert_eq!(END, free_list.remove());
         assert_eq!(END, free_list.remove());
     }
 }
