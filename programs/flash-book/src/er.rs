@@ -492,6 +492,24 @@ pub fn process_external_undelegate<'info>(
     let (derived, bump) = Pubkey::find_program_address(&seed_slices, &crate::ID);
     require_keys_eq!(*delegated.key, derived, crate::FlashBookError::WrongMarket);
 
+    // AUDIT HIGH-4 (2026-07): BIND the buffer to `delegated`. The two guards
+    // above (is_signer + owner == DLP) are NOT sufficient — an attacker can
+    // manufacture a DLP-owned signer with arbitrary bytes (allocate a PDA under
+    // their own program, write bytes, `assign` it to the delegation program —
+    // data survives `assign` — and sign for it via invoke_signed) and target
+    // ANY uninitialized canonical PDA, fabricating e.g. a TraderState with
+    // u64::MAX collateral that `create_pda` below then copies in. Re-derive the
+    // canonical delegation-buffer PDA for THIS delegated account and require the
+    // passed buffer to equal it — an attacker cannot produce a *signer* at that
+    // address. This mirrors how the delegate path stages the buffer
+    // (`delegate_buffer_pda`, [b"buffer", delegated] under this program).
+    let (expected_buffer, _) = delegate_buffer_pda(delegated.key, &crate::ID);
+    require_keys_eq!(
+        *buffer.key,
+        expected_buffer,
+        crate::FlashBookError::Unauthorized
+    );
+
     let bump_arr = [bump];
     let mut signer: Vec<&[u8]> = seed_slices.clone();
     signer.push(&bump_arr);
