@@ -192,9 +192,15 @@ pub fn effective_mmr_bps_full(
 ///    (5_000_000, 300),   // tier 3: ~$25M    → 3.0% MMR
 ///    (25_000_000, 500)]  // tier 4: > $25M   → 5.0% MMR
 ///
-/// `tiers` MUST be sorted ascending by `min_notional`. The caller is
-/// responsible for sort order; helpers in `lib.rs:init_market_leverage_tiers`
-/// enforce this at write time.
+/// `tiers` MUST be sorted ascending by `min_notional`; the caller is
+/// responsible for sort order.
+///
+/// NOTE (AUDIT M-1, 2026-07): the on-chain leverage-tier ladder
+/// (`MarketLeverageTiersAccount` + `init/update_market_leverage_tiers`) was
+/// REMOVED — it was governance-configurable but never consulted by the margin
+/// engine (false assurance). This pure helper is retained as an unused,
+/// unit-tested library function; the live per-position MMR is
+/// `MarketSnapshot::effective_mmr_bps` (base + concentration step).
 ///
 /// Pure function — no Solana types beyond u64/u32. Unit-tested directly.
 pub fn tiered_mmr_bps(
