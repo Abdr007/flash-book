@@ -5913,7 +5913,11 @@ pub mod flash_book {
             FlashBookError::OutOfRange
         );
 
+        // Validators sign the keccak DIGEST of the canonical message (not the raw
+        // 152 bytes) — self-contained Ed25519 ixs each carry the signed bytes, so a
+        // 32-byte digest keeps a multi-validator tx under the 1232-byte limit.
         let msg = batch_attestation_message(&market_key, &header);
+        let digest = solana_keccak_hasher::hashv(&[&msg[..]]).0;
         require!(
             attestors.len() <= constants::MAX_COMMITTEE_VALIDATORS,
             FlashBookError::OutOfRange
@@ -5929,7 +5933,7 @@ pub mod flash_book {
                 &ctx.accounts.instructions_sysvar.to_account_info(),
                 a.ed25519_ix_index as usize,
                 &validator.to_bytes(),
-                &msg,
+                &digest,
             )
             .map_err(|_| error!(FlashBookError::Unauthorized))?;
             attestor_keys.push(validator);
