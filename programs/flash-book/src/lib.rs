@@ -4316,7 +4316,7 @@ pub mod flash_book {
         // Net fee to insurance fund = taker_fee + maker_fee − maker_rebate.
         // (maker_fee and maker_rebate are mutually exclusive by the
         // sign split above.)
-        let net_fee = taker_fee.saturating_add(maker_fee).saturating_sub(maker_rebate);
+        let mut net_fee = taker_fee.saturating_add(maker_fee).saturating_sub(maker_rebate);
         let taker_side_enum = if taker_side == 0 { Side::Long } else { Side::Short };
         let maker_side_enum = taker_side_enum.opposite();
         let taker_trader_pk = ctx.accounts.taker_trader_state.load()?.trader;
@@ -4339,19 +4339,25 @@ pub mod flash_book {
         let maker_pos_isolated = ctx.accounts.maker_position.load()?.collateral_quote_lots > 0;
         {
             if taker_fee > 0 {
-                if taker_pos_isolated {
+                // AUDIT HIGH-6 (2026-07): CAP the fee at the taker's available
+                // collateral instead of reverting. Reverting here would wedge the
+                // strict-FIFO fill ring for the WHOLE market (a settlement DoS
+                // reachable by an under-collateralized taker). The taker pays what
+                // they can; the uncollected shortfall is subtracted from `net_fee`
+                // so insurance/FLP are NOT over-credited (no phantom value). The
+                // resulting thin position is handled by the liquidation engine.
+                let paid = if taker_pos_isolated {
                     let mut p = ctx.accounts.taker_position.load_mut()?;
-                    p.collateral_quote_lots = p
-                        .collateral_quote_lots
-                        .checked_sub(taker_fee)
-                        .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+                    let paid = taker_fee.min(p.collateral_quote_lots);
+                    p.collateral_quote_lots = p.collateral_quote_lots.saturating_sub(paid);
+                    paid
                 } else {
                     let mut s = ctx.accounts.taker_trader_state.load_mut()?;
-                    s.collateral_quote_lots = s
-                        .collateral_quote_lots
-                        .checked_sub(taker_fee)
-                        .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
-                }
+                    let paid = taker_fee.min(s.collateral_quote_lots);
+                    s.collateral_quote_lots = s.collateral_quote_lots.saturating_sub(paid);
+                    paid
+                };
+                net_fee = net_fee.saturating_sub(taker_fee.saturating_sub(paid));
             }
             if taker_negative_rebate_u128 > 0 {
                 let neg_rebate_u64 = if taker_negative_rebate_u128 > u64::MAX as u128 {
