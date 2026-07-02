@@ -15,6 +15,7 @@ pub mod liquidation;
 pub mod lot;
 pub mod order;
 pub mod cancel_on_disconnect;
+pub mod committee;
 pub mod conditional_cancel;
 pub mod jit_lp_defense;
 pub mod min_fill_size;
