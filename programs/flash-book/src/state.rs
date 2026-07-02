@@ -284,6 +284,12 @@ pub struct MarketAccount {
     pub mark_price_ticks: u64,
     pub cum_funding_index: i128,
     pub last_funding_rate_bps_per_sec: i64,
+    /// AUDIT M-11 (2026-07): INERT. `VpinState::record_fill` is never called
+    /// anywhere, so `as_bps()` is always 0 → the VPIN-scaled toxicity tax NEVER
+    /// fires and `total_toxicity_tax_collected` never grows. Retained (not
+    /// removed) only because deleting an on-chain field is a state migration
+    /// that would break every existing market; drop it in a future versioned
+    /// realloc. Do NOT rely on this as an active protection.
     pub vpin: VpinState,
     pub oi_long_lots: u64,
     pub oi_short_lots: u64,

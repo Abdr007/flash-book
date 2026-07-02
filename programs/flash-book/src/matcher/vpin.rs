@@ -1,5 +1,14 @@
 //! VPIN — Volume-synchronized Probability of Informed Trading.
 //!
+//! ⚠️ AUDIT M-11 (2026-07): THIS MODULE IS INERT IN PRODUCTION. `record_fill`
+//! has NO on-chain caller (it is never invoked from `apply_fill` or anywhere
+//! else), so a market's `VpinState` never advances past `default()` and
+//! `as_bps()` is always 0. Consequently the VPIN-scaled toxicity tax in
+//! `apply_fill` / `apply_flp_fill` NEVER fires. The `MarketAccount.vpin` field
+//! is retained only because removing an on-chain field is a state migration;
+//! do NOT treat VPIN or the toxicity tax as an active protection. To activate:
+//! call `record_fill` on every fill and migrate the (already-present) state.
+//!
 //! Pure-integer fixed-point Q32.32. Each fill records a (side, size). When
 //! cumulative volume crosses `bucket_size`, we compute imbalance and update
 //! the EMA. The EMA value is the "VPIN" — a number in [0, Q32.32_one]

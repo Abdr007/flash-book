@@ -4581,12 +4581,15 @@ pub mod flash_book {
         }
 
         // ── Toxicity tax (VPIN-scaled) ────────────────────────────────
+        // ⚠️ AUDIT M-11 (2026-07): INERT. `vpin_bps` is ALWAYS 0 because
+        // `VpinState::record_fill` is never called (see matcher/vpin.rs), so
+        // this branch NEVER executes regardless of `toxicity_tax_max_bps`. Kept
+        // in place (rather than deleted) to avoid touching the settlement fee
+        // waterfall; it is dead pending VPIN's removal via a state migration.
         // Charges the taker an extra fee proportional to the market's
         // current VPIN signal. Compensates the maker — who was on the
         // wrong side of toxic flow — and tops up the insurance fund.
         // tax = notional × max_bps × vpin_bps / (10_000 × 10_000)
-        // Skipped silently when vpin_bps == 0 (no observed toxicity) or
-        // when toxicity_tax_max_bps == 0 (feature disabled per market).
         let tax_max_bps = market.params.toxicity_tax_max_bps;
         let vpin_bps = market.vpin.as_bps();
         if tax_max_bps > 0 && vpin_bps > 0 {
@@ -6543,10 +6546,11 @@ pub mod flash_book {
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
 
         // ── Toxicity tax (FLP-fill variant) ───────────────────────────
-        // Same VPIN-scaled tax as apply_fill, but the maker is the FLP
-        // pool — so the maker share flows into flp.total_capital, lifting
-        // NAV/share for all LPs pro-rata. This is the LP equivalent of a
-        // toxic-flow rebate.
+        // ⚠️ AUDIT M-11 (2026-07): INERT — same VPIN-scaled tax as apply_fill,
+        // and equally dead: `vpin_bps` is always 0 (record_fill is never
+        // called), so this branch NEVER executes. See matcher/vpin.rs.
+        // When active it would route the maker share into flp.total_capital,
+        // lifting NAV/share for all LPs pro-rata (LP toxic-flow rebate).
         let tax_max_bps = market.params.toxicity_tax_max_bps;
         let vpin_bps = market.vpin.as_bps();
         if tax_max_bps > 0 && vpin_bps > 0 {
