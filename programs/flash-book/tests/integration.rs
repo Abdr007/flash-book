@@ -4050,17 +4050,35 @@ async fn cu_of(
     fee_payer: &Pubkey,
     signers: &[&Keypair],
 ) -> u64 {
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let tx = Transaction::new_signed_with_payer(&[ix], Some(fee_payer), signers, bh);
-    let r = ctx
-        .banks_client
-        .process_transaction_with_metadata(tx)
-        .await
-        .unwrap();
-    assert!(r.result.is_ok(), "benchmark tx failed: {:?}", r.result);
-    r.metadata
-        .expect("metadata present")
-        .compute_units_consumed
+    // Use a FRESH blockhash per measurement so successive benchmark txs in a
+    // tight loop never collide with `AccountInUse` — a transient banks-client
+    // scheduling error that occurred when `get_latest_blockhash()` was reused
+    // across rapid txs (it returns the same hash within a slot). Retry that one
+    // transient error a few times as belt-and-suspenders: the tx never lands on
+    // an error, so re-submitting is idempotent.
+    let mut attempts = 0u8;
+    loop {
+        attempts += 1;
+        let bh = ctx.get_new_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(&[ix.clone()], Some(fee_payer), signers, bh);
+        let r = ctx
+            .banks_client
+            .process_transaction_with_metadata(tx)
+            .await
+            .unwrap();
+        match r.result {
+            Ok(()) => {
+                return r
+                    .metadata
+                    .expect("metadata present")
+                    .compute_units_consumed;
+            }
+            Err(solana_sdk::transaction::TransactionError::AccountInUse) if attempts < 6 => {
+                continue;
+            }
+            other => panic!("benchmark tx failed after {attempts} attempt(s): {other:?}"),
+        }
+    }
 }
 
 /// exactly what a production client does for a deep multi-level sweep (the default
