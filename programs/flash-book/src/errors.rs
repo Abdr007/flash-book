@@ -251,6 +251,8 @@ pub enum FlashBookError {
     ReseatRequiresEmptyBook = 2311,
     #[msg("Market is paused — liquidation and ADL are disabled while paused")]
     MarketPaused = 2312,
+    #[msg("Haircut residual exceeds the vault-backed surplus (over-stated / unbacked)")]
+    HaircutResidualUnbacked = 2313,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
