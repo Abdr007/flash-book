@@ -18,6 +18,7 @@ pub mod cancel_on_disconnect;
 pub mod committee;
 pub mod conditional_cancel;
 pub mod jit_lp_defense;
+pub mod merkle;
 pub mod min_fill_size;
 pub mod mit_order;
 pub mod pro_rata;
