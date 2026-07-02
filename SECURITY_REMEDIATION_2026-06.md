@@ -284,6 +284,8 @@ that would regress the proven hot path.
    sets the mark *within* the (now-tight) band. *Recommendation:* a decentralized /
    BFT-run continuous CLOB (Hyperliquid-style) is the endgame; it keeps continuous
    price-time execution (no FBA) while removing the single-sequencer trust point.
+   Full architecture + phased migration + the concrete first on-chain primitive:
+   **`docs/DECENTRALIZED_SEQUENCER.md`**.
 2. **`force_undelegate` DLP limitation (M-16).** The L1-initiated force-undelegate
    path fails closed (`Custom(221)`); undelegation flows through
    `commit_and_undelegate_* → process_undelegation`, which is what the live ER
