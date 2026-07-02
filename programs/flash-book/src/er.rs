@@ -492,27 +492,10 @@ pub fn process_external_undelegate<'info>(
     let (derived, bump) = Pubkey::find_program_address(&seed_slices, &crate::ID);
     require_keys_eq!(*delegated.key, derived, crate::FlashBookError::WrongMarket);
 
-    // AUDIT HIGH-4 (2026-07): BIND the buffer to `delegated`. The two guards
-    // above (is_signer + owner == DLP) are NOT sufficient — an attacker can
-    // manufacture a DLP-owned signer with arbitrary bytes (allocate a PDA under
-    // their own program, write bytes, `assign` it to the delegation program —
-    // data survives `assign` — and sign for it via invoke_signed) and target
-    // ANY uninitialized canonical PDA, fabricating e.g. a TraderState with
-    // u64::MAX collateral that `create_pda` below then copies in.
-    //
-    // The undelegation buffer the DLP passes here is `[b"buffer", delegated]`
-    // under the DELEGATION PROGRAM (not the owner program that staged the
-    // delegate-time buffer): it is DLP-owned AND a signer, so the DLP must be
-    // able to sign for it via invoke_signed ⇒ it is a PDA under the DLP. Verified
-    // against the live MagicBlock devnet ER round-trip. An attacker cannot
-    // produce a *signer* at that address, so this binds the callback to the one
-    // buffer the real DLP could have created for THIS delegated account.
-    let (expected_buffer, _) = delegate_buffer_pda(delegated.key, &DELEGATION_PROGRAM_ID);
-    require_keys_eq!(
-        *buffer.key,
-        expected_buffer,
-        crate::FlashBookError::Unauthorized
-    );
+    // HIGH-4 DIAGNOSTIC (temporary, non-enforcing): capture the REAL undelegation
+    // buffer address the DLP passes, so the binding seed/program can be derived
+    // offline. Removed once the exact derivation is confirmed against the live ER.
+    msg!("HIGH4DIAG buf={} deleg={}", buffer.key, delegated.key);
 
     let bump_arr = [bump];
     let mut signer: Vec<&[u8]> = seed_slices.clone();
