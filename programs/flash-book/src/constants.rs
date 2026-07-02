@@ -130,6 +130,10 @@ pub const MARK_STALENESS_MAX_SLOTS: u64 = 150;
 /// `MAX`% of the oracle. Tightening the clamp toward the oracle strictly REDUCES
 /// manipulated-mark wrongful-liquidation risk. Security floor/ceiling; a future
 /// governance field can widen them once MarketParams is versioned.
+/// Max validators in a `SequencerCommittee` (M-14 decentralization, Phase 1).
+/// 32 supports a healthy BFT set (tolerates up to 10 Byzantine at N=31, f=10).
+pub const MAX_COMMITTEE_VALIDATORS: usize = 32;
+
 pub const DEFAULT_ORACLE_BAND_BPS: u32 = 200; // 2% when the market left it unset
 pub const MAX_ORACLE_BAND_BPS: u32 = 500; // 5% hard ceiling on the effective band
 

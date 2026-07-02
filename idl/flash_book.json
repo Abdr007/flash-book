@@ -10347,6 +10347,109 @@
       ]
     },
     {
+      "name": "set_sequencer_committee",
+      "docs": [
+        "M-14 decentralization (Phase 1 scaffold): create/rotate the market's",
+        "sequencer committee. Authority-gated. Validates the BFT quorum config",
+        "(`3·threshold > 2·N`, `1 ≤ threshold ≤ N ≤ MAX`) + a distinct, non-zero",
+        "validator set, stores it, and bumps the rotation epoch. **Scaffolding:**",
+        "settlement authorization is NOT yet generalized to the committee (a later",
+        "phase — see `docs/DECENTRALIZED_SEQUENCER.md`), so setting a committee",
+        "changes no runtime behavior today; it lays the on-chain primitive."
+      ],
+      "discriminator": [
+        38,
+        96,
+        5,
+        55,
+        166,
+        56,
+        104,
+        166
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "committee",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  101,
+                  113,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  116,
+                  101,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "validators",
+          "type": {
+            "vec": "pubkey"
+          }
+        },
+        {
+          "name": "threshold",
+          "type": "u8"
+        }
+      ]
+    },
+    {
       "name": "set_trader_builder",
       "docs": [
         "Set or rotate the trader's builder pubkey + the maximum fee share",
@@ -14287,6 +14390,19 @@
       ]
     },
     {
+      "name": "SequencerCommittee",
+      "discriminator": [
+        135,
+        235,
+        84,
+        179,
+        138,
+        246,
+        64,
+        17
+      ]
+    },
+    {
       "name": "SessionTokenAccount",
       "discriminator": [
         239,
@@ -15573,6 +15689,19 @@
         163,
         107,
         9
+      ]
+    },
+    {
+      "name": "SequencerCommitteeSetEvent",
+      "discriminator": [
+        123,
+        221,
+        16,
+        134,
+        52,
+        201,
+        162,
+        209
       ]
     },
     {
@@ -21435,6 +21564,108 @@
           {
             "name": "new_residual",
             "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SequencerCommittee",
+      "docs": [
+        "The M-of-N validator committee that will authorize settlement once the",
+        "decentralized-sequencer endgame lands (see `docs/DECENTRALIZED_SEQUENCER.md`).",
+        "PHASE 1 is scaffolding: this account + its governance ix",
+        "(`set_sequencer_committee`) + the Kani-proven quorum logic",
+        "(`matcher::committee`) exist and are validated, but settlement authorization",
+        "is NOT yet generalized to it — so landing this changes no runtime behavior.",
+        "Seeds: `[b\"seq_committee\", market]`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "validator_count",
+            "docs": [
+              "N — number of active validators (`validators[..validator_count]`)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "threshold",
+            "docs": [
+              "M — signatures required. BFT-valid iff `3·threshold > 2·N` (quorum",
+              "intersection); `N=1, threshold=1` is the backward-compatible single case."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "_pad0",
+            "type": {
+              "array": [
+                "u8",
+                5
+              ]
+            }
+          },
+          {
+            "name": "epoch",
+            "docs": [
+              "Rotation epoch — bumped on every `set_sequencer_committee`."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "validators",
+            "docs": [
+              "The validator set. Only the first `validator_count` entries are live; the",
+              "rest are `Pubkey::default()`."
+            ],
+            "type": {
+              "array": [
+                "pubkey",
+                32
+              ]
+            }
+          },
+          {
+            "name": "_reserved",
+            "type": {
+              "array": [
+                "u8",
+                64
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "SequencerCommitteeSetEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "epoch",
+            "type": "u64"
+          },
+          {
+            "name": "validator_count",
+            "type": "u8"
+          },
+          {
+            "name": "threshold",
+            "type": "u8"
           }
         ]
       }

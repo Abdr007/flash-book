@@ -5813,6 +5813,62 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// M-14 decentralization (Phase 1 scaffold): create/rotate the market's
+    /// sequencer committee. Authority-gated. Validates the BFT quorum config
+    /// (`3·threshold > 2·N`, `1 ≤ threshold ≤ N ≤ MAX`) + a distinct, non-zero
+    /// validator set, stores it, and bumps the rotation epoch. **Scaffolding:**
+    /// settlement authorization is NOT yet generalized to the committee (a later
+    /// phase — see `docs/DECENTRALIZED_SEQUENCER.md`), so setting a committee
+    /// changes no runtime behavior today; it lays the on-chain primitive.
+    pub fn set_sequencer_committee(
+        ctx: Context<SetSequencerCommittee>,
+        validators: Vec<Pubkey>,
+        threshold: u8,
+    ) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+        require!(
+            ctx.accounts.market.authority != Pubkey::default(),
+            FlashBookError::Unauthorized
+        );
+        let n = validators.len();
+        require!(
+            n >= 1 && n <= constants::MAX_COMMITTEE_VALIDATORS,
+            FlashBookError::OutOfRange
+        );
+        let validator_count = n as u8;
+        require!(
+            matcher::committee::is_valid_bft_config(validator_count, threshold),
+            FlashBookError::OutOfRange
+        );
+        let mut arr = [Pubkey::default(); constants::MAX_COMMITTEE_VALIDATORS];
+        arr[..n].copy_from_slice(&validators);
+        require!(
+            matcher::committee::validators_valid_set(&arr, validator_count),
+            FlashBookError::OutOfRange
+        );
+
+        let committee = &mut ctx.accounts.committee;
+        committee.market = ctx.accounts.market.key();
+        committee.bump = ctx.bumps.committee;
+        committee.validator_count = validator_count;
+        committee.threshold = threshold;
+        committee._pad0 = [0; 5];
+        committee.epoch = committee.epoch.saturating_add(1);
+        committee.validators = arr;
+        committee._reserved = [0; 64];
+        emit!(SequencerCommitteeSetEvent {
+            market: committee.market,
+            epoch: committee.epoch,
+            validator_count,
+            threshold,
+        });
+        Ok(())
+    }
+
     // ─── Order intake ───────────────────────────────────────────────
 
     /// V2 2-leg basket order against the hypertree-backed book. Pure
@@ -13459,6 +13515,28 @@ pub struct UpdateMarketAuthority<'info> {
     pub market: Account<'info, MarketAccount>,
 }
 
+/// M-14 decentralization (Phase 1): create/rotate the per-market sequencer
+/// committee. `init_if_needed` so the same ix handles first-set + rotation.
+#[derive(Accounts)]
+pub struct SetSequencerCommittee<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = state_v3::SequencerCommittee::space(),
+        seeds = [state_v3::SequencerCommittee::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub committee: Box<Account<'info, state_v3::SequencerCommittee>>,
+    pub system_program: Program<'info, System>,
+}
+
 // ─── Wave 22 — Multi-tier fee table ix accounts ──────────────────────
 
 #[derive(Accounts)]
@@ -15101,6 +15179,14 @@ pub struct MarketSequencerRotatedEvent {
     pub market: Pubkey,
     pub previous_sequencer: Pubkey,
     pub new_sequencer: Pubkey,
+}
+
+#[event]
+pub struct SequencerCommitteeSetEvent {
+    pub market: Pubkey,
+    pub epoch: u64,
+    pub validator_count: u8,
+    pub threshold: u8,
 }
 
 #[event]

@@ -469,6 +469,42 @@ mod oracle_config_layout_tests {
     }
 }
 
+// ─── M-14 decentralization: sequencer committee (Phase 1) ───────────
+//
+/// The M-of-N validator committee that will authorize settlement once the
+/// decentralized-sequencer endgame lands (see `docs/DECENTRALIZED_SEQUENCER.md`).
+/// PHASE 1 is scaffolding: this account + its governance ix
+/// (`set_sequencer_committee`) + the Kani-proven quorum logic
+/// (`matcher::committee`) exist and are validated, but settlement authorization
+/// is NOT yet generalized to it — so landing this changes no runtime behavior.
+/// Seeds: `[b"seq_committee", market]`.
+#[account]
+#[derive(Debug)]
+pub struct SequencerCommittee {
+    pub market: Pubkey,
+    pub bump: u8,
+    /// N — number of active validators (`validators[..validator_count]`).
+    pub validator_count: u8,
+    /// M — signatures required. BFT-valid iff `3·threshold > 2·N` (quorum
+    /// intersection); `N=1, threshold=1` is the backward-compatible single case.
+    pub threshold: u8,
+    pub _pad0: [u8; 5],
+    /// Rotation epoch — bumped on every `set_sequencer_committee`.
+    pub epoch: u64,
+    /// The validator set. Only the first `validator_count` entries are live; the
+    /// rest are `Pubkey::default()`.
+    pub validators: [Pubkey; crate::constants::MAX_COMMITTEE_VALIDATORS],
+    pub _reserved: [u8; 64],
+}
+impl SequencerCommittee {
+    pub const SEED: &'static [u8] = b"seq_committee";
+    pub fn space() -> usize {
+        // 8 disc + 32 market + 1 bump + 1 count + 1 threshold + 5 pad + 8 epoch
+        //   + 32*MAX validators + 64 reserved
+        8 + 32 + 1 + 1 + 1 + 5 + 8 + 32 * crate::constants::MAX_COMMITTEE_VALIDATORS + 64
+    }
+}
+
 // ─── Wave 24: H-haircut state ───────────────────────────────────────
 //
 // Sibling PDAs to the existing `MarketAccount` and `PositionAccount`.
