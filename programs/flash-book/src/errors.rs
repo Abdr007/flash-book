@@ -249,6 +249,8 @@ pub enum FlashBookError {
     OrderSeqExhaustedReseat = 2310,
     #[msg("Order-sequence reseat requires a fully empty, L1-resident book")]
     ReseatRequiresEmptyBook = 2311,
+    #[msg("Market is paused — liquidation and ADL are disabled while paused")]
+    MarketPaused = 2312,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
