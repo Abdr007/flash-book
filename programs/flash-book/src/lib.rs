@@ -4922,7 +4922,15 @@ pub mod flash_book {
             // bounds drift to ~band while preserving the single-fill flash-move
             // guard. Only when the oracle is not provably stale (when it IS stale,
             // liquidation is already paused, so no wrongful-liq surface exists).
-            let band_bps = market.params.oracle_band_bps as u128;
+            // AUDIT M-14 (2026-07): the EFFECTIVE oracle band is enforced at
+            // runtime independent of config — an unset band (0) uses a tight
+            // DEFAULT, and any stored band is capped to MAX. So a fresh oracle
+            // always pins the mark within MAX% of the trustless oracle, closing
+            // the "band == 0 ⇒ unclamped mark ⇒ manipulated-mark worse-of
+            // liquidation" gap. Only ever tightens the mark toward the oracle
+            // (clamp, not reject) ⇒ FIFO/settlement untouched.
+            let band_bps =
+                constants::effective_oracle_band_bps(market.params.oracle_band_bps) as u128;
             let oracle_px = market.oracle_price_ticks;
             if band_bps > 0 && oracle_px > 0 {
                 let max_age = market.params.oracle_staleness_max_seconds as u64;
@@ -5491,8 +5499,11 @@ pub mod flash_book {
             new_params.flp_max_growth_per_batch_bps <= constants::BPS_DENOM,
             FlashBookError::OutOfRange
         );
+        // AUDIT M-14: reject an absurdly-wide mark band at config time (was
+        // <= BPS_DENOM = 100%). apply_fill additionally caps the EFFECTIVE band to
+        // MAX at runtime, so this is early operator feedback, not the sole guard.
         require!(
-            new_params.oracle_band_bps <= constants::BPS_DENOM,
+            new_params.oracle_band_bps <= constants::MAX_ORACLE_BAND_BPS,
             FlashBookError::OutOfRange
         );
 
