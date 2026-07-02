@@ -505,6 +505,39 @@ impl SequencerCommittee {
     }
 }
 
+/// PHASE 2: the last committee-attested state transition per market. `commit_batch`
+/// advances it when ≥`threshold` distinct validators sign a batch that chains onto
+/// `last_state_root` with a strictly-greater `last_batch_seq`.
+///
+/// NOTE — this is NOT a batch auction (no FBA). Matching stays a CONTINUOUS
+/// price-time CLOB; a "batch" here is only the unit of committed fills the
+/// validator set threshold-signs (the consensus attestation over what the
+/// continuous book already produced). Seeds: `[b"batch_attest", market]`.
+#[account]
+#[derive(Debug)]
+pub struct BatchAttestation {
+    pub market: Pubkey,
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    /// Strictly-increasing committed batch sequence (replay/reorder guard — the
+    /// batch analog of the per-fill `advance_settlement_seq`).
+    pub last_batch_seq: u64,
+    /// Committee epoch of the last accepted batch.
+    pub epoch: u64,
+    /// Chaining anchor: a batch must carry `prev_state_root == last_state_root`.
+    pub last_state_root: [u8; 32],
+    pub total_batches: u64,
+    pub _reserved: [u8; 32],
+}
+impl BatchAttestation {
+    pub const SEED: &'static [u8] = b"batch_attest";
+    pub fn space() -> usize {
+        // 8 disc + 32 market + 1 bump + 7 pad + 8 seq + 8 epoch + 32 root
+        //   + 8 total + 32 reserved
+        8 + 32 + 1 + 7 + 8 + 8 + 32 + 8 + 32
+    }
+}
+
 // ─── Wave 24: H-haircut state ───────────────────────────────────────
 //
 // Sibling PDAs to the existing `MarketAccount` and `PositionAccount`.

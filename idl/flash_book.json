@@ -1884,6 +1884,156 @@
       "args": []
     },
     {
+      "name": "commit_batch",
+      "docs": [
+        "M-14 decentralization (Phase 2): PERMISSIONLESSLY commit a",
+        "committee-attested state transition. **NOT a batch auction (no FBA)** —",
+        "matching stays a continuous price-time CLOB; this only records the state",
+        "root the validator set threshold-signed over the fills the continuous book",
+        "already produced. Verifies (1) `epoch` matches the active committee, (2)",
+        "`batch_seq` strictly increases (replay/reorder guard — the batch analog of",
+        "`advance_settlement_seq`), (3) `prev_state_root` chains onto the last",
+        "committed root, and (4) ≥ `threshold` DISTINCT committee validators each",
+        "Ed25519-signed the canonical batch message (checked by the native",
+        "precompile). No single signer authorizes it — the quorum does. Additive",
+        "scaffolding: settlement is not yet gated on this (a later phase), so it",
+        "moves no funds. See `docs/DECENTRALIZED_SEQUENCER.md`."
+      ],
+      "discriminator": [
+        27,
+        234,
+        100,
+        224,
+        134,
+        31,
+        168,
+        142
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "committee",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  101,
+                  113,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  116,
+                  101,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "batch_attestation",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  97,
+                  116,
+                  99,
+                  104,
+                  95,
+                  97,
+                  116,
+                  116,
+                  101,
+                  115,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "instructions_sysvar",
+          "docs": [
+            "`verify_ed25519_precompile`, which then introspects it for the signatures."
+          ]
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "header",
+          "type": {
+            "defined": {
+              "name": "BatchHeader"
+            }
+          }
+        },
+        {
+          "name": "attestors",
+          "type": {
+            "vec": {
+              "defined": {
+                "name": "CommitteeAttestor"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "commit_fill_commitment",
       "docs": [
         "ON THE ER: snapshot the delegated `fill_commitment` back to L1 while staying",
@@ -14182,6 +14332,19 @@
   ],
   "accounts": [
     {
+      "name": "BatchAttestation",
+      "discriminator": [
+        53,
+        205,
+        219,
+        183,
+        255,
+        199,
+        92,
+        65
+      ]
+    },
+    {
       "name": "ErMarginAttestation",
       "discriminator": [
         253,
@@ -14532,6 +14695,19 @@
         1,
         128,
         118
+      ]
+    },
+    {
+      "name": "BatchCommittedEvent",
+      "discriminator": [
+        22,
+        237,
+        150,
+        5,
+        120,
+        103,
+        100,
+        137
       ]
     },
     {
@@ -16801,6 +16977,167 @@
       }
     },
     {
+      "name": "BatchAttestation",
+      "docs": [
+        "PHASE 2: the last committee-attested state transition per market. `commit_batch`",
+        "advances it when ≥`threshold` distinct validators sign a batch that chains onto",
+        "`last_state_root` with a strictly-greater `last_batch_seq`.",
+        "",
+        "NOTE — this is NOT a batch auction (no FBA). Matching stays a CONTINUOUS",
+        "price-time CLOB; a \"batch\" here is only the unit of committed fills the",
+        "validator set threshold-signs (the consensus attestation over what the",
+        "continuous book already produced). Seeds: `[b\"batch_attest\", market]`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "_pad0",
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          },
+          {
+            "name": "last_batch_seq",
+            "docs": [
+              "Strictly-increasing committed batch sequence (replay/reorder guard — the",
+              "batch analog of the per-fill `advance_settlement_seq`)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "epoch",
+            "docs": [
+              "Committee epoch of the last accepted batch."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_state_root",
+            "docs": [
+              "Chaining anchor: a batch must carry `prev_state_root == last_state_root`."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "total_batches",
+            "type": "u64"
+          },
+          {
+            "name": "_reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BatchCommittedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "epoch",
+            "type": "u64"
+          },
+          {
+            "name": "batch_seq",
+            "type": "u64"
+          },
+          {
+            "name": "new_state_root",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "attestor_count",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BatchHeader",
+      "docs": [
+        "Phase 2 batch header — the state transition the committee threshold-signs.",
+        "NOT an auction batch (no FBA); `fills_merkle_root` commits to the fills the",
+        "continuous CLOB already matched, and `prev/new_state_root` chain the book +",
+        "position state across committed batches."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "epoch",
+            "type": "u64"
+          },
+          {
+            "name": "batch_seq",
+            "type": "u64"
+          },
+          {
+            "name": "prev_state_root",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "fills_merkle_root",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "new_state_root",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "mark_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "BookDepthV2Event",
       "type": {
         "kind": "struct",
@@ -17108,6 +17445,31 @@
           {
             "name": "new_balance",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CommitteeAttestor",
+      "docs": [
+        "One validator's attestation reference for `commit_batch`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "validator_slot",
+            "docs": [
+              "Index into `SequencerCommittee.validators`."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "ed25519_ix_index",
+            "docs": [
+              "Index of this validator's Ed25519 precompile instruction in the tx."
+            ],
+            "type": "u8"
           }
         ]
       }

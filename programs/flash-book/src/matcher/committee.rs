@@ -48,6 +48,36 @@ pub fn validators_valid_set(validators: &[Pubkey], validator_count: u8) -> bool 
     true
 }
 
+/// PHASE 2 quorum check. Given the committee's validator set and the list of
+/// `attestors` that each PRECOMPILE-verified a signature over the batch message,
+/// returns true iff the attestation is a valid quorum: every attestor is a
+/// distinct committee member and there are `>= threshold` of them. The native
+/// Ed25519 precompile already checked the signature MATH (per attestor); this
+/// enforces the SET properties that make the quorum meaningful — no duplicate
+/// key filling multiple slots, no non-member, and the threshold is met.
+pub fn attestation_meets_threshold(
+    validators: &[Pubkey],
+    validator_count: u8,
+    threshold: u8,
+    attestors: &[Pubkey],
+) -> bool {
+    if attestors.len() < threshold as usize || threshold == 0 {
+        return false;
+    }
+    // Each attestor must be a distinct committee member.
+    for (i, a) in attestors.iter().enumerate() {
+        if !is_committee_member(validators, validator_count, a) {
+            return false;
+        }
+        for b in &attestors[i + 1..] {
+            if a == b {
+                return false; // duplicate attestor
+            }
+        }
+    }
+    true
+}
+
 #[cfg(kani)]
 mod proofs {
     use super::is_valid_bft_config;
@@ -96,6 +126,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn attestation_quorum_set_rules() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let c = Pubkey::new_unique();
+        let d = Pubkey::new_unique();
+        let outsider = Pubkey::new_unique();
+        let vals = [a, b, c, d]; // N=4, BFT threshold = 3 (f=1)
+
+        assert!(attestation_meets_threshold(&vals, 4, 3, &[a, b, c])); // 3 distinct members
+        assert!(attestation_meets_threshold(&vals, 4, 3, &[a, b, c, d])); // 4 ≥ 3
+        assert!(!attestation_meets_threshold(&vals, 4, 3, &[a, b])); // 2 < threshold
+        assert!(!attestation_meets_threshold(&vals, 4, 3, &[a, b, a])); // duplicate attestor
+        assert!(!attestation_meets_threshold(&vals, 4, 3, &[a, b, outsider])); // non-member
+        assert!(!attestation_meets_threshold(&vals, 4, 0, &[a, b, c])); // threshold 0
+        // N=1, threshold=1 — the backward-compatible single-sequencer quorum.
+        assert!(attestation_meets_threshold(&[a], 1, 1, &[a]));
+        assert!(!attestation_meets_threshold(&[a], 1, 1, &[b])); // not the member
     }
 
     #[test]

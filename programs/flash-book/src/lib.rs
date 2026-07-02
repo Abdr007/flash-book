@@ -5869,6 +5869,95 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// M-14 decentralization (Phase 2): PERMISSIONLESSLY commit a
+    /// committee-attested state transition. **NOT a batch auction (no FBA)** —
+    /// matching stays a continuous price-time CLOB; this only records the state
+    /// root the validator set threshold-signed over the fills the continuous book
+    /// already produced. Verifies (1) `epoch` matches the active committee, (2)
+    /// `batch_seq` strictly increases (replay/reorder guard — the batch analog of
+    /// `advance_settlement_seq`), (3) `prev_state_root` chains onto the last
+    /// committed root, and (4) ≥ `threshold` DISTINCT committee validators each
+    /// Ed25519-signed the canonical batch message (checked by the native
+    /// precompile). No single signer authorizes it — the quorum does. Additive
+    /// scaffolding: settlement is not yet gated on this (a later phase), so it
+    /// moves no funds. See `docs/DECENTRALIZED_SEQUENCER.md`.
+    pub fn commit_batch(
+        ctx: Context<CommitBatch>,
+        header: BatchHeader,
+        attestors: Vec<CommitteeAttestor>,
+    ) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let committee = &ctx.accounts.committee;
+        require_keys_eq!(committee.market, market_key, FlashBookError::WrongMarket);
+
+        let attest = &mut ctx.accounts.batch_attestation;
+        if attest.market == Pubkey::default() {
+            // First batch: anchor chaining at (seq 0, zero root) for this market.
+            attest.market = market_key;
+            attest.bump = ctx.bumps.batch_attestation;
+            attest._pad0 = [0; 7];
+            attest.last_batch_seq = 0;
+            attest.epoch = 0;
+            attest.last_state_root = [0u8; 32];
+            attest.total_batches = 0;
+            attest._reserved = [0; 32];
+        }
+
+        require!(header.epoch == committee.epoch, FlashBookError::OutOfRange);
+        require!(
+            header.batch_seq > attest.last_batch_seq,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            header.prev_state_root == attest.last_state_root,
+            FlashBookError::OutOfRange
+        );
+
+        let msg = batch_attestation_message(&market_key, &header);
+        require!(
+            attestors.len() <= constants::MAX_COMMITTEE_VALIDATORS,
+            FlashBookError::OutOfRange
+        );
+        let mut attestor_keys: Vec<Pubkey> = Vec::with_capacity(attestors.len());
+        for a in &attestors {
+            require!(
+                (a.validator_slot as usize) < committee.validator_count as usize,
+                FlashBookError::OutOfRange
+            );
+            let validator = committee.validators[a.validator_slot as usize];
+            lazer_oracle::verify_ed25519_precompile(
+                &ctx.accounts.instructions_sysvar.to_account_info(),
+                a.ed25519_ix_index as usize,
+                &validator.to_bytes(),
+                &msg,
+            )
+            .map_err(|_| error!(FlashBookError::Unauthorized))?;
+            attestor_keys.push(validator);
+        }
+        require!(
+            matcher::committee::attestation_meets_threshold(
+                &committee.validators,
+                committee.validator_count,
+                committee.threshold,
+                &attestor_keys,
+            ),
+            FlashBookError::Unauthorized
+        );
+
+        attest.last_batch_seq = header.batch_seq;
+        attest.epoch = header.epoch;
+        attest.last_state_root = header.new_state_root;
+        attest.total_batches = attest.total_batches.saturating_add(1);
+        emit!(BatchCommittedEvent {
+            market: market_key,
+            epoch: header.epoch,
+            batch_seq: header.batch_seq,
+            new_state_root: header.new_state_root,
+            attestor_count: attestor_keys.len() as u8,
+        });
+        Ok(())
+    }
+
     // ─── Order intake ───────────────────────────────────────────────
 
     /// V2 2-leg basket order against the hypertree-backed book. Pure
@@ -13537,6 +13626,77 @@ pub struct SetSequencerCommittee<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Phase 2 batch header — the state transition the committee threshold-signs.
+/// NOT an auction batch (no FBA); `fills_merkle_root` commits to the fills the
+/// continuous CLOB already matched, and `prev/new_state_root` chain the book +
+/// position state across committed batches.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct BatchHeader {
+    pub epoch: u64,
+    pub batch_seq: u64,
+    pub prev_state_root: [u8; 32],
+    pub fills_merkle_root: [u8; 32],
+    pub new_state_root: [u8; 32],
+    pub mark_ticks: u64,
+}
+
+/// One validator's attestation reference for `commit_batch`.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct CommitteeAttestor {
+    /// Index into `SequencerCommittee.validators`.
+    pub validator_slot: u8,
+    /// Index of this validator's Ed25519 precompile instruction in the tx.
+    pub ed25519_ix_index: u8,
+}
+
+/// Canonical 152-byte message the committee validators Ed25519-sign for a batch —
+/// `market(32) ‖ epoch(8 LE) ‖ batch_seq(8 LE) ‖ prev_root(32) ‖ fills_root(32) ‖
+/// new_root(32) ‖ mark(8 LE)`. Reconstructed on-chain from the header so the
+/// native precompile verifies each signature against the exact committed bytes —
+/// the batch content is never trusted from the caller.
+fn batch_attestation_message(market: &Pubkey, h: &BatchHeader) -> Vec<u8> {
+    let mut m = Vec::with_capacity(152);
+    m.extend_from_slice(market.as_ref());
+    m.extend_from_slice(&h.epoch.to_le_bytes());
+    m.extend_from_slice(&h.batch_seq.to_le_bytes());
+    m.extend_from_slice(&h.prev_state_root);
+    m.extend_from_slice(&h.fills_merkle_root);
+    m.extend_from_slice(&h.new_state_root);
+    m.extend_from_slice(&h.mark_ticks.to_le_bytes());
+    m
+}
+
+/// M-14 decentralization (Phase 2): commit a committee-attested state transition.
+/// Permissionless — the M-of-N attestation is the authorization.
+#[derive(Accounts)]
+pub struct CommitBatch<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+    #[account(
+        seeds = [state_v3::SequencerCommittee::SEED, market.key().as_ref()],
+        bump = committee.bump,
+        constraint = committee.market == market.key() @ FlashBookError::WrongMarket,
+    )]
+    pub committee: Box<Account<'info, state_v3::SequencerCommittee>>,
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = state_v3::BatchAttestation::space(),
+        seeds = [state_v3::BatchAttestation::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub batch_attestation: Box<Account<'info, state_v3::BatchAttestation>>,
+    /// CHECK: verified to equal the Instructions sysvar inside
+    /// `verify_ed25519_precompile`, which then introspects it for the signatures.
+    pub instructions_sysvar: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
 // ─── Wave 22 — Multi-tier fee table ix accounts ──────────────────────
 
 #[derive(Accounts)]
@@ -15187,6 +15347,15 @@ pub struct SequencerCommitteeSetEvent {
     pub epoch: u64,
     pub validator_count: u8,
     pub threshold: u8,
+}
+
+#[event]
+pub struct BatchCommittedEvent {
+    pub market: Pubkey,
+    pub epoch: u64,
+    pub batch_seq: u64,
+    pub new_state_root: [u8; 32],
+    pub attestor_count: u8,
 }
 
 #[event]
