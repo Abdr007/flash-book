@@ -119,6 +119,64 @@ pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
 /// a future governance field can override it once MarketParams is versioned.
 pub const MARK_STALENESS_MAX_SLOTS: u64 = 150;
 
+/// AUDIT M-14 (2026-07): runtime bounds on the oracle-band mark clamp. The mark
+/// (an EMA of fills the semi-trusted sequencer produces) feeds worse-of(mark,
+/// oracle) liquidation health, so it MUST stay pinned near the trustless oracle.
+/// `MarketParams.oracle_band_bps` is the configured deviation, but a market could
+/// set it to 0 (no clamp — a manipulated mark could then drive wrongful
+/// liquidations) or absurdly wide. `apply_fill` enforces these bounds on the
+/// EFFECTIVE band regardless of config: an unset band (0) uses `DEFAULT`, and any
+/// stored band is capped to `MAX`. So a fresh oracle always pins the mark within
+/// `MAX`% of the oracle. Tightening the clamp toward the oracle strictly REDUCES
+/// manipulated-mark wrongful-liquidation risk. Security floor/ceiling; a future
+/// governance field can widen them once MarketParams is versioned.
+pub const DEFAULT_ORACLE_BAND_BPS: u32 = 200; // 2% when the market left it unset
+pub const MAX_ORACLE_BAND_BPS: u32 = 500; // 5% hard ceiling on the effective band
+
+/// Runtime-effective oracle band (bps) used by `apply_fill`'s mark clamp:
+/// `DEFAULT_ORACLE_BAND_BPS` when the market left it unset (0), otherwise the
+/// stored band capped to `MAX_ORACLE_BAND_BPS`. Result is always in
+/// `[1, MAX_ORACLE_BAND_BPS]`, so a fresh oracle always pins the mark. Pure so
+/// the default/cap logic is unit-testable independent of the settlement path.
+#[inline]
+pub fn effective_oracle_band_bps(stored_band_bps: u32) -> u32 {
+    if stored_band_bps == 0 {
+        DEFAULT_ORACLE_BAND_BPS
+    } else {
+        stored_band_bps.min(MAX_ORACLE_BAND_BPS)
+    }
+}
+
+#[cfg(test)]
+mod oracle_band_tests {
+    use super::*;
+
+    #[test]
+    fn unset_band_uses_tight_default() {
+        assert_eq!(effective_oracle_band_bps(0), DEFAULT_ORACLE_BAND_BPS);
+    }
+
+    #[test]
+    fn configured_band_within_ceiling_is_kept() {
+        assert_eq!(effective_oracle_band_bps(100), 100);
+        assert_eq!(effective_oracle_band_bps(MAX_ORACLE_BAND_BPS), MAX_ORACLE_BAND_BPS);
+    }
+
+    #[test]
+    fn wide_band_is_capped_to_max() {
+        assert_eq!(effective_oracle_band_bps(800), MAX_ORACLE_BAND_BPS);
+        assert_eq!(effective_oracle_band_bps(u32::MAX), MAX_ORACLE_BAND_BPS);
+    }
+
+    #[test]
+    fn effective_band_is_always_active_and_tight() {
+        for stored in [0u32, 1, 100, 499, 500, 501, 10_000, u32::MAX] {
+            let eff = effective_oracle_band_bps(stored);
+            assert!(eff >= 1 && eff <= MAX_ORACLE_BAND_BPS, "stored={stored} eff={eff}");
+        }
+    }
+}
+
 /// Censorship / ER-stall escape threshold: L1 slots the ER may be silent (no
 /// committed fill advancing `MarketAccount.last_mark_update_slot`) before ANY
 /// caller may permissionlessly undelegate the market book / market back to L1
