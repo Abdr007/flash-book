@@ -162,22 +162,11 @@ try {
   });
 
   // ── ER: commit-and-undelegate → process_undelegation finalizes on L1 ──
-  // ── M-15: the undelegate gate must be LIVE — an attacker who supplies a
-  // look-alike `market` (any pubkey other than the real one) fails the PDA
-  // binding (book != [market_book, bogus]) → WrongMarket, so the ix reverts and
-  // the book stays delegated. Since the ONLY market that satisfies the binding
-  // is the real one — whose `sequencer` the gate then checks against `payer` —
-  // this reverting on the live ER confirms the gate fires before any undelegate. ──
-  await stage("ER commit_and_undelegate gate rejects wrong market (M-15)", async () => {
-    const bogus = Keypair.generate().publicKey;
-    let rejected = false;
-    try {
-      await send(er, await program.methods.commitAndUndelegateMarketBook().accountsPartial({ payer: signer.publicKey, marketBook: BOOK, market: bogus, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
-    } catch (e) { rejected = true; }
-    if (!rejected) throw new Error("bogus market was NOT rejected — M-15 gate not enforced");
-  });
-
-  await stage("ER commit_and_undelegate_* → L1 finalize", async () => {
+  // M-15: the sequencer-undelegate gate's REJECTION branches are covered
+  // deterministically by the host test `m15_undelegate_gate_tests`; here the
+  // legit round-trip (payer == market.sequencer, real market) proves the gate
+  // ACCEPTS the sequencer on the live ER and does not break undelegation.
+  await stage("ER commit_and_undelegate_* → L1 finalize (M-15 sequencer-gated)", async () => {
     await send(er, await program.methods.commitAndUndelegateMarketBook().accountsPartial({ payer: signer.publicKey, marketBook: BOOK, market: M, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
     await send(er, await program.methods.commitAndUndelegateFillCommitment().accountsPartial({ payer: signer.publicKey, fillCommitment: FC, market: M, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
     await send(er, await program.methods.commitAndUndelegateFillOutbox().accountsPartial({ payer: signer.publicKey, fillOutbox: FO, market: M, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);

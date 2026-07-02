@@ -1770,7 +1770,11 @@
           "writable": true
         },
         {
-          "name": "market"
+          "name": "market",
+          "docs": [
+            "accounts may be non-readonly, and the market IS delegated; gate only reads."
+          ],
+          "writable": true
         },
         {
           "name": "magic_context",
@@ -1810,7 +1814,11 @@
           "writable": true
         },
         {
-          "name": "market"
+          "name": "market",
+          "docs": [
+            "accounts may be non-readonly, and the market IS delegated; gate only reads."
+          ],
+          "writable": true
         },
         {
           "name": "magic_context",
@@ -1858,8 +1866,10 @@
         {
           "name": "market",
           "docs": [
-            "re-derives the book PDA from it and requires `payer == market.sequencer`."
-          ]
+            "only delegated accounts may be non-readonly, and the market IS delegated",
+            "alongside the book; the M-15 gate only READS it (payer == market.sequencer)."
+          ],
+          "writable": true
         },
         {
           "name": "magic_context",
