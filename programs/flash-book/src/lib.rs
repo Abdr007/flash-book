@@ -4235,8 +4235,19 @@ pub mod flash_book {
         // Suppress unused-warning when no tier table is supplied.
         let _ = (taker_maker_rebate_bps, maker_taker_fee_bps);
 
-        let base_taker_fee_u128 =
-            notional_u128.saturating_mul(taker_taker_fee_bps as u128) / constants::BPS_DENOM as u128;
+        let base_taker_fee_u128 = {
+            let raw = notional_u128.saturating_mul(taker_taker_fee_bps as u128)
+                / constants::BPS_DENOM as u128;
+            // AUDIT L-1 (2026-07): floor the base fee at 1 quote-lot for any real
+            // (nonzero-bps) fee on a nonzero-notional fill, so a taker can't
+            // avoid fees entirely by splitting into sub-`BPS_DENOM/bps`-notional
+            // dust fills (each of which would otherwise floor to 0).
+            if raw == 0 && taker_taker_fee_bps > 0 && notional_u128 > 0 {
+                1
+            } else {
+                raw
+            }
+        };
         // Apply taker's per-trader fee tier discount.
         //   discount ≤ 10_000 (100%) → standard discount, fee ≥ 0
         //   discount ∈ (10_000, MAX]  → NEGATIVE fee (rebate to taker)
@@ -6987,11 +6998,17 @@ pub mod flash_book {
         });
         let close_side = pos_side.opposite();
         let penalty = market.params.liq_penalty_bps as u128;
-        let oracle = market.oracle_price_ticks as u128;
-        let penalty_delta = (oracle * penalty) / constants::BPS_DENOM as u128;
+        // AUDIT F3 (2026-07): price the synthetic close off the freshness-gated
+        // HEALTH price (worse-of mark/oracle, validated by the gate above), NOT
+        // the raw `oracle_price_ticks`. With staleness unconfigured and the mark
+        // fresh, health can pass on mark-only while `oracle_price_ticks` is 0 or
+        // stale — using it here would inject a 0/stale-priced market-sell,
+        // converting the liquidatee's residual equity into excess loss / bad debt.
+        let px = health_price_ticks as u128;
+        let penalty_delta = (px * penalty) / constants::BPS_DENOM as u128;
         let synthetic_limit_u128: u128 = match close_side {
-            Side::Short => oracle.saturating_sub(penalty_delta),
-            Side::Long => oracle.saturating_add(penalty_delta),
+            Side::Short => px.saturating_sub(penalty_delta),
+            Side::Long => px.saturating_add(penalty_delta),
         };
         let synthetic_limit = synthetic_limit_u128 as u64;
 
@@ -7197,8 +7214,11 @@ pub mod flash_book {
         // Dutch-auction reward (parity-port from v1).
         let mut reward_paid: u64 = 0;
         if market.params.liquidator_reward_bps > 0 {
+            // AUDIT F3 (2026-07): reward notional off the freshness-gated health
+            // price `px` (not the raw oracle, which could be 0/stale → reward
+            // collapses to 0).
             let notional_u128 = (close_size as u128)
-                .saturating_mul(oracle)
+                .saturating_mul(px)
                 .saturating_mul(market.params.tick_size as u128);
             let mut reward_bps_eff = market.params.liquidator_reward_bps as u128;
             let auction_duration =
@@ -7954,11 +7974,16 @@ pub mod flash_book {
         let pos_side = if exec_position.side == 0 { Side::Long } else { Side::Short };
         let close_side = pos_side.opposite();
         let penalty = exec_market.params.liq_penalty_bps as u128;
-        let oracle = exec_market.oracle_price_ticks as u128;
-        let penalty_delta = (oracle * penalty) / constants::BPS_DENOM as u128;
+        // AUDIT F3 (2026-07): price the synthetic close off the freshness-gated
+        // HEALTH mark (as the portfolio assessment above does), NOT the raw
+        // oracle — avoids injecting a 0/stale-priced close when the oracle is
+        // unset/stale but the mark is fresh.
+        let px =
+            effective_health_mark(exec_market, liq_now_unix, liq_current_slot)? as u128;
+        let penalty_delta = (px * penalty) / constants::BPS_DENOM as u128;
         let limit = match close_side {
-            Side::Short => oracle.saturating_sub(penalty_delta) as u64,
-            Side::Long => oracle.saturating_add(penalty_delta) as u64,
+            Side::Short => px.saturating_sub(penalty_delta) as u64,
+            Side::Long => px.saturating_add(penalty_delta) as u64,
         };
 
         let trader = exec_position.trader;
