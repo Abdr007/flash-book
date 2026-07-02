@@ -52,21 +52,46 @@ pub struct TriggerOrderAccountV3 {
     /// `TriggerOrderV3SlippageCancelledEvent`. The trader can re-place
     /// with updated params if they still want to act.
     pub acceptable_price_ticks: u64,
-    /// Reserved for future expansion (e.g. trailing-stop offset,
-    /// per-trigger fee override). Pre-existing accounts read this as
+    /// AUDIT HIGH-7 (2026-07) — OCO link. For a bracket leg, this holds the
+    /// sibling leg's `trigger_id`; when this leg FIRES, the executor must pass
+    /// the sibling `TriggerOrderAccountV3` and it is deactivated, so both legs
+    /// of a bracket can never both fire (which previously let a whipsaw
+    /// double-fill flip the position). Set iff `flags & FLAG_HAS_SIBLING`.
+    /// Pre-existing accounts read this as 0 (no sibling) from the trailing
+    /// zeros of `space()`, and `FLAG_HAS_SIBLING` is unset — full backward
+    /// compatibility (non-bracket triggers are unaffected).
+    pub sibling_trigger_id: u8,
+    /// Reserved for future expansion. Pre-existing accounts read this as
     /// zero from the trailing space().
-    pub _reserved: [u8; 8],
+    pub _reserved: [u8; 7],
 }
 
 impl TriggerOrderAccountV3 {
     pub const SEED: &'static [u8] = b"trigger_v3";
     pub const FLAG_REDUCE_ONLY: u8 = 1 << 0;
     pub const FLAG_ACTIVE: u8 = 1 << 1;
+    /// AUDIT HIGH-7 (2026-07) — set on both legs of a bracket. Marks that
+    /// `sibling_trigger_id` is valid and that firing this leg must deactivate
+    /// the sibling (OCO). Unset on standalone triggers (backward compatible).
+    pub const FLAG_HAS_SIBLING: u8 = 1 << 2;
     pub fn space() -> usize {
         // 8 disc + 32+32+1+1+1+1+1 + 8+8+8+8+8 + 1 (sub_index) = 118.
         // Wave 27a: + 8 (acceptable_price) + 8 (reserved) = 134.
         // 8 + 128 = 136 still fits with 2 bytes spare.
         8 + 128
+    }
+
+    /// AUDIT HIGH-7 (2026-07) — true iff `other` is THIS trigger's genuine OCO
+    /// sibling: same trader + market, `other.trigger_id` equals our
+    /// `sibling_trigger_id`, AND `other` points back at us
+    /// (`other.sibling_trigger_id == self.trigger_id`). The mutual back-link is
+    /// what prevents a malicious executor from passing an unrelated trigger they
+    /// own just to deactivate it. Pure function for unit-testability.
+    pub fn is_oco_sibling(&self, other: &TriggerOrderAccountV3) -> bool {
+        self.trader == other.trader
+            && self.market == other.market
+            && other.trigger_id == self.sibling_trigger_id
+            && other.sibling_trigger_id == self.trigger_id
     }
 
     /// Wave 27a — check the slippage cap against the current oracle.
@@ -759,6 +784,61 @@ impl MarketEnvelopeConfigAccount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // AUDIT HIGH-7 (2026-07): host coverage for the OCO sibling validation —
+    // the security-critical check that stops a malicious executor from passing
+    // an unrelated trigger just to deactivate it.
+    fn mk_trig(trader: Pubkey, market: Pubkey, id: u8, sibling: u8) -> TriggerOrderAccountV3 {
+        TriggerOrderAccountV3 {
+            trader,
+            market,
+            bump: 0,
+            trigger_id: id,
+            side: 0,
+            kind: 0,
+            flags: 0,
+            size_lots: 0,
+            trigger_price_ticks: 0,
+            limit_price_ticks: 0,
+            created_at_slot: 0,
+            expires_at_slot: 0,
+            sub_index: 0,
+            acceptable_price_ticks: 0,
+            sibling_trigger_id: sibling,
+            _reserved: [0; 7],
+        }
+    }
+
+    #[test]
+    fn oco_accepts_genuine_mutual_pair() {
+        let t = Pubkey::new_from_array([1u8; 32]);
+        let m = Pubkey::new_from_array([2u8; 32]);
+        let tp = mk_trig(t, m, 1, 2); // TP: id 1, points at 2
+        let sl = mk_trig(t, m, 2, 1); // SL: id 2, points at 1
+        assert!(tp.is_oco_sibling(&sl));
+        assert!(sl.is_oco_sibling(&tp));
+    }
+
+    #[test]
+    fn oco_rejects_non_mutual_backlink() {
+        let t = Pubkey::new_from_array([1u8; 32]);
+        let m = Pubkey::new_from_array([2u8; 32]);
+        let tp = mk_trig(t, m, 1, 2);
+        // Attacker-owned trigger with the right id (2) but NOT pointing back at
+        // TP (its sibling is 9) — must be rejected.
+        let fake = mk_trig(t, m, 2, 9);
+        assert!(!tp.is_oco_sibling(&fake));
+    }
+
+    #[test]
+    fn oco_rejects_wrong_trader_market_or_id() {
+        let t = Pubkey::new_from_array([1u8; 32]);
+        let m = Pubkey::new_from_array([2u8; 32]);
+        let tp = mk_trig(t, m, 1, 2);
+        assert!(!tp.is_oco_sibling(&mk_trig(Pubkey::new_from_array([9u8; 32]), m, 2, 1)));
+        assert!(!tp.is_oco_sibling(&mk_trig(t, Pubkey::new_from_array([9u8; 32]), 2, 1)));
+        assert!(!tp.is_oco_sibling(&mk_trig(t, m, 3, 1))); // id 3 != expected sibling 2
+    }
 
     #[test]
     fn jit_offer_seed_is_stable() {

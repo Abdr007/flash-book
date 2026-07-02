@@ -8149,7 +8149,9 @@ pub mod flash_book {
         trigger.expires_at_slot = expires_at_slot;
         trigger.sub_index = sub_index;
         trigger.acceptable_price_ticks = acceptable_price_ticks;
-        trigger._reserved = [0; 8];
+        // Standalone trigger: no OCO sibling (FLAG_HAS_SIBLING unset above).
+        trigger.sibling_trigger_id = 0;
+        trigger._reserved = [0; 7];
 
         emit!(TriggerOrderV3PlacedEvent {
             market: market.key(),
@@ -8278,8 +8280,37 @@ pub mod flash_book {
         };
         drop(book_data);
 
-        let trigger = &mut ctx.accounts.trigger_order;
-        trigger.flags &= !state_v3::TriggerOrderAccountV3::FLAG_ACTIVE;
+        // Deactivate this leg (it has fired).
+        {
+            let trigger = &mut ctx.accounts.trigger_order;
+            trigger.flags &= !state_v3::TriggerOrderAccountV3::FLAG_ACTIVE;
+        }
+
+        // AUDIT HIGH-7 (2026-07): OCO — when a bracket leg fires, deactivate its
+        // sibling so a whipsaw across BOTH trigger prices can't fire both legs
+        // and double-close (flip) the position. The executor MUST supply the
+        // genuine mutual sibling (validated by `is_oco_sibling`); omitting it or
+        // passing an unrelated trigger reverts.
+        let has_sibling = ctx.accounts.trigger_order.flags
+            & state_v3::TriggerOrderAccountV3::FLAG_HAS_SIBLING
+            != 0;
+        if has_sibling {
+            let is_valid = {
+                let trigger = &ctx.accounts.trigger_order;
+                let sibling = ctx
+                    .accounts
+                    .sibling_trigger
+                    .as_ref()
+                    .ok_or_else(|| error!(FlashBookError::OutOfRange))?;
+                trigger.is_oco_sibling(sibling)
+            };
+            require!(is_valid, FlashBookError::OutOfRange);
+            ctx.accounts
+                .sibling_trigger
+                .as_mut()
+                .unwrap()
+                .flags &= !state_v3::TriggerOrderAccountV3::FLAG_ACTIVE;
+        }
 
         emit!(TriggerOrderV3ExecutedEvent {
             market: market_key,
@@ -8898,8 +8929,13 @@ pub mod flash_book {
         } else {
             (0u8, 1u8)
         };
+        // AUDIT HIGH-7 (2026-07): mark both legs as an OCO pair. Each leg points
+        // at the other's trigger_id; when one fires, execute_trigger_order_v3
+        // deactivates the sibling so a whipsaw can't fire BOTH legs and
+        // double-close (flip) the position.
         let common_flags = state_v3::TriggerOrderAccountV3::FLAG_ACTIVE
-            | state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY;
+            | state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY
+            | state_v3::TriggerOrderAccountV3::FLAG_HAS_SIBLING;
 
         let tp = &mut ctx.accounts.tp_trigger;
         tp.trader = trader_pk;
@@ -8915,6 +8951,7 @@ pub mod flash_book {
         tp.created_at_slot = now;
         tp.expires_at_slot = expires_at_slot;
         tp.sub_index = sub_index;
+        tp.sibling_trigger_id = sl_trigger_id;
 
         let sl = &mut ctx.accounts.sl_trigger;
         sl.trader = trader_pk;
@@ -8930,6 +8967,7 @@ pub mod flash_book {
         sl.created_at_slot = now;
         sl.expires_at_slot = expires_at_slot;
         sl.sub_index = sub_index;
+        sl.sibling_trigger_id = tp_trigger_id;
 
         emit!(BracketOrderV3PlacedEvent {
             market: market_key,
@@ -17236,6 +17274,13 @@ pub struct ExecuteTriggerOrderV3<'info> {
         constraint = position.load()?.trader == trigger_order.trader @ FlashBookError::WrongTrader,
     )]
     pub position: AccountLoader<'info, state::PositionAccount>,
+
+    /// AUDIT HIGH-7 (2026-07) — OCO sibling leg. REQUIRED when `trigger_order`
+    /// is a bracket leg (`flags & FLAG_HAS_SIBLING`); the handler validates it
+    /// is the genuine paired leg and deactivates it so both legs of a bracket
+    /// can never both fire. `None` for standalone triggers (backward compatible).
+    #[account(mut)]
+    pub sibling_trigger: Option<Account<'info, state_v3::TriggerOrderAccountV3>>,
 }
 
 #[derive(Accounts)]
