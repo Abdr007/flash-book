@@ -45,6 +45,13 @@ pub const DELEGATION_PROGRAM_ID: Pubkey =
 
 /// PDA seed prefix for the delegate buffer (lives under `owner_program`).
 pub const DELEGATE_BUFFER_TAG: &[u8] = b"buffer";
+/// PDA seed prefix for the DLP-created UNDELEGATION buffer. Distinct from the
+/// delegate-time buffer above: at undelegate the DLP hands `process_undelegation`
+/// a buffer it created and signs for, so the buffer is a PDA under the DELEGATION
+/// program with seeds `["undelegate-buffer", delegated]` — NOT `["buffer", …]`
+/// under the owner program. Empirically confirmed against the live MagicBlock
+/// devnet ER (magicblock-core 0.13.2); see AUDIT HIGH-4 below.
+pub const UNDELEGATE_BUFFER_TAG: &[u8] = b"undelegate-buffer";
 /// PDA seed prefix for the delegation record (lives under DELEGATION_PROGRAM_ID).
 pub const DELEGATION_RECORD_TAG: &[u8] = b"delegation";
 /// PDA seed prefix for the delegation metadata (lives under DELEGATION_PROGRAM_ID).
@@ -75,6 +82,16 @@ pub struct DelegateArgs {
 /// program control over rent and lifetime.
 pub fn delegate_buffer_pda(delegated: &Pubkey, owner_program: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[DELEGATE_BUFFER_TAG, delegated.as_ref()], owner_program)
+}
+
+/// Derive the DLP's UNDELEGATION-buffer PDA for a delegated account — the buffer
+/// the delegation program creates and passes to `process_undelegation`. Lives
+/// under the DELEGATION program (the DLP signs it via invoke_signed).
+pub fn undelegate_buffer_pda(delegated: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[UNDELEGATE_BUFFER_TAG, delegated.as_ref()],
+        &DELEGATION_PROGRAM_ID,
+    )
 }
 
 /// Derive the delegation record PDA. Lives under the delegation program.
@@ -492,6 +509,28 @@ pub fn process_external_undelegate<'info>(
     let (derived, bump) = Pubkey::find_program_address(&seed_slices, &crate::ID);
     require_keys_eq!(*delegated.key, derived, crate::FlashBookError::WrongMarket);
 
+    // AUDIT HIGH-4 (2026-07): BIND the buffer to `delegated`. The two guards
+    // above (is_signer + owner == DLP) are NOT sufficient — an attacker can
+    // manufacture a DLP-owned signer with arbitrary bytes (allocate a PDA under
+    // their own program, write bytes, `assign` it to the delegation program —
+    // data survives `assign` — and sign for it via invoke_signed) and target ANY
+    // uninitialized canonical PDA, fabricating e.g. a TraderState with u64::MAX
+    // collateral that `create_pda` below then copies in.
+    //
+    // Re-derive the DLP's canonical undelegation-buffer PDA for THIS delegated
+    // account (`["undelegate-buffer", delegated]` under the delegation program)
+    // and require the passed buffer to equal it. Only the real DLP can produce a
+    // signer at that address, so a forged buffer at any other address is rejected.
+    // The seed/program is empirically confirmed against the live MagicBlock devnet
+    // ER — the full delegate→commit→undelegate round-trip stays green with this
+    // binding enforced.
+    let (expected_buffer, _) = undelegate_buffer_pda(delegated.key);
+    require_keys_eq!(
+        *buffer.key,
+        expected_buffer,
+        crate::FlashBookError::Unauthorized
+    );
+
     let bump_arr = [bump];
     let mut signer: Vec<&[u8]> = seed_slices.clone();
     signer.push(&bump_arr);
@@ -524,6 +563,35 @@ mod tests {
 
     // Censorship backstop is far away in these fast-path tests (heartbeat=0).
     const CENSOR: u64 = 9_000;
+
+    /// AUDIT HIGH-4 (2026-07): lock in the exact undelegation-buffer derivation
+    /// against REAL (buffer, delegated) pairs captured from the live MagicBlock
+    /// devnet ER round-trip. If a refactor ever changes the seed/program, the
+    /// buffer binding in `process_external_undelegate` would silently reject the
+    /// real DLP buffer (breaking undelegation) or accept a wrong one — this
+    /// regression guard fails first. Not synthetic: these are on-chain values.
+    #[test]
+    fn undelegate_buffer_pda_matches_live_dlp() {
+        use std::str::FromStr;
+        let cases = [
+            (
+                "DLFXXGB1GHT87pvrVv5BHD7aqWHpGp6xVTbiTCbt6yV1",
+                "JWW3myFHZE8hUqE9L8kC83TU6AxeL7D5GRxauUFrRhP",
+            ),
+            (
+                "9UfK4Xdm4Y3XyMySRRGoK8rFCAGNh1NZsvdAtqAZe9nF",
+                "9iB8cVfMMKmTP47NLhuCiQZcoL5H5CHqznmHDygBWNHj",
+            ),
+            (
+                "BUL48eJdynEqK5uL1vw2wLiVKJW6JumLDHUo3Z3i11BL",
+                "BbzWcmHnC1TBDzwXuERtyQapoXcAKaRfPZ2gXW4i2N7v",
+            ),
+        ];
+        for (buf, deleg) in cases {
+            let (got, _) = undelegate_buffer_pda(&Pubkey::from_str(deleg).unwrap());
+            assert_eq!(got, Pubkey::from_str(buf).unwrap(), "deleg {deleg}");
+        }
+    }
 
     #[test]
     fn force_undelegate_blocked_without_baseline() {

@@ -61,7 +61,15 @@ jobs:
           sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
       - name: Build SBF
-        run: cargo build-sbf --manifest-path programs/flash-book/Cargo.toml
+        run: cargo build-sbf --manifest-path programs/flash-book/Cargo.toml --sbf-out-dir target/deploy
+      # Upload the built .so so it can be downloaded and deployed to devnet
+      # (local `cargo build-sbf` is blocked by a toolchain edition2024 issue).
+      - name: Upload flash_book.so
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash_book-so
+          path: target/deploy/flash_book.so
+          if-no-files-found: error
       - name: Build SBF (Pinocchio migration crate, WIP)
         run: cargo build-sbf --manifest-path programs/flash-book-pin/Cargo.toml
       # Runs BOTH the host equivalence tests (--lib) AND the on-validator
