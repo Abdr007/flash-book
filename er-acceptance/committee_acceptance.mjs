@@ -16,7 +16,8 @@ import {
   Ed25519Program, SYSVAR_INSTRUCTIONS_PUBKEY, sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import nacl from "tweetnacl";
-import { keccak256 } from "js-sha3";
+import sha3 from "js-sha3";
+const { keccak256 } = sha3;
 const { Program, AnchorProvider, Wallet, BN } = anchor;
 // Validators sign the keccak DIGEST of the 152-byte canonical message (matches
 // the on-chain `keccak::hash(batch_attestation_message(..))`).
