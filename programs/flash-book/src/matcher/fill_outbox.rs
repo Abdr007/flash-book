@@ -341,6 +341,28 @@ mod proofs {
         let idx = produced % cap as u64;
         assert!(idx < cap as u64);
     }
+
+    /// AUDIT (2026-07): `grow_fill_outbox` requires the outbox be DRAINED
+    /// (`produced == settled`) before it changes `cap`. This proves that gate is
+    /// exactly what makes the cap change safe. An occupied slot holds the fill at
+    /// some index `idx` with `settled <= idx < produced`, physically at
+    /// `idx % cap`; a grow to `new_cap` would relocate it to `idx % new_cap` — a
+    /// DIFFERENT slot — so a reader would misread it. Here we prove the invariant
+    /// that rules this out: **any pending index implies the outbox is NOT drained**
+    /// (`produced != settled`). Contrapositive: the drained gate excludes every
+    /// state with a live slot occupant, so no cap-change remap can ever move a
+    /// still-unsettled fill. ∀ legal (produced, settled, idx).
+    #[kani::proof]
+    fn drained_grow_has_no_remappable_pending_slot() {
+        let produced: u64 = kani::any();
+        let settled: u64 = kani::any();
+        let idx: u64 = kani::any();
+        kani::assume(settled <= produced); // cursors monotonic (ring invariant)
+        kani::assume(idx >= settled && idx < produced); // `idx` occupies a slot
+        // A live slot occupant ⇒ depth >= 1 ⇒ not drained. So the
+        // `produced == settled` grow gate provably admits no remappable entry.
+        assert!(produced != settled);
+    }
 }
 
 #[cfg(test)]

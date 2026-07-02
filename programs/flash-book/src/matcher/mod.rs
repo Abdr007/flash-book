@@ -19,7 +19,6 @@ pub mod conditional_cancel;
 pub mod jit_lp_defense;
 pub mod min_fill_size;
 pub mod mit_order;
-pub mod peg_pricing;
 pub mod pro_rata;
 pub mod reduce_only;
 pub mod risk;
