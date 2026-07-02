@@ -1,13 +1,15 @@
 # Flash Book — Security Audit & Remediation Report
 
 **Program:** `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq` (Solana devnet)
-**Branch:** `feat/flash-book-devnet-delegation-lazer` · **PR:** #150
-**Date:** 2026-06-29 · **Status:** all Critical/High/Medium remediated, deployed, on-chain-validated
+**Round 1:** PR #150 (`feat/flash-book-devnet-delegation-lazer`), 2026-06-29
+**Round 2:** PRs #197–#211, 2026-07-02 — see **§8** (deep 13-dimension audit + remediation, incl. two ER-boundary fixes verified on the live MagicBlock devnet rollup)
+**Status:** all Critical/High/Medium remediated across both rounds, deployed, on-chain-validated; ER trust boundary now exercised live (not just the unit harness).
 
 > This document is a turnkey handoff for an external audit firm and for the team's
 > own review. Every figure is from real devnet transactions or the test/proof
 > suite — no synthetic data. Each finding lists the fix, the deploy signature, and
-> how it was verified.
+> how it was verified. §1–§7 cover Round 1 (2026-06); **§8 covers Round 2
+> (2026-07)** and supersedes the Round-1 counts where they differ.
 
 ---
 
@@ -169,3 +171,125 @@ Drift place-and-make 400k–800k.
 `3edxZN1R` (CR+H) → `YX6yMWWp` (M-1/M-2) → `2wWbL5Jg` (re-audit) → `2GFcNZJq` (§3.2 P1)
 → `W5KsHHZ5` (P2) → `ZtPGZKcm` (P3) → `4zoeS6ax` (P4) → `71oH5VDC` (Lows) →
 `3YbGwWBA` (ER L-2). Upgrade authority `GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD`.
+
+---
+
+## 8. Round 2 — deep 13-dimension audit + remediation (2026-07-02)
+
+A second, deeper adversarial audit (13 parallel domain auditors + a line-by-line
+self-audit of the solvency core), run against the deployed program and **treating
+the Kani proofs and the test suite as untrusted**. It found **1 Critical, 9 High,
+and a full Medium/Low set**, plus a systemic "inert safety controls" theme. **Every
+code-level finding is remediated and merged** across **PRs #197–#212**, each
+CI-green on all four required checks (`Rust on-chain program`, `cargo build-sbf`,
+`Formal verification (Kani)`, `Formal verification (Lean)`). Two ER-boundary fixes
+were additionally **verified on the live MagicBlock devnet rollup** — the one
+surface a `solana-program-test`/BanksClient CI structurally cannot exercise.
+
+### 8.1 Critical
+- **FLP unbacked mint** — `initialize_flp_exposure` minted LP shares with **no token
+  transfer**, no admin gate, first-caller-wins singleton over the *shared* insurance
+  vault → phantom shares redeem real trader collateral. *Fix:* require
+  `initial_capital == 0` + admin-gate; capital is seeded only via `deposit_flp_capital`
+  (real transfer). (#197, `939ac57`)
+
+### 8.2 High — 8 fixed, 1 downgraded
+| ID | Issue | Fix | PR |
+|---|---|---|---|
+| H-1 | Stress-lattice netted opposing legs across markets (~2× under-margin) | per-market decomposition in `assess_margin` | #197 |
+| H-2 | ER reserved-margin bypass (`transfer_main_to_sub`/`sweep`) | `er_active` gate | #197 |
+| H-3 | Delegate-custody escalation via `sweep_collateral` | require source **owner** signs | #197 |
+| H-4 | `process_undelegation` forged-buffer → fabricate `TraderState` → drain | bind buffer to the DLP's canonical undelegation PDA `["undelegate-buffer", delegated]` — **seed recovered empirically from the live ER**, then enforced | #210 |
+| H-5 | Cyclic committed book → infinite loop (market brick) | bounded-reachability DFS in `validate_node_links` | #197 |
+| H-6 | Unmargined taker wedges the FIFO settlement ring | cap taker fee at available collateral (never revert) | #203 |
+| H-7 | Bracket OCO double-fill flips position | sibling-trigger mutual-backlink deactivation | #199 |
+| H-8 | Pause asymmetry (liquidations run while frozen) | `MarketPaused` gate on liquidate/ADL | #202 |
+| H-9 | Haircut warmup backdating | downgraded → Medium; fixed with M-7 | #204 |
+
+### 8.3 Medium / Low
+Param caps + init-gates (M-2/M-4/M-5/M-13/M-17/M-18), stress-scenario cap (M-9),
+zero-NAV reject (M-3), haircut residual reconcile via an optional solvency-monitor
+account (M-6, #208), cached-`h` refresh (M-7, #204), order-seq reseat ix (M-8, #200),
+**M-15 sequencer-gated ER `commit_and_undelegate_*`** (#211, verified live), liquidation
+price off the freshness-gated health price + per-fill fee dust-floor (F3/L-1, #209),
+and the **Lazer replay-nonce** — a strictly-increasing publisher timestamp per
+`oracle_config` rejects re-posting a public signed payload within the staleness
+window (#212).
+
+### 8.4 Inert-controls cleanup (false assurance removed)
+Deleted 6 dead risk modules (concentration / position-cap / daily-loss / volume-rate
+/ stable-collateral / pending-claim), the ARG anti-sandwich stub, the never-read
+leverage-tier state, and dead/broken LLRB (#205/#206/#43). VPIN + the toxicity-tax
+branches are **documented inert** (#207) — a full removal needs a state migration
+that would break live accounts, so they are marked, not ripped out.
+
+### 8.5 Live-ER verification (the CI-unreachable surface)
+The `er-acceptance/` harness runs the full **delegate → match-on-rollup → commit →
+commit_and_undelegate → process_undelegation → L1** round-trip on the **real
+MagicBlock devnet ER** (`magicblock-core 0.13.2`). Both ER fixes were confirmed
+**7/7 green with the fix enforced**:
+- **H-4** — the guessed buffer derivations *broke undelegation on the live rollup*;
+  the true seed (`["undelegate-buffer", delegated]` under the delegation program)
+  was recovered via a non-enforcing diagnostic build + offline brute-force against 3
+  real captured `(buffer, delegated)` pairs, then locked in by a regression test.
+- **M-15** — the market is delegated alongside the book/ring/outbox during a session,
+  so the sequencer is reachable on the ER; the gate re-derives each account's
+  per-market PDA to bind the passed `market`, then requires `payer == market.sequencer`.
+
+### 8.6 Test & formal-verification posture (Round 2, current)
+- **417 host unit tests** (`cargo test -p flash-book --lib`) + the integration suite
+  (16 files, loaded as a real compiled SBF `.so` in the BPF VM) — all green. Lower
+  than Round 1's 449 because the dead modules (and their tests) were deleted.
+- **49 Kani proofs** over the matcher/solvency pure-math (incl. the C-1 margin frame,
+  haircut conservation/solvency, fill-ring/outbox no-overwrite, order-id price-time
+  priority, ER liveness) + the **Lean theorems** (Haircut / OI-MMR / Funding) at the
+  real `1e9` divisors. All green.
+- New Round-2 regression tests: cross-market margin (H-1), cyclic-book rejection (H-5),
+  OCO sibling backlink (H-7), scenario cap (M-9), residual over-backing (M-6),
+  the live-ER buffer-seed derivation (H-4, real captured pairs), the M-15 gate's
+  both reject branches, and the Lazer replay-nonce Borsh-compat + round-trip.
+
+### 8.7 Residual risk — architectural items an auditor should weigh
+These are **trust-model / protocol-design properties, not code defects**; each is
+bounded and documented rather than "fixed", because a code fix would require
+decentralizing the sequencer, an upstream MagicBlock change, or a matcher redesign
+that would regress the proven hot path.
+
+1. **Sequencer within-band discretion (M-14).** On an armed market the sequencer
+   cannot fabricate/reorder/alter fills (§3.2 authenticity is mandatory), but within
+   the mandatory per-slot oracle **envelope** it retains ordinary market-maker
+   discretion over the mark. Bounded by the envelope move-cap + confidence gate +
+   fill authenticity. *Recommendation:* tighten the envelope and move to a
+   decentralized sequencer set before mainnet.
+2. **`force_undelegate` DLP limitation (M-16).** The L1-initiated force-undelegate
+   path fails closed (`Custom(221)`); undelegation flows through
+   `commit_and_undelegate_* → process_undelegation`, which is what the live ER
+   harness exercises. Full unilateral L1 reclaim depends on an upstream delegation-
+   program capability that does not yet exist.
+3. **Reduce-only for *resting* CLOB makers (H-7 residual).** Plain-limit reduce-only
+   is **rejected fail-closed**; *triggers* enforce the reduce-only cap at fire-time
+   (position > 0, opposes, `size ≤ position`). A resting maker's reduce-only cannot
+   be enforced at bilateral settlement — the fill is already committed, and capping
+   the maker unilaterally would unbalance the taker — so a position that shrinks
+   between fire and fill is a known, narrow, self-inflicted edge inherent to resting
+   reduce-only orders in any CLOB (not a protocol-solvency risk).
+4. **Centralization** (carried from §6): single upgrade + per-market authority/
+   sequencer key → multisig/timelock recommended before mainnet.
+
+*Verified-sound on re-inspection (no change needed):* `grow_fill_outbox`'s drained
+gate reads the outbox's **own** cursors and requires the account be program-owned
+(L1, not delegated), so its remap invariant is correct; `align_to_tick`'s bid-floor
+is unreachable (the peg-pricing module has no production caller); the entry-price
+weighted-average sub-tick rounding is value-conserving (INFO).
+
+### 8.8 Round-2 deploy history (devnet)
+The Round-2 fixes deploy to the same program via the CI-built `.so`
+(`cargo build-sbf` runs in CI and uploads the artifact; local `build-sbf` is blocked
+by an `edition2024` toolchain issue). The two ER fixes landed and were re-verified on
+the live rollup: **H-4** enforcing build `5iPgnWpg…`, **M-15** `4wEyrJMM…`. Upgrade
+authority + market authority: `GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD`.
+
+**Round-2 posture:** no reachable Critical/High/Medium on the deployed program; the
+ER trust boundary is now exercised on the live rollup, not just the unit harness.
+Held from a production rating only by the centralization residual and the absence of
+an external audit — for which this document is the turnkey input.

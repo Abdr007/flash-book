@@ -253,6 +253,8 @@ pub enum FlashBookError {
     MarketPaused = 2312,
     #[msg("Haircut residual exceeds the vault-backed surplus (over-stated / unbacked)")]
     HaircutResidualUnbacked = 2313,
+    #[msg("Lazer payload timestamp not strictly newer than the last accepted price (replay)")]
+    OracleLazerReplay = 2314,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

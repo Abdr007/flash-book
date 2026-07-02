@@ -11583,6 +11583,7 @@
         },
         {
           "name": "oracle_config",
+          "writable": true,
           "pda": {
             "seeds": [
               {
@@ -16490,6 +16491,11 @@
       "code": 8313,
       "name": "HaircutResidualUnbacked",
       "msg": "Haircut residual exceeds the vault-backed surplus (over-stated / unbacked)"
+    },
+    {
+      "code": 8314,
+      "name": "OracleLazerReplay",
+      "msg": "Lazer payload timestamp not strictly newer than the last accepted price (replay)"
     }
   ],
   "types": [
@@ -19889,6 +19895,21 @@
                 7
               ]
             }
+          },
+          {
+            "name": "last_lazer_timestamp_us",
+            "docs": [
+              "AUDIT (2026-07): Lazer replay-nonce. The strictly-increasing",
+              "publisher-attested microsecond timestamp of the last accepted Lazer",
+              "price. `update_oracle_from_lazer` rejects any payload whose `timestamp_us`",
+              "is not greater, so a public signed payload cannot be re-posted (or an",
+              "older one applied) within the staleness window. APPENDED after `_pad1` —",
+              "the account was always allocated 128 B (space) while the struct serialized",
+              "to 96 B, so pre-existing configs deserialize this trailing field as 0",
+              "(first Lazer update then seeds it). Borsh field order + offsets of every",
+              "prior field are unchanged (same technique as the CR-2 `lazer_feed_id` carve)."
+            ],
+            "type": "u64"
           }
         ]
       }

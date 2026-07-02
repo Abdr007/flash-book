@@ -366,6 +366,16 @@ pub struct MarketOracleConfigAccount {
     /// exponents.
     pub tick_decimals: i8,
     pub _pad1: [u8; 7],
+    /// AUDIT (2026-07): Lazer replay-nonce. The strictly-increasing
+    /// publisher-attested microsecond timestamp of the last accepted Lazer
+    /// price. `update_oracle_from_lazer` rejects any payload whose `timestamp_us`
+    /// is not greater, so a public signed payload cannot be re-posted (or an
+    /// older one applied) within the staleness window. APPENDED after `_pad1` —
+    /// the account was always allocated 128 B (space) while the struct serialized
+    /// to 96 B, so pre-existing configs deserialize this trailing field as 0
+    /// (first Lazer update then seeds it). Borsh field order + offsets of every
+    /// prior field are unchanged (same technique as the CR-2 `lazer_feed_id` carve).
+    pub last_lazer_timestamp_us: u64,
 }
 impl MarketOracleConfigAccount {
     pub const SEED: &'static [u8] = b"oracle_config";
@@ -374,11 +384,13 @@ impl MarketOracleConfigAccount {
     pub const SOURCE_LAZER: u8 = 2;
     pub fn space() -> usize {
         // 8 disc
-        //   + 1 bump + 1 source + 6 pad
+        //   + 1 bump + 1 source + 2 pad + 4 lazer_feed_id
         //   + 32 market + 32 feed_id
         //   + 4 + 4 max_staleness/conf
         //   + 1 tick_decimals + 7 pad
-        // = 8 + 88 = 96. Round up to 128.
+        //   + 8 last_lazer_timestamp_us
+        // = 8 + 96 = 104. Allocation stays 128 (unchanged), so existing 128-byte
+        // configs remain valid and the appended field reads 0.
         8 + 120
     }
 }
@@ -410,6 +422,11 @@ mod oracle_config_layout_tests {
         old.extend_from_slice(&45u32.to_le_bytes()); // max_confidence_bps
         old.push(3i8 as u8); // tick_decimals
         old.extend_from_slice(&[0u8; 7]); // _pad1
+        // AUDIT (2026-07): the appended `last_lazer_timestamp_us: u64` reads from
+        // the account's trailing allocation. A pre-existing on-chain config is 128
+        // bytes (space) while the struct serialized to 88, so those 8 bytes are
+        // zeros — simulate that slack here so the NEW struct has enough to decode.
+        old.extend_from_slice(&[0u8; 8]); // last_lazer_timestamp_us slot (pre-existing = 0)
 
         let cfg = MarketOracleConfigAccount::try_from_slice(&old).unwrap();
         assert_eq!(cfg.bump, 9);
@@ -420,8 +437,10 @@ mod oracle_config_layout_tests {
         assert_eq!(cfg.max_staleness_seconds, 123);
         assert_eq!(cfg.max_confidence_bps, 45);
         assert_eq!(cfg.tick_decimals, 3);
-        // Serialized size must be unchanged so the account still fits `space()`.
-        assert_eq!(old.len(), 88);
+        assert_eq!(cfg.last_lazer_timestamp_us, 0, "old configs must read the nonce as 0");
+        // Serialized struct is now 96 B (88 + 8 nonce); still well under the
+        // unchanged 128-B `space()` allocation, so existing accounts stay valid.
+        assert_eq!(old.len(), 96);
     }
 
     // A LAZER-bound config round-trips and exposes the new field.
@@ -438,13 +457,15 @@ mod oracle_config_layout_tests {
             max_confidence_bps: 50,
             tick_decimals: -8,
             _pad1: [0; 7],
+            last_lazer_timestamp_us: 1_700_000_000_000_000,
         };
         let mut bytes = Vec::new();
         AnchorSerialize::serialize(&cfg, &mut bytes).unwrap();
         let back = MarketOracleConfigAccount::try_from_slice(&bytes).unwrap();
         assert_eq!(back.lazer_feed_id, 0xDEAD_BEEF);
         assert_eq!(back.source, MarketOracleConfigAccount::SOURCE_LAZER);
-        assert_eq!(bytes.len(), 88, "serialized size must stay 88 (fits space())");
+        assert_eq!(back.last_lazer_timestamp_us, 1_700_000_000_000_000);
+        assert_eq!(bytes.len(), 96, "serialized size is 96 (88 + 8 nonce); fits 128 space()");
     }
 }
 
