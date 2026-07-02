@@ -32,9 +32,18 @@ pub const MAX_ACCOUNT_NOTIONAL_LOTS: u128 = 1_000_000_000_000_000;
 
 /// Hard cap on `max_price_move_bps_per_slot`. Anything beyond this is
 /// rejected at init — even the wildest crypto move (e.g. LUNA going to
-/// zero) fits within ~500 bps/slot at 400ms slots. We pick 2_000 bps
-/// (20%) as the cap — well above realistic limits.
-pub const ABS_MAX_PRICE_MOVE_BPS_PER_SLOT: u32 = 2_000;
+/// zero) fits within ~500 bps/slot at 400ms slots.
+///
+/// AUDIT M-14 (2026-07): tightened 2_000 → 1_000 bps (10%/slot). The mark is a
+/// trust surface the (semi-trusted) sequencer influences within this band, so
+/// the backstop is pulled toward the realistic ceiling while keeping 2× headroom
+/// over the ~500 bps/slot wildest-legit-move — it still admits any real move but
+/// halves the worst-case per-slot band a sequencer could push. The closed-form
+/// soundness proof below already binds most configs tighter; this only lowers the
+/// absolute backstop. NOTE: this constrains configs set from here on
+/// (`set_envelope_config` re-proves against it); the runtime gate uses each
+/// market's stored cap, so pre-existing markets are unaffected until reconfigured.
+pub const ABS_MAX_PRICE_MOVE_BPS_PER_SLOT: u32 = 1_000;
 
 /// Hard cap on `max_accrual_dt_slots`. 10_000 slots ≈ 67 minutes at
 /// 400ms; longer than this and the per-slot envelope no longer bounds
