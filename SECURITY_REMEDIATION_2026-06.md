@@ -2,7 +2,7 @@
 
 **Program:** `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq` (Solana devnet)
 **Round 1:** PR #150 (`feat/flash-book-devnet-delegation-lazer`), 2026-06-29
-**Round 2:** PRs #197–#211, 2026-07-02 — see **§8** (deep 13-dimension audit + remediation, incl. two ER-boundary fixes verified on the live MagicBlock devnet rollup)
+**Round 2:** PRs #197–#215, 2026-07-02/03 — see **§8** (deep 13-dimension audit + remediation, incl. two ER-boundary fixes verified on the live MagicBlock devnet rollup, plus a mark-manipulation hardening)
 **Status:** all Critical/High/Medium remediated across both rounds, deployed, on-chain-validated; ER trust boundary now exercised live (not just the unit harness).
 
 > This document is a turnkey handoff for an external audit firm and for the team's
@@ -180,7 +180,7 @@ A second, deeper adversarial audit (13 parallel domain auditors + a line-by-line
 self-audit of the solvency core), run against the deployed program and **treating
 the Kani proofs and the test suite as untrusted**. It found **1 Critical, 9 High,
 and a full Medium/Low set**, plus a systemic "inert safety controls" theme. **Every
-code-level finding is remediated and merged** across **PRs #197–#212**, each
+code-level finding is remediated and merged** across **PRs #197–#215**, each
 CI-green on all four required checks (`Rust on-chain program`, `cargo build-sbf`,
 `Formal verification (Kani)`, `Formal verification (Lean)`). Two ER-boundary fixes
 were additionally **verified on the live MagicBlock devnet rollup** — the one
@@ -216,12 +216,30 @@ and the **Lazer replay-nonce** — a strictly-increasing publisher timestamp per
 `oracle_config` rejects re-posting a public signed payload within the staleness
 window (#212).
 
+**Mark-manipulation hardening (M-14 mark surface).** The mark is an EMA of fills
+the semi-trusted sequencer produces and it feeds **worse-of(mark, oracle)**
+liquidation health, so it must stay pinned to the trustless oracle. Two fixes:
+- **Always-on, tight oracle band (#215, `bf46bea`).** `apply_fill`'s oracle-band
+  clamp previously ran only when `oracle_band_bps > 0`, so a market that left the
+  band unset (0) had an **unclamped mark** — a sequencer could walk it off the
+  oracle via wash fills and drive wrongful liquidations. The *effective* band is
+  now enforced at runtime regardless of config: unset → 2% default, any stored
+  band → capped to 5% (`constants::effective_oracle_band_bps`). A fresh oracle
+  always pins the mark within 5% of the oracle. Pure clamp refinement
+  (clamp-not-reject, no account/field/API change) → **settlement/FIFO structurally
+  identical**; it only ever tightens the mark toward the oracle, strictly reducing
+  wrongful-liq risk. Config-time cap also tightened 100% → 5%.
+- **Envelope backstop 2000 → 1000 bps/slot (#214, `712152b`).** `ABS_MAX_PRICE_MOVE_BPS_PER_SLOT`
+  (the per-slot price-move ceiling) pulled toward the realistic ~500 bps/slot
+  worst case while keeping 2× headroom.
+
 ### 8.4 Inert-controls cleanup (false assurance removed)
 Deleted 6 dead risk modules (concentration / position-cap / daily-loss / volume-rate
 / stable-collateral / pending-claim), the ARG anti-sandwich stub, the never-read
-leverage-tier state, and dead/broken LLRB (#205/#206/#43). VPIN + the toxicity-tax
-branches are **documented inert** (#207) — a full removal needs a state migration
-that would break live accounts, so they are marked, not ripped out.
+leverage-tier state, and dead/broken LLRB (#205/#206/#43), plus the dead
+`peg_pricing` module (`align_to_tick` et al. — no production caller; #213). VPIN +
+the toxicity-tax branches are **documented inert** (#207) — a full removal needs a
+state migration that would break live accounts, so they are marked, not ripped out.
 
 ### 8.5 Live-ER verification (the CI-unreachable surface)
 The `er-acceptance/` harness runs the full **delegate → match-on-rollup → commit →
@@ -237,17 +255,18 @@ MagicBlock devnet ER** (`magicblock-core 0.13.2`). Both ER fixes were confirmed
   per-market PDA to bind the passed `market`, then requires `payer == market.sequencer`.
 
 ### 8.6 Test & formal-verification posture (Round 2, current)
-- **417 host unit tests** (`cargo test -p flash-book --lib`) + the integration suite
+- **411 host unit tests** (`cargo test -p flash-book --lib`) + the integration suite
   (16 files, loaded as a real compiled SBF `.so` in the BPF VM) — all green. Lower
   than Round 1's 449 because the dead modules (and their tests) were deleted.
-- **49 Kani proofs** over the matcher/solvency pure-math (incl. the C-1 margin frame,
-  haircut conservation/solvency, fill-ring/outbox no-overwrite, order-id price-time
-  priority, ER liveness) + the **Lean theorems** (Haircut / OI-MMR / Funding) at the
-  real `1e9` divisors. All green.
+- **50 Kani proofs** over the matcher/solvency pure-math (incl. the C-1 margin frame,
+  haircut conservation/solvency, fill-ring/outbox no-overwrite, the `grow_fill_outbox`
+  drained-gate remap safety, order-id price-time priority, ER liveness) + the **Lean
+  theorems** (Haircut / OI-MMR / Funding) at the real `1e9` divisors. All green.
 - New Round-2 regression tests: cross-market margin (H-1), cyclic-book rejection (H-5),
   OCO sibling backlink (H-7), scenario cap (M-9), residual over-backing (M-6),
   the live-ER buffer-seed derivation (H-4, real captured pairs), the M-15 gate's
-  both reject branches, and the Lazer replay-nonce Borsh-compat + round-trip.
+  both reject branches, the Lazer replay-nonce Borsh-compat + round-trip, and the
+  effective-oracle-band default/cap logic (M-14 mark clamp).
 
 ### 8.7 Residual risk — architectural items an auditor should weigh
 These are **trust-model / protocol-design properties, not code defects**; each is
@@ -256,11 +275,15 @@ decentralizing the sequencer, an upstream MagicBlock change, or a matcher redesi
 that would regress the proven hot path.
 
 1. **Sequencer within-band discretion (M-14).** On an armed market the sequencer
-   cannot fabricate/reorder/alter fills (§3.2 authenticity is mandatory), but within
-   the mandatory per-slot oracle **envelope** it retains ordinary market-maker
-   discretion over the mark. Bounded by the envelope move-cap + confidence gate +
-   fill authenticity. *Recommendation:* tighten the envelope and move to a
-   decentralized sequencer set before mainnet.
+   cannot fabricate/reorder/alter fills (§3.2 authenticity is mandatory), and
+   fill ordering is reorder/replay-proof at settlement (monotonic `fill_seq`,
+   Kani-proven). The **mark-manipulation surface is now hardened** (§8.3): the mark
+   is always pinned within 5% of the trustless oracle, and the per-slot move
+   backstop was tightened. What remains is irreducible without decentralization —
+   a single sequencer still chooses *which* crossable order to service first and
+   sets the mark *within* the (now-tight) band. *Recommendation:* a decentralized /
+   BFT-run continuous CLOB (Hyperliquid-style) is the endgame; it keeps continuous
+   price-time execution (no FBA) while removing the single-sequencer trust point.
 2. **`force_undelegate` DLP limitation (M-16).** The L1-initiated force-undelegate
    path fails closed (`Custom(221)`); undelegation flows through
    `commit_and_undelegate_* → process_undelegation`, which is what the live ER
@@ -276,18 +299,24 @@ that would regress the proven hot path.
 4. **Centralization** (carried from §6): single upgrade + per-market authority/
    sequencer key → multisig/timelock recommended before mainnet.
 
-*Verified-sound on re-inspection (no change needed):* `grow_fill_outbox`'s drained
-gate reads the outbox's **own** cursors and requires the account be program-owned
-(L1, not delegated), so its remap invariant is correct; `align_to_tick`'s bid-floor
-is unreachable (the peg-pricing module has no production caller); the entry-price
-weighted-average sub-tick rounding is value-conserving (INFO).
+*Verified-sound on re-inspection:* `grow_fill_outbox`'s drained gate reads the
+outbox's **own** cursors and requires the account be program-owned (L1, not
+delegated), so its remap invariant is correct — now **Kani-proven**
+(`drained_grow_has_no_remappable_pending_slot`, #213); the `align_to_tick`
+bid-floor was unreachable dead code and the whole `peg_pricing` module has been
+**deleted** (#213); the entry-price weighted-average sub-tick rounding is
+value-conserving (INFO).
 
 ### 8.8 Round-2 deploy history (devnet)
 The Round-2 fixes deploy to the same program via the CI-built `.so`
 (`cargo build-sbf` runs in CI and uploads the artifact; local `build-sbf` is blocked
 by an `edition2024` toolchain issue). The two ER fixes landed and were re-verified on
-the live rollup: **H-4** enforcing build `5iPgnWpg…`, **M-15** `4wEyrJMM…`. Upgrade
-authority + market authority: `GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD`.
+the live rollup: **H-4** enforcing build `5iPgnWpg…`, **M-15** `4wEyrJMM…`. The
+deployed program is kept current with `main` (latest upgrade `2RQV37R…`, covering
+through #215) and the `er-acceptance` round-trip re-verifies **7/7 green** after
+each upgrade — so H-4/M-15 stay enforced and the mark-clamp / cleanup changes
+introduce no ER regression. Upgrade authority + market authority:
+`GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD`.
 
 **Round-2 posture:** no reachable Critical/High/Medium on the deployed program; the
 ER trust boundary is now exercised on the live rollup, not just the unit harness.
