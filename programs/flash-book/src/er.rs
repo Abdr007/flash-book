@@ -498,12 +498,16 @@ pub fn process_external_undelegate<'info>(
     // their own program, write bytes, `assign` it to the delegation program —
     // data survives `assign` — and sign for it via invoke_signed) and target
     // ANY uninitialized canonical PDA, fabricating e.g. a TraderState with
-    // u64::MAX collateral that `create_pda` below then copies in. Re-derive the
-    // canonical delegation-buffer PDA for THIS delegated account and require the
-    // passed buffer to equal it — an attacker cannot produce a *signer* at that
-    // address. This mirrors how the delegate path stages the buffer
-    // (`delegate_buffer_pda`, [b"buffer", delegated] under this program).
-    let (expected_buffer, _) = delegate_buffer_pda(delegated.key, &crate::ID);
+    // u64::MAX collateral that `create_pda` below then copies in.
+    //
+    // The undelegation buffer the DLP passes here is `[b"buffer", delegated]`
+    // under the DELEGATION PROGRAM (not the owner program that staged the
+    // delegate-time buffer): it is DLP-owned AND a signer, so the DLP must be
+    // able to sign for it via invoke_signed ⇒ it is a PDA under the DLP. Verified
+    // against the live MagicBlock devnet ER round-trip. An attacker cannot
+    // produce a *signer* at that address, so this binds the callback to the one
+    // buffer the real DLP could have created for THIS delegated account.
+    let (expected_buffer, _) = delegate_buffer_pda(delegated.key, &DELEGATION_PROGRAM_ID);
     require_keys_eq!(
         *buffer.key,
         expected_buffer,
