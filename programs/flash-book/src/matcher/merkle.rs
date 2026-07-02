@@ -48,35 +48,36 @@ where
 mod proofs {
     use super::*;
 
-    /// A deterministic, order-SENSITIVE mock combiner (distinguishes left/right)
-    /// so the fold's structural guarantees are provable without keccak.
+    // A deterministic mock combiner. Order-sensitivity of the ROOT is a property
+    // of the real combiner (keccak collision-resistance), NOT of the fold — so
+    // these proofs verify only the fold's STRUCTURAL guarantees, which hold for
+    // any `combine` and don't depend on the mock being collision-free.
     fn mock(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
         let mut o = [0u8; 32];
-        // asymmetric: left rotated one lane vs right — combine(l,r) != combine(r,l)
         for i in 0..32 {
             o[i] = l[i].wrapping_mul(3).wrapping_add(r[i].wrapping_mul(7)).wrapping_add(i as u8);
         }
         o
     }
 
-    /// Empty proof ⇒ the leaf is the root (single-leaf tree identity).
+    /// Empty proof ⇒ the leaf is the root (single-leaf tree identity). ∀ leaf.
     #[kani::proof]
     fn empty_proof_is_leaf() {
         let leaf: [u8; 32] = kani::any();
         assert!(verify_inclusion(leaf, &[], leaf, mock));
     }
 
-    /// The fold is ORDER-SENSITIVE: at one level, swapping the sibling's side
-    /// generally yields a different root (so a valid left-proof is not silently a
-    /// valid right-proof) whenever the two children differ.
+    /// A single proof level applies the sibling's SIDE correctly: sibling-on-right
+    /// folds to `combine(node, sib)`, sibling-on-left to `combine(sib, node)`. This
+    /// is the structural core that makes an inclusion proof position-bound — the
+    /// running node can't silently be placed on the wrong side. ∀ (leaf, sib),
+    /// combiner-agnostic (holds for keccak).
     #[kani::proof]
-    fn side_matters_one_level() {
+    fn single_level_applies_side_correctly() {
         let leaf: [u8; 32] = kani::any();
         let sib: [u8; 32] = kani::any();
-        kani::assume(leaf != sib);
-        let as_left = fold_proof(leaf, &[(sib, true)], mock);
-        let as_right = fold_proof(leaf, &[(sib, false)], mock);
-        assert_ne!(as_left, as_right);
+        assert_eq!(fold_proof(leaf, &[(sib, false)], mock), mock(&leaf, &sib));
+        assert_eq!(fold_proof(leaf, &[(sib, true)], mock), mock(&sib, &leaf));
     }
 }
 
