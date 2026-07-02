@@ -391,6 +391,51 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// AUDIT M-8 (2026-07): reseat the per-market order-sequence counter.
+    ///
+    /// `order_seq_counter` is monotonic and 24-bit-encodable, and was never
+    /// reset — so a market BRICKS (rejects ALL new orders with
+    /// `OrderSeqExhausted`) after ~16.7M cumulative orders (place + modify +
+    /// taker each burn a seq). This lets the market authority reset it, but
+    /// ONLY when the book is COMPLETELY empty — no resting orders on either
+    /// side — so that no live `order_id` references any seq and a reset cannot
+    /// collide. The book must be L1-resident (owned by this program, i.e. not
+    /// currently delegated to the ER).
+    pub fn reseat_order_seq_counter(ctx: Context<ReseatOrderSeqCounter>) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+        require!(
+            ctx.accounts.market_book.owner == ctx.program_id,
+            FlashBookError::ReseatRequiresEmptyBook
+        );
+        let market_key = ctx.accounts.market.key();
+        let previous_counter;
+        {
+            let mut data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let handle = state_v2::MarketBookHandle::from_account_data(&mut data)?;
+            require!(
+                handle.header.market_pubkey == market_key,
+                FlashBookError::WrongMarket
+            );
+            require!(
+                handle.header.total_orders_active == 0
+                    && handle.header.bids_root_index == crate::hypertree::NIL
+                    && handle.header.asks_root_index == crate::hypertree::NIL,
+                FlashBookError::ReseatRequiresEmptyBook
+            );
+            previous_counter = handle.header.order_seq_counter;
+            handle.header.order_seq_counter = 0;
+        }
+        emit!(OrderSeqCounterReseatEvent {
+            market: market_key,
+            previous_counter,
+        });
+        Ok(())
+    }
+
     /// Delegate the v2 hypertree market_book PDA to the MagicBlock ER.
     /// After this lands, the account state lives on the ER for sub-ms
     /// matcher access; only this program (via PDA signature) can
@@ -12219,6 +12264,28 @@ pub struct StampBookLivenessBaseline<'info> {
     pub market_book: UncheckedAccount<'info>,
 }
 
+/// AUDIT M-8 (2026-07) — reseat the order-sequence counter on an empty book.
+#[derive(Accounts)]
+pub struct ReseatOrderSeqCounter<'info> {
+    /// Market authority (validated in handler against `market.authority`).
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: the market_book PDA; disc + market-binding + emptiness + L1
+    /// residency (owner == this program) are all validated in the handler.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
 /// Private/dark-pool book permission management. Authority-gated (`has_one`); the
 /// book PDA signs the permission CPI. The permission PDA is seed-validated under
 /// the MagicBlock permission program, and the vault/magic/permission programs are
@@ -14262,6 +14329,14 @@ pub struct MarketBookExpandedEvent {
     pub new_bytes: u32,
     /// Node capacity after this expansion = (new_bytes − 264) / 96.
     pub max_nodes: u32,
+}
+
+/// AUDIT M-8 (2026-07) — emitted when the authority reseats a market's
+/// order-sequence counter (only permitted on a fully empty book).
+#[event]
+pub struct OrderSeqCounterReseatEvent {
+    pub market: Pubkey,
+    pub previous_counter: u64,
 }
 
 #[event]
