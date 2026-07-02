@@ -247,6 +247,8 @@ pub enum FlashBookError {
     TooManyStressScenarios = 2309,
     #[msg("Order sequence counter exhausted for this market — the book must be reseated")]
     OrderSeqExhaustedReseat = 2310,
+    #[msg("Order-sequence reseat requires a fully empty, L1-resident book")]
+    ReseatRequiresEmptyBook = 2311,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
