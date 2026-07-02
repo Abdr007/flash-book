@@ -45,12 +45,18 @@ pub const DEFAULT_VOLUME_WINDOW_SLOTS: u64 = 3_024_000;
 // permissionless market creation / bond infrastructure in Flash Book
 // V3. Markets are now authority-gated only.
 
-/// Maximum stress scenarios per batch — capped to keep margin compute bounded.
-/// At 60 scenarios × 8 markets × 16 positions = 7680 evaluations per batch.
-pub const MAX_STRESS_SCENARIOS: usize = 64;
-
 /// Maximum positions per trader, used for stress-lattice loops.
 pub const MAX_POSITIONS_PER_TRADER: usize = 16;
+
+/// AUDIT M-9 (2026-07): maximum stress scenarios `assess_margin` will accept,
+/// now ENFORCED (previously declared as 64 but never checked, while the
+/// on-chain generator produced more). `default_scenarios` emits exactly
+/// `5 + 8·N` scenarios for `N` markets (1 flat + 8 single-market shocks per
+/// market + 4 uniform all-up/down/black-swan), so with `N ≤
+/// MAX_POSITIONS_PER_TRADER` the true maximum is `5 + 8·16 = 133`. Setting the
+/// cap to exactly that bound keeps the compute cost bounded
+/// (≤ 133 × 16 ≈ 2128 evaluations) without ever rejecting a legitimate caller.
+pub const MAX_STRESS_SCENARIOS: usize = 5 + 8 * MAX_POSITIONS_PER_TRADER;
 
 /// Maximum FLP quote levels per side per batch.
 pub const MAX_FLP_QUOTE_LEVELS: usize = 16;

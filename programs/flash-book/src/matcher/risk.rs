@@ -7,13 +7,14 @@
 //! risk in every scenario; only the maintenance margin on stressed notional
 //! remains.
 //!
-//! Cost: O(N_positions × N_scenarios). Bounded at compile time by
-//! MAX_POSITIONS_PER_TRADER × MAX_STRESS_SCENARIOS = 16 × 64 = 1024 evals.
+//! Cost: O(N_positions × N_scenarios). Bounded (and now ENFORCED, AUDIT M-9)
+//! by MAX_POSITIONS_PER_TRADER × MAX_STRESS_SCENARIOS = 16 × 133 = 2128 evals —
+//! `assess_margin` rejects a scenario vector longer than MAX_STRESS_SCENARIOS.
 
 use super::funding::{funding_owed, FundingIndex};
 use super::lot::Ticks;
 use super::order::Side;
-use crate::constants::BPS_DENOM;
+use crate::constants::{BPS_DENOM, MAX_STRESS_SCENARIOS};
 use crate::errors::{FlashBookError, OrOverflow};
 use anchor_lang::prelude::*;
 
@@ -420,6 +421,15 @@ pub fn assess_margin(
     scenarios: &[Scenario],
     collateral_quote_lots: u64,
 ) -> Result<MarginAssessment> {
+    // AUDIT M-9 (2026-07): bound the compute cost. The on-chain generator never
+    // exceeds MAX_STRESS_SCENARIOS, so this never rejects a legitimate caller —
+    // it caps a pathological / future caller that could otherwise pass an
+    // unbounded scenario vector and exhaust the compute budget (a griefing /
+    // un-liquidatable vector).
+    require!(
+        scenarios.len() <= MAX_STRESS_SCENARIOS,
+        FlashBookError::TooManyStressScenarios
+    );
     // Equity at current marks.
     let mut unrealized_total: i128 = 0;
     let mut funding_total: i128 = 0;
@@ -1282,5 +1292,40 @@ mod high1_cross_market_regression {
         }]];
         let a = assess_margin(&positions, &[m], &scenarios, 0).unwrap();
         assert_eq!(a.required_quote_lots, 1); // MM(5) - pnl_stressed(4)
+    }
+}
+
+#[cfg(test)]
+mod m9_scenario_cap {
+    //! AUDIT M-9 (2026-07): the stress-scenario count is bounded and ENFORCED.
+    use super::*;
+
+    fn flat_scenarios(n: usize) -> Vec<Scenario> {
+        (0..n).map(|_| Vec::new()).collect()
+    }
+
+    #[test]
+    fn accepts_exactly_at_cap() {
+        // Empty portfolio + MAX flat scenarios: the cap admits it (== bound).
+        let r = assess_margin(&[], &[], &flat_scenarios(MAX_STRESS_SCENARIOS), 0);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn rejects_over_cap() {
+        let r = assess_margin(&[], &[], &flat_scenarios(MAX_STRESS_SCENARIOS + 1), 0);
+        assert!(r.is_err(), "a scenario vector past the cap must be rejected");
+    }
+
+    #[test]
+    fn generator_at_max_markets_stays_within_cap() {
+        // The real on-chain generator, at the maximum market count, must fit the
+        // cap — so enforcement never rejects a legitimate caller.
+        let markets: Vec<Pubkey> = (0..crate::constants::MAX_POSITIONS_PER_TRADER as u8)
+            .map(|i| Pubkey::new_from_array([i + 1; 32]))
+            .collect();
+        let s = default_scenarios(&markets);
+        assert_eq!(s.len(), 5 + 8 * markets.len());
+        assert!(s.len() <= MAX_STRESS_SCENARIOS, "generator exceeded the cap");
     }
 }
