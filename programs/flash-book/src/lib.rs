@@ -10207,6 +10207,20 @@ pub mod flash_book {
             .map_err(|_| error!(FlashBookError::OracleTooStale))?;
         require!(px.price > 0, FlashBookError::ZeroPrice);
 
+        // AUDIT (2026-07): Lazer REPLAY-NONCE. A Lazer payload is public and stays
+        // signature-valid for the entire staleness window, so without a monotonic
+        // gate a permissionless caller could re-post the SAME price (or an older
+        // in-window one) to re-anchor the mark / reset the envelope's per-slot
+        // baseline off a stale print. Require a strictly-increasing publisher
+        // timestamp per config; the nonce is advanced only AFTER every gate passes
+        // (below), so a rejected update cannot burn it. `timestamp_us` is the
+        // Lazer-signed publish time (microseconds) — monotonic by construction for
+        // genuine successive prints; equal/earlier ⇒ a replay or reorder.
+        require!(
+            px.timestamp_us > ctx.accounts.oracle_config.last_lazer_timestamp_us,
+            FlashBookError::OracleLazerReplay
+        );
+
         // AUDIT F-1 (re-audit): enforce the confidence-interval gate the Pyth and
         // trusted paths apply. A genuinely Lazer-signed but wide-confidence
         // (uncertain) tick — the JELLY/POPCAT-class signal this gate exists to
@@ -10281,6 +10295,9 @@ pub mod flash_book {
             channel: px.channel,
             publish_time_unix: published_unix,
         });
+        // Advance the replay nonce AFTER a fully-accepted update (the `market`
+        // borrow above ends here), so a gate-rejected price never burns it.
+        ctx.accounts.oracle_config.last_lazer_timestamp_us = px.timestamp_us;
         Ok(())
     }
 
@@ -17614,7 +17631,9 @@ pub struct UpdateOracleFromLazer<'info> {
     )]
     pub market: Box<Account<'info, MarketAccount>>,
 
+    // `mut`: the handler advances `last_lazer_timestamp_us` (the replay nonce).
     #[account(
+        mut,
         seeds = [state_v3::MarketOracleConfigAccount::SEED, market.key().as_ref()],
         bump = oracle_config.bump,
         constraint = oracle_config.market == market.key() @ FlashBookError::WrongMarket,
