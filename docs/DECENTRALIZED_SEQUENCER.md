@@ -109,21 +109,31 @@ This is where the real engineering-months live.
 
 - **Phase 0 (done).** Single sequencer + authenticity + monotonic `fill_seq` +
   mark clamp. The residual is *bounded*, not open.
-- **Phase 1 (on-chain primitive, backward-compatible).** Introduce the committee as
-  **N = 1, threshold = 1** — functionally **identical** to today's single sequencer,
-  so zero behavior change, but the settlement-authorization primitive and the batch
-  path now exist. This is the first concrete PR (see §7). Fully CI + live-ER
-  verifiable because 1-of-1 reproduces current behavior.
-- **Phase 2 (on-chain).** Enable **N > 1, threshold = 2f+1** batch attestation +
-  state-root chaining + governance rotation. Verify against a local multi-signer
-  test harness.
+- **Phase 1 — DONE (#218).** `SequencerCommittee` PDA + authority-gated
+  `set_sequencer_committee` + the Kani-proven BFT-quorum logic
+  (`matcher::committee`). `N = 1, threshold = 1` reproduces the single sequencer,
+  so **zero behavior change**; the primitive + governance now exist. Deployed +
+  live-ER 7/7.
+- **Phase 2 — DONE (#219).** `commit_batch`: permissionless commit of a
+  **committee-attested state transition** — verifies `≥ threshold` **distinct**
+  validators each Ed25519-signed the canonical batch (native precompile over the
+  keccak digest), with epoch check, strictly-increasing `batch_seq`
+  (replay/reorder guard) and `prev→new` state-root chaining, recorded on the
+  `BatchAttestation` PDA. **Verified live 9/9** on devnet (`committee_acceptance.mjs`):
+  3-of-4 quorum accepted; sub-quorum / forged-sig / non-member / replay /
+  broken-chain rejected; a chained batch under a *different* quorum accepted.
+- **Phase 2.5 — DONE.** `matcher::merkle` — the pure, generic, Kani-proven
+  fill-**inclusion** fold (a fill's leaf → `fills_merkle_root`). The bridge a future
+  `settle_batch` uses to prove a specific fill belongs to an attested batch.
 - **Phase 3 (off-chain).** Build the BFT consensus engine + deterministic CLOB
-  replica + validator client.
-- **Phase 4.** Stand up the validator set on devnet, rotate 1-of-1 → M-of-N, run
-  the live acceptance suite against the committee, then mainnet.
+  replica + validator client. *(The engineering-months; separate system.)*
+- **Phase 4.** Wire settlement to require a valid committee attestation + fill
+  inclusion; stand up the validator set on devnet, rotate 1-of-1 → M-of-N, run the
+  live acceptance suite against the committee, then mainnet.
 
-Each phase is independently reviewable; Phase 1 is safe *because* it's a no-op
-functionally.
+Each phase is independently reviewable; Phases 1/2/2.5 are safe because they are
+**additive and off the settlement hot path** — settlement is not yet gated on the
+attestation (Phase 4), so they move no funds while the off-chain engine is built.
 
 ## 7. The concrete first PR (Phase 1)
 
