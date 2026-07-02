@@ -148,6 +148,31 @@ pub fn partial_collateral_proves_insolvent(
     Ok(partial_collateral > headroom)
 }
 
+/// AUDIT M-6 (2026-07): one-sided detector for an OVER-STATED haircut `residual`.
+///
+/// `residual` is the sole backing for junior-profit extraction (convert_position
+/// credits `min(residual, matured)/matured` of matured PnL). It must be covered
+/// by the vault SURPLUS (`vault − collateral − flp − insurance`). Since
+/// `partial_collateral <= total_collateral`, if `partial + flp + insurance +
+/// residual` already exceeds the vault, the residual is PROVABLY over-stated /
+/// unbacked, regardless of the unseen collateral remainder. Sound in one
+/// direction: `true` ⇒ the residual is definitely unbacked — it never fires on a
+/// genuinely-backed residual. Saturating u128 arithmetic (no overflow path).
+#[inline]
+pub fn residual_exceeds_backed_surplus(
+    partial_collateral: u64,
+    flp_capital: u64,
+    insurance: u64,
+    residual: u128,
+    vault: u64,
+) -> bool {
+    let committed = (partial_collateral as u128)
+        .saturating_add(flp_capital as u128)
+        .saturating_add(insurance as u128)
+        .saturating_add(residual);
+    committed > vault as u128
+}
+
 /// Assess protocol solvency over the vault / insurance / FLP-capital buckets.
 /// `Err(())` iff `insurance + flp_capital` overflows u64 (unreachable for real
 /// balances — the caller maps it to ArithmeticOverflow).
@@ -244,6 +269,42 @@ mod solvency_kani_proofs {
                 assert!(surplus == 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod m6_residual_backing_tests {
+    //! AUDIT M-6 (2026-07): sound one-sided detection of an over-stated residual.
+    use super::residual_exceeds_backed_surplus;
+
+    #[test]
+    fn backed_residual_passes() {
+        // vault 1000; collateral 400 + flp 200 + insurance 100 = 700 committed;
+        // residual 200 → 900 <= 1000 → backed (no flag).
+        assert!(!residual_exceeds_backed_surplus(400, 200, 100, 200, 1000));
+        // exactly at the surplus (900 committed, residual 100 → 1000) is OK.
+        assert!(!residual_exceeds_backed_surplus(400, 200, 100, 100, 1000));
+    }
+
+    #[test]
+    fn overstated_residual_flagged() {
+        // Same buckets (700), residual 301 → 1001 > 1000 → provably unbacked.
+        assert!(residual_exceeds_backed_surplus(400, 200, 100, 301, 1000));
+        // Residual alone exceeds the whole vault.
+        assert!(residual_exceeds_backed_surplus(0, 0, 0, 1_001, 1000));
+    }
+
+    #[test]
+    fn partial_collateral_is_conservative() {
+        // Even a PARTIAL collateral sum that (with the others + residual) exceeds
+        // the vault proves insolvency, because total >= partial.
+        assert!(residual_exceeds_backed_surplus(950, 0, 0, 60, 1000));
+    }
+
+    #[test]
+    fn saturating_no_overflow() {
+        // u128 residual near max + u64 buckets must not panic.
+        assert!(residual_exceeds_backed_surplus(u64::MAX, u64::MAX, u64::MAX, u128::MAX, u64::MAX));
     }
 }
 

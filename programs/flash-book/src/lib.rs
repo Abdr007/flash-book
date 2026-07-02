@@ -10926,6 +10926,29 @@ pub mod flash_book {
             fully_covered,
         });
 
+        // AUDIT M-6 (2026-07): if a haircut state is supplied, verify its
+        // `residual` (the sole backing bound for junior-profit extraction via
+        // convert_position) is actually backed by the vault surplus. `residual`
+        // is set/grown by `seed_residual` (authority-asserted) and was otherwise
+        // never reconciled against real balances — an over-stated residual
+        // drives the haircut ratio h→1 and lets traders convert matured PnL
+        // beyond the protocol's true surplus. Sound one-sided:
+        // `partial_collateral <= total`, so if partial + flp + insurance +
+        // residual already exceeds the vault, the residual is PROVABLY
+        // over-stated (never a false positive on a genuinely-backed residual).
+        if let Some(hs) = ctx.accounts.haircut_state.as_ref() {
+            require!(
+                !matcher::insurance::residual_exceeds_backed_surplus(
+                    partial_collateral,
+                    flp_capital,
+                    insurance_bal,
+                    hs.residual_quote_lots,
+                    vault_amount,
+                ),
+                FlashBookError::HaircutResidualUnbacked
+            );
+        }
+
         // One-sided hard fail — only ever fires on genuine insolvency. Off-chain
         // monitors should poll this with the full trader set and page on error.
         require!(!insolvent, FlashBookError::ProtocolInsolvent);
@@ -11973,6 +11996,11 @@ pub struct VerifyCollateralSolvency<'info> {
     /// The protocol's quote-token vault.
     #[account(address = insurance_fund.quote_vault)]
     pub quote_vault: Account<'info, TokenAccount>,
+
+    /// AUDIT M-6 (2026-07): optional — when supplied, its `residual` is checked
+    /// to be backed by the vault surplus. `None` = legacy behavior (backward
+    /// compatible; existing callers are unaffected).
+    pub haircut_state: Option<Account<'info, state_v3::MarketHaircutStateAccount>>,
 }
 
 #[derive(Accounts)]
