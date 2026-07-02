@@ -6841,6 +6841,16 @@ pub mod flash_book {
         requested_close_lots: u64,
     ) -> Result<()> {
         let market = &ctx.accounts.market;
+        // AUDIT HIGH-8 (2026-07): no liquidation while the market is Paused. A
+        // paused market is frozen (no order intake, no fresh fills), so its mark
+        // is uncertain; liquidating on it is unsafe and would let a malicious
+        // authority pause + push the mark + liquidate the trapped book. Positions
+        // are held until the market resumes. (Closed markets still liquidate to
+        // wind down the sunset.)
+        require!(
+            market.status != MarketStatus::Paused as u8,
+            FlashBookError::MarketPaused
+        );
         // Snapshot the position (Copy) so reads don't hold a borrow that
         // would collide with the later `load_mut()` write-back.
         let position = *ctx.accounts.position.load()?;
@@ -7460,6 +7470,13 @@ pub mod flash_book {
         require!(close_size_lots > 0, FlashBookError::ZeroSize);
 
         let market = &ctx.accounts.market;
+        // AUDIT HIGH-8 (2026-07): no ADL while the market is Paused (see
+        // liquidate_position_v2) — a frozen market must not be deleveraged on an
+        // uncertain mark.
+        require!(
+            market.status != MarketStatus::Paused as u8,
+            FlashBookError::MarketPaused
+        );
         // Snapshot both positions (Copy) so reads don't hold borrows that
         // collide with the later `load_mut()` write-backs. These are
         // DIFFERENT accounts, but the snapshot keeps each read clean.
@@ -7846,6 +7863,13 @@ pub mod flash_book {
         ctx: Context<'info, LiquidatePortfolioV2<'info>>,
     ) -> Result<()> {
         let exec_market = &ctx.accounts.execution_market;
+        // AUDIT HIGH-8 (2026-07): no portfolio liquidation while the execution
+        // market is Paused (see liquidate_position_v2) — a frozen market must not
+        // be liquidated on an uncertain mark.
+        require!(
+            exec_market.status != MarketStatus::Paused as u8,
+            FlashBookError::MarketPaused
+        );
         let exec_position = *ctx.accounts.execution_position.load()?;
         let trader_state = ctx.accounts.trader_state.load()?;
 
