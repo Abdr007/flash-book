@@ -10387,6 +10387,15 @@ pub mod flash_book {
             .checked_add(delta as u128)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
 
+        // AUDIT M-7 (2026-07): matured_pos_total just changed → refresh the
+        // cached h so verify_haircut_invariants' consistency check stays true.
+        let h_post = matcher::haircut::compute_h(
+            market_haircut.residual_quote_lots,
+            market_haircut.matured_pos_total_quote_lots,
+        );
+        market_haircut.h_scaled_cached = h_post.min(u64::MAX as u128) as u64;
+        market_haircut.h_cached_at_slot = now_slot;
+
         emit!(PositionMaturedEvent {
             market: market_haircut.market,
             position: pos_haircut.position,
@@ -10473,8 +10482,16 @@ pub mod flash_book {
             &mut ctx.accounts.trader_state,
         )?;
 
-        // Cache the freshly-computed h for off-chain readers.
-        market_haircut.h_scaled_cached = h_scaled.min(u64::MAX as u128) as u64;
+        // AUDIT M-7 (2026-07): cache h recomputed from the POST-mutation residual
+        // / matured totals — NOT the pre-convert `h_scaled` above. `residual` and
+        // `matured_pos_total` were just decremented, so caching the pre-convert
+        // value with a fresh slot made `verify_haircut_invariants`'
+        // `cached_h_consistent` check report a (false) breach after every convert.
+        let h_post = matcher::haircut::compute_h(
+            market_haircut.residual_quote_lots,
+            market_haircut.matured_pos_total_quote_lots,
+        );
+        market_haircut.h_scaled_cached = h_post.min(u64::MAX as u128) as u64;
         market_haircut.h_cached_at_slot = Clock::get()?.slot;
 
         emit!(PositionConvertedEvent {
@@ -10997,6 +11014,14 @@ pub mod flash_book {
         let new_residual = matcher::haircut::apply_residual_delta(st.residual_quote_lots, delta)
             .map_err(map_haircut_error)?;
         st.residual_quote_lots = new_residual;
+        // AUDIT M-7 (2026-07): residual just changed → refresh the cached h so
+        // verify_haircut_invariants' consistency check stays true.
+        let h_post = matcher::haircut::compute_h(
+            st.residual_quote_lots,
+            st.matured_pos_total_quote_lots,
+        );
+        st.h_scaled_cached = h_post.min(u64::MAX as u128) as u64;
+        st.h_cached_at_slot = Clock::get()?.slot;
         emit!(ResidualSeededEvent {
             market: st.market,
             delta,
