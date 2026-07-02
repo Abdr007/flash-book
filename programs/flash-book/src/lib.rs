@@ -4042,9 +4042,24 @@ pub mod flash_book {
         // .sequencer). A market whose sequencer is still the zero pubkey
         // (pre-field markets) fails closed here — settlement halts until
         // `set_market_sequencer` is called.
-        require_keys_eq!(
-            ctx.accounts.sequencer.key(),
-            ctx.accounts.market.sequencer,
+        // AUDIT (2026-07): PERMISSIONLESS keeper for ARMED markets. On an armed
+        // market (`fill_commitment_required`, the §3.2 default) the commitment ring
+        // below FULLY constrains settlement — `apply_fill` recomputes
+        // `keccak(fill_preimage)`, which binds the market, BOTH trader identities
+        // (from the passed trader-state accounts), side, size, price, sub-indices
+        // and the JIT flag, and pops it FIFO (`buffer_settle`). So a caller can only
+        // settle the EXACT committed fills, to the EXACT committed parties, in
+        // order; it cannot fabricate, redirect, alter, or reorder (and the ring +
+        // haircut accounts are MANDATORY when armed/enabled — see below). Therefore
+        // ANY signer may drive settlement on an armed market: the industry-standard
+        // permissionless-keeper model (censorship-resistant, ZERO extra CU vs. a
+        // single sequencer). An UNARMED (legacy) market has no ring enforcement, so
+        // it stays gated on the single `market.sequencer` (failing closed if that is
+        // still the zero key). The `sequencer` account is just the fee-paying signer
+        // here — for an armed market it need not equal `market.sequencer`.
+        require!(
+            ctx.accounts.market.fill_commitment_required
+                || ctx.accounts.sequencer.key() == ctx.accounts.market.sequencer,
             FlashBookError::Unauthorized
         );
 

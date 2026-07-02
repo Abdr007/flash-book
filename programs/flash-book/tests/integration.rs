@@ -3892,6 +3892,71 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
     assert_eq!(taker_p.size_lots, 1, "taker size 1 lot");
 }
 
+/// PERMISSIONLESS KEEPER (2026-07): on an ARMED market the commitment ring FULLY
+/// constrains settlement — `apply_fill` recomputes `keccak(fill_preimage)` (which
+/// binds both trader identities, side, size, price) and pops it FIFO. So a caller
+/// can only settle the EXACT committed fill, to the EXACT committed parties, in
+/// order; it cannot fabricate/redirect/reorder. Therefore ANY signer — not just
+/// `market.sequencer` — may drive settlement (the industry-standard, censorship-
+/// resistant, zero-extra-CU permissionless-keeper model). Here a ROGUE keeper (NOT
+/// the sequencer) settles the real committed fill and it SUCCEEDS.
+#[tokio::test]
+async fn armed_apply_fill_permissionless_keeper_settles_committed_fill() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let (taker_pos, _) = pda(&[flash_book::state::PositionAccount::SEED, market_pda.as_ref(), taker_state.as_ref()]);
+    let (maker_pos, _) = pda(&[flash_book::state::PositionAccount::SEED, market_pda.as_ref(), maker_state.as_ref()]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market_pda.as_ref()]);
+
+    async fn send(ctx: &mut solana_program_test::ProgramTestContext, ix: Instruction, signers: &[&Keypair]) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&signers[0].pubkey()), signers, bh)).await
+    }
+
+    send(&mut ctx, build_ix(flash_book::instruction::InitMarketBook {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(system_program::ID, false)]), &[&payer]).await.unwrap();
+    send(&mut ctx, build_ix(flash_book::instruction::InitFillCommitment { cap: 256 }, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(fc_pda, false), AccountMeta::new_readonly(system_program::ID, false)]), &[&payer]).await.unwrap();
+    send(&mut ctx, build_ix(flash_book::instruction::PlaceLimitOrderV2 { side: 1, size_lots: 5, limit_ticks: 100_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(maker.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false)]), &[&payer, &maker]).await.unwrap();
+    send(&mut ctx, build_ix(flash_book::instruction::PlaceTakerOrderV2 { side: 0, size_lots: 1, limit_ticks: 100_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(taker.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new(fc_pda, false)]), &[&payer, &taker]).await.unwrap();
+
+    // Fund a ROGUE keeper (NOT market.sequencer) so the only variable is the auth model.
+    let rogue = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[system_instruction::transfer(&payer.pubkey(), &rogue.pubkey(), 1_000_000_000)], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+
+    // The ROGUE settles the SAME committed fill — armed market ⇒ permissionless ⇒ SUCCEEDS.
+    send(&mut ctx, build_ix(
+        flash_book::instruction::ApplyFill { size_lots: 1, price_ticks: 100_000, taker_side: 0, taker_was_jit: false, taker_sub_index: 0, maker_sub_index: 0, fill_seq: 1 },
+        vec![
+            AccountMeta::new(rogue.pubkey(), true), // NOT the sequencer
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(fc_pda, false),
+        ],
+    ), &[&rogue]).await.expect("armed market: a permissionless keeper must settle a committed fill");
+
+    let taker_p: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(taker_p.side, 0, "taker long after permissionless-keeper settle");
+    assert_eq!(taker_p.size_lots, 1, "taker size 1 lot (permissionless keeper)");
+}
+
 /// C-2 regression: `partial_withdraw_collateral` must reject a caller who
 /// omits an open position from `remaining_accounts`. Before the fix the
 /// handler only checked `remaining.len() % 2 == 0`, so a trader could
