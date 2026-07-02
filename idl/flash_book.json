@@ -11158,6 +11158,131 @@
       "args": []
     },
     {
+      "name": "slash_equivocation",
+      "docs": [
+        "M-14 decentralization (Phase 2.6): PERMISSIONLESSLY slash a validator that",
+        "PROVABLY equivocated — Ed25519-signed two conflicting batches at the SAME",
+        "consensus height (`epoch`, `batch_seq`) but with DIFFERENT content. Both",
+        "signatures are verified by the native precompile against the SAME validator",
+        "and the two committed digests must differ at that height (the canonical BFT",
+        "fault). On proof the validator is JAILED (`committee.jailed_mask`) — its",
+        "attestations no longer count toward any quorum in `commit_batch`.",
+        "Permissionless: anyone can submit the fraud proof. Governance re-forms the",
+        "committee via `set_sequencer_committee` (which clears the jail state)."
+      ],
+      "discriminator": [
+        20,
+        87,
+        239,
+        196,
+        234,
+        109,
+        43,
+        138
+      ],
+      "accounts": [
+        {
+          "name": "reporter",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "committee",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  101,
+                  113,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116,
+                  116,
+                  101,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "instructions_sysvar",
+          "docs": [
+            "`verify_ed25519_precompile`."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "validator_slot",
+          "type": "u8"
+        },
+        {
+          "name": "header_a",
+          "type": {
+            "defined": {
+              "name": "BatchHeader"
+            }
+          }
+        },
+        {
+          "name": "ed25519_ix_index_a",
+          "type": "u8"
+        },
+        {
+          "name": "header_b",
+          "type": {
+            "defined": {
+              "name": "BatchHeader"
+            }
+          }
+        },
+        {
+          "name": "ed25519_ix_index_b",
+          "type": "u8"
+        }
+      ]
+    },
+    {
       "name": "stamp_book_liveness_baseline",
       "docs": [
         "PERMISSIONLESS one-shot: stamp the force-undelegate liveness baseline for a",
@@ -16177,6 +16302,19 @@
         217,
         212,
         45
+      ]
+    },
+    {
+      "name": "ValidatorJailedEvent",
+      "discriminator": [
+        235,
+        113,
+        149,
+        208,
+        185,
+        250,
+        126,
+        29
       ]
     },
     {
@@ -21997,11 +22135,21 @@
             }
           },
           {
+            "name": "jailed_mask",
+            "docs": [
+              "PHASE 2.6 — equivocation jail bitmask: bit `i` set ⇒ `validators[i]` was",
+              "PROVABLY caught double-signing conflicting batches (`slash_equivocation`)",
+              "and no longer counts toward a quorum. Carved from the former `_reserved`",
+              "(backward-compatible: pre-existing committees read it as 0 = none jailed)."
+            ],
+            "type": "u64"
+          },
+          {
             "name": "_reserved",
             "type": {
               "array": [
                 "u8",
-                64
+                56
               ]
             }
           }
@@ -23159,6 +23307,34 @@
           },
           {
             "name": "acceptable_price_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ValidatorJailedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "epoch",
+            "type": "u64"
+          },
+          {
+            "name": "validator",
+            "type": "pubkey"
+          },
+          {
+            "name": "validator_slot",
+            "type": "u8"
+          },
+          {
+            "name": "height_seq",
             "type": "u64"
           }
         ]

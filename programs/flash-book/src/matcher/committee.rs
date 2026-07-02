@@ -78,9 +78,73 @@ pub fn attestation_meets_threshold(
     true
 }
 
+/// True iff committee slot `slot` is jailed (its bit is set in `jailed_mask`).
+#[inline]
+pub fn is_jailed(jailed_mask: u64, slot: u8) -> bool {
+    (slot as u32) < 64 && (jailed_mask & (1u64 << slot)) != 0
+}
+
+/// Jail `slot` (idempotent set of its bit). Slots ≥ 64 are ignored.
+#[inline]
+pub fn jail_slot(jailed_mask: u64, slot: u8) -> u64 {
+    if (slot as u32) < 64 {
+        jailed_mask | (1u64 << slot)
+    } else {
+        jailed_mask
+    }
+}
+
+/// PHASE 2.6 equivocation predicate. Two attestations by the SAME validator are a
+/// slashable equivocation iff they cover the SAME consensus height (`epoch`,
+/// `batch_seq`) but commit to DIFFERENT content (distinct signed digest). A BFT
+/// validator must sign at most one value per height; two distinct values at one
+/// height is the canonical, provable fault (and, by quorum intersection, what a
+/// safety violation requires).
+#[inline]
+pub fn is_equivocation(
+    epoch_a: u64,
+    seq_a: u64,
+    digest_a: &[u8; 32],
+    epoch_b: u64,
+    seq_b: u64,
+    digest_b: &[u8; 32],
+) -> bool {
+    epoch_a == epoch_b && seq_a == seq_b && digest_a != digest_b
+}
+
 #[cfg(kani)]
 mod proofs {
-    use super::is_valid_bft_config;
+    use super::{is_equivocation, is_jailed, jail_slot, is_valid_bft_config};
+
+    /// Jailing is a monotone idempotent set: after `jail_slot`, the slot reads
+    /// jailed, and re-jailing changes nothing. ∀ (mask, slot < 64).
+    #[kani::proof]
+    fn jail_then_is_jailed() {
+        let mask: u64 = kani::any();
+        let slot: u8 = kani::any();
+        kani::assume((slot as u32) < 64);
+        let m2 = jail_slot(mask, slot);
+        assert!(is_jailed(m2, slot));
+        assert_eq!(jail_slot(m2, slot), m2); // idempotent
+    }
+
+    /// Equivocation is exactly "same height, different digest" — and is symmetric
+    /// in the two attestations. ∀ (epoch, seq, digests).
+    #[kani::proof]
+    fn equivocation_iff_same_height_diff_digest() {
+        let e: u64 = kani::any();
+        let s: u64 = kani::any();
+        let da: [u8; 32] = kani::any();
+        let db: [u8; 32] = kani::any();
+        assert_eq!(is_equivocation(e, s, &da, e, s, &db), da != db);
+        // symmetric
+        assert_eq!(
+            is_equivocation(e, s, &da, e, s, &db),
+            is_equivocation(e, s, &db, e, s, &da)
+        );
+        // different height is never equivocation, whatever the digests
+        assert!(!is_equivocation(e, s, &da, e, s.wrapping_add(1), &db));
+    }
 
     /// THE safety property: a valid BFT config guarantees quorum INTERSECTION —
     /// `2·threshold > N`, so two size-`threshold` quorums drawn from `N`
@@ -146,6 +210,23 @@ mod tests {
         // N=1, threshold=1 — the backward-compatible single-sequencer quorum.
         assert!(attestation_meets_threshold(&[a], 1, 1, &[a]));
         assert!(!attestation_meets_threshold(&[a], 1, 1, &[b])); // not the member
+    }
+
+    #[test]
+    fn jail_and_equivocation() {
+        assert!(!is_jailed(0, 0));
+        let m = jail_slot(0, 3);
+        assert!(is_jailed(m, 3) && !is_jailed(m, 2));
+        assert_eq!(jail_slot(m, 3), m); // idempotent
+        let m2 = jail_slot(m, 0);
+        assert!(is_jailed(m2, 0) && is_jailed(m2, 3));
+
+        let da = [1u8; 32];
+        let db = [2u8; 32];
+        assert!(is_equivocation(1, 5, &da, 1, 5, &db)); // same height, diff digest
+        assert!(!is_equivocation(1, 5, &da, 1, 5, &da)); // same digest → not a fault
+        assert!(!is_equivocation(1, 5, &da, 1, 6, &db)); // different seq
+        assert!(!is_equivocation(1, 5, &da, 2, 5, &db)); // different epoch
     }
 
     #[test]
