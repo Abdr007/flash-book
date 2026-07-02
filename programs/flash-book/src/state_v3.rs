@@ -494,7 +494,12 @@ pub struct SequencerCommittee {
     /// The validator set. Only the first `validator_count` entries are live; the
     /// rest are `Pubkey::default()`.
     pub validators: [Pubkey; crate::constants::MAX_COMMITTEE_VALIDATORS],
-    pub _reserved: [u8; 64],
+    /// PHASE 2.6 — equivocation jail bitmask: bit `i` set ⇒ `validators[i]` was
+    /// PROVABLY caught double-signing conflicting batches (`slash_equivocation`)
+    /// and no longer counts toward a quorum. Carved from the former `_reserved`
+    /// (backward-compatible: pre-existing committees read it as 0 = none jailed).
+    pub jailed_mask: u64,
+    pub _reserved: [u8; 56],
 }
 impl SequencerCommittee {
     pub const SEED: &'static [u8] = b"seq_committee";

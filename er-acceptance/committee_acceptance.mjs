@@ -91,6 +91,19 @@ async function commit(seq, prevRoot, newRoot, signVals, { corrupt = false } = {}
   }).instruction();
   return send([...ed, ci]);
 }
+const toHeader = (h) => ({ epoch: new BN(h.epoch), batchSeq: new BN(h.batchSeq), prevStateRoot: Array.from(h.prevRoot), fillsMerkleRoot: Array.from(h.fillsRoot), newStateRoot: Array.from(h.newRoot), markTicks: new BN(h.mark) });
+const edIx = (val, digest) => Ed25519Program.createInstructionWithPublicKey({ publicKey: val.publicKey.toBytes(), message: digest, signature: nacl.sign.detached(digest, val.secretKey) });
+
+// slash_equivocation: validator `slot` signs TWO conflicting batches at the same
+// (epoch, seq) but different new_state_root → provable equivocation → jail.
+async function slash(slot, seq, newA, newB) {
+  const val = validators[slot];
+  const base = { epoch, batchSeq: seq, prevRoot: new Uint8Array(32), fillsRoot: new Uint8Array(32).fill(7), mark: 100000 };
+  const hA = { ...base, newRoot: newA }, hB = { ...base, newRoot: newB };
+  const ed = [edIx(val, digestOf(M, hA)), edIx(val, digestOf(M, hB))];
+  const si = await program.methods.slashEquivocation(slot, toHeader(hA), 0, toHeader(hB), 1).accountsPartial({ reporter: signer.publicKey, market: M, committee: COMM, instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY }).instruction();
+  return send([...ed, si]);
+}
 const expectFail = async (name, fn) => { try { await fn(); bad(name, "was ACCEPTED (should reject)"); } catch { ok(name); } };
 
 console.log(`committee (Phase 2) acceptance — L1=${L1_RPC}`);
@@ -148,6 +161,28 @@ try {
 
   // 7. broken chain (wrong prev_state_root) → REJECT
   await expectFail("broken chain (prev != last_state_root) REJECTED", () => commit(3, R1, R0, [validators[0], validators[1], validators[2]]));
+
+  // 8. EQUIVOCATION: validator 0 double-signs conflicting batches at (epoch, seq 9) → JAIL
+  await slash(0, 9, new Uint8Array(32).fill(0xaa), new Uint8Array(32).fill(0xbb));
+  let cc = await program.account.sequencerCommittee.fetch(COMM);
+  ((Number(cc.jailedMask) & 1) === 1) ? ok("equivocator (validator 0) JAILED via permissionless fraud proof") : bad("equivocation slash", `mask=${cc.jailedMask}`);
+
+  // 9. non-equivocation (identical batch signed twice) → slash REJECTED
+  await expectFail("non-equivocation (same digest) slash REJECTED", async () => {
+    const h = { epoch, batchSeq: 9, prevRoot: new Uint8Array(32), fillsRoot: new Uint8Array(32).fill(7), newRoot: new Uint8Array(32).fill(0xcc), mark: 100000 };
+    const d = digestOf(M, h);
+    const ed = edIx(validators[1], d);
+    const si = await program.methods.slashEquivocation(1, toHeader(h), 0, toHeader(h), 1).accountsPartial({ reporter: signer.publicKey, market: M, committee: COMM, instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY }).instruction();
+    await send([ed, ed, si]);
+  });
+
+  // 10. a JAILED validator's attestation is void → a batch including slot 0 REJECTED
+  await expectFail("jailed validator's attestation REJECTED", () => commit(6, R2, R1, [validators[0], validators[1], validators[2]]));
+
+  // 11. quorum from the 3 NON-jailed validators → ACCEPT (BFT liveness holds after slashing f=1)
+  await commit(6, R2, R1, [validators[1], validators[2], validators[3]]);
+  cc = await program.account.batchAttestation.fetch(ATT);
+  (Number(cc.lastBatchSeq) === 6) ? ok("post-jail quorum (3 non-jailed) ACCEPTED — liveness holds") : bad("post-jail quorum", `seq=${cc.lastBatchSeq}`);
 } catch (e) {
   bad("unexpected setup error", String(e.message || e).slice(0, 200));
 }

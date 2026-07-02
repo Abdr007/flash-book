@@ -5859,7 +5859,8 @@ pub mod flash_book {
         committee._pad0 = [0; 5];
         committee.epoch = committee.epoch.saturating_add(1);
         committee.validators = arr;
-        committee._reserved = [0; 64];
+        committee.jailed_mask = 0; // fresh validator set ⇒ clear jail state
+        committee._reserved = [0; 56];
         emit!(SequencerCommitteeSetEvent {
             market: committee.market,
             epoch: committee.epoch,
@@ -5928,6 +5929,11 @@ pub mod flash_book {
                 (a.validator_slot as usize) < committee.validator_count as usize,
                 FlashBookError::OutOfRange
             );
+            // A jailed (proven-equivocating) validator's attestation is void.
+            require!(
+                !matcher::committee::is_jailed(committee.jailed_mask, a.validator_slot),
+                FlashBookError::Unauthorized
+            );
             let validator = committee.validators[a.validator_slot as usize];
             lazer_oracle::verify_ed25519_precompile(
                 &ctx.accounts.instructions_sysvar.to_account_info(),
@@ -5958,6 +5964,83 @@ pub mod flash_book {
             batch_seq: header.batch_seq,
             new_state_root: header.new_state_root,
             attestor_count: attestor_keys.len() as u8,
+        });
+        Ok(())
+    }
+
+    /// M-14 decentralization (Phase 2.6): PERMISSIONLESSLY slash a validator that
+    /// PROVABLY equivocated — Ed25519-signed two conflicting batches at the SAME
+    /// consensus height (`epoch`, `batch_seq`) but with DIFFERENT content. Both
+    /// signatures are verified by the native precompile against the SAME validator
+    /// and the two committed digests must differ at that height (the canonical BFT
+    /// fault). On proof the validator is JAILED (`committee.jailed_mask`) — its
+    /// attestations no longer count toward any quorum in `commit_batch`.
+    /// Permissionless: anyone can submit the fraud proof. Governance re-forms the
+    /// committee via `set_sequencer_committee` (which clears the jail state).
+    pub fn slash_equivocation(
+        ctx: Context<SlashEquivocation>,
+        validator_slot: u8,
+        header_a: BatchHeader,
+        ed25519_ix_index_a: u8,
+        header_b: BatchHeader,
+        ed25519_ix_index_b: u8,
+    ) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let committee = &mut ctx.accounts.committee;
+        require_keys_eq!(committee.market, market_key, FlashBookError::WrongMarket);
+        require!(
+            (validator_slot as usize) < committee.validator_count as usize,
+            FlashBookError::OutOfRange
+        );
+        // The fault must be against THIS committee epoch (slots are epoch-scoped).
+        require!(header_a.epoch == committee.epoch, FlashBookError::OutOfRange);
+        require!(
+            !matcher::committee::is_jailed(committee.jailed_mask, validator_slot),
+            FlashBookError::OutOfRange // already jailed
+        );
+
+        // Same height, DIFFERENT committed content ⇒ equivocation.
+        let digest_a =
+            solana_keccak_hasher::hashv(&[&batch_attestation_message(&market_key, &header_a)[..]]).0;
+        let digest_b =
+            solana_keccak_hasher::hashv(&[&batch_attestation_message(&market_key, &header_b)[..]]).0;
+        require!(
+            matcher::committee::is_equivocation(
+                header_a.epoch,
+                header_a.batch_seq,
+                &digest_a,
+                header_b.epoch,
+                header_b.batch_seq,
+                &digest_b,
+            ),
+            FlashBookError::OutOfRange
+        );
+
+        // The SAME validator signed BOTH conflicting digests (native precompile).
+        let validator = committee.validators[validator_slot as usize];
+        lazer_oracle::verify_ed25519_precompile(
+            &ctx.accounts.instructions_sysvar.to_account_info(),
+            ed25519_ix_index_a as usize,
+            &validator.to_bytes(),
+            &digest_a,
+        )
+        .map_err(|_| error!(FlashBookError::Unauthorized))?;
+        lazer_oracle::verify_ed25519_precompile(
+            &ctx.accounts.instructions_sysvar.to_account_info(),
+            ed25519_ix_index_b as usize,
+            &validator.to_bytes(),
+            &digest_b,
+        )
+        .map_err(|_| error!(FlashBookError::Unauthorized))?;
+
+        committee.jailed_mask =
+            matcher::committee::jail_slot(committee.jailed_mask, validator_slot);
+        emit!(ValidatorJailedEvent {
+            market: market_key,
+            epoch: committee.epoch,
+            validator,
+            validator_slot,
+            height_seq: header_a.batch_seq,
         });
         Ok(())
     }
@@ -13701,6 +13784,28 @@ pub struct CommitBatch<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// M-14 decentralization (Phase 2.6): permissionlessly slash a proven equivocator.
+#[derive(Accounts)]
+pub struct SlashEquivocation<'info> {
+    #[account(mut)]
+    pub reporter: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+    #[account(
+        mut,
+        seeds = [state_v3::SequencerCommittee::SEED, market.key().as_ref()],
+        bump = committee.bump,
+        constraint = committee.market == market.key() @ FlashBookError::WrongMarket,
+    )]
+    pub committee: Box<Account<'info, state_v3::SequencerCommittee>>,
+    /// CHECK: verified to equal the Instructions sysvar inside
+    /// `verify_ed25519_precompile`.
+    pub instructions_sysvar: UncheckedAccount<'info>,
+}
+
 // ─── Wave 22 — Multi-tier fee table ix accounts ──────────────────────
 
 #[derive(Accounts)]
@@ -15360,6 +15465,15 @@ pub struct BatchCommittedEvent {
     pub batch_seq: u64,
     pub new_state_root: [u8; 32],
     pub attestor_count: u8,
+}
+
+#[event]
+pub struct ValidatorJailedEvent {
+    pub market: Pubkey,
+    pub epoch: u64,
+    pub validator: Pubkey,
+    pub validator_slot: u8,
+    pub height_seq: u64,
 }
 
 #[event]
