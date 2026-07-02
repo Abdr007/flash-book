@@ -162,10 +162,14 @@ try {
   });
 
   // ── ER: commit-and-undelegate → process_undelegation finalizes on L1 ──
-  await stage("ER commit_and_undelegate_* → L1 finalize", async () => {
-    await send(er, await program.methods.commitAndUndelegateMarketBook().accountsPartial({ payer: signer.publicKey, marketBook: BOOK, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
-    await send(er, await program.methods.commitAndUndelegateFillCommitment().accountsPartial({ payer: signer.publicKey, fillCommitment: FC, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
-    await send(er, await program.methods.commitAndUndelegateFillOutbox().accountsPartial({ payer: signer.publicKey, fillOutbox: FO, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
+  // M-15: the sequencer-undelegate gate's REJECTION branches are covered
+  // deterministically by the host test `m15_undelegate_gate_tests`; here the
+  // legit round-trip (payer == market.sequencer, real market) proves the gate
+  // ACCEPTS the sequencer on the live ER and does not break undelegation.
+  await stage("ER commit_and_undelegate_* → L1 finalize (M-15 sequencer-gated)", async () => {
+    await send(er, await program.methods.commitAndUndelegateMarketBook().accountsPartial({ payer: signer.publicKey, marketBook: BOOK, market: M, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
+    await send(er, await program.methods.commitAndUndelegateFillCommitment().accountsPartial({ payer: signer.publicKey, fillCommitment: FC, market: M, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
+    await send(er, await program.methods.commitAndUndelegateFillOutbox().accountsPartial({ payer: signer.publicKey, fillOutbox: FO, market: M, magicContext: MAGIC_CONTEXT, magicProgram: MAGIC_PROGRAM }).instruction(), []);
   });
   await sleep(7000); // undelegation callback to L1
 

@@ -824,7 +824,15 @@ pub mod flash_book {
     /// ON THE ER: snapshot final state AND queue undelegation
     /// (`ScheduleCommitAndUndelegate`). After this lands, the delegation
     /// program calls back into `process_undelegation` on base to finalize.
-    pub fn commit_and_undelegate_market_book(ctx: Context<CommitMarketBook>) -> Result<()> {
+    pub fn commit_and_undelegate_market_book(
+        ctx: Context<CommitUndelegateMarketBook>,
+    ) -> Result<()> {
+        assert_sequencer_may_undelegate(
+            &ctx.accounts.market,
+            &ctx.accounts.market_book,
+            state_v2::MARKET_BOOK_SEED,
+            ctx.accounts.payer.key,
+        )?;
         er::cpi_commit(
             &ctx.accounts.payer.to_account_info(),
             &ctx.accounts.magic_context,
@@ -947,8 +955,14 @@ pub mod flash_book {
     /// (`ScheduleCommitAndUndelegate`). The delegation program then calls back into
     /// `process_undelegation` on base to finalize.
     pub fn commit_and_undelegate_fill_commitment(
-        ctx: Context<CommitFillCommitment>,
+        ctx: Context<CommitUndelegateFillCommitment>,
     ) -> Result<()> {
+        assert_sequencer_may_undelegate(
+            &ctx.accounts.market,
+            &ctx.accounts.fill_commitment,
+            matcher::fill_commitment::FILL_COMMIT_SEED,
+            ctx.accounts.payer.key,
+        )?;
         er::cpi_commit(
             &ctx.accounts.payer.to_account_info(),
             &ctx.accounts.magic_context,
@@ -1203,7 +1217,15 @@ pub mod flash_book {
     }
 
     /// ON THE ER: snapshot final state AND queue undelegation of the `fill_outbox`.
-    pub fn commit_and_undelegate_fill_outbox(ctx: Context<CommitFillOutbox>) -> Result<()> {
+    pub fn commit_and_undelegate_fill_outbox(
+        ctx: Context<CommitUndelegateFillOutbox>,
+    ) -> Result<()> {
+        assert_sequencer_may_undelegate(
+            &ctx.accounts.market,
+            &ctx.accounts.fill_outbox,
+            matcher::fill_outbox::FILL_OUTBOX_SEED,
+            ctx.accounts.payer.key,
+        )?;
         er::cpi_commit(
             &ctx.accounts.payer.to_account_info(),
             &ctx.accounts.magic_context,
@@ -12532,6 +12554,116 @@ pub struct ExpandMarketBook<'info> {
 /// the Magic program + validator enforce commit semantics, and the CPI fails
 /// loudly on a non-delegated account. Authority control lives on the base-layer
 /// `delegate_*` instructions (audit ER-1).
+/// AUDIT M-15 (2026-07): gate a permissionless ER `commit_and_undelegate_*` on
+/// the market's sequencer, so an attacker cannot prematurely force a delegated
+/// book/ring/outbox off the rollup (a liveness/griefing DoS on the ER session).
+///
+/// `delegated` is the account being undelegated. It is bound to `market` by
+/// re-deriving its canonical PDA `[seed, market]` under this program — the book
+/// (`[b"market_book", market]`), ring (`[b"fill_commit", market]`) and outbox
+/// (`[b"fill_outbox", market]`) are all per-market PDAs, so the only `market`
+/// key that reproduces the real `delegated` address is the real market; an
+/// attacker cannot substitute a look-alike market with a forged sequencer.
+///
+/// `market` is an UncheckedAccount because on the ER it is delegated (owned by
+/// the delegation program), so `Account<MarketAccount>` cannot load it; we
+/// deserialize the data directly — the 8-byte discriminator and the immutable
+/// `sequencer` field survive delegation unchanged.
+fn assert_sequencer_may_undelegate(
+    market_ai: &AccountInfo,
+    delegated: &AccountInfo,
+    seed: &[u8],
+    payer: &Pubkey,
+) -> Result<()> {
+    let data = market_ai.try_borrow_data()?;
+    let market = MarketAccount::try_deserialize(&mut &data[..])?;
+    check_undelegate_binding(delegated.key, market_ai.key, seed, &market.sequencer, payer)
+}
+
+/// Pure binding + authorization core of [`assert_sequencer_may_undelegate`],
+/// split out for deterministic host testing of BOTH rejection branches:
+/// (1) the `delegated` account must be the canonical `[seed, market]` PDA under
+/// this program (an attacker cannot substitute a look-alike market), and
+/// (2) the caller must be the market's `sequencer`.
+fn check_undelegate_binding(
+    delegated: &Pubkey,
+    market: &Pubkey,
+    seed: &[u8],
+    sequencer: &Pubkey,
+    payer: &Pubkey,
+) -> Result<()> {
+    let (expected, _) = Pubkey::find_program_address(&[seed, market.as_ref()], &crate::ID);
+    require_keys_eq!(*delegated, expected, FlashBookError::WrongMarket);
+    require_keys_eq!(*sequencer, *payer, FlashBookError::Unauthorized);
+    Ok(())
+}
+
+/// M-15: undelegate context — the plain `commit_*` stays permissionless (an
+/// honest snapshot is harmless), but `commit_and_undelegate_*` adds `market` and
+/// is sequencer-gated. Separate from `CommitMarketBook` so plain commit is
+/// unchanged.
+#[derive(Accounts)]
+pub struct CommitUndelegateMarketBook<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: the delegated market_book PDA being committed + undelegated. On the
+    /// ER its owner is the delegation program; `cpi_commit` fails loudly if it is
+    /// not actually delegated. Bound to `market` by the M-15 gate.
+    #[account(mut)]
+    pub market_book: UncheckedAccount<'info>,
+    /// CHECK: the market this book belongs to. Passed writable because on the ER
+    /// only delegated accounts may be non-readonly, and the market IS delegated
+    /// alongside the book; the M-15 gate only READS it (payer == market.sequencer).
+    #[account(mut)]
+    pub market: UncheckedAccount<'info>,
+    /// CHECK: MagicBlock magic context (writable). Address-pinned to MAGIC_CONTEXT_ID.
+    #[account(mut, address = er::MAGIC_CONTEXT_ID)]
+    pub magic_context: UncheckedAccount<'info>,
+    /// CHECK: MagicBlock magic program. Address-pinned to MAGIC_PROGRAM_ID.
+    #[account(address = er::MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
+/// M-15: sequencer-gated undelegate context for the fill-commitment ring.
+#[derive(Accounts)]
+pub struct CommitUndelegateFillCommitment<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: the delegated fill_commitment PDA. Bound to `market` by the M-15 gate.
+    #[account(mut)]
+    pub fill_commitment: UncheckedAccount<'info>,
+    /// CHECK: the market this ring belongs to. Writable: on the ER only delegated
+    /// accounts may be non-readonly, and the market IS delegated; gate only reads.
+    #[account(mut)]
+    pub market: UncheckedAccount<'info>,
+    /// CHECK: MagicBlock magic context (writable). Address-pinned to MAGIC_CONTEXT_ID.
+    #[account(mut, address = er::MAGIC_CONTEXT_ID)]
+    pub magic_context: UncheckedAccount<'info>,
+    /// CHECK: MagicBlock magic program. Address-pinned to MAGIC_PROGRAM_ID.
+    #[account(address = er::MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
+/// M-15: sequencer-gated undelegate context for the fill outbox.
+#[derive(Accounts)]
+pub struct CommitUndelegateFillOutbox<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: the delegated fill_outbox PDA. Bound to `market` by the M-15 gate.
+    #[account(mut)]
+    pub fill_outbox: UncheckedAccount<'info>,
+    /// CHECK: the market this outbox belongs to. Writable: on the ER only delegated
+    /// accounts may be non-readonly, and the market IS delegated; gate only reads.
+    #[account(mut)]
+    pub market: UncheckedAccount<'info>,
+    /// CHECK: MagicBlock magic context (writable). Address-pinned to MAGIC_CONTEXT_ID.
+    #[account(mut, address = er::MAGIC_CONTEXT_ID)]
+    pub magic_context: UncheckedAccount<'info>,
+    /// CHECK: MagicBlock magic program. Address-pinned to MAGIC_PROGRAM_ID.
+    #[account(address = er::MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
 #[derive(Accounts)]
 pub struct CommitMarketBook<'info> {
     #[account(mut)]
@@ -18340,4 +18472,80 @@ pub struct FlpWithdrawnV3Event {
     pub amount_quote_lots: u64,
     pub new_total_capital: u64,
     pub new_shares_outstanding: u64,
+}
+
+#[cfg(test)]
+mod m15_undelegate_gate_tests {
+    //! AUDIT M-15 (2026-07): deterministic coverage of the sequencer-undelegate
+    //! gate's pure core. The live er-acceptance round-trip proves ACCEPTANCE of
+    //! the real sequencer on the ER; these prove the two REJECTION branches.
+    use super::*;
+
+    fn book_pda(market: &Pubkey) -> Pubkey {
+        Pubkey::find_program_address(&[state_v2::MARKET_BOOK_SEED, market.as_ref()], &crate::ID).0
+    }
+
+    #[test]
+    fn accepts_real_sequencer_with_canonical_pda() {
+        let market = Pubkey::new_unique();
+        let seq = Pubkey::new_unique();
+        assert!(check_undelegate_binding(
+            &book_pda(&market),
+            &market,
+            state_v2::MARKET_BOOK_SEED,
+            &seq,
+            &seq, // payer == sequencer
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_non_sequencer_caller() {
+        // Canonical book PDA (passes the binding), but payer != sequencer ⇒ the
+        // ONLY branch that can fire is Unauthorized.
+        let market = Pubkey::new_unique();
+        let seq = Pubkey::new_unique();
+        let attacker = Pubkey::new_unique();
+        assert!(check_undelegate_binding(
+            &book_pda(&market),
+            &market,
+            state_v2::MARKET_BOOK_SEED,
+            &seq,
+            &attacker,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_substituted_market() {
+        // Real book PDA but a DIFFERENT market ⇒ [seed, fake] != book ⇒ WrongMarket
+        // fires before the sequencer check, so an attacker can't smuggle a market
+        // whose sequencer they control.
+        let real_market = Pubkey::new_unique();
+        let fake_market = Pubkey::new_unique();
+        let seq = Pubkey::new_unique();
+        assert!(check_undelegate_binding(
+            &book_pda(&real_market),
+            &fake_market,
+            state_v2::MARKET_BOOK_SEED,
+            &seq,
+            &seq,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ring_and_outbox_seeds_bind() {
+        let market = Pubkey::new_unique();
+        let seq = Pubkey::new_unique();
+        for seed in [
+            matcher::fill_commitment::FILL_COMMIT_SEED,
+            matcher::fill_outbox::FILL_OUTBOX_SEED,
+        ] {
+            let acct = Pubkey::find_program_address(&[seed, market.as_ref()], &crate::ID).0;
+            assert!(check_undelegate_binding(&acct, &market, seed, &seq, &seq).is_ok());
+            // A book PDA passed under the ring/outbox seed must not validate.
+            assert!(check_undelegate_binding(&book_pda(&market), &market, seed, &seq, &seq).is_err());
+        }
+    }
 }
