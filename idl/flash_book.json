@@ -591,6 +591,10 @@
         {
           "name": "fill_seq",
           "type": "u64"
+        },
+        {
+          "name": "taker_was_jit",
+          "type": "bool"
         }
       ]
     },
@@ -4044,6 +4048,135 @@
       "args": [
         {
           "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "flp_post_maker_order",
+      "docs": [
+        "HLP (pool-backed CLOB), increment 1b — post a resting FLP maker quote onto",
+        "the book, owned by the pool (`trader = flp_exposure` PDA). A taker crossing",
+        "it becomes a normal ring-committed BOOK fill (maker = the FLP PDA), settled",
+        "by the FLP-maker settlement path — so the pool provides on-book liquidity",
+        "that real MMs can improve on (the Hyperliquid HLP model, solving CLOB",
+        "cold-start). Authority-gated for now (the on-chain quoter drives this in a",
+        "later increment); POST-ONLY by construction — an FLP quote must REST, so it",
+        "is rejected if it would cross the opposite best (that would make the pool a",
+        "taker against its own book). Moves no capital: pure book insertion."
+      ],
+      "discriminator": [
+        160,
+        215,
+        17,
+        88,
+        60,
+        155,
+        41,
+        171
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "size_lots",
+          "type": "u64"
+        },
+        {
+          "name": "limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "expires_at_slot",
           "type": "u64"
         }
       ]
@@ -15265,6 +15398,19 @@
       ]
     },
     {
+      "name": "FlpMakerOrderPostedEvent",
+      "discriminator": [
+        152,
+        47,
+        108,
+        243,
+        31,
+        109,
+        145,
+        57
+      ]
+    },
+    {
       "name": "FlpPerMarketInitV3Event",
       "discriminator": [
         177,
@@ -18587,6 +18733,34 @@
           {
             "name": "new_realized_pnl",
             "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FlpMakerOrderPostedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "order_id",
+            "type": "u64"
           }
         ]
       }
