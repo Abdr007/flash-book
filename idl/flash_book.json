@@ -17211,6 +17211,11 @@
       "code": 8314,
       "name": "OracleLazerReplay",
       "msg": "Lazer payload timestamp not strictly newer than the last accepted price (replay)"
+    },
+    {
+      "code": 8315,
+      "name": "RefreshTooSoon",
+      "msg": "FLP quote refresh rate-limited: the pool's quotes are still fresh"
     }
   ],
   "types": [
@@ -18982,6 +18987,10 @@
           },
           {
             "name": "posted",
+            "type": "u32"
+          },
+          {
+            "name": "inventory_capped",
             "type": "u32"
           },
           {
