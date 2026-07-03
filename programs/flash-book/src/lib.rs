@@ -16380,74 +16380,39 @@ fn apply_fill_to_flp_market(
         }
     };
 
-    let cur = &mut flp.per_market[idx];
-    let cur_side_enum = if cur.side == 0 { Side::Long } else { Side::Short };
-
-    if cur_side_enum == fill_side {
-        let new_size = cur
-            .size_lots
-            .checked_add(fill_size_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        let weighted = (cur.entry_price_ticks as u128)
-            .checked_mul(cur.size_lots as u128)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
-            .checked_add(
-                (fill_price_ticks as u128)
-                    .checked_mul(fill_size_lots as u128)
-                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?,
-            )
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
-            .checked_div(new_size as u128)
-            .ok_or_else(|| error!(FlashBookError::DivisionByZero))?;
-        cur.entry_price_ticks = weighted as u64;
-        cur.size_lots = new_size;
-        return Ok(());
-    }
-
-    // Opposite side: realize PnL on closed portion (FLP carries this in
-    // `flp.realized_pnl`, not per-market).
-    let close_size = fill_size_lots.min(cur.size_lots);
-    let sign: i128 = if cur_side_enum == Side::Long { 1 } else { -1 };
-    let pnl_per_lot: i128 = (fill_price_ticks as i128) - (cur.entry_price_ticks as i128);
-    // AUDIT H-1 fix: realized PnL is in quote-lots = size × Δticks × tick_size,
-    // matching unrealized PnL (risk.rs), funding, fees and liquidation shortfall.
-    // The tick_size factor was previously dropped, mis-scaling settled collateral
-    // / FLP NAV by 1/tick_size on any market with tick_size > 1.
-    let pnl: i128 = sign
-        .checked_mul(close_size as i128)
-        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
-        .checked_mul(pnl_per_lot)
-        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
-        .checked_mul(tick_size as i128)
-        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-    let pnl_clamped = if pnl > i64::MAX as i128 {
-        i64::MAX
-    } else if pnl < i64::MIN as i128 {
-        i64::MIN
-    } else {
-        pnl as i64
+    // Existing pool position: settle through the SAME Kani-proven core as trader
+    // fills (`matcher::position_math`) — the pool and a trader provably use
+    // byte-identical open/stack-VWAP/reduce-flip + H-1 PnL math. This handler
+    // adds only the FLP-specific plumbing: aggregate realized PnL (saturating, as
+    // before — FLP carries it on `flp.realized_pnl`, not per-market) and the slot
+    // lifecycle (free the slot + decrement `markets_count` on a full close). The
+    // pool has no funding anchor, so the core's `reset_funding` flag is moot.
+    use matcher::position_math as pm;
+    let cur = pm::Pos {
+        side: flp.per_market[idx].side,
+        size_lots: flp.per_market[idx].size_lots,
+        entry_ticks: flp.per_market[idx].entry_price_ticks,
     };
-    flp.realized_pnl = flp.realized_pnl.saturating_add(pnl_clamped);
-
-    if fill_size_lots <= cur.size_lots {
-        cur.size_lots = cur
-            .size_lots
-            .checked_sub(fill_size_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
-        if cur.size_lots == 0 {
-            // Mark slot empty.
-            cur.side = 255;
-            cur.entry_price_ticks = 0;
-            flp.markets_count = flp.markets_count.saturating_sub(1);
-        }
+    let outcome = pm::apply_fill(cur, fill_side as u8, fill_size_lots, fill_price_ticks, tick_size)
+        .map_err(|e| match e {
+            pm::PosMathError::Overflow => error!(FlashBookError::ArithmeticOverflow),
+            pm::PosMathError::Underflow => error!(FlashBookError::ArithmeticUnderflow),
+            pm::PosMathError::DivByZero => error!(FlashBookError::DivisionByZero),
+        })?;
+    flp.realized_pnl = flp
+        .realized_pnl
+        .saturating_add(outcome.realized_pnl_quote_lots);
+    let slot = &mut flp.per_market[idx];
+    if outcome.pos.size_lots == 0 {
+        // Full close → free the slot (mirrors the prior close-to-zero path).
+        slot.side = 255;
+        slot.size_lots = 0;
+        slot.entry_price_ticks = 0;
+        flp.markets_count = flp.markets_count.saturating_sub(1);
     } else {
-        // Flip side.
-        let remaining = fill_size_lots
-            .checked_sub(cur.size_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
-        cur.side = fill_side as u8;
-        cur.size_lots = remaining;
-        cur.entry_price_ticks = fill_price_ticks;
+        slot.side = outcome.pos.side;
+        slot.size_lots = outcome.pos.size_lots;
+        slot.entry_price_ticks = outcome.pos.entry_ticks;
     }
     Ok(())
 }
@@ -16702,84 +16667,38 @@ fn apply_fill_to_position(
     funding_index_now: i128,
     tick_size: u64,
 ) -> Result<()> {
-    let cur_side = if pos.side == 0 { Side::Long } else { Side::Short };
-
-    if pos.size_lots == 0 {
-        pos.side = fill_side as u8;
-        pos.size_lots = fill_size_lots;
-        pos.entry_price_ticks = fill_price_ticks;
-        pos.set_cum_funding_index(funding_index_now);
-        return Ok(());
-    }
-
-    if cur_side == fill_side {
-        // Same side: weighted-avg entry.
-        let new_size = pos
-            .size_lots
-            .checked_add(fill_size_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        // entry = (entry*old_size + price*fill_size) / new_size
-        let weighted = (pos.entry_price_ticks as u128)
-            .checked_mul(pos.size_lots as u128)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
-            .checked_add(
-                (fill_price_ticks as u128)
-                    .checked_mul(fill_size_lots as u128)
-                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?,
-            )
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
-            .checked_div(new_size as u128)
-            .ok_or_else(|| error!(FlashBookError::DivisionByZero))?;
-        pos.entry_price_ticks = weighted as u64;
-        pos.size_lots = new_size;
-        return Ok(());
-    }
-
-    // Opposite side: realize PnL on the closed portion.
-    let close_size = fill_size_lots.min(pos.size_lots);
-    let sign: i128 = if cur_side == Side::Long { 1 } else { -1 };
-    let pnl_per_lot: i128 =
-        (fill_price_ticks as i128) - (pos.entry_price_ticks as i128);
-    // AUDIT H-1 fix: realized PnL is in quote-lots = size × Δticks × tick_size,
-    // matching unrealized PnL (risk.rs), funding, fees and liquidation shortfall.
-    // The tick_size factor was previously dropped, mis-scaling settled collateral
-    // by 1/tick_size on any market with tick_size > 1.
-    let pnl: i128 = sign
-        .checked_mul(close_size as i128)
-        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
-        .checked_mul(pnl_per_lot)
-        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
-        .checked_mul(tick_size as i128)
-        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-    let pnl_clamped = if pnl > i64::MAX as i128 {
-        i64::MAX
-    } else if pnl < i64::MIN as i128 {
-        i64::MIN
-    } else {
-        pnl as i64
-    };
+    // Fund-critical arithmetic lives in the pure, Kani-proven `position_math`
+    // core (open / stack-VWAP / reduce-flip + H-1 tick_size PnL scaling). This
+    // handler is now just the account-plumbing shell: it maps the verified
+    // outcome onto the `PositionAccount`, accumulates realized PnL, and applies
+    // the funding-index reset at the points the core flags. The FLP pool's
+    // on-book maker inventory settles through the SAME core (pool-backed CLOB),
+    // so a trader and the pool are provably priced by identical math.
+    use matcher::position_math as pm;
+    let outcome = pm::apply_fill(
+        pm::Pos {
+            side: pos.side,
+            size_lots: pos.size_lots,
+            entry_ticks: pos.entry_price_ticks,
+        },
+        fill_side as u8,
+        fill_size_lots,
+        fill_price_ticks,
+        tick_size,
+    )
+    .map_err(|e| match e {
+        pm::PosMathError::Overflow => error!(FlashBookError::ArithmeticOverflow),
+        pm::PosMathError::Underflow => error!(FlashBookError::ArithmeticUnderflow),
+        pm::PosMathError::DivByZero => error!(FlashBookError::DivisionByZero),
+    })?;
+    pos.side = outcome.pos.side;
+    pos.size_lots = outcome.pos.size_lots;
+    pos.entry_price_ticks = outcome.pos.entry_ticks;
     pos.realized_pnl_quote_lots = pos
         .realized_pnl_quote_lots
-        .checked_add(pnl_clamped)
+        .checked_add(outcome.realized_pnl_quote_lots)
         .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-
-    if fill_size_lots <= pos.size_lots {
-        pos.size_lots = pos
-            .size_lots
-            .checked_sub(fill_size_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
-        if pos.size_lots == 0 {
-            pos.entry_price_ticks = 0;
-            pos.set_cum_funding_index(funding_index_now);
-        }
-    } else {
-        // Flip side. Remaining = fill - existing.
-        let remaining = fill_size_lots
-            .checked_sub(pos.size_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
-        pos.side = fill_side as u8;
-        pos.size_lots = remaining;
-        pos.entry_price_ticks = fill_price_ticks;
+    if outcome.reset_funding {
         pos.set_cum_funding_index(funding_index_now);
     }
     Ok(())
