@@ -2537,7 +2537,15 @@ async fn hlp_flp_refresh_quotes_posts_crossable_ladder() {
     assert!(produced >= 1, "a taker must have crossed at least one auto-quoted FLP level (produced={produced})");
 
     // 4) re-quoting cancels the pool's stale orders and reposts (idempotent refresh).
-    send(&mut ctx, build_ix(flash_book::instruction::FlpRefreshQuotes {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(flp_exposure, false)]), &[&payer]).await.expect("pool re-refreshes (cancel stale + repost)");
+    // 5) RATE LIMIT (permissionless): an IMMEDIATE re-quote is rejected — the
+    //    pool's quotes are still resting + fresh, so a keeper can't churn the book.
+    assert!(
+        send(&mut ctx, build_ix(flash_book::instruction::FlpRefreshQuotes {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(flp_exposure, false)]), &[&payer]).await.is_err(),
+        "immediate re-quote must be rate-limited (RefreshTooSoon)"
+    );
+    // ...but after FLP_REFRESH_MIN_SLOTS the pool re-quotes (cancel stale + repost).
+    ctx.warp_to_slot(200).unwrap();
+    send(&mut ctx, build_ix(flash_book::instruction::FlpRefreshQuotes {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(flp_exposure, false)]), &[&payer]).await.expect("re-quote allowed once quotes are stale");
 }
 
 /// #35 / H1 part B — FLP authenticity band: an `apply_flp_fill` priced far from

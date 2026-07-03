@@ -226,6 +226,12 @@ pub const MAX_PRIVACY_MEMBERS: usize = 32;
 /// layout is versioned.
 pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 300;
 
+/// Rate limit for the PERMISSIONLESS `flp_refresh_quotes`: while the pool's quotes
+/// are still resting, a keeper may only re-quote once they are at least this many
+/// slots old (~a few seconds), so nobody can churn the book. Consumed/stale quotes
+/// (none resting) can always be re-posted immediately.
+pub const FLP_REFRESH_MIN_SLOTS: u32 = 10;
+
 /// #36 — anti-book-stuffing: max deviation (bps, symmetric) a RESTING order's
 /// price may sit from the fresh oracle. Far-from-market orders are the classic
 /// node-arena-exhaustion vector (cheap because they never fill); requiring a

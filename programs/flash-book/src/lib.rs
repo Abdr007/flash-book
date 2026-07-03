@@ -6756,11 +6756,13 @@ pub mod flash_book {
     pub fn flp_refresh_quotes(ctx: Context<FlpRefreshQuotes>) -> Result<()> {
         let now_slot = Clock::get()?.slot;
         let market = &ctx.accounts.market;
-        require_keys_eq!(
-            ctx.accounts.authority.key(),
-            market.authority,
-            FlashBookError::Unauthorized
-        );
+        // PERMISSIONLESS (rate-limit follow-up): any keeper may refresh — the
+        // ladder is DETERMINISTIC from on-chain state (oracle + inventory) + the
+        // quoter, so the caller cannot choose prices; the worst a spammer can do is
+        // re-post the same quotes and pay the CU. A rate limit (below, derived from
+        // the resting FLP orders' post slot — no new account/field) throttles
+        // churn while quotes are fresh, and allows an immediate re-quote once they
+        // are consumed. `authority` is now just the fee-paying signer.
         require!(
             market.status == MarketStatus::Active as u8
                 || market.status == MarketStatus::PostOnly as u8,
@@ -6841,17 +6843,36 @@ pub mod flash_book {
             matcher::flp_quoter::generate_quotes(flp_params, flp_inputs, flp_pk, base_seq)?;
 
         // Cancel every resting order owned by the pool (collect indices first —
-        // mid-iteration mutation of the RBT is unsafe).
+        // mid-iteration mutation of the RBT is unsafe). Track the NEWEST post slot
+        // among the pool's resting quotes for the rate limit.
         let mut flp_bids: Vec<hypertree::DataIndex> = Vec::new();
         let mut flp_asks: Vec<hypertree::DataIndex> = Vec::new();
+        let mut newest_flp_slot: u32 = 0;
         handle.for_each_bid_best_first(|idx, o| {
-            if o.trader == flp_pk { flp_bids.push(idx); }
+            if o.trader == flp_pk {
+                flp_bids.push(idx);
+                newest_flp_slot = newest_flp_slot.max(o.last_valid_slot);
+            }
             true
         });
         handle.for_each_ask_best_first(|idx, o| {
-            if o.trader == flp_pk { flp_asks.push(idx); }
+            if o.trader == flp_pk {
+                flp_asks.push(idx);
+                newest_flp_slot = newest_flp_slot.max(o.last_valid_slot);
+            }
             true
         });
+        // RATE LIMIT (permissionless): while the pool's quotes are still resting
+        // AND fresh (posted < FLP_REFRESH_MIN_SLOTS ago), reject — a keeper can't
+        // churn the book. Once they're consumed (none resting) or stale, a
+        // re-quote is allowed. No new state: the resting orders' post slot IS the
+        // last-refresh marker.
+        let has_resting = !flp_bids.is_empty() || !flp_asks.is_empty();
+        if has_resting
+            && (now_slot as u32).saturating_sub(newest_flp_slot) < constants::FLP_REFRESH_MIN_SLOTS
+        {
+            return err!(FlashBookError::RefreshTooSoon);
+        }
         let cancelled = (flp_bids.len() + flp_asks.len()) as u32;
         for idx in flp_bids { handle.remove_bid_node(idx); }
         for idx in flp_asks { handle.remove_ask_node(idx); }

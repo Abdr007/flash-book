@@ -255,6 +255,8 @@ pub enum FlashBookError {
     HaircutResidualUnbacked = 2313,
     #[msg("Lazer payload timestamp not strictly newer than the last accepted price (replay)")]
     OracleLazerReplay = 2314,
+    #[msg("FLP quote refresh rate-limited: the pool's quotes are still fresh")]
+    RefreshTooSoon = 2315,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
