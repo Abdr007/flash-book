@@ -6628,6 +6628,121 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// HLP (pool-backed CLOB), increment 1b — post a resting FLP maker quote onto
+    /// the book, owned by the pool (`trader = flp_exposure` PDA). A taker crossing
+    /// it becomes a normal ring-committed BOOK fill (maker = the FLP PDA), settled
+    /// by the FLP-maker settlement path — so the pool provides on-book liquidity
+    /// that real MMs can improve on (the Hyperliquid HLP model, solving CLOB
+    /// cold-start). Authority-gated for now (the on-chain quoter drives this in a
+    /// later increment); POST-ONLY by construction — an FLP quote must REST, so it
+    /// is rejected if it would cross the opposite best (that would make the pool a
+    /// taker against its own book). Moves no capital: pure book insertion.
+    pub fn flp_post_maker_order(
+        ctx: Context<FlpPostMakerOrder>,
+        side: u8,
+        size_lots: u64,
+        limit_ticks: u64,
+        expires_at_slot: u64,
+    ) -> Result<()> {
+        let market = &ctx.accounts.market;
+        // Only the market authority may post pool quotes (opt-in; inert until used).
+        require_keys_eq!(
+            ctx.accounts.authority.key(),
+            market.authority,
+            FlashBookError::Unauthorized
+        );
+        let now_slot = Clock::get()?.slot;
+        require!(
+            side <= 1 && size_lots > 0 && limit_ticks > 0,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            market.status == MarketStatus::Active as u8
+                || market.status == MarketStatus::PostOnly as u8,
+            FlashBookError::OutOfRange
+        );
+        let p = &market.params;
+        require!(size_lots >= p.min_base_lots, FlashBookError::SizeBelowMinLot);
+        require!(limit_ticks % p.tick_size == 0, FlashBookError::PriceNotOnTick);
+        require!(
+            expires_at_slot == 0 || expires_at_slot > now_slot,
+            FlashBookError::OutOfRange
+        );
+        let oi_cap = p.max_oi_base_lots;
+        if oi_cap > 0 {
+            let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
+            require!(
+                cur.saturating_add(size_lots) <= oi_cap,
+                FlashBookError::OpenInterestCapExceeded
+            );
+        }
+
+        // The pool's on-book identity IS the flp_exposure PDA.
+        let flp_pk = ctx.accounts.flp_exposure.key();
+        let market_key = market.key();
+        let side_is_bid = side == 0;
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        require!(
+            handle.header.market_pubkey == market_key,
+            FlashBookError::WrongMarket
+        );
+
+        // POST-ONLY guard: peek the opposite best; reject if this quote would cross
+        // (an FLP quote must rest, never take).
+        let mut best_opp: Option<u64> = None;
+        if side_is_bid {
+            handle.for_each_ask_best_first(|_i, ask| {
+                best_opp = Some(ask.price_ticks);
+                false
+            });
+        } else {
+            handle.for_each_bid_best_first(|_i, bid| {
+                best_opp = Some(bid.price_ticks);
+                false
+            });
+        }
+        if let Some(bp) = best_opp {
+            let crosses = if side_is_bid { limit_ticks >= bp } else { limit_ticks <= bp };
+            require!(!crosses, FlashBookError::OutOfRange);
+        }
+
+        let seq = handle
+            .header
+            .order_seq_counter
+            .checked_add(1)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        handle.header.order_seq_counter = seq;
+        let order_id = state_v2::encode_order_id(limit_ticks, seq, side_is_bid);
+        let order = state_v2::RestingOrderV2 {
+            order_id,
+            seq,
+            price_ticks: limit_ticks,
+            size_lots,
+            expires_at_slot,
+            trader: flp_pk,
+            last_valid_slot: u32::try_from(now_slot).unwrap_or(u32::MAX),
+            side,
+            order_type: 0,
+            flags: 1, // POST_ONLY
+            sub_index: 0,
+        };
+        if side_is_bid {
+            handle.insert_bid(order)?;
+        } else {
+            handle.insert_ask(order)?;
+        }
+        emit!(FlpMakerOrderPostedEvent {
+            market: market_key,
+            side,
+            price_ticks: limit_ticks,
+            size_lots,
+            order_id,
+        });
+        Ok(())
+    }
+
     /// Apply a fill in which the FLP pool is the *maker*. Mutates the
     /// `FlpExposureAccount.per_market` entry for this market while
     /// applying the opposite-side update to the taker's `PositionAccount`.
@@ -6642,15 +6757,64 @@ pub mod flash_book {
         taker_side: u8,
         taker_sub_index: u8,
         fill_seq: u64,
+        // HLP (1b): the taker's JIT flag, bound into the commitment preimage on
+        // the ring-authenticated path. Legacy sequencer callers pass `false`.
+        taker_was_jit: bool,
     ) -> Result<()> {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(price_ticks > 0, FlashBookError::ZeroPrice);
         require!(taker_side <= 1, FlashBookError::OutOfRange);
 
-        // ── C-1 settlement authorization (see apply_fill) ───────────
-        require_keys_eq!(
-            ctx.accounts.sequencer.key(),
-            ctx.accounts.market.sequencer,
+        // ── Settlement authorization: RING-AUTHENTICATED (HLP) or SEQUENCER ──
+        // HLP (1b) pool-backed CLOB: when a taker crosses a resting FLP quote
+        // (`flp_post_maker_order`, maker = the flp_exposure PDA), `place_taker_
+        // order_v2` pushes a STANDARD fill commitment (maker = the FLP PDA). If an
+        // armed market's fill-commitment ring is supplied here and the fill
+        // recomputes to the oldest pending commitment (verify-and-pop, FIFO), the
+        // fill is AUTHENTIC — the pool can only settle exactly what the matcher
+        // committed, to the committed taker, in order. That makes settlement
+        // PERMISSIONLESS (any keeper), identical to the book-fill path.
+        // Otherwise (no commitment) this is a legacy sequencer-decided FLP fill,
+        // gated on `market.sequencer` and bounded by the oracle band below.
+        let mut ring_authenticated = false;
+        {
+            let market_bytes = ctx.accounts.market.key().to_bytes();
+            if ctx.accounts.market.fill_commitment_required {
+                if let Some(fc_acct) =
+                    find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &market_bytes)
+                {
+                    use matcher::fill_commitment as fc;
+                    let taker_bytes = ctx.accounts.taker_trader_state.load()?.trader.to_bytes();
+                    // The pool's on-book maker identity is the flp_exposure PDA;
+                    // FLP quotes post with sub_index 0 (see `flp_post_maker_order`).
+                    let maker_bytes = ctx.accounts.flp_exposure.key().to_bytes();
+                    let mut fc_data = fc_acct.try_borrow_mut_data()?;
+                    let idx = fc::buffer_settle_index(&fc_data);
+                    let pre = fc::fill_preimage(
+                        &market_bytes,
+                        &taker_bytes,
+                        &maker_bytes,
+                        taker_side,
+                        size_lots,
+                        price_ticks,
+                        taker_sub_index,
+                        0, // maker_sub_index (FLP orders post with sub_index 0)
+                        idx,
+                        taker_was_jit,
+                    );
+                    let recomputed = solana_keccak_hasher::hashv(&[&pre[..]]).0;
+                    fc::buffer_settle(&mut fc_data, &market_bytes, recomputed).map_err(|e| match e {
+                        fc::FillRingError::NotCommitted => error!(FlashBookError::FillNotCommitted),
+                        fc::FillRingError::Empty => error!(FlashBookError::FillRingEmpty),
+                        _ => error!(FlashBookError::FillRingCorrupt),
+                    })?;
+                    ring_authenticated = true;
+                }
+            }
+        }
+        require!(
+            ring_authenticated
+                || ctx.accounts.sequencer.key() == ctx.accounts.market.sequencer,
             FlashBookError::Unauthorized
         );
 
@@ -14577,6 +14741,35 @@ pub struct ViewMarket<'info> {
 }
 
 #[derive(Accounts)]
+pub struct FlpPostMakerOrder<'info> {
+    pub authority: Signer<'info>,
+
+    // Box the (large) MarketAccount onto the heap — an un-boxed `Account` here
+    // deserializes it onto the stack and, with the book handle + order struct in
+    // the same frame, overflows BPF's 4 KB stack (Access violation).
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: market_book PDA; validated in-handler via `MarketBookHandle`.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
+    )]
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+}
+
+#[derive(Accounts)]
 pub struct ApplyFlpFill<'info> {
     #[account(mut)]
     pub sequencer: Signer<'info>,
@@ -15501,6 +15694,15 @@ pub struct FlpFillAppliedEvent {
     pub batch_num: u64,
     pub flp_size_after: u64,
     pub flp_side_after: u8,
+}
+
+#[event]
+pub struct FlpMakerOrderPostedEvent {
+    pub market: Pubkey,
+    pub side: u8,
+    pub price_ticks: u64,
+    pub size_lots: u64,
+    pub order_id: u64,
 }
 
 #[event]
