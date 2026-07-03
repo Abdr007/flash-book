@@ -2371,6 +2371,7 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
             taker_side: 0, // long
             taker_sub_index: 0, // main account
             fill_seq: 1,
+            taker_was_jit: false,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer
@@ -2425,6 +2426,80 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
     assert_eq!(market.oi_short_lots, 1);
 }
 
+/// HLP (1b) — the POOL-BACKED CLOB full loop: the FLP pool posts a resting maker
+/// quote on the book (`flp_post_maker_order`, owner = the flp_exposure PDA); a
+/// taker crosses it via `place_taker_order_v2`, which pushes a STANDARD fill
+/// commitment (maker = the FLP PDA); then a ROGUE keeper (NOT market.sequencer)
+/// settles it via the RING-AUTHENTICATED `apply_flp_fill` path. Asserts the fill
+/// is authentic + permissionless, and the pool takes the opposite side — the
+/// Hyperliquid HLP model, on-chain and trust-minimized.
+#[tokio::test]
+async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market_pda.as_ref()]);
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+
+    let taker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let (taker_pos, _) = pda(&[flash_book::state::PositionAccount::SEED, market_pda.as_ref(), taker_state.as_ref()]);
+
+    async fn send(ctx: &mut solana_program_test::ProgramTestContext, ix: Instruction, signers: &[&Keypair]) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&signers[0].pubkey()), signers, bh)).await
+    }
+
+    // 1) init the v2 book + arm the fill-commitment ring.
+    send(&mut ctx, build_ix(flash_book::instruction::InitMarketBook {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(system_program::ID, false)]), &[&payer]).await.unwrap();
+    send(&mut ctx, build_ix(flash_book::instruction::InitFillCommitment { cap: 256 }, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(fc_pda, false), AccountMeta::new_readonly(system_program::ID, false)]), &[&payer]).await.unwrap();
+
+    // 2) FLP posts a resting ASK (side=1) 1 lot @ 100_000 — owned by the pool.
+    send(&mut ctx, build_ix(flash_book::instruction::FlpPostMakerOrder { side: 1, size_lots: 1, limit_ticks: 100_000, expires_at_slot: 0 }, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(flp_exposure, false)]), &[&payer]).await.expect("FLP posts a resting maker quote");
+
+    // 3) taker crosses: bid (side=0) 1 @ 100_000 -> fills against the FLP ask.
+    //    The commitment pushed binds maker = the FLP PDA.
+    send(&mut ctx, build_ix(flash_book::instruction::PlaceTakerOrderV2 { side: 0, size_lots: 1, limit_ticks: 100_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(taker.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new(fc_pda, false)]), &[&payer, &taker]).await.expect("taker crosses the FLP quote");
+
+    // 4) a ROGUE keeper (NOT market.sequencer) settles via the ring-authenticated
+    //    FLP-maker path -> permissionless. The fill_commitment rides in
+    //    remaining_accounts; taker_was_jit=false matches the pushed commitment.
+    let rogue = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[system_instruction::transfer(&payer.pubkey(), &rogue.pubkey(), 1_000_000_000)], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+    send(&mut ctx, build_ix(
+        flash_book::instruction::ApplyFlpFill { size_lots: 1, price_ticks: 100_000, taker_side: 0, taker_sub_index: 0, fill_seq: 1, taker_was_jit: false },
+        vec![
+            AccountMeta::new(rogue.pubkey(), true), // NOT the sequencer
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new_readonly(program_id(), false), // fee_tiers None
+            AccountMeta::new_readonly(program_id(), false), // market_haircut None
+            AccountMeta::new_readonly(program_id(), false), // taker_position_haircut None
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(fc_pda, false), // fill_commitment (remaining_accounts)
+        ],
+    ), &[&rogue]).await.expect("ring-authenticated FLP fill settles permissionlessly");
+
+    // taker long 1 @ 100k; pool took the opposite side (short 1 @ 100k).
+    let position: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(position.side, 0, "taker long after HLP fill");
+    assert_eq!(position.size_lots, 1);
+    assert_eq!(position.entry_price_ticks, 100_000);
+    let flp: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
+    let entry = flp.per_market.iter().find(|e| e.side != 255 && e.market == to_anchor(market_pda)).expect("FLP has an entry");
+    assert_eq!(entry.side, 1, "pool short after being crossed as maker");
+    assert_eq!(entry.size_lots, 1);
+    assert_eq!(entry.entry_price_ticks, 100_000);
+}
+
 /// #35 / H1 part B — FLP authenticity band: an `apply_flp_fill` priced far from
 /// the FRESH oracle (a compromised sequencer pricing the pool fill to extract
 /// value) is REJECTED. Oracle = 100_000; posting 300_000 (200% deviation, far
@@ -2456,6 +2531,7 @@ async fn apply_flp_fill_rejects_price_far_from_oracle() {
             taker_side: 0,
             taker_sub_index: 0,
             fill_seq: 1,
+            taker_was_jit: false,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -5935,6 +6011,7 @@ async fn apply_flp_fill_rejects_stale_oracle_h1() {
             taker_side: 0,
             taker_sub_index: 0,
             fill_seq: 1,
+            taker_was_jit: false,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -6574,6 +6651,7 @@ async fn apply_flp_fill_band_tightened_rejects_ten_percent_m1() {
             taker_side: 0,
             taker_sub_index: 0,
             fill_seq: 1,
+            taker_was_jit: false,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
