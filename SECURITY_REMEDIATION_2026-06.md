@@ -4,6 +4,7 @@
 **Round 1:** PR #150 (`feat/flash-book-devnet-delegation-lazer`), 2026-06-29
 **Round 2:** PRs #197–#215, 2026-07-02/03 — see **§8** (deep 13-dimension audit + remediation, incl. two ER-boundary fixes verified on the live MagicBlock devnet rollup, plus a mark-manipulation hardening)
 **Round 3:** PRs #216–#231, 2026-07-03/04 — see **§9** (HLP pool-backed CLOB: permissionless keeper, the Kani-proven + V2-reconciled `position_math` settlement core, FLP-as-on-book-maker with ring-authenticated permissionless settlement, the auto-quoter + inventory cap + rate-limit — each live-verified on devnet)
+**Round 4:** PRs #233–#235, 2026-07-04 — see **§10** (focused adversarial hardening of the FLP-pool settlement surface: no value leak / auth bypass for non-sequencer callers; H-1 permissionless-DoS + H-2 sequencer-fabrication + M-1 FIFO-liveness fixed, both High findings live-verified on devnet)
 **Status:** all Critical/High/Medium remediated across both rounds, deployed, on-chain-validated; ER trust boundary now exercised live (not just the unit harness).
 
 > This document is a turnkey handoff for an external audit firm and for the team's
@@ -399,7 +400,43 @@ permissionless+rate-limit are each live-verified on the deployed program (latest
 incl. `iQbECnv…`, `4cX9GsW…`). Upgrade + market authority:
 `GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD`.
 
-**Current posture:** the HLP pool-backed CLOB is functionally complete and live on
-devnet, with all fund-critical math Kani-proven and V2-reconciled. Still held from a
-production rating by (a) the absence of an external audit — for which this document is the
-turnkey input — and (b) the FLP-pool settlement surface warranting focused review.
+## 10. FLP-pool settlement hardening (2026-07-04, PRs #233–#235)
+
+The FLP-pool settlement path (the pool acting as an on-book maker — §9) is the newest
+fund-critical surface: it settles against pooled LP capital. We ran a **focused
+adversarial fund-safety review** of the whole surface (`apply_flp_fill` incl. the ring-auth
+branch, `apply_fill_to_flp_market`, `flp_post_maker_order`, `flp_refresh_quotes`).
+
+**Verdict: no value leak or auth bypass is reachable by a non-sequencer permissionless
+caller.** Verified: value CONSERVES across a fill (taker realized PnL and pool realized PnL
+are exact negatives via the shared, Kani-proven `matcher::position_math`, and the pool's PnL
+is folded into LP redemption NAV — no unbacked credit); the ring commitment binds every
+economically-relevant field (market, taker, maker=FLP PDA, side, size, price, both
+sub-indices, JIT flag) so a caller cannot fabricate/redirect/replay/mis-price; forged ring
+accounts are rejected; refresh cancels only the pool's own orders; the inventory cap is
+Kani-proven never to freeze both sides.
+
+Three findings — two High, one Medium — all fixed (#233), then **each High live-verified on
+devnet**:
+
+| ID | Issue | Fix | Verified |
+|---|---|---|---|
+| **H-1** | Permissionless market-freeze DoS: on the armed/ring path the caller-controlled `fill_seq` let one authentic fill settled with `u64::MAX` wedge `last_settlement_seq` forever (no reset ix). Present in BOTH `apply_fill` and `apply_flp_fill`. | The ring already gives replay-protection + FIFO ordering, so on that path the nonce now AUTO-INCREMENTS by 1; the legacy unarmed sequencer path keeps the supplied `fill_seq`. | CI (`u64::MAX`→nonce=1) + **devnet 2/2** (`hlp_h1_acceptance.mjs`, market `F6qeEV4…`) |
+| **H-2** | Sequencer FLP-fabrication asymmetry: armed `apply_flp_fill` did NOT mandate the ring (unlike `apply_fill`), so a compromised sequencer could omit the commitment and settle a fabricated FLP fill within the ±300 bps oracle band → cumulative LP drain. | Armed `apply_flp_fill` now MANDATES the ring; only UNARMED (legacy) markets accept the sequencer + oracle-band path. | CI + **devnet 2/2** (`hlp_h2_acceptance.mjs`, market `HFcdCd5W…`: armed + no ring → `Unauthorized`, no position) |
+| **M-1** | Shared-FIFO liveness: the oracle-band/staleness gate ran on the ring path too, so oracle drift between ER match-time and L1 settle-time could reject an AUTHENTIC committed fill, stranding it at the head of the shared ring and blocking all later settlement. | Band skipped on the ring path (price already keccak-bound); retained as the sole authenticity bound on the legacy path. | CI (+ implicit: H-1's ring fill settled with band-skip) |
+
+Lower-severity (documented, not fixed): the post-only flag already prevents a refreshed FLP
+quote from resting crossed; the rate-limit `u32` slot compare wraps only years out; the FLP
+pool leg carries no funding anchor (a documented design choice). No value-safety impact.
+
+**Verification:** CI 4/4 on the real `.so` (all fixes + tests); hardened program deployed
+(`32pYcex…`); the 1b ring-settlement loop re-verified live (3/3); and both High findings
+independently live-verified on devnet (above), the H-1 harness also exercising the full
+FLP-maker ring settlement (taker + pool) end-to-end.
+
+**Current posture:** the HLP pool-backed CLOB is functionally complete and live on devnet;
+all fund-critical math is Kani-proven and V2-reconciled; and the newest fund-critical surface
+(FLP-pool settlement) has now been adversarially reviewed, hardened on all findings, and
+live-verified. The program is held from a production rating only by the **absence of an
+external audit** — for which this document is the complete, current turnkey input (PRs #150,
+#197–#235). Upgrade + market authority: `GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD`.
