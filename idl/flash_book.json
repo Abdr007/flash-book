@@ -4182,6 +4182,119 @@
       ]
     },
     {
+      "name": "flp_refresh_quotes",
+      "docs": [
+        "HLP (increment 2) — refresh the pool's on-book quotes. Reads the oracle +",
+        "FLP inventory and runs the SAME deterministic `flp_quoter::generate_quotes`",
+        "the view exposes (Avellaneda-Stoikov inventory skew + spread model), then",
+        "CANCELS the pool's stale resting quotes and POSTS the fresh two-sided",
+        "ladder — turning the pool into a self-managing on-book market maker. The",
+        "ladder is oracle-anchored and inventory-skewed, so the pool leans against",
+        "its own position (it quotes wider/further on the side it's already long).",
+        "Authority-gated for now (a keeper bot holding the authority key refreshes;",
+        "permissionless-with-rate-limit is a follow-up). Prices come only from",
+        "on-chain state + the deterministic quoter — the caller cannot choose them."
+      ],
+      "discriminator": [
+        146,
+        167,
+        214,
+        242,
+        121,
+        85,
+        127,
+        219
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "flp_withdraw_v3",
       "docs": [
         "Withdraw FLP capital by burning shares + SPL release."
@@ -15424,6 +15537,19 @@
       ]
     },
     {
+      "name": "FlpQuotesRefreshedEvent",
+      "discriminator": [
+        140,
+        67,
+        36,
+        10,
+        16,
+        55,
+        177,
+        118
+      ]
+    },
+    {
       "name": "FlpWithdrawnV3Event",
       "discriminator": [
         162,
@@ -18836,6 +18962,34 @@
           },
           {
             "name": "shares",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FlpQuotesRefreshedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "cancelled",
+            "type": "u32"
+          },
+          {
+            "name": "posted",
+            "type": "u32"
+          },
+          {
+            "name": "skew_bps",
+            "type": "i32"
+          },
+          {
+            "name": "fair_value_ticks",
             "type": "u64"
           }
         ]
