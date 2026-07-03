@@ -228,9 +228,14 @@ pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 300;
 
 /// Rate limit for the PERMISSIONLESS `flp_refresh_quotes`: while the pool's quotes
 /// are still resting, a keeper may only re-quote once they are at least this many
-/// slots old (~a few seconds), so nobody can churn the book. Consumed/stale quotes
-/// (none resting) can always be re-posted immediately.
-pub const FLP_REFRESH_MIN_SLOTS: u32 = 10;
+/// slots old, so nobody can churn the book. Consumed/stale quotes (none resting)
+/// can always be re-posted immediately — so this only throttles re-quoting of
+/// UNFILLED quotes, where freshness barely matters (the spread absorbs small
+/// moves). 50 slots ≈ 20s at ~0.4s/slot: a real anti-churn floor (a tighter value
+/// like 10 slots ≈ 4s is below normal tx-confirmation latency, so it throttles
+/// almost nothing). A future governance field can tune it once MarketParams is
+/// versioned.
+pub const FLP_REFRESH_MIN_SLOTS: u32 = 50;
 
 /// #36 — anti-book-stuffing: max deviation (bps, symmetric) a RESTING order's
 /// price may sit from the fresh oracle. Far-from-market orders are the classic
