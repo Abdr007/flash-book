@@ -6859,12 +6859,27 @@ pub mod flash_book {
         // Post the fresh ladder (generate_quotes already priced/sized each level
         // and stamped trader = the pool PDA). Convert each matcher `Order` to a
         // `RestingOrderV2` and insert; sequence ids stay strictly increasing.
+        // INVENTORY CAP (increment 3): bound the pool's directional exposure —
+        // its net-position NOTIONAL must not exceed its capital (a conservative
+        // ~1× limit; derived from live state, so no new market-params field). When
+        // the pool sits at the cap on one side, DROP the quotes that would grow it
+        // — a filled BID grows the pool's LONG (a taker sells into it), a filled
+        // ASK grows the SHORT — and keep only the REDUCING side, so takers can
+        // always unwind the pool. `generate_quotes`'s skew leans against inventory
+        // continuously; this is the hard backstop that caps the tail.
+        let (skip_bids, skip_asks) =
+            matcher::flp_quoter::inventory_cap_skip(flp_net_signed, flp_pool_capital);
         let mut seq = handle.header.order_seq_counter;
         let mut posted: u32 = 0;
+        let mut inventory_capped: u32 = 0;
         for o in &orders {
             if o.size.0 == 0 { continue; }
-            seq = seq.checked_add(1).ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
             let side_is_bid = matches!(o.side, Side::Long);
+            if (side_is_bid && skip_bids) || (!side_is_bid && skip_asks) {
+                inventory_capped = inventory_capped.saturating_add(1);
+                continue;
+            }
+            seq = seq.checked_add(1).ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
             let order_id = state_v2::encode_order_id(o.limit_price.0, seq, side_is_bid);
             let ro = state_v2::RestingOrderV2 {
                 order_id,
@@ -6892,6 +6907,7 @@ pub mod flash_book {
             market: market_key,
             cancelled,
             posted,
+            inventory_capped,
             skew_bps: _out.skew_bps,
             fair_value_ticks: _out.fair_value.0,
         });
@@ -15893,6 +15909,7 @@ pub struct FlpQuotesRefreshedEvent {
     pub market: Pubkey,
     pub cancelled: u32,
     pub posted: u32,
+    pub inventory_capped: u32,
     pub skew_bps: i32,
     pub fair_value_ticks: u64,
 }

@@ -262,6 +262,24 @@ pub fn price_within_band(oracle_ticks: u64, price_ticks: u64, max_dev_bps: u32) 
     diff * (BPS_DENOM as u128) <= allowed
 }
 
+/// HARD INVENTORY CAP (increment 3): the pool's net-position notional must not
+/// exceed its capital (a conservative ~1× exposure limit). Returns
+/// `(skip_bids, skip_asks)` for `flp_refresh_quotes`: when the pool is at the
+/// LONG cap it stops posting BIDs (a filled bid would grow its long — a taker
+/// selling into the pool), keeping only ASKs so takers can unwind it; symmetric
+/// at the SHORT cap. `capital == 0` (uncapitalized pool) → cap disabled. This is
+/// the hard backstop under `generate_quotes`'s continuous inventory skew.
+#[inline]
+pub fn inventory_cap_skip(net_signed: i64, capital_quote_lots: u64) -> (bool, bool) {
+    if capital_quote_lots == 0 {
+        return (false, false);
+    }
+    let net = net_signed as i128;
+    let cap = capital_quote_lots as i128;
+    // long-capped ⇒ skip bids; short-capped ⇒ skip asks.
+    (net >= cap, net <= -cap)
+}
+
 /// FV: machine-checked properties of the FLP fill-price band (Kani). Equality
 /// comparisons + multiplies over u128 — bounded and terminating. Runs in CI.
 #[cfg(kani)]
@@ -313,5 +331,41 @@ mod flp_band_kani_proofs {
         kani::assume(max_dev < DEV_MAX); // cap strictly below 100%
         assert!(!price_within_band(oracle, oracle * 2, max_dev)); // 100% high
         assert!(!price_within_band(oracle, 0, max_dev)); // 100% low
+    }
+}
+
+#[cfg(kani)]
+mod inventory_cap_kani {
+    use super::inventory_cap_skip;
+
+    /// THE safety property: the inventory cap NEVER stops BOTH sides — for any
+    /// (net, capital) at least one side stays quotable, so a taker can always
+    /// unwind the pool (the cap can never freeze the book). And an uncapitalized
+    /// pool (capital==0) is uncapped. ∀ (net, capital).
+    #[kani::proof]
+    fn cap_never_stops_both_sides() {
+        let net: i64 = kani::any();
+        let cap: u64 = kani::any();
+        let (skip_bids, skip_asks) = inventory_cap_skip(net, cap);
+        assert!(!(skip_bids && skip_asks));
+        if cap == 0 {
+            assert!(!skip_bids && !skip_asks);
+        }
+    }
+}
+
+#[cfg(test)]
+mod inventory_cap_tests {
+    use super::inventory_cap_skip;
+
+    #[test]
+    fn cap_behavior() {
+        assert_eq!(inventory_cap_skip(0, 1000), (false, false)); // flat → quote both
+        assert_eq!(inventory_cap_skip(1000, 1000), (true, false)); // at long cap → skip bids
+        assert_eq!(inventory_cap_skip(1500, 1000), (true, false)); // over long cap
+        assert_eq!(inventory_cap_skip(-1000, 1000), (false, true)); // at short cap → skip asks
+        assert_eq!(inventory_cap_skip(-1500, 1000), (false, true)); // over short cap
+        assert_eq!(inventory_cap_skip(999, 1000), (false, false)); // just under → quote both
+        assert_eq!(inventory_cap_skip(5000, 0), (false, false)); // no capital → no cap
     }
 }
