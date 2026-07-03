@@ -3,6 +3,7 @@
 **Program:** `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq` (Solana devnet)
 **Round 1:** PR #150 (`feat/flash-book-devnet-delegation-lazer`), 2026-06-29
 **Round 2:** PRs #197–#215, 2026-07-02/03 — see **§8** (deep 13-dimension audit + remediation, incl. two ER-boundary fixes verified on the live MagicBlock devnet rollup, plus a mark-manipulation hardening)
+**Round 3:** PRs #216–#231, 2026-07-03/04 — see **§9** (HLP pool-backed CLOB: permissionless keeper, the Kani-proven + V2-reconciled `position_math` settlement core, FLP-as-on-book-maker with ring-authenticated permissionless settlement, the auto-quoter + inventory cap + rate-limit — each live-verified on devnet)
 **Status:** all Critical/High/Medium remediated across both rounds, deployed, on-chain-validated; ER trust boundary now exercised live (not just the unit harness).
 
 > This document is a turnkey handoff for an external audit firm and for the team's
@@ -324,3 +325,81 @@ introduce no ER regression. Upgrade authority + market authority:
 ER trust boundary is now exercised on the live rollup, not just the unit harness.
 Held from a production rating only by the centralization residual and the absence of
 an external audit — for which this document is the turnkey input.
+
+## 9. HLP pool-backed CLOB + trust-minimization (2026-07-03/04, PRs #216–#231)
+
+Round 2 closed the audit findings; this round builds *out* — turning the CLOB into a
+**decentralized, pool-backed continuous CLOB** (the Hyperliquid HLP model on Solana).
+Every fund-critical addition is Kani-proven and **live-verified on devnet**, not just
+unit-tested. Nothing here weakens Round-1/2 guarantees: the additions are additive,
+off the audited settlement body, or reuse it verbatim.
+
+### 9.1 What shipped
+- **Permissionless keeper (#222).** `apply_fill` settlement is opened to ANY signer on
+  ARMED markets — safe because the §3.2 commitment ring already binds the fill
+  (market, both trader identities, side/size/price) and pops FIFO, so a caller can only
+  settle the exact committed fill to the exact parties in order. The C-1
+  anti-fabrication guarantee moved from "trust the sequencer" to "the ring enforces
+  it." Legacy/unarmed markets stay sequencer-gated.
+- **Verified settlement core (#223/#224).** The position arithmetic (open / VWAP-stack /
+  reduce-flip + H-1 tick PnL) was duplicated in the trader and FLP-pool paths; extracted
+  once into pure `matcher::position_math` and BOTH paths routed through it — a trader and
+  the pool provably settle through byte-identical, machine-checked math. Includes a
+  **cross-system proof that flash-book PnL == Flash V2's `(mark−entry)/entry·notional`**
+  (the `/entry` cancels; ours carries no float division), reconciled over 16k positions.
+- **FLP-as-on-book-maker + ring-authenticated settlement (#225).** The pool posts resting
+  quotes owned by the `flp_exposure` PDA; a taker crossing one is a normal ring-committed
+  BOOK fill, settled **permissionlessly** via `apply_flp_fill`'s new (additive)
+  ring-auth path. This also closes the FLP-permissionless gap (FLP fills were previously
+  oracle-band-trusted; now ring-authenticated).
+- **Auto-quoter (#226) + inventory cap (#227).** `flp_refresh_quotes` runs the
+  deterministic `generate_quotes` (Avellaneda-Stoikov skew) and posts/cancels the pool's
+  two-sided ladder. A hard inventory cap bounds the pool's net notional to ≤ its capital
+  (derived from live state, no `MarketParams` layout change); Kani-proven it can **never
+  freeze both sides** (the pool is always unwindable).
+- **Permissionless refresh + rate limit (#229/#230).** Any keeper may refresh (prices are
+  deterministic from on-chain state, so the caller can't choose them); a no-new-state
+  rate limit (the resting orders' post slot IS the marker; `RefreshTooSoon`,
+  `FLP_REFRESH_MIN_SLOTS = 50 ≈ 20s`) throttles book-churn of unfilled quotes.
+- **V2 bridge reference adapter (#228).** A pure mapping library (`v2-bridge/`)
+  demonstrating V2 `OpenPositionRequest` → flash-book order and flash-book position → V2
+  `PositionMetrics`, with the PnL reconciliation asserted end-to-end (16k positions, 0
+  mismatch). No program change.
+
+### 9.2 Verification posture (current)
+- **59 Kani proofs** (was 50) — added: `position_math` (open/stack/no-realized), the V2
+  reconciliation, the inventory-cap never-freeze, committee BFT-quorum/equivocation, and
+  merkle-inclusion proofs. Kani-tractability note: deep nested-i128-multiply / division-
+  result properties are pinned by **exhaustive host sweeps** instead (CBMC can't bit-blast
+  them in CI time) — e.g. reduce/flip PnL values, the VWAP bracket, and the V2 recon.
+- **430 host unit tests** (was 411) + the integration suite (incl. the full HLP loop:
+  FLP posts → taker crosses → permissionless settle; and the rate-limit warp test).
+- **CI 4/4 green** on every PR (Rust on-chain, `cargo build-sbf`, Kani, Lean). Merges are
+  gated on explicit per-check SUCCESS.
+- **Live-verified on devnet** — three new acceptance harnesses beyond the 7/7 ER
+  round-trip: `hlp_acceptance.mjs` (1b loop), `hlp_refresh_acceptance.mjs` (auto-quoter),
+  `hlp_ratelimit_acceptance.mjs` (permissionless + rate-limit, 3/3).
+
+### 9.3 Residual risk an auditor should weigh
+- **Un-used committee code (#218–#221).** An M-of-N BFT sequencer-committee (attestation +
+  equivocation slashing) was built then **de-scoped** in favour of the cheaper
+  permissionless-keeper model. It remains merged but **inert**: no market sets a committee,
+  settlement is not gated on it, and it adds 0 CU to the live path. An auditor may treat
+  it as dead code pending removal, not as an active trust dependency.
+- **FLP-pool settlement moves real capital.** The FLP-as-maker path (`apply_flp_fill` ring
+  branch + `apply_fill_to_flp_market`) settles against pool capital; it reuses the audited
+  settlement body and the Kani-proven `position_math`, and is ring-authenticated, but it
+  is the newest fund-critical surface and the primary focus for external review.
+- **V2 integration is out of scope here** — the `flashapi.trade/v2` service and landing
+  fills in V2 `Position`/`Custody` are V2-side (separate `FLASH6…` program).
+
+### 9.4 Deploy (devnet)
+Kept current with `main` through #231; the HLP loop, auto-quoter, inventory cap, and
+permissionless+rate-limit are each live-verified on the deployed program (latest upgrades
+incl. `iQbECnv…`, `4cX9GsW…`). Upgrade + market authority:
+`GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD`.
+
+**Current posture:** the HLP pool-backed CLOB is functionally complete and live on
+devnet, with all fund-critical math Kani-proven and V2-reconciled. Still held from a
+production rating by (a) the absence of an external audit — for which this document is the
+turnkey input — and (b) the FLP-pool settlement surface warranting focused review.
