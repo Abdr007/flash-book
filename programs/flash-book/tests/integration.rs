@@ -2347,6 +2347,7 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
     let payer = ctx.payer.insecure_clone();
 
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    disarm_fill_commitment(&mut ctx, market_pda).await; // FLP H-2: legacy sequencer path is unarmed-only
     let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
 
     let trader = Keypair::new();
@@ -2472,7 +2473,9 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[system_instruction::transfer(&payer.pubkey(), &rogue.pubkey(), 1_000_000_000)], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
     send(&mut ctx, build_ix(
-        flash_book::instruction::ApplyFlpFill { size_lots: 1, price_ticks: 100_000, taker_side: 0, taker_sub_index: 0, fill_seq: 1, taker_was_jit: false },
+        // FLP hardening H-1: pass fill_seq = u64::MAX on the RING path — it must be
+        // IGNORED (auto-incremented), NOT wedge last_settlement_seq. Asserted below.
+        flash_book::instruction::ApplyFlpFill { size_lots: 1, price_ticks: 100_000, taker_side: 0, taker_sub_index: 0, fill_seq: u64::MAX, taker_was_jit: false },
         vec![
             AccountMeta::new(rogue.pubkey(), true), // NOT the sequencer
             AccountMeta::new(market_pda, false),
@@ -2498,6 +2501,61 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
     assert_eq!(entry.side, 1, "pool short after being crossed as maker");
     assert_eq!(entry.size_lots, 1);
     assert_eq!(entry.entry_price_ticks, 100_000);
+    // FLP H-1: the caller-supplied fill_seq (u64::MAX) was IGNORED on the ring path —
+    // the nonce auto-incremented to 1 rather than wedging at u64::MAX. A permissionless
+    // caller cannot brick the market's settlement.
+    let mkt: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(mkt.last_settlement_seq, 1, "ring-path nonce auto-increments; caller fill_seq ignored");
+}
+
+/// FLP hardening H-2: on an ARMED market, `apply_flp_fill` via the SEQUENCER path
+/// (no fill-commitment supplied) is REJECTED — the ring is now mandatory, matching
+/// `apply_fill`. Previously a compromised sequencer could fabricate FLP fills within
+/// the ±FLP_MAX_FILL_DEVIATION_BPS band and drain LP capital; that asymmetric channel
+/// is closed. Only UNARMED (legacy) markets accept the sequencer + oracle-band path.
+#[tokio::test]
+async fn apply_flp_fill_armed_requires_ring_rejects_sequencer_path() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market_pda.as_ref()]);
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    // setup_market DISARMS; re-ARM (init_fill_commitment sets fill_commitment_required=true).
+    {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[build_ix(flash_book::instruction::InitMarketBook {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(system_program::ID, false)])], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[build_ix(flash_book::instruction::InitFillCommitment { cap: 256 }, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(fc_pda, false), AccountMeta::new_readonly(system_program::ID, false)])], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+    }
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (taker_pos, _) = pda(&[flash_book::state::PositionAccount::SEED, market_pda.as_ref(), trader_state.as_ref()]);
+    // The sequencer (payer) tries to settle an FLP fill with NO commitment on an armed market.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFlpFill { size_lots: 1, price_ticks: 100_000, taker_side: 0, taker_sub_index: 0, fill_seq: 1, taker_was_jit: false },
+        vec![
+            AccountMeta::new(payer.pubkey(), true), // the market's sequencer
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new_readonly(program_id(), false), // fee_tiers None
+            AccountMeta::new_readonly(program_id(), false), // haircut None ×2
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            // NO fill_commitment in remaining_accounts → not ring-authenticated → armed rejects.
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let r = ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).await;
+    assert!(r.is_err(), "armed market must reject the sequencer FLP path without a ring (H-2)");
+    let taker_acct = ctx.banks_client.get_account(taker_pos).await.unwrap();
+    assert!(taker_acct.is_none(), "no taker position after a rejected fabricated FLP fill (H-2)");
 }
 
 /// HLP (increment 2) — the pool AUTO-QUOTES: `flp_refresh_quotes` runs the
@@ -2560,6 +2618,7 @@ async fn apply_flp_fill_rejects_price_far_from_oracle() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    disarm_fill_commitment(&mut ctx, market_pda).await; // FLP H-2: legacy sequencer path is unarmed-only
     let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
 
     let trader = Keypair::new();
@@ -6039,6 +6098,8 @@ async fn apply_flp_fill_rejects_stale_oracle_h1() {
         ))
         .await
         .unwrap();
+        // FLP H-2: LEGACY sequencer + oracle-staleness path → market must be UNARMED.
+        disarm_fill_commitment(&mut ctx, market_pda).await;
 
     let trader = Keypair::new();
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
@@ -6683,6 +6744,7 @@ async fn apply_flp_fill_band_tightened_rejects_ten_percent_m1() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    disarm_fill_commitment(&mut ctx, market_pda).await; // FLP H-2: legacy sequencer path is unarmed-only
 
     let trader = Keypair::new();
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
