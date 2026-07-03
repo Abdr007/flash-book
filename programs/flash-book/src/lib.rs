@@ -4077,12 +4077,27 @@ pub mod flash_book {
         // P-SETTLE-1: advance the per-market settlement nonce through the
         // Kani-proven monotonic helper — strictly-increasing `fill_seq` only;
         // any replay/reorder is rejected (FillSeqReplay) before state mutates.
-        ctx.accounts.market.last_settlement_seq =
+        //
+        // AUDIT (2026-07 FLP hardening H-1): an ARMED market is permissionless
+        // (any keeper settles) and the ring below is mandatory + provides
+        // replay-protection (verify-and-pop, FIFO), so a caller-controlled
+        // `fill_seq` is redundant AND a market-freeze DoS (settling one authentic
+        // fill with `fill_seq = u64::MAX` wedges every later settlement). On the
+        // armed path auto-increment by 1 (deterministic, un-grief-able); the
+        // legacy unarmed SEQUENCER path (trusted) keeps the supplied `fill_seq`.
+        ctx.accounts.market.last_settlement_seq = if ctx.accounts.market.fill_commitment_required {
+            ctx.accounts
+                .market
+                .last_settlement_seq
+                .checked_add(1)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+        } else {
             matcher::fill_commitment::advance_settlement_seq(
                 ctx.accounts.market.last_settlement_seq,
                 fill_seq,
             )
-            .map_err(|_| error!(FlashBookError::FillSeqReplay))?;
+            .map_err(|_| error!(FlashBookError::FillSeqReplay))?
+        };
 
         // Legibility / defense-in-depth (audit 2026-06): taker and maker MUST be
         // distinct position accounts. A self-fill (same account passed twice) would
@@ -7004,9 +7019,19 @@ pub mod flash_book {
                 }
             }
         }
+        // AUDIT (2026-07 FLP hardening H-2): on an ARMED market the ring is
+        // MANDATORY — matching `apply_fill`. Previously the sequencer could OMIT
+        // the commitment and settle a fabricated FLP fill via the legacy path,
+        // bounded only by the ±FLP_MAX_FILL_DEVIATION_BPS oracle band — an
+        // asymmetric fabrication channel against LP capital (book fills were ring-
+        // mandatory, FLP fills were not). Now an armed market requires
+        // `ring_authenticated`; only an UNARMED (legacy) market may use the
+        // sequencer + oracle-band path. All HLP/on-book FLP fills are ring-crossed,
+        // so nothing legitimate depends on the armed sequencer fallback.
         require!(
             ring_authenticated
-                || ctx.accounts.sequencer.key() == ctx.accounts.market.sequencer,
+                || (!ctx.accounts.market.fill_commitment_required
+                    && ctx.accounts.sequencer.key() == ctx.accounts.market.sequencer),
             FlashBookError::Unauthorized
         );
 
@@ -7014,15 +7039,28 @@ pub mod flash_book {
         // The FLP settlement nonce shares the SAME market counter as apply_fill,
         // so a replay of either path is rejected and the two interleave under a
         // single strictly-increasing sequence.
-        // P-SETTLE-1: advance the per-market settlement nonce through the
-        // Kani-proven monotonic helper — strictly-increasing `fill_seq` only;
-        // any replay/reorder is rejected (FillSeqReplay) before state mutates.
-        ctx.accounts.market.last_settlement_seq =
+        //
+        // AUDIT (2026-07 FLP hardening H-1): on the RING-AUTHENTICATED path the
+        // caller is permissionless, and a caller-controlled `fill_seq` is a
+        // market-freeze DoS — one authentic fill settled with `fill_seq = u64::MAX`
+        // wedges `last_settlement_seq` so every later settlement (`> u64::MAX`)
+        // reverts forever. The ring already provides replay protection (verify-and-
+        // pop, FIFO) and ordering, so the caller's nonce is redundant there:
+        // auto-increment by 1 instead (deterministic, un-grief-able, ignores the
+        // arg). The legacy SEQUENCER path (trusted) keeps the supplied `fill_seq`.
+        ctx.accounts.market.last_settlement_seq = if ring_authenticated {
+            ctx.accounts
+                .market
+                .last_settlement_seq
+                .checked_add(1)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+        } else {
             matcher::fill_commitment::advance_settlement_seq(
                 ctx.accounts.market.last_settlement_seq,
                 fill_seq,
             )
-            .map_err(|_| error!(FlashBookError::FillSeqReplay))?;
+            .map_err(|_| error!(FlashBookError::FillSeqReplay))?
+        };
 
         // ── #35 / H1 part B: FLP fill-price authenticity band ────────────
         // FLP fills aren't matcher-produced on-chain, so they can't ride the
@@ -7042,7 +7080,15 @@ pub mod flash_book {
         // the pool. When a staleness bound is configured, require the oracle fresh
         // (and treat `published_at == 0` as stale → reject). `max_age == 0` is the
         // operator's explicit "no staleness gate" (tracked separately as L-5).
-        {
+        // AUDIT (2026-07 FLP hardening M-1): the oracle-band + staleness gate is the
+        // authenticity bound for LEGACY sequencer-decided FLP fills. On the RING-
+        // AUTHENTICATED path the fill is already matcher-produced and its price is
+        // bound in the keccak commitment, so the band is redundant here — and worse,
+        // running it would let oracle drift between match-time (ER) and settle-time
+        // (L1) REJECT an authentic committed fill, stranding it at the head of the
+        // SHARED FIFO ring and blocking every later settlement (book + FLP). Skip it
+        // on the ring path; keep it as the sole authenticity bound on the legacy path.
+        if !ring_authenticated {
             let max_age = ctx.accounts.market.params.oracle_staleness_max_seconds as u64;
             if max_age > 0 {
                 let now = Clock::get()?.unix_timestamp.max(0) as u64;
@@ -7052,15 +7098,15 @@ pub mod flash_book {
                     FlashBookError::OracleTooStale
                 );
             }
+            require!(
+                matcher::flp_quoter::price_within_band(
+                    ctx.accounts.market.oracle_price_ticks,
+                    price_ticks,
+                    crate::constants::FLP_MAX_FILL_DEVIATION_BPS,
+                ),
+                FlashBookError::FlpPriceOutsideBand
+            );
         }
-        require!(
-            matcher::flp_quoter::price_within_band(
-                ctx.accounts.market.oracle_price_ticks,
-                price_ticks,
-                crate::constants::FLP_MAX_FILL_DEVIATION_BPS,
-            ),
-            FlashBookError::FlpPriceOutsideBand
-        );
         // H-2 (audit 2026-06) FIX: on a haircut-enabled market the haircut accounts
         // are MANDATORY (FLP path has market + taker only — FLP is the maker), so a
         // settlement can't omit them to route the taker's PnL past the solvency gate.
