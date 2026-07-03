@@ -2518,10 +2518,19 @@ async fn apply_flp_fill_armed_requires_ring_rejects_sequencer_path() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
-    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // ARMED by default
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market_pda.as_ref()]);
     seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    // setup_market DISARMS; re-ARM (init_fill_commitment sets fill_commitment_required=true).
+    {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[build_ix(flash_book::instruction::InitMarketBook {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(system_program::ID, false)])], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[build_ix(flash_book::instruction::InitFillCommitment { cap: 256 }, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(fc_pda, false), AccountMeta::new_readonly(system_program::ID, false)])], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+    }
     let trader = Keypair::new();
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (taker_pos, _) = pda(&[flash_book::state::PositionAccount::SEED, market_pda.as_ref(), trader_state.as_ref()]);
@@ -5960,7 +5969,6 @@ async fn auto_deleverage_rejects_multi_leg_cross_h5() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_a, _, _, _) = setup_market(&mut ctx, &payer).await;
-    disarm_fill_commitment(&mut ctx, market_a).await; // FLP H-2: legacy sequencer path is unarmed-only
     let (market_b, _, _, _) = setup_additional_market(&mut ctx, &payer, 100_000).await;
 
     let under = Keypair::new();
@@ -6090,6 +6098,8 @@ async fn apply_flp_fill_rejects_stale_oracle_h1() {
         ))
         .await
         .unwrap();
+        // FLP H-2: LEGACY sequencer + oracle-staleness path → market must be UNARMED.
+        disarm_fill_commitment(&mut ctx, market_pda).await;
 
     let trader = Keypair::new();
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
