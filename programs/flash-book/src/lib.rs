@@ -6743,6 +6743,161 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// HLP (increment 2) — refresh the pool's on-book quotes. Reads the oracle +
+    /// FLP inventory and runs the SAME deterministic `flp_quoter::generate_quotes`
+    /// the view exposes (Avellaneda-Stoikov inventory skew + spread model), then
+    /// CANCELS the pool's stale resting quotes and POSTS the fresh two-sided
+    /// ladder — turning the pool into a self-managing on-book market maker. The
+    /// ladder is oracle-anchored and inventory-skewed, so the pool leans against
+    /// its own position (it quotes wider/further on the side it's already long).
+    /// Authority-gated for now (a keeper bot holding the authority key refreshes;
+    /// permissionless-with-rate-limit is a follow-up). Prices come only from
+    /// on-chain state + the deterministic quoter — the caller cannot choose them.
+    pub fn flp_refresh_quotes(ctx: Context<FlpRefreshQuotes>) -> Result<()> {
+        let now_slot = Clock::get()?.slot;
+        let market = &ctx.accounts.market;
+        require_keys_eq!(
+            ctx.accounts.authority.key(),
+            market.authority,
+            FlashBookError::Unauthorized
+        );
+        require!(
+            market.status == MarketStatus::Active as u8
+                || market.status == MarketStatus::PostOnly as u8,
+            FlashBookError::OutOfRange
+        );
+
+        // ── assemble quoter params + inputs (mirrors `view_quote_ladder`) ──
+        let market_key = market.key();
+        let flp = &ctx.accounts.flp_exposure;
+        let flp_pk = flp.key();
+        let flp_pool_capital = flp.total_capital_quote_lots;
+        let flp_net_signed: i64 = {
+            let entry = flp
+                .per_market
+                .iter()
+                .find(|e| e.market == market_key && e.side != 255);
+            match entry {
+                Some(e) => {
+                    let n = (e.size_lots as u128)
+                        .saturating_mul(e.entry_price_ticks as u128)
+                        .saturating_mul(market.params.tick_size as u128)
+                        .min(i64::MAX as u128) as i64;
+                    if e.side == 0 { n } else { -n }
+                }
+                None => 0,
+            }
+        };
+        let mut gross_used: u128 = 0;
+        for e in flp.per_market.iter() {
+            if e.side == 255 { continue; }
+            gross_used = gross_used.saturating_add(
+                (e.size_lots as u128)
+                    .saturating_mul(e.entry_price_ticks as u128)
+                    .saturating_mul(market.params.tick_size as u128),
+            );
+        }
+        let utilization_bps: u32 = if flp_pool_capital == 0 {
+            0
+        } else {
+            ((gross_used.saturating_mul(constants::BPS_DENOM as u128)) / (flp_pool_capital as u128))
+                .min(u32::MAX as u128) as u32
+        };
+        let flp_params = matcher::flp_quoter::FlpQuoterParams {
+            base_spread_bps: market.params.flp_spread_base_bps,
+            alpha_bps: market.params.flp_spread_alpha_bps,
+            beta_bps: market.params.flp_spread_beta_bps,
+            gamma_bps: market.params.flp_spread_gamma_bps,
+            kappa_bps: market.params.flp_spread_kappa_bps,
+            delta_bps: market.params.flp_spread_delta_bps,
+            inventory_lambda_bps: market.params.flp_inventory_lambda_bps,
+            depth_floor_lots: market.params.flp_depth_floor_lots,
+            max_growth_per_batch_bps: market.params.flp_max_growth_per_batch_bps,
+            levels: market.params.flp_quote_levels,
+            tick_size: market.params.tick_size,
+        };
+        let realized_vol_bps = realized_vol_bps_from_window(
+            &market.recent_clearing_prices,
+            market.recent_clearing_count,
+        );
+        let flp_inputs = matcher::flp_quoter::FlpQuoterInputs {
+            oracle_ticks: matcher::lot::Ticks(market.oracle_price_ticks),
+            vpin_bps: market.vpin.as_bps(),
+            realized_vol_bps,
+            pool_capital_quote_lots: flp_pool_capital,
+            pool_net_quote_lots_signed: flp_net_signed,
+            pool_gross_utilization_bps: utilization_bps,
+            oi_long_lots: market.oi_long_lots,
+            oi_short_lots: market.oi_short_lots,
+        };
+
+        // ── mutate the book: cancel the pool's stale quotes, post the fresh ──
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        require!(handle.header.market_pubkey == market_key, FlashBookError::WrongMarket);
+
+        let base_seq = handle.header.order_seq_counter;
+        let (_out, orders) =
+            matcher::flp_quoter::generate_quotes(flp_params, flp_inputs, flp_pk, base_seq)?;
+
+        // Cancel every resting order owned by the pool (collect indices first —
+        // mid-iteration mutation of the RBT is unsafe).
+        let mut flp_bids: Vec<hypertree::DataIndex> = Vec::new();
+        let mut flp_asks: Vec<hypertree::DataIndex> = Vec::new();
+        handle.for_each_bid_best_first(|idx, o| {
+            if o.trader == flp_pk { flp_bids.push(idx); }
+            true
+        });
+        handle.for_each_ask_best_first(|idx, o| {
+            if o.trader == flp_pk { flp_asks.push(idx); }
+            true
+        });
+        let cancelled = (flp_bids.len() + flp_asks.len()) as u32;
+        for idx in flp_bids { handle.remove_bid_node(idx); }
+        for idx in flp_asks { handle.remove_ask_node(idx); }
+
+        // Post the fresh ladder (generate_quotes already priced/sized each level
+        // and stamped trader = the pool PDA). Convert each matcher `Order` to a
+        // `RestingOrderV2` and insert; sequence ids stay strictly increasing.
+        let mut seq = handle.header.order_seq_counter;
+        let mut posted: u32 = 0;
+        for o in &orders {
+            if o.size.0 == 0 { continue; }
+            seq = seq.checked_add(1).ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            let side_is_bid = matches!(o.side, Side::Long);
+            let order_id = state_v2::encode_order_id(o.limit_price.0, seq, side_is_bid);
+            let ro = state_v2::RestingOrderV2 {
+                order_id,
+                seq,
+                price_ticks: o.limit_price.0,
+                size_lots: o.size.0,
+                expires_at_slot: 0,
+                trader: flp_pk,
+                last_valid_slot: u32::try_from(now_slot).unwrap_or(u32::MAX),
+                side: if side_is_bid { 0 } else { 1 },
+                order_type: 0,
+                flags: 1, // POST_ONLY
+                sub_index: 0,
+            };
+            if side_is_bid {
+                handle.insert_bid(ro)?;
+            } else {
+                handle.insert_ask(ro)?;
+            }
+            posted += 1;
+        }
+        handle.header.order_seq_counter = seq;
+
+        emit!(FlpQuotesRefreshedEvent {
+            market: market_key,
+            cancelled,
+            posted,
+            skew_bps: _out.skew_bps,
+            fair_value_ticks: _out.fair_value.0,
+        });
+        Ok(())
+    }
+
     /// Apply a fill in which the FLP pool is the *maker*. Mutates the
     /// `FlpExposureAccount.per_market` entry for this market while
     /// applying the opposite-side update to the taker's `PositionAccount`.
@@ -14770,6 +14925,34 @@ pub struct FlpPostMakerOrder<'info> {
 }
 
 #[derive(Accounts)]
+pub struct FlpRefreshQuotes<'info> {
+    pub authority: Signer<'info>,
+
+    // Box the large MarketAccount (heap) — an un-boxed Account here overflows
+    // BPF's 4 KB stack alongside the book handle + generated-order Vec.
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: market_book PDA; validated in-handler via `MarketBookHandle`.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+
+    #[account(
+        seeds = [FlpExposureAccount::SEED],
+        bump = flp_exposure.bump,
+    )]
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+}
+
+#[derive(Accounts)]
 pub struct ApplyFlpFill<'info> {
     #[account(mut)]
     pub sequencer: Signer<'info>,
@@ -15703,6 +15886,15 @@ pub struct FlpMakerOrderPostedEvent {
     pub price_ticks: u64,
     pub size_lots: u64,
     pub order_id: u64,
+}
+
+#[event]
+pub struct FlpQuotesRefreshedEvent {
+    pub market: Pubkey,
+    pub cancelled: u32,
+    pub posted: u32,
+    pub skew_bps: i32,
+    pub fair_value_ticks: u64,
 }
 
 #[event]

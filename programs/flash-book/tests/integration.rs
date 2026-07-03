@@ -2500,6 +2500,46 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
     assert_eq!(entry.entry_price_ticks, 100_000);
 }
 
+/// HLP (increment 2) — the pool AUTO-QUOTES: `flp_refresh_quotes` runs the
+/// deterministic quoter and posts a two-sided ladder owned by the pool, then a
+/// taker crosses the pool's own ask → a ring-committed FLP-maker fill. Proves the
+/// quoter → book → cross pipeline: the pool is now a self-managing on-book MM.
+#[tokio::test]
+async fn hlp_flp_refresh_quotes_posts_crossable_ladder() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market_pda.as_ref()]);
+    // Seed enough capital that per-level size is non-zero (per_level_quote =
+    // capital · max_growth_bps/1e4 / levels must exceed one lot's notional).
+    seed_flp_capital(&mut ctx, &payer, &protocol, 10_000_000_000).await;
+
+    async fn send(ctx: &mut solana_program_test::ProgramTestContext, ix: Instruction, signers: &[&Keypair]) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[ix], Some(&signers[0].pubkey()), signers, bh)).await
+    }
+
+    send(&mut ctx, build_ix(flash_book::instruction::InitMarketBook {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(system_program::ID, false)]), &[&payer]).await.unwrap();
+    send(&mut ctx, build_ix(flash_book::instruction::InitFillCommitment { cap: 256 }, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(fc_pda, false), AccountMeta::new_readonly(system_program::ID, false)]), &[&payer]).await.unwrap();
+
+    // 1) the pool auto-quotes — posts a fresh two-sided ladder.
+    send(&mut ctx, build_ix(flash_book::instruction::FlpRefreshQuotes {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(flp_exposure, false)]), &[&payer]).await.expect("pool refreshes its on-book quotes");
+
+    // 2) a taker crosses the pool's best ask (bid well above fair value ~100k).
+    send(&mut ctx, build_ix(flash_book::instruction::PlaceTakerOrderV2 { side: 0, size_lots: 1, limit_ticks: 110_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new(fc_pda, false)]), &[&payer]).await.expect("taker crosses an auto-quoted FLP ask");
+
+    // 3) the ring recorded the FLP-maker fill → the auto-quoted ladder is live + crossable.
+    let fc_data = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
+    let produced = u64::from_le_bytes(fc_data[8..16].try_into().unwrap());
+    assert!(produced >= 1, "a taker must have crossed at least one auto-quoted FLP level (produced={produced})");
+
+    // 4) re-quoting cancels the pool's stale orders and reposts (idempotent refresh).
+    send(&mut ctx, build_ix(flash_book::instruction::FlpRefreshQuotes {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(flp_exposure, false)]), &[&payer]).await.expect("pool re-refreshes (cancel stale + repost)");
+}
+
 /// #35 / H1 part B — FLP authenticity band: an `apply_flp_fill` priced far from
 /// the FRESH oracle (a compromised sequencer pricing the pool fill to extract
 /// value) is REJECTED. Oracle = 100_000; posting 300_000 (200% deviation, far
