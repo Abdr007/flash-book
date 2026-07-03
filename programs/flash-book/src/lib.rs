@@ -14744,12 +14744,15 @@ pub struct ViewMarket<'info> {
 pub struct FlpPostMakerOrder<'info> {
     pub authority: Signer<'info>,
 
+    // Box the (large) MarketAccount onto the heap — an un-boxed `Account` here
+    // deserializes it onto the stack and, with the book handle + order struct in
+    // the same frame, overflows BPF's 4 KB stack (Access violation).
     #[account(
         mut,
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
 
     /// CHECK: market_book PDA; validated in-handler via `MarketBookHandle`.
     #[account(
