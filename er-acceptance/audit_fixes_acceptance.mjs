@@ -236,5 +236,17 @@ const lockSig = await send(await program.methods.lockOracleSource().accountsPart
 ok(!!lockSig, `Gov P-3: authority LOCKED the oracle source — ${String(lockSig).slice(0, 12)}…`);
 ok((await program.account.marketEnvelopeConfigAccount.fetch(envPda)).sourceLocked === 1, "  source_locked == 1 (direct update_oracle disabled; one-way — no unlock ix)");
 
+// ── GOVERNANCE Phase-2b follow-up: guardian VETO of a pending params update ──────
+// im0 already has a guardian (set in Phase 1). Authority proposes a valid timelocked
+// param change; the guardian vetoes it during the delay (the fail-safe brake).
+console.log("\nGov P-2b veto: guardian vetoes a pending timelocked params update");
+const vetoPending = pda(["pending_params", im0.M]);
+const im0Guardian = pda(["market_guardian", im0.M]);
+await send(await program.methods.proposeParamUpdate(paramsIM).accountsPartial({ authority: signer.publicKey, market: im0.M }).instruction());
+ok(!!(await l1.getAccountInfo(vetoPending)), "  authority proposed a pending update");
+const vetoSig = await send(await program.methods.guardianVetoParamUpdate().accountsPartial({ guardian: guardian.publicKey, market: im0.M, guardianAccount: im0Guardian, pending: vetoPending }).instruction(), [guardian]);
+ok(!!vetoSig, `Gov P-2b veto: guardian VETOED the pending update — ${String(vetoSig).slice(0, 12)}…`);
+ok((await l1.getAccountInfo(vetoPending)) === null, "  pending closed by the guardian veto (fail-safe brake)");
+
 console.log(`\n${fail === 0 ? "✅ AUDIT-FIXES LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

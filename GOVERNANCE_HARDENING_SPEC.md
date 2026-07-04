@@ -89,9 +89,13 @@ stores `keccak(params) + eta = now + PARAM_UPDATE_TIMELOCK_SECONDS` (48h); it do
 `execute_param_update` applies only when `now >= eta` AND `keccak(supplied) == stored` (the change is
 exactly the pre-announced one), re-validates, and closes the pending. `cancel_param_update`
 (authority) revokes. `ParamUpdateProposedEvent` carries `eta` for off-chain alerting. The immediate
-`update_market_params` is retained as the un-timelocked path. **Follow-up (ready, not shipped):**
-`guardian_veto_param_update` — let the emergency guardian cancel a pending param change during the
-delay (fail-safe emergency brake), as a pure-addition ix that doesn't touch the authority cancel path.
+`update_market_params` is retained as the un-timelocked path.
+
+**Phase-2b follow-up — guardian veto — ✅ SHIPPED (commit `8fc2854`; live 32/32).**
+`guardian_veto_param_update` lets the emergency guardian (Phase-1 restrict-only key) cancel a pending
+param change during its delay window — the fail-safe brake for a compromised authority that proposed
+a dangerous loosening. A pure-addition ix (does not touch the authority `cancel_param_update` path);
+auth is the guardian-account constraint; closes the pending (rent → guardian).
 
 ### Phase 3 — Deprecate direct-write `update_oracle` on production markets — ✅ SHIPPED (commit `f9cf4ad`; live 29/29)
 `lock_oracle_source` (authority-only, ONE-WAY — no unlock ix). Once locked, the direct-authority
