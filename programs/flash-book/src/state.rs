@@ -432,6 +432,25 @@ impl MarketGuardianAccount {
     pub const LEN: usize = 32 + 32 + 1;
 }
 
+/// GOVERNANCE Phase-2 (2026-07): pending authority for a 2-step (propose→accept)
+/// market-authority transfer. Held in its own PDA (not a MarketAccount field — the
+/// stack constraint, see Phase 1). `propose_authority_transfer` (current authority)
+/// stores `pending_authority`; `accept_authority_transfer`, signed BY that pending
+/// key, commits `market.authority` and closes this account. Because the new key must
+/// itself sign to accept, a transfer can never strand control at a wrong/dead key
+/// (the failure mode of the 1-step `transfer_market_authority`).
+#[account]
+pub struct MarketPendingAuthorityAccount {
+    pub market: Pubkey,
+    pub pending_authority: Pubkey,
+    pub bump: u8,
+}
+
+impl MarketPendingAuthorityAccount {
+    pub const SEED: &'static [u8] = b"pending_authority";
+    pub const LEN: usize = 32 + 32 + 1;
+}
+
 // H1: build-time guard — the struct (incl. the new nonce) must still fit the
 // allocated `space()` (8 disc + 1152). If a future field overflows it, this
 // fails the build instead of silently corrupting account (de)serialization.

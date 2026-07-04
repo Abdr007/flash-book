@@ -3964,6 +3964,119 @@ async fn armed_apply_fill_rejects_when_commitment_account_omitted() {
     assert!(taker_acct.is_none(), "no position after C-1 rejection");
 }
 
+/// GOVERNANCE Phase-2 (2026-07): 2-step authority transfer — the current authority
+/// PROPOSES a new key, which then must ACCEPT (proving it is live/correct); a wrong
+/// key cannot accept, and the authority can CANCEL before acceptance. Prevents
+/// stranding a market at a mistyped/dead key (the 1-step transfer's failure mode).
+#[tokio::test]
+async fn two_step_authority_transfer_requires_new_key_to_accept() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone(); // the initial market authority
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (pending_pda, _) = pda(&[
+        flash_book::state::MarketPendingAuthorityAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let new_auth = Keypair::new();
+    let rando = Keypair::new();
+    for k in [&new_auth, &rando] {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[system_instruction::transfer(&payer.pubkey(), &k.pubkey(), 1_000_000_000)],
+                Some(&payer.pubkey()),
+                &[&payer],
+                bh,
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    let propose_ix = |authority: Pubkey, new: Pubkey| {
+        build_ix(
+            flash_book::instruction::ProposeAuthorityTransfer { new_authority: new },
+            vec![
+                AccountMeta::new(authority, true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(pending_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        )
+    };
+    let accept_ix = |signer: Pubkey| {
+        build_ix(
+            flash_book::instruction::AcceptAuthorityTransfer {},
+            vec![
+                AccountMeta::new(signer, true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(pending_pda, false),
+            ],
+        )
+    };
+    let cancel_ix = |authority: Pubkey| {
+        build_ix(
+            flash_book::instruction::CancelAuthorityTransfer {},
+            vec![
+                AccountMeta::new(authority, true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(pending_pda, false),
+            ],
+        )
+    };
+    // 1) authority proposes new_auth.
+    send(&mut ctx, propose_ix(payer.pubkey(), new_auth.pubkey()), &[&payer]).await.unwrap();
+    let p: flash_book::state::MarketPendingAuthorityAccount = fetch(&mut ctx.banks_client, pending_pda).await;
+    assert_eq!(p.pending_authority, new_auth.pubkey());
+
+    // 2) a WRONG key cannot accept; authority unchanged.
+    assert!(send(&mut ctx, accept_ix(rando.pubkey()), &[&rando]).await.is_err(), "wrong key cannot accept");
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.authority,
+        payer.pubkey(),
+        "authority unchanged after wrong accept"
+    );
+
+    // 3) the NEW key accepts → authority transfers, pending account closed.
+    send(&mut ctx, accept_ix(new_auth.pubkey()), &[&new_auth]).await.expect("new key accepts");
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.authority,
+        new_auth.pubkey(),
+        "authority transferred to new key"
+    );
+    assert!(ctx.banks_client.get_account(pending_pda).await.unwrap().is_none(), "pending account closed on accept");
+
+    // 4) the OLD authority can no longer act.
+    assert!(send(&mut ctx, propose_ix(payer.pubkey(), rando.pubkey()), &[&payer]).await.is_err(), "old authority is locked out");
+
+    // 5) cancel path: new authority proposes rando, then cancels → no transfer.
+    send(&mut ctx, propose_ix(new_auth.pubkey(), rando.pubkey()), &[&new_auth]).await.expect("re-propose by new authority");
+    send(&mut ctx, cancel_ix(new_auth.pubkey()), &[&new_auth]).await.expect("authority cancels");
+    assert!(ctx.banks_client.get_account(pending_pda).await.unwrap().is_none(), "pending closed by cancel");
+    assert!(send(&mut ctx, accept_ix(rando.pubkey()), &[&rando]).await.is_err(), "a cancelled transfer cannot be accepted");
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.authority,
+        new_auth.pubkey(),
+        "authority still the (un-cancelled) new key"
+    );
+}
+
 /// GOVERNANCE Phase-1 (2026-07): a guardian may RESTRICT market status (pause /
 /// post-only / close) but NEVER loosen it (unpause stays authority-only), and
 /// `set_guardian` is authority-only. Asymmetric emergency control via a separate

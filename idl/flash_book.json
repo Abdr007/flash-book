@@ -8,6 +8,96 @@
   },
   "instructions": [
     {
+      "name": "accept_authority_transfer",
+      "docs": [
+        "GOVERNANCE Phase-2: step 2 — the PENDING authority accepts, committing the",
+        "transfer and closing the pending account (rent → the accepter). Signed by the",
+        "new authority (context constraint), so control can never land on a key that",
+        "can't sign."
+      ],
+      "discriminator": [
+        239,
+        248,
+        177,
+        2,
+        206,
+        97,
+        46,
+        255
+      ],
+      "accounts": [
+        {
+          "name": "new_authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "apply_fill",
       "docs": [
         "Apply a single fill against the taker's and maker's Position PDAs.",
@@ -1030,6 +1120,94 @@
                   111,
                   111,
                   107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "cancel_authority_transfer",
+      "docs": [
+        "GOVERNANCE Phase-2: the current authority cancels a pending transfer (closes",
+        "the pending account, rent → authority) — e.g. if the target key is no longer",
+        "trusted before it accepts."
+      ],
+      "discriminator": [
+        94,
+        131,
+        125,
+        184,
+        183,
+        24,
+        125,
+        229
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
                 ]
               },
               {
@@ -9343,6 +9521,105 @@
       ]
     },
     {
+      "name": "propose_authority_transfer",
+      "docs": [
+        "GOVERNANCE Phase-2 (2026-07): step 1 of a SAFE 2-step authority transfer. The",
+        "current authority proposes `new_authority`; it does NOT take effect until that",
+        "key calls `accept_authority_transfer` (proving it is live + correct). Prefer",
+        "this over the 1-step `transfer_market_authority`, which can strand a market at",
+        "a mistyped/dead key. Re-proposing overwrites the pending target."
+      ],
+      "discriminator": [
+        57,
+        206,
+        225,
+        129,
+        35,
+        111,
+        174,
+        145
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "new_authority",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
       "name": "reap_expired_orders",
       "docs": [
         "Permissionless expiry-reaper (#36 anti-book-stuffing). Removes GTT orders",
@@ -15235,6 +15512,19 @@
       ]
     },
     {
+      "name": "MarketPendingAuthorityAccount",
+      "discriminator": [
+        234,
+        133,
+        133,
+        183,
+        44,
+        8,
+        102,
+        145
+      ]
+    },
+    {
       "name": "MarketSideAccrualAccount",
       "discriminator": [
         211,
@@ -15366,6 +15656,45 @@
     }
   ],
   "events": [
+    {
+      "name": "AuthorityTransferAcceptedEvent",
+      "discriminator": [
+        197,
+        245,
+        131,
+        59,
+        10,
+        170,
+        215,
+        14
+      ]
+    },
+    {
+      "name": "AuthorityTransferCancelledEvent",
+      "discriminator": [
+        192,
+        121,
+        140,
+        224,
+        229,
+        96,
+        13,
+        143
+      ]
+    },
+    {
+      "name": "AuthorityTransferProposedEvent",
+      "discriminator": [
+        219,
+        219,
+        120,
+        196,
+        117,
+        157,
+        182,
+        254
+      ]
+    },
     {
       "name": "AutoDeleveragedEvent",
       "discriminator": [
@@ -17595,6 +17924,61 @@
     }
   ],
   "types": [
+    {
+      "name": "AuthorityTransferAcceptedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "new_authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AuthorityTransferCancelledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "cancelled_authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AuthorityTransferProposedEvent",
+      "docs": [
+        "GOVERNANCE Phase-2 (2026-07): 2-step authority transfer lifecycle events."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "new_authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
     {
       "name": "AutoDeleveragedEvent",
       "type": {
@@ -21808,6 +22192,35 @@
           {
             "name": "market",
             "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketPendingAuthorityAccount",
+      "docs": [
+        "GOVERNANCE Phase-2 (2026-07): pending authority for a 2-step (propose→accept)",
+        "market-authority transfer. Held in its own PDA (not a MarketAccount field — the",
+        "stack constraint, see Phase 1). `propose_authority_transfer` (current authority)",
+        "stores `pending_authority`; `accept_authority_transfer`, signed BY that pending",
+        "key, commits `market.authority` and closes this account. Because the new key must",
+        "itself sign to accept, a transfer can never strand control at a wrong/dead key",
+        "(the failure mode of the 1-step `transfer_market_authority`)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "pending_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
           }
         ]
       }

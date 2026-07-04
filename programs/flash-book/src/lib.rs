@@ -6107,6 +6107,56 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// GOVERNANCE Phase-2 (2026-07): step 1 of a SAFE 2-step authority transfer. The
+    /// current authority proposes `new_authority`; it does NOT take effect until that
+    /// key calls `accept_authority_transfer` (proving it is live + correct). Prefer
+    /// this over the 1-step `transfer_market_authority`, which can strand a market at
+    /// a mistyped/dead key. Re-proposing overwrites the pending target.
+    pub fn propose_authority_transfer(
+        ctx: Context<ProposeAuthorityTransfer>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        require!(new_authority != Pubkey::default(), FlashBookError::OutOfRange);
+        let market_key = ctx.accounts.market.key();
+        let p = &mut ctx.accounts.pending;
+        p.market = market_key;
+        p.pending_authority = new_authority;
+        p.bump = ctx.bumps.pending;
+        emit!(AuthorityTransferProposedEvent {
+            market: market_key,
+            new_authority,
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-2: step 2 — the PENDING authority accepts, committing the
+    /// transfer and closing the pending account (rent → the accepter). Signed by the
+    /// new authority (context constraint), so control can never land on a key that
+    /// can't sign.
+    pub fn accept_authority_transfer(ctx: Context<AcceptAuthorityTransfer>) -> Result<()> {
+        let new_authority = ctx.accounts.pending.pending_authority;
+        let market = &mut ctx.accounts.market;
+        let previous_authority = market.authority;
+        market.authority = new_authority;
+        emit!(AuthorityTransferAcceptedEvent {
+            market: market.key(),
+            previous_authority,
+            new_authority,
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-2: the current authority cancels a pending transfer (closes
+    /// the pending account, rent → authority) — e.g. if the target key is no longer
+    /// trusted before it accepts.
+    pub fn cancel_authority_transfer(ctx: Context<CancelAuthorityTransfer>) -> Result<()> {
+        emit!(AuthorityTransferCancelledEvent {
+            market: ctx.accounts.market.key(),
+            cancelled_authority: ctx.accounts.pending.pending_authority,
+        });
+        Ok(())
+    }
+
     /// Wave 30 — Authority burn. Permanently relinquish authority over
     /// this market by setting `market.authority` to `Pubkey::default()`.
     /// This is a one-way operation: once burned, no further
@@ -14797,6 +14847,75 @@ pub struct SetGuardian<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// GOVERNANCE Phase-2 (2026-07): propose a 2-step authority transfer (authority-only
+/// via the context constraint). Creates the pending PDA on first use.
+#[derive(Accounts)]
+pub struct ProposeAuthorityTransfer<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + state::MarketPendingAuthorityAccount::LEN,
+        seeds = [state::MarketPendingAuthorityAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub pending: Account<'info, state::MarketPendingAuthorityAccount>,
+    pub system_program: Program<'info, System>,
+}
+
+/// GOVERNANCE Phase-2: accept a pending transfer. Auth is the `new_authority`
+/// signer matching the stored `pending_authority` (context constraint) — NOT the
+/// current market authority. Closes the pending account (rent → new_authority).
+#[derive(Accounts)]
+pub struct AcceptAuthorityTransfer<'info> {
+    #[account(mut)]
+    pub new_authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        mut,
+        close = new_authority,
+        seeds = [state::MarketPendingAuthorityAccount::SEED, market.key().as_ref()],
+        bump = pending.bump,
+        constraint = pending.market == market.key() @ FlashBookError::WrongMarket,
+        constraint = pending.pending_authority == new_authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub pending: Account<'info, state::MarketPendingAuthorityAccount>,
+}
+
+/// GOVERNANCE Phase-2: cancel a pending transfer (authority-only). Closes the
+/// pending account (rent → authority).
+#[derive(Accounts)]
+pub struct CancelAuthorityTransfer<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        mut,
+        close = authority,
+        seeds = [state::MarketPendingAuthorityAccount::SEED, market.key().as_ref()],
+        bump = pending.bump,
+        constraint = pending.market == market.key() @ FlashBookError::WrongMarket,
+    )]
+    pub pending: Account<'info, state::MarketPendingAuthorityAccount>,
+}
+
 /// M-14 decentralization (Phase 1): create/rotate the per-market sequencer
 /// committee. `init_if_needed` so the same ix handles first-set + rotation.
 #[derive(Accounts)]
@@ -16622,6 +16741,26 @@ pub struct MarketAuthorityTransferredEvent {
     pub market: Pubkey,
     pub previous_authority: Pubkey,
     pub new_authority: Pubkey,
+}
+
+/// GOVERNANCE Phase-2 (2026-07): 2-step authority transfer lifecycle events.
+#[event]
+pub struct AuthorityTransferProposedEvent {
+    pub market: Pubkey,
+    pub new_authority: Pubkey,
+}
+
+#[event]
+pub struct AuthorityTransferAcceptedEvent {
+    pub market: Pubkey,
+    pub previous_authority: Pubkey,
+    pub new_authority: Pubkey,
+}
+
+#[event]
+pub struct AuthorityTransferCancelledEvent {
+    pub market: Pubkey,
+    pub cancelled_authority: Pubkey,
 }
 
 #[event]
