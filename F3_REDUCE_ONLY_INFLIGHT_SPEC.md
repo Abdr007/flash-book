@@ -39,17 +39,25 @@ free option, bad debt socialized to insurance/LPs. The profitable actor is the m
   `trigger.size_lots <= position.size_lots` (plus `size > 0` and opposite side) before injecting a
   reduce-only close order. A **single** reduce-only order therefore can never exceed the position
   at fire time — the single-oversized-order vector is closed.
-- **OCO (HIGH-7).** When a bracket leg fires, `execute_trigger_order_v3` deactivates the validated
-  mutual sibling (`FLAG_ACTIVE` cleared, reverts if the sibling is omitted/wrong), so a bracket's
-  TP+SL can never both inject. The bracket double-leg vector is closed.
+- **OCO (HIGH-7) — but note its EXACT scope.** When a bracket leg fires, `execute_trigger_order_v3`
+  deactivates that bracket's *own* validated mutual sibling, so a single bracket's TP+SL can never
+  both inject. **OCO does NOT relate a bracket leg to any UNRELATED reduce-only order.**
 - **Per-call cap.** Within one `place_taker` walk, two reduce-only orders on the same position map
   to the same `maker_positions` entry and share its decremented reducible, so a single taker call
   cannot over-reduce.
 
-**Remaining residual after the above:** two **standalone** (non-OCO) reduce-only stops on one
-position, both fired (price whipsaw), crossed by **two separate** taker calls in the ER→L1
-settle gap. Narrow, self-cross-shaped, and attacker-timed — but real, because the injection clamp
-is per-order (not cumulative) and the matcher's reducible read is a stale snapshot.
+**Remaining residual after the above (scope corrected 2026-07 after deep review):** the residual is
+NOT limited to two *standalone* stops. Because the injection clamp is strictly **per-order**
+(`trigger.size ≤ position.size`, no cumulative accounting) and OCO only pairs a bracket's own two
+legs, **any two independent injection-capable reduce-only exits on one position** can both inject and
+both cap against the stale snapshot — including a **bracket stop-loss leg PLUS an unrelated standalone
+stop** on the same position, not just two standalone stops. Both cross via two separate taker calls in
+the match→settle gap → collective over-reduce → flip. Narrow (attacker-timed self-cross, TTL-bounded
+~5 min by `REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS`) but real. The correct complete fix therefore MUST
+account for cumulative in-flight reduction across ALL reduce-only orders on a position (either the
+persisted per-position counter of §4, or a per-position ≤1-active-exit cap that counts bracket legs
+too — the latter closes F-3 but restricts a position to a single protective exit, a product
+trade-off).
 
 ## 3 · Why it can't be a small patch (the architecture wall)
 
@@ -115,11 +123,21 @@ so `reducible ≥ 0` and total reduction across all in-flight reduce-only fills 
 
 ## 6 · Interim posture (until the migration ships)
 
-Documented residual, not a silent gap: single-order over-reduce and bracket double-leg are closed
-(§2); the remaining vector is two standalone reduce-only stops self-crossed across the settle gap,
-bounded further by `REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS` (~5 min) on how long a stale reduce-only
-order can linger. A cheap, sound **narrowing** that could ship independently (still not complete):
-enforce **≤ 1 active standalone reduce-only trigger per (position, side)** at
-`place_trigger_order_v3` (brackets are exempt — they are OCO-protected), removing the
-two-standalone-stops setup. It needs a per-position marker, so it is itself a (smaller) state
-addition and should be evaluated against the full migration rather than layered ad hoc.
+Documented residual, not a silent gap: single-order over-reduce and a bracket's *own* double-leg are
+closed (§2); the remaining vector is **any two independent injection-capable reduce-only exits on one
+position** (two standalone stops, OR a bracket stop-loss leg + an unrelated standalone stop)
+self-crossed across the settle gap, bounded further by `REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS` (~5 min)
+on how long a stale reduce-only order can linger.
+
+A **≤ 1 active reduce-only exit per (position, side)** cap at injection would close it WITHOUT a
+hot-matcher change or live-ER validation — but note two things it is NOT: (a) it must count **bracket
+legs too** (an exempt-brackets version, as an earlier draft of this doc wrongly suggested, leaves the
+bracket-leg + standalone vector open); and (b) capping to one exit **restricts a position to a single
+protective exit** (you could not hold both a take-profit and a stop-loss), a real product trade-off,
+and it still needs a per-position active-exit counter with its own cancel/expire liveness reconcile.
+So it is not free. **Decision (deep review, 2026-07):** no fix is BOTH low-risk-to-implement AND
+functionality-preserving — the complete functionality-preserving fix (§4 `ReducePending`) is
+inherently high-risk (new ER-writable account on the hot matcher path + both settlement paths + a new
+ER seam, validatable only on devnet-ER), and the low-risk complete fix restricts exits. The residual
+being narrow + TTL-bounded, **leaving §4 migration-gated is the defensible posture**; do not ship
+either variant reflexively.
