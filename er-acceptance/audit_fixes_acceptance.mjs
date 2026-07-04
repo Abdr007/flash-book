@@ -221,5 +221,20 @@ ok(execRej, "Gov P-2b: execute BEFORE the 48h eta is REJECTED (TimelockNotElapse
 await send(await program.methods.cancelParamUpdate().accountsPartial({ authority: signer.publicKey, market: im0.M }).instruction());
 ok((await l1.getAccountInfo(pppda)) === null, "Gov P-2b: authority CANCELLED — pending closed");
 
+// ── GOVERNANCE Phase-3 (2026-07): one-way oracle-source lock ────────────────────
+// The lock flag lives in the market's envelope config (already required by the direct
+// update_oracle paths). Set up an envelope on im0, then lock — proving the flag is set
+// on-chain by the authority (the direct-update rejection is covered by BanksClient,
+// where the oracle mechanics are controllable).
+console.log("\nGov Phase-3: one-way oracle-source lock");
+const envPda = pda(["envelope", im0.M]);
+await send(await program.methods.setEnvelopeConfig(14, new BN(100), new BN(10000), 3000, 50, new BN(1), new BN(100)).accountsPartial({ authority: signer.publicKey, market: im0.M, envelopeConfig: envPda }).instruction());
+const lockRando = Keypair.generate();
+const lockRej = await sendExpectFail(await program.methods.lockOracleSource().accountsPartial({ authority: lockRando.publicKey, market: im0.M, envelopeConfig: envPda }).instruction(), [lockRando]);
+ok(lockRej, "Gov P-3: a non-authority CANNOT lock the oracle source");
+const lockSig = await send(await program.methods.lockOracleSource().accountsPartial({ authority: signer.publicKey, market: im0.M, envelopeConfig: envPda }).instruction());
+ok(!!lockSig, `Gov P-3: authority LOCKED the oracle source — ${String(lockSig).slice(0, 12)}…`);
+ok((await program.account.marketEnvelopeConfigAccount.fetch(envPda)).sourceLocked === 1, "  source_locked == 1 (direct update_oracle disabled; one-way — no unlock ix)");
+
 console.log(`\n${fail === 0 ? "✅ AUDIT-FIXES LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
