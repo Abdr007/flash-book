@@ -5738,27 +5738,77 @@ pub mod flash_book {
     ///   Active → Paused:   no order intake; existing positions held
     ///   Any → Closed:      terminal sunset; only liquidation + close
     pub fn set_market_status(
-        ctx: Context<UpdateMarketAuthority>,
+        ctx: Context<SetMarketStatus>,
         new_status: u8,
     ) -> Result<()> {
         require!(new_status <= 4, FlashBookError::OutOfRange);
+        let caller = ctx.accounts.authority.key();
+        let market_key = ctx.accounts.market.key();
+        let is_authority = ctx.accounts.market.authority == caller;
+        // GOVERNANCE Phase-1: the guardian is an OPTIONAL separate PDA. It may act
+        // too, but ONLY to restrict (see the asymmetry below). Absent account or a
+        // zero guardian ⇒ disabled. Bound to THIS market by seeds + a field check.
+        let is_guardian = match ctx.accounts.guardian_account.as_ref() {
+            Some(g) => {
+                g.market == market_key
+                    && g.guardian != Pubkey::default()
+                    && g.guardian == caller
+            }
+            None => false,
+        };
+        require!(is_authority || is_guardian, FlashBookError::Unauthorized);
         let market = &mut ctx.accounts.market;
-        require_keys_eq!(
-            market.authority,
-            ctx.accounts.authority.key(),
-            FlashBookError::Unauthorized
-        );
         // Closed is terminal — cannot reopen.
         require!(
             market.status != MarketStatus::Closed as u8,
             FlashBookError::OutOfRange
         );
+        // GOVERNANCE Phase-1 (2026-07): asymmetric control. A guardian-only caller
+        // (not the authority) may move the market only to a STRICTLY MORE restricted
+        // live status — PostOnly/Paused/Closed, monotonically up the ladder
+        // (Active=1 < PostOnly=2 < Paused=3 < Closed=4) from a live state. It can
+        // never loosen (→ Active/Inactive) nor act on a non-live (Inactive) market,
+        // so a compromised guardian can pause/close but never re-open. The authority
+        // retains full control (any transition, subject to the Closed-terminal rule).
+        if is_guardian && !is_authority {
+            let from_live = market.status == MarketStatus::Active as u8
+                || market.status == MarketStatus::PostOnly as u8
+                || market.status == MarketStatus::Paused as u8;
+            let to_restrict = new_status == MarketStatus::PostOnly as u8
+                || new_status == MarketStatus::Paused as u8
+                || new_status == MarketStatus::Closed as u8;
+            require!(
+                from_live && to_restrict && new_status > market.status,
+                FlashBookError::Unauthorized
+            );
+        }
         let prev = market.status;
         market.status = new_status;
         emit!(MarketStatusChangedEvent {
             market: market.key(),
             previous_status: prev,
             new_status,
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-1 (2026-07): set (or clear) the market's emergency guardian
+    /// — a key that may only RESTRICT market status (pause/post-only/close), never
+    /// loosen (see `set_market_status`). Authority-only. `Pubkey::default()` clears
+    /// it (disables the guardian path).
+    pub fn set_guardian(ctx: Context<SetGuardian>, new_guardian: Pubkey) -> Result<()> {
+        // Authority is enforced by the context constraint (`market.authority ==
+        // authority`). The guardian PDA is created on first use (init_if_needed).
+        let market_key = ctx.accounts.market.key();
+        let g = &mut ctx.accounts.guardian_account;
+        let previous_guardian = g.guardian; // Pubkey::default() on first init
+        g.market = market_key;
+        g.guardian = new_guardian;
+        g.bump = ctx.bumps.guardian_account;
+        emit!(MarketGuardianChangedEvent {
+            market: market_key,
+            previous_guardian,
+            new_guardian,
         });
         Ok(())
     }
@@ -14703,6 +14753,50 @@ pub struct UpdateMarketAuthority<'info> {
     pub market: Account<'info, MarketAccount>,
 }
 
+/// GOVERNANCE Phase-1 (2026-07): `set_market_status` context. Auth is checked
+/// in-handler (authority OR guardian, with the restrict-only asymmetry). The
+/// guardian PDA is OPTIONAL — supplied for a guardian-restrict call, omitted for an
+/// authority call. Kept separate from `UpdateMarketAuthority` so the guardian
+/// account doesn't leak into the other authority-only handlers that share it.
+#[derive(Accounts)]
+pub struct SetMarketStatus<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        seeds = [state::MarketGuardianAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub guardian_account: Option<Account<'info, state::MarketGuardianAccount>>,
+}
+
+/// GOVERNANCE Phase-1 (2026-07): `set_guardian` context — authority-only (context
+/// constraint). Creates the per-market guardian PDA on first use.
+#[derive(Accounts)]
+pub struct SetGuardian<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + state::MarketGuardianAccount::LEN,
+        seeds = [state::MarketGuardianAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub guardian_account: Account<'info, state::MarketGuardianAccount>,
+    pub system_program: Program<'info, System>,
+}
+
 /// M-14 decentralization (Phase 1): create/rotate the per-market sequencer
 /// committee. `init_if_needed` so the same ix handles first-set + rotation.
 #[derive(Accounts)]
@@ -16465,6 +16559,15 @@ pub struct MarketStatusChangedEvent {
     pub market: Pubkey,
     pub previous_status: u8,
     pub new_status: u8,
+}
+
+/// GOVERNANCE Phase-1 (2026-07): emitted when the market's emergency guardian is
+/// set or cleared via `set_guardian`.
+#[event]
+pub struct MarketGuardianChangedEvent {
+    pub market: Pubkey,
+    pub previous_guardian: Pubkey,
+    pub new_guardian: Pubkey,
 }
 
 #[event]

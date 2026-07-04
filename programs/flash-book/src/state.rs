@@ -412,6 +412,26 @@ pub struct MarketAccount {
     pub unsettled_fill_volume: u64,
 }
 
+/// GOVERNANCE Phase-1 (2026-07): optional emergency guardian for one market, held
+/// in a SEPARATE PDA (not a MarketAccount field — adding 32 B there pushed several
+/// `try_accounts` frames past the 4 KB BPF stack limit). A guardian may only
+/// RESTRICT market status (→ PostOnly/Paused/Closed, monotonic — the fast, fail-safe
+/// direction), NEVER loosen (→ Active/Inactive stays authority-only), so a
+/// compromised guardian can pause/close but never re-open. Absence of this account
+/// (or `guardian == Pubkey::default()`) = no guardian. Set/cleared by the market
+/// authority via `set_guardian`; read (optionally) by `set_market_status`.
+#[account]
+pub struct MarketGuardianAccount {
+    pub market: Pubkey,
+    pub guardian: Pubkey,
+    pub bump: u8,
+}
+
+impl MarketGuardianAccount {
+    pub const SEED: &'static [u8] = b"market_guardian";
+    pub const LEN: usize = 32 + 32 + 1;
+}
+
 // H1: build-time guard — the struct (incl. the new nonce) must still fit the
 // allocated `space()` (8 disc + 1152). If a future field overflows it, this
 // fails the build instead of silently corrupting account (de)serialization.

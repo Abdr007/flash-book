@@ -3964,6 +3964,124 @@ async fn armed_apply_fill_rejects_when_commitment_account_omitted() {
     assert!(taker_acct.is_none(), "no position after C-1 rejection");
 }
 
+/// GOVERNANCE Phase-1 (2026-07): a guardian may RESTRICT market status (pause /
+/// post-only / close) but NEVER loosen it (unpause stays authority-only), and
+/// `set_guardian` is authority-only. Asymmetric emergency control via a separate
+/// guardian PDA (kept off MarketAccount to avoid the 4 KB stack limit).
+#[tokio::test]
+async fn guardian_can_restrict_but_not_loosen_market_status() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone(); // setup_market makes payer the authority
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (guardian_pda, _) =
+        pda(&[flash_book::state::MarketGuardianAccount::SEED, market_pda.as_ref()]);
+
+    let guardian = Keypair::new();
+    let rando = Keypair::new();
+    for k in [&guardian, &rando] {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[system_instruction::transfer(&payer.pubkey(), &k.pubkey(), 1_000_000_000)],
+                Some(&payer.pubkey()),
+                &[&payer],
+                bh,
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    // set_guardian by a NON-authority is rejected (context constraint).
+    let set_guardian_ix = |signer: Pubkey, new_guardian: Pubkey| {
+        build_ix(
+            flash_book::instruction::SetGuardian { new_guardian },
+            vec![
+                AccountMeta::new(signer, true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(guardian_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        )
+    };
+    assert!(
+        send(&mut ctx, set_guardian_ix(rando.pubkey(), guardian.pubkey()), &[&rando]).await.is_err(),
+        "set_guardian must be authority-only"
+    );
+
+    // Authority sets the guardian.
+    send(&mut ctx, set_guardian_ix(payer.pubkey(), guardian.pubkey()), &[&payer])
+        .await
+        .expect("authority sets guardian");
+    let g: flash_book::state::MarketGuardianAccount = fetch(&mut ctx.banks_client, guardian_pda).await;
+    assert_eq!(g.guardian, guardian.pubkey());
+
+    // status ix: guardian slot = guardian_pda (guardian call) or program-id sentinel (None).
+    let status_ix = |caller: Pubkey, new_status: u8, with_guardian: bool| {
+        let g_slot = if with_guardian { guardian_pda } else { program_id() };
+        build_ix(
+            flash_book::instruction::SetMarketStatus { new_status },
+            vec![
+                AccountMeta::new_readonly(caller, true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new_readonly(g_slot, false),
+            ],
+        )
+    };
+    // Guardian RESTRICTS: Active(1) → Paused(3). Allowed.
+    send(&mut ctx, status_ix(guardian.pubkey(), 3, true), &[&guardian])
+        .await
+        .expect("guardian may pause (restrict)");
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.status,
+        3,
+        "market is Paused"
+    );
+
+    // Guardian tries to LOOSEN: Paused(3) → Active(1). Rejected (authority-only).
+    assert!(
+        send(&mut ctx, status_ix(guardian.pubkey(), 1, true), &[&guardian]).await.is_err(),
+        "guardian must NOT be able to unpause"
+    );
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.status,
+        3,
+        "still Paused after the guardian's failed unpause"
+    );
+
+    // A random key can neither restrict nor loosen.
+    assert!(
+        send(&mut ctx, status_ix(rando.pubkey(), 2, false), &[&rando]).await.is_err(),
+        "a non-authority non-guardian cannot change status"
+    );
+
+    // Authority LOOSENS: Paused(3) → Active(1). Allowed (guardian slot omitted → None).
+    send(&mut ctx, status_ix(payer.pubkey(), 1, false), &[&payer])
+        .await
+        .expect("authority may unpause");
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.status,
+        1,
+        "market re-opened by the authority"
+    );
+}
+
 /// AUDIT F-4 (2026-07): `reconcile_unsettled_fill_volume` resets a drifted M-6
 /// counter to 0 ONLY when the fill-commitment ring is DRAINED, and reverts
 /// (FillRingNotDrained) when the ring still holds pending fills — so it can never
