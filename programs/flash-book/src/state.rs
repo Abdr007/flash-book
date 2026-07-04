@@ -282,6 +282,15 @@ pub struct MarketAccount {
     pub oracle_confidence: u64,
     pub oracle_published_at_unix_seconds: u64,
     pub mark_price_ticks: u64,
+    /// DORMANT (truth-in-code, 2026-07): funding is plumbed but UNWIRED.
+    /// `last_funding_rate_bps_per_sec` is initialized to 0 and set to nonzero
+    /// NOWHERE in the program (the rate formula lives only in the read-only
+    /// `view_predicted_funding`; nothing stores its result), so `settle_funding`
+    /// accrues and charges EXACTLY 0. `cum_funding_index` therefore never advances
+    /// from funding, and invariant #8 (funding nets to zero) holds trivially.
+    /// Retained (not deleted): these are account layout, and `settle_funding` is a
+    /// live, reachable instruction — turning funding ON is a feature (compute +
+    /// store the rate, with its own conservation proof + devnet cycle), not a fix.
     pub cum_funding_index: i128,
     pub last_funding_rate_bps_per_sec: i64,
     /// AUDIT M-11 (2026-07): INERT. `VpinState::record_fill` is never called

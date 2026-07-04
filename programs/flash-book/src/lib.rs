@@ -4158,15 +4158,27 @@ pub mod flash_book {
     /// position's `cum_funding_index_at_entry` to the market's current
     /// index. Idempotent — calling again immediately is a no-op (delta=0).
     ///
-    /// Permissionless: anyone can poke a position to settle. This protects
-    /// the protocol against traders who never close — funding accrues into
-    /// the margin calc forever otherwise. Off-chain keepers will sweep
-    /// stale positions periodically.
+    /// Permissionless: anyone can poke a position to settle. Off-chain keepers
+    /// will sweep stale positions periodically.
     ///
     /// On insufficient collateral to cover positive funding owed, the
     /// position's collateral is drained to zero (it will be liquidated on
     /// the next risk check). We do not fail the tx because that would let
     /// underwater positions block keepers from settling them.
+    ///
+    /// DORMANT (truth-in-code, 2026-07): the funding RATE driving this —
+    /// `market.last_funding_rate_bps_per_sec` — is initialized to 0 and set to
+    /// nonzero NOWHERE in the program (the rate formula exists only in the
+    /// read-only `view_predicted_funding`; no path stores its result). So
+    /// `advance_indices` accrues ZERO funding and this handler charges/credits
+    /// EXACTLY 0 today — it still advances the side-accrual price index and resets
+    /// the position's funding checkpoint, but moves no value. The plumbing
+    /// (formula, `route_funding`, the conservation tests) is complete and correct
+    /// but UNWIRED; turning funding on is a deliberate feature (compute + store the
+    /// rate, with its own conservation proof and devnet cycle), not a bug fix.
+    /// Until then funding is economically inert and invariant #8 holds trivially.
+    /// Kept (not deleted): the fields are account layout and the handler is a live,
+    /// reachable instruction — removing either would be a layout/ABI regression.
     pub fn settle_funding(ctx: Context<SettleFunding>) -> Result<()> {
         let market = &ctx.accounts.market;
         let mkey = market.key();
