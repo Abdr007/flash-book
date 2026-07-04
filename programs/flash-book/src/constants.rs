@@ -123,6 +123,13 @@ pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
 /// awareness — a larger redesign; this bounds the residual risk soundly.)
 pub const REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS: u64 = 750;
 
+/// GOVERNANCE Phase-2b (2026-07): the delay (unix seconds) a proposed market-params
+/// change must wait before it can be executed. 48h gives LPs and traders a window
+/// to see the pre-announced change (the `ParamUpdateProposedEvent` carries the eta)
+/// and exit / react before it lands. The immediate `update_market_params` is
+/// unchanged; this timelocked path is the safer alternative for production markets.
+pub const PARAM_UPDATE_TIMELOCK_SECONDS: i64 = 48 * 60 * 60;
+
 /// ER-stall safety floor: max L1 slots since the mark price last moved (via the
 /// fill-EMA in `apply_fill` or a hard `settle_mark`) before the mark is treated
 /// as STALE. A stalled MagicBlock ER freezes the fill stream, so the mark stops

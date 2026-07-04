@@ -6157,6 +6157,75 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// GOVERNANCE Phase-2b (2026-07): propose a TIMELOCKED market-params update.
+    /// Validates `new_params` (same checks as `update_market_params`), then records
+    /// `keccak(new_params)` + `eta = now + PARAM_UPDATE_TIMELOCK_SECONDS`; does NOT
+    /// apply. `execute_param_update` applies it only after the delay. Authority-only.
+    /// Re-proposing overwrites the pending update (and restarts the clock). The
+    /// immediate `update_market_params` is left in place as the un-timelocked path.
+    pub fn propose_param_update(
+        ctx: Context<ProposeParamUpdate>,
+        new_params: MarketParams,
+    ) -> Result<()> {
+        validate_market_params(&ctx.accounts.market.params, &new_params)?;
+        let market_key = ctx.accounts.market.key();
+        let now = Clock::get()?.unix_timestamp;
+        let eta_unix = now
+            .checked_add(constants::PARAM_UPDATE_TIMELOCK_SECONDS)
+            .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+        let params_hash = hash_params(&new_params)?;
+        let p = &mut ctx.accounts.pending;
+        p.market = market_key;
+        p.params_hash = params_hash;
+        p.eta_unix = eta_unix;
+        p.bump = ctx.bumps.pending;
+        emit!(ParamUpdateProposedEvent {
+            market: market_key,
+            eta_unix,
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-2b: execute a matured, hash-matching timelocked params
+    /// update. Requires `now >= eta` AND `keccak(new_params) == stored hash` (so the
+    /// applied params are EXACTLY the pre-announced ones), re-validates defensively,
+    /// applies, and closes the pending account. Authority-only.
+    pub fn execute_param_update(
+        ctx: Context<ExecuteParamUpdate>,
+        new_params: MarketParams,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now >= ctx.accounts.pending.eta_unix,
+            FlashBookError::TimelockNotElapsed
+        );
+        let supplied_hash = hash_params(&new_params)?;
+        require!(
+            supplied_hash == ctx.accounts.pending.params_hash,
+            FlashBookError::OutOfRange
+        );
+        // Defense-in-depth: re-validate against the current market before applying.
+        validate_market_params(&ctx.accounts.market.params, &new_params)?;
+        let market = &mut ctx.accounts.market;
+        market.params = new_params;
+        emit!(MarketParamsUpdatedEvent {
+            market: market.key(),
+        });
+        emit!(ParamUpdateExecutedEvent {
+            market: market.key(),
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-2b: cancel a pending timelocked params update (authority-only,
+    /// closes the pending account, rent → authority).
+    pub fn cancel_param_update(ctx: Context<CancelParamUpdate>) -> Result<()> {
+        emit!(ParamUpdateCancelledEvent {
+            market: ctx.accounts.market.key(),
+        });
+        Ok(())
+    }
+
     /// Wave 30 — Authority burn. Permanently relinquish authority over
     /// this market by setting `market.authority` to `Pubkey::default()`.
     /// This is a one-way operation: once burned, no further
@@ -14916,6 +14985,71 @@ pub struct CancelAuthorityTransfer<'info> {
     pub pending: Account<'info, state::MarketPendingAuthorityAccount>,
 }
 
+/// GOVERNANCE Phase-2b (2026-07): propose a timelocked params update (authority-only).
+#[derive(Accounts)]
+pub struct ProposeParamUpdate<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + state::PendingParamUpdateAccount::LEN,
+        seeds = [state::PendingParamUpdateAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub pending: Account<'info, state::PendingParamUpdateAccount>,
+    pub system_program: Program<'info, System>,
+}
+
+/// GOVERNANCE Phase-2b: execute a matured timelocked params update (authority-only).
+#[derive(Accounts)]
+pub struct ExecuteParamUpdate<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        mut,
+        close = authority,
+        seeds = [state::PendingParamUpdateAccount::SEED, market.key().as_ref()],
+        bump = pending.bump,
+        constraint = pending.market == market.key() @ FlashBookError::WrongMarket,
+    )]
+    pub pending: Account<'info, state::PendingParamUpdateAccount>,
+}
+
+/// GOVERNANCE Phase-2b: cancel a pending timelocked params update (authority-only).
+#[derive(Accounts)]
+pub struct CancelParamUpdate<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        mut,
+        close = authority,
+        seeds = [state::PendingParamUpdateAccount::SEED, market.key().as_ref()],
+        bump = pending.bump,
+        constraint = pending.market == market.key() @ FlashBookError::WrongMarket,
+    )]
+    pub pending: Account<'info, state::PendingParamUpdateAccount>,
+}
+
 /// M-14 decentralization (Phase 1): create/rotate the per-market sequencer
 /// committee. `init_if_needed` so the same ix handles first-set + rotation.
 #[derive(Accounts)]
@@ -16691,6 +16825,25 @@ pub struct MarketGuardianChangedEvent {
 
 #[event]
 pub struct MarketParamsUpdatedEvent {
+    pub market: Pubkey,
+}
+
+/// GOVERNANCE Phase-2b (2026-07): timelocked params-update lifecycle events.
+/// `eta_unix` on the proposal is the earliest execute time — off-chain monitors
+/// surface it so LPs/traders can react before the change lands.
+#[event]
+pub struct ParamUpdateProposedEvent {
+    pub market: Pubkey,
+    pub eta_unix: i64,
+}
+
+#[event]
+pub struct ParamUpdateExecutedEvent {
+    pub market: Pubkey,
+}
+
+#[event]
+pub struct ParamUpdateCancelledEvent {
     pub market: Pubkey,
 }
 
@@ -18556,6 +18709,84 @@ fn find_fill_outbox<'a, 'info>(
         }
     }
     None
+}
+
+/// GOVERNANCE Phase-2b (2026-07): shared market-params validation — the immutability
+/// of the measurement primitives + the mutable-field bounds. Used by the timelocked
+/// `propose_param_update` / `execute_param_update` so they enforce EXACTLY the same
+/// invariants as the immediate `update_market_params`. NOTE: this mirrors the inline
+/// checks in `update_market_params`; keep the two in sync (a proptest/BanksClient
+/// test pins a representative rejection on both paths).
+/// GOVERNANCE Phase-2b (2026-07): keccak of the borsh-serialized params — the
+/// commitment stored at propose and re-checked at execute so the applied change is
+/// exactly the pre-announced one. (borsh 1.x dropped the inherent `try_to_vec`;
+/// serialize via `AnchorSerialize` into a buffer, as elsewhere in the crate.)
+fn hash_params(p: &MarketParams) -> Result<[u8; 32]> {
+    use anchor_lang::AnchorSerialize;
+    let mut bytes = Vec::new();
+    AnchorSerialize::serialize(p, &mut bytes).map_err(|_| error!(FlashBookError::OutOfRange))?;
+    Ok(solana_keccak_hasher::hashv(&[&bytes]).0)
+}
+
+fn validate_market_params(current: &MarketParams, new: &MarketParams) -> Result<()> {
+    // Immutability of the measurement primitives.
+    require!(new.tick_size == current.tick_size, FlashBookError::OutOfRange);
+    require!(new.base_lot_size == current.base_lot_size, FlashBookError::OutOfRange);
+    require!(new.quote_lot_size == current.quote_lot_size, FlashBookError::OutOfRange);
+    require!(new.min_base_lots == current.min_base_lots, FlashBookError::OutOfRange);
+    // Mutable-field bounds.
+    require!(new.max_leverage >= 1, FlashBookError::OutOfRange);
+    require!(new.oracle_staleness_max_seconds > 0, FlashBookError::OutOfRange);
+    require!(
+        new.maintenance_margin_ratio_bps <= new.initial_margin_ratio_bps,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        new.flp_max_growth_per_batch_bps <= constants::BPS_DENOM,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        new.oracle_band_bps <= constants::MAX_ORACLE_BAND_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(new.maintenance_margin_ratio_bps < 5_000, FlashBookError::OutOfRange);
+    require!(new.initial_margin_ratio_bps < 5_000, FlashBookError::OutOfRange);
+    require!(
+        new.maintenance_margin_ratio_bps
+            .saturating_add(new.concentration_extra_mmr_bps)
+            < 5_000,
+        FlashBookError::OutOfRange
+    );
+    require!(new.taker_fee_bps <= constants::MAX_FEE_TIER_BPS, FlashBookError::OutOfRange);
+    require!(
+        new.maker_rebate_bps.unsigned_abs() <= constants::MAX_FEE_TIER_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        new.toxicity_tax_max_bps <= constants::MAX_FEE_TIER_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        new.jit_bonus_rebate_bps <= constants::MAX_FEE_TIER_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(new.liq_penalty_bps <= 5_000, FlashBookError::OutOfRange);
+    require!(
+        new.liquidator_reward_bps <= new.liq_penalty_bps,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        new.funding_rate_max_bps_per_sec <= constants::BPS_DENOM,
+        FlashBookError::OutOfRange
+    );
+    require!(new.funding_per_period_max_bps <= 5_000, FlashBookError::OutOfRange);
+    require!(
+        new.referrer_share_bps <= constants::BPS_DENOM
+            && new.builder_share_bps <= constants::BPS_DENOM
+            && new.creator_share_bps <= constants::BPS_DENOM,
+        FlashBookError::OutOfRange
+    );
+    Ok(())
 }
 
 fn verify_trader_state_pda(

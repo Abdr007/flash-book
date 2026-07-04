@@ -451,6 +451,25 @@ impl MarketPendingAuthorityAccount {
     pub const LEN: usize = 32 + 32 + 1;
 }
 
+/// GOVERNANCE Phase-2b (2026-07): a timelocked market-params update. Own PDA (not a
+/// MarketAccount field — the stack constraint). `propose_param_update` validates the
+/// new params, stores `keccak(params)` + an `eta_unix` (= now + timelock), and does
+/// NOT apply. `execute_param_update` applies the params only once `now >= eta` AND
+/// the supplied params hash to the stored `params_hash` — so the executed change is
+/// exactly the pre-announced one, after the delay. `cancel_param_update` revokes it.
+#[account]
+pub struct PendingParamUpdateAccount {
+    pub market: Pubkey,
+    pub params_hash: [u8; 32],
+    pub eta_unix: i64,
+    pub bump: u8,
+}
+
+impl PendingParamUpdateAccount {
+    pub const SEED: &'static [u8] = b"pending_params";
+    pub const LEN: usize = 32 + 32 + 8 + 1;
+}
+
 // H1: build-time guard — the struct (incl. the new nonce) must still fit the
 // allocated `space()` (8 disc + 1152). If a future field overflows it, this
 // fails the build instead of silently corrupting account (de)serialization.

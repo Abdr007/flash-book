@@ -3964,6 +3964,111 @@ async fn armed_apply_fill_rejects_when_commitment_account_omitted() {
     assert!(taker_acct.is_none(), "no position after C-1 rejection");
 }
 
+/// GOVERNANCE Phase-2b (2026-07): timelocked market-params update — propose records
+/// keccak(params)+eta and does NOT apply; execute is rejected before eta and on a
+/// hash mismatch, and applies (closing the pending account) only after the delay
+/// with the exact pre-announced params.
+#[tokio::test]
+async fn timelocked_param_update_enforces_delay_and_hash() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (pending_pda, _) = pda(&[
+        flash_book::state::PendingParamUpdateAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    let orig_leverage = m.params.max_leverage;
+    let mut new_params = m.params.clone();
+    new_params.max_leverage = orig_leverage.saturating_add(1); // a valid mutable change
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    let propose = |p: flash_book::state::MarketParams| {
+        build_ix(
+            flash_book::instruction::ProposeParamUpdate { new_params: p },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(pending_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        )
+    };
+    let execute = |p: flash_book::state::MarketParams| {
+        build_ix(
+            flash_book::instruction::ExecuteParamUpdate { new_params: p },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(pending_pda, false),
+            ],
+        )
+    };
+
+    // 0) propose enforces the SAME validation as update_market_params (guards the
+    //    shared `validate_market_params` helper): an invalid param is rejected.
+    let mut bad = new_params.clone();
+    bad.max_leverage = 0; // violates max_leverage >= 1
+    assert!(send(&mut ctx, propose(bad), &[&payer]).await.is_err(), "propose rejects invalid params");
+    assert!(ctx.banks_client.get_account(pending_pda).await.unwrap().is_none(), "no pending created on invalid propose");
+
+    // 1) propose — records the pending update (eta in the future); does NOT apply.
+    send(&mut ctx, propose(new_params.clone()), &[&payer]).await.unwrap();
+    let pend: flash_book::state::PendingParamUpdateAccount = fetch(&mut ctx.banks_client, pending_pda).await;
+    assert!(pend.eta_unix > 0, "eta recorded");
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.params.max_leverage,
+        orig_leverage,
+        "propose does not apply"
+    );
+
+    // 2) execute BEFORE eta → rejected (TimelockNotElapsed).
+    assert!(send(&mut ctx, execute(new_params.clone()), &[&payer]).await.is_err(), "cannot execute before eta");
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.params.max_leverage,
+        orig_leverage,
+        "params unchanged before eta"
+    );
+
+    // 3) advance the Clock's unix_timestamp past the 48h eta. (warp_to_slot moves the
+    //    slot but not unix_timestamp in solana-program-test, and the timelock is
+    //    time-based — so set the Clock sysvar directly.)
+    let mut clock = ctx.banks_client.get_sysvar::<Clock>().await.unwrap();
+    clock.unix_timestamp += 49 * 60 * 60; // 49h > the 48h PARAM_UPDATE_TIMELOCK_SECONDS
+    ctx.set_sysvar(&clock);
+
+    // 4) execute with WRONG params (hash mismatch) → rejected.
+    let mut wrong = new_params.clone();
+    wrong.max_leverage = orig_leverage.saturating_add(9);
+    assert!(send(&mut ctx, execute(wrong), &[&payer]).await.is_err(), "hash mismatch rejected");
+
+    // 5) execute with the CORRECT params after eta → applied, pending closed.
+    send(&mut ctx, execute(new_params.clone()), &[&payer]).await.expect("execute after delay");
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.params.max_leverage,
+        orig_leverage.saturating_add(1),
+        "params applied after the timelock"
+    );
+    assert!(ctx.banks_client.get_account(pending_pda).await.unwrap().is_none(), "pending closed on execute");
+}
+
 /// GOVERNANCE Phase-2 (2026-07): 2-step authority transfer — the current authority
 /// PROPOSES a new key, which then must ACCEPT (proving it is live/correct); a wrong
 /// key cannot accept, and the authority can CANCEL before acceptance. Prevents

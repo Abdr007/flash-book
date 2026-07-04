@@ -1532,6 +1532,90 @@
       ]
     },
     {
+      "name": "cancel_param_update",
+      "docs": [
+        "GOVERNANCE Phase-2b: cancel a pending timelocked params update (authority-only,",
+        "closes the pending account, rent → authority)."
+      ],
+      "discriminator": [
+        48,
+        233,
+        88,
+        184,
+        201,
+        198,
+        45,
+        199
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  112,
+                  97,
+                  114,
+                  97,
+                  109,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "cancel_trigger_order_v3",
       "docs": [
         "Cancel a v3 trigger and close the account, refunding rent."
@@ -3744,6 +3828,102 @@
         }
       ],
       "args": []
+    },
+    {
+      "name": "execute_param_update",
+      "docs": [
+        "GOVERNANCE Phase-2b: execute a matured, hash-matching timelocked params",
+        "update. Requires `now >= eta` AND `keccak(new_params) == stored hash` (so the",
+        "applied params are EXACTLY the pre-announced ones), re-validates defensively,",
+        "applies, and closes the pending account. Authority-only."
+      ],
+      "discriminator": [
+        202,
+        100,
+        72,
+        53,
+        170,
+        243,
+        222,
+        62
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  112,
+                  97,
+                  114,
+                  97,
+                  109,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "new_params",
+          "type": {
+            "defined": {
+              "name": "MarketParams"
+            }
+          }
+        }
+      ]
     },
     {
       "name": "execute_trigger_order_v3",
@@ -9616,6 +9796,107 @@
         {
           "name": "new_authority",
           "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "propose_param_update",
+      "docs": [
+        "GOVERNANCE Phase-2b (2026-07): propose a TIMELOCKED market-params update.",
+        "Validates `new_params` (same checks as `update_market_params`), then records",
+        "`keccak(new_params)` + `eta = now + PARAM_UPDATE_TIMELOCK_SECONDS`; does NOT",
+        "apply. `execute_param_update` applies it only after the delay. Authority-only.",
+        "Re-proposing overwrites the pending update (and restarts the clock). The",
+        "immediate `update_market_params` is left in place as the un-timelocked path."
+      ],
+      "discriminator": [
+        15,
+        171,
+        118,
+        239,
+        106,
+        176,
+        100,
+        137
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  112,
+                  97,
+                  114,
+                  97,
+                  109,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "new_params",
+          "type": {
+            "defined": {
+              "name": "MarketParams"
+            }
+          }
         }
       ]
     },
@@ -15538,6 +15819,19 @@
       ]
     },
     {
+      "name": "PendingParamUpdateAccount",
+      "discriminator": [
+        183,
+        2,
+        181,
+        97,
+        145,
+        192,
+        95,
+        180
+      ]
+    },
+    {
       "name": "PositionAccount",
       "discriminator": [
         60,
@@ -16775,6 +17069,45 @@
       ]
     },
     {
+      "name": "ParamUpdateCancelledEvent",
+      "discriminator": [
+        133,
+        246,
+        123,
+        169,
+        199,
+        43,
+        104,
+        200
+      ]
+    },
+    {
+      "name": "ParamUpdateExecutedEvent",
+      "discriminator": [
+        7,
+        222,
+        9,
+        215,
+        9,
+        178,
+        140,
+        71
+      ]
+    },
+    {
+      "name": "ParamUpdateProposedEvent",
+      "discriminator": [
+        30,
+        66,
+        185,
+        127,
+        60,
+        62,
+        114,
+        125
+      ]
+    },
+    {
       "name": "PartialCollateralWithdrawnEvent",
       "discriminator": [
         211,
@@ -17921,6 +18254,11 @@
       "code": 8315,
       "name": "RefreshTooSoon",
       "msg": "FLP quote refresh rate-limited: the pool's quotes are still fresh"
+    },
+    {
+      "code": 8316,
+      "name": "TimelockNotElapsed",
+      "msg": "Timelock has not elapsed: the proposed governance action is not yet executable"
     }
   ],
   "types": [
@@ -22614,6 +22952,51 @@
       }
     },
     {
+      "name": "ParamUpdateCancelledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ParamUpdateExecutedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ParamUpdateProposedEvent",
+      "docs": [
+        "GOVERNANCE Phase-2b (2026-07): timelocked params-update lifecycle events.",
+        "`eta_unix` on the proposal is the earliest execute time — off-chain monitors",
+        "surface it so LPs/traders can react before the change lands."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "eta_unix",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
       "name": "PartialCollateralWithdrawnEvent",
       "type": {
         "kind": "struct",
@@ -22651,6 +23034,43 @@
               "withdrawal collateral must be ≥ this."
             ],
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PendingParamUpdateAccount",
+      "docs": [
+        "GOVERNANCE Phase-2b (2026-07): a timelocked market-params update. Own PDA (not a",
+        "MarketAccount field — the stack constraint). `propose_param_update` validates the",
+        "new params, stores `keccak(params)` + an `eta_unix` (= now + timelock), and does",
+        "NOT apply. `execute_param_update` applies the params only once `now >= eta` AND",
+        "the supplied params hash to the stored `params_hash` — so the executed change is",
+        "exactly the pre-announced one, after the delay. `cancel_param_update` revokes it."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "params_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "eta_unix",
+            "type": "i64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
           }
         ]
       }
