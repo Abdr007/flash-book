@@ -6250,6 +6250,21 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// GOVERNANCE Phase-2b follow-up (2026-07): emergency guardian VETO of a pending
+    /// timelocked params update. The guardian (Phase-1 restrict-only key) may cancel a
+    /// pending change during its delay window — the fail-safe brake for a compromised
+    /// authority that proposed a dangerous loosening. Closes the pending account (rent
+    /// → guardian). Pure addition: does not touch the authority `cancel_param_update`
+    /// path; auth is the guardian-account constraint in the context.
+    pub fn guardian_veto_param_update(
+        ctx: Context<GuardianVetoParamUpdate>,
+    ) -> Result<()> {
+        emit!(ParamUpdateCancelledEvent {
+            market: ctx.accounts.market.key(),
+        });
+        Ok(())
+    }
+
     /// GOVERNANCE Phase-3 (2026-07): ONE-WAY lock of the market's oracle source. Once
     /// locked, the direct-authority `update_oracle` / `update_oracle_quorum` paths
     /// revert (`OracleSourceLocked`) — only the Pyth (account-owner + Full) and Lazer
@@ -15105,6 +15120,40 @@ pub struct CancelParamUpdate<'info> {
     #[account(
         mut,
         close = authority,
+        seeds = [state::PendingParamUpdateAccount::SEED, market.key().as_ref()],
+        bump = pending.bump,
+        constraint = pending.market == market.key() @ FlashBookError::WrongMarket,
+    )]
+    pub pending: Account<'info, state::PendingParamUpdateAccount>,
+}
+
+/// GOVERNANCE Phase-2b follow-up: guardian VETO of a pending params update. Auth is
+/// the guardian-account constraint (the caller must be THIS market's set guardian).
+/// Pure addition — independent of `CancelParamUpdate`. Closes the pending (rent →
+/// guardian).
+#[derive(Accounts)]
+pub struct GuardianVetoParamUpdate<'info> {
+    #[account(mut)]
+    pub guardian: Signer<'info>,
+    // Boxed: this context holds three accounts incl. the 1152-byte MarketAccount;
+    // unboxed it tips the try_accounts frame to the 4 KB BPF stack limit. Box moves
+    // it off-frame and derefs transparently for the handler.
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+    #[account(
+        seeds = [state::MarketGuardianAccount::SEED, market.key().as_ref()],
+        bump = guardian_account.bump,
+        constraint = guardian_account.market == market.key() @ FlashBookError::WrongMarket,
+        constraint = guardian_account.guardian != Pubkey::default()
+            && guardian_account.guardian == guardian.key() @ FlashBookError::Unauthorized,
+    )]
+    pub guardian_account: Account<'info, state::MarketGuardianAccount>,
+    #[account(
+        mut,
+        close = guardian,
         seeds = [state::PendingParamUpdateAccount::SEED, market.key().as_ref()],
         bump = pending.bump,
         constraint = pending.market == market.key() @ FlashBookError::WrongMarket,

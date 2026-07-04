@@ -5268,6 +5268,125 @@
       ]
     },
     {
+      "name": "guardian_veto_param_update",
+      "docs": [
+        "GOVERNANCE Phase-2b follow-up (2026-07): emergency guardian VETO of a pending",
+        "timelocked params update. The guardian (Phase-1 restrict-only key) may cancel a",
+        "pending change during its delay window — the fail-safe brake for a compromised",
+        "authority that proposed a dangerous loosening. Closes the pending account (rent",
+        "→ guardian). Pure addition: does not touch the authority `cancel_param_update`",
+        "path; auth is the guardian-account constraint in the context."
+      ],
+      "discriminator": [
+        62,
+        245,
+        118,
+        232,
+        219,
+        90,
+        235,
+        114
+      ],
+      "accounts": [
+        {
+          "name": "guardian",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "guardian_account",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  103,
+                  117,
+                  97,
+                  114,
+                  100,
+                  105,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  112,
+                  97,
+                  114,
+                  97,
+                  109,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "init_book_permission",
       "docs": [
         "PRIVATE / DARK-POOL BOOK (TEE), step 1 of 2. Create the MagicBlock",

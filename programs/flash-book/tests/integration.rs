@@ -4157,6 +4157,108 @@ async fn timelocked_param_update_enforces_delay_and_hash() {
     assert!(ctx.banks_client.get_account(pending_pda).await.unwrap().is_none(), "pending closed on execute");
 }
 
+/// GOVERNANCE Phase-2b follow-up (2026-07): the emergency guardian may VETO a pending
+/// timelocked params update during its delay (the fail-safe brake for a compromised
+/// authority). A non-guardian cannot; the authority's own cancel path is unaffected.
+#[tokio::test]
+async fn guardian_can_veto_a_pending_param_update() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (guardian_pda, _) = pda(&[flash_book::state::MarketGuardianAccount::SEED, market_pda.as_ref()]);
+    let (pending_pda, _) = pda(&[flash_book::state::PendingParamUpdateAccount::SEED, market_pda.as_ref()]);
+
+    let guardian = Keypair::new();
+    let rando = Keypair::new();
+    for k in [&guardian, &rando] {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[system_instruction::transfer(&payer.pubkey(), &k.pubkey(), 1_000_000_000)],
+                Some(&payer.pubkey()),
+                &[&payer],
+                bh,
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    // authority sets the guardian.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::SetGuardian { new_guardian: guardian.pubkey() },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(guardian_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // authority proposes a valid timelocked params update.
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    let mut new_params = m.params.clone();
+    new_params.max_leverage = m.params.max_leverage.saturating_add(1);
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ProposeParamUpdate { new_params },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(pending_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+    assert!(ctx.banks_client.get_account(pending_pda).await.unwrap().is_some(), "pending created");
+
+    let veto_ix = |signer: Pubkey| {
+        build_ix(
+            flash_book::instruction::GuardianVetoParamUpdate {},
+            vec![
+                AccountMeta::new(signer, true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new_readonly(guardian_pda, false),
+                AccountMeta::new(pending_pda, false),
+            ],
+        )
+    };
+
+    // a NON-guardian cannot veto.
+    assert!(send(&mut ctx, veto_ix(rando.pubkey()), &[&rando]).await.is_err(), "non-guardian cannot veto");
+    assert!(ctx.banks_client.get_account(pending_pda).await.unwrap().is_some(), "pending still there after failed veto");
+
+    // the guardian vetoes → pending closed.
+    send(&mut ctx, veto_ix(guardian.pubkey()), &[&guardian]).await.expect("guardian vetoes the pending update");
+    assert!(ctx.banks_client.get_account(pending_pda).await.unwrap().is_none(), "guardian veto closed the pending update");
+}
+
 /// GOVERNANCE Phase-2 (2026-07): 2-step authority transfer — the current authority
 /// PROPOSES a new key, which then must ACCEPT (proving it is live/correct); a wrong
 /// key cannot accept, and the authority can CANCEL before acceptance. Prevents
