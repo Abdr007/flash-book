@@ -1251,6 +1251,79 @@ mod tests {
         assert_eq!(handle.header.asks_best_index, NIL);
     }
 
+    // AUDIT F-3 (2026-07): validates the cumulative reduce-only capacity scan +
+    // clamp used by `execute_trigger_order_v3` — the exact `for_each_ask_best_first`
+    // predicate (reduce-only flag + same trader + same sub_index) and the
+    // `min(req, position − Σexisting)` math — on a REAL MarketBookHandle. Proves the
+    // scan sums only THIS position's resting reduce-only orders (not other traders,
+    // other sub_indices, or non-reduce-only orders), preserves scale-out (partials
+    // summing ≤ position all fit), and trims genuine over-capacity to 0 (the flip
+    // that F-3 exploits can never be set up).
+    fn insert_ro_ask(
+        handle: &mut MarketBookHandle,
+        seq: u64,
+        trader: Pubkey,
+        sub: u8,
+        size: u64,
+        reduce_only: bool,
+    ) {
+        let mut o = make_order_for(100_000 + seq * 1_000, seq, false /*ask*/, trader);
+        o.size_lots = size;
+        o.sub_index = sub;
+        o.flags = if reduce_only { FLAG_REDUCE_ONLY } else { 0 };
+        handle.insert_ask(o).unwrap();
+    }
+
+    fn scan_ro(handle: &MarketBookHandle, trader: Pubkey, sub: u8) -> u64 {
+        let mut existing = 0u64;
+        handle.for_each_ask_best_first(|_i, o: &RestingOrderV2| {
+            if o.flags & FLAG_REDUCE_ONLY != 0 && o.trader == trader && o.sub_index == sub {
+                existing = existing.saturating_add(o.size_lots);
+            }
+            true
+        });
+        existing
+    }
+
+    fn clamp(position: u64, existing: u64, requested: u64) -> u64 {
+        requested.min(position.saturating_sub(existing))
+    }
+
+    #[test]
+    fn f3_reduce_only_capacity_clamp_scan() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        let trader = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let position = 100u64;
+
+        // Empty book ⇒ full capacity.
+        assert_eq!(scan_ro(&handle, trader, 0), 0);
+        assert_eq!(clamp(position, 0, 100), 100);
+
+        // Scale-out is preserved: first 50-lot exit fits, second 50 still fits (Σ=100).
+        insert_ro_ask(&mut handle, 1, trader, 0, 50, true);
+        assert_eq!(scan_ro(&handle, trader, 0), 50);
+        assert_eq!(clamp(position, 50, 50), 50, "scale-out second partial exit fits");
+
+        insert_ro_ask(&mut handle, 2, trader, 0, 50, true);
+        assert_eq!(scan_ro(&handle, trader, 0), 100);
+        // Over-capacity: a THIRD reduce-only exit is trimmed to 0 — this is exactly
+        // what stops two orders from summing past the position and flipping it.
+        assert_eq!(clamp(position, 100, 50), 0, "F-3: over-capacity reduce-only trimmed to 0");
+
+        // Must NOT count: a different trader, a different sub_index, or a
+        // non-reduce-only order — otherwise the clamp would wrongly block legit orders.
+        insert_ro_ask(&mut handle, 3, other, 0, 100, true); // other trader
+        insert_ro_ask(&mut handle, 4, trader, 1, 100, true); // other position (sub 1)
+        insert_ro_ask(&mut handle, 5, trader, 0, 100, false); // NOT reduce-only
+        assert_eq!(
+            scan_ro(&handle, trader, 0),
+            100,
+            "only this (trader, sub, reduce-only) position's orders are summed"
+        );
+    }
+
     #[test]
     fn bids_iterate_highest_price_first() {
         let mut data = make_book();

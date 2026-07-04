@@ -1,12 +1,30 @@
 # F-3 — Airtight reduce-only across the match→settle gap (implementation spec)
 
-Status: **SPEC — migration-gated, NOT shipped.** Author: audit-remediation follow-up, 2026-07.
+Status: **PRIMARY VECTOR CLOSED (shipped); one narrow edge migration-gated.** Author:
+audit-remediation follow-up, 2026-07.
 
-This is the design for the *complete* fix of F-3. It is deliberately **not** implemented as a
-patch: the sound fix requires ER-writable **per-position** state written during matching, which
-the current delegation model does not allow (see §3). Rushing a cross-domain write into the hot
-settlement path is exactly the break-one-fix-another failure the remediation protocol forbids, so
-this is spec'd and gated on a migration + its own devnet ER cycle.
+### Shipped mitigation (the safe part) — injection-time cumulative capacity clamp
+A safe, complete fix for the **multi-order** flip — the demonstrated exploit — ships in
+`execute_trigger_order_v3`: before injecting a reduce-only close order, it sums this position's
+EXISTING resting reduce-only orders (same trader + sub_index + close side, via the book scan idiom
+already used on the liquidation path) and clamps the new order so **total resting reduce-only for a
+position can never exceed the position size**. Two reduce-only orders (two standalone stops,
+scale-out legs, or a bracket SL leg + an unrelated stop) can therefore never sum past the position
+and flip it. It touches **no hot-matcher code, adds no account, no ER-write, no layout change**, and
+is validated on a real `MarketBookHandle` (host test `f3_reduce_only_capacity_clamp_scan`,
+state_v2.rs) + full suite green. Scale-out is preserved (partial exits summing ≤ position all fit);
+only genuine over-capacity is trimmed.
+
+### Remaining edge (the migration below) — position SHRUNK below its resting reduce-only
+The injection clamp bounds against the position size *at injection*. A single reduce-only order sized
+to the position, after which the trader **shrinks the position via a separate path** (e.g. a market
+sell), leaves that one order larger than the now-smaller position — and two takers can still
+over-cross it across the match→settle gap. This narrower edge (a deliberate self-shrink-then-overhang
+self-cross, TTL-bounded ~5 min) needs the match-time per-position in-flight state below, which
+requires ER-writable **per-position** state written during matching — the current delegation model
+does not allow it (see §3). That remains deliberately **not** shipped: rushing a cross-domain write
+into the hot matcher is the break-one-fix-another failure the protocol forbids, so it stays gated on
+a migration + its own devnet-ER cycle.
 
 ---
 

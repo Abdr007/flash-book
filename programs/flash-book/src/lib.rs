@@ -9524,7 +9524,13 @@ pub mod flash_book {
             return Err(error!(FlashBookError::TriggerSlippageExceeded));
         }
 
-        if trigger.flags & state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY != 0 {
+        // F-3 (2026-07): the position size backing a reduce-only injection. Captured
+        // here so the cumulative-capacity clamp below (after the book handle is open)
+        // can bound TOTAL resting reduce-only for this position, not just this order.
+        let reduce_only_position_size: u64 = if trigger.flags
+            & state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY
+            != 0
+        {
             let position = ctx.accounts.position.load()?;
             require!(position.size_lots > 0, FlashBookError::OutOfRange);
             require!(position.side != trigger.side, FlashBookError::OutOfRange);
@@ -9532,7 +9538,10 @@ pub mod flash_book {
                 trigger.size_lots <= position.size_lots,
                 FlashBookError::OutOfRange
             );
-        }
+            position.size_lots
+        } else {
+            0
+        };
 
         let side = trigger.side;
         let size_lots = trigger.size_lots;
@@ -9571,12 +9580,65 @@ pub mod flash_book {
         require!(seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
         handle.header.order_seq_counter = seq;
 
+        // AUDIT F-3 (2026-07): cumulative reduce-only capacity clamp. The per-order
+        // check above bounds ONE injection to the position; it does not bound the SUM
+        // of a position's reduce-only orders. Two (or more) reduce-only orders on one
+        // position — two standalone stops, scale-out legs, or a bracket SL leg plus an
+        // unrelated stop — can otherwise be crossed by SEPARATE takers in the
+        // match→settle gap (the matcher reads a stale per-call position snapshot and
+        // caps each to the full size), collectively over-reducing and FLIPPING the
+        // position into an under-margined maker-side open that M-2 (intake-only) never
+        // gates. Fix: before injecting, sum this position's EXISTING reduce-only
+        // resting orders (same trader+sub_index, same close side) and clamp the new
+        // order so total resting reduce-only never exceeds the position. This closes
+        // the multi-order flip at injection time — no hot-matcher change, no new
+        // account, no ER-write; the book scan mirrors the liquidation path's existing
+        // idiom and this handler is a per-fire keeper call, not the matcher walk.
+        // Scale-out is preserved (partial exits summing ≤ position all fit); only
+        // genuine over-capacity is trimmed. (A residual — a position SHRUNK below its
+        // already-resting reduce-only after injection — still needs the match-time
+        // per-position in-flight migration in F3_REDUCE_ONLY_INFLIGHT_SPEC.md; that
+        // path is far narrower: a deliberate self-shrink-then-overhang self-cross.)
+        let effective_size: u64 = if is_reduce_only {
+            let mut existing: u64 = 0;
+            if side == 0 {
+                handle.for_each_bid_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.flags & state_v2::FLAG_REDUCE_ONLY != 0
+                        && o.trader == trader_pk
+                        && o.sub_index == trigger_sub_index
+                    {
+                        existing = existing.saturating_add(o.size_lots);
+                    }
+                    true
+                });
+            } else {
+                handle.for_each_ask_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.flags & state_v2::FLAG_REDUCE_ONLY != 0
+                        && o.trader == trader_pk
+                        && o.sub_index == trigger_sub_index
+                    {
+                        existing = existing.saturating_add(o.size_lots);
+                    }
+                    true
+                });
+            }
+            let remaining_capacity = reduce_only_position_size.saturating_sub(existing);
+            let eff = size_lots.min(remaining_capacity);
+            // If the position's reduce-only capacity is already fully reserved, there
+            // is nothing to inject — fail closed (the trigger stays active and can fire
+            // once existing reduce-only orders fill/expire and free capacity).
+            require!(eff > 0, FlashBookError::OutOfRange);
+            eff
+        } else {
+            size_lots
+        };
+
         let side_is_bid = side == 0;
         let order = state_v2::RestingOrderV2 {
             order_id: state_v2::encode_order_id(limit_ticks, seq, side_is_bid),
             seq,
             price_ticks: limit_ticks,
-            size_lots,
+            size_lots: effective_size,
             // AUDIT M-7: bound reduce-only close orders (0 = GTC for entries).
             expires_at_slot: injected_expiry,
             trader: trader_pk,
