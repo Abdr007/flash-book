@@ -7490,6 +7490,89 @@
       ]
     },
     {
+      "name": "lock_oracle_source",
+      "docs": [
+        "GOVERNANCE Phase-3 (2026-07): ONE-WAY lock of the market's oracle source. Once",
+        "locked, the direct-authority `update_oracle` / `update_oracle_quorum` paths",
+        "revert (`OracleSourceLocked`) — only the Pyth (account-owner + Full) and Lazer",
+        "(Ed25519 precompile + replay nonce) paths remain, removing the compromised-",
+        "authority \"walk the mark within the H-6 per-slot cap\" vector on production",
+        "markets. Authority-only; there is deliberately NO unlock instruction. The flag",
+        "lives in the market's envelope config (already REQUIRED by those paths), so an",
+        "initialized envelope is a precondition."
+      ],
+      "discriminator": [
+        196,
+        245,
+        243,
+        223,
+        244,
+        119,
+        222,
+        66
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "envelope_config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  110,
+                  118,
+                  101,
+                  108,
+                  111,
+                  112,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "mature_position",
       "docs": [
         "Permissionless: advance a position's reserve → matured pipeline.",
@@ -16991,6 +17074,19 @@
       ]
     },
     {
+      "name": "OracleSourceLockedEvent",
+      "discriminator": [
+        49,
+        54,
+        151,
+        141,
+        101,
+        68,
+        83,
+        9
+      ]
+    },
+    {
       "name": "OracleUpdatedFromLazerEvent",
       "discriminator": [
         185,
@@ -18259,6 +18355,11 @@
       "code": 8316,
       "name": "TimelockNotElapsed",
       "msg": "Timelock has not elapsed: the proposed governance action is not yet executable"
+    },
+    {
+      "code": 8317,
+      "name": "OracleSourceLocked",
+      "msg": "Oracle source is locked: direct-authority price writes are disabled (Pyth/Lazer only)"
     }
   ],
   "types": [
@@ -21744,11 +21845,25 @@
             "type": "u64"
           },
           {
+            "name": "source_locked",
+            "docs": [
+              "GOVERNANCE Phase-3 (2026-07): one-way oracle-source lock. `1` = the direct",
+              "authority `update_oracle` / `update_oracle_quorum` paths are DISABLED for this",
+              "market (only the Pyth / Lazer paths are accepted) — removing the compromised-",
+              "authority \"walk the mark within the H-6 per-slot cap\" vector entirely. Carved",
+              "from `_reserved` so the account size is unchanged and pre-existing envelopes",
+              "read it back as `0` (unlocked). Set (never cleared — one-way) by",
+              "`lock_oracle_source`; enforced in the two direct-write handlers, which already",
+              "REQUIRE this account (H-6), so the lock cannot be bypassed by omitting it."
+            ],
+            "type": "u8"
+          },
+          {
             "name": "_reserved",
             "type": {
               "array": [
                 "u8",
-                32
+                31
               ]
             }
           }
@@ -22729,6 +22844,22 @@
           {
             "name": "new_status",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OracleSourceLockedEvent",
+      "docs": [
+        "GOVERNANCE Phase-3 (2026-07): emitted when a market's oracle source is locked to",
+        "Pyth/Lazer-only (one-way)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
           }
         ]
       }

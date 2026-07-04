@@ -3964,6 +3964,94 @@ async fn armed_apply_fill_rejects_when_commitment_account_omitted() {
     assert!(taker_acct.is_none(), "no position after C-1 rejection");
 }
 
+/// GOVERNANCE Phase-3 (2026-07): one-way oracle-source lock — while unlocked the
+/// direct-authority update_oracle works; a non-authority cannot lock; once the
+/// authority locks, the direct path reverts (OracleSourceLocked) and stays locked
+/// (no unlock ix). The flag lives in the already-required envelope config, so the
+/// lock cannot be bypassed by omitting an account.
+#[tokio::test]
+async fn oracle_source_lock_disables_direct_update_one_way() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let envelope_config = setup_envelope(&mut ctx, &payer, market_pda).await;
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    let now = ctx.banks_client.get_sysvar::<Clock>().await.unwrap().unix_timestamp as u64;
+    let update_oracle = |price: u64| {
+        build_ix(
+            flash_book::instruction::UpdateOracle {
+                price_ticks: price,
+                confidence: 50,
+                published_at_unix_seconds: now,
+            },
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(envelope_config, false),
+            ],
+        )
+    };
+    let lock_ix = |signer: Pubkey| {
+        build_ix(
+            flash_book::instruction::LockOracleSource {},
+            vec![
+                AccountMeta::new_readonly(signer, true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(envelope_config, false),
+            ],
+        )
+    };
+
+    // 1) UNLOCKED: the direct-authority update works.
+    send(&mut ctx, update_oracle(105_000), &[&payer]).await.expect("direct update works while unlocked");
+    assert_eq!(fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.oracle_price_ticks, 105_000);
+
+    // 2) a NON-authority cannot lock.
+    let rando = Keypair::new();
+    send(&mut ctx, system_instruction::transfer(&payer.pubkey(), &rando.pubkey(), 1_000_000_000), &[&payer]).await.unwrap();
+    assert!(send(&mut ctx, lock_ix(rando.pubkey()), &[&rando]).await.is_err(), "non-authority cannot lock");
+
+    // 3) the AUTHORITY locks the oracle source.
+    send(&mut ctx, lock_ix(payer.pubkey()), &[&payer]).await.expect("authority locks");
+    assert_eq!(
+        fetch::<flash_book::state_v3::MarketEnvelopeConfigAccount>(&mut ctx.banks_client, envelope_config).await.source_locked,
+        1,
+        "source_locked flag set"
+    );
+
+    // 4) the direct-authority update is now REJECTED (OracleSourceLocked).
+    assert!(send(&mut ctx, update_oracle(110_000), &[&payer]).await.is_err(), "direct update blocked when locked");
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.oracle_price_ticks,
+        105_000,
+        "price unchanged by the blocked update"
+    );
+
+    // 5) ONE-WAY: still locked (no unlock instruction exists).
+    assert_eq!(
+        fetch::<flash_book::state_v3::MarketEnvelopeConfigAccount>(&mut ctx.banks_client, envelope_config).await.source_locked,
+        1,
+        "lock is one-way"
+    );
+}
+
 /// GOVERNANCE Phase-2b (2026-07): timelocked market-params update — propose records
 /// keccak(params)+eta and does NOT apply; execute is rejected before eta and on a
 /// hash mismatch, and applies (closing the pending account) only after the delay

@@ -5436,6 +5436,18 @@ pub mod flash_book {
             ctx.accounts.envelope_config.is_some(),
             FlashBookError::EnvelopeNotInitialized
         );
+        // GOVERNANCE Phase-3 (2026-07): if this market's oracle source is locked, the
+        // direct-authority price write is DISABLED (only Pyth/Lazer accepted).
+        // Un-bypassable: the envelope account is already REQUIRED just above, so the
+        // lock flag can't be dodged by omitting the account.
+        require!(
+            ctx.accounts
+                .envelope_config
+                .as_ref()
+                .map(|e| e.source_locked == 0)
+                .unwrap_or(true),
+            FlashBookError::OracleSourceLocked
+        );
         // Wave 26b — envelope gate. Rejects out-of-cap moves before mutating market.
         let now_slot = Clock::get()?.slot;
         gate_oracle_update(
@@ -5538,6 +5550,18 @@ pub mod flash_book {
         require!(
             ctx.accounts.envelope_config.is_some(),
             FlashBookError::EnvelopeNotInitialized
+        );
+        // GOVERNANCE Phase-3 (2026-07): if this market's oracle source is locked, the
+        // direct-authority price write is DISABLED (only Pyth/Lazer accepted).
+        // Un-bypassable: the envelope account is already REQUIRED just above, so the
+        // lock flag can't be dodged by omitting the account.
+        require!(
+            ctx.accounts
+                .envelope_config
+                .as_ref()
+                .map(|e| e.source_locked == 0)
+                .unwrap_or(true),
+            FlashBookError::OracleSourceLocked
         );
         // Wave 26b — envelope gate on the accepted median.
         let now_slot = Clock::get()?.slot;
@@ -6223,6 +6247,21 @@ pub mod flash_book {
         emit!(ParamUpdateCancelledEvent {
             market: ctx.accounts.market.key(),
         });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-3 (2026-07): ONE-WAY lock of the market's oracle source. Once
+    /// locked, the direct-authority `update_oracle` / `update_oracle_quorum` paths
+    /// revert (`OracleSourceLocked`) — only the Pyth (account-owner + Full) and Lazer
+    /// (Ed25519 precompile + replay nonce) paths remain, removing the compromised-
+    /// authority "walk the mark within the H-6 per-slot cap" vector on production
+    /// markets. Authority-only; there is deliberately NO unlock instruction. The flag
+    /// lives in the market's envelope config (already REQUIRED by those paths), so an
+    /// initialized envelope is a precondition.
+    pub fn lock_oracle_source(ctx: Context<LockOracleSource>) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        ctx.accounts.envelope_config.source_locked = 1;
+        emit!(OracleSourceLockedEvent { market: market_key });
         Ok(())
     }
 
@@ -12007,7 +12046,8 @@ pub mod flash_book {
             cfg.bump = ctx.bumps.envelope_config;
             cfg._pad0 = [0; 7];
             cfg._pad1 = [0; 4];
-            cfg._reserved = [0; 32];
+            cfg.source_locked = 0; // Phase-3: markets start with the direct path OPEN
+            cfg._reserved = [0; 31];
             cfg.version = 0;
             // Wave 26b gate-state defaults (zero = no prior observation).
             cfg.last_observed_slot = 0;
@@ -14829,6 +14869,28 @@ pub struct UpdateOracle<'info> {
     pub envelope_config: Option<Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>>,
 }
 
+/// GOVERNANCE Phase-3 (2026-07): one-way oracle-source lock (authority-only). The
+/// flag lives in the market's envelope config (the account the direct oracle paths
+/// already require), so no new account leaks into `update_oracle` — the lock is
+/// enforced there and can't be bypassed.
+#[derive(Accounts)]
+pub struct LockOracleSource<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        mut,
+        seeds = [state_v3::MarketEnvelopeConfigAccount::SEED, market.key().as_ref()],
+        bump = envelope_config.bump,
+        constraint = envelope_config.market == market.key() @ FlashBookError::EnvelopePriceCapInvalid,
+    )]
+    pub envelope_config: Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>,
+}
+
 /// V3 mark-engine: permissionless `settle_mark` accounts. The caller pays
 /// the tx fee; the per-market `mark_settle_min_slots` rate-limit
 /// prevents spam. No PDA mutations beyond the market itself.
@@ -16844,6 +16906,13 @@ pub struct ParamUpdateExecutedEvent {
 
 #[event]
 pub struct ParamUpdateCancelledEvent {
+    pub market: Pubkey,
+}
+
+/// GOVERNANCE Phase-3 (2026-07): emitted when a market's oracle source is locked to
+/// Pyth/Lazer-only (one-way).
+#[event]
+pub struct OracleSourceLockedEvent {
     pub market: Pubkey,
 }
 
