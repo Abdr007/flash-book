@@ -3964,6 +3964,137 @@ async fn armed_apply_fill_rejects_when_commitment_account_omitted() {
     assert!(taker_acct.is_none(), "no position after C-1 rejection");
 }
 
+/// AUDIT F-4 (2026-07): `reconcile_unsettled_fill_volume` resets a drifted M-6
+/// counter to 0 ONLY when the fill-commitment ring is DRAINED, and reverts
+/// (FillRingNotDrained) when the ring still holds pending fills — so it can never
+/// zero a counter that legitimately backs unsettled OI. Permissionless caller.
+#[tokio::test]
+async fn reconcile_unsettled_fill_volume_resets_only_when_ring_drained() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (fc_pda, _) = pda(&[
+        flash_book::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market_pda.as_ref(),
+    ]);
+
+    // Arm the ring — it starts DRAINED (produced == settled == 0).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitFillCommitment { cap: 256 },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(fc_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .ok(); // InitFillCommitment may already be armed by setup_market; either way the ring is drained.
+
+    async fn set_unsettled(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        market_pda: Pubkey,
+        v: u64,
+    ) {
+        use solana_sdk::account::Account as SolAccount;
+        let a = ctx.banks_client.get_account(market_pda).await.unwrap().unwrap();
+        let mut m =
+            flash_book::state::MarketAccount::try_deserialize(&mut a.data.as_slice()).unwrap();
+        m.unsettled_fill_volume = v;
+        let mut d = Vec::new();
+        m.try_serialize(&mut d).unwrap();
+        d.resize(a.data.len(), 0);
+        ctx.set_account(
+            &market_pda,
+            &SolAccount { lamports: a.lamports, data: d, owner: a.owner, executable: a.executable, rent_epoch: a.rent_epoch }.into(),
+        );
+    }
+
+    // Simulate the ER-seam drift: nonzero counter on a drained ring.
+    set_unsettled(&mut ctx, market_pda, 9_999).await;
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.unsettled_fill_volume,
+        9_999
+    );
+
+    // Permissionless caller (not the market authority).
+    let caller = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(&payer.pubkey(), &caller.pubkey(), 1_000_000_000)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let reconcile = || {
+        build_ix(
+            flash_book::instruction::ReconcileUnsettledFillVolume {},
+            vec![
+                AccountMeta::new_readonly(caller.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new_readonly(fc_pda, false),
+            ],
+        )
+    };
+
+    // POSITIVE: drained ring → permissionless reconcile succeeds, counter → 0.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[reconcile()],
+            Some(&caller.pubkey()),
+            &[&caller],
+            bh,
+        ))
+        .await
+        .expect("F-4: reconcile on a drained ring must succeed (permissionless)");
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.unsettled_fill_volume,
+        0,
+        "F-4: drained-ring reconcile resets the drifted counter to 0"
+    );
+
+    // NEGATIVE: re-inject drift AND make the ring NON-drained (produced=1 > settled=0).
+    set_unsettled(&mut ctx, market_pda, 7_777).await;
+    {
+        let a = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap();
+        let mut d = a.data.clone();
+        d[8..16].copy_from_slice(&1u64.to_le_bytes()); // OFF_PRODUCED = 8 → depth 1
+        ctx.set_account(
+            &fc_pda,
+            &SolAccount { lamports: a.lamports, data: d, owner: a.owner, executable: a.executable, rent_epoch: a.rent_epoch }.into(),
+        );
+    }
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let r = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[reconcile()],
+            Some(&caller.pubkey()),
+            &[&caller],
+            bh,
+        ))
+        .await;
+    assert!(r.is_err(), "F-4: reconcile must REVERT when the ring is not drained");
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda).await.unsettled_fill_volume,
+        7_777,
+        "F-4: a non-drained reconcile leaves the counter untouched"
+    );
+}
+
 /// #35 / H1 part B — HONEST PATH, end-to-end on the v2 hypertree book:
 /// init book + arm fill_commitment → maker rests an ask → taker crosses it
 /// (`place_taker_order_v2` pushes a keccak commitment for the real fill) →

@@ -300,6 +300,56 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// AUDIT F-4 (2026-07): reconcile `MarketAccount.unsettled_fill_volume` (the
+    /// M-6 matched-but-unsettled OI reserve) back to 0 when the fill-commitment
+    /// ring is fully DRAINED.
+    ///
+    /// The counter lives on `market` and the ring lives on `fill_commitment` — two
+    /// separately-delegated accounts with no atomic co-undelegate (there is no
+    /// `commit_and_undelegate_market`; the counter reaches L1 only via MagicBlock's
+    /// independent auto-commit). If the `market` snapshot leads the ring snapshot
+    /// (auto-commit lag / partial or forced commit), L1 settlement drains the
+    /// entries that arrived and decrements them, but the counter is left holding the
+    /// volume of the entries that never made it — with an empty ring and nothing
+    /// left to settle it back down, and no reset path. Once
+    /// `oi[side] + unsettled_fill_volume + new_size > oi_cap`, every place reverts
+    /// `OpenInterestCapExceeded` FOREVER on that market (a permanent placement brick).
+    ///
+    /// Soundness: when the ring is drained (`produced == settled`) every produced
+    /// fill has settled and decremented the counter, so the TRUE unsettled volume is
+    /// 0 by construction. Resetting to 0 here is therefore never a guess and can only
+    /// move the counter toward truth — which is why this is safe to expose
+    /// PERMISSIONLESSLY (no authority gate): a caller can only un-stick a market, not
+    /// harm it. If the ring is NOT drained it reverts `FillRingNotDrained`, so it can
+    /// never zero a counter that still backs pending fills. (The transient
+    /// under-count direction — ring ahead of counter — self-heals on drain and needs
+    /// no action.) The sizes in the ring are keccak commitments, so an exact
+    /// non-drained recompute is impossible; the drained gate is the sound reconcile.
+    pub fn reconcile_unsettled_fill_volume(
+        ctx: Context<ReconcileUnsettledFillVolume>,
+    ) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        let fc_ai = ctx.accounts.fill_commitment.to_account_info();
+        require_keys_eq!(*fc_ai.owner, *ctx.program_id, FlashBookError::Unauthorized);
+        let market_bytes = ctx.accounts.market.key().to_bytes();
+        {
+            let data = fc_ai.try_borrow_data()?;
+            fc::buffer_check(&data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+            require!(
+                fc::buffer_next_index(&data) == fc::buffer_settle_index(&data),
+                FlashBookError::FillRingNotDrained
+            );
+        }
+        let previous_unsettled = ctx.accounts.market.unsettled_fill_volume;
+        ctx.accounts.market.unsettled_fill_volume = 0;
+        emit!(UnsettledFillVolumeReconciledEvent {
+            market: ctx.accounts.market.key(),
+            previous_unsettled,
+        });
+        Ok(())
+    }
+
     /// Grow an existing v2 `market_book` PDA in place by `additional_nodes`
     /// hypertree slots — this is what breaks the 100-node init cap. Only the
     /// market authority may call it (same gate as `init_market_book`).
@@ -13707,6 +13757,31 @@ pub struct GrowFillCommitment<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// AUDIT F-4 (2026-07): permissionless reconcile of `unsettled_fill_volume` when
+/// the fill-commitment ring is drained. No authority gate — the handler can only
+/// reset the counter to its provably-correct value (0 on a drained ring), so any
+/// signer may un-stick a market whose counter drifted via the ER commit seam.
+#[derive(Accounts)]
+pub struct ReconcileUnsettledFillVolume<'info> {
+    /// Permissionless caller (fee payer only). Intentionally unconstrained.
+    pub caller: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; disc + market binding validated in-handler via
+    /// `buffer_check`, and program-ownership re-asserted before the read. Read-only.
+    #[account(
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
+}
+
 /// Grow a market_book PDA in place (`expand_market_book`). Same authority
 /// gate and seed binding as `InitMarketBook`; the book is reallocated in the
 /// handler so it's `UncheckedAccount` (Anchor can't size a variable account).
@@ -15811,6 +15886,15 @@ pub struct FillCommitmentGrownEvent {
     pub new_cap: u32,
     pub old_bytes: u32,
     pub new_bytes: u32,
+}
+
+/// AUDIT F-4 (2026-07): emitted when `reconcile_unsettled_fill_volume` resets a
+/// drifted M-6 counter to 0 on a drained ring. `previous_unsettled` records the
+/// drift that was cleared (0 if it was already correct).
+#[event]
+pub struct UnsettledFillVolumeReconciledEvent {
+    pub market: Pubkey,
+    pub previous_unsettled: u64,
 }
 
 #[event]

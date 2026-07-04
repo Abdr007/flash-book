@@ -9439,6 +9439,115 @@
       ]
     },
     {
+      "name": "reconcile_unsettled_fill_volume",
+      "docs": [
+        "AUDIT F-4 (2026-07): reconcile `MarketAccount.unsettled_fill_volume` (the",
+        "M-6 matched-but-unsettled OI reserve) back to 0 when the fill-commitment",
+        "ring is fully DRAINED.",
+        "",
+        "The counter lives on `market` and the ring lives on `fill_commitment` — two",
+        "separately-delegated accounts with no atomic co-undelegate (there is no",
+        "`commit_and_undelegate_market`; the counter reaches L1 only via MagicBlock's",
+        "independent auto-commit). If the `market` snapshot leads the ring snapshot",
+        "(auto-commit lag / partial or forced commit), L1 settlement drains the",
+        "entries that arrived and decrements them, but the counter is left holding the",
+        "volume of the entries that never made it — with an empty ring and nothing",
+        "left to settle it back down, and no reset path. Once",
+        "`oi[side] + unsettled_fill_volume + new_size > oi_cap`, every place reverts",
+        "`OpenInterestCapExceeded` FOREVER on that market (a permanent placement brick).",
+        "",
+        "Soundness: when the ring is drained (`produced == settled`) every produced",
+        "fill has settled and decremented the counter, so the TRUE unsettled volume is",
+        "0 by construction. Resetting to 0 here is therefore never a guess and can only",
+        "move the counter toward truth — which is why this is safe to expose",
+        "PERMISSIONLESSLY (no authority gate): a caller can only un-stick a market, not",
+        "harm it. If the ring is NOT drained it reverts `FillRingNotDrained`, so it can",
+        "never zero a counter that still backs pending fills. (The transient",
+        "under-count direction — ring ahead of counter — self-heals on drain and needs",
+        "no action.) The sizes in the ring are keccak commitments, so an exact",
+        "non-drained recompute is impossible; the drained gate is the sound reconcile."
+      ],
+      "discriminator": [
+        185,
+        86,
+        84,
+        89,
+        147,
+        200,
+        33,
+        239
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Permissionless caller (fee payer only). Intentionally unconstrained."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fill_commitment",
+          "docs": [
+            "`buffer_check`, and program-ownership re-asserted before the read. Read-only."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  105,
+                  108,
+                  108,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "record_flp_fill_v3",
       "docs": [
         "Record a fill on this per-market FLP exposure."
@@ -16665,6 +16774,19 @@
       ]
     },
     {
+      "name": "UnsettledFillVolumeReconciledEvent",
+      "discriminator": [
+        216,
+        106,
+        224,
+        10,
+        121,
+        198,
+        7,
+        6
+      ]
+    },
+    {
       "name": "ValidatorJailedEvent",
       "discriminator": [
         235,
@@ -23757,6 +23879,27 @@
           },
           {
             "name": "acceptable_price_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "UnsettledFillVolumeReconciledEvent",
+      "docs": [
+        "AUDIT F-4 (2026-07): emitted when `reconcile_unsettled_fill_volume` resets a",
+        "drifted M-6 counter to 0 on a drained ring. `previous_unsettled` records the",
+        "drift that was cleared (0 if it was already correct)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_unsettled",
             "type": "u64"
           }
         ]
