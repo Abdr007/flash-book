@@ -541,6 +541,36 @@ async fn disarm_fill_commitment(
     );
 }
 
+/// M-2 helper for CU benchmarks: zero the market's `initial_margin_ratio_bps`
+/// so opening orders don't need funded collateral (the benchmarks measure
+/// matching CU, not the margin gate). `initial_margin_ratio_bps` is a real
+/// per-market field, so this is a legitimate test configuration. Trader states
+/// still must EXIST (C-1); only the collateral requirement is relaxed.
+async fn zero_initial_margin(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    market: Pubkey,
+) {
+    use solana_sdk::account::Account as SolAccount;
+    let acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
+    let mut m =
+        flash_book::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    m.params.initial_margin_ratio_bps = 0;
+    let mut data = Vec::new();
+    m.try_serialize(&mut data).unwrap();
+    data.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &market,
+        &SolAccount {
+            lamports: acc.lamports,
+            data,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
+}
+
 /// Initialize an additional market on an already-initialized protocol.
 /// Used by multi-market tests. Returns (market PDA, order_buffer PDA, base, quote).
 async fn setup_additional_market(
@@ -687,6 +717,49 @@ async fn setup_trader(
     }
 
     trader_state
+}
+
+/// H-6: `update_oracle` now REQUIRES an initialized envelope_config. This
+/// helper creates it (default proven params) so the authority path can
+/// write a price. Returns the envelope_config PDA.
+async fn setup_envelope(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    market_pda: Pubkey,
+) -> Pubkey {
+    let (envelope_config, _) = pda(&[
+        flash_book::state_v3::MarketEnvelopeConfigAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let ix = build_ix(
+        flash_book::instruction::SetEnvelopeConfig {
+            // EnvelopeParams::default() — proven-sound.
+            max_price_move_bps_per_slot: 14,
+            max_accrual_dt_slots: 100,
+            max_abs_funding_e9_per_slot: 10_000,
+            maintenance_bps: 3_000,
+            liquidation_fee_bps: 50,
+            min_liquidation_abs_lots: 1,
+            min_nonzero_mm_req_lots: 100,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(envelope_config, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    envelope_config
 }
 
 #[tokio::test]
@@ -2080,19 +2153,28 @@ async fn update_oracle_authority_only() {
     let payer = ctx.payer.insecure_clone();
 
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    // H-6: update_oracle now requires an initialized envelope_config.
+    let envelope_config = setup_envelope(&mut ctx, &payer, market_pda).await;
 
-    // Authority can update.
+    // Authority can update. Anchor `published_at` to the on-chain clock so the
+    // staleness gate passes deterministically.
+    let now = ctx
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp as u64;
     let ok_ix = build_ix(
         flash_book::instruction::UpdateOracle {
             price_ticks: 105_000,
             confidence: 50,
-            published_at_unix_seconds: 0,
+            published_at_unix_seconds: now,
         },
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
-            // Wave 26b — None sentinel for optional envelope_config.
-            AccountMeta::new_readonly(program_id(), false),
+            // H-6 — real (initialized) envelope_config.
+            AccountMeta::new(envelope_config, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2467,7 +2549,7 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
 
     // 3) taker crosses: bid (side=0) 1 @ 100_000 -> fills against the FLP ask.
     //    The commitment pushed binds maker = the FLP PDA.
-    send(&mut ctx, build_ix(flash_book::instruction::PlaceTakerOrderV2 { side: 0, size_lots: 1, limit_ticks: 100_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(taker.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new(fc_pda, false)]), &[&payer, &taker]).await.expect("taker crosses the FLP quote");
+    send(&mut ctx, build_ix(flash_book::instruction::PlaceTakerOrderV2 { side: 0, size_lots: 1, limit_ticks: 100_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(taker.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(taker_state, false), AccountMeta::new_readonly(program_id(), false), AccountMeta::new(fc_pda, false)]), &[&payer, &taker]).await.expect("taker crosses the FLP quote");
 
     // 4) a ROGUE keeper (NOT market.sequencer) settles via the ring-authenticated
     //    FLP-maker path -> permissionless. The fill_commitment rides in
@@ -2590,7 +2672,10 @@ async fn hlp_flp_refresh_quotes_posts_crossable_ladder() {
     send(&mut ctx, build_ix(flash_book::instruction::FlpRefreshQuotes {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(flp_exposure, false)]), &[&payer]).await.expect("pool refreshes its on-book quotes");
 
     // 2) a taker crosses the pool's best ask (bid well above fair value ~100k).
-    send(&mut ctx, build_ix(flash_book::instruction::PlaceTakerOrderV2 { side: 0, size_lots: 1, limit_ticks: 110_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new(fc_pda, false)]), &[&payer]).await.expect("taker crosses an auto-quoted FLP ask");
+    // C-1 + M-2: create + fund the taker's trader_state so the opening cross passes.
+    let taker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    send(&mut ctx, build_ix(flash_book::instruction::PlaceTakerOrderV2 { side: 0, size_lots: 1, limit_ticks: 110_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(taker.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(taker_state, false), AccountMeta::new_readonly(program_id(), false), AccountMeta::new(fc_pda, false)]), &[&payer, &taker]).await.expect("taker crosses an auto-quoted FLP ask");
 
     // 3) the ring recorded the FLP-maker fill → the auto-quoted ladder is live + crossable.
     let fc_data = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
@@ -2687,7 +2772,7 @@ async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
-    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     // init the v2 book.
@@ -2711,6 +2796,9 @@ async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
         .unwrap();
 
     let maker = Keypair::new();
+    // C-1: trader_state must exist; M-2: fund it so the in-band OPEN passes the
+    // initial-margin gate (the far order still rejects on the oracle band).
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
     let place = |price: u64| {
         build_ix(
             flash_book::instruction::PlaceLimitOrderV2 {
@@ -2725,6 +2813,9 @@ async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
                 AccountMeta::new(maker.pubkey(), true),
                 AccountMeta::new(market_pda, false),
                 AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(maker_state, false),
+                // M-2: None sentinel for the optional position (full-open gate).
+                AccountMeta::new_readonly(program_id(), false),
             ],
         )
     };
@@ -2771,7 +2862,7 @@ async fn reap_expired_orders_removes_only_expired() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
-    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     async fn send(
@@ -2807,6 +2898,9 @@ async fn reap_expired_orders_removes_only_expired() {
     .unwrap();
 
     let maker = Keypair::new();
+    // C-1 + M-2: create + fund the maker's trader_state so the opening resting
+    // orders pass the initial-margin gate.
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
     let place = |expires: u64| {
         build_ix(
             flash_book::instruction::PlaceLimitOrderV2 {
@@ -2821,6 +2915,9 @@ async fn reap_expired_orders_removes_only_expired() {
                 AccountMeta::new(maker.pubkey(), true),
                 AccountMeta::new(market_pda, false),
                 AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(maker_state, false),
+                // M-2: None sentinel for the optional position.
+                AccountMeta::new_readonly(program_id(), false),
             ],
         )
     };
@@ -3047,6 +3144,8 @@ async fn update_oracle_quorum_writes_median_with_three_close_sources() {
     let payer = ctx.payer.insecure_clone();
 
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    // H-6: quorum path also requires an initialized envelope_config.
+    let envelope_config = setup_envelope(&mut ctx, &payer, market_pda).await;
 
     // Anchor `published_at` to the ON-CHAIN clock, not wall-clock: the test
     // validator's `Clock` drifts from `SystemTime` during the async setup, so a
@@ -3070,7 +3169,7 @@ async fn update_oracle_quorum_writes_median_with_three_close_sources() {
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
-            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new(envelope_config, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -3969,6 +4068,8 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
                 AccountMeta::new(maker.pubkey(), true),
                 AccountMeta::new(market_pda, false),
                 AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(maker_state, false),
+                AccountMeta::new_readonly(program_id(), false), // position None
             ],
         ),
         &[&payer, &maker],
@@ -3994,6 +4095,8 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
                 AccountMeta::new(taker.pubkey(), true),
                 AccountMeta::new(market_pda, false),
                 AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(taker_state, false),
+                AccountMeta::new_readonly(program_id(), false), // position None
                 AccountMeta::new(fc_pda, false), // remaining_accounts
             ],
         ),
@@ -4110,8 +4213,8 @@ async fn armed_apply_fill_permissionless_keeper_settles_committed_fill() {
 
     send(&mut ctx, build_ix(flash_book::instruction::InitMarketBook {}, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(system_program::ID, false)]), &[&payer]).await.unwrap();
     send(&mut ctx, build_ix(flash_book::instruction::InitFillCommitment { cap: 256 }, vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(fc_pda, false), AccountMeta::new_readonly(system_program::ID, false)]), &[&payer]).await.unwrap();
-    send(&mut ctx, build_ix(flash_book::instruction::PlaceLimitOrderV2 { side: 1, size_lots: 5, limit_ticks: 100_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(maker.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false)]), &[&payer, &maker]).await.unwrap();
-    send(&mut ctx, build_ix(flash_book::instruction::PlaceTakerOrderV2 { side: 0, size_lots: 1, limit_ticks: 100_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(taker.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new(fc_pda, false)]), &[&payer, &taker]).await.unwrap();
+    send(&mut ctx, build_ix(flash_book::instruction::PlaceLimitOrderV2 { side: 1, size_lots: 5, limit_ticks: 100_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(maker.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(maker_state, false), AccountMeta::new_readonly(program_id(), false)]), &[&payer, &maker]).await.unwrap();
+    send(&mut ctx, build_ix(flash_book::instruction::PlaceTakerOrderV2 { side: 0, size_lots: 1, limit_ticks: 100_000, flags: 0, expires_at_slot: 0, sub_index: 0 }, vec![AccountMeta::new(taker.pubkey(), true), AccountMeta::new(market_pda, false), AccountMeta::new(book_pda, false), AccountMeta::new_readonly(taker_state, false), AccountMeta::new_readonly(program_id(), false), AccountMeta::new(fc_pda, false)]), &[&payer, &taker]).await.unwrap();
 
     // Fund a ROGUE keeper (NOT market.sequencer) so the only variable is the auth model.
     let rogue = Keypair::new();
@@ -4350,7 +4453,11 @@ async fn deep_book_matching_cu_curve() {
     pt.set_compute_max_units(1_400_000);
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone(); // market authority = maker
-    let (_protocol, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+    // C-1: the maker's trader_state must exist; M-2: zero IM so the benchmark's
+    // resting/crossing orders don't need funded collateral.
+    zero_initial_margin(&mut ctx, market).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &payer, 0, &protocol).await;
     let (book, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market.as_ref()]);
     let (fc, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market.as_ref()]);
 
@@ -4438,12 +4545,14 @@ async fn deep_book_matching_cu_curve() {
                     limit_ticks: tick,
                     flags: 0,
                     expires_at_slot: 0,
-                    sub_index: (i % 256) as u8,
+                    sub_index: 0,
                 },
                 vec![
                     AccountMeta::new(payer.pubkey(), true),
                     AccountMeta::new(market, false),
                     AccountMeta::new(book, false),
+                    AccountMeta::new_readonly(maker_state, false),
+                    AccountMeta::new_readonly(program_id(), false), // position None
                 ],
             ),
             &payer.pubkey(),
@@ -4454,17 +4563,9 @@ async fn deep_book_matching_cu_curve() {
     }
 
     // (2) A SEPARATE taker (no self-trade) sweeps doubling depths {1..256}.
+    // setup_trader funds SOL AND creates the taker's trader_state (C-1).
     let taker = Keypair::new();
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[system_instruction::transfer(&payer.pubkey(), &taker.pubkey(), 100_000_000)],
-            Some(&payer.pubkey()),
-            &[&payer],
-            bh,
-        ))
-        .await
-        .unwrap();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 0, &protocol).await;
 
     // The taker requests a 256 KiB heap frame (standard for a deep sweep — the
     // default 32 KiB SBF heap can't hold the fills Vec + FillBatchEvent past
@@ -4493,6 +4594,8 @@ async fn deep_book_matching_cu_curve() {
                     AccountMeta::new(taker.pubkey(), true),
                     AccountMeta::new(market, false),
                     AccountMeta::new(book, false),
+                    AccountMeta::new_readonly(taker_state, false),
+                    AccountMeta::new_readonly(program_id(), false), // position None
                     AccountMeta::new(fc, false), // fill-commitment ring (remaining account)
                 ],
             ),
@@ -4541,6 +4644,8 @@ async fn deep_book_matching_cu_curve() {
                 AccountMeta::new(taker.pubkey(), true),
                 AccountMeta::new(market, false),
                 AccountMeta::new(book, false),
+                AccountMeta::new_readonly(taker_state, false),
+                AccountMeta::new_readonly(program_id(), false), // position None
                 AccountMeta::new(fc, false),
             ],
         ),
@@ -4579,7 +4684,11 @@ async fn fill_outbox_deep_sweep_256() {
     pt.set_compute_max_units(1_400_000);
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone(); // market authority = maker
-    let (_protocol, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+    // C-1: the maker's trader_state must exist; M-2: zero IM so the benchmark's
+    // resting/crossing orders don't need funded collateral.
+    zero_initial_margin(&mut ctx, market).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &payer, 0, &protocol).await;
     let (book, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market.as_ref()]);
     let (fc, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market.as_ref()]);
     let (fob, _) = pda(&[fo::FILL_OUTBOX_SEED, market.as_ref()]);
@@ -4698,6 +4807,8 @@ async fn fill_outbox_deep_sweep_256() {
                     AccountMeta::new(payer.pubkey(), true),
                     AccountMeta::new(market, false),
                     AccountMeta::new(book, false),
+                    AccountMeta::new_readonly(maker_state, false),
+                    AccountMeta::new_readonly(program_id(), false), // position None
                 ],
             ),
             &payer.pubkey(),
@@ -4706,18 +4817,10 @@ async fn fill_outbox_deep_sweep_256() {
         .await;
     }
 
-    // A separate taker (no self-trade).
+    // A separate taker (no self-trade). setup_trader funds SOL AND creates the
+    // taker's trader_state (C-1).
     let taker = Keypair::new();
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[system_instruction::transfer(&payer.pubkey(), &taker.pubkey(), 100_000_000)],
-            Some(&payer.pubkey()),
-            &[&payer],
-            bh,
-        ))
-        .await
-        .unwrap();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 0, &protocol).await;
 
     // (A) ERROR PATH: a cap-256 market MUST reject a taker that omits the outbox —
     // else the >96 fills would truncate in the 10 KB log and wedge settlement.
@@ -4734,6 +4837,8 @@ async fn fill_outbox_deep_sweep_256() {
             AccountMeta::new(taker.pubkey(), true),
             AccountMeta::new(market, false),
             AccountMeta::new(book, false),
+            AccountMeta::new_readonly(taker_state, false),
+            AccountMeta::new_readonly(program_id(), false), // position None
             AccountMeta::new(fc, false), // ring present, but NO outbox
         ],
     );
@@ -4770,6 +4875,8 @@ async fn fill_outbox_deep_sweep_256() {
                 AccountMeta::new(taker.pubkey(), true),
                 AccountMeta::new(market, false),
                 AccountMeta::new(book, false),
+                AccountMeta::new_readonly(taker_state, false),
+                AccountMeta::new_readonly(program_id(), false), // position None
                 AccountMeta::new(fc, false),  // ring
                 AccountMeta::new(fob, false), // outbox
             ],
@@ -4829,7 +4936,11 @@ async fn fill_outbox_versatile_er_cap() {
     pt.set_compute_max_units(1_400_000);
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
-    let (_p, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (protocol, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+    // C-1: the maker's trader_state must exist; M-2: zero IM so the benchmark's
+    // resting/crossing orders don't need funded collateral.
+    zero_initial_margin(&mut ctx, market).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &payer, 0, &protocol).await;
     let (book, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market.as_ref()]);
     let (fc, _) = pda(&[flash_book::matcher::fill_commitment::FILL_COMMIT_SEED, market.as_ref()]);
     let (fob, _) = pda(&[fo::FILL_OUTBOX_SEED, market.as_ref()]);
@@ -4867,18 +4978,18 @@ async fn fill_outbox_versatile_er_cap() {
         let tick = 100_000 - (i as u64);
         cu_of(&mut ctx, build_ix(flash_book::instruction::PlaceLimitOrderV2 {
             side: 0, size_lots: 1, limit_ticks: tick, flags: 0, expires_at_slot: 0, sub_index: 0 },
-            vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(book, false)]),
+            vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(book, false),
+                AccountMeta::new_readonly(maker_state, false), AccountMeta::new_readonly(program_id(), false)]),
             &payer.pubkey(), &[&payer]).await;
     }
+    // setup_trader funds SOL AND creates the taker's trader_state (C-1).
     let taker = Keypair::new();
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(
-        &[system_instruction::transfer(&payer.pubkey(), &taker.pubkey(), 100_000_000)],
-        Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 0, &protocol).await;
     cu_of(&mut ctx, build_ix(flash_book::instruction::PlaceTakerOrderV2 {
         side: 1, size_lots: CAP as u64, limit_ticks: 99_000, flags: 0, expires_at_slot: 0, sub_index: 0 },
         vec![AccountMeta::new(taker.pubkey(), true), AccountMeta::new(market, false),
-            AccountMeta::new(book, false), AccountMeta::new(fc, false), AccountMeta::new(fob, false)]),
+            AccountMeta::new(book, false), AccountMeta::new_readonly(taker_state, false),
+            AccountMeta::new_readonly(program_id(), false), AccountMeta::new(fc, false), AccountMeta::new(fob, false)]),
         &taker.pubkey(), &[&taker]).await;
 
     let data = ctx.banks_client.get_account(fob).await.unwrap().unwrap().data;
@@ -5059,6 +5170,8 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             AccountMeta::new(maker.pubkey(), true),
             AccountMeta::new(market_pda, false),
             AccountMeta::new(book_pda, false),
+            AccountMeta::new_readonly(maker_state, false),
+            AccountMeta::new_readonly(program_id(), false), // position None
         ],
     );
     let cu_place_limit = cu_of(&mut ctx, place_limit_ix, &payer.pubkey(), &[&payer, &maker]).await;
@@ -5070,6 +5183,8 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             AccountMeta::new(taker.pubkey(), true),
             AccountMeta::new(market_pda, false),
             AccountMeta::new(book_pda, false),
+            AccountMeta::new_readonly(taker_state, false),
+            AccountMeta::new_readonly(program_id(), false), // position None
         ];
         if armed {
             metas.push(AccountMeta::new(fc_pda, false)); // remaining_accounts
