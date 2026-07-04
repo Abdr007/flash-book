@@ -72,28 +72,41 @@ un-pause right back.
   `PendingGovAction` is a Phase-2 follow-up.
 
 ### Phase 2 — On-chain timelock + 2-step transfers (the core)
-- New PDA **`PendingGovAction { target_market, kind, payload_hash, eta_unix, proposer }`**, seeds
-  `[GOV_PENDING_SEED, market, kind]`.
-- **`propose_gov_action(kind, payload)`** (authority/multisig): stamps `eta = now + TIMELOCK_DELAY`
-  and `payload_hash = keccak(payload)`. **`execute_gov_action(payload)`**: requires
-  `now >= eta` and `keccak(payload) == payload_hash`, then applies. **`cancel_gov_action`**:
-  authority or guardian, any time (fail-safe).
-- Gate the **fail-dangerous** ops behind it: `update_market_params` (loosen), oracle-source change,
-  `withdraw_insurance_fund`, authority transfer, unpause. Leave tightening/pause on the fast path.
-- **2-step authority transfer:** `propose_authority(new)` stores `pending_authority`;
-  `accept_authority` (signed by `new`) commits. A wrong key can never take control passively and a
-  typo strands nothing.
-- `TIMELOCK_DELAY`: a named constant (e.g. 48h) so LPs/traders can exit before a dangerous change
-  lands. Emit `GovActionProposedEvent` (with eta) so off-chain monitors can alert.
+Shipped as two focused, self-contained pieces (each its own PDA — the separate-PDA principle —
+rather than one generic `PendingGovAction`, which was deferred as a larger dispatch framework):
 
-### Phase 3 — Deprecate direct-write `update_oracle` on production markets
-- Add a one-way **`oracle_source_locked`** flag in a small **`MarketOracleLockAccount` PDA** (seeds
-  `[b"oracle_lock", market]`), NOT a MarketAccount field (Layout-safe principle). The consuming
-  contexts (`update_oracle` / `update_oracle_quorum`) take it as an OPTIONAL account and, when
-  present-and-locked, **revert** — only the
-  Pyth (account-owner + `VerificationLevel::Full`) and Lazer (Ed25519 precompile + replay nonce)
-  paths are accepted. Removes the "authority walks the mark within the H-6 cap" vector entirely on
-  locked markets. One-way (never un-lockable) so it's a real commitment, not a toggle.
+**Phase 2a — 2-step authority transfer — ✅ SHIPPED (commits `0618e41`, `629ae80`; live 23/23).**
+`MarketPendingAuthorityAccount` PDA (`[b"pending_authority", market]`). `propose_authority_transfer`
+(authority) stores the pending key; `accept_authority_transfer` — signed BY that new key — commits
+`market.authority` and closes the pending account; `cancel_authority_transfer` (authority) revokes.
+Because the new key must sign to accept, control can never strand at a mistyped/dead key (the 1-step
+`transfer_market_authority` failure mode); that immediate path is retained.
+
+**Phase 2b — timelocked market-params update — ✅ SHIPPED (commits `a45853b`, `66eeb67`; live 26/26).**
+`PendingParamUpdateAccount` PDA (`[b"pending_params", market]`). `propose_param_update` validates the
+new params (shared `validate_market_params`, identical to the immediate `update_market_params`) and
+stores `keccak(params) + eta = now + PARAM_UPDATE_TIMELOCK_SECONDS` (48h); it does NOT apply.
+`execute_param_update` applies only when `now >= eta` AND `keccak(supplied) == stored` (the change is
+exactly the pre-announced one), re-validates, and closes the pending. `cancel_param_update`
+(authority) revokes. `ParamUpdateProposedEvent` carries `eta` for off-chain alerting. The immediate
+`update_market_params` is retained as the un-timelocked path. **Follow-up (ready, not shipped):**
+`guardian_veto_param_update` — let the emergency guardian cancel a pending param change during the
+delay (fail-safe emergency brake), as a pure-addition ix that doesn't touch the authority cancel path.
+
+### Phase 3 — Deprecate direct-write `update_oracle` on production markets — ✅ SHIPPED (commit `f9cf4ad`; live 29/29)
+`lock_oracle_source` (authority-only, ONE-WAY — no unlock ix). Once locked, the direct-authority
+`update_oracle` / `update_oracle_quorum` paths **revert** (`OracleSourceLocked`) — only the Pyth
+(account-owner + `VerificationLevel::Full`) and Lazer (Ed25519 precompile + replay nonce) paths
+remain, removing the "authority walks the mark within the H-6 per-slot cap" vector on locked markets.
+
+**Design correction (important — the original spec here was BYPASSABLE):** an *optional* lock account
+can be omitted by the caller, so a lock stored in one is not a control. The shipped design instead
+carves a **`source_locked: u8`** flag from the `MarketEnvelopeConfigAccount`'s `_reserved` bytes
+(size-unchanged; pre-existing envelopes read `0`) — i.e. the account the two direct paths **already
+REQUIRE** (H-6). So the check is **un-bypassable** (can't omit the account), adds **no new account**
+to the hot `update_oracle` context (no ABI break, no test churn), and Pyth/Lazer (which don't get the
+check) keep working. The flag is set only on first-init (open) and by `lock_oracle_source` (locked);
+`set_envelope_config` re-config never touches it, so the lock cannot be reset.
 
 ## 4 · What this does NOT do (explicit residuals)
 - It does not decentralize the **ER sequencer** (separate project — the true Hyperliquid/dYdX
