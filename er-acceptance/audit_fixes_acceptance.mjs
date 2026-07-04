@@ -202,5 +202,24 @@ ok(!!acceptSig, `Gov P-2a: new key ACCEPTED — authority transferred — ${Stri
 ok((await program.account.marketAccount.fetch(imM.M)).authority.equals(newAuth.publicKey), "  market.authority == the new key");
 ok((await l1.getAccountInfo(pendingPda)) === null, "  pending PDA closed on accept");
 
+// ── GOVERNANCE Phase-2b (2026-07): timelocked market-params update ──────────────
+// Proves the delay gate live (the 48h eta can't be warped on devnet; the
+// after-delay APPLY is covered by the BanksClient test). Round-trips the current
+// params (a valid no-op change) to exercise propose → execute-rejected → cancel.
+console.log("\nGov Phase-2b: timelocked params update (delay-gated)");
+const pppda = pda(["pending_params", im0.M]);
+// Propose the VALID reference params (paramsIM) on the signer-owned im0 market — a
+// legitimate mutable change with matching immutable fields. (im0's own params are
+// the IM=0 test config, whose initial_margin=0 fails the update-time
+// maintenance<=initial bound, so they can't be re-proposed as-is.)
+const params = paramsIM;
+await send(await program.methods.proposeParamUpdate(params).accountsPartial({ authority: signer.publicKey, market: im0.M }).instruction());
+const pp = await program.account.pendingParamUpdateAccount.fetch(pppda);
+ok(pp.etaUnix.toNumber() > 0, `  proposed — eta set (now + 48h) = ${pp.etaUnix.toNumber()}`);
+const execRej = await sendExpectFail(await program.methods.executeParamUpdate(params).accountsPartial({ authority: signer.publicKey, market: im0.M }).instruction());
+ok(execRej, "Gov P-2b: execute BEFORE the 48h eta is REJECTED (TimelockNotElapsed)");
+await send(await program.methods.cancelParamUpdate().accountsPartial({ authority: signer.publicKey, market: im0.M }).instruction());
+ok((await l1.getAccountInfo(pppda)) === null, "Gov P-2b: authority CANCELLED — pending closed");
+
 console.log(`\n${fail === 0 ? "✅ AUDIT-FIXES LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
