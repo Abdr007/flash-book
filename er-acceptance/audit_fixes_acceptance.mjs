@@ -151,5 +151,36 @@ await send(await program.methods.vaultOpenTraderStateV3().accountsPartial({ stra
 const f1sig = await send(await vaultPlace());
 ok(!!f1sig, `F-1: vault order WITH a real vault TraderState is ACCEPTED — ${String(f1sig).slice(0, 12)}… (no false-reject)`);
 
+// ── GOVERNANCE Phase-1 (2026-07): asymmetric emergency guardian ─────────────────
+// A guardian may RESTRICT market status (pause) but NEVER loosen it (unpause stays
+// authority-only). Run last: it pauses then re-opens the IM=0 market.
+console.log("\nGov Phase-1: guardian may restrict but not loosen market status");
+const guardian = Keypair.generate();
+await send(await program.methods.setGuardian(guardian.publicKey).accountsPartial({ authority: signer.publicKey, market: im0.M }).instruction());
+const gpda = pda(["market_guardian", im0.M]);
+const gacc = await program.account.marketGuardianAccount.fetch(gpda);
+ok(gacc.guardian.equals(guardian.publicKey), `  guardian set on the IM=0 market ${gpda.toBase58().slice(0, 8)}…`);
+
+// guardian_account slot: the PDA for a guardian call, null (omitted) for an authority call.
+const statusIx = (caller, newStatus, withGuardian) =>
+  program.methods.setMarketStatus(newStatus)
+    .accountsPartial({ authority: caller, market: im0.M, guardianAccount: withGuardian ? gpda : null })
+    .instruction();
+
+// Guardian PAUSES (Active(1) → Paused(3)) — restrict, allowed. (guardian co-signs; signer pays.)
+const pauseSig = await send(await statusIx(guardian.publicKey, 3, true), [guardian]);
+ok(!!pauseSig, `Gov P-1: guardian PAUSED the market (restrict) — ${String(pauseSig).slice(0, 12)}…`);
+ok((await program.account.marketAccount.fetch(im0.M)).status === 3, "  market status == Paused(3)");
+
+// Guardian tries to UNPAUSE (3 → 1) — loosen, MUST be rejected.
+const unpauseRej = await sendExpectFail(await statusIx(guardian.publicKey, 1, true), [guardian]);
+ok(unpauseRej, "Gov P-1: guardian CANNOT unpause (rejected — loosening is authority-only)");
+ok((await program.account.marketAccount.fetch(im0.M)).status === 3, "  still Paused(3) after the guardian's failed unpause");
+
+// Authority UNPAUSES (3 → 1) — allowed (guardian slot omitted).
+const reopenSig = await send(await statusIx(signer.publicKey, 1, false));
+ok(!!reopenSig, `Gov P-1: authority RE-OPENED the market — ${String(reopenSig).slice(0, 12)}…`);
+ok((await program.account.marketAccount.fetch(im0.M)).status === 1, "  market status == Active(1)");
+
 console.log(`\n${fail === 0 ? "✅ AUDIT-FIXES LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
