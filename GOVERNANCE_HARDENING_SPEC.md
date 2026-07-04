@@ -31,10 +31,17 @@ un-pause right back.
   upgrade, insurance withdraw) should be **slow** (timelock) and **high threshold**.
 - **No new trust in the hot path.** Governance changes must not add accounts or CU to
   place/match/settle. All of this lives on admin ixs only.
-- **Layout-safe.** New governance state goes in **trailing fields within `MarketAccount`'s existing
-  `space()=1152` headroom** (the M-6 `unsettled_fill_volume` pattern — pre-existing markets read
-  them back as 0), guarded by the existing build-time `assert!(size_of ≤ space)` (`state.rs:416`).
-  If a field would overflow 1152, it escalates to a versioned migration — never a silent realloc.
+- **Layout-safe → use SEPARATE PDAs, not `MarketAccount` fields.** New governance state gets its own
+  small PDA (the Phase-1 `MarketGuardianAccount` pattern: seeds `[b"<name>", market]`, optional in
+  the consuming context). **Do NOT add trailing fields to `MarketAccount`.** Empirically confirmed
+  during Phase 1: `MarketAccount` is held UNBOXED (`Account<MarketAccount>`, ~1152 B) in dozens of
+  `try_accounts` frames, several already within a few bytes of the 4 KB BPF stack limit
+  (`ViewMarket` 4104, `InitFlpPerMarketV3` 4160). Adding a single 32-byte `Pubkey` field pushed
+  `SettleFunding` and `VaultPlaceOrderV3` past 4096 with **"overwrites frame / undefined behavior"**
+  errors. `space()=1152` has byte headroom, but the *stack* does not — the binding constraint is the
+  4 KB frame, not the account size. So the M-6 `unsettled_fill_volume` trailing-field trick is a
+  one-off that must NOT be repeated for governance. A separate PDA adds bytes only to the one admin
+  context that reads it (far from the limit) and touches no hot path.
 - **Two-step, never fat-finger.** Authority/ownership transfers are propose→accept, so a typo can't
   strand control at a dead key.
 
@@ -48,14 +55,21 @@ un-pause right back.
   multisig** by calling the existing authority-set paths with the multisig as the new authority.
   (If no set-authority ix exists for one of them, that's Phase 2's 2-step transfer.)
 
-### Phase 1 — Asymmetric pause (small, on-chain)
-- Add a **`guardian: Pubkey`** trailing field to `MarketAccount` (or a protocol-level config PDA).
-- Split `set_market_status`:
-  - **Pause / PostOnly / tighten** → allowed by EITHER `market.authority` OR `guardian` (fast,
-    fail-safe direction only — can only *restrict*).
-  - **Unpause → Active** (fail-dangerous) → routed through the Phase 2 timelock (a compromised
-    guardian can pause but never re-open).
-- Unit + BanksClient: guardian can pause but not unpause; authority-via-timelock can unpause.
+### Phase 1 — Asymmetric pause (small, on-chain) — ✅ SHIPPED (commits `59a9fba`, `dee2133`)
+- **`MarketGuardianAccount` PDA** (seeds `[b"market_guardian", market]`; `{market, guardian, bump}`)
+  — a SEPARATE account, NOT a MarketAccount field (see the Layout-safe principle; the field version
+  blew the 4 KB stack). Set/cleared by the authority via `set_guardian` (init_if_needed).
+- `set_market_status` moved to its own `SetMarketStatus` context (so the optional guardian account
+  does not leak into the 4 other handlers sharing `UpdateMarketAuthority`) and now accepts EITHER
+  `market.authority` OR the guardian:
+  - guardian may move only to a STRICTLY more-restricted live status (PostOnly/Paused/Closed,
+    monotonic on the enum values `Active 1 < PostOnly 2 < Paused 3 < Closed 4`, from a live state);
+  - any loosening (→ Active/Inactive) or lifecycle change stays authority-only.
+- Validated: host + BanksClient (guardian pauses / can't unpause / rando rejected / authority
+  re-opens / `set_guardian` authority-only) AND live on devnet (acceptance 18/18).
+- NOTE for Phase 2: "unpause routes through the timelock" is deferred to Phase 2 — today unpause is
+  authority-only (already the fail-dangerous key, just not yet delayed). Wiring unpause through
+  `PendingGovAction` is a Phase-2 follow-up.
 
 ### Phase 2 — On-chain timelock + 2-step transfers (the core)
 - New PDA **`PendingGovAction { target_market, kind, payload_hash, eta_unix, proposer }`**, seeds
@@ -73,8 +87,10 @@ un-pause right back.
   lands. Emit `GovActionProposedEvent` (with eta) so off-chain monitors can alert.
 
 ### Phase 3 — Deprecate direct-write `update_oracle` on production markets
-- Add a one-way **`oracle_source_locked: bool`** trailing field. When set (via a Phase-2 timelocked
-  action), the direct-authority `update_oracle` / `update_oracle_quorum` paths **revert** — only the
+- Add a one-way **`oracle_source_locked`** flag in a small **`MarketOracleLockAccount` PDA** (seeds
+  `[b"oracle_lock", market]`), NOT a MarketAccount field (Layout-safe principle). The consuming
+  contexts (`update_oracle` / `update_oracle_quorum`) take it as an OPTIONAL account and, when
+  present-and-locked, **revert** — only the
   Pyth (account-owner + `VerificationLevel::Full`) and Lazer (Ed25519 precompile + replay nonce)
   paths are accepted. Removes the "authority walks the mark within the H-6 cap" vector entirely on
   locked markets. One-way (never un-lockable) so it's a real commitment, not a toggle.
@@ -93,9 +109,11 @@ un-pause right back.
 - Phase 2: BanksClient — `execute` before `eta` reverts (TimelockNotElapsed); after `eta` applies;
   payload mismatch reverts; 2-step transfer requires the *new* key to accept; cancel works.
 - Phase 3: BanksClient — after lock, direct `update_oracle` reverts; Pyth/Lazer paths still accept.
-- Layout: the build-time `assert!(size_of::<MarketAccount>() ≤ 1152)` must still hold after each new
-  trailing field; if it would break, stop and version the account (documented migration), never
-  silently realloc.
+- Layout/stack: governance state lives in **separate PDAs**, so `MarketAccount` is unchanged — but
+  after ANY governance change, re-run `cargo build-sbf --tools-version v1.52` and confirm the stack
+  warning set is unchanged (baseline: `ViewMarket`, `InitFlpPerMarketV3` only). A new context that
+  holds `MarketAccount` unboxed plus another sizeable account can itself cross 4096 — Box the
+  `MarketAccount` (transparent deref) or split the context if so. Never grow `MarketAccount`.
 
 ## 6 · Cost / sequencing
 Phase 0 is hours (ops). Phase 1 is a small on-chain change. Phase 2 is the real work (new PDA +
