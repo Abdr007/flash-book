@@ -88,4 +88,29 @@ mod tests {
     fn zero_order_size_admits_trivially() {
         assert_eq!(check_reduce_only(0, 100, 1, 0), ReduceOnlyOutcome::Admit);
     }
+
+    /// AUDIT M-7 airtight (2026-07): models how the matcher consumes the reducible
+    /// size across multiple reduce-only crosses of ONE position within a walk (it
+    /// decrements the reducible by each capped fill). Invariant: the total reduced
+    /// can never exceed the position size, so the position can never flip.
+    #[test]
+    fn sequential_reduces_cannot_over_reduce_one_position() {
+        let cap_fill = |reducible: u64, desired: u64| -> u64 {
+            match check_reduce_only(0 /*long*/, reducible, 1 /*sell*/, desired) {
+                ReduceOnlyOutcome::Admit => desired,
+                ReduceOnlyOutcome::PartialAdmit(c) => c,
+                ReduceOnlyOutcome::Reject => 0,
+            }
+        };
+        let mut reducible = 100u64; // long 100
+        let c1 = cap_fill(reducible, 60);
+        assert_eq!(c1, 60);
+        reducible -= c1; // 40 left
+        let c2 = cap_fill(reducible, 60); // only 40 reducible now
+        assert_eq!(c2, 40);
+        reducible -= c2; // 0 left
+        assert_eq!(c1 + c2, 100, "total reduced == position size — never flips");
+        // A further reduce-only cross of the now-flat position fills nothing.
+        assert_eq!(cap_fill(reducible, 10), 0);
+    }
 }

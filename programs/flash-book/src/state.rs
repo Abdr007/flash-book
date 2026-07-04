@@ -390,6 +390,17 @@ pub struct MarketAccount {
     /// truncate fills in the 10 KB log and wedge settlement (the H-2 class). See
     /// `FILL_OUTBOX_DESIGN.md`.
     pub max_batch_orders: u16,
+
+    /// AUDIT M-6 (2026-07): total base-lot volume of fills that have been MATCHED
+    /// (pushed to the fill-commitment ring) but NOT yet settled by apply_fill /
+    /// apply_flp_fill. Because settled OI (`oi_long/short_lots`) only advances at
+    /// settlement, the per-market OI cap was checkable against stale OI and could be
+    /// overshot by pipelining takers ahead of settlement. The intake cap now checks
+    /// `oi[side] + unsettled_fill_volume + new_size`. Incremented per fill at match
+    /// (produce), decremented per fill at settle — tied 1:1 to the ring's FIFO
+    /// produce/settle lifecycle, so it self-balances (no cancellation accounting;
+    /// cancels produce no fills). Trailing field ⇒ existing accounts read it as 0.
+    pub unsettled_fill_volume: u64,
 }
 
 // H1: build-time guard — the struct (incl. the new nonce) must still fit the

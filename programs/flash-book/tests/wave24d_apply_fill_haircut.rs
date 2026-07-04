@@ -57,7 +57,7 @@ fn dispatch(
                 matured_pos_quote_lots: ph.matured,
                 original_reserve_at_attach: ph.original,
             };
-            let post = apply_release(pre, gain, now_slot).map_err(|_| "release")?;
+            let post = apply_release(pre, gain, now_slot, u64::MAX).map_err(|_| "release")?;
             ph.reserve = post.released_reserve_quote_lots;
             ph.attached = post.released_attached_at_slot;
             ph.matured = post.matured_pos_quote_lots;

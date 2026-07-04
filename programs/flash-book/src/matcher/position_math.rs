@@ -54,17 +54,6 @@ pub enum PosMathError {
     DivByZero,
 }
 
-#[inline]
-fn clamp_i128_to_i64(v: i128) -> i64 {
-    if v > i64::MAX as i128 {
-        i64::MAX
-    } else if v < i64::MIN as i128 {
-        i64::MIN
-    } else {
-        v as i64
-    }
-}
-
 /// Apply `(fill_side, fill_size_lots, fill_price_ticks)` to `pos`. Byte-faithful
 /// port of the long-standing `apply_fill_to_position` arithmetic (incl. the H-1
 /// `tick_size` scaling of realized PnL). Returns the new position + realized PnL
@@ -131,7 +120,13 @@ pub fn apply_fill(
         .ok_or(PosMathError::Overflow)?
         .checked_mul(tick_size as i128)
         .ok_or(PosMathError::Overflow)?;
-    let realized = clamp_i128_to_i64(pnl);
+    // AUDIT L-3 (2026-07): REJECT a realized PnL that exceeds i64 rather than
+    // silently saturating it. A clamped value both breaks per-fill value
+    // conservation (the two legs would clamp independently) and, once fed to the
+    // caller's `checked_add`, can revert mid-ring and strand the FIFO. Realistic
+    // markets never approach i64 quote-lots, so a hard reject is safe and fails
+    // the fill cleanly at settlement rather than distorting value.
+    let realized: i64 = i64::try_from(pnl).map_err(|_| PosMathError::Overflow)?;
 
     if fill_size_lots <= pos.size_lots {
         // Shrink (possibly to flat).

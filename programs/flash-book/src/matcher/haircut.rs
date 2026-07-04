@@ -211,6 +211,7 @@ pub fn apply_release(
     pre: PositionHaircutSnapshot,
     gain_quote_lots: u64,
     now_slot: u64,
+    h_min_slots: u64,
 ) -> Result<PositionHaircutSnapshot, HaircutError> {
     if gain_quote_lots == 0 {
         return Err(HaircutError::ZeroGain);
@@ -219,19 +220,30 @@ pub fn apply_release(
         .released_reserve_quote_lots
         .checked_add(gain_quote_lots)
         .ok_or(HaircutError::Overflow)?;
-    let attached = if pre.released_reserve_quote_lots == 0 {
-        // First dollar of reserve — start the warmup clock now.
-        now_slot
+    let reserve_empty = pre.released_reserve_quote_lots == 0;
+    let old_elapsed = now_slot.saturating_sub(pre.released_attached_at_slot);
+    // AUDIT M-3 / F-2 (2026-07): the HIGH-9 size-weighted blend fixed the common
+    // case but NOT `reserve >> gain`: the blend `attached' = (r·a + g·n)/(r+g)`
+    // barely moves the clock, so a fresh gain inherits the OLD reserve's elapsed
+    // time. `matured_fraction` begins maturing at `h_min` (NOT `h_max`), so any
+    // un-drained reserve whose `old_elapsed >= h_min` lets the fresh gain mature
+    // early — near-INSTANTLY once `old_elapsed` approaches `h_max`. The first M-3
+    // fix gated only the fully-matured case (`>= h_max`) and left the whole
+    // `[h_min, h_max)` window open (see the F-2 finding + `poc_*` regression test
+    // below). Correct threshold is `h_min`: BELOW `h_min` nothing has matured yet,
+    // so the blend is harmless (elapsed' <= old_elapsed < h_min ⇒ still 0 matured)
+    // and honest steady warming keeps the fair blend; AT/ABOVE `h_min` maturation
+    // has begun, so restart the warmup at `now` to stop the fresh gain (and any
+    // un-drained matured remainder) inheriting matured status. Safe direction: this
+    // only ever DELAYS reserve maturation, never rejects a close/reduce/withdraw,
+    // and the matured amount is re-warmed, not lost. The honest mature-then-release
+    // flow drains the reserve to 0 first ⇒ hits the fresh-start path ⇒ unpenalised.
+    let reset = reserve_empty || old_elapsed >= h_min_slots;
+    let (attached, new_original) = if reset {
+        (now_slot, new_reserve)
     } else {
-        // AUDIT HIGH-9 (2026-07): reserve-weighted attach slot. Previously the
-        // ORIGINAL (older) slot was kept, so a large gain released long after a
-        // tiny leftover reserve inherited an already-elapsed warmup clock and
-        // could mature instantly — defeating the anti-spike warmup. Blend the
-        // clocks in proportion to size so a fresh gain pulls the effective
-        // attach forward: attached' = (reserve·attached + gain·now)/(reserve+gain).
-        // `now_slot >= attached` (time only advances), so the result stays in
-        // [attached, now] — older dollars are never warmed FASTER, and new
-        // gains never start already-matured.
+        // Reserve-weighted attach slot: attached' = (reserve·a + gain·now)/(reserve+gain),
+        // in [attached, now] — older dollars never warm FASTER.
         let r = pre.released_reserve_quote_lots as u128;
         let g = gain_quote_lots as u128;
         let a = pre.released_attached_at_slot as u128;
@@ -242,18 +254,12 @@ pub fn apply_release(
             .checked_add(g.checked_mul(n).ok_or(HaircutError::Overflow)?)
             .ok_or(HaircutError::Overflow)?;
         let denom = r.checked_add(g).ok_or(HaircutError::Overflow)?;
-        (numer / denom) as u64
-    };
-    // Original reserve tracks the total in this warmup window.
-    // - First release (reserve was 0): start fresh at gain.
-    // - Subsequent release while warming: bump by gain (treat new gains
-    //   as joining the existing warmup pool).
-    let new_original = if pre.released_reserve_quote_lots == 0 {
-        gain_quote_lots
-    } else {
-        pre.original_reserve_at_attach
+        let blended = (numer / denom) as u64;
+        let orig = pre
+            .original_reserve_at_attach
             .checked_add(gain_quote_lots)
-            .ok_or(HaircutError::Overflow)?
+            .ok_or(HaircutError::Overflow)?;
+        (blended, orig)
     };
     Ok(PositionHaircutSnapshot {
         released_reserve_quote_lots: new_reserve,
@@ -404,7 +410,7 @@ pub fn release_mature_convert_if_ripe(
     now_slot: u64,
     market: MarketHaircutSnapshot,
 ) -> Result<(PositionHaircutSnapshot, u64, u64, u64), HaircutError> {
-    let after_release = apply_release(pre, gain_quote_lots, now_slot)?;
+    let after_release = apply_release(pre, gain_quote_lots, now_slot, market.h_min_slots)?;
     let (after_mature, matured_delta) =
         apply_mature(after_release, now_slot, market.h_min_slots, market.h_max_slots)?;
     if after_mature.matured_pos_quote_lots == 0 {
@@ -789,7 +795,7 @@ mod tests {
     #[test]
     fn release_starts_warmup_clock() {
         let pre = PositionHaircutSnapshot::default();
-        let post = apply_release(pre, 500, 42).unwrap();
+        let post = apply_release(pre, 500, 42, 100).unwrap();
         assert_eq!(post.released_reserve_quote_lots, 500);
         assert_eq!(post.released_attached_at_slot, 42);
     }
@@ -806,7 +812,8 @@ mod tests {
             matured_pos_quote_lots: 0,
             original_reserve_at_attach: 100,
         };
-        let post = apply_release(pre, 200, 50).unwrap();
+        // h_min=100 > old_elapsed(40) ⇒ nothing matured yet ⇒ fair blend path.
+        let post = apply_release(pre, 200, 50, 100).unwrap();
         assert_eq!(post.released_reserve_quote_lots, 300);
         // Reserve-weighted: (100*10 + 200*50) / 300 = 11000/300 = 36 (floor).
         assert_eq!(post.released_attached_at_slot, 36);
@@ -817,9 +824,59 @@ mod tests {
     }
 
     #[test]
+    fn release_into_fully_matured_reserve_restarts_warmup() {
+        // AUDIT M-3 (2026-07): a large existing reserve that has begun maturing
+        // (old_elapsed >= h_min) must NOT let a fresh gain inherit its elapsed clock
+        // and mature instantly. The pool's warmup restarts at `now`.
+        let h_min = 10u64;
+        let h_max = 200u64;
+        let pre = PositionHaircutSnapshot {
+            released_reserve_quote_lots: 1_000_000,
+            released_attached_at_slot: 0, // now=1000 ⇒ old_elapsed=1000 >= h_min
+            matured_pos_quote_lots: 0,
+            original_reserve_at_attach: 1_000_000,
+        };
+        let post = apply_release(pre, 1_000, 1_000, h_min).unwrap();
+        assert_eq!(post.released_reserve_quote_lots, 1_001_000);
+        // Clock reset to now (not the stale 0) ⇒ the fresh gain must warm.
+        assert_eq!(post.released_attached_at_slot, 1_000);
+        // original re-based to the full current reserve ⇒ nothing matured yet.
+        assert_eq!(post.original_reserve_at_attach, 1_001_000);
+        let (after, delta) = apply_mature(post, 1_000, h_min, h_max).unwrap();
+        assert_eq!(delta, 0, "no instant maturation after a warmup restart");
+        assert_eq!(after.released_reserve_quote_lots, 1_001_000);
+    }
+
+    #[test]
+    fn release_in_hmin_hmax_window_restarts_warmup_no_instant_mature() {
+        // AUDIT F-2 (2026-07) regression: the M-3 fix originally gated only the
+        // FULLY-matured case (old_elapsed >= h_max). But maturation begins at h_min,
+        // so a large un-drained reserve with old_elapsed in [h_min, h_max) let a
+        // fresh gain mature near-instantly via the size-weighted blend (r >> g ⇒
+        // attach barely moves). This pins the window closed: reset fires at h_min, so
+        // a gain released at old_elapsed = h_max-1 matures ZERO on the same slot.
+        let h_min = 100u64;
+        let h_max = 1000u64;
+        let now = 999u64; // old_elapsed = 999 ∈ [h_min, h_max) — the exploit window.
+        let pre = PositionHaircutSnapshot {
+            released_reserve_quote_lots: 1_000_000_000,
+            released_attached_at_slot: 0,
+            matured_pos_quote_lots: 0,
+            original_reserve_at_attach: 1_000_000_000,
+        };
+        let post = apply_release(pre, 1_000, now, h_min).unwrap();
+        // Warmup restarted at `now`, not blended to the stale slot 0.
+        assert_eq!(post.released_attached_at_slot, now);
+        assert_eq!(post.original_reserve_at_attach, 1_000_001_000);
+        // Mature at the SAME slot the gain was released ⇒ nothing matures.
+        let (_after, delta) = apply_mature(post, now, h_min, h_max).unwrap();
+        assert_eq!(delta, 0, "F-2: fresh gain must serve its own warmup — no instant maturation");
+    }
+
+    #[test]
     fn release_rejects_zero() {
         let pre = PositionHaircutSnapshot::default();
-        assert_eq!(apply_release(pre, 0, 42), Err(HaircutError::ZeroGain));
+        assert_eq!(apply_release(pre, 0, 42, 100), Err(HaircutError::ZeroGain));
     }
 
     #[test]

@@ -118,6 +118,14 @@ const _: () = assert!(std::mem::size_of::<MarketBookHeader>() == 256);
 ///
 /// Implements `Ord` by `order_id` (which embeds price + seq + side). The
 /// RBT uses this for sort.
+///
+/// AUDIT M-7 airtight (2026-07): `RestingOrderV2.flags` bit1 = REDUCE_ONLY. Set ONLY
+/// by the program when a reduce-only trigger/bracket leg injects its close order
+/// (never settable on a user place path — those reject bit1 at intake). The matcher
+/// caps a crossed reduce-only maker's fill to the maker's reducible position size so
+/// it can only close, never open/flip. See `matcher::reduce_only::check_reduce_only`.
+pub const FLAG_REDUCE_ONLY: u8 = 0b0000_0010;
+
 #[zero_copy]
 pub struct RestingOrderV2 {
     /// `(price << 16) | (seq mod 2^16)`. For bids, the resulting u64
@@ -556,6 +564,17 @@ impl<'a> MarketBookHandle<'a> {
                 crate::errors::FlashBookError::OutOfRange
             );
         }
+        // AUDIT M-1 (2026-07): the bump allocator returns `num_bytes_allocated` as
+        // the next fresh node offset. If a malicious-/buggy-ER commit leaves it
+        // non-node-aligned or past the slab, the next `alloc_node` yields a
+        // misaligned slice (bytemuck alignment panic → placement brick) or an
+        // in-bounds offset that overlaps a live node (silent corruption). Validate
+        // it here on the per-op hot gate so a tampered bump pointer fails closed.
+        require!(
+            header.num_bytes_allocated as usize % NODE_TOTAL_BYTES == 0
+                && header.num_bytes_allocated as usize <= slab_len,
+            crate::errors::FlashBookError::OutOfRange
+        );
         // NOTE: internal RBT node-links (left/right/parent) are NOT walked here — that
         // would add O(capacity) CU to EVERY book op on the hot path. Instead they are
         // validated ONCE, when a book re-enters L1 via `process_undelegation` (the
@@ -609,6 +628,15 @@ impl<'a> MarketBookHandle<'a> {
                     crate::errors::FlashBookError::OutOfRange
                 );
             }
+            // AUDIT L-1 (2026-07): `RBNode.color` (byte offset 12) is a `#[repr(u8)]`
+            // enum with only 0=Black / 1=Red valid; reading any other discriminant as
+            // the enum is UB. `unsafe impl Pod` bypasses bytemuck's variant check, so
+            // validate the byte here. Free/unused slots are zeroed (0=Black), so a
+            // well-formed book always passes; only a tampered color byte fails closed.
+            require!(
+                slab[base + 12] <= 1,
+                crate::errors::FlashBookError::OutOfRange
+            );
         }
 
         // AUDIT HIGH-5 (2026-07): the per-link bounds check above stops an OOB
@@ -671,6 +699,66 @@ impl<'a> MarketBookHandle<'a> {
                 }
             }
         }
+
+        // AUDIT H-3 (2026-07): the cached best-bid/best-ask pointers are NOT roots
+        // of the DFS above, so a commit can plant a `best` that points at a detached
+        // node (unreachable from any root) whose self-cycle the DFS never inspects;
+        // the first `for_each_best_first` walk then starts there and spins forever
+        // (unbounded successor loop) → permanent brick. Require each cached best be
+        // NIL or a node the tree DFS actually reached (∈ visited).
+        for best in [header.bids_best_index, header.asks_best_index] {
+            if best != NIL {
+                let off = best as usize;
+                require!(
+                    off % NODE_TOTAL_BYTES == 0 && off < slab_len,
+                    crate::errors::FlashBookError::OutOfRange
+                );
+                require!(
+                    visited[off / NODE_TOTAL_BYTES],
+                    crate::errors::FlashBookError::OutOfRange
+                );
+            }
+        }
+
+        // AUDIT H-4 (2026-07): the free list is not walked by the tree DFS. A commit
+        // can plant a free list that (a) cycles or (b) aliases a live tree node, so a
+        // later `alloc_node` pops a slot that is still linked in a tree → one physical
+        // slot in two logical positions (use-after-free / type confusion / eventual
+        // brick). Walk the free list from its head with the SHARED `visited` bitmap:
+        // any slot already marked (tree-live, or a free-list revisit = cycle) fails
+        // closed, and the walk is step-bounded. This proves the tree-live and free
+        // sets are disjoint and the free list is acyclic. `FreeListNode.next_index`
+        // sits at byte offset 0 (same slot the DFS read as `left`).
+        {
+            let mut free = header.free_list_head_index;
+            let mut steps = 0usize;
+            while free != NIL {
+                steps += 1;
+                require!(steps <= node_count, crate::errors::FlashBookError::OutOfRange);
+                let off = free as usize;
+                require!(
+                    off % NODE_TOTAL_BYTES == 0
+                        && off
+                            .checked_add(NODE_TOTAL_BYTES)
+                            .is_some_and(|end| end <= slab_len),
+                    crate::errors::FlashBookError::OutOfRange
+                );
+                let ord = off / NODE_TOTAL_BYTES;
+                require!(!visited[ord], crate::errors::FlashBookError::OutOfRange);
+                visited[ord] = true;
+                free = read_link(off, 0);
+            }
+        }
+
+        // AUDIT M-1 (2026-07): fail closed at undelegation on a corrupt bump pointer
+        // too (from_account_data validates it on every subsequent op, but reverting
+        // the undelegate keeps the corrupt book off L1 in the first place).
+        require!(
+            header.num_bytes_allocated as usize % NODE_TOTAL_BYTES == 0
+                && header.num_bytes_allocated as usize <= slab_len,
+            crate::errors::FlashBookError::OutOfRange
+        );
+
         Ok(())
     }
 

@@ -2369,6 +2369,10 @@
         {
           "name": "ttl_seconds",
           "type": "i64"
+        },
+        {
+          "name": "scope_market",
+          "type": "pubkey"
         }
       ]
     },
@@ -7565,6 +7569,13 @@
               }
             ]
           }
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": [
@@ -8400,6 +8411,9 @@
           "signer": true
         },
         {
+          "name": "trader_state"
+        },
+        {
           "name": "market"
         },
         {
@@ -8511,6 +8525,9 @@
           "name": "trader",
           "writable": true,
           "signer": true
+        },
+        {
+          "name": "trader_state"
         },
         {
           "name": "market"
@@ -8797,6 +8814,13 @@
               }
             ]
           }
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": [
@@ -8940,6 +8964,13 @@
               }
             ]
           }
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": [
@@ -9067,6 +9098,13 @@
               }
             ]
           }
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": [
@@ -9119,6 +9157,9 @@
           "name": "trader",
           "writable": true,
           "signer": true
+        },
+        {
+          "name": "trader_state"
         },
         {
           "name": "market"
@@ -9195,6 +9236,9 @@
           "name": "trader",
           "writable": true,
           "signer": true
+        },
+        {
+          "name": "trader_state"
         },
         {
           "name": "market"
@@ -13011,6 +13055,50 @@
               {
                 "kind": "account",
                 "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_trader_state",
+          "docs": [
+            "AUDIT C-1 (2026-07): the vault's own TraderState. `vault_place_order_v3`",
+            "rests a `RestingOrderV2` under `(vault_pk, 0)`; when a taker crosses it the",
+            "matcher commits that maker identity into the strict fill-commitment FIFO,",
+            "and `apply_fill` HARD-loads this TraderState (`verify_trader_state_pda`) to",
+            "settle. If it did not exist, the committed fill could never settle, the FIFO",
+            "cursor could never advance, and the market's settlement pipeline would wedge",
+            "PERMANENTLY (the C-1 class the other place paths already gate — this one was",
+            "missed). Requiring the canonical, program-owned PDA here (sub_index 0 ⇒ the",
+            "single-seed derivation, matching `vault_open_trader_state_v3`) makes a vault",
+            "order structurally unable to rest against a non-existent TraderState. Existence",
+            "is enforced by `AccountLoader` (program-owned + valid discriminator); the PDA",
+            "binding to `vault.key()` is enforced by the seed constraint. Read-only. A",
+            "legitimate vault always creates this via `vault_open_trader_state_v3` before",
+            "its first order, so this never false-rejects a valid flow."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
               }
             ]
           }
@@ -20301,6 +20389,21 @@
               "`FILL_OUTBOX_DESIGN.md`."
             ],
             "type": "u16"
+          },
+          {
+            "name": "unsettled_fill_volume",
+            "docs": [
+              "AUDIT M-6 (2026-07): total base-lot volume of fills that have been MATCHED",
+              "(pushed to the fill-commitment ring) but NOT yet settled by apply_fill /",
+              "apply_flp_fill. Because settled OI (`oi_long/short_lots`) only advances at",
+              "settlement, the per-market OI cap was checkable against stale OI and could be",
+              "overshot by pipelining takers ahead of settlement. The intake cap now checks",
+              "`oi[side] + unsettled_fill_volume + new_size`. Incremented per fill at match",
+              "(produce), decremented per fill at settle — tied 1:1 to the ring's FIFO",
+              "produce/settle lifecycle, so it self-balances (no cancellation accounting;",
+              "cancels produce no fills). Trailing field ⇒ existing accounts read it as 0."
+            ],
+            "type": "u64"
           }
         ]
       }
@@ -22521,7 +22624,7 @@
       "name": "SessionTokenAccount",
       "docs": [
         "A revocable, auto-expiring authorization for `session_signer` to act for",
-        "`owner`. 73 bytes + 8 disc."
+        "`owner`. 105 bytes + 8 disc."
       ],
       "type": {
         "kind": "struct",
@@ -22546,6 +22649,16 @@
               "Unix seconds after which the session is invalid (checked on every use)."
             ],
             "type": "i64"
+          },
+          {
+            "name": "scope_market",
+            "docs": [
+              "AUDIT M-9 (2026-07): market scope. `Pubkey::default()` (all-zero) = the",
+              "session may act on ANY market (legacy/opt-out behaviour). A specific market",
+              "key = the session is restricted to that ONE market, so a leaked session key",
+              "cannot dump the owner's collateral across every market. Enforced in `verify`."
+            ],
+            "type": "pubkey"
           },
           {
             "name": "bump",

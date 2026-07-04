@@ -72,7 +72,7 @@ fn ix_release(pos: &mut PositionHaircutState, gain: u64, now_slot: u64) {
         matured_pos_quote_lots: pos.matured,
         original_reserve_at_attach: pos.original_reserve_at_attach,
     };
-    let post = apply_release(pre, gain, now_slot).unwrap();
+    let post = apply_release(pre, gain, now_slot, u64::MAX).unwrap();
     pos.reserve = post.released_reserve_quote_lots;
     pos.attached_at_slot = post.released_attached_at_slot;
     pos.matured = post.matured_pos_quote_lots;

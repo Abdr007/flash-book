@@ -169,7 +169,10 @@ fn default_params() -> MarketParams {
         twap_window: 5,
         batch_interval_ms: 50,
 
-        oracle_staleness_max_seconds: 0,
+        // AUDIT M-5 (2026-07): initialize_market now requires a positive staleness
+        // bound (0 silently disabled the gate). Use the 60s convention the staleness
+        // tests already set explicitly. Individual tests override as needed.
+        oracle_staleness_max_seconds: 60,
         oracle_confidence_max_bps: 0,
         max_position_lots_per_trader: 0,
         oracle_quorum_max_dispersion_bps: 0,
@@ -7212,7 +7215,7 @@ async fn deposit_collateral_session_funds_owner_margin() {
         session_signer.pubkey().as_ref(),
     ]);
     let create_session = build_ix(
-        flash_book::instruction::CreateSessionToken { ttl_seconds: 3_600 },
+        flash_book::instruction::CreateSessionToken { ttl_seconds: 3_600, scope_market: Pubkey::default() },
         vec![
             AccountMeta::new(owner.pubkey(), true),
             AccountMeta::new_readonly(session_signer.pubkey(), false),

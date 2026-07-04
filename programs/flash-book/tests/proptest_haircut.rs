@@ -253,7 +253,7 @@ proptest! {
 
         for (g, dt) in gains.iter().zip(slot_deltas.iter().cycle()) {
             now += dt;
-            pos = apply_release(pos, *g, now).unwrap();
+            pos = apply_release(pos, *g, now, u64::MAX).unwrap();
             total_gain += *g as u128;
 
             let (post, delta) = apply_mature(pos, now, h_min, h_max).unwrap();
