@@ -182,5 +182,25 @@ const reopenSig = await send(await statusIx(signer.publicKey, 1, false));
 ok(!!reopenSig, `Gov P-1: authority RE-OPENED the market — ${String(reopenSig).slice(0, 12)}…`);
 ok((await program.account.marketAccount.fetch(im0.M)).status === 1, "  market status == Active(1)");
 
+// ── GOVERNANCE Phase-2a (2026-07): 2-step authority transfer ────────────────────
+// Run last on the imM market: the current authority proposes a new key, a wrong key
+// can't accept, the new key accepts (authority transfers + pending closes).
+console.log("\nGov Phase-2a: 2-step authority transfer (propose → the new key must accept)");
+const newAuth = Keypair.generate();
+const pendingPda = pda(["pending_authority", imM.M]);
+await send(await program.methods.proposeAuthorityTransfer(newAuth.publicKey).accountsPartial({ authority: signer.publicKey, market: imM.M }).instruction());
+const pend = await program.account.marketPendingAuthorityAccount.fetch(pendingPda);
+ok(pend.pendingAuthority.equals(newAuth.publicKey), "  transfer proposed (pending PDA set)");
+
+// A WRONG key (signer, not the pending target) cannot accept.
+const wrongAccept = await sendExpectFail(await program.methods.acceptAuthorityTransfer().accountsPartial({ newAuthority: signer.publicKey, market: imM.M, pending: pendingPda }).instruction());
+ok(wrongAccept, "Gov P-2a: a wrong key CANNOT accept the transfer");
+
+// The NEW key accepts (it co-signs; signer pays fees). Authority transfers, pending closes.
+const acceptSig = await send(await program.methods.acceptAuthorityTransfer().accountsPartial({ newAuthority: newAuth.publicKey, market: imM.M, pending: pendingPda }).instruction(), [newAuth]);
+ok(!!acceptSig, `Gov P-2a: new key ACCEPTED — authority transferred — ${String(acceptSig).slice(0, 12)}…`);
+ok((await program.account.marketAccount.fetch(imM.M)).authority.equals(newAuth.publicKey), "  market.authority == the new key");
+ok((await l1.getAccountInfo(pendingPda)) === null, "  pending PDA closed on accept");
+
 console.log(`\n${fail === 0 ? "✅ AUDIT-FIXES LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
