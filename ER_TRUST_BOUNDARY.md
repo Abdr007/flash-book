@@ -125,8 +125,10 @@ so the sequencer always has somewhere to write the reservation.
 only when the sequencer attests, which is after an order rests. A trader who
 places an ER order and withdraws before the next attestation can leave that
 order's eventual fill under-margined — bounded by the raced amount and by one
-attestation interval. Mitigation is cadence: the sequencer attests on every
-ER commit/heartbeat, so the window is seconds. This is squarely inside the
+attestation interval. Mitigation is cadence: the sequencer runs the
+attestation cranker ([sequencer/](sequencer/README.md)), which reads the
+delegated book every poll interval and attests any reservation change, so the
+window is seconds. This is squarely inside the
 already-accepted single-sequencer trust of §1 (the same operator is already
 trusted for ordering and for honest fill commitment), not an expansion of it;
 a sequencer that under-attests can cause bounded under-margining, never theft

@@ -1,0 +1,15 @@
+{
+  "name": "flash-book-attestation-cranker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Sequencer-side ER reserved-margin attestation cranker — keeps every trader's ErMarginAttestation current with the margin their live ER resting orders require.",
+  "scripts": {
+    "cranker": "node attestation_cranker.mjs",
+    "acceptance": "node cranker_acceptance.mjs"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.1",
+    "@solana/web3.js": "^1.95.0"
+  }
+}
