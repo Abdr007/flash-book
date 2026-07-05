@@ -1,27 +1,24 @@
-//! MagicBlock **Private ER (TEE) ephemeral-permission** CPI — in-house, byte-faithful.
+//! MagicBlock Private-ER (TEE) ephemeral-permission CPIs.
 //!
-//! This is the on-chain plumbing for a **private / dark-pool order book**: when a
-//! market's delegated book PDA runs on a MagicBlock *Private* Ephemeral Rollup
-//! (TEE-backed), an *ephemeral permission* account gates who may read the ER's
-//! state. Flip it private and only allow-listed members can see the book — a
-//! hidden order book competitors (CLOB_er / private_er_orderbooks) have and we do
-//! not, until now.
+//! The on-chain plumbing for a private (dark-pool) order book: when a
+//! market's delegated book PDA runs on a MagicBlock *Private* Ephemeral
+//! Rollup (TEE-backed), an *ephemeral permission* account gates who may
+//! read the ER's state. A private book is visible only to allow-listed
+//! members; public observers are denied depth, orders, and flow.
 //!
-//! ## Why hand-rolled (consistent with `er.rs`)
-//! The upstream `ephemeral-rollups-sdk` cannot be added: its transitive `bytemuck
-//! 1.25` needs `bytemuck_derive ≥1.10`, but our `pyth-solana-receiver-sdk 0.6.1`
-//! caps `bytemuck_derive ≤1.8.1` — an unresolvable conflict. `er.rs` already
-//! hand-rolls the delegation CPIs for the same class of reason (solana 2.1 pin).
-//! So we reproduce the permission program's ABI here **byte-for-byte** from the
-//! SDK source (program id, discriminators, account order/flags, and the bespoke
-//! non-borsh `EphemeralMembersArgs` serialization), and host-test every byte.
+//! The permission program's ABI (program id, discriminators, account
+//! order/flags, and the bespoke non-borsh `EphemeralMembersArgs`
+//! serialization) is implemented directly and every assembled byte is
+//! host-tested below — the CPIs are issued with `invoke_signed`, not
+//! through SDK crates (whose dependency requirements conflict with this
+//! program's solana 2.1 / bytemuck_derive pin).
 //!
-//! ## Validation boundary (honest)
-//! Byte-correctness of the assembled CPIs is fully unit-tested below. The actual
-//! TEE privacy *enforcement* is only observable against a live MagicBlock Private
-//! ER (same limitation as every reference implementation). These instructions are
-//! additive and authority-gated — no matching/risk/settlement path calls them, so
-//! they cannot affect the core program.
+//! ## Validation boundary
+//! Byte-correctness of the assembled CPIs is fully unit-tested below. The
+//! TEE privacy *enforcement* itself is only observable against a live
+//! MagicBlock Private ER. These instructions are additive and
+//! authority-gated — no matching/risk/settlement path calls them, so they
+//! cannot affect the core program.
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
@@ -37,16 +34,15 @@ pub const MAGIC_PROGRAM_ID: Pubkey = pubkey!("Magic11111111111111111111111111111
 pub const EPHEMERAL_VAULT_ID: Pubkey = pubkey!("MagicVau1t999999999999999999999999999999999");
 
 /// PDA seed for the permission account: `[PERMISSION_SEED, permissioned_account]`
-/// under `PERMISSION_PROGRAM_ID`. (Note the trailing colon — matches the SDK.)
+/// under `PERMISSION_PROGRAM_ID`. The trailing colon is part of the seed.
 pub const PERMISSION_SEED: &[u8] = b"permission:";
 
-// Instruction discriminators (u64 LE) of the permission program — verbatim from
-// the SDK's `access_control::instructions`.
+// Instruction discriminators (u64 LE) of the permission program.
 const CREATE_EPHEMERAL_PERMISSION_DISCRIMINATOR: u64 = 6;
 const UPDATE_EPHEMERAL_PERMISSION_DISCRIMINATOR: u64 = 7;
 const CLOSE_EPHEMERAL_PERMISSION_DISCRIMINATOR: u64 = 8;
 
-// Member capability flags (verbatim from the SDK).
+// Member capability flags of the permission program.
 /// Member has authority privileges.
 pub const AUTHORITY_FLAG: u8 = 1 << 0;
 /// Member can see transaction logs.
@@ -129,7 +125,9 @@ fn require_permission_program(a: &PermissionCpiAccounts) -> Result<()> {
 
 /// Build the CREATE instruction data + account metas (pure — host-testable).
 fn create_ix(a: &PermissionCpiAccounts, args: &EphemeralMembersArgs) -> Instruction {
-    let mut data = CREATE_EPHEMERAL_PERMISSION_DISCRIMINATOR.to_le_bytes().to_vec();
+    let mut data = CREATE_EPHEMERAL_PERMISSION_DISCRIMINATOR
+        .to_le_bytes()
+        .to_vec();
     data.extend_from_slice(&args.to_vec());
     Instruction {
         program_id: PERMISSION_PROGRAM_ID,
@@ -160,16 +158,24 @@ fn update_metas(a: &PermissionCpiAccounts) -> Vec<AccountMeta> {
 }
 
 fn update_ix(a: &PermissionCpiAccounts, args: &EphemeralMembersArgs) -> Instruction {
-    let mut data = UPDATE_EPHEMERAL_PERMISSION_DISCRIMINATOR.to_le_bytes().to_vec();
+    let mut data = UPDATE_EPHEMERAL_PERMISSION_DISCRIMINATOR
+        .to_le_bytes()
+        .to_vec();
     data.extend_from_slice(&args.to_vec());
-    Instruction { program_id: PERMISSION_PROGRAM_ID, accounts: update_metas(a), data }
+    Instruction {
+        program_id: PERMISSION_PROGRAM_ID,
+        accounts: update_metas(a),
+        data,
+    }
 }
 
 fn close_ix(a: &PermissionCpiAccounts) -> Instruction {
     Instruction {
         program_id: PERMISSION_PROGRAM_ID,
         accounts: update_metas(a),
-        data: CLOSE_EPHEMERAL_PERMISSION_DISCRIMINATOR.to_le_bytes().to_vec(),
+        data: CLOSE_EPHEMERAL_PERMISSION_DISCRIMINATOR
+            .to_le_bytes()
+            .to_vec(),
     }
 }
 
@@ -225,15 +231,24 @@ mod tests {
             PERMISSION_PROGRAM_ID.to_string(),
             "ACLseoPoyC3cBqoUtkbjZ4aDrkurZW86v19pXz2XQnp1"
         );
-        assert_eq!(MAGIC_PROGRAM_ID.to_string(), "Magic11111111111111111111111111111111111111");
-        assert_eq!(EPHEMERAL_VAULT_ID.to_string(), "MagicVau1t999999999999999999999999999999999");
+        assert_eq!(
+            MAGIC_PROGRAM_ID.to_string(),
+            "Magic11111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            EPHEMERAL_VAULT_ID.to_string(),
+            "MagicVau1t999999999999999999999999999999999"
+        );
         assert_eq!(PERMISSION_SEED, b"permission:");
     }
 
     #[test]
     fn members_args_serialization_is_byte_exact() {
         // Public, no members → single 0 byte.
-        let pub_args = EphemeralMembersArgs { is_private: false, members: vec![] };
+        let pub_args = EphemeralMembersArgs {
+            is_private: false,
+            members: vec![],
+        };
         assert_eq!(pub_args.to_vec(), vec![0u8]);
         assert_eq!(EphemeralMembersArgs::required_bytes(0), 1);
 
@@ -241,7 +256,10 @@ mod tests {
         let pk = Pubkey::new_from_array([7u8; 32]);
         let priv_args = EphemeralMembersArgs {
             is_private: true,
-            members: vec![Member { flags: MEMBER_READ_FLAGS, pubkey: pk }],
+            members: vec![Member {
+                flags: MEMBER_READ_FLAGS,
+                pubkey: pk,
+            }],
         };
         let bytes = priv_args.to_vec();
         assert_eq!(bytes.len(), EphemeralMembersArgs::required_bytes(1));
@@ -259,8 +277,14 @@ mod tests {
         let args = EphemeralMembersArgs {
             is_private: true,
             members: vec![
-                Member { flags: AUTHORITY_FLAG | MEMBER_READ_FLAGS, pubkey: a },
-                Member { flags: TX_BALANCES_FLAG, pubkey: b },
+                Member {
+                    flags: AUTHORITY_FLAG | MEMBER_READ_FLAGS,
+                    pubkey: a,
+                },
+                Member {
+                    flags: TX_BALANCES_FLAG,
+                    pubkey: b,
+                },
             ],
         };
         let bytes = args.to_vec();
@@ -294,7 +318,10 @@ mod tests {
         let args = EphemeralMembersArgs {
             is_private: n_members > 0,
             members: (0..n_members)
-                .map(|i| Member { flags: MEMBER_READ_FLAGS, pubkey: Pubkey::new_from_array([20 + i as u8; 32]) })
+                .map(|i| Member {
+                    flags: MEMBER_READ_FLAGS,
+                    pubkey: Pubkey::new_from_array([20 + i as u8; 32]),
+                })
                 .collect(),
         };
         let (metas, data): (Vec<AccountMeta>, Vec<u8>) = if disc == 6 {
@@ -328,7 +355,10 @@ mod tests {
             )
         };
         (
-            metas.into_iter().map(|m| (m.pubkey, m.is_signer, m.is_writable)).collect(),
+            metas
+                .into_iter()
+                .map(|m| (m.pubkey, m.is_signer, m.is_writable))
+                .collect(),
             data,
         )
     }
@@ -359,6 +389,10 @@ mod tests {
 
         let (cmetas, cdata) = metas_for(8, 0);
         assert_eq!(cmetas.len(), 6);
-        assert_eq!(cdata, 8u64.to_le_bytes().to_vec(), "close carries NO args, disc only");
+        assert_eq!(
+            cdata,
+            8u64.to_le_bytes().to_vec(),
+            "close carries NO args, disc only"
+        );
     }
 }

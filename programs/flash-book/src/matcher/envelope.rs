@@ -1,4 +1,4 @@
-//! Per-slot price/funding envelope proof (Wave 26 scaffold).
+//! Per-slot price/funding envelope proof.
 //!
 //! Turns "crank often enough" from an operator preference into a hard
 //! solvency boundary. At market init, the parameter set must satisfy:
@@ -18,8 +18,6 @@
 //! Bad-parameter markets cannot instantiate. Once a market exists, the
 //! cap is enforced at every K/F advance via `gate_price_move`.
 //!
-//! Reference: Percolator `spec.md` v12.20.6 §1.4. Adapted to flash-book
-//! lot conventions.
 
 use crate::constants::BPS_DENOM;
 use crate::matcher::side_accrual::FUNDING_DEN;
@@ -34,7 +32,7 @@ pub const MAX_ACCOUNT_NOTIONAL_LOTS: u128 = 1_000_000_000_000_000;
 /// rejected at init — even the wildest crypto move (e.g. LUNA going to
 /// zero) fits within ~500 bps/slot at 400ms slots.
 ///
-/// AUDIT M-14 (2026-07): tightened 2_000 → 1_000 bps (10%/slot). The mark is a
+/// 1_000 bps (10%/slot). The mark is a
 /// trust surface the (semi-trusted) sequencer influences within this band, so
 /// the backstop is pulled toward the realistic ceiling while keeping 2× headroom
 /// over the ~500 bps/slot wildest-legit-move — it still admits any real move but
@@ -52,8 +50,7 @@ pub const ABS_MAX_PRICE_MOVE_BPS_PER_SLOT: u32 = 1_000;
 pub const ABS_MAX_ACCRUAL_DT_SLOTS: u64 = 10_000;
 
 /// Hard cap on `max_abs_funding_e9_per_slot`. 10_000 (≈ 1e-5 per slot)
-/// at 400ms/slot = 2.16% per day saturating. Mirrors Percolator's
-/// `GLOBAL_MAX_ABS_FUNDING_E9_PER_SLOT`.
+/// at 400ms/slot = 2.16% per day saturating.
 pub const ABS_MAX_FUNDING_E9_PER_SLOT: i64 = 10_000;
 
 /// Per-market envelope parameters. All five are set at init and
@@ -84,14 +81,13 @@ impl Default for EnvelopeParams {
         //   price_budget = price_cap × dt = 14 bps × 100 = 1400 bps = 14%
         //   maintenance  = 3000 bps = 30%
         //   ratio = 0.467 + fee_term ≈ 0.473 ≤ 1.0 ✓
-        // Matches flash-book's existing v3 `max_price_move_bps_per_slot=14`
-        // (from V3 doc) and Percolator's `maintenance_margin_bps=3000` test
-        // default. Per-market override at init.
+        // Matches the v3 default `max_price_move_bps_per_slot=14`.
+        // Per-market override at init.
         Self {
             max_price_move_bps_per_slot: 14, // 0.14% per slot ≈ 0.35%/sec
             max_accrual_dt_slots: 100,       // ~40s at 400ms
             max_abs_funding_e9_per_slot: 10_000,
-            maintenance_bps: 3_000, // 30% MMR (Percolator parity)
+            maintenance_bps: 3_000,  // 30% MMR default
             liquidation_fee_bps: 50, // 0.5%
             min_liquidation_abs_lots: 1,
             min_nonzero_mm_req_lots: 100,
@@ -129,7 +125,7 @@ pub fn prove_envelope(params: &EnvelopeParams) -> Result<(), EnvelopeError> {
         return Err(EnvelopeError::LiqFeeTooLarge);
     }
 
-    // 2. Closed-form envelope check (Percolator spec §1.4 adapted).
+    // 2. Closed-form envelope check.
     //
     //    price_budget_bps = max_price_move_bps × dt
     //    fund_budget_num  = |max_funding_e9| × dt × BPS_DENOM
@@ -168,7 +164,9 @@ pub fn prove_envelope(params: &EnvelopeParams) -> Result<(), EnvelopeError> {
         .ok_or(EnvelopeError::Overflow)?
         .checked_add(fund_budget_num)
         .ok_or(EnvelopeError::Overflow)?;
-    let loss_budget_den = (BPS_DENOM as u128).checked_mul(FUNDING_DEN).ok_or(EnvelopeError::Overflow)?;
+    let loss_budget_den = (BPS_DENOM as u128)
+        .checked_mul(FUNDING_DEN)
+        .ok_or(EnvelopeError::Overflow)?;
 
     let breakpoint_n = breakpoint_notional(params);
     let probes: [u128; 3] = [1, breakpoint_n, MAX_ACCOUNT_NOTIONAL_LOTS];
@@ -178,7 +176,8 @@ pub fn prove_envelope(params: &EnvelopeParams) -> Result<(), EnvelopeError> {
             continue;
         }
         let price_funding_loss = ceil_div(
-            n.checked_mul(loss_budget_num).ok_or(EnvelopeError::Overflow)?,
+            n.checked_mul(loss_budget_num)
+                .ok_or(EnvelopeError::Overflow)?,
             loss_budget_den,
         );
         let worst_liq_notional = ceil_div(
@@ -199,9 +198,13 @@ pub fn prove_envelope(params: &EnvelopeParams) -> Result<(), EnvelopeError> {
             / (BPS_DENOM as u128);
         let mm_req = mm_floor.max(params.min_nonzero_mm_req_lots as u128);
 
-        // AUDIT (re-audit, Arith INFO): checked_add for consistency with the rest
+        // checked_add for consistency with the rest
         // of the module (unreachable with realistic params, but no raw u128 +).
-        if price_funding_loss.checked_add(liq_fee).ok_or(EnvelopeError::Overflow)? > mm_req {
+        if price_funding_loss
+            .checked_add(liq_fee)
+            .ok_or(EnvelopeError::Overflow)?
+            > mm_req
+        {
             return Err(EnvelopeError::EnvelopeViolated {
                 n,
                 loss: price_funding_loss,
@@ -233,11 +236,7 @@ pub fn gate_price_move(
     if dt_slots == 0 {
         return Err(EnvelopeError::SameSlotMove);
     }
-    let abs_delta = if p_new >= p_last {
-        p_new - p_last
-    } else {
-        p_last - p_new
-    };
+    let abs_delta = p_new.abs_diff(p_last);
     // |Δp| × BPS_DENOM ≤ cap × dt × p_last
     let lhs = (abs_delta as u128)
         .checked_mul(BPS_DENOM as u128)
@@ -262,8 +261,7 @@ fn breakpoint_notional(params: &EnvelopeParams) -> u128 {
     if params.maintenance_bps == 0 {
         return 0;
     }
-    (params.min_nonzero_mm_req_lots as u128)
-        .saturating_mul(BPS_DENOM as u128)
+    (params.min_nonzero_mm_req_lots as u128).saturating_mul(BPS_DENOM as u128)
         / (params.maintenance_bps as u128)
 }
 
@@ -343,8 +341,10 @@ mod tests {
             ..Default::default()
         };
         let res = prove_envelope(&p);
-        assert!(matches!(res, Err(EnvelopeError::EnvelopeViolated { .. })),
-            "expected envelope violation, got {res:?}");
+        assert!(
+            matches!(res, Err(EnvelopeError::EnvelopeViolated { .. })),
+            "expected envelope violation, got {res:?}"
+        );
     }
 
     #[test]

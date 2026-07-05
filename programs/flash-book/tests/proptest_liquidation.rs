@@ -2,14 +2,11 @@
 
 use anchor_lang::prelude::Pubkey;
 use flash_book::matcher::liquidation::{
-    compute_shortfall, detect_liquidations, generate_liquidation_orders,
-    LiquidationCandidate,
+    compute_shortfall, detect_liquidations, generate_liquidation_orders, LiquidationCandidate,
 };
 use flash_book::matcher::lot::Ticks;
 use flash_book::matcher::order::{OrderType, Side};
-use flash_book::matcher::risk::{
-    default_scenarios, MarketSnapshot, PositionSnapshot,
-};
+use flash_book::matcher::risk::{default_scenarios, MarketSnapshot, PositionSnapshot};
 use proptest::prelude::*;
 
 const MARKET_PK_BYTES: [u8; 32] = [42u8; 32];

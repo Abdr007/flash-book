@@ -129,28 +129,48 @@ on-chain assessment is bounded compute.
 
 Given `𝒫`, `B`, scenarios `𝒮`:
 
+Required margin is decomposed **per market**, not as a single
+max-over-scenarios of the summed loss. For each market it takes the worst
+of that market's own scenario losses (positions on the same market still
+net against each other under a shared shock — the hedge property), then
+sums the per-market worst cases. This equals the perfectly-decorrelated
+adverse scenario, so it is always ≥ the summed-then-maxed figure and can
+never grant a cross-market offset (e.g. long A + short B cannot cancel
+under a uniform shock while "A crashes and B rallies" goes unpriced). For
+a single-market portfolio it is identical to the naive computation.
+
 ```
-equity = equity(𝒫, B)                              (signed i128)
+for each market m:
+    worst_m = max_{σ ∈ 𝒮}  Σ_{p on m}  contrib_p(σ)
+    where:
+      stressed_p(σ) = mark_m · (1 + shock_σ_m / BPS)
+      contrib_p(σ)  = mm_p(σ) − upnl(P_p, stressed_p(σ))
+      mm_p(σ)       = size_p · stressed_p(σ) · tick_m
+                      · effective_mmr_bps(size_p, m) / BPS
 
-required = max_{σ ∈ 𝒮}  Σ_m∈𝒫  loss_m(σ) + mm_m(σ)
-   where:
-     stressed_m(σ)   = mark_m · (1 + shock_σ_m / BPS)
-     loss_m(σ)       = − upnl(P_m, stressed_m(σ))     (≥ 0 when adverse)
-     mm_m(σ)         = size_m · stressed_m(σ) · tick_m
-                       · mmr_concentration(size_m, m) / BPS
+required = Σ_m max(worst_m, 0)      (a market whose worst case is a net
+                                     gain contributes 0, never an offset)
 
-is_healthy = equity ≥ required
+available = collateral − funding_owed          (signed i128)
+is_healthy = available ≥ required
 ```
 
-Saturating arithmetic at each step: `required` clamps to `u64::MAX`
-on overflow; `equity` clamps to `i128` boundaries.
+The health gate compares **available collateral** (`collateral −
+funding`) against `required`, NOT equity-with-mark-PnL. Each scenario's
+`contrib` already accounts for unrealized PnL once (at the stressed
+price), so comparing against equity — which re-adds unrealized PnL at the
+mark — would double-count it. `equity` is retained only as the reported
+UI figure.
+
+Saturating arithmetic at each step: `required` clamps to `u64::MAX` on
+overflow.
 
 The function returns `MarginAssessment { required, equity, is_healthy,
-worst_scenario_idx }`. `worst_scenario_idx` is the index of `σ` that
-produced the maximal `required` — surfaces to keepers for "which
-scenario tipped this position" diagnostics.
+worst_scenario_idx }`. `worst_scenario_idx` is the scenario that drove the
+single largest per-market loss — a keeper diagnostic for "which scenario
+tipped this position."
 
-Implementation: `risk.rs::assess_margin` lines 241–336.
+Implementation: `risk.rs::assess_margin`.
 
 ---
 
@@ -559,7 +579,7 @@ refunds rent to the trader. The new account is `init` (not
 `init_if_needed`) so a second migration attempt against an existing
 new position fails — protects against accidental double-migration.
 
-`docs/SUB_ACCOUNT_TRADING.md` covers the architectural rationale and
+`docs/ARCHITECTURE.md` covers the architectural rationale and
 the remaining Phase 2d/2e work (RestingOrderV2 schema + matcher fill
 routing) required for sub-accounts to PLACE orders rather than just
 hold collateral.

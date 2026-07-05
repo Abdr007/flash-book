@@ -1,12 +1,11 @@
-//! Sequencer committee — M-14 decentralization primitive (Phase 1 scaffold).
+//! Sequencer committee — decentralized-sequencer primitive.
 //!
 //! Pure membership + BFT-quorum logic for the on-chain `SequencerCommittee`
-//! (`state_v3`). Phase 1 lands the data structure + governance + this verified
-//! logic; generalizing settlement authorization to the committee (the
-//! threshold-attested `settle_batch` path) is a later phase — see
-//! `docs/DECENTRALIZED_SEQUENCER.md`. Kept pure so the quorum math is Kani-proven
-//! independent of account plumbing, and so it can't perturb the settlement path
-//! while it is only scaffolding.
+//! (`state_v3`). The committee attests batch state transitions
+//! (`commit_batch`); fill settlement authorization (`apply_fill`) remains
+//! bound to the market's single settlement signer. Kept pure so the quorum
+//! math is Kani-proven independent of account plumbing and cannot perturb
+//! the settlement path.
 
 use anchor_lang::prelude::Pubkey;
 
@@ -114,7 +113,7 @@ pub fn is_equivocation(
 
 #[cfg(kani)]
 mod proofs {
-    use super::{is_equivocation, is_jailed, jail_slot, is_valid_bft_config};
+    use super::{is_equivocation, is_jailed, is_valid_bft_config, jail_slot};
 
     /// Jailing is a monotone idempotent set: after `jail_slot`, the slot reads
     /// jailed, and re-jailing changes nothing. ∀ (mask, slot < 64).
@@ -207,7 +206,7 @@ mod tests {
         assert!(!attestation_meets_threshold(&vals, 4, 3, &[a, b, a])); // duplicate attestor
         assert!(!attestation_meets_threshold(&vals, 4, 3, &[a, b, outsider])); // non-member
         assert!(!attestation_meets_threshold(&vals, 4, 0, &[a, b, c])); // threshold 0
-        // N=1, threshold=1 — the backward-compatible single-sequencer quorum.
+                                                                        // N=1, threshold=1 — the backward-compatible single-sequencer quorum.
         assert!(attestation_meets_threshold(&[a], 1, 1, &[a]));
         assert!(!attestation_meets_threshold(&[a], 1, 1, &[b])); // not the member
     }

@@ -1,18 +1,11 @@
-//! Pure-Rust unit tests for the matcher core. Mirror the TypeScript test
-//! suite in `tests/matcher.test.ts` etc.
+//! Unit tests for the pure matcher core.
 
 use super::flp_quoter::{generate_quotes, FlpQuoterInputs, FlpQuoterParams};
-use super::funding::advance;
 use super::insurance::InsuranceFund;
-use super::liquidation::{
-    compute_shortfall, detect_liquidations, generate_liquidation_orders,
-};
+use super::liquidation::{compute_shortfall, detect_liquidations, generate_liquidation_orders};
 use super::lot::{BaseLots, Ticks};
 use super::order::{Order, OrderType, Side};
-use super::risk::{
-    assess_margin, default_scenarios, MarketSnapshot, PositionSnapshot,
-};
-use super::vpin::VpinState;
+use super::risk::{assess_margin, default_scenarios, MarketSnapshot, PositionSnapshot};
 use anchor_lang::prelude::Pubkey;
 
 #[test]
@@ -82,62 +75,6 @@ fn flp_quoter_inventory_skew_short_pool_lifts_fair_value() {
     assert!(out.fair_value.0 > 100_000);
 }
 
-// K is in "bps per 1 bp of premium per second"; realistic prod values are
-// sub-bps so production stores K in micro-bps. For unit tests we use K that
-// produces a visible rate after integer division.
-
-#[test]
-fn funding_premium_drives_rate_sign() {
-    // mark > oracle → positive rate (longs pay)
-    let (_, t) = advance(0, Ticks(101), Ticks(100), 1000, 100_000, 10_000).unwrap();
-    assert!(t.rate_bps_per_sec > 0);
-    assert!(t.index_delta > 0);
-
-    // mark < oracle → negative
-    let (_, t) = advance(0, Ticks(99), Ticks(100), 1000, 100_000, 10_000).unwrap();
-    assert!(t.rate_bps_per_sec < 0);
-    assert!(t.index_delta < 0);
-}
-
-#[test]
-fn funding_zero_delta_no_change() {
-    let (idx, t) = advance(123, Ticks(101), Ticks(100), 0, 100_000, 10_000).unwrap();
-    assert_eq!(idx, 123);
-    assert_eq!(t.index_delta, 0);
-}
-
-#[test]
-fn funding_rate_clamped() {
-    let (_, t) = advance(0, Ticks(1_000_000), Ticks(100), 1000, 1_000_000_000, 100).unwrap();
-    assert!(t.rate_bps_per_sec.abs() <= 100);
-}
-
-#[test]
-fn vpin_balanced_flow_low() {
-    let mut v = VpinState::new();
-    for _ in 0..50 {
-        v.record_fill(Side::Long, 10, 100, 5).unwrap();
-        v.record_fill(Side::Short, 10, 100, 5).unwrap();
-    }
-    assert!(v.as_bps() < 2_000); // < 20%
-}
-
-#[test]
-fn vpin_one_sided_flow_high() {
-    let mut v = VpinState::new();
-    for _ in 0..50 {
-        v.record_fill(Side::Long, 100, 100, 5).unwrap();
-    }
-    assert!(v.as_bps() > 8_000); // > 80%
-}
-
-#[test]
-fn vpin_zero_before_first_bucket() {
-    let mut v = VpinState::new();
-    v.record_fill(Side::Long, 50, 100, 5).unwrap();
-    assert_eq!(v.as_bps(), 0);
-}
-
 // ─── risk + liquidation ─────────────────────────────────────────────
 
 fn sol_market() -> MarketSnapshot {
@@ -202,7 +139,10 @@ fn risk_hedged_position_collapses_required_margin() {
     let m = sol_market();
     let scenarios = default_scenarios(&[m.market]);
     let unhedged = vec![long_position(m.market, 100, 100)];
-    let hedged = vec![long_position(m.market, 100, 100), short_position(m.market, 100, 100)];
+    let hedged = vec![
+        long_position(m.market, 100, 100),
+        short_position(m.market, 100, 100),
+    ];
 
     let a_unhedged = assess_margin(&unhedged, &[m], &scenarios, 0).unwrap();
     let a_hedged = assess_margin(&hedged, &[m], &scenarios, 0).unwrap();

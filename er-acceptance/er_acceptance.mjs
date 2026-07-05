@@ -43,6 +43,38 @@ const ER_VALIDATOR = new PublicKey(process.env.ER_VALIDATOR || "MAS1Dt9qreoRMQ14
 const MAGIC_PROGRAM = new PublicKey("Magic11111111111111111111111111111111111111");
 const MAGIC_CONTEXT = new PublicKey("MagicContext1111111111111111111111111111111");
 const sys = SystemProgram.programId;
+const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const ATA_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+// Associated token account for `owner`/`mint`.
+const ata = (owner, mint) =>
+  PublicKey.findProgramAddressSync([owner.toBuffer(), TOKEN_PROGRAM.toBuffer(), mint.toBuffer()], ATA_PROGRAM)[0];
+// CreateIdempotent (discriminator 1) — no-op if the ATA already exists.
+const createAtaIx = (payer, owner, mint) => new anchor.web3.TransactionInstruction({
+  programId: ATA_PROGRAM,
+  keys: [
+    { pubkey: payer, isSigner: true, isWritable: true },
+    { pubkey: ata(owner, mint), isSigner: false, isWritable: true },
+    { pubkey: owner, isSigner: false, isWritable: false },
+    { pubkey: mint, isSigner: false, isWritable: false },
+    { pubkey: sys, isSigner: false, isWritable: false },
+    { pubkey: TOKEN_PROGRAM, isSigner: false, isWritable: false },
+  ],
+  data: Buffer.from([1]),
+});
+// SPL Token Transfer (instruction 3, amount u64 LE).
+const transferIx = (from, to, authority, amount) => {
+  const d = Buffer.alloc(9); d.writeUInt8(3, 0); d.writeBigUInt64LE(BigInt(amount), 1);
+  return new anchor.web3.TransactionInstruction({
+    programId: TOKEN_PROGRAM,
+    keys: [
+      { pubkey: from, isSigner: false, isWritable: true },
+      { pubkey: to, isSigner: false, isWritable: true },
+      { pubkey: authority, isSigner: true, isWritable: false },
+    ],
+    data: d,
+  });
+};
+const traderStatePda = (trader) => pda(["trader_state", trader]);
 // devnet market reference (params + vault/oracle to clone), per the replay infra.
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
 const QUOTE = new PublicKey("CJKxS7WBFaEoZkEBxd8kgWPtVShvTAfZswx4oFwGtQL3");
@@ -73,7 +105,7 @@ async function stage(name, fn) {
   catch (e) { stages.push({ name, ok: false, err: String(e.message || e).slice(0, 160) }); console.log(`  ✗ ${name}: ${String(e.message || e).slice(0, 160)}`); throw e; }
 }
 
-// outbox account decode (raw layout — see SEQUENCER_OUTBOX_CUTOVER.md §2b)
+// outbox account decode (raw layout — see docs/SETTLEMENT.md §4)
 function decodeOutbox(data) {
   return { produced: Number(data.readBigUInt64LE(8)), settled: Number(data.readBigUInt64LE(16)), cap: data.readUInt32LE(24) };
 }
@@ -90,11 +122,17 @@ console.log("market", M.toBase58());
 // FULL outbox (10,144 B) one-CPI delegate-safe (< 10,240 B), so the entire off-log
 // pipeline — book + §3.2 ring + fill-outbox — delegates to the ER. (At cap 256 the
 // outbox can't be ER-delegated; that's the L1 deep-sweep config. See
-// FILL_OUTBOX_DESIGN.md §10.) This round-trip therefore covers the FULL ER pipeline.
+// docs/SETTLEMENT.md §2.) This round-trip therefore covers the FULL ER pipeline.
 const CAP = 105;
 
 try {
   const ref = await program.account.marketAccount.fetch(REF_MARKET);
+  // The reference market predates the init-time oracle-staleness bound; clone
+  // its params but supply a positive staleness window so initializeMarket's
+  // validation accepts them.
+  if (!ref.params.oracleStalenessMaxSeconds || ref.params.oracleStalenessMaxSeconds === 0) {
+    ref.params.oracleStalenessMaxSeconds = 60;
+  }
 
   // ── L1: build a fresh cap-105 market (book + ring + FULL outbox, no grow) ──
   await stage(`L1 init_market + book + ring + outbox (cap ${CAP}, ER-capable)`, async () => {
@@ -133,15 +171,38 @@ try {
   // claims them; the ER match must transact against THAT validator (or the MagicBlock
   // router), else it returns InvalidWritableAccount. Pin the validator identity in the
   // delegate calls, or route through the MagicBlock router, for a deterministic green.
+  // Maker (signer) and taker (fresh keypair) are distinct traders — a self-cross
+  // is skipped by self-trade prevention, so a real fill needs two parties. Both
+  // open a trader-state on L1 and deposit collateral to back the position each
+  // opens; the ER reads these non-delegated accounts as L1 clones during matching.
   const taker = Keypair.generate();
+  const makerTS = traderStatePda(signer.publicKey);
+  const takerTS = traderStatePda(taker.publicKey);
+  const makerAta = ata(signer.publicKey, QUOTE);
+  const takerAta = ata(taker.publicKey, QUOTE);
+  const DEPOSIT = 5_000_000_000; // 5,000 quote-lots — ample initial margin
+  await stage("L1 fund maker + taker trader-states (open + deposit)", async () => {
+    await send(l1, SystemProgram.transfer({ fromPubkey: signer.publicKey, toPubkey: taker.publicKey, lamports: 50_000_000 }), []);
+    // Fund the taker's quote ATA from the signer.
+    await send(l1, [createAtaIx(signer.publicKey, taker.publicKey, QUOTE), transferIx(makerAta, takerAta, signer.publicKey, DEPOSIT)], []);
+    // Open both trader-states (each trader pays its own rent). The maker's
+    // state may persist from a prior run — open only when absent.
+    if (!(await l1.getAccountInfo(makerTS)))
+      await send(l1, await program.methods.openTraderState().accountsPartial({ trader: signer.publicKey, traderState: makerTS, systemProgram: sys }).instruction(), []);
+    await send(l1, await program.methods.openTraderState().accountsPartial({ trader: taker.publicKey, traderState: takerTS, systemProgram: sys }).instruction(), [taker]);
+    // Deposit collateral for both.
+    const dep = (trader, traderState, tAta, extra) => program.methods.depositCollateral(new BN(DEPOSIT)).accountsPartial({ trader, traderState, insuranceFund: INS, quoteMint: QUOTE, traderQuoteAta: tAta, quoteVault: VAULT, tokenProgram: TOKEN_PROGRAM }).instruction();
+    await send(l1, await dep(signer.publicKey, makerTS, makerAta), []);
+    await send(l1, await dep(taker.publicKey, takerTS, takerAta), [taker]);
+  });
+  await sleep(2000);
   await stage("ER rest bids + taker sweep (4 fills; commitments + outbox on the ER)", async () => {
-    await send(l1, SystemProgram.transfer({ fromPubkey: signer.publicKey, toPubkey: taker.publicKey, lamports: 30_000_000 }), []);
     for (let i = 0; i < 4; i++) {
       const tick = 90000 - i * 10;
-      await send(er, await program.methods.placeLimitOrderV2(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK }).instruction(), []);
+      await send(er, await program.methods.placeLimitOrderV2(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: makerTS, position: null }).instruction(), []);
     }
     await send(er, await program.methods.placeTakerOrderV2(1, new BN(4), new BN(1), 0, new BN(0), 0)
-      .accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK })
+      .accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: takerTS, position: null })
       .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
   });
 

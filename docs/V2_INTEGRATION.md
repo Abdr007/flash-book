@@ -1,4 +1,4 @@
-# flash-book ↔ Flash V2 — integration design (make the CLOB drop-in)
+# Flash Book ↔ Flash V2 — integration design
 
 > Goal: the **best orderbook**, designed so **Flash V2 integrates it with minimal work**.
 > Grounded in the real V2 surface (`github.com/flash-trade/examples-v2`,
@@ -62,8 +62,8 @@ skew). Takers cross the **better of** the pool quote or an external MM's tighter
 3. **Have the FLP pool quote on the book** (wire `generate_quotes()` → resting FLP orders).
 
 That's it. The hard parts — the CLOB engine, sub-50ms ER matching, fill authenticity,
-permissionless keeper, the security audit, the FLP quoter math — are **already built and
-proven** here (26 PRs, live-ER verified). Integration is API wiring + the position adapter +
+the permissionless keeper, the FLP quoter math — are already built, machine-proven, and
+validated on the live devnet ER. Integration is API wiring + the position adapter +
 turning the pool into an on-book MM.
 
 ## Why this is "the best orderbook" for Flash specifically

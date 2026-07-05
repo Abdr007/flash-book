@@ -94,7 +94,11 @@ proptest! {
 
 fn liquidation_reward(notional: u128, reward_bps: u32, collateral: u64) -> u64 {
     let reward = notional.saturating_mul(reward_bps as u128) / BPS_DENOM;
-    let reward_u64 = if reward > u64::MAX as u128 { u64::MAX } else { reward as u64 };
+    let reward_u64 = if reward > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        reward as u64
+    };
     reward_u64.min(collateral)
 }
 
@@ -146,7 +150,11 @@ fn toxicity_tax_split(
         .saturating_mul(vpin_bps as u128)
         / BPS_DENOM
         / BPS_DENOM;
-    let tax_uncapped: u64 = if tax_u128 > u64::MAX as u128 { u64::MAX } else { tax_u128 as u64 };
+    let tax_uncapped: u64 = if tax_u128 > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        tax_u128 as u64
+    };
     let tax = tax_uncapped.min(taker_collateral);
     let to_insurance =
         ((tax as u128).saturating_mul(tox_contribution_bps as u128) / BPS_DENOM) as u64;
@@ -185,12 +193,7 @@ proptest! {
 //   accept iff position.size > 0 AND order.side != position.side
 //            AND order.size <= position.size
 
-fn reduce_only_check(
-    pos_size: u64,
-    pos_side: u8,
-    order_size: u64,
-    order_side: u8,
-) -> bool {
+fn reduce_only_check(pos_size: u64, pos_side: u8, order_size: u64, order_side: u8) -> bool {
     pos_size > 0 && pos_side != order_side && order_size <= pos_size
 }
 
@@ -260,7 +263,7 @@ proptest! {
     }
 }
 
-// ─── Symmetric-OI funding dampener (wave 13) ─────────────────────────
+// ─── Symmetric-OI funding dampener ───────────────────────────────────
 //
 // Mirrors the run_batch dampener:
 //   skew_bps = |oi_long - oi_short| × 10_000 / (oi_long + oi_short)
@@ -348,7 +351,7 @@ proptest! {
     }
 }
 
-// ─── Concentration margin tier (wave 12) ─────────────────────────────
+// ─── Concentration margin tier ───────────────────────────────────────
 //
 // Mirrors MarketSnapshot::effective_mmr_bps:
 //   if size >= threshold > 0 → base + extra (saturating_add)

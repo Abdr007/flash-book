@@ -1,300 +1,242 @@
 # Architecture
 
-## Mapping to Flash V2
-
-Flash Book is **not a replacement** for Flash V2. It is a matcher layer that
-sits on top of Flash V2's existing FLP pool program and settles back into
-Flash V2 position accounts. Every architectural abstraction in this repo
-maps directly to a Flash V2 primitive:
-
-| Flash Book concept | Flash V2 primitive | Notes |
-|---|---|---|
-| `MarketState` | `Custody` + market PDA in `PoolConfig` | One per pool market (`SOL`, `BTC`, `ETH`, ...). |
-| `FlpState` | FLP pool token vault + custody accounts | Read on every batch; never written directly by the matcher. |
-| `Position` | Flash V2 `Position` PDA | `side`, `size`, `collateral`, `entryPrice` align 1:1. |
-| Trader collateral | Flash V2 collateral custody | USD_DECIMALS = 6 throughout. |
-| FLP virtual quoter | Synthesizes orders that *would* be filled by the FLP pool | Pool program is unmodified; matcher reads pool state and quotes against it. |
-| Insurance fund | New PDA owned by Flash Book program | Funded from fees, toxicity tax, liq penalty. |
-| Engine batch tick | One ER block | 50 ms cadence, 5 ER blocks per batch. |
-| Settlement to L1 | Flash V2 `Position` account writes | Every K batches (default 600 ≈ 6 s). |
-
-The integration uses Flash V2's existing `@flash_trade/magic-trade-client`
-session-signer pattern (`createSession` / `useSession` / `revokeSession`).
-Traders sign once on session start; subsequent batches require no biometric
-re-prompt.
-
-## System diagram
+Flash Book is an on-chain central limit order book (CLOB) perpetual-futures
+engine for Solana. Matching runs at rollup speed on a MagicBlock Ephemeral
+Rollup (ER); custody, risk, and settlement live on the base layer (L1). The
+program surface is 146 instructions, 137 events, and 109 error codes
+(`idl/flash_book.json` is the source of truth).
 
 ```
-        ┌──────────── Solana mainnet ────────────┐
-        │                                        │
-        │   Flash V2 program  ◄──── settlement ──┤
-        │   ├── FLP pool                         │
-        │   ├── Position PDAs                    │
-        │   └── Collateral custody               │
-        │                                        │
-        │   Pyth oracle  ────────────────────────┤
-        │                                        │
-        │   Flash Book program (new)             │
-        │   ├── Market account                   │
-        │   ├── Insurance fund PDA               │
-        │   └── Trader book state                │
-        │                                        │
-        │            ▲                           │
-        └────────────┼───────────────────────────┘
-                     │ delegate
-                     ▼
-        ┌──────── MagicBlock ER ─────────────────┐
-        │                                        │
-        │   Flash Book matcher (per market)      │
-        │   ├── Order buffer                     │
-        │   ├── Commit-reveal registry           │
-        │   ├── FBA Walrasian clear (50 ms)      │
-        │   ├── Virtual FLP quoter               │
-        │   ├── In-loop liquidation injector     │
-        │   ├── Funding index advance            │
-        │   ├── VPIN calculator                  │
-        │   └── Insurance / ADL waterfall        │
-        │                                        │
-        └────────────────────────────────────────┘
+        ┌──────────────── Solana L1 ─────────────────────┐
+        │                                                │
+        │  MarketAccount        · params, mark, OI,      │
+        │                         oracle, status         │
+        │  TraderStateAccount   · collateral, fee tier,  │
+        │                         sub-accounts           │
+        │  PositionAccount      · side, size, entry,     │
+        │                         funding snapshot       │
+        │  FlpExposureAccount   · pool capital + NAV     │
+        │  InsuranceFundAccount · waterfall backstop     │
+        │  Vaults v3            · strategist vaults      │
+        │  Oracle configs       · Pyth / Lazer bindings  │
+        │  Governance PDAs      · guardian, pending      │
+        │                         transfer/params,       │
+        │                         committee              │
+        │                                                │
+        │  apply_fill / apply_flp_fill  ◄── settlement   │
+        │  (verifies every fill against the ring)        │
+        └───────────────┬────────────────────────────────┘
+                        │ delegate market_book + fill ring + outbox
+                        ▼
+        ┌────────── MagicBlock ER (per market) ──────────┐
+        │                                                │
+        │  MarketBook (hypertree slab; bids + asks)      │
+        │  place/cancel/modify · continuous price-time   │
+        │  place_taker_order_v2 · walks the book,        │
+        │    pushes keccak fill commitments to the ring  │
+        │    and full fill records to the outbox         │
+        │  FLP auto-quoter ladder                        │
+        │                                                │
+        └────────────────────────────────────────────────┘
 ```
 
-## Lifecycle
+## The L1/ER split
 
-### 1. Session start
+Exactly three accounts per market are delegated to the ER: the
+**market book** (the order book slab), the **fill-commitment ring**, and the
+**fill outbox**. Matching on the ER may write only those. Positions,
+TraderStates, the vault, and every other account remain L1-owned — on the
+rollup they are read-only clones. This is a hard wall: no ER instruction
+emits a cross-domain write, and no L1 money movement happens without an L1
+transaction.
 
-1. Trader's wallet signs a `createSession` instruction on L1, registering an
-   ephemeral session keypair owned by their Flash V2 trader account.
-2. The Flash Book program's market account, the trader's position accounts,
-   and the FLP pool's custody accounts are **delegated** to the ER.
-3. ER becomes authoritative for these accounts until session ends.
+The settlement loop:
 
-### 2. Per-batch tick (every 50 ms)
+1. **Match (ER).** `place_taker_order_v2` walks the opposite side of the
+   book in price-time order. Each fill is appended to the fill-commitment
+   ring as a keccak commitment and to the fill outbox as a full record.
+2. **Commit (ER → L1).** The book, ring, and outbox are committed back to
+   L1 (`commit_*`), either periodically or with undelegation.
+3. **Settle (L1).** The sequencer calls `apply_fill` (or `apply_flp_fill`
+   for pool fills) per fill. On an armed market the ring is mandatory:
+   settlement recomputes the commitment and pops it in FIFO order, so a
+   fabricated, altered, repriced, reordered, or replayed fill is rejected.
+   Position state, collateral, fees, funding, and OI move here — and only
+   here.
+
+Settlement can never reject or resize a *committed* fill (that would wedge
+the FIFO ring or break two-sided conservation), so every economic
+precondition — margin, reduce-only capacity, OI caps, price bands — is
+enforced at intake or match time, before a fill is committed.
+
+## Matching engine
+
+The order book is a slab of fixed-size nodes indexed by a red-black tree
+(the vendored `hypertree` library — GPL-3.0, see `LICENSE-HYPERTREE`),
+giving O(log n) insert/cancel and O(1) best-price access with zero heap
+allocation. Orders carry price, size, sequence number, expiry, flags
+(post-only, IOC, FOK, reduce-only, self-trade-prevention mode), and the
+owner inline. Price-time priority is machine-proven on the order-id
+encoding (see `docs/FORMAL_VERIFICATION.md`).
+
+Order types beyond limit/taker are built as L1 PDAs whose permissionless
+`execute_*` instructions inject regular orders into the book when their
+condition fires: trigger orders (stop / take-profit, with slippage caps and
+OCO links), TWAP orders (sliced execution), icebergs (hidden reservoir +
+visible chunk replenishment), brackets (parent + two OCO-linked trigger
+legs), and basket orders (multi-leg with a cross-market margin gate).
+
+A reduce-only order can never open or flip a position: intake clamps its
+size against the position's remaining reducible capacity (cumulative across
+all resting reduce-only orders), and on markets with the v1 fill-commitment
+ring the matcher additionally tracks reduce-in-flight per position inside
+the ring itself, so the cap holds across the match→settle gap.
+
+## FLP: the pool as an on-book maker
+
+The FLP pool quotes both sides of the book through a deterministic,
+inventory-aware ladder (`flp_refresh_quotes`, permissionless with an
+anti-churn rate limit). Spread widens with realized volatility, pool
+utilization, and inventory skew; a hard inventory cap bounds pool exposure.
+Pool fills settle through `apply_flp_fill` under the same ring authenticity
+plus an oracle price band (`FLP_MAX_FILL_DEVIATION_BPS`) that caps how far
+any settled pool fill may sit from a fresh oracle. LP capital enters and
+exits through NAV-based shares (deposits/withdrawals price against pool
+NAV including realized PnL), with a minimum hold time defeating
+just-in-time windfall capture.
+
+## Risk stack
+
+- **Margin.** A stress-lattice portfolio margin: required margin is the
+  worst-case loss across per-market shocks, correlated moves, and
+  black-swan scenarios, plus maintenance margin on stressed notional.
+  Hedged books collapse to maintenance-only. Positions may be
+  cross-margined (pooled collateral) or isolated (per-position bucket).
+  Initial margin is enforced at order intake; withdrawals re-run the gate.
+- **Liquidation.** `liquidate_position_v2` prices health on the *worse of*
+  mark and oracle (falling back to oracle-only when the mark is stale — an
+  ER stall cannot freeze an adverse mark into liquidations). Rewards are
+  bounded by residual equity; self-liquidation is forbidden; nothing
+  liquidates while the market is paused. JIT liquidation offers let makers
+  bid to absorb liquidations at better-than-synthetic prices.
+- **Insurance fund.** Funded from fee/penalty streams; covers bankruptcy
+  shortfalls; below its pause threshold the market stops accepting new
+  positions and ADL becomes eligible.
+- **ADL.** `auto_deleverage` force-closes the most profitable
+  counter-positions at the bankruptcy price, only against a truly bankrupt
+  position, conserving value: the counter-party's credited gain is capped
+  at what the bankrupt side actually forfeits.
+- **Haircut.** Profit is junior to capital: released positive PnL matures
+  through a time-gated reserve and converts at
+  `h = min(residual, matured) / matured`, so aggregate extractable profit
+  can never exceed the real residual backing it. Losses settle immediately
+  against capital. (Formal spec: `docs/HAIRCUT_MATH.md`.)
+- **Funding.** Positions carry a cumulative-index snapshot and settle
+  funding on touch; per-side accrual indices let funding/mark/ADL effects
+  apply lazily in O(1) per position. The index driver is currently inert
+  (no instruction advances the funding index), which the code documents
+  explicitly.
+
+## Oracles and the mark
+
+Each market binds an oracle source: authority-pushed (with a quorum
+variant), Pyth pull (`PriceUpdateV2` under full verification), or Pyth
+Lazer (Ed25519 precompile + strictly-increasing replay nonce). All paths
+share a per-slot envelope gate that bounds price movement per slot, and
+staleness gates reject future-dated or stale prints. The mark (a fill EMA
+the sequencer produces) is always clamped to an effective oracle band —
+between 1 bp and 500 bps, defaulting to 200 — so a manipulated mark cannot
+stray from the trustless oracle. `lock_oracle_source` permanently disables
+the direct-authority paths on a market, leaving only Pyth/Lazer.
+
+## ER lifecycle and liveness
+
+Delegation CPIs (`src/er.rs`) stage the account into a buffer, hand
+ownership to the MagicBlock delegation program, and restore it byte-exact
+at undelegation — where the callback binds the DLP's signed buffer to the
+canonical `["undelegate-buffer", delegated]` PDA and re-derives the target
+from its seeds, so a forged buffer cannot materialize state. Liveness is
+two-tier: a fast permissionless force-undelegate opens when the ER shows no
+signal (no fill, no heartbeat) past a stall timeout, and a censorship
+backstop opens on settlement silence alone past a much longer timeout —
+a heartbeating-but-censoring sequencer cannot trap funds, and a
+healthy-but-quiet market cannot be griefed off the ER (Kani-proven gate).
+
+## Privacy (dark pool)
+
+A market's delegated book can run on a MagicBlock *Private* ER (TEE-backed).
+`init_book_permission` / `set_book_privacy` / `close_book_permission` manage
+the ephemeral permission account that gates ER reads: allow-listed members
+see the book; public observers are denied depth, orders, and flow.
+Settlement still lands on L1 and `apply_fill` verifies every fill against
+the ring, so privacy is purely additive — no matching, risk, or settlement
+path depends on it. Wire format and validation boundary: `docs/PRIVACY.md`.
+
+## Accounts and sessions
+
+TraderStates support sub-accounts (index 0 = main), collateral transfers
+between them, delegates, referrers, builder codes, and volume-based fee
+tiers. Session keys (`create_session_token`) authorize scoped, expiring
+trading sessions — optionally market-scoped — for the session variants of
+place/cancel/deposit. Cross-domain (`_xdomain`) withdrawal paths respect
+margin reserved by live ER orders, attested via the ER margin-attestation
+flow.
+
+## Governance
+
+All admin control is per-market `market.authority` plus the
+`insurance_fund.authority`, hardened by: a restrict-only emergency guardian
+(can pause, never unpause; can veto pending param updates), two-step
+authority transfer (the new key must sign to accept), a 48-hour timelocked
+params path bound to a keccak params-hash, a one-way oracle-source lock,
+sequencer rotation, and irreversible authority burn. Details:
+`docs/GOVERNANCE.md`. The sequencer-committee primitive (quorum-attested
+batch roots + equivocation slashing) exists on-chain as an additive step
+toward decentralized sequencing: `docs/DECENTRALIZED_SEQUENCER.md`.
+
+## Trust model
+
+Fill *authenticity* is enforced on L1 by the commitment ring; fill
+*ordering and liveness* rest on a single sequencer per market, bounded by
+the force-undelegate escapes and the oracle-pinned mark. This boundary is
+stated precisely in `ER_TRUST_BOUNDARY.md` and `SECURITY.md`.
+
+## Source layout
 
 ```
-runBatch(nowMs):
-  1. advanceFundingIndex on every market
-  2. recomputeOpenInterest from authoritative position state
-  3. detectLiquidations from prior-batch mark using stress-lattice
-  4. for each market:
-       a. generate FLP virtual quotes
-       b. inject liquidation orders for unhealthy traders
-       c. clearBatch(buffer + flp + liq) → uniform clearing price
-       d. apply fills (positions, fees, OI, VPIN)
-       e. update mark = oracle-banded TWAP of clearing prices
-       f. process bankruptcies via insurance / ADL waterfall
-  5. sweep expired commits
-  6. verify invariants
+programs/flash-book/src/
+├── lib.rs            handlers, account contexts, events (the on-chain shell)
+├── state.rs          v1 accounts: market, trader, position, insurance
+├── state_v2.rs       order-book slab: MarketBookHandle, resting orders
+├── state_v3.rs       v3 accounts: triggers/TWAP/iceberg, oracle configs,
+│                     committee, haircut + side-accrual + envelope state
+├── er.rs             MagicBlock delegation/commit/undelegate CPIs + liveness
+├── er_permission.rs  TEE private-ER read-permission CPIs
+├── pyth_oracle.rs    Pyth PriceUpdateV2 reader
+├── lazer_oracle.rs   Pyth Lazer payload parser + Ed25519 introspection
+├── session.rs        session-token verification
+├── xmargin.rs        cross-domain (ER-aware) margin floors
+├── hypertree/        vendored red-black-tree slab (GPL — LICENSE-HYPERTREE)
+└── matcher/          pure engine math (no Solana account types):
+    ├── order, lot            order/side/price-lot primitives
+    ├── envelope              per-slot price/funding move proofs
+    ├── fill_commitment       keccak settlement ring (+ v1 reduce-in-flight)
+    ├── fill_outbox           full fill records for off-log settlement reads
+    ├── flp_quoter            deterministic pool quoting ladder
+    ├── risk                  stress-lattice margin + fee tiers
+    ├── liquidation           worse-of health pricing, shortfall math
+    ├── insurance             fund model + solvency detectors
+    ├── haircut               junior-profit gating (reserve/mature/convert)
+    ├── side_accrual          A/K/F/B per-side lazy indices
+    ├── position_math         open/VWAP/reduce/flip + realized-PnL core
+    ├── funding               settlement-side funding charge (index inert)
+    ├── reduce_only           reduce-only capacity clamp
+    ├── jit_lp_defense        LP minimum-hold gate
+    ├── committee             BFT quorum membership + equivocation predicates
+    └── vpin                  layout-reserved accumulator (retired)
 ```
 
-### 3. Settlement (every K batches)
-
-1. State diff (positions, collateral, FLP exposure, insurance fund balance,
-   funding index) is committed to L1 via Flash V2 instruction calls.
-2. Mainnet position accounts reflect post-batch state.
-3. Pyth oracle is re-read from mainnet for the next batch's reference price.
-
-### 4. Session end
-
-1. `revokeSession` instruction on L1 ends delegation.
-2. Final state is committed.
-3. Account control returns to Flash V2 mainnet program.
-
-## Components in detail
-
-### Matcher (`src/matcher.ts`)
-
-Walrasian uniform-price clearing. For each batch, build the joint demand
-and supply curves from all candidate orders (limits, takers, FLP virtual,
-liquidations). Find `p* = arg max_p min(D(p), S(p))`. Tie-break by
-proximity to prior mark; midpoint of indifference interval if it spans the
-mark. Match eligible orders by priority (`liquidation > adl > taker >
-flp_virtual > limit`) then FIFO timestamp. Self-trade is filtered.
-
-### FLP virtual quoter (`src/flp-quoter.ts`)
-
-Avellaneda-Stoikov-grade inventory-aware quoter:
-
-- Inventory skew: `skew = -(λ + γ_risk · σ²) · (pool_net / pool_capital)`
-- Spread per level:
-  `s = s0 + α·VPIN + β·u + γ·|oi_imb| + κ·(Q/depth_floor) + δ·σ`
-- Per-batch growth cap: `pool_capital · max_growth_pct`, split across
-  N price levels.
-- Multi-level depth ladder, each level priced at fair-value ± s(level).
-
-The quoter is **stateless** — given pool state it produces a deterministic
-ladder. This is critical: every node running the matcher produces the
-same FLP quotes given the same pool state, so consensus is automatic.
-
-### Risk engine (`src/risk.ts`)
-
-Stress-lattice maintenance margin. For each scenario `s ∈ S` (single-asset
-shocks ±2/5/10/20%, correlated all-down/all-up at ±10%, black swans at
-±30%), compute portfolio loss + maintenance margin on the stressed
-notional. Required margin is the worst-case scenario loss. Hedged
-positions (long+short same market) cancel directional risk in every
-scenario, so required margin collapses to maintenance margin on the
-stressed notional only — the design's hedge-aware property.
-
-### Liquidation engine (`src/liquidation.ts`)
-
-In-loop liquidations. Detection runs once per batch on positions priced
-against the prior-batch mark; this avoids the race where a position
-becomes unhealthy mid-batch. Detected positions get a synthetic
-liquidation order injected into the current batch's matcher input, with a
-limit price of `oracle ± liq_penalty`. The matcher clears the
-liquidation at the batch uniform price (which is at least as good as the
-limit).
-
-After the batch clears, each filled liquidation is examined for bankruptcy:
-if collateral can't cover the realized loss + penalty, the shortfall flows
-through the waterfall:
-
-1. Insurance fund (paid up to fund balance)
-2. ADL — most-profitable counter-positions are auto-deleveraged at
-   batch mark, ranked by `profit_ratio · leverage` (highest first)
-
-### Funding (`src/funding.ts`)
-
-Continuous funding via cumulative index. Each block, the engine computes:
-
-```
-premium = (mark - oracle) / oracle
-rate    = clamp(K · premium, ±r_max)
-ΔI      = rate · Δt
-cum_funding_index += ΔI
-```
-
-A position records `cum_funding_index_at_entry`. On every position change,
-the position is charged `sign · notional · (I_now - I_at_entry)`. Index
-marker is reset on each settlement. This is the same pattern Compound /
-Aave use for interest accrual; we apply it to funding at sub-second
-resolution because ER tx is free.
-
-### VPIN (`src/vpin.ts`)
-
-Volume-Synchronized Probability of Informed Trading. Volume buckets close
-when cumulative volume reaches `bucket_size`. Each bucket records
-`|V_buy − V_sell| / bucket_size`; VPIN is an EMA of these bucket
-imbalances over the last `ema_window` buckets. Drives the α coefficient
-of the FLP spread function (toxic flow widens FLP spread → LPs protected).
-
-### Commit-reveal (`src/commit-reveal.ts`)
-
-Two-phase taker submission:
-
-1. Block N: `submitCommit(hash)` where
-   `hash = H(market ‖ trader ‖ side ‖ size ‖ limit ‖ nonce)`
-2. Block ≤ N + K: `submitReveal(payload)`; matcher checks the hash matches
-   and queues a synthesized taker order for the next batch.
-3. K elapses without reveal → bond seized.
-
-Sequencer cannot front-run because the hash hides every value. Cost: ~50–100
-ms perceived latency for takers (vs immediate matching). For perps holding
-positions for hours, this is irrelevant.
-
-### Insurance fund (`src/insurance.ts`)
-
-Three contribution streams, one waterfall payout. Contributions: 10% of
-trading fees + 50% of toxicity tax + 50% of liquidation penalty.
-Pause-new-positions threshold halts new positions when fund balance falls
-below a configured floor (default $5K); existing positions can continue to
-trade (close or reduce only).
-
-## Why each choice
-
-See [`docs/MATH.md`](MATH.md) for the formal math and
-[`docs/SAFETY.md`](SAFETY.md) for the threat model and invariants.
-
-## Recent additions (waves 6-13)
-
-The base architecture is unchanged; the additions slot into existing
-seams. Every new feature is **additive** — no instruction's signature
-breaks, no account layout migrates (existing accounts default the new
-fields to zero/equivalent). The matcher's hot path doesn't grow.
-
-### Native order types beyond limit/taker
-- **Trigger orders** (`TriggerOrderAccount`) — permissionless `execute_*`
-  reads oracle, inserts the resulting order into the regular buffer.
-  Optional OCO link, reduce-only, GTT expiry, trailing offset.
-- **TWAP orders** (`TwapOrderAccount`) — permissionless `execute_twap_slice`
-  inserts one slice per interval.
-- **Bracket orders** (`place_bracket_order`) — atomic parent + 2 OCO
-  triggers (TP + SL) in one tx. Parent fill → triggers become
-  reduce-only-eligible; one fires → other auto-deactivates.
-- **Iceberg orders** (`IcebergOrderAccount`) — hidden reservoir;
-  permissionless `replenish_iceberg` inserts the next chunk when the
-  visible child fills.
-- **Trailing stops** — `trailing_offset_bps` on TriggerOrderAccount;
-  permissionless `update_trailing_stop` ratchets in the favorable
-  direction with conservative tick rounding.
-
-### Risk + safety
-- **Per-position leverage cap** (`set_position_leverage`) — enforced at
-  intake against projected post-fill notional.
-- **Concentration margin tier** (FLP-keyed; smarter than HL's flat MMR)
-  — `MarketSnapshot::effective_mmr_bps(size_lots)` used in stress
-  lattice.
-- **Symmetric-OI funding dampener** (smarter than HL's premium-only
-  funding) — when `funding_oi_dampening`, rate × |skew| / total scales
-  funding. Balanced book → 0 funding.
-- **Funding-premium TWAP** — last-N-batch clearing-price TWAP as the
-  premium input; kills 1-batch microbursts at our 50ms cadence.
-- **Mark sanity cap** — per-batch ±X bps clamp on post-clearing mark.
-- **Per-market OI cap** — whole-market hard ceiling at intake.
-- **STP modes** — CancelNewest / CancelOldest / CancelBoth via flag bits
-  4-5 on the OrderSlot; matcher applies the newer-order's mode.
-- **GTT order expiry** — `expires_at_slot` on every order; matcher
-  silently skips expired slots; cleanup-keeper reclaims rent.
-
-### Permissionless markets (HIP-3 + bond)
-- **`permissionless_initialize_market`** — anyone deploys a market;
-  envelope-clamped params; caller is creator + earns
-  `creator_share_bps`.
-- **HIP-3 deployer bond** (`MarketBondAccount`) — slashable stake with
-  7-day unbond delay. `slash_market_bond` is authority-gated.
-
-### Capital primitives
-- **Multi-LP NAV vault** (`LpPositionAccount`) — already present; share
-  math now also covers per-deposit + per-withdraw bookkeeping.
-- **User-managed trading vaults** (`VaultAccount` +
-  `VaultPositionAccount`) — strategist trades via the existing
-  delegate path; deposit + withdraw use mark-to-market NAV via market
-  walk in `remaining_accounts`. HWM perf-fee in shares.
-- **Cross-margin sweep** (`sweep_collateral`) — position-aware via
-  joint stress-lattice gate; same MTM walk pattern as vaults.
-
-### Liquidation + ADL
-- **Auto-Deleverage** (`auto_deleverage`) — when insurance is below
-  pause_threshold, force-close highest-ranked profitable counter at
-  the bankruptcy price. Permissionless; eligibility re-checked on chain.
-- **Multi-threshold margin alerts** — per-fill emit at 250%/200%/125%
-  of MMR for off-chain pre-liq pushes.
-- **Mass cancel** (`cancel_all_orders_in_market`) — single-tx flatten.
-
-### Fee + reward primitives
-- **Builder codes** (`set_trader_builder`) — frontend earns up to user-
-  approved cap.
-- **Referral program** (`set_trader_referrer`) — one-time-write,
-  anti-rotation.
-- **Negative-fee top tier** — `discount_bps` up to 12_000 (120%) →
-  taker is paid for routing flow; sourced from insurance contribution.
-- **Trading-rewards eligibility** — per-fill emit for off-chain HYPE-
-  style accrual.
-
-### View ixs (UI primitives via tx simulation)
-- `view_predicted_funding` — emits `PredictedFundingEvent` with
-  rate + premium + cum_index; SDK simulates the tx.
-- `view_quote_ladder` — re-runs `generate_quotes` with current state;
-  emits `QuoteLadderSnapshotEvent` (top-level summary; full ladder is
-  deterministically recoverable off-chain).
-
-### MagicBlock ER compatibility
-Every new ix and view operates through Anchor's standard PDA
-derivation + Borsh accessors that work transparently when the market
-account is delegated to an ER. The in-house `cpi_delegate` /
-`cpi_undelegate` ixs (`programs/flash-book/src/er.rs`) bypass the
-upstream SDK's Solana version conflict by re-implementing the
-delegation discriminators directly. New state (vault, iceberg,
-trigger, twap, bond) participates in the same delegation lifecycle —
-no special-casing needed.
+Formal verification (57 Kani harnesses, 6 Lean theorems, property suites):
+`docs/FORMAL_VERIFICATION.md`. Math specs: `docs/MATH.md`,
+`docs/MARGIN_MATH.md`, `docs/HAIRCUT_MATH.md`. Threat model:
+`docs/SAFETY.md`. Flash V2 integration: `docs/V2_INTEGRATION.md`.

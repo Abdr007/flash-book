@@ -1,16 +1,16 @@
-//! Flash Book V3 account types — merged in from the (now-deleted)
-//! flash-book-orders / flash-book-flp / flash-book-vaults wrapper
-//! programs. All types live under `flash_book` program ID; PDAs use
-//! distinct seed prefixes (`trigger_v3`, `vault_v3`, etc.) so they
-//! coexist alongside legacy v1/v2 types without seed collision.
+//! Flash Book V3 account types — trigger/TWAP/iceberg orders, vaults,
+//! FLP per-market state, oracle configs, and the risk/haircut siblings.
+//! All types live under the `flash_book` program ID; PDAs use distinct
+//! seed prefixes (`trigger_v3`, `vault_v3`, etc.) so they coexist
+//! alongside the v1/v2 types without seed collision.
 
 use anchor_lang::prelude::*;
 
 // ─── Trigger orders v3 ──────────────────────────────────────────────
 
 /// V3 trigger order. Seeds: `[b"trigger_v3", market, trader, trigger_id]`.
-/// Distinct from legacy `[b"trigger", ...]` so legacy + v3 triggers can
-/// coexist during a migration window.
+/// Distinct from the v1 `[b"trigger", ...]` prefix so both PDA families
+/// can coexist without collision.
 #[account]
 #[derive(Debug)]
 pub struct TriggerOrderAccountV3 {
@@ -26,18 +26,17 @@ pub struct TriggerOrderAccountV3 {
     pub limit_price_ticks: u64,
     pub created_at_slot: u64,
     pub expires_at_slot: u64,
-    /// Phase 2f — TraderState sub-account index this trigger fires
-    /// against. Pre-Phase-2f accounts read back as 0 (main) from the
-    /// trailing zeros of their allocated `space()`. ExecuteTriggerOrderV3
+    /// TraderState sub-account index this trigger fires against.
+    /// Accounts serialized before this field existed read it as 0 (main)
+    /// from the trailing zeros of their allocation. ExecuteTriggerOrderV3
     /// copies this into the synthetic RestingOrderV2.sub_index so the
     /// resulting fill is routed to the right TraderState.
     pub sub_index: u8,
-    /// Wave 27a — slippage cap on trigger execution (GMX V2 acceptablePrice
-    /// pattern). When > 0, the trigger refuses to fire if the oracle has
-    /// moved past `acceptable_price_ticks` in the direction unfavorable
-    /// to the resulting order. Pre-Wave-27a triggers read this back as 0
-    /// (from the trailing zeros of `space()`), meaning "no cap, legacy
-    /// behavior" — full backward compatibility.
+    /// Slippage cap on trigger execution (acceptable-price pattern).
+    /// When > 0, the trigger refuses to fire if the oracle has moved past
+    /// `acceptable_price_ticks` in the direction unfavorable to the
+    /// resulting order. Trailing field: accounts serialized before it
+    /// existed read 0, meaning "no cap".
     ///
     /// Direction rules:
     /// - side == 0 (long, buying): refuse if `oracle > acceptable_price`.
@@ -52,14 +51,13 @@ pub struct TriggerOrderAccountV3 {
     /// `TriggerOrderV3SlippageCancelledEvent`. The trader can re-place
     /// with updated params if they still want to act.
     pub acceptable_price_ticks: u64,
-    /// AUDIT HIGH-7 (2026-07) — OCO link. For a bracket leg, this holds the
-    /// sibling leg's `trigger_id`; when this leg FIRES, the executor must pass
-    /// the sibling `TriggerOrderAccountV3` and it is deactivated, so both legs
-    /// of a bracket can never both fire (which previously let a whipsaw
-    /// double-fill flip the position). Set iff `flags & FLAG_HAS_SIBLING`.
-    /// Pre-existing accounts read this as 0 (no sibling) from the trailing
-    /// zeros of `space()`, and `FLAG_HAS_SIBLING` is unset — full backward
-    /// compatibility (non-bracket triggers are unaffected).
+    /// OCO link. For a bracket leg, this holds the sibling leg's
+    /// `trigger_id`; when this leg FIRES, the executor must pass the
+    /// sibling `TriggerOrderAccountV3` and it is deactivated, so both legs
+    /// of a bracket can never both fire (a whipsaw double-fill would flip
+    /// the position). Set iff `flags & FLAG_HAS_SIBLING`. Trailing field:
+    /// pre-existing accounts read 0 (no sibling) with `FLAG_HAS_SIBLING`
+    /// unset — non-bracket triggers are unaffected.
     pub sibling_trigger_id: u8,
     /// Reserved for future expansion. Pre-existing accounts read this as
     /// zero from the trailing space().
@@ -70,18 +68,18 @@ impl TriggerOrderAccountV3 {
     pub const SEED: &'static [u8] = b"trigger_v3";
     pub const FLAG_REDUCE_ONLY: u8 = 1 << 0;
     pub const FLAG_ACTIVE: u8 = 1 << 1;
-    /// AUDIT HIGH-7 (2026-07) — set on both legs of a bracket. Marks that
-    /// `sibling_trigger_id` is valid and that firing this leg must deactivate
-    /// the sibling (OCO). Unset on standalone triggers (backward compatible).
+    /// Set on both legs of a bracket. Marks that `sibling_trigger_id` is
+    /// valid and that firing this leg must deactivate the sibling (OCO).
+    /// Unset on standalone triggers.
     pub const FLAG_HAS_SIBLING: u8 = 1 << 2;
     pub fn space() -> usize {
-        // 8 disc + 32+32+1+1+1+1+1 + 8+8+8+8+8 + 1 (sub_index) = 118.
-        // Wave 27a: + 8 (acceptable_price) + 8 (reserved) = 134.
-        // 8 + 128 = 136 still fits with 2 bytes spare.
+        // 8 disc + 32+32+1+1+1+1+1 + 8+8+8+8+8 + 1 (sub_index)
+        //   + 8 (acceptable_price) + 1 (sibling) + 7 (reserved) = 126;
+        // 8 + 128 leaves 2 bytes spare.
         8 + 128
     }
 
-    /// AUDIT HIGH-7 (2026-07) — true iff `other` is THIS trigger's genuine OCO
+    /// True iff `other` is THIS trigger's genuine OCO
     /// sibling: same trader + market, `other.trigger_id` equals our
     /// `sibling_trigger_id`, AND `other` points back at us
     /// (`other.sibling_trigger_id == self.trigger_id`). The mutual back-link is
@@ -94,7 +92,7 @@ impl TriggerOrderAccountV3 {
             && other.sibling_trigger_id == self.trigger_id
     }
 
-    /// Wave 27a — check the slippage cap against the current oracle.
+    /// Check the slippage cap against the current oracle.
     /// Returns `true` if the cap is breached (caller should cancel
     /// instead of fire). `acceptable_price_ticks == 0` means "no cap"
     /// → returns `false`. Pure function for unit-testability.
@@ -128,29 +126,28 @@ pub struct TwapOrderAccountV3 {
     pub slot_interval: u64,
     pub end_slot: u64,
     pub last_slice_at_slot: u64,
-    /// Phase 2f — same semantics as TriggerOrderAccountV3.sub_index.
+    /// Same semantics as TriggerOrderAccountV3.sub_index.
     /// Every child slice the TWAP emits carries this sub_index in its
     /// RestingOrderV2.
     pub sub_index: u8,
-    /// Wave 27b — same shape as `TriggerOrderAccountV3.acceptable_price_ticks`.
+    /// Same shape as `TriggerOrderAccountV3.acceptable_price_ticks`.
     /// Each TWAP slice is checked against this cap before injection.
     /// A slice that would fire while oracle is beyond the cap is
     /// **skipped** (not the TWAP deactivated) — the TWAP itself stays
     /// active so subsequent slices can fire if price returns within
-    /// bounds. `0 = no cap` (legacy behavior).
+    /// bounds. `0` = no cap.
     pub acceptable_price_ticks: u64,
-    /// Reserved. Pre-Wave-27b TWAPs read this as zero from the
-    /// trailing space().
+    /// Reserved; reads as zero from the trailing allocation.
     pub _reserved: [u8; 7],
 }
 impl TwapOrderAccountV3 {
     pub const SEED: &'static [u8] = b"twap_v3";
     pub const FLAG_ACTIVE: u8 = 1 << 0;
     pub fn space() -> usize {
-        // H-8 (audit 2026-06): body = 32+32 + 4×u8 + 8×u64 + 1 sub + 8 acceptable
-        // + 7 reserved = 64+4+64+1+8+7 = 148 (the old comment miscounted as 144,
-        // returning 152 < the 156 a full account needs → AccountDidNotSerialize on
-        // a populated V3 TWAP). Correct size is 8 + 148.
+        // body = 32+32 + 4×u8 + 8×u64 + 1 sub + 8 acceptable + 7 reserved
+        //      = 64+4+64+1+8+7 = 148. An undercounted body here fails a
+        // populated account with AccountDidNotSerialize, so the exact
+        // length is pinned by `twap_v3_space_matches_borsh_serialized_len`.
         8 + 148
     }
 }
@@ -165,10 +162,9 @@ pub struct IcebergOrderAccountV3 {
     pub iceberg_id: u8,
     pub side: u8,
     pub flags: u8, // bit 0: active
-    /// Phase 2f — sub_index repurposes the first byte of the prior
-    /// `_pad0: [u8; 4]`. Pre-Phase-2f accounts have this byte as 0
-    /// (main TraderState) by virtue of the zero-initialised allocation,
-    /// so the change is layout-compatible.
+    /// Sub-account index; occupies the first byte of a former
+    /// `_pad0: [u8; 4]`. Accounts serialized before the field existed
+    /// carry 0 here (main TraderState).
     pub sub_index: u8,
     pub _pad0: [u8; 3],
     pub limit_ticks: u64,
@@ -300,8 +296,8 @@ pub struct JitLiquidationOfferAccount {
     /// 1=will close SHORT positions (acts as a SELLER → ask). See ix
     /// docs for the close-side mapping.
     pub side: u8,
-    /// Phase 2f — maker's sub-account index. Repurposed from the first
-    /// byte of the prior `_pad0: [u8; 2]`. When the JIT offer fires
+    /// Maker's sub-account index; occupies the first byte of a former
+    /// `_pad0: [u8; 2]`. When the JIT offer fires
     /// against an underwater position, the synthetic close order picks
     /// up this sub_index so the maker rebate / position update lands
     /// on the right maker TraderState.
@@ -332,11 +328,11 @@ impl JitLiquidationOfferAccount {
     }
 }
 
-// ─── Pyth oracle config (P0.1 — mainnet readiness) ──────────────────
+// ─── Pyth oracle config ──────────────────────────────────────────────
 //
 // Per-market PDA that holds the Pyth feed ID + freshness bounds. Lives
-// alongside the market rather than expanding `MarketParams` to avoid yet
-// another account-layout migration. The `update_oracle_from_pyth` ix
+// alongside the market rather than expanding `MarketParams`, which would
+// be an account-layout migration. The `update_oracle_from_pyth` ix
 // CPI-reads the Pyth `PriceUpdateV2` account and validates the feed_id
 // matches this config before writing to `MarketAccount.oracle_*` fields.
 //
@@ -345,14 +341,14 @@ impl JitLiquidationOfferAccount {
 #[derive(Debug)]
 pub struct MarketOracleConfigAccount {
     pub bump: u8,
-    /// 0 = legacy trusted `update_oracle` (devnet only). 1 = Pyth pull.
-    /// Future: 2 = Switchboard, 3 = TWAP, etc.
+    /// 0 = trusted `update_oracle` (devnet only). 1 = Pyth pull.
+    /// 2 = Lazer signed payloads.
     pub source: u8,
     pub _pad0: [u8; 2],
     /// Lazer feed id, bound at config init when `source == SOURCE_LAZER`.
-    /// AUDIT CR-2 fix: carved from the former `_pad0: [u8; 6]` (now `[u8; 2]`).
-    /// Borsh field order + total size are preserved, so pre-existing configs
-    /// (which had 6 zero pad bytes here) deserialize this as 0.
+    /// Occupies 4 bytes of a former `_pad0: [u8; 6]` (now `[u8; 2]`);
+    /// Borsh field order + total size are preserved, so configs serialized
+    /// with 6 zero pad bytes here deserialize this as 0.
     pub lazer_feed_id: u32,
     pub market: Pubkey,
     /// The 32-byte Pyth feed identifier (e.g. SOL/USD on mainnet is
@@ -366,15 +362,15 @@ pub struct MarketOracleConfigAccount {
     /// exponents.
     pub tick_decimals: i8,
     pub _pad1: [u8; 7],
-    /// AUDIT (2026-07): Lazer replay-nonce. The strictly-increasing
-    /// publisher-attested microsecond timestamp of the last accepted Lazer
-    /// price. `update_oracle_from_lazer` rejects any payload whose `timestamp_us`
+    /// Lazer replay-nonce: the strictly-increasing publisher-attested
+    /// microsecond timestamp of the last accepted Lazer price.
+    /// `update_oracle_from_lazer` rejects any payload whose `timestamp_us`
     /// is not greater, so a public signed payload cannot be re-posted (or an
-    /// older one applied) within the staleness window. APPENDED after `_pad1` —
-    /// the account was always allocated 128 B (space) while the struct serialized
-    /// to 96 B, so pre-existing configs deserialize this trailing field as 0
-    /// (first Lazer update then seeds it). Borsh field order + offsets of every
-    /// prior field are unchanged (same technique as the CR-2 `lazer_feed_id` carve).
+    /// older one applied) within the staleness window. Trailing field — the
+    /// account is allocated 128 B while the struct serializes to 96 B, so
+    /// configs serialized without it deserialize this as 0 (the first Lazer
+    /// update seeds it). Borsh field order + offsets of every prior field
+    /// are unchanged.
     pub last_lazer_timestamp_us: u64,
 }
 impl MarketOracleConfigAccount {
@@ -389,8 +385,8 @@ impl MarketOracleConfigAccount {
         //   + 4 + 4 max_staleness/conf
         //   + 1 tick_decimals + 7 pad
         //   + 8 last_lazer_timestamp_us
-        // = 8 + 96 = 104. Allocation stays 128 (unchanged), so existing 128-byte
-        // configs remain valid and the appended field reads 0.
+        // = 8 + 96 body; allocated 8 + 120 so the trailing slack keeps
+        // older 128-byte configs valid (trailing fields read 0).
         8 + 120
     }
 }
@@ -400,12 +396,12 @@ mod oracle_config_layout_tests {
     use super::*;
     use anchor_lang::{AnchorDeserialize, AnchorSerialize};
 
-    // AUDIT CR-2 regression: `lazer_feed_id: u32` was carved out of the former
-    // `_pad0: [u8; 6]` (now `[u8; 2]`). Prove that an account serialized in the
-    // OLD layout (6 zero pad bytes after `source`) still deserializes correctly
-    // under the NEW struct, reading `lazer_feed_id == 0` and leaving every other
-    // field byte-identical. This is what guarantees existing on-chain configs
-    // are not corrupted by the field addition.
+    // `lazer_feed_id: u32` occupies 4 bytes of a former `_pad0: [u8; 6]`
+    // (now `[u8; 2]`). Prove that an account serialized in the pad-bytes
+    // layout (6 zero pad bytes after `source`) still deserializes correctly
+    // under the current struct, reading `lazer_feed_id == 0` and leaving
+    // every other field byte-identical — the guarantee that on-chain
+    // configs are not corrupted by the field carve.
     #[test]
     fn old_layout_deserializes_with_zero_lazer_feed_id() {
         let market = Pubkey::new_unique();
@@ -422,22 +418,28 @@ mod oracle_config_layout_tests {
         old.extend_from_slice(&45u32.to_le_bytes()); // max_confidence_bps
         old.push(3i8 as u8); // tick_decimals
         old.extend_from_slice(&[0u8; 7]); // _pad1
-        // AUDIT (2026-07): the appended `last_lazer_timestamp_us: u64` reads from
-        // the account's trailing allocation. A pre-existing on-chain config is 128
-        // bytes (space) while the struct serialized to 88, so those 8 bytes are
-        // zeros — simulate that slack here so the NEW struct has enough to decode.
+                                          // The trailing `last_lazer_timestamp_us: u64` reads from the
+                                          // account's trailing allocation: an on-chain config allocated 128
+                                          // bytes with an 88-byte serialized body carries zeros there —
+                                          // simulate that slack so the current struct has enough to decode.
         old.extend_from_slice(&[0u8; 8]); // last_lazer_timestamp_us slot (pre-existing = 0)
 
         let cfg = MarketOracleConfigAccount::try_from_slice(&old).unwrap();
         assert_eq!(cfg.bump, 9);
         assert_eq!(cfg.source, MarketOracleConfigAccount::SOURCE_PYTH);
-        assert_eq!(cfg.lazer_feed_id, 0, "old configs must read lazer_feed_id as 0");
+        assert_eq!(
+            cfg.lazer_feed_id, 0,
+            "old configs must read lazer_feed_id as 0"
+        );
         assert_eq!(cfg.market, market);
         assert_eq!(cfg.pyth_price_feed_id, feed);
         assert_eq!(cfg.max_staleness_seconds, 123);
         assert_eq!(cfg.max_confidence_bps, 45);
         assert_eq!(cfg.tick_decimals, 3);
-        assert_eq!(cfg.last_lazer_timestamp_us, 0, "old configs must read the nonce as 0");
+        assert_eq!(
+            cfg.last_lazer_timestamp_us, 0,
+            "old configs must read the nonce as 0"
+        );
         // Serialized struct is now 96 B (88 + 8 nonce); still well under the
         // unchanged 128-B `space()` allocation, so existing accounts stay valid.
         assert_eq!(old.len(), 96);
@@ -465,19 +467,22 @@ mod oracle_config_layout_tests {
         assert_eq!(back.lazer_feed_id, 0xDEAD_BEEF);
         assert_eq!(back.source, MarketOracleConfigAccount::SOURCE_LAZER);
         assert_eq!(back.last_lazer_timestamp_us, 1_700_000_000_000_000);
-        assert_eq!(bytes.len(), 96, "serialized size is 96 (88 + 8 nonce); fits 128 space()");
+        assert_eq!(
+            bytes.len(),
+            96,
+            "serialized size is 96 (88 + 8 nonce); fits 128 space()"
+        );
     }
 }
 
-// ─── M-14 decentralization: sequencer committee (Phase 1) ───────────
+// ─── Sequencer committee ─────────────────────────────────────────────
 //
-/// The M-of-N validator committee that will authorize settlement once the
-/// decentralized-sequencer endgame lands (see `docs/DECENTRALIZED_SEQUENCER.md`).
-/// PHASE 1 is scaffolding: this account + its governance ix
+/// The M-of-N validator committee for decentralized settlement
+/// attestation. This account + its governance ix
 /// (`set_sequencer_committee`) + the Kani-proven quorum logic
-/// (`matcher::committee`) exist and are validated, but settlement authorization
-/// is NOT yet generalized to it — so landing this changes no runtime behavior.
-/// Seeds: `[b"seq_committee", market]`.
+/// (`matcher::committee`) validate committee-attested batches via
+/// `commit_batch`; per-fill settlement authorization remains gated by
+/// `market.sequencer`. Seeds: `[b"seq_committee", market]`.
 #[account]
 #[derive(Debug)]
 pub struct SequencerCommittee {
@@ -494,10 +499,10 @@ pub struct SequencerCommittee {
     /// The validator set. Only the first `validator_count` entries are live; the
     /// rest are `Pubkey::default()`.
     pub validators: [Pubkey; crate::constants::MAX_COMMITTEE_VALIDATORS],
-    /// PHASE 2.6 — equivocation jail bitmask: bit `i` set ⇒ `validators[i]` was
+    /// Equivocation jail bitmask: bit `i` set ⇒ `validators[i]` was
     /// PROVABLY caught double-signing conflicting batches (`slash_equivocation`)
-    /// and no longer counts toward a quorum. Carved from the former `_reserved`
-    /// (backward-compatible: pre-existing committees read it as 0 = none jailed).
+    /// and no longer counts toward a quorum. Occupies former `_reserved`
+    /// bytes: committees serialized before it read 0 = none jailed.
     pub jailed_mask: u64,
     pub _reserved: [u8; 56],
 }
@@ -510,7 +515,7 @@ impl SequencerCommittee {
     }
 }
 
-/// PHASE 2: the last committee-attested state transition per market. `commit_batch`
+/// The last committee-attested state transition per market. `commit_batch`
 /// advances it when ≥`threshold` distinct validators sign a batch that chains onto
 /// `last_state_root` with a strictly-greater `last_batch_seq`.
 ///
@@ -543,11 +548,11 @@ impl BatchAttestation {
     }
 }
 
-// ─── Wave 24: H-haircut state ───────────────────────────────────────
+// ─── H-haircut state ─────────────────────────────────────────────────
 //
-// Sibling PDAs to the existing `MarketAccount` and `PositionAccount`.
-// Additive — no legacy layout migration. See `docs/HAIRCUT_MATH.md`
-// for the math and `matcher/haircut.rs` for the pure-function core.
+// Sibling PDAs to the existing `MarketAccount` and `PositionAccount`
+// (no layout change to either). See `docs/HAIRCUT_MATH.md` for the math
+// and `matcher/haircut.rs` for the pure-function core.
 
 /// Per-market haircut state. Tracks the global ratio inputs:
 ///   h = min(Residual, MaturedPosTotal) / MaturedPosTotal
@@ -570,8 +575,7 @@ pub struct MarketHaircutStateAccount {
     /// Cumulative matured positive PnL awaiting conversion. The
     /// denominator for h. Decreases on convert.
     pub matured_pos_total_quote_lots: u128,
-    /// Cumulative realized losses (informational; used for fee
-    /// distribution to FLP in Wave 28).
+    /// Cumulative realized losses (informational).
     pub realized_loss_total_quote_lots: u128,
     /// Floor-rounding dust accrued from convert ops. Drained to
     /// insurance fund on `flush_haircut_dust`.
@@ -636,17 +640,11 @@ impl PositionHaircutStateAccount {
     }
 }
 
-// ─── Wave 25a: A/K/F/B per-side accrual state ───────────────────────
+// ─── A/K/F/B per-side accrual state ──────────────────────────────────
 //
 // Sibling PDA to MarketAccount. Holds the two-sided (long, short)
 // A/K/F/B index quartet that drives O(1) per-position settlement.
-// See `matcher::side_accrual` for the math and Percolator `spec.md`
-// v12.20.6 §3 (Invariant 2) for the formal reference.
-//
-// Wave 25a (this commit) ships the account + init ix. Wave 25b rewires
-// `settle_funding` / `auto_deleverage` to operate on it. Wave 25c adds
-// Position snapshots `(a_snap, k_snap, f_snap, b_snap)` and rewires
-// `apply_fill_to_position` to capture them on attach.
+// See `matcher::side_accrual` for the math and invariants.
 //
 // Seeds: `[b"side_accrual", market]`.
 
@@ -704,8 +702,8 @@ impl MarketSideAccrualAccount {
     }
 
     /// Hydrate the `matcher::side_accrual::SideAccrual` struct for one
-    /// side. Used by Wave 25b wire-in points that operate on the pure
-    /// `SideAccrual` type without binding to Anchor accounts.
+    /// side, for wire-in points that operate on the pure `SideAccrual`
+    /// type without binding to Anchor accounts.
     pub fn long_side(&self) -> crate::matcher::side_accrual::SideAccrual {
         use crate::matcher::side_accrual::*;
         SideAccrual {
@@ -745,8 +743,7 @@ impl MarketSideAccrualAccount {
     }
 
     /// Write back a side's state. Counterpart to `long_side()` /
-    /// `short_side()` — round-tripping `read → mutate → write` is the
-    /// idiomatic wire-in pattern for Wave 25b.
+    /// `short_side()` — wire-in points round-trip `read → mutate → write`.
     pub fn write_long_side(&mut self, s: &crate::matcher::side_accrual::SideAccrual) {
         self.long_a = s.a;
         self.long_k = s.k;
@@ -770,19 +767,15 @@ impl MarketSideAccrualAccount {
     }
 }
 
-// ─── Wave 26a: Per-market envelope config ───────────────────────────
+// ─── Per-market envelope config ──────────────────────────────────────
 //
 // Stores the per-slot price/funding envelope parameters proved at init
 // via `matcher::envelope::prove_envelope`. Once written, the engine
-// can call `gate_price_move` against this account on every mark
+// calls `gate_price_move` against this account on every oracle/mark
 // advance to enforce the per-slot solvency bound.
 //
-// Sibling to MarketAccount; additive — no layout migration. Seeds:
+// Sibling to MarketAccount (no layout change there). Seeds:
 // `[b"envelope", market]`.
-//
-// Wave 26a (this commit) lands the storage + set/verify ix. Wave 26b
-// hooks the runtime gate into apply_fill's mark-EMA advance alongside
-// Wave 25b's settle_funding rewrite.
 
 #[account]
 #[derive(Debug)]
@@ -814,7 +807,7 @@ pub struct MarketEnvelopeConfigAccount {
     pub version: u32,
     pub _pad1: [u8; 4],
 
-    /// Wave 26b — runtime gate state. Tracks the (slot, price) at which
+    /// Runtime gate state. Tracks the (slot, price) at which
     /// the engine last observed an oracle update on this market. Used
     /// to compute `dt_slots` and `|Δp|` for `gate_price_move`. Updated
     /// after every successful oracle update on opted-in markets.
@@ -832,14 +825,15 @@ pub struct MarketEnvelopeConfigAccount {
     pub gate_passes: u64,
     pub gate_rejects: u64,
 
-    /// GOVERNANCE Phase-3 (2026-07): one-way oracle-source lock. `1` = the direct
-    /// authority `update_oracle` / `update_oracle_quorum` paths are DISABLED for this
-    /// market (only the Pyth / Lazer paths are accepted) — removing the compromised-
-    /// authority "walk the mark within the H-6 per-slot cap" vector entirely. Carved
-    /// from `_reserved` so the account size is unchanged and pre-existing envelopes
-    /// read it back as `0` (unlocked). Set (never cleared — one-way) by
-    /// `lock_oracle_source`; enforced in the two direct-write handlers, which already
-    /// REQUIRE this account (H-6), so the lock cannot be bypassed by omitting it.
+    /// One-way oracle-source lock. `1` = the direct authority
+    /// `update_oracle` / `update_oracle_quorum` paths are DISABLED for this
+    /// market (only the Pyth / Lazer paths are accepted) — removing the
+    /// compromised-authority "walk the mark within the per-slot cap" vector
+    /// entirely. Occupies a former `_reserved` byte, so the account size is
+    /// unchanged and envelopes serialized before it read `0` (unlocked).
+    /// Set (never cleared — one-way) by `lock_oracle_source`; enforced in
+    /// the two direct-write handlers, which REQUIRE this account, so the
+    /// lock cannot be bypassed by omitting it.
     pub source_locked: u8,
     pub _reserved: [u8; 31],
 }
@@ -851,7 +845,7 @@ impl MarketEnvelopeConfigAccount {
         // 8 disc + 32 market + 1 bump + 7 pad
         //   + 4 + 8 + 8 + 4 + 4 + 8 + 8 = 44 (params)
         //   + 8 + 4 + 4 pad = 16 (version block)
-        //   + 8 + 8 + 8 + 8 = 32 (Wave 26b gate state)
+        //   + 8 + 8 + 8 + 8 = 32 (runtime gate state)
         //   + 32 reserved
         // = 8 + 32 + 1 + 7 + 44 + 16 + 32 + 32 = 172. Round to 192.
         8 + 192
@@ -889,7 +883,7 @@ impl MarketEnvelopeConfigAccount {
 mod tests {
     use super::*;
 
-    // AUDIT HIGH-7 (2026-07): host coverage for the OCO sibling validation —
+    // Host coverage for the OCO sibling validation —
     // the security-critical check that stops a malicious executor from passing
     // an unrelated trigger just to deactivate it.
     fn mk_trig(trader: Pubkey, market: Pubkey, id: u8, sibling: u8) -> TriggerOrderAccountV3 {
@@ -973,12 +967,12 @@ mod tests {
         assert_ne!(jit, PositionHaircutStateAccount::SEED);
     }
 
-    /// H-8 (audit 2026-06) REGRESSION: `space()` must cover the FULL Borsh
-    /// serialization of a populated account, not an undercounted body. The bug
-    /// returned 8+144 while the real body is 148 bytes → AccountDidNotSerialize
-    /// on a fully-populated V3 TWAP (e.g. one carrying `acceptable_price_ticks`).
-    /// Unlike the sibling `>= 8 + body` checks, this pins the EXACT serialized
-    /// length so any future field addition that desyncs `space()` fails loudly.
+    /// `space()` must cover the FULL Borsh serialization of a populated
+    /// account, not an undercounted body — an undercount fails a
+    /// fully-populated V3 TWAP (e.g. one carrying `acceptable_price_ticks`)
+    /// with AccountDidNotSerialize. Unlike the sibling `>= 8 + body` checks,
+    /// this pins the EXACT serialized length so any future field addition
+    /// that desyncs `space()` fails loudly.
     #[test]
     fn twap_v3_space_matches_borsh_serialized_len() {
         use anchor_lang::AnchorSerialize;
@@ -1105,7 +1099,7 @@ mod tests {
         acc.write_params(&p);
         let q = acc.params();
         assert_eq!(p, q, "round-trip preserves all fields");
-        // Wave 26b gate state defaults to zero (no prior observation).
+        // Runtime gate state defaults to zero (no prior observation).
         assert_eq!(acc.last_observed_slot, 0);
         assert_eq!(acc.last_observed_price_ticks, 0);
         assert_eq!(acc.gate_passes, 0);

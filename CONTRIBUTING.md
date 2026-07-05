@@ -49,7 +49,7 @@ anchor idl build -o idl/flash_book.json
   `Box<Account<...>>` the heavier members — `cargo build-sbf` warns when
   you cross the line.
 - Prefer `#[account(zero_copy)]` + `AccountLoader` for hot-path accounts
-  to avoid Borsh ser/deser CU (see [`docs/CU_OPTIMIZATION.md`](docs/CU_OPTIMIZATION.md)).
+  to avoid Borsh ser/deser CU (see [`docs/SETTLEMENT.md`](docs/SETTLEMENT.md)).
   Pod layouts must have no implicit padding and no `u128` (host/SBF
   alignment differ).
 - Regenerate the IDL (`anchor idl build -o idl/flash_book.json`) in the

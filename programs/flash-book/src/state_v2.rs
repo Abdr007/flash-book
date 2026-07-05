@@ -1,32 +1,25 @@
-//! V2 account types — orderbook over a Manifest-style hypertree.
+//! V2 account types — the orderbook over a hypertree slab.
 //!
-//! This is the future of the order buffer. It eliminates the BPF stack
-//! overflow that bit us at CAP=64 (Borsh deserialise built a 5KB struct
-//! on the 4KB stack). With this layout:
+//! The slab layout keeps every book operation off the 4 KB BPF stack
+//! (a Borsh-deserialized book struct would not fit):
 //!
-//!   * The whole `MarketBookAccount` is `bytemuck::Pod` and loaded via
-//!     `AccountLoader<T>` — never deserialised onto the stack.
+//!   * The book account is never deserialized onto the stack — the
+//!     handle parses a 256-byte header in place and treats the rest as
+//!     a raw byte slab.
 //!   * Bids, asks, and claimed seats live in 3 overlapping red-black
-//!     trees inside a single byte array. One `LinkedList` of free 80-byte
-//!     blocks tracks evictable slots.
-//!   * Adding/cancelling an order is an O(log n) RBT op on a 64-byte
+//!     trees inside that single byte array. A free list of 96-byte
+//!     slots tracks evictable nodes.
+//!   * Adding/cancelling an order is an O(log n) RBT op on an 80-byte
 //!     payload — no per-slot scan, no flat array.
-//!   * Account size is fixed at INIT (8KB data → 100 nodes → ~50
-//!     orders/side + 50 seats); realloc to grow ships in wave 18c.
-//!
-//! See `docs/V3_PLAN.md` § 2.1 for the full design rationale.
-//!
-//! Compatibility note: this lives ALONGSIDE the legacy
-//! `state::OrderBufferAccount` for now. The matcher migration in wave
-//! 18d/e will swap the legacy buffer for this. Wave 18b ships only the
-//! types + init/expand ixs; nothing trades against it yet.
+//!   * Account size is fixed at init (~50 orders/side + 50 seats);
+//!     `expand_market_book` grows it in place up to the ceiling.
 
 use anchor_lang::prelude::*;
 
 use crate::hypertree::{
-    get_helper, get_mut_helper, DataIndex, FreeList, FreeListNode, Get,
-    HyperTreeReadOperations, HyperTreeWriteOperations, Payload, RBNode, RedBlackTree,
-    RedBlackTreeReadOnly, RedBlackTreeReadOperationsHelpers, NIL,
+    get_helper, get_mut_helper, DataIndex, FreeList, FreeListNode, Get, HyperTreeReadOperations,
+    HyperTreeWriteOperations, Payload, RBNode, RedBlackTree, RedBlackTreeReadOnly,
+    RedBlackTreeReadOperationsHelpers, NIL,
 };
 
 /// Bytes available for hypertree nodes after the fixed header **at init**.
@@ -36,12 +29,10 @@ use crate::hypertree::{
 /// is always `MarketBookHandle::data.len()`, NOT this constant.
 pub const MARKET_BOOK_DATA_BYTES: usize = 9_600;
 
-/// Each RBNode<V> = 16-byte RBT header + V (the payload).
-/// We size payloads at 80 bytes so each node = 96 bytes total — wider
-/// than Manifest (64+16=80) because OUR resting orders carry the
-/// trader Pubkey inline (Manifest indirects through a seat). Wave 19's
-/// free-funds optimisation will move trader off the order onto the
-/// seat and shrink back to 80B.
+/// Each RBNode<V> = 16-byte RBT header + V (the payload). Payloads are
+/// 80 bytes so each node is 96 bytes total: resting orders carry the
+/// trader Pubkey inline, so cancel/modify can verify ownership without
+/// an extra seat lookup.
 pub const NODE_PAYLOAD_BYTES: usize = 80;
 pub const NODE_TOTAL_BYTES: usize = 96;
 
@@ -98,9 +89,9 @@ pub struct MarketBookHeader {
     /// `RestingOrderV2.order_id` along with the side bit.
     pub order_seq_counter: u64,
 
-    /// Future-proofing — 112 bytes for fields we'll add in waves 19-22
-    /// without breaking layout. Split into ≤32-byte chunks because
-    /// bytemuck's classical `Pod for [T; N]` impl tops out at N=32.
+    /// Reserved — 112 bytes for future fields without a layout break.
+    /// Split into ≤32-byte chunks because bytemuck's classical
+    /// `Pod for [T; N]` impl tops out at N=32.
     pub _reserved_a: [u8; 32],
     pub _reserved_b: [u8; 32],
     pub _reserved_c: [u8; 32],
@@ -111,26 +102,26 @@ const _: () = assert!(std::mem::size_of::<MarketBookHeader>() == 256);
 
 // ─── RestingOrderV2 ──────────────────────────────────────────────────
 
-/// 64-byte resting-order payload. Carries everything the matcher needs
-/// to clear a fill PLUS the GTT expiry + Phoenix-style `order_id` that
-/// encodes side in the leading bit so a single u64 ordering serves
-/// both bids and asks.
+/// 80-byte resting-order payload. Carries everything the matcher needs
+/// to clear a fill PLUS the GTT expiry + an `order_id` whose encoding
+/// makes a single ascending u64 ordering serve both bids and asks.
 ///
 /// Implements `Ord` by `order_id` (which embeds price + seq + side). The
 /// RBT uses this for sort.
 ///
-/// AUDIT M-7 airtight (2026-07): `RestingOrderV2.flags` bit1 = REDUCE_ONLY. Set ONLY
-/// by the program when a reduce-only trigger/bracket leg injects its close order
-/// (never settable on a user place path — those reject bit1 at intake). The matcher
-/// caps a crossed reduce-only maker's fill to the maker's reducible position size so
-/// it can only close, never open/flip. See `matcher::reduce_only::check_reduce_only`.
+/// `RestingOrderV2.flags` bit1 = REDUCE_ONLY. Set ONLY by the program
+/// when a reduce-only trigger/bracket leg injects its close order (never
+/// settable on a user place path — those reject bit1 at intake). The
+/// matcher caps a crossed reduce-only maker's fill to the maker's
+/// reducible position size so it can only close, never open/flip. See
+/// `matcher::reduce_only::check_reduce_only`.
 pub const FLAG_REDUCE_ONLY: u8 = 0b0000_0010;
 
 #[zero_copy]
 pub struct RestingOrderV2 {
-    /// `(price << 16) | (seq mod 2^16)`. For bids, the resulting u64
-    /// is INVERTED (`!`) so natural ascending sort still puts the
-    /// highest-price bids first. Phoenix's exact pattern.
+    /// Side-encoded sort key: high bits price, low bits seq. For bids
+    /// the price field is inverted so natural ascending sort puts the
+    /// highest-price bids first (see `encode_order_id`).
     pub order_id: u64,
     /// Per-batch monotonic sequence — used for FIFO tie-breaking within
     /// a price level (price-time priority).
@@ -144,10 +135,8 @@ pub struct RestingOrderV2 {
     /// this order. Cleanup keepers reclaim rent via cancel.
     pub expires_at_slot: u64,
 
-    /// Trader pubkey (32 B). In wave 19's free-funds optimisation this
-    /// will be replaced by `trader_index: u32` pointing at the trader's
-    /// seat in the same byte array; for now we carry the pubkey inline
-    /// so wave 18d can ship without seat-claim plumbing.
+    /// Trader pubkey (32 B), carried inline so cancel/modify verify
+    /// ownership directly against the order node.
     pub trader: Pubkey,
 
     /// Anti-replay guard for off-chain replay tools. u32 saturates to
@@ -157,18 +146,18 @@ pub struct RestingOrderV2 {
     /// (treat `last_valid_slot == u32::MAX` as "always valid").
     pub last_valid_slot: u32,
 
-    pub side: u8,        // 0 = long/buy/bid, 1 = short/sell/ask
-    pub order_type: u8,  // 0 = limit, 1 = ioc, 2 = post_only, 3 = jit
+    pub side: u8,       // 0 = long/buy/bid, 1 = short/sell/ask
+    pub order_type: u8, // 0 = limit, 1 = ioc, 2 = post_only, 3 = jit
     /// Bitfield (authoritative layout — see lib.rs place_limit_order_v2 docs +
-    /// the matcher reads): bit0 post_only, bit1 reduce_only (UNSUPPORTED on v2 —
-    /// rejected at intake, H4), bit2 ioc, bit3 jit, bits 4-5 stp_mode, bit6 fok.
+    /// the matcher reads): bit0 post_only, bit1 reduce_only (program-injected
+    /// only — rejected on user place paths at intake), bit2 ioc, bit3 jit,
+    /// bits 4-5 stp_mode, bit6 fok.
     pub flags: u8,
-    /// Phase 2e — sub-account index this order belongs to.
+    /// Sub-account index this order belongs to.
     /// `0` (default) = main TraderState `[STATE_SEED, trader.as_ref()]`.
     /// `1..=255` = sub TraderState `[STATE_SEED, trader.as_ref(), &[sub_index]]`.
-    /// Repurposed from the prior `_pad` byte — layout-compatible because
-    /// pre-Phase-2e hypertree nodes serialised `_pad = 0`, which now
-    /// reads back as `sub_index = 0` (the main-account default).
+    /// Occupies a former `_pad` byte — nodes serialized before the field
+    /// existed carry 0 here, which reads as the main-account default.
     /// ApplyFill / ApplyFlpFill use this to route fills + fees + PnL
     /// to the correct TraderState. Cancel / modify do NOT need to read
     /// it (those ixs verify the signer against `order.trader`, the
@@ -219,22 +208,21 @@ pub const ORDER_ID_SEQ_BITS: u32 = 24;
 pub const MAX_PRICE_TICKS_ENCODABLE: u64 = (1u64 << ORDER_ID_PRICE_BITS) - 1;
 pub const MAX_SEQ_ENCODABLE: u64 = (1u64 << ORDER_ID_SEQ_BITS) - 1;
 
-/// H1 (audit 2026-06) FIX: fail-loud ceiling on the FIFO `seq` before it is
-/// committed to the book. `encode_order_id` masks `seq` to `ORDER_ID_SEQ_BITS`
-/// (24) bits; once the per-market `order_seq_counter` exceeds `MAX_SEQ_ENCODABLE`
-/// the masked low bits WRAP toward 0, so a fresh order would get a SMALLER
-/// `order_id` than older orders at the same price (price-time-priority violation)
-/// and could even collide on `order_id` with a live order (mis-resolving
-/// cancel/modify and corrupting the best-index cache). Every resting order —
-/// user, FLP, trigger, TWAP, iceberg, basket — funnels through `insert_bid`/
-/// `insert_ask`, so enforcing the bound here is the single complete chokepoint
-/// and is exactly the precondition the `encode_order_id` Kani proofs assume.
-/// Fail-loud (reject the order) forces a market reseat before the counter wraps,
-/// rather than silently corrupting the book. The prior `< FLP_SEQ_RESERVED_OFFSET`
-/// (2^56) checks at placement were 32 bits too loose to protect the 24-bit field.
-/// Pure predicate: does `seq` fit the 24-bit `order_id` field without aliasing?
-/// This is the SAME bound the `encode_order_id` priority/collision Kani proofs
-/// `assume()`, so the runtime guard and the FV precondition can never drift.
+/// Fail-loud ceiling on the FIFO `seq` before it is committed to the book.
+/// `encode_order_id` masks `seq` to `ORDER_ID_SEQ_BITS` (24) bits; past
+/// `MAX_SEQ_ENCODABLE` the masked low bits WRAP toward 0, so a fresh order
+/// would get a SMALLER `order_id` than older orders at the same price
+/// (price-time-priority violation) and could even collide on `order_id`
+/// with a live order (mis-resolving cancel/modify and corrupting the
+/// best-index cache). Every resting order — user, FLP, trigger, TWAP,
+/// iceberg, basket — funnels through `insert_bid`/`insert_ask`, so
+/// enforcing the bound there is the single complete chokepoint. Fail-loud
+/// (reject the order) forces a market reseat before the counter wraps,
+/// rather than silently corrupting the book.
+/// Pure predicate: does `seq` fit the 24-bit `order_id` field without
+/// aliasing? This is the SAME bound the `encode_order_id`
+/// priority/collision Kani proofs `assume()`, so the runtime guard and the
+/// FV precondition can never drift.
 #[inline]
 pub const fn seq_is_encodable(seq: u64) -> bool {
     seq <= MAX_SEQ_ENCODABLE
@@ -251,19 +239,18 @@ pub fn require_seq_encodable(seq: u64) -> Result<()> {
 
 /// Compose the side-encoded `order_id` from (price_ticks, seq, side).
 ///
-/// For BIDS we invert ONLY the price field — not the whole word — so a
+/// For BIDS only the price field is inverted — not the whole word — so a
 /// single ascending `order_id` walk yields correct price-TIME priority on
 /// both books:
 ///   * higher price => better => smaller key   (price inverted for bids)
 ///   * older seq     => better => smaller key   (seq ascending for BOTH sides)
 ///
-/// The previous implementation inverted the entire word for bids, which
-/// also inverted the seq tiebreak and made bids fill **LIFO** at each price
-/// level (a price-time-priority violation). Asks were unaffected.
+/// Inverting the entire word would also invert the seq tiebreak and make
+/// bids fill LIFO at each price level (a price-time-priority violation).
 ///
-/// Price is **saturated** to `MAX_PRICE_TICKS_ENCODABLE` (clamp keeps the
-/// ordering monotonic; the old code masked, which would wrap an out-of-range
-/// price to a tiny key and mis-order the book). Seq is masked to 24 bits;
+/// Price is **saturated** to `MAX_PRICE_TICKS_ENCODABLE` — a clamp keeps
+/// the ordering monotonic, where masking would wrap an out-of-range price
+/// to a tiny key and mis-order the book. Seq is masked to 24 bits;
 /// placement enforces the 24-bit ceiling so masking can never alias a live id.
 pub fn encode_order_id(price_ticks: u64, seq: u64, side_is_bid: bool) -> u64 {
     let price = price_ticks.min(MAX_PRICE_TICKS_ENCODABLE);
@@ -307,9 +294,7 @@ pub fn probe_order(order_id: u64) -> RestingOrderV2 {
 // ─────────────────────────────────────────────────────────────────────
 #[cfg(kani)]
 mod order_id_priority_kani_proofs {
-    use super::{
-        encode_order_id, seq_is_encodable, MAX_PRICE_TICKS_ENCODABLE, MAX_SEQ_ENCODABLE,
-    };
+    use super::{encode_order_id, seq_is_encodable, MAX_PRICE_TICKS_ENCODABLE, MAX_SEQ_ENCODABLE};
 
     /// H1: the insert-time guard `seq_is_encodable` admits EXACTLY the seqs every
     /// proof in this module `assume()`s — so runtime enforcement and the FV
@@ -399,11 +384,10 @@ mod order_id_priority_kani_proofs {
 
 // ─── ClaimedSeatV2 ───────────────────────────────────────────────────
 
-/// 64-byte per-(market, trader) seat. Holds the trader pubkey + open
-/// order count + free-funds balances (Phoenix-style settlement). On
-/// first trade in a market the trader claims a seat (one-time rent
-/// ≈ $0.0005). Subsequent trades settle into `quote_free_lots` — no
-/// SPL token CPI on every fill (sub-100µs hot path, wave 19).
+/// 80-byte per-(market, trader) seat. Holds the trader pubkey + open
+/// order count + free-funds balances. On first trade in a market the
+/// trader claims a seat (one-time rent ≈ $0.0005). Subsequent trades
+/// settle into `quote_free_lots` — no SPL token CPI on every fill.
 #[zero_copy]
 pub struct ClaimedSeatV2 {
     pub trader: Pubkey,
@@ -430,7 +414,9 @@ pub struct ClaimedSeatV2 {
 const _: () = assert!(std::mem::size_of::<ClaimedSeatV2>() == 80);
 
 impl PartialEq for ClaimedSeatV2 {
-    fn eq(&self, other: &Self) -> bool { self.trader == other.trader }
+    fn eq(&self, other: &Self) -> bool {
+        self.trader == other.trader
+    }
 }
 impl Eq for ClaimedSeatV2 {}
 impl PartialOrd for ClaimedSeatV2 {
@@ -445,7 +431,11 @@ impl Ord for ClaimedSeatV2 {
 }
 impl std::fmt::Display for ClaimedSeatV2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Seat {{ trader={} open={} }}", self.trader, self.open_orders_count)
+        write!(
+            f,
+            "Seat {{ trader={} open={} }}",
+            self.trader, self.open_orders_count
+        )
     }
 }
 impl Get for ClaimedSeatV2 {}
@@ -457,16 +447,12 @@ impl Get for ClaimedSeatV2 {}
 // requires every field to satisfy a derive-time check that bytemuck's
 // blanket array impl doesn't visibly satisfy in this expansion).
 //
-// Manifest's solution: don't use Anchor at all; raw Solana program with
-// `UncheckedAccount` + manual `&[u8]` slicing. We adopt the same
-// pattern in wave 18c — define a `MarketBookHandle<'a>` newtype that
-// wraps a `&mut [u8]`, parses the first 256 bytes as `MarketBookHeader`
-// via `bytemuck::from_bytes`, and exposes the rest as the dynamic byte
+// The book account therefore bypasses Anchor account types entirely:
+// it is an `UncheckedAccount` (owner-checked at the context level)
+// accessed through `MarketBookHandle<'a>` — a newtype over `&mut [u8]`
+// that parses the first 256 bytes as `MarketBookHeader` via
+// `bytemuck::from_bytes` and exposes the rest as the dynamic byte
 // array for the hypertree's `FreeList`/`RedBlackTree` ops.
-//
-// For wave 18b the header + payload structs above are enough to
-// validate the layout and start writing the matcher migration.
-// `init_market_book` ix lands in wave 18c.
 
 // Compile-time sanity: RBNode<RestingOrderV2> and RBNode<ClaimedSeatV2>
 // are exactly NODE_TOTAL_BYTES (96), so they fit the same FreeList
@@ -498,13 +484,11 @@ pub const MARKET_BOOK_DISC: [u8; 8] = [0xFB, 0xBA, 0x00, 0x4B, 0x4D, 0x4B, 0x42,
 /// 8-byte discriminator + 256-byte header.
 pub const MARKET_BOOK_DISC_BYTES: usize = 8;
 pub const MARKET_BOOK_HEADER_BYTES: usize = 256;
-pub const MARKET_BOOK_PREFIX_BYTES: usize =
-    MARKET_BOOK_DISC_BYTES + MARKET_BOOK_HEADER_BYTES;
+pub const MARKET_BOOK_PREFIX_BYTES: usize = MARKET_BOOK_DISC_BYTES + MARKET_BOOK_HEADER_BYTES;
 
 /// Total byte size of a freshly-initialised MarketBookAccount
 /// (disc + header + initial data). = 8 + 256 + 9600 = 9864 bytes.
-pub const MARKET_BOOK_TOTAL_BYTES: usize =
-    MARKET_BOOK_PREFIX_BYTES + MARKET_BOOK_DATA_BYTES;
+pub const MARKET_BOOK_TOTAL_BYTES: usize = MARKET_BOOK_PREFIX_BYTES + MARKET_BOOK_DATA_BYTES;
 
 /// Largest a MarketBookAccount may grow to via `expand_market_book`.
 /// = 264 + 960,000 = 960,264 bytes.
@@ -536,8 +520,8 @@ impl<'a> MarketBookHandle<'a> {
         );
         let (header_bytes, dyn_data) = data[8..].split_at_mut(256);
         let header: &mut MarketBookHeader = bytemuck::from_bytes_mut(header_bytes);
-        // AUDIT (re-audit ER L-2): bounds-check the header's node indices against
-        // the slab capacity. A structurally-invalid book — e.g. one committed by a
+        // Bounds-check the header's node indices against the slab capacity.
+        // A structurally-invalid book — e.g. one committed by a
         // malicious or buggy ER sequencer across an undelegate, or any tampered
         // account — could otherwise drive a raw slab accessor out of bounds
         // (panic/DoS) or misread an in-bounds-but-bogus node. `NIL` is the valid
@@ -560,12 +544,14 @@ impl<'a> MarketBookHandle<'a> {
             require!(
                 idx == NIL
                     || (off % NODE_TOTAL_BYTES == 0
-                        && off.checked_add(NODE_TOTAL_BYTES).is_some_and(|end| end <= slab_len)),
+                        && off
+                            .checked_add(NODE_TOTAL_BYTES)
+                            .is_some_and(|end| end <= slab_len)),
                 crate::errors::FlashBookError::OutOfRange
             );
         }
-        // AUDIT M-1 (2026-07): the bump allocator returns `num_bytes_allocated` as
-        // the next fresh node offset. If a malicious-/buggy-ER commit leaves it
+        // The bump allocator returns `num_bytes_allocated` as the next
+        // fresh node offset. If a malicious-/buggy-ER commit leaves it
         // non-node-aligned or past the slab, the next `alloc_node` yields a
         // misaligned slice (bytemuck alignment panic → placement brick) or an
         // in-bounds offset that overlaps a live node (silent corruption). Validate
@@ -579,11 +565,14 @@ impl<'a> MarketBookHandle<'a> {
         // would add O(capacity) CU to EVERY book op on the hot path. Instead they are
         // validated ONCE, when a book re-enters L1 via `process_undelegation` (the
         // only point a malicious-ER-committed book can arrive), by
-        // `MarketBookHandle::validate_node_links` below. Zero hot-path cost (AUDIT O-1).
-        Ok(MarketBookHandle { header, data: dyn_data })
+        // `MarketBookHandle::validate_node_links` below. Zero hot-path cost.
+        Ok(MarketBookHandle {
+            header,
+            data: dyn_data,
+        })
     }
 
-    /// AUDIT O-1 (2026-06 deep audit) — validate every node's INTERNAL RBT links
+    /// Validate every node's INTERNAL RBT links
     /// (`left`/`right`/`parent`), not just the 6 header roots `from_account_data`
     /// checks. The hot traversal accessors use the unchecked `get_helper`, so a book
     /// carrying an out-of-range child pointer would panic-DoS the FIRST L1 traversal
@@ -611,7 +600,10 @@ impl<'a> MarketBookHandle<'a> {
         );
         let slab = &account_data[MARKET_BOOK_PREFIX_BYTES..];
         let slab_len = slab.len();
-        require!(slab_len % NODE_TOTAL_BYTES == 0, crate::errors::FlashBookError::OutOfRange);
+        require!(
+            slab_len % NODE_TOTAL_BYTES == 0,
+            crate::errors::FlashBookError::OutOfRange
+        );
         let node_count = slab_len / NODE_TOTAL_BYTES;
         for i in 0..node_count {
             let base = i * NODE_TOTAL_BYTES;
@@ -628,7 +620,7 @@ impl<'a> MarketBookHandle<'a> {
                     crate::errors::FlashBookError::OutOfRange
                 );
             }
-            // AUDIT L-1 (2026-07): `RBNode.color` (byte offset 12) is a `#[repr(u8)]`
+            // `RBNode.color` (byte offset 12) is a `#[repr(u8)]`
             // enum with only 0=Black / 1=Red valid; reading any other discriminant as
             // the enum is UB. `unsafe impl Pod` bypasses bytemuck's variant check, so
             // validate the byte here. Free/unused slots are zeroed (0=Black), so a
@@ -639,21 +631,21 @@ impl<'a> MarketBookHandle<'a> {
             );
         }
 
-        // AUDIT HIGH-5 (2026-07): the per-link bounds check above stops an OOB
-        // panic but NOT an infinite loop. A malicious-/buggy-ER commit can plant
-        // a book whose links are all in-bounds yet form a CYCLE (e.g. A.right=B
-        // and B.right=A). `validate` used to accept it, and the first L1
-        // traversal (lookup_max / get_next_higher — all unbounded `while` loops)
-        // would spin forever → compute-exhaustion → the market bricks (there is
-        // no reset ix). Close it with a bounded-reachability walk: DFS each tree
+        // The per-link bounds check above stops an OOB panic but NOT an
+        // infinite loop: a malicious-/buggy-ER commit can plant a book whose
+        // links are all in-bounds yet form a CYCLE (e.g. A.right=B and
+        // B.right=A), and the L1 traversals (lookup_max / get_next_higher)
+        // are unbounded `while` loops — a cycle would spin to compute
+        // exhaustion and brick the market (there is no reset ix). The guard
+        // is a bounded-reachability walk: DFS each tree
         // from its root with a SHARED visited bitmap, rejecting a revisit (cycle
         // or cross-tree aliasing) or a child whose `parent` link does not point
         // back (broken symmetry). Verifying child→parent symmetry along an
         // acyclic DFS also makes every parent-chain (up-walk) acyclic. Runs ONCE
         // per undelegate, off the hot path.
         let header: &MarketBookHeader = bytemuck::from_bytes(
-            &account_data[MARKET_BOOK_DISC_BYTES
-                ..MARKET_BOOK_DISC_BYTES + MARKET_BOOK_HEADER_BYTES],
+            &account_data
+                [MARKET_BOOK_DISC_BYTES..MARKET_BOOK_DISC_BYTES + MARKET_BOOK_HEADER_BYTES],
         );
         let read_link = |off: usize, link_off: usize| -> u32 {
             let mut b = [0u8; 4];
@@ -700,7 +692,7 @@ impl<'a> MarketBookHandle<'a> {
             }
         }
 
-        // AUDIT H-3 (2026-07): the cached best-bid/best-ask pointers are NOT roots
+        // The cached best-bid/best-ask pointers are NOT roots
         // of the DFS above, so a commit can plant a `best` that points at a detached
         // node (unreachable from any root) whose self-cycle the DFS never inspects;
         // the first `for_each_best_first` walk then starts there and spins forever
@@ -720,7 +712,7 @@ impl<'a> MarketBookHandle<'a> {
             }
         }
 
-        // AUDIT H-4 (2026-07): the free list is not walked by the tree DFS. A commit
+        // The free list is not walked by the tree DFS. A commit
         // can plant a free list that (a) cycles or (b) aliases a live tree node, so a
         // later `alloc_node` pops a slot that is still linked in a tree → one physical
         // slot in two logical positions (use-after-free / type confusion / eventual
@@ -734,7 +726,10 @@ impl<'a> MarketBookHandle<'a> {
             let mut steps = 0usize;
             while free != NIL {
                 steps += 1;
-                require!(steps <= node_count, crate::errors::FlashBookError::OutOfRange);
+                require!(
+                    steps <= node_count,
+                    crate::errors::FlashBookError::OutOfRange
+                );
                 let off = free as usize;
                 require!(
                     off % NODE_TOTAL_BYTES == 0
@@ -750,7 +745,7 @@ impl<'a> MarketBookHandle<'a> {
             }
         }
 
-        // AUDIT M-1 (2026-07): fail closed at undelegation on a corrupt bump pointer
+        // Fail closed at undelegation on a corrupt bump pointer
         // too (from_account_data validates it on every subsequent op, but reverting
         // the undelegate keeps the corrupt book off L1 in the first place).
         require!(
@@ -808,10 +803,8 @@ impl<'a> MarketBookHandle<'a> {
     pub fn alloc_node(&mut self) -> Result<DataIndex> {
         // Try free-list first.
         let free_idx = {
-            let mut fl = FreeList::<FreeListPadding>::new(
-                self.data,
-                self.header.free_list_head_index,
-            );
+            let mut fl =
+                FreeList::<FreeListPadding>::new(self.data, self.header.free_list_head_index);
             let popped = fl.remove();
             self.header.free_list_head_index = fl.get_head();
             popped
@@ -836,10 +829,7 @@ impl<'a> MarketBookHandle<'a> {
     /// Return a node to the free-list. Caller is responsible for having
     /// removed the node from any tree it lived in first.
     pub fn free_node(&mut self, idx: DataIndex) {
-        let mut fl = FreeList::<FreeListPadding>::new(
-            self.data,
-            self.header.free_list_head_index,
-        );
+        let mut fl = FreeList::<FreeListPadding>::new(self.data, self.header.free_list_head_index);
         fl.add(idx);
         self.header.free_list_head_index = fl.get_head();
     }
@@ -856,11 +846,8 @@ impl<'a> MarketBookHandle<'a> {
         let new_order_id = order.order_id;
         let new_root;
         {
-            let mut tree = RedBlackTree::<RestingOrderV2>::new(
-                self.data,
-                self.header.bids_root_index,
-                NIL,
-            );
+            let mut tree =
+                RedBlackTree::<RestingOrderV2>::new(self.data, self.header.bids_root_index, NIL);
             tree.insert(idx, order);
             new_root = tree.get_root_index();
         }
@@ -868,9 +855,7 @@ impl<'a> MarketBookHandle<'a> {
         // O(1) best update: new is best iff tree was empty OR new order_id
         // < current best's order_id. No leftmost-walk required.
         let cur_best = self.header.bids_best_index;
-        if cur_best == NIL
-            || new_order_id < self.order_at(cur_best).order_id
-        {
+        if cur_best == NIL || new_order_id < self.order_at(cur_best).order_id {
             self.header.bids_best_index = idx;
         }
         self.header.total_orders_active = self.header.total_orders_active.saturating_add(1);
@@ -886,19 +871,14 @@ impl<'a> MarketBookHandle<'a> {
         let new_order_id = order.order_id;
         let new_root;
         {
-            let mut tree = RedBlackTree::<RestingOrderV2>::new(
-                self.data,
-                self.header.asks_root_index,
-                NIL,
-            );
+            let mut tree =
+                RedBlackTree::<RestingOrderV2>::new(self.data, self.header.asks_root_index, NIL);
             tree.insert(idx, order);
             new_root = tree.get_root_index();
         }
         self.header.asks_root_index = new_root;
         let cur_best = self.header.asks_best_index;
-        if cur_best == NIL
-            || new_order_id < self.order_at(cur_best).order_id
-        {
+        if cur_best == NIL || new_order_id < self.order_at(cur_best).order_id {
             self.header.asks_best_index = idx;
         }
         self.header.total_orders_active = self.header.total_orders_active.saturating_add(1);
@@ -909,8 +889,8 @@ impl<'a> MarketBookHandle<'a> {
     /// `f(idx, order)` for each resting bid. Stops early if `f` returns
     /// `false`. Read-only; safe to call from a view ix.
     ///
-    /// Wave 18e's read-side primitive — wave 18f's matcher walks the tree
-    /// via this same helper to consume liquidity in price-time priority.
+    /// The matcher walks the tree via this same helper to consume
+    /// liquidity in price-time priority.
     pub fn for_each_bid_best_first<F>(&self, mut f: F)
     where
         F: FnMut(DataIndex, &RestingOrderV2) -> bool,
@@ -993,18 +973,14 @@ impl<'a> MarketBookHandle<'a> {
 
         let new_root;
         {
-            let mut tree = RedBlackTree::<RestingOrderV2>::new(
-                self.data,
-                self.header.bids_root_index,
-                NIL,
-            );
+            let mut tree =
+                RedBlackTree::<RestingOrderV2>::new(self.data, self.header.bids_root_index, NIL);
             tree.remove_by_index(idx);
             new_root = tree.get_root_index();
         }
         self.header.bids_root_index = new_root;
         self.header.bids_best_index = new_best;
-        self.header.total_orders_active =
-            self.header.total_orders_active.saturating_sub(1);
+        self.header.total_orders_active = self.header.total_orders_active.saturating_sub(1);
         self.free_node(idx);
     }
 
@@ -1024,18 +1000,14 @@ impl<'a> MarketBookHandle<'a> {
 
         let new_root;
         {
-            let mut tree = RedBlackTree::<RestingOrderV2>::new(
-                self.data,
-                self.header.asks_root_index,
-                NIL,
-            );
+            let mut tree =
+                RedBlackTree::<RestingOrderV2>::new(self.data, self.header.asks_root_index, NIL);
             tree.remove_by_index(idx);
             new_root = tree.get_root_index();
         }
         self.header.asks_root_index = new_root;
         self.header.asks_best_index = new_best;
-        self.header.total_orders_active =
-            self.header.total_orders_active.saturating_sub(1);
+        self.header.total_orders_active = self.header.total_orders_active.saturating_sub(1);
         self.free_node(idx);
     }
 
@@ -1068,16 +1040,14 @@ impl<'a> MarketBookHandle<'a> {
         );
         tree.lookup_index::<RestingOrderV2>(&probe)
     }
-
 }
 
 /// 92-byte payload for the FreeList — pure padding. Sized so that
 /// `FreeListNode<FreeListPadding>` (next_index 4B + payload 92B) is exactly
 /// `NODE_TOTAL_BYTES` (96), which means `FreeList::add` scrubs the **entire**
-/// freed slab slot rather than the first 84 bytes — closing HYP-C2/H-2 (a
-/// freed slot used to retain 12 stale RBNode bytes: stale parent/color/high
-/// value bytes that were a latent dangling-index footgun under refactor /
-/// formal verification). Manifest's pattern, full-slot variant.
+/// freed slab slot: a shorter payload would leave stale RBNode bytes
+/// (parent/color/high value bytes) in freed slots — a latent
+/// dangling-index footgun.
 #[zero_copy]
 pub struct FreeListPadding {
     pub _padding_a: [u8; 32],
@@ -1090,9 +1060,8 @@ const _: () = assert!(std::mem::size_of::<FreeListPadding>() == 92);
 // Must equal NODE_TOTAL_BYTES so a freed slot is fully zeroed by `add`.
 const _: () = assert!(std::mem::size_of::<FreeListNode<FreeListPadding>>() == NODE_TOTAL_BYTES);
 
-/// FreeList sentinel — Manifest uses `u32::MAX` to mean "no more free
-/// nodes". When `FreeList::remove()` returns this, the bump-alloc
-/// fallback kicks in.
+/// FreeList sentinel: `u32::MAX` means "no more free nodes". When
+/// `FreeList::remove()` returns this, the bump-alloc fallback kicks in.
 const FREE_LIST_END: DataIndex = u32::MAX;
 
 // ─── RBT walk helpers ────────────────────────────────────────────────
@@ -1123,10 +1092,7 @@ fn leftmost_descendant<V: Payload>(
 /// right-child case and the walk-up-while-right-child case). The vendored
 /// `get_next_higher_index` only handles the first case (debug-asserts a
 /// right child exists) because remove never calls it on leaves.
-fn successor_index<V: Payload>(
-    tree: &RedBlackTreeReadOnly<V>,
-    idx: DataIndex,
-) -> DataIndex {
+fn successor_index<V: Payload>(tree: &RedBlackTreeReadOnly<V>, idx: DataIndex) -> DataIndex {
     if idx == NIL {
         return NIL;
     }
@@ -1152,12 +1118,8 @@ fn successor_index<V: Payload>(
 /// Internal: walk an RBT in BEST → WORST (ascending order_id) order,
 /// calling `f` on each. `cached_min` is consulted first for O(1) start;
 /// if `NIL`, falls back to walking from `root`.
-fn for_each_best_first<V, F>(
-    data: &[u8],
-    root: DataIndex,
-    cached_min: DataIndex,
-    f: &mut F,
-) where
+fn for_each_best_first<V, F>(data: &[u8], root: DataIndex, cached_min: DataIndex, f: &mut F)
+where
     V: Payload,
     F: FnMut(DataIndex, &V) -> bool,
 {
@@ -1200,12 +1162,7 @@ mod tests {
         make_order_for(price, seq, side_is_bid, Pubkey::default())
     }
 
-    fn make_order_for(
-        price: u64,
-        seq: u64,
-        side_is_bid: bool,
-        trader: Pubkey,
-    ) -> RestingOrderV2 {
+    fn make_order_for(price: u64, seq: u64, side_is_bid: bool, trader: Pubkey) -> RestingOrderV2 {
         RestingOrderV2 {
             order_id: encode_order_id(price, seq, side_is_bid),
             seq,
@@ -1251,14 +1208,15 @@ mod tests {
         assert_eq!(handle.header.asks_best_index, NIL);
     }
 
-    // AUDIT F-3 (2026-07): validates the cumulative reduce-only capacity scan +
-    // clamp used by `execute_trigger_order_v3` — the exact `for_each_ask_best_first`
+    // Validates the cumulative reduce-only capacity scan + clamp used by
+    // `execute_trigger_order_v3` — the exact `for_each_ask_best_first`
     // predicate (reduce-only flag + same trader + same sub_index) and the
-    // `min(req, position − Σexisting)` math — on a REAL MarketBookHandle. Proves the
-    // scan sums only THIS position's resting reduce-only orders (not other traders,
-    // other sub_indices, or non-reduce-only orders), preserves scale-out (partials
-    // summing ≤ position all fit), and trims genuine over-capacity to 0 (the flip
-    // that F-3 exploits can never be set up).
+    // `min(req, position − Σexisting)` math — on a REAL MarketBookHandle.
+    // Proves the scan sums only THIS position's resting reduce-only orders
+    // (not other traders, other sub_indices, or non-reduce-only orders),
+    // preserves scale-out (partials summing ≤ position all fit), and trims
+    // genuine over-capacity to 0 (no setup can flip a position across the
+    // match→settle gap).
     fn insert_ro_ask(
         handle: &mut MarketBookHandle,
         seq: u64,
@@ -1290,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_reduce_only_capacity_clamp_scan() {
+    fn reduce_only_capacity_clamp_scan() {
         let mut data = make_book();
         let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
         let trader = Pubkey::new_unique();
@@ -1304,13 +1262,21 @@ mod tests {
         // Scale-out is preserved: first 50-lot exit fits, second 50 still fits (Σ=100).
         insert_ro_ask(&mut handle, 1, trader, 0, 50, true);
         assert_eq!(scan_ro(&handle, trader, 0), 50);
-        assert_eq!(clamp(position, 50, 50), 50, "scale-out second partial exit fits");
+        assert_eq!(
+            clamp(position, 50, 50),
+            50,
+            "scale-out second partial exit fits"
+        );
 
         insert_ro_ask(&mut handle, 2, trader, 0, 50, true);
         assert_eq!(scan_ro(&handle, trader, 0), 100);
         // Over-capacity: a THIRD reduce-only exit is trimmed to 0 — this is exactly
         // what stops two orders from summing past the position and flipping it.
-        assert_eq!(clamp(position, 100, 50), 0, "F-3: over-capacity reduce-only trimmed to 0");
+        assert_eq!(
+            clamp(position, 100, 50),
+            0,
+            "over-capacity reduce-only trimmed to 0"
+        );
 
         // Must NOT count: a different trader, a different sub_index, or a
         // non-reduce-only order — otherwise the clamp would wrongly block legit orders.
@@ -1353,21 +1319,23 @@ mod tests {
 
     #[test]
     fn insert_rejects_seq_beyond_encoding_ceiling() {
-        // H1 (audit 2026-06): a seq past the 24-bit encoding ceiling would wrap
+        // A seq past the 24-bit encoding ceiling would wrap
         // the low bits of order_id (price-time-priority break + id collision).
         // Both insert paths must fail loud, and a seq exactly at the ceiling
         // must still be accepted (boundary).
         let mut data = make_book();
         let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
 
-        assert!(handle.insert_bid(make_order(100, MAX_SEQ_ENCODABLE, true)).is_ok());
-        assert!(handle.insert_ask(make_order(100, MAX_SEQ_ENCODABLE, false)).is_ok());
+        assert!(handle
+            .insert_bid(make_order(100, MAX_SEQ_ENCODABLE, true))
+            .is_ok());
+        assert!(handle
+            .insert_ask(make_order(100, MAX_SEQ_ENCODABLE, false))
+            .is_ok());
         assert!(handle
             .insert_bid(make_order(100, MAX_SEQ_ENCODABLE + 1, true))
             .is_err());
-        assert!(handle
-            .insert_ask(make_order(100, u64::MAX, false))
-            .is_err());
+        assert!(handle.insert_ask(make_order(100, u64::MAX, false)).is_err());
         // Only the two in-range orders ever joined the book.
         assert_eq!(handle.header.total_orders_active, 2);
     }
@@ -1484,7 +1452,11 @@ mod tests {
         handle.insert_bid(make_order(100, 1, true)).unwrap(); // older, cheaper
         handle.insert_bid(make_order(101, 2, true)).unwrap(); // newer, pricier
         let best = handle.header.bids_best_index;
-        assert_eq!(handle.order_at(best).price_ticks, 101, "highest bid is best");
+        assert_eq!(
+            handle.order_at(best).price_ticks,
+            101,
+            "highest bid is best"
+        );
     }
 
     #[test]
@@ -1604,7 +1576,7 @@ mod tests {
         assert!(MarketBookHandle::from_account_data(&mut huge).is_err());
     }
 
-    // ER L-2 (re-audit): from_account_data must reject a structurally-corrupt
+    // from_account_data must reject a structurally-corrupt
     // header node index (OOB or misaligned) — never feed it to a raw slab
     // accessor — while still accepting a well-formed book.
     #[test]
@@ -1637,18 +1609,18 @@ mod tests {
         );
     }
 
-    // AUDIT O-1 (2026-06 deep audit): from_account_data must also reject a corrupt
-    // INTERNAL node link (left/right/parent), not just the header roots — a
-    // malicious-ER-committed book with an OOB child pointer would otherwise panic
-    // the first L1 traversal (book DoS). `#[repr(C)] RBNode` puts left/right/parent
-    // at byte offsets 0/4/8 of node 0 (the first slab slot).
-    // AUDIT O-1: `validate_node_links` is the once-per-undelegate corruption gate
+    // A corrupt INTERNAL node link (left/right/parent) must also be rejected,
+    // not just the header roots — a malicious-ER-committed book with an OOB
+    // child pointer would otherwise panic the first L1 traversal (book DoS).
+    // `#[repr(C)] RBNode` puts left/right/parent at byte offsets 0/4/8 of
+    // node 0 (the first slab slot).
+    // `validate_node_links` is the once-per-undelegate corruption gate
     // (called from `process_undelegation`, NOT the per-op hot path). It must reject an
     // out-of-range or misaligned internal RBT link and pass a well-formed book.
     #[test]
     fn validate_node_links_rejects_corrupt_internal_link() {
         let p = MARKET_BOOK_PREFIX_BYTES; // node 0 starts here; its `left` is at +0
-        // OOB internal left-link
+                                          // OOB internal left-link
         let mut data = make_book();
         data[p..p + 4].copy_from_slice(&9_999_999u32.to_le_bytes());
         assert!(
@@ -1670,10 +1642,10 @@ mod tests {
         assert!(MarketBookHandle::from_account_data(&mut data).is_ok());
     }
 
-    /// AUDIT HIGH-5 (2026-07) regression: a malicious-/buggy-ER commit can plant
-    /// a book whose links are all IN-BOUNDS yet form a CYCLE. The old per-link
-    /// bounds check accepted it and the first L1 traversal would infinite-loop
-    /// (compute-exhaustion → market brick). Build a 2-node cycle rooted at
+    /// A malicious-/buggy-ER commit can plant a book whose links are all
+    /// IN-BOUNDS yet form a CYCLE; per-link bounds checks alone accept it and
+    /// the first L1 traversal would infinite-loop (compute-exhaustion →
+    /// market brick). Build a 2-node cycle rooted at
     /// node0 (node0.right=node1, node1.right=node0, parents point back so the
     /// symmetry check passes) and assert the bounded-reachability walk rejects.
     #[test]
@@ -1740,5 +1712,4 @@ mod tests {
             assert!(w[0] > w[1], "bids must stay descending after expand");
         }
     }
-
 }

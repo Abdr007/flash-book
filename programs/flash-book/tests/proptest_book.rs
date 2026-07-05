@@ -86,14 +86,12 @@ proptest! {
                     } else {
                         handle.insert_ask(order(price, seq, is_bid))
                     };
-                    match res {
-                        Ok(_) => {
-                            live.push((is_bid, price, seq, oid));
-                            next_seq += 1;
-                        }
-                        // BufferFull near MAX_NODES is the only acceptable error;
-                        // the model is unchanged and the book must stay consistent.
-                        Err(_) => {}
+                    // BufferFull near MAX_NODES is the only acceptable error;
+                    // on error the model is unchanged and the book must stay
+                    // consistent.
+                    if res.is_ok() {
+                        live.push((is_bid, price, seq, oid));
+                        next_seq += 1;
                     }
                 }
                 Op::Remove { which } => {
@@ -182,10 +180,14 @@ enum FillOp {
 
 fn fill_op_strategy() -> impl Strategy<Value = FillOp> {
     prop_oneof![
-        (any::<bool>(), 1u64..=15u64, 1u64..=1000u64)
-            .prop_map(|(is_bid, price, size)| FillOp::Insert { is_bid, price, size }),
-        (0usize..10_000, 1u64..=1000u64)
-            .prop_map(|(which, amount)| FillOp::Fill { which, amount }),
+        (any::<bool>(), 1u64..=15u64, 1u64..=1000u64).prop_map(|(is_bid, price, size)| {
+            FillOp::Insert {
+                is_bid,
+                price,
+                size,
+            }
+        }),
+        (0usize..10_000, 1u64..=1000u64).prop_map(|(which, amount)| FillOp::Fill { which, amount }),
         (0usize..10_000).prop_map(|which| FillOp::Remove { which }),
     ]
 }

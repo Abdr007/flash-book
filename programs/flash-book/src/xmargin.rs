@@ -73,13 +73,10 @@ pub fn advance_epoch(current: u64, proposed: u64) -> Result<u64> {
 ///
 /// Returns Ok iff `amount <= collateral` AND `collateral - amount >= er_reserved`.
 /// With `er_reserved == 0` this reduces to the original balance check, so the
-/// non-ER path is byte-for-byte unchanged.
+/// non-ER path is unaffected.
 #[inline]
 pub fn check_simple_withdraw(collateral: u64, amount: u64, er_reserved: u64) -> Result<()> {
-    require!(
-        amount <= collateral,
-        FlashBookError::InsufficientCollateral
-    );
+    require!(amount <= collateral, FlashBookError::InsufficientCollateral);
     let remaining = collateral - amount;
     require!(remaining >= er_reserved, FlashBookError::ErMarginReserved);
     Ok(())
@@ -93,11 +90,7 @@ pub fn check_simple_withdraw(collateral: u64, amount: u64, er_reserved: u64) -> 
 ///
 /// `required = max(im_required, notional_floor) + er_reserved` (saturating).
 #[inline]
-pub fn required_collateral_with_er(
-    im_required: u64,
-    notional_floor: u64,
-    er_reserved: u64,
-) -> u64 {
+pub fn required_collateral_with_er(im_required: u64, notional_floor: u64, er_reserved: u64) -> u64 {
     let base = if im_required > notional_floor {
         im_required
     } else {
@@ -141,10 +134,7 @@ mod tests {
         assert_eq!(required_collateral_with_er(80, 50, 20), 100);
         assert_eq!(required_collateral_with_er(0, 0, 0), 0);
         // Saturating — never wraps.
-        assert_eq!(
-            required_collateral_with_er(u64::MAX, 0, 10),
-            u64::MAX
-        );
+        assert_eq!(required_collateral_with_er(u64::MAX, 0, 10), u64::MAX);
     }
 }
 

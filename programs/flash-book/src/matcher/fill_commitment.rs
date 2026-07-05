@@ -1,4 +1,4 @@
-//! Settlement-authenticity Fill Commitment Queue (H1 part B / issue #35).
+//! Settlement-authenticity fill-commitment queue.
 //!
 //! The on-chain matcher (`place_taker_order_v2`) already crosses takers against
 //! real resting orders and mutates the hypertree book — so the *authentic* fills
@@ -32,7 +32,7 @@ pub const FILL_COMMIT_SEED: &[u8] = b"fill_commit";
 /// matcher applies backpressure). Sized into the account at init; the account is
 /// realloc-expandable later.
 ///
-/// AUDIT M-2 fix: this MUST be >= `MAX_BATCH_ORDERS_PER_SIDE_V2` (256, lib.rs) —
+/// This MUST be >= `MAX_BATCH_ORDERS_PER_SIDE_V2` (256, lib.rs) —
 /// `place_taker_order_v2` can cross up to that many levels and pushes one
 /// commitment per fill in a single tx before any settlement drains the ring. At
 /// 64 a legitimate taker sweep of 65–256 levels on an ARMED market unconditionally
@@ -78,7 +78,7 @@ pub enum FillRingError {
 /// | 107 |   8 | size_lots         |
 /// | 115 |   8 | price_ticks       |
 /// | 123 |   8 | produced_index    |
-/// | 131 |   1 | taker_was_jit     |  (AUDIT §3.2: now bound — was zero pad)
+/// | 131 |   1 | taker_was_jit     |
 /// | 132 |   4 | zero pad          |
 ///
 /// §3.2 fill-authenticity: `taker_was_jit` drives a real value transfer at
@@ -205,7 +205,7 @@ pub const fn fill_commit_account_len(cap: usize) -> usize {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUDIT F-3 migration (2026-07): OPTIONAL, backward-compatible v1 layout that adds
+// OPTIONAL, backward-compatible v1 layout that adds
 // per-position REDUCE-IN-FLIGHT tracking, CO-LOCATED with the ring so it commits
 // atomically with it (no cross-account ER seam) and needs NO change to the fill
 // preimage (authenticity is untouched). A v1 account appends, after the ring slots:
@@ -335,7 +335,11 @@ fn slot_view(data: &mut [u8], cap: usize) -> &mut [FillCommit] {
 
 /// Producer: push a fill commitment (matcher). Reads/advances the produced
 /// cursor in the header and writes the slot via the proven `ring_push`.
-pub fn buffer_push(data: &mut [u8], market: &[u8; 32], commit: FillCommit) -> Result<(), FillRingError> {
+pub fn buffer_push(
+    data: &mut [u8],
+    market: &[u8; 32],
+    commit: FillCommit,
+) -> Result<(), FillRingError> {
     let cap = buffer_check(data, market)?;
     let mut produced = rd_u64(data, OFF_PRODUCED);
     let settled = rd_u64(data, OFF_SETTLED);
@@ -366,7 +370,7 @@ pub fn buffer_settle(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUDIT F-3 v1: reduce-in-flight accessors. All are NO-OPs of intent unless the
+// v1 reduce-in-flight accessors. All are NO-OPs of intent unless the
 // account is v1 (the caller gates on `buffer_version(data) == 1`); they compute
 // offsets from `cap` (from `buffer_check`) and never touch the ring/header. The
 // flags array is parallel to the ring slots (index = fill index mod cap); the map
@@ -520,6 +524,7 @@ pub fn buffer_upgrade_to_v1(data: &mut [u8], market: &[u8; 32]) -> Result<(), Fi
 /// (rejects replays + out-of-order settlements); the returned nonce is exactly
 /// `fill_seq` and strictly exceeds `current`. `Err(())` leaves the caller to
 /// reject without mutating state.
+#[allow(clippy::result_unit_err)] // the caller maps the erased error to a program error
 #[inline]
 pub fn advance_settlement_seq(current: u64, fill_seq: u64) -> Result<u64, ()> {
     if fill_seq > current {
@@ -726,13 +731,17 @@ mod tests {
         // Exactly one byte (131) differs.
         assert_eq!(p_false[131], 0);
         assert_eq!(p_true[131], 1);
-        let diff = p_false.iter().zip(p_true.iter()).filter(|(a, b)| a != b).count();
+        let diff = p_false
+            .iter()
+            .zip(p_true.iter())
+            .filter(|(a, b)| a != b)
+            .count();
         assert_eq!(diff, 1, "only the taker_was_jit byte should differ");
         // Domain bumped so pre-upgrade commitments can't be reinterpreted.
         assert_eq!(&p_false[0..8], b"FBfillC2");
     }
 
-    // AUDIT F-3 v1: a freshly-initialized v0 account grows + migrates to v1, and the
+    // A freshly-initialized v0 account grows + migrates to v1, and the
     // reduce-in-flight map + per-slot flags behave as the matcher/settlement need.
     fn make_v1(market: &[u8; 32], cap: u32) -> Vec<u8> {
         let mut data = vec![0u8; fill_commit_account_len(cap as usize)];
@@ -742,12 +751,16 @@ mod tests {
         data.resize(fill_commit_account_len_v1(cap as usize), 0);
         buffer_upgrade_to_v1(&mut data, market).unwrap();
         assert_eq!(buffer_version(&data), 1);
-        assert_eq!(buffer_check(&data, market).unwrap(), cap, "v1 length validates");
+        assert_eq!(
+            buffer_check(&data, market).unwrap(),
+            cap,
+            "v1 length validates"
+        );
         data
     }
 
     #[test]
-    fn f3_v1_upgrade_requires_drained_ring_and_v0() {
+    fn v1_upgrade_requires_drained_ring_and_v0() {
         let market = [5u8; 32];
         let cap = 8u32;
         let mut data = vec![0u8; fill_commit_account_len(cap as usize)];
@@ -765,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_v1_map_and_flags_roundtrip() {
+    fn v1_map_and_flags_roundtrip() {
         let market = [6u8; 32];
         let cap = 8u32;
         let mut d = make_v1(&market, cap);
@@ -784,12 +797,15 @@ mod tests {
         assert!(!reduce_flag_take(&mut d, cap, 1));
         reduce_flag_set(&mut d, cap, 1);
         reduce_flag_set(&mut d, cap, 1 + cap as u64); // same slot (wraps)
-        assert!(reduce_flag_take(&mut d, cap, 1), "flag set is observed at settle");
+        assert!(
+            reduce_flag_take(&mut d, cap, 1),
+            "flag set is observed at settle"
+        );
         assert!(!reduce_flag_take(&mut d, cap, 1), "take clears the flag");
     }
 
     #[test]
-    fn f3_v1_map_full_fails_closed() {
+    fn v1_map_full_fails_closed() {
         let market = [7u8; 32];
         let cap = 8u32;
         let mut d = make_v1(&market, cap);
@@ -801,7 +817,10 @@ mod tests {
         }
         // a NEW position with the map full fails closed (never silently over-admits)
         let overflow = [0xFFu8; 32];
-        assert_eq!(inflight_add(&mut d, cap, &overflow, 1), Err(FillRingError::Full));
+        assert_eq!(
+            inflight_add(&mut d, cap, &overflow, 1),
+            Err(FillRingError::Full)
+        );
         // but an EXISTING position still accumulates (no new slot needed)
         let mut p0 = [0u8; 32];
         p0[0] = 1;
@@ -814,7 +833,14 @@ mod tests {
     // position, crossed by SEPARATE takers across the settle gap, can NEVER
     // collectively reduce more than the position — even after the position shrinks.
     // Models the matcher cap: reducible = position − inflight_get(P).
-    fn cap_and_track(d: &mut [u8], cap: u32, pos_key: &[u8; 32], position: u64, desired: u64, idx: u64) -> u64 {
+    fn cap_and_track(
+        d: &mut [u8],
+        cap: u32,
+        pos_key: &[u8; 32],
+        position: u64,
+        desired: u64,
+        idx: u64,
+    ) -> u64 {
         let reducible = position.saturating_sub(inflight_get(d, cap, pos_key));
         let fill = desired.min(reducible);
         if fill > 0 {
@@ -825,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_v1_two_takers_cannot_over_reduce_stable_position() {
+    fn v1_two_takers_cannot_over_reduce_stable_position() {
         let market = [8u8; 32];
         let cap = 8u32;
         let mut d = make_v1(&market, cap);
@@ -839,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_v1_two_takers_cannot_over_reduce_shrunken_position() {
+    fn v1_two_takers_cannot_over_reduce_shrunken_position() {
         let market = [9u8; 32];
         let cap = 8u32;
         let mut d = make_v1(&market, cap);
@@ -849,12 +875,85 @@ mod tests {
         let f1 = cap_and_track(&mut d, cap, &p, 50, 50, 0);
         let f2 = cap_and_track(&mut d, cap, &p, 50, 50, 1); // stale snapshot still 50
         assert_eq!(f1, 50);
-        assert_eq!(f2, 0, "shrink edge closed: second cross capped to 0 by in-flight");
-        assert_eq!(f1 + f2, 50, "total reduced == shrunken position, never flips");
+        assert_eq!(
+            f2, 0,
+            "shrink edge closed: second cross capped to 0 by in-flight"
+        );
+        assert_eq!(
+            f1 + f2,
+            50,
+            "total reduced == shrunken position, never flips"
+        );
         // settlement drains the in-flight back to zero via the flags
         assert!(reduce_flag_take(&mut d, cap, 0));
         inflight_sub(&mut d, cap, &p, 50);
-        assert_eq!(inflight_get(&d, cap, &p), 0, "in-flight fully released at settlement");
+        assert_eq!(
+            inflight_get(&d, cap, &p),
+            0,
+            "in-flight fully released at settlement"
+        );
+    }
+
+    // The no-flip invariant, machine-checked over the COMPLETE bounded domain:
+    // for every initial position size P0 and every interleaving of taker
+    // crosses (any desired size) and settlements across the match→settle gap,
+    // the total lots ever admitted against the position never exceeds P0, and
+    // the settled position never goes below zero (never flips). Models exactly
+    // the matcher/settlement discipline: a cross reads the L1 position clone
+    // (which only moves at settlement) minus the ring's in-flight; a
+    // settlement shrinks the position and releases the same in-flight lots.
+    // Exhaustive: P0 ∈ 0..=3, five steps, each step ∈ {settle-oldest} ∪
+    // {cross desired ∈ 0..=3} — 4 × 5^5 = 12,500 full lifecycles.
+    #[test]
+    fn v1_inflight_bounds_total_reduction_exhaustive() {
+        let market = [10u8; 32];
+        let cap = 8u32;
+        let p = [44u8; 32];
+        for p0 in 0u64..=3 {
+            // 5 steps, each encoded 0..=4: 0 = settle oldest pending,
+            // 1..=4 = taker cross with desired = step - 1 (0..=3 lots).
+            for combo in 0u32..5u32.pow(5) {
+                let mut d = make_v1(&market, cap);
+                let mut pos = p0; // L1 truth; moves only at settlement
+                let mut pending: Vec<u64> = Vec::new(); // matched, unsettled
+                let mut applied_total = 0u64;
+                let mut idx = 0u64;
+                let mut c = combo;
+                for _ in 0..5 {
+                    let step = c % 5;
+                    c /= 5;
+                    if step == 0 {
+                        if let Some(lots) = pending.first().copied() {
+                            pending.remove(0);
+                            assert!(reduce_flag_take(
+                                &mut d,
+                                cap,
+                                idx - pending.len() as u64 - 1
+                            ));
+                            inflight_sub(&mut d, cap, &p, lots);
+                            assert!(pos >= lots, "settlement would flip the position");
+                            pos -= lots;
+                        }
+                    } else {
+                        let desired = (step - 1) as u64;
+                        let fill = cap_and_track(&mut d, cap, &p, pos, desired, idx);
+                        if fill > 0 {
+                            pending.push(fill);
+                            idx += 1;
+                            applied_total += fill;
+                        }
+                    }
+                    assert!(
+                        applied_total <= p0,
+                        "over-reduce: applied {applied_total} > P0 {p0} (combo {combo})"
+                    );
+                    assert!(
+                        applied_total.saturating_sub(p0 - pos) <= pos,
+                        "pending exceeds remaining position (combo {combo})"
+                    );
+                }
+            }
+        }
     }
 
     // §3.2 P3: growing the ring resizes the account, stamps the new cap, and the
@@ -867,15 +966,27 @@ mod tests {
         let mut data = vec![0u8; fill_commit_account_len(cap as usize)];
         buffer_init(&mut data, &market, cap, 1).unwrap();
         assert_eq!(buffer_check(&data, &market).unwrap(), 4);
-        assert_eq!(buffer_next_index(&data), buffer_settle_index(&data), "fresh ring is drained");
+        assert_eq!(
+            buffer_next_index(&data),
+            buffer_settle_index(&data),
+            "fresh ring is drained"
+        );
         // simulate the handler's realloc-to-larger then cap stamp
         let new_cap = 10u32;
         data.resize(fill_commit_account_len(new_cap as usize), 0);
         // before the cap stamp the header is inconsistent (len != cap*32+hdr)
         assert!(buffer_check(&data, &market).is_err());
         buffer_set_cap(&mut data, new_cap);
-        assert_eq!(buffer_check(&data, &market).unwrap(), 10, "re-validates at the new cap");
-        assert_eq!(buffer_next_index(&data), buffer_settle_index(&data), "still drained");
+        assert_eq!(
+            buffer_check(&data, &market).unwrap(),
+            10,
+            "re-validates at the new cap"
+        );
+        assert_eq!(
+            buffer_next_index(&data),
+            buffer_settle_index(&data),
+            "still drained"
+        );
     }
 
     #[test]
@@ -995,7 +1106,10 @@ mod tests {
         buffer_settle(&mut data, &market, c(13)).unwrap();
         assert_eq!(buffer_settle_index(&data), 3);
         // fully drained
-        assert_eq!(buffer_settle(&mut data, &market, c(13)), Err(FillRingError::Empty));
+        assert_eq!(
+            buffer_settle(&mut data, &market, c(13)),
+            Err(FillRingError::Empty)
+        );
     }
 
     #[test]
@@ -1006,7 +1120,10 @@ mod tests {
             buffer_push(&mut data, &market, c(i + 1)).unwrap();
         }
         assert_eq!(buffer_next_index(&data), TEST_CAP as u64);
-        assert_eq!(buffer_push(&mut data, &market, c(200)), Err(FillRingError::Full));
+        assert_eq!(
+            buffer_push(&mut data, &market, c(200)),
+            Err(FillRingError::Full)
+        );
     }
 
     #[test]

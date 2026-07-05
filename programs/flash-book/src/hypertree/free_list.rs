@@ -53,7 +53,7 @@ impl<'a, T: Pod> FreeList<'a, T> {
 
     /// Free a node to the free list
     pub fn add(&mut self, index: DataIndex) {
-        // AUDIT M-17 (2026-07): guard against an immediate double-free. If
+        // Guard against an immediate double-free. If
         // `index` is already the list head, re-adding it would set the node's
         // `next` to itself → a self-referential free list, so the SAME slot is
         // handed out to two live allocations (use-after-free / type confusion).
@@ -109,7 +109,7 @@ mod test {
         assert_eq!(END, free_list.remove());
     }
 
-    /// AUDIT M-17 (2026-07) regression: an immediate double-free of the list
+    /// Regression: an immediate double-free of the list
     /// head must NOT create a self-referential node (next == self), which would
     /// hand the same slot out to two live allocations (use-after-free / type
     /// confusion). The repeat free is a safe no-op.

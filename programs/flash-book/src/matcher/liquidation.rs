@@ -169,9 +169,19 @@ pub fn compute_shortfall(
     // DO NOT replace this with checked_into / try_into — that would
     // *abort the liquidation* on a numerically extreme position, leaving
     // an unwinnable position open. Saturation is the safe failure mode.
-    let penalty_u64 = if penalty < 0 { 0 } else if penalty > u64::MAX as i128 { u64::MAX } else { penalty as u64 };
+    let penalty_u64 = if penalty < 0 {
+        0
+    } else if penalty > u64::MAX as i128 {
+        u64::MAX
+    } else {
+        penalty as u64
+    };
     if remaining >= 0 {
-        let recovered = if remaining > u64::MAX as i128 { u64::MAX } else { remaining as u64 };
+        let recovered = if remaining > u64::MAX as i128 {
+            u64::MAX
+        } else {
+            remaining as u64
+        };
         Ok(ShortfallResult {
             liquidation_penalty_quote_lots: penalty_u64,
             shortfall_quote_lots: 0,
@@ -179,7 +189,11 @@ pub fn compute_shortfall(
         })
     } else {
         let shortfall_signed = -remaining;
-        let shortfall = if shortfall_signed > u64::MAX as i128 { u64::MAX } else { shortfall_signed as u64 };
+        let shortfall = if shortfall_signed > u64::MAX as i128 {
+            u64::MAX
+        } else {
+            shortfall_signed as u64
+        };
         Ok(ShortfallResult {
             liquidation_penalty_quote_lots: penalty_u64,
             shortfall_quote_lots: shortfall,

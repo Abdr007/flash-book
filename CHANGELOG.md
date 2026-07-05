@@ -121,10 +121,10 @@ modules covering every primitive a top-tier perp DEX uses, plus
 
 ### Added — Documentation
 
-- `docs/AUDIT.md` — 19-audit internal review report
+- `docs/AUDIT.md` (since consolidated into `SECURITY.md`) — 19-audit internal review report
 - `docs/AUDIT_BRIEF.md` — external auditor handoff brief
 - `docs/ARCHITECTURE_FULL.md` — end-to-end system diagrams
-- `docs/FEATURES.md` — complete primitive matrix
+- `docs/FEATURES.md` (since consolidated into `docs/ARCHITECTURE.md`) — complete primitive matrix
 - `docs/HAIRCUT_MATH.md` — H-haircut formal spec
 - `docs/SDK_ALIGNMENT.md` — Flash V2 beta SDK alignment
 - `docs/INCIDENT_RESPONSE.md` — operational playbook
@@ -235,14 +235,14 @@ items. The previous v0.32.0 known-gap section listed:
 * ADL settlement routing for isolated positions — **fixed (Phase 2h)**
 * ApplyFill sequencer trust — **fixed (Phase 2i)**
 
-The `docs/SUB_ACCOUNT_TRADING.md §0` status section is current as
+The sub-account status section (now part of `docs/ARCHITECTURE.md`) is current as
 of this release.
 
 ## [0.32.0] — 2026-05-14 — Phase 2: isolated margin + sub-account trading
 
 Eight commits implementing isolated-margin end-to-end and enabling
 sub-accounts to trade through every primitive. See `docs/MARGIN_MATH.md`
-and `docs/SUB_ACCOUNT_TRADING.md` for the formal specs.
+and the sub-account sections of `docs/ARCHITECTURE.md` / `docs/MARGIN_MATH.md` for the formal specs.
 
 ### Added
 
@@ -274,7 +274,7 @@ and `docs/SUB_ACCOUNT_TRADING.md` for the formal specs.
   + `liquidate_portfolio_v2` carry the liquidatee's sub_index.
 - **`docs/MARGIN_MATH.md`** — audit-grade margin model spec with §9
   invariants table cross-referenced to handlers + tests.
-- **`docs/SUB_ACCOUNT_TRADING.md`** — Phase 2c–2f scope, design
+- **Sub-account scope doc** (since consolidated into `docs/ARCHITECTURE.md`) — scope, design
   choices, what's done vs pending.
 - **6 isolated-margin proptests** in `tests/proptest_isolated.rs`,
   2000 random cases each.

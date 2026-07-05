@@ -24,9 +24,9 @@ solana airdrop 2
 
 ```bash
 cd /path/to/flash-book
-cargo build-sbf --manifest-path programs/flash-book/Cargo.toml
-# or, equivalently:
-anchor build
+cargo build-sbf --tools-version v1.52 --manifest-path programs/flash-book/Cargo.toml --sbf-out-dir target/deploy
+# platform-tools v1.52 (rustc 1.89) is required: earlier releases cannot
+# compile edition2024 dependencies.
 ```
 
 This produces:

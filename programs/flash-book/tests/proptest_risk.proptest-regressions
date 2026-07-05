@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 8153fd7afc7646ca12ed9e0a729d6eea0ced62d87348aa12ace45462e19729d5 # shrinks to size = 242, entry = 122, mark = 50, collateral = 21159
+cc 784ae56516e2ca0d0018b7c4d83d1dc2669cd77b163e7bdc47140e8b2d138c23 # shrinks to long_size = 824, short_size = 348, entry = 155, mark = 108, collateral = 38716

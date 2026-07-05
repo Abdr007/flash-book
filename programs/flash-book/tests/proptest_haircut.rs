@@ -18,8 +18,8 @@
 //! Run: `cargo test -p flash-book --test proptest_haircut`.
 
 use flash_book::matcher::haircut::{
-    apply_convert, apply_mature, apply_release, compute_h, convert_with_haircut,
-    matured_fraction, PositionHaircutSnapshot, H_DENOM,
+    apply_convert, apply_mature, apply_release, compute_h, convert_with_haircut, matured_fraction,
+    PositionHaircutSnapshot, H_DENOM,
 };
 use proptest::prelude::*;
 
@@ -214,7 +214,7 @@ proptest! {
 // ─── I-6 Loss seniority ─────────────────────────────────────────────
 // Encoded structurally: apply_release rejects zero-gain (and would
 // reject negative if the signature allowed it). The wire-in module
-// (Wave 24b) is responsible for routing losses to the existing
+// is responsible for routing losses to the existing
 // `compute_realized_pnl_routing` path WITHOUT calling any
 // haircut::apply_* function. We assert that property statically here:
 // any signature in this crate that takes a loss must not touch

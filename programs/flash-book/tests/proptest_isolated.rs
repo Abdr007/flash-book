@@ -25,8 +25,8 @@ use anchor_lang::prelude::Pubkey;
 use flash_book::matcher::lot::Ticks;
 use flash_book::matcher::order::Side;
 use flash_book::matcher::risk::{
-    assess_margin, assess_margin_split, assess_margin_unified,
-    default_scenarios, MarketSnapshot, PositionSnapshot,
+    assess_margin, assess_margin_split, assess_margin_unified, default_scenarios, MarketSnapshot,
+    PositionSnapshot,
 };
 use proptest::prelude::*;
 
@@ -42,7 +42,7 @@ fn market(seed: [u8; 32], mark: u64, mmr_bps: u32) -> MarketSnapshot {
         tick_size: 1,
         concentration_threshold_lots: 0,
         concentration_extra_mmr_bps: 0,
-        // Wave 28b — OI-scaled MMR disabled by default in tests.
+        // OI-scaled MMR disabled by default in tests.
         side_oi_lots: 0,
         oi_mmr_slope_bps_per_million_lots: 0,
         oi_mmr_max_extra_bps: 0,

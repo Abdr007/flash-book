@@ -1,4 +1,4 @@
-//! JIT LP defense (Wave 57).
+//! JIT LP defense.
 //!
 //! Prevent flash JIT liquidity attacks against the FLP: a depositor
 //! who tries to sneak in front of a big trader-loss event, capture the
@@ -12,11 +12,7 @@
 
 /// Check whether a withdrawal is admissible given the hold-time rule.
 #[inline]
-pub fn can_withdraw(
-    deposited_at_slot: u64,
-    now_slot: u64,
-    min_hold_slots: u64,
-) -> bool {
+pub fn can_withdraw(deposited_at_slot: u64, now_slot: u64, min_hold_slots: u64) -> bool {
     if min_hold_slots == 0 {
         return true;
     }
@@ -29,20 +25,6 @@ pub fn can_withdraw(
 #[inline]
 pub fn extend_lock_on_deposit(now_slot: u64) -> u64 {
     now_slot
-}
-
-/// Compute slots remaining until withdrawal is admissible.
-#[inline]
-pub fn slots_until_unlock(
-    deposited_at_slot: u64,
-    now_slot: u64,
-    min_hold_slots: u64,
-) -> u64 {
-    if min_hold_slots == 0 {
-        return 0;
-    }
-    let elapsed = now_slot.saturating_sub(deposited_at_slot);
-    min_hold_slots.saturating_sub(elapsed)
 }
 
 #[cfg(test)]
@@ -74,15 +56,5 @@ mod tests {
     #[test]
     fn extend_lock_returns_now() {
         assert_eq!(extend_lock_on_deposit(12_345), 12_345);
-    }
-
-    #[test]
-    fn slots_until_unlock_counts_down() {
-        // hold=100, elapsed=30 → 70 remaining.
-        assert_eq!(slots_until_unlock(100, 130, 100), 70);
-        // elapsed = hold → 0.
-        assert_eq!(slots_until_unlock(100, 200, 100), 0);
-        // past hold → still 0.
-        assert_eq!(slots_until_unlock(100, 500, 100), 0);
     }
 }

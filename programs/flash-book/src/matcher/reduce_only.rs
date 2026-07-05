@@ -1,4 +1,4 @@
-//! Reduce-only flag for limit orders (Wave 63).
+//! Reduce-only flag for limit orders.
 //!
 //! When set, the order can ONLY reduce or close an existing position
 //! on the configured side — it cannot open a new position or flip
@@ -35,8 +35,8 @@ pub fn check_reduce_only(
         return ReduceOnlyOutcome::Reject;
     }
     // Order must oppose the position.
-    let opposes = (position_side == 0 && order_side == 1)
-        || (position_side == 1 && order_side == 0);
+    let opposes =
+        (position_side == 0 && order_side == 1) || (position_side == 1 && order_side == 0);
     if !opposes {
         return ReduceOnlyOutcome::Reject;
     }
@@ -75,13 +75,19 @@ mod tests {
     #[test]
     fn partial_admits_capped_at_position_size() {
         // Long 100, sell 200 → admit 100 (don't flip).
-        assert_eq!(check_reduce_only(0, 100, 1, 200), ReduceOnlyOutcome::PartialAdmit(100));
+        assert_eq!(
+            check_reduce_only(0, 100, 1, 200),
+            ReduceOnlyOutcome::PartialAdmit(100)
+        );
     }
 
     #[test]
     fn short_position_reduces_with_buy() {
         assert_eq!(check_reduce_only(1, 100, 0, 50), ReduceOnlyOutcome::Admit);
-        assert_eq!(check_reduce_only(1, 100, 0, 200), ReduceOnlyOutcome::PartialAdmit(100));
+        assert_eq!(
+            check_reduce_only(1, 100, 0, 200),
+            ReduceOnlyOutcome::PartialAdmit(100)
+        );
     }
 
     #[test]
@@ -89,7 +95,7 @@ mod tests {
         assert_eq!(check_reduce_only(0, 100, 1, 0), ReduceOnlyOutcome::Admit);
     }
 
-    /// AUDIT M-7 airtight (2026-07): models how the matcher consumes the reducible
+    /// Models how the matcher consumes the reducible
     /// size across multiple reduce-only crosses of ONE position within a walk (it
     /// decrements the reducible by each capped fill). Invariant: the total reduced
     /// can never exceed the position size, so the position can never flip.

@@ -10,25 +10,33 @@ use anchor_lang::prelude::*;
 
 /// Base asset size, in base lots. One base lot is `MarketParams.base_lot_size`
 /// atoms of the base mint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, AnchorSerialize, AnchorDeserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, AnchorSerialize, AnchorDeserialize,
+)]
 #[repr(transparent)]
 pub struct BaseLots(pub u64);
 
 /// Quote asset size, in quote lots. One quote lot is `MarketParams.quote_lot_size`
 /// atoms of the quote mint (USDC).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, AnchorSerialize, AnchorDeserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, AnchorSerialize, AnchorDeserialize,
+)]
 #[repr(transparent)]
 pub struct QuoteLots(pub u64);
 
 /// Price in ticks. One tick is `MarketParams.tick_size_quote_lots_per_base_lot`
 /// quote-lots-per-base-lot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, AnchorSerialize, AnchorDeserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, AnchorSerialize, AnchorDeserialize,
+)]
 #[repr(transparent)]
 pub struct Ticks(pub u64);
 
 /// Basis points (1 bp = 0.0001). Stored as u32 — max 4.29B bps which
 /// covers any sensible parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, AnchorSerialize, AnchorDeserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, AnchorSerialize, AnchorDeserialize,
+)]
 #[repr(transparent)]
 pub struct Bps(pub u32);
 
@@ -84,7 +92,9 @@ pub fn notional_quote_lots(
     let m1 = (base.0 as u128)
         .checked_mul(price.0 as u128)
         .or_overflow()?;
-    let m2 = m1.checked_mul(tick_size_quote_lots_per_base_lot as u128).or_overflow()?;
+    let m2 = m1
+        .checked_mul(tick_size_quote_lots_per_base_lot as u128)
+        .or_overflow()?;
     if m2 > u64::MAX as u128 {
         return Err(error!(FlashBookError::ArithmeticOverflow));
     }

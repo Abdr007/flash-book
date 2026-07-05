@@ -89,7 +89,7 @@ Same shape, tighter caps and higher fees:
 + oracle_band_bps:                    5_000,               // 50%
 ```
 
-## Envelope config (Wave 26)
+## Envelope config
 
 The envelope inequality must hold:
 
@@ -112,7 +112,7 @@ For each, `liquidation_fee_bps = 50`, `min_liquidation_abs_lots = 1`,
 `min_nonzero_mm_req_lots = 100`, `max_abs_funding_e9_per_slot =
 10_000`.
 
-## H-haircut config (Wave 24)
+## H-haircut config
 
 | Asset class | `h_min_slots` | `h_max_slots` | Initial Residual |
 |---|---|---|---|
@@ -124,7 +124,7 @@ For each, `liquidation_fee_bps = 50`, `min_liquidation_abs_lots = 1`,
 Longer warmup for thinner markets reduces oracle-spike attack
 surface.
 
-## OI-scaled MMR (Wave 28)
+## OI-scaled MMR
 
 For each market:
 - `oi_mmr_slope_bps_per_million_lots`: 50–200 depending on liquidity
@@ -141,7 +141,7 @@ For each market:
 | Long-tail | 20% of average daily OI | NAV > 1.10× target |
 
 `pause_threshold_quote_lots = 50%` of target. When insurance drops
-below this, auto-deleverage kicks in (Wave 38 helper).
+below this, auto-deleverage becomes eligible.
 
 ## Tuning workflow
 

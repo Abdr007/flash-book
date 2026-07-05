@@ -1,35 +1,19 @@
-//! MagicBlock Ephemeral Rollups delegation CPI (in-house implementation).
+//! MagicBlock Ephemeral Rollups delegation CPIs.
 //!
-//! Why this exists in-house instead of using the upstream
-//! `ephemeral-rollups-sdk` crate:
+//! The delegation program's ABI is small and stable — a program ID, a
+//! one-byte discriminator, and Borsh args — so the CPIs are issued
+//! directly with `invoke_signed` rather than through the SDK crates
+//! (whose solana-instruction/solana-pubkey ^3.0 requirements conflict
+//! with the spl-token v6 / solana 2.1 dependency set).
 //!
-//!   - `ephemeral-rollups-sdk` 0.10–0.13 contain code paths that depend
-//!     on `Pubkey::as_array()` — a method introduced in solana-program
-//!     2.2.x. Our stack is pinned to solana 2.1.x by spl-token v6 (which
-//!     can't bump until upstream SPL releases a 2.2-compatible v7).
-//!   - `magicblock-delegation-program-api` ≥0.1.1 declares
-//!     `solana-instruction ^3.0.0` / `solana-pubkey ^3.0.0` — also out
-//!     of reach.
+//! Delegation-program ABI:
 //!
-//! The MagicBlock delegation program's ABI is small and stable (program
-//! ID + 1-byte discriminator + Borsh args). Implementing the CPI here
-//! by hand is ~100 lines of code, version-agnostic, and easier to audit
-//! than pulling a dependency we can barely build against. When the
-//! upstream SDK lands a 2.1-compatible release we can swap to it
-//! drop-in via the `Delegate`/`Undelegate` ix builders below.
-//!
-//! ABI references (verified against the v0.3.0 magicblock-delegation-
-//! program-api source):
-//!
-//!   - Program ID: DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh
-//!   - Delegate discriminator: 0u8
-//!   - Undelegate discriminator: 3u8
-//!   - PDA seeds:
-//!       buffer       = [b"buffer", delegated_account]            (under owner_program)
-//!       record       = [b"delegation", delegated_account]        (under delegation program)
-//!       metadata     = [b"delegation-metadata", delegated_account] (under delegation program)
-//!
-//! Account layouts mirror the upstream `cpi::delegate` builder.
+//! - Program ID: DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh
+//! - Delegate discriminator: 0u8
+//! - PDA seeds:
+//!   `buffer   = [b"buffer", delegated_account]` (under owner_program),
+//!   `record   = [b"delegation", delegated_account]` (under the delegation program),
+//!   `metadata = [b"delegation-metadata", delegated_account]` (under the delegation program)
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
@@ -39,9 +23,7 @@ use anchor_lang::solana_program::{
 };
 
 /// MagicBlock Delegation Program ID. Mainnet + devnet share this address.
-/// Confirmed against `magicblock-delegation-program-api 0.3.0` source.
-pub const DELEGATION_PROGRAM_ID: Pubkey =
-    pubkey!("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
+pub const DELEGATION_PROGRAM_ID: Pubkey = pubkey!("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
 
 /// PDA seed prefix for the delegate buffer (lives under `owner_program`).
 pub const DELEGATE_BUFFER_TAG: &[u8] = b"buffer";
@@ -49,8 +31,8 @@ pub const DELEGATE_BUFFER_TAG: &[u8] = b"buffer";
 /// delegate-time buffer above: at undelegate the DLP hands `process_undelegation`
 /// a buffer it created and signs for, so the buffer is a PDA under the DELEGATION
 /// program with seeds `["undelegate-buffer", delegated]` — NOT `["buffer", …]`
-/// under the owner program. Empirically confirmed against the live MagicBlock
-/// devnet ER (magicblock-core 0.13.2); see AUDIT HIGH-4 below.
+/// under the owner program. The derivation matches the live MagicBlock
+/// delegation program (regression-pinned in the tests below).
 pub const UNDELEGATE_BUFFER_TAG: &[u8] = b"undelegate-buffer";
 /// PDA seed prefix for the delegation record (lives under DELEGATION_PROGRAM_ID).
 pub const DELEGATION_RECORD_TAG: &[u8] = b"delegation";
@@ -60,8 +42,8 @@ pub const DELEGATION_METADATA_TAG: &[u8] = b"delegation-metadata";
 /// Discriminator for the `Delegate` instruction.
 const DELEGATE_DISCRIMINATOR: u8 = 0;
 
-/// Borsh-serialized argument struct for the Delegate ix. Layout matches
-/// `magicblock-delegation-program-api::args::DelegateArgs` byte-for-byte.
+/// Borsh-serialized argument struct for the Delegate ix, in the delegation
+/// program's wire layout.
 #[derive(Default, Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct DelegateArgs {
     /// Frequency at which the validator commits the account state if the
@@ -69,7 +51,7 @@ pub struct DelegateArgs {
     pub commit_frequency_ms: u32,
     /// Canonical PDA seeds (WITHOUT the bump) — the delegation program
     /// re-derives via find_program_address. The bump travels only in the
-    /// invoke_signed signer seeds, not here (WAVE 24i).
+    /// invoke_signed signer seeds, never here.
     pub seeds: Vec<Vec<u8>>,
     /// Optional validator authority. Pass None for permissionless
     /// validator selection.
@@ -102,7 +84,6 @@ pub fn delegation_record_pda(delegated: &Pubkey) -> (Pubkey, u8) {
     )
 }
 
-
 /// Account list for the Delegate CPI.
 pub struct DelegateAccounts<'info> {
     pub payer: AccountInfo<'info>,
@@ -134,14 +115,13 @@ pub fn cpi_delegate(
         crate::FlashBookError::Unauthorized
     );
 
-    // WAVE 24i — the upgraded delegation program uses a "fast" delegate path
-    // (`split_at(8)` discriminator; byte[0]=Delegate=0) that requires the CALLER
-    // to stage the account into the buffer and hand its ownership to the
-    // delegation program BEFORE the CPI (the old DLP did this internally). This
-    // mirrors `ephemeral_rollups_sdk::cpi::delegate_account` byte-for-byte. The
-    // DLP copies the buffer back into the (zeroed) account during its CPI, so the
-    // round-trip is lossless. `delegated_seeds` MUST include the bump (for PDA
-    // signing); `args.seeds` MUST NOT (the DLP re-derives via find_program_address).
+    // The delegation program's delegate path (`split_at(8)` discriminator;
+    // byte[0]=Delegate=0) requires the CALLER to stage the account into the
+    // buffer and hand its ownership to the delegation program BEFORE the CPI.
+    // The DLP copies the buffer back into the (zeroed) account during its CPI,
+    // so the round-trip is lossless. `delegated_seeds` MUST include the bump
+    // (for PDA signing); `args.seeds` MUST NOT (the DLP re-derives via
+    // find_program_address).
     let data_len = accounts.delegated_account.data_len();
     let (_, buffer_bump) =
         delegate_buffer_pda(accounts.delegated_account.key, accounts.owner_program.key);
@@ -238,11 +218,9 @@ pub fn cpi_delegate(
     Ok(())
 }
 
-// NOTE: the program-initiated `cpi_undelegate` (+ its `UndelegateAccounts` /
-// `UNDELEGATE_DISCRIMINATOR`) was removed in the 2026-06 dead-code cleanup. Real
-// undelegation is driven by the MagicBlock delegation program calling back into
-// `process_undelegation` → `process_external_undelegate` (the EXTERNAL_UNDELEGATE
-// path below); the program never issues an Undelegate CPI itself.
+// Undelegation is driven by the MagicBlock delegation program calling back
+// into `process_undelegation` → `process_external_undelegate` (below); this
+// program never issues an Undelegate CPI itself.
 
 /// Pure decision for the permissionless force-undelegate timeout gate
 /// (`force_undelegate_market_book`). Returns true iff the ER has been silent for
@@ -252,8 +230,8 @@ pub fn cpi_delegate(
 /// trap. A 0 baseline (book not delegated via the upgraded path) is never
 /// escapable. Extracted pure so the "never fires while the ER is live" property
 /// is host-tested and Kani-proven, and the handler calls the proven function.
-/// F3 (audit 2026-06): two-tier so a healthy-but-QUIET market is not griefed off
-/// the ER, while a CENSORING sequencer still cannot trap funds (preserving F1).
+/// Two-tier so a healthy-but-QUIET market is not griefed off the ER, while a
+/// CENSORING sequencer still cannot trap funds.
 ///   • FAST path — the ER shows NO liveness of any kind (no fill, no heartbeat,
 ///     no recent delegation) for `stall_timeout_slots`. Heartbeat-aware, so a
 ///     live ER that simply has no trades keeps this shut.
@@ -272,7 +250,11 @@ pub fn force_undelegate_allowed(
     censorship_timeout_slots: u64,
 ) -> bool {
     // FAST: any liveness signal (fill, heartbeat, or the delegation baseline).
-    let er_baseline = max3(last_mark_update_slot, last_heartbeat_slot, book_delegated_at_slot);
+    let er_baseline = max3(
+        last_mark_update_slot,
+        last_heartbeat_slot,
+        book_delegated_at_slot,
+    );
     let er_stalled =
         er_baseline != 0 && current_slot.saturating_sub(er_baseline) > stall_timeout_slots;
 
@@ -321,13 +303,12 @@ mod force_undelegate_kani_proofs {
             let er_baseline = core::cmp::max(last_fill, core::cmp::max(heartbeat, delegated));
             let settle_baseline = core::cmp::max(last_fill, delegated);
             let er_stalled = er_baseline != 0 && current.saturating_sub(er_baseline) > stall;
-            let censored =
-                settle_baseline != 0 && current.saturating_sub(settle_baseline) > censor;
+            let censored = settle_baseline != 0 && current.saturating_sub(settle_baseline) > censor;
             assert!(er_stalled || censored);
         }
     }
 
-    /// F3 ANTI-GRIEF: a market with a FRESH ER signal (recent fill or heartbeat
+    /// ANTI-GRIEF: a market with a FRESH ER signal (recent fill or heartbeat
     /// within the stall window) AND recent settlement (within the censorship
     /// window) can NEVER be force-undelegated — so a healthy/heartbeating market
     /// is not griefed off the ER.
@@ -351,8 +332,7 @@ mod force_undelegate_kani_proofs {
 
 // ─── MagicBlock Magic program (ER-side commit) + undelegation callback ───
 //
-// The pieces below complete the settlement loop the bare Delegate/Undelegate
-// CPIs above cannot do on their own (audit finding ER-2 / C-2):
+// The pieces below complete the settlement loop around the Delegate CPI:
 //
 //   * `cpi_commit` — an ON-THE-ER Magic Action (CPI to the Magic program) that
 //     either snapshots delegated state back to L1 (`ScheduleCommit`) or
@@ -361,10 +341,9 @@ mod force_undelegate_kani_proofs {
 //     program invokes (prefixed with EXTERNAL_UNDELEGATE_DISCRIMINATOR) to
 //     re-open the PDA under this program and copy the committed buffer back.
 //
-// Wire format hand-rolled (we can't depend on `ephemeral-rollups-sdk`, see the
-// module header) but byte-verified against the SDK source + its bincode tests:
-//   ScheduleCommit               -> u32 LE enum tag [1,0,0,0]
-//   ScheduleCommitAndUndelegate  -> u32 LE enum tag [2,0,0,0]
+// Magic-program wire format (bincode u32 LE enum tags):
+//   ScheduleCommit               -> [1,0,0,0]
+//   ScheduleCommitAndUndelegate  -> [2,0,0,0]
 
 /// MagicBlock Magic (validator) program — runs ON the ER. `declare_id!` in
 /// `magicblock-magic-program-api`.
@@ -439,9 +418,9 @@ pub fn cpi_commit<'info>(
 }
 
 /// Re-create / re-own a PDA under `owner` with `space` bytes, signed by its
-/// seeds. Mirrors the SDK `create_pda`: fresh account -> `create_account`;
-/// pre-existing (lamport-carrying) account -> top up rent + `allocate` +
-/// `assign`. 2.1-clean (no SDK dependency).
+/// seeds. A fresh account goes through `create_account`; a pre-existing
+/// (lamport-carrying) account is topped up to rent exemption, then
+/// `allocate` + `assign`.
 fn create_pda<'info>(
     payer: &AccountInfo<'info>,
     pda: &AccountInfo<'info>,
@@ -470,7 +449,11 @@ fn create_pda<'info>(
         let alloc = system_instruction::allocate(pda.key, space as u64);
         invoke_signed(&alloc, &[pda.clone(), system_program.clone()], signer_seeds)?;
         let assign = system_instruction::assign(pda.key, owner);
-        invoke_signed(&assign, &[pda.clone(), system_program.clone()], signer_seeds)?;
+        invoke_signed(
+            &assign,
+            &[pda.clone(), system_program.clone()],
+            signer_seeds,
+        )?;
     }
     Ok(())
 }
@@ -485,10 +468,10 @@ fn create_pda<'info>(
 /// (see `process_undelegation` in `lib.rs`), and Anchor deserializes the
 /// `account_seeds: Vec<Vec<u8>>` arg for us — no entrypoint fallback needed.
 ///
-/// This mirrors `ephemeral_rollups_sdk::cpi::undelegate_account`. Accounts:
-/// `delegated`(w), `buffer`(signer, owned by the delegation program), `payer`(w),
-/// `system_program`. The buffer (filled by the validator with the committed ER
-/// state) is copied byte-for-byte into the re-opened PDA.
+/// Accounts: `delegated`(w), `buffer`(signer, owned by the delegation
+/// program), `payer`(w), `system_program`. The buffer (filled by the
+/// validator with the committed ER state) is copied verbatim into the
+/// re-opened PDA.
 pub fn process_external_undelegate<'info>(
     delegated: &AccountInfo<'info>,
     buffer: &AccountInfo<'info>,
@@ -509,21 +492,21 @@ pub fn process_external_undelegate<'info>(
     let (derived, bump) = Pubkey::find_program_address(&seed_slices, &crate::ID);
     require_keys_eq!(*delegated.key, derived, crate::FlashBookError::WrongMarket);
 
-    // AUDIT HIGH-4 (2026-07): BIND the buffer to `delegated`. The two guards
-    // above (is_signer + owner == DLP) are NOT sufficient — an attacker can
-    // manufacture a DLP-owned signer with arbitrary bytes (allocate a PDA under
-    // their own program, write bytes, `assign` it to the delegation program —
-    // data survives `assign` — and sign for it via invoke_signed) and target ANY
-    // uninitialized canonical PDA, fabricating e.g. a TraderState with u64::MAX
-    // collateral that `create_pda` below then copies in.
+    // BIND the buffer to `delegated`. The two guards above (is_signer +
+    // owner == DLP) are NOT sufficient on their own — an attacker can
+    // manufacture a DLP-owned signer with arbitrary bytes (allocate a PDA
+    // under their own program, write bytes, `assign` it to the delegation
+    // program — data survives `assign` — and sign for it via invoke_signed)
+    // and target ANY uninitialized canonical PDA, fabricating e.g. a
+    // TraderState with u64::MAX collateral that `create_pda` below then
+    // copies in.
     //
-    // Re-derive the DLP's canonical undelegation-buffer PDA for THIS delegated
-    // account (`["undelegate-buffer", delegated]` under the delegation program)
-    // and require the passed buffer to equal it. Only the real DLP can produce a
-    // signer at that address, so a forged buffer at any other address is rejected.
-    // The seed/program is empirically confirmed against the live MagicBlock devnet
-    // ER — the full delegate→commit→undelegate round-trip stays green with this
-    // binding enforced.
+    // So: re-derive the DLP's canonical undelegation-buffer PDA for THIS
+    // delegated account (`["undelegate-buffer", delegated]` under the
+    // delegation program) and require the passed buffer to equal it. Only
+    // the real DLP can produce a signer at that address, so a forged buffer
+    // at any other address is rejected. The derivation matches the live
+    // delegation program (regression-pinned below).
     let (expected_buffer, _) = undelegate_buffer_pda(delegated.key);
     require_keys_eq!(
         *buffer.key,
@@ -549,10 +532,7 @@ pub fn process_external_undelegate<'info>(
     // buffer.data_len()); guard anyway — Solana programs must not panic.
     let src = buffer.try_borrow_data()?;
     let mut dst = delegated.try_borrow_mut_data()?;
-    require!(
-        dst.len() == src.len(),
-        crate::FlashBookError::OutOfRange
-    );
+    require!(dst.len() == src.len(), crate::FlashBookError::OutOfRange);
     dst.copy_from_slice(&src);
     Ok(())
 }
@@ -564,10 +544,10 @@ mod tests {
     // Censorship backstop is far away in these fast-path tests (heartbeat=0).
     const CENSOR: u64 = 9_000;
 
-    /// AUDIT HIGH-4 (2026-07): lock in the exact undelegation-buffer derivation
-    /// against REAL (buffer, delegated) pairs captured from the live MagicBlock
-    /// devnet ER round-trip. If a refactor ever changes the seed/program, the
-    /// buffer binding in `process_external_undelegate` would silently reject the
+    /// Locks in the exact undelegation-buffer derivation against REAL
+    /// (buffer, delegated) pairs captured from live MagicBlock devnet ER
+    /// round-trips. If a refactor ever changes the seed/program, the buffer
+    /// binding in `process_external_undelegate` would silently reject the
     /// real DLP buffer (breaking undelegation) or accept a wrong one — this
     /// regression guard fails first. Not synthetic: these are on-chain values.
     #[test]
@@ -618,44 +598,62 @@ mod tests {
     }
 
     #[test]
-    fn f2_f3_fresh_heartbeat_blocks_fast_escape_on_quiet_market() {
-        // F3: a QUIET but healthy market — last fill 5_000 slots ago (≫ stall 750,
+    fn fresh_heartbeat_blocks_fast_escape_on_quiet_market() {
+        // A QUIET but healthy market — last fill 5_000 slots ago (≫ stall 750,
         // but within the 9_000 censorship window so the backstop is NOT in play),
         // and the ER heartbeats every ~100 slots. WITHOUT the heartbeat the fast
         // path would fire (5_000 > 750); WITH it the escape must stay SHUT (no grief).
         // current 100_000, last_fill 95_000, heartbeat 99_900, delegated 1_000.
-        assert!(!force_undelegate_allowed(100_000, 95_000, 99_900, 1_000, 750, CENSOR));
+        assert!(!force_undelegate_allowed(
+            100_000, 95_000, 99_900, 1_000, 750, CENSOR
+        ));
         // Same market, ER now ALSO stops heartbeating for > 750 slots ⇒ dark ⇒ escape.
-        assert!(force_undelegate_allowed(100_000, 95_000, 99_000, 1_000, 750, CENSOR));
+        assert!(force_undelegate_allowed(
+            100_000, 95_000, 99_000, 1_000, 750, CENSOR
+        ));
     }
 
     #[test]
-    fn f3_censorship_backstop_fires_despite_fresh_heartbeat() {
-        // F1 preserved: an alive-but-CENSORING sequencer heartbeats every slot but
+    fn censorship_backstop_fires_despite_fresh_heartbeat() {
+        // An alive-but-CENSORING sequencer heartbeats every slot but
         // settles NOTHING. The fast path stays shut (heartbeat fresh), but the
         // censorship backstop opens once settlement is older than CENSOR.
         // current 1_000_000, last_fill 990_000 (10k ago > CENSOR 9_000),
         // heartbeat 999_999 (1 slot ago), delegated 990_000.
-        assert!(force_undelegate_allowed(1_000_000, 990_000, 999_999, 990_000, 750, CENSOR));
+        assert!(force_undelegate_allowed(
+            1_000_000, 990_000, 999_999, 990_000, 750, CENSOR
+        ));
         // If the fill is within the censorship window, NOT escapable (still trading).
-        assert!(!force_undelegate_allowed(1_000_000, 995_000, 999_999, 990_000, 750, CENSOR));
+        assert!(!force_undelegate_allowed(
+            1_000_000, 995_000, 999_999, 990_000, 750, CENSOR
+        ));
     }
 
     #[test]
-    fn f1_stamp_baseline_closes_the_pre_upgrade_trap() {
-        // F1: a market delegated BEFORE the upgrade has both signals at 0. Its ER
-        // goes dark with no committed fill → baseline 0 → trapped forever.
+    fn stamp_baseline_closes_the_pre_upgrade_trap() {
+        // A market delegated before liveness stamping existed has both
+        // signals at 0. Its ER goes dark with no committed fill → baseline 0
+        // → trapped forever unless a baseline is stamped.
         let timeout = 750;
         assert!(
             !force_undelegate_allowed(10_000_000, 0, 0, 0, timeout, CENSOR),
-            "pre-upgrade market with no baseline must be trapped (the F1 bug)"
+            "market with no baseline must be trapped until stamped"
         );
         // stamp_book_liveness_baseline sets book_delegated_at_slot = current slot.
         let stamp_slot = 10_000_000;
         // Immediately after stamping, the ER has NOT yet been silent past the
         // timeout, so the escape stays closed (cannot be used to grief).
-        assert!(!force_undelegate_allowed(stamp_slot, 0, 0, stamp_slot, timeout, CENSOR));
-        assert!(!force_undelegate_allowed(stamp_slot + timeout, 0, 0, stamp_slot, timeout, CENSOR));
+        assert!(!force_undelegate_allowed(
+            stamp_slot, 0, 0, stamp_slot, timeout, CENSOR
+        ));
+        assert!(!force_undelegate_allowed(
+            stamp_slot + timeout,
+            0,
+            0,
+            stamp_slot,
+            timeout,
+            CENSOR
+        ));
         // A genuinely live ER that posts a fill after the stamp pushes the
         // baseline forward via last_mark_update_slot → still blocked.
         assert!(!force_undelegate_allowed(
@@ -668,7 +666,14 @@ mod tests {
         ));
         // After a FULL timeout of continued silence post-stamp (no fill, no
         // heartbeat), the trapped trader can finally escape — the trap is closed.
-        assert!(force_undelegate_allowed(stamp_slot + timeout + 1, 0, 0, stamp_slot, timeout, CENSOR));
+        assert!(force_undelegate_allowed(
+            stamp_slot + timeout + 1,
+            0,
+            0,
+            stamp_slot,
+            timeout,
+            CENSOR
+        ));
     }
 
     #[test]
@@ -756,7 +761,10 @@ mod tests {
     fn undelegate_callback_seeds_borsh_roundtrip() {
         // The delegation program sends EXTERNAL_UNDELEGATE_DISCRIMINATOR ++
         // borsh(Vec<Vec<u8>>); process_external_undelegate decodes the tail.
-        let seeds: Vec<Vec<u8>> = vec![b"market_book".to_vec(), Pubkey::new_unique().to_bytes().to_vec()];
+        let seeds: Vec<Vec<u8>> = vec![
+            b"market_book".to_vec(),
+            Pubkey::new_unique().to_bytes().to_vec(),
+        ];
         let mut buf = Vec::new();
         seeds.serialize(&mut buf).unwrap();
         let decoded = Vec::<Vec<u8>>::try_from_slice(&buf).unwrap();

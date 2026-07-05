@@ -1,4 +1,4 @@
-//! Stress-lattice maintenance margin — integer-arithmetic Rust port.
+//! Stress-lattice maintenance margin — integer arithmetic throughout.
 //!
 //! For each scenario s ∈ Σ, compute portfolio loss + maintenance margin on
 //! the stressed notional. Required margin is the worst-case scenario loss.
@@ -7,7 +7,7 @@
 //! risk in every scenario; only the maintenance margin on stressed notional
 //! remains.
 //!
-//! Cost: O(N_positions × N_scenarios). Bounded (and now ENFORCED, AUDIT M-9)
+//! Cost: O(N_positions × N_scenarios). Bounded (ENFORCED at entry)
 //! by MAX_POSITIONS_PER_TRADER × MAX_STRESS_SCENARIOS = 16 × 133 = 2128 evals —
 //! `assess_margin` rejects a scenario vector longer than MAX_STRESS_SCENARIOS.
 
@@ -39,7 +39,7 @@ pub struct PositionSnapshot {
     pub size_lots: u64,
     pub entry_price: Ticks,
     pub cum_funding_index_at_entry: FundingIndex,
-    /// Phase 2 isolated-margin marker.
+    /// Isolated-margin marker.
     /// `0`  — position is cross-margined and is evaluated against the
     ///        trader's pooled `collateral_quote_lots`.
     /// `>0` — position is isolated. `assess_margin_unified` filters it
@@ -66,10 +66,10 @@ pub struct MarketSnapshot {
     /// 0 threshold = tier disabled (legacy single-mmr behaviour).
     pub concentration_threshold_lots: u64,
     pub concentration_extra_mmr_bps: u32,
-    // ─── Wave 28b — OI-scaled MMR inputs ─────────────────────────────
+    // ─── OI-scaled MMR inputs ────────────────────────────────────────
     /// Side OI in lots, for the side this *position* is on. Caller is
     /// responsible for passing `long_oi_lots` for long positions,
-    /// `short_oi_lots` for shorts. Defaults to 0 (Wave 28 disabled).
+    /// `short_oi_lots` for shorts. 0 disables the surcharge.
     pub side_oi_lots: u64,
     /// Per-million-lots slope, in bps. `100` ⇒ +1 bp extra MMR per
     /// 10_000 lots of side OI. `0` disables OI scaling entirely.
@@ -84,11 +84,11 @@ impl MarketSnapshot {
     /// `size_lots` on this market. Stacks all three contributions:
     ///   1. base `maintenance_margin_bps`
     ///   2. CME-style concentration extra (size ≥ threshold)
-    ///   3. Wave 28b OI-scaled crowded-trade extra (heavy-side OI)
+    ///   3. OI-scaled crowded-trade extra (heavy-side OI)
     ///
     /// All terms are additive; total saturates on u32 overflow.
     ///
-    /// ⚠️ RISK-H1 — term (3) is **INACTIVE in production**. Every on-chain
+    /// ⚠️ Term (3) is **INACTIVE in production**. Every on-chain
     /// `RiskMarketSnap` constructs this snapshot with `side_oi_lots = 0` and
     /// `oi_mmr_slope_bps_per_million_lots = 0`, and there is **no MarketParams
     /// field** to configure them — so `oi_extra` is always 0 and the
@@ -124,7 +124,7 @@ impl MarketSnapshot {
     }
 }
 
-/// Wave 28a — GMX V2-style OI-scaled MMR.
+/// OI-scaled MMR.
 ///
 /// Adds a *crowded-trade* penalty on top of the existing tier table:
 /// when the heavy-side open interest grows, every position on the
@@ -162,103 +162,9 @@ pub fn oi_scaled_mmr_extra_bps(
     (extra.min(max_extra_bps as u128) as u32).min(max_extra_bps)
 }
 
-/// Compose the full effective MMR for a position: stress-lattice tier
-/// + concentration extra (existing) + OI-scaled extra (Wave 28a).
-///
-/// `tiers` is the Hyperliquid-style tier table; pass `&[]` to skip.
-/// `oi_slope` + `oi_max` are the Wave 28a knobs; pass `(0, 0)` to skip.
-pub fn effective_mmr_bps_full(
-    base_mmr_bps: u32,
-    tiers: &[(u64, u32)],
-    position_notional_quote_lots: u128,
-    side_oi_lots: u64,
-    oi_slope_bps_per_million_lots: u32,
-    oi_max_extra_bps: u32,
-) -> u32 {
-    let tier_mmr = tiered_mmr_bps(base_mmr_bps, tiers, position_notional_quote_lots);
-    let oi_extra = oi_scaled_mmr_extra_bps(side_oi_lots, oi_slope_bps_per_million_lots, oi_max_extra_bps);
-    tier_mmr.saturating_add(oi_extra)
-}
-
-/// Hyperliquid-style multi-tier MMR. Each tier is a
-/// `(min_notional_quote_lots, mmr_bps)` pair sorted ascending by notional.
-/// A position's effective MMR = `mmr_bps` of the largest tier whose
-/// `min_notional` is ≤ the position's notional, OR `base_mmr_bps` if no
-/// tier matches (notional below the first tier's threshold).
-///
-/// Example tier table (typical HL BTC market):
-///   [(0,        100),    // tier 1: ≤  ~$1M  → 1.0% MMR
-///    (1_000_000, 200),   // tier 2:  ~$5M    → 2.0% MMR
-///    (5_000_000, 300),   // tier 3: ~$25M    → 3.0% MMR
-///    (25_000_000, 500)]  // tier 4: > $25M   → 5.0% MMR
-///
-/// `tiers` MUST be sorted ascending by `min_notional`; the caller is
-/// responsible for sort order.
-///
-/// NOTE (AUDIT M-1, 2026-07): the on-chain leverage-tier ladder
-/// (`MarketLeverageTiersAccount` + `init/update_market_leverage_tiers`) was
-/// REMOVED — it was governance-configurable but never consulted by the margin
-/// engine (false assurance). This pure helper is retained as an unused,
-/// unit-tested library function; the live per-position MMR is
-/// `MarketSnapshot::effective_mmr_bps` (base + concentration step).
-///
-/// Pure function — no Solana types beyond u64/u32. Unit-tested directly.
-pub fn tiered_mmr_bps(
-    base_mmr_bps: u32,
-    tiers: &[(u64, u32)],
-    position_notional_quote_lots: u128,
-) -> u32 {
-    let mut effective = base_mmr_bps;
-    for (min_notional, tier_mmr) in tiers {
-        if position_notional_quote_lots >= *min_notional as u128 {
-            effective = *tier_mmr;
-        } else {
-            break;
-        }
-    }
-    effective
-}
-
 #[cfg(test)]
-mod tier_tests {
+mod oi_mmr_tests {
     use super::*;
-
-    #[test]
-    fn empty_tiers_returns_base() {
-        assert_eq!(tiered_mmr_bps(100, &[], 0), 100);
-        assert_eq!(tiered_mmr_bps(100, &[], 1_000_000_000), 100);
-    }
-
-    #[test]
-    fn below_first_tier_returns_base() {
-        let tiers = [(1_000_000u64, 200u32), (5_000_000, 300)];
-        assert_eq!(tiered_mmr_bps(100, &tiers, 0), 100);
-        assert_eq!(tiered_mmr_bps(100, &tiers, 999_999), 100);
-    }
-
-    #[test]
-    fn at_or_above_tier_returns_tier_mmr() {
-        let tiers = [(1_000_000u64, 200u32), (5_000_000, 300), (25_000_000, 500)];
-        assert_eq!(tiered_mmr_bps(100, &tiers, 1_000_000), 200);
-        assert_eq!(tiered_mmr_bps(100, &tiers, 4_999_999), 200);
-        assert_eq!(tiered_mmr_bps(100, &tiers, 5_000_000), 300);
-        assert_eq!(tiered_mmr_bps(100, &tiers, 24_999_999), 300);
-        assert_eq!(tiered_mmr_bps(100, &tiers, 25_000_000), 500);
-        assert_eq!(tiered_mmr_bps(100, &tiers, u128::MAX), 500);
-    }
-
-    #[test]
-    fn monotone_in_notional() {
-        let tiers = [(100u64, 150u32), (1_000, 250), (10_000, 400)];
-        let mut prev = tiered_mmr_bps(100, &tiers, 0);
-        for n in [99u128, 100, 999, 1_000, 9_999, 10_000, 1_000_000] {
-            let now = tiered_mmr_bps(100, &tiers, n);
-            assert!(now >= prev, "non-monotone at {}: prev={} now={}", n, prev, now);
-            prev = now;
-        }
-    }
-
-    // ─── Wave 28a tests ─────────────────────────────────────────
 
     #[test]
     fn oi_scaled_zero_slope_returns_zero() {
@@ -291,65 +197,24 @@ mod tier_tests {
     }
 
     #[test]
-    fn effective_mmr_full_stacks_tier_and_oi() {
-        // base 100, tier @ 1M → 200, OI 500k slope 100 cap 1000 → +50.
-        // Effective = 200 + 50 = 250.
-        let tiers = [(1_000_000u64, 200u32)];
-        let r = effective_mmr_bps_full(100, &tiers, 1_500_000, 500_000, 100, 1_000);
-        assert_eq!(r, 250);
-    }
-
-    #[test]
-    fn effective_mmr_full_no_oi_matches_pure_tiered() {
-        let tiers = [(1_000_000u64, 200u32)];
-        let with_oi = effective_mmr_bps_full(100, &tiers, 1_500_000, 0, 100, 1_000);
-        let without = tiered_mmr_bps(100, &tiers, 1_500_000);
-        assert_eq!(with_oi, without);
-    }
-
-    #[test]
-    fn effective_mmr_full_no_tier_matches_pure_oi() {
-        // No tiers → just base + OI extra.
-        let extra = oi_scaled_mmr_extra_bps(1_000_000, 100, 1_000);
-        let composed = effective_mmr_bps_full(100, &[], 0, 1_000_000, 100, 1_000);
-        assert_eq!(composed, 100 + extra);
-    }
-
-    #[test]
-    fn effective_mmr_full_monotone_in_oi() {
-        let tiers = [(1_000u64, 200u32)];
-        let mut prev = 0u32;
-        for oi in [0u64, 100_000, 500_000, 1_000_000, 5_000_000] {
-            let now = effective_mmr_bps_full(100, &tiers, 10_000, oi, 50, 2_000);
-            assert!(now >= prev, "non-monotone at oi={}", oi);
-            prev = now;
-        }
-    }
-
-    #[test]
-    fn hl_btc_table() {
-        // HL's typical BTC tier table:
-        //   <$1M  → base 0.5% MMR (retail tier — uses caller's base_mmr)
-        //   $1M+  → 1.0% MMR
-        //   $5M+  → 2.0%
-        //   $25M+ → 3.0%
-        //   $100M+→ 5.0% (whale tier)
-        let tiers = [
-            (1_000_000u64, 100u32),
-            (5_000_000, 200),
-            (25_000_000, 300),
-            (100_000_000, 500),
-        ];
-        // Tiny retail position (< $1M) → base MMR (50 bps from caller).
-        assert_eq!(tiered_mmr_bps(50, &tiers, 500_000), 50);
-        // $3M position → first tier matches (≥$1M), second doesn't (<$5M).
-        assert_eq!(tiered_mmr_bps(50, &tiers, 3_000_000), 100);
-        // $7M position → second tier active.
-        assert_eq!(tiered_mmr_bps(50, &tiers, 7_000_000), 200);
-        // $30M position → third tier.
-        assert_eq!(tiered_mmr_bps(50, &tiers, 30_000_000), 300);
-        // $200M whale → top tier (5% MMR).
-        assert_eq!(tiered_mmr_bps(50, &tiers, 200_000_000), 500);
+    fn effective_mmr_stacks_concentration_and_oi() {
+        // base 100, concentration extra +50 at threshold, OI 500k
+        // slope 100 cap 1000 → +50. Effective = 100 + 50 + 50 = 200.
+        let snap = MarketSnapshot {
+            market: Pubkey::new_from_array([1; 32]),
+            mark_price: Ticks(100),
+            cum_funding_index: 0,
+            maintenance_margin_bps: 100,
+            tick_size: 1,
+            concentration_threshold_lots: 1_000,
+            concentration_extra_mmr_bps: 50,
+            side_oi_lots: 500_000,
+            oi_mmr_slope_bps_per_million_lots: 100,
+            oi_mmr_max_extra_bps: 1_000,
+        };
+        assert_eq!(snap.effective_mmr_bps(2_000), 200);
+        // Below the concentration threshold the extra drops out.
+        assert_eq!(snap.effective_mmr_bps(500), 150);
     }
 }
 
@@ -395,17 +260,14 @@ fn shocked_price(price: Ticks, shock_bps: i32) -> Result<Ticks> {
     if r <= 0 {
         return Ok(Ticks(0));
     }
-    // AUDIT (re-audit Arith L-1): reject a stressed price that overflows u64
+    // Reject a stressed price that overflows u64
     // rather than silently truncating via `as u64`. Only reachable with a
     // misconfigured (governance) shock, but matches the clamp/reject discipline
     // used for every other narrowing cast in this module.
     Ok(Ticks(u64::try_from(r).ok().or_overflow()?))
 }
 
-fn lookup_market<'a>(
-    markets: &'a [MarketSnapshot],
-    pk: &Pubkey,
-) -> Option<&'a MarketSnapshot> {
+fn lookup_market<'a>(markets: &'a [MarketSnapshot], pk: &Pubkey) -> Option<&'a MarketSnapshot> {
     markets.iter().find(|m| m.market == *pk)
 }
 
@@ -427,7 +289,7 @@ pub fn assess_margin(
     scenarios: &[Scenario],
     collateral_quote_lots: u64,
 ) -> Result<MarginAssessment> {
-    // AUDIT M-9 (2026-07): bound the compute cost. The on-chain generator never
+    // Bound the compute cost. The on-chain generator never
     // exceeds MAX_STRESS_SCENARIOS, so this never rejects a legitimate caller —
     // it caps a pathological / future caller that could otherwise pass an
     // unbounded scenario vector and exhaust the compute budget (a griefing /
@@ -470,7 +332,7 @@ pub fn assess_margin(
         .checked_sub(funding_total)
         .or_underflow()?;
 
-    // AUDIT HIGH-1 (2026-07): required margin must NOT grant cross-market
+    // Required margin must NOT grant cross-market
     // offset. The old code took `max over scenarios` of the loss SUMMED across
     // ALL positions, so any scenario that moves two markets together netted
     // opposing legs (e.g. long A + short B): the uniform all-down/all-up
@@ -556,7 +418,7 @@ pub fn assess_margin(
     }
 
     // Healthy iff the trader's available collateral covers the worst-case
-    // stressed loss. C-1 (audit 2026-06): gate on `collateral − funding`, NOT
+    // stressed loss. Gate on `collateral − funding`, NOT
     // `equity_signed`. Each scenario already measures loss from ENTRY
     // (`scenario_loss = MM_stressed − pnl_stressed`), so unrealized PnL is
     // accounted ONCE inside `required`. Comparing against `equity_signed`
@@ -584,8 +446,8 @@ pub fn assess_margin(
 ///
 /// A position is "isolated" when its own `PositionAccount.collateral_quote_lots`
 /// > 0. The caller passes a map of (market → isolated_collateral) for every
-/// isolated position; positions whose market is NOT in the map are treated
-/// as cross.
+/// >    isolated position; positions whose market is NOT in the map are treated
+/// >    as cross.
 ///
 /// The trader is HEALTHY iff:
 ///   (a) The cross set, assessed against `cross_collateral_quote_lots`, is
@@ -643,8 +505,9 @@ pub fn assess_margin_split(
     let mut all_healthy = cross.is_healthy;
     // Tightness metric: required − equity. Larger = closer to (or past) liquidation.
     let mut worst_idx = cross.worst_scenario_idx;
-    let mut worst_tightness: i128 =
-        (cross.required_quote_lots as i128).checked_sub(cross.equity_quote_lots_signed).unwrap_or(0);
+    let mut worst_tightness: i128 = (cross.required_quote_lots as i128)
+        .checked_sub(cross.equity_quote_lots_signed)
+        .unwrap_or(0);
 
     for (pos, iso_collateral) in &isolated_positions {
         let singleton = [*pos];
@@ -671,9 +534,8 @@ pub fn assess_margin_split(
     })
 }
 
-/// Phase 2 dispatch helper. Call this from any handler that previously
-/// called `assess_margin` directly — it picks the right code path based
-/// on whether any snapshot is isolated.
+/// Margin-mode dispatch helper: picks the cross vs isolated code path
+/// based on whether any snapshot is isolated.
 ///
 /// The "isolated" decision is read from each `PositionSnapshot`'s own
 /// `collateral_quote_lots` field. Handlers that mutate per-position
@@ -730,19 +592,31 @@ pub fn default_scenarios(markets: &[Pubkey]) -> Vec<Scenario> {
 
     let all_down: Vec<StressShock> = markets
         .iter()
-        .map(|m| StressShock { market: *m, shock_bps: -1000 })
+        .map(|m| StressShock {
+            market: *m,
+            shock_bps: -1000,
+        })
         .collect();
     let all_up: Vec<StressShock> = markets
         .iter()
-        .map(|m| StressShock { market: *m, shock_bps: 1000 })
+        .map(|m| StressShock {
+            market: *m,
+            shock_bps: 1000,
+        })
         .collect();
     let bs_down: Vec<StressShock> = markets
         .iter()
-        .map(|m| StressShock { market: *m, shock_bps: -3000 })
+        .map(|m| StressShock {
+            market: *m,
+            shock_bps: -3000,
+        })
         .collect();
     let bs_up: Vec<StressShock> = markets
         .iter()
-        .map(|m| StressShock { market: *m, shock_bps: 3000 })
+        .map(|m| StressShock {
+            market: *m,
+            shock_bps: 3000,
+        })
         .collect();
     out.push(all_down);
     out.push(all_up);
@@ -751,7 +625,7 @@ pub fn default_scenarios(markets: &[Pubkey]) -> Vec<Scenario> {
     out
 }
 
-/// WAVE 22 — pure tier resolution for the multi-tier fee table.
+/// Pure tier resolution for the multi-tier fee table.
 ///
 /// Picks the HIGHEST tier (by `min_volume`) that the trader's
 /// rolling-window volume satisfies. Returns `(maker_rebate_bps,
@@ -765,9 +639,9 @@ pub fn default_scenarios(markets: &[Pubkey]) -> Vec<Scenario> {
 /// default_taker_bps)`.
 ///
 /// `maker_rebate_bps` is SIGNED (i32) — positive = rebate paid to
-/// maker, negative = fee charged to maker (wave 22 retail tier 0).
+/// maker, negative = fee charged to maker (retail tier 0).
 ///
-/// Same shape as `tiered_mmr_bps` — pure, no Solana types.
+/// Pure — no Solana types.
 pub fn resolve_fee_tier(
     default_maker_rebate_bps: i32,
     default_taker_fee_bps: u32,
@@ -839,10 +713,18 @@ mod fee_tier_tests {
         ];
         let mut prev_maker = i32::MIN;
         let mut prev_taker = u32::MAX;
-        for vol in [0u64, 9_999, 10_000, 99_999, 100_000, 999_999, 1_000_000, 1_000_001] {
+        for vol in [
+            0u64, 9_999, 10_000, 99_999, 100_000, 999_999, 1_000_000, 1_000_001,
+        ] {
             let (m, t) = resolve_fee_tier(0, 0, &tiers, vol);
-            assert!(m >= prev_maker, "maker rebate must not decrease as volume rises");
-            assert!(t <= prev_taker, "taker fee must not increase as volume rises");
+            assert!(
+                m >= prev_maker,
+                "maker rebate must not decrease as volume rises"
+            );
+            assert!(
+                t <= prev_taker,
+                "taker fee must not increase as volume rises"
+            );
             prev_maker = m;
             prev_taker = t;
         }
@@ -850,7 +732,7 @@ mod fee_tier_tests {
 
     #[test]
     fn negative_maker_rebate_for_retail_tier() {
-        // Wave 22: tier 0 retail PAYS a maker fee (negative rebate);
+        // Tier 0 retail PAYS a maker fee (negative rebate);
         // higher-volume tiers cross zero into rebate.
         //   tier 0 (vol 0):      maker -10 (10 bps fee), taker 10
         //   tier 1 ($1M):        maker  -5 (5 bps fee),  taker 8
@@ -931,7 +813,10 @@ mod isolated_margin_tests {
         let flat = assess_margin(&positions, &[ms_a], &scenarios, 5_000).unwrap();
         assert_eq!(unified.is_healthy, flat.is_healthy);
         assert_eq!(unified.required_quote_lots, flat.required_quote_lots);
-        assert_eq!(unified.equity_quote_lots_signed, flat.equity_quote_lots_signed);
+        assert_eq!(
+            unified.equity_quote_lots_signed,
+            flat.equity_quote_lots_signed
+        );
     }
 
     #[test]
@@ -942,7 +827,10 @@ mod isolated_margin_tests {
         let scenarios = default_scenarios(&[mkt_a]);
         // Cross pool empty — only the isolated bucket matters here.
         let a = assess_margin_unified(&positions, &[ms_a], &scenarios, 0).unwrap();
-        assert!(a.is_healthy, "isolated position must use its own collateral");
+        assert!(
+            a.is_healthy,
+            "isolated position must use its own collateral"
+        );
     }
 
     #[test]
@@ -969,7 +857,7 @@ mod isolated_margin_tests {
         let (mkt_a, ms_a) = mkt(1, 100);
         let (mkt_b, ms_b) = mkt(2, 200);
         let positions = vec![
-            long_at(mkt_a, 10, 95, 0),  // cross — well-collateralised by 10_000 pool
+            long_at(mkt_a, 10, 95, 0),     // cross — well-collateralised by 10_000 pool
             long_at(mkt_b, 1_000, 195, 1), // isolated — under-collateralised
         ];
         let scenarios = default_scenarios(&[mkt_a, mkt_b]);
@@ -978,8 +866,7 @@ mod isolated_margin_tests {
 
         // Sanity: cross-only assessment over the cross subset alone IS healthy.
         let cross_only = vec![long_at(mkt_a, 10, 95, 0)];
-        let cross_check =
-            assess_margin(&cross_only, &[ms_a, ms_b], &scenarios, 10_000).unwrap();
+        let cross_check = assess_margin(&cross_only, &[ms_a, ms_b], &scenarios, 10_000).unwrap();
         assert!(
             cross_check.is_healthy,
             "cross subset must be self-sufficient — isolated failure does NOT bleed back"
@@ -1010,7 +897,9 @@ mod isolated_margin_tests {
 /// properties that hold for ANY division result). Runs in the CI Kani job.
 #[cfg(kani)]
 mod mmr_kani_proofs {
-    use super::{effective_mmr_bps_full, oi_scaled_mmr_extra_bps};
+    use super::{oi_scaled_mmr_extra_bps, MarketSnapshot};
+    use crate::matcher::lot::Ticks;
+    use anchor_lang::prelude::Pubkey;
 
     /// The OI surcharge NEVER exceeds its configured cap — a crowded book cannot
     /// be charged more maintenance margin than governance bounded.
@@ -1031,29 +920,37 @@ mod mmr_kani_proofs {
         assert!(oi_scaled_mmr_extra_bps(oi, 0, max) == 0);
     }
 
-    /// INV-M4: with no tier table, the effective maintenance margin is NEVER below
-    /// the base floor — the OI surcharge only ADDS, it can never UNDER-margin a
-    /// position below `base_mmr_bps` (saturating_add of a non-negative extra).
+    /// INV-M4: the effective maintenance margin is NEVER below the base
+    /// floor — the concentration and OI surcharges only ADD (saturating),
+    /// so no input can under-margin a position below `maintenance_margin_bps`.
+    /// Proven on the live per-position MMR path used by `assess_margin`.
     #[kani::proof]
     fn effective_mmr_never_below_base_floor() {
-        let base: u32 = kani::any();
-        let notional: u128 = kani::any();
-        let oi: u64 = kani::any();
-        let slope: u32 = kani::any();
-        let max: u32 = kani::any();
-        let eff = effective_mmr_bps_full(base, &[], notional, oi, slope, max);
-        assert!(eff >= base);
+        let snap = MarketSnapshot {
+            market: Pubkey::new_from_array([0; 32]),
+            mark_price: Ticks(kani::any()),
+            cum_funding_index: kani::any(),
+            maintenance_margin_bps: kani::any(),
+            tick_size: kani::any(),
+            concentration_threshold_lots: kani::any(),
+            concentration_extra_mmr_bps: kani::any(),
+            side_oi_lots: kani::any(),
+            oi_mmr_slope_bps_per_million_lots: kani::any(),
+            oi_mmr_max_extra_bps: kani::any(),
+        };
+        let size_lots: u64 = kani::any();
+        assert!(snap.effective_mmr_bps(size_lots) >= snap.maintenance_margin_bps);
     }
 }
 
 #[cfg(test)]
 mod assess_margin_frame_tests {
     //! Regression tests for the stress-lattice reference-frame mismatch
-    //! (audit 2026-06, "C-1"): `assess_margin` must NOT double-count unrealized
+    //! `assess_margin` must NOT double-count unrealized
     //! PnL — once in equity (at mark) and again in each scenario loss (at the
     //! stressed price). Health under stress is `collateral - funding + pnl_stressed
     //! >= MM_stressed`; equivalently `(collateral - funding) >= worst(MM_s - pnl_s)`.
-    //! Both tests use a single custom -20% scenario so the boundary is exact.
+    //! > Both tests use a single custom -20% scenario so the boundary is exact.
     use super::*;
 
     fn mkt(seed: u8, mark: u64) -> (Pubkey, MarketSnapshot) {
@@ -1087,7 +984,10 @@ mod assess_margin_frame_tests {
     }
 
     fn down_20pct(market: Pubkey) -> Vec<Scenario> {
-        vec![vec![StressShock { market, shock_bps: -2000 }]]
+        vec![vec![StressShock {
+            market,
+            shock_bps: -2000,
+        }]]
     }
 
     /// Direction 1 — collateral drain. A winning long (mark 130 > entry 100)
@@ -1104,7 +1004,7 @@ mod assess_margin_frame_tests {
         assert_eq!(a.required_quote_lots, 1, "scenario math drifted");
         assert!(
             !a.is_healthy,
-            "zero-collateral winner must be unhealthy under stress (C-1 double-count)"
+            "zero-collateral winner must be unhealthy under stress (no PnL double-count)"
         );
     }
 
@@ -1121,24 +1021,29 @@ mod assess_margin_frame_tests {
         assert_eq!(a.required_quote_lots, 27, "scenario math drifted");
         assert!(
             a.is_healthy,
-            "solvent position carrying a small loss must not be liquidated (C-1 double-count)"
+            "solvent position carrying a small loss must not be liquidated (no PnL double-count)"
         );
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// FV: stress-soundness of the C-1 health gate (Kani). The empirical tests in
+// FV: stress-soundness of the available-collateral health gate (Kani). The empirical tests in
 // `assess_margin_frame_tests` prove `assess_margin` IMPLEMENTS this gate at exact
 // boundaries; these proofs show the gate is sound for ALL bounded inputs — a
 // position the gate calls healthy provably survives the worst stressed scenario.
 // Pure i128 add/sub/max/compare (NO division), so CBMC is complete and fast.
 // ─────────────────────────────────────────────────────────────────────
 #[cfg(kani)]
-mod assess_margin_c1_kani_proofs {
-    /// Mirror of the post-C-1 gate (risk.rs::assess_margin): `required` clamps the
+mod assess_margin_gate_kani_proofs {
+    /// Mirror of the live gate (risk.rs::assess_margin): `required` clamps the
     /// per-scenario stressed loss (MM − pnl) at 0, and health compares AVAILABLE
     /// collateral (`collateral − funding`) — NOT equity-with-mark-PnL — to it.
-    fn gate(collateral: i128, funding: i128, pnl_stressed: i128, mm_stressed: i128) -> (bool, i128) {
+    fn gate(
+        collateral: i128,
+        funding: i128,
+        pnl_stressed: i128,
+        mm_stressed: i128,
+    ) -> (bool, i128) {
         let required = core::cmp::max(mm_stressed - pnl_stressed, 0);
         let available = collateral - funding;
         (available >= required, available)
@@ -1195,7 +1100,7 @@ mod assess_margin_c1_kani_proofs {
 
 #[cfg(test)]
 mod high1_cross_market_regression {
-    //! AUDIT HIGH-1 (2026-07) regression. A cross-margin portfolio that is long
+    //! Regression: a cross-margin portfolio that is long
     //! market A and short market B must be margined for BOTH legs moving
     //! adversely AT ONCE (A crashes AND B rallies). The pre-fix code took
     //! `max over scenarios` of the loss SUMMED across positions, so the uniform
@@ -1260,12 +1165,16 @@ mod high1_cross_market_regression {
         );
 
         // Exact boundary: 7000 healthy, 6999 not.
-        assert!(assess_margin(&positions, &[ma, mb], &scenarios, 7_000)
-            .unwrap()
-            .is_healthy);
-        assert!(!assess_margin(&positions, &[ma, mb], &scenarios, 6_999)
-            .unwrap()
-            .is_healthy);
+        assert!(
+            assess_margin(&positions, &[ma, mb], &scenarios, 7_000)
+                .unwrap()
+                .is_healthy
+        );
+        assert!(
+            !assess_margin(&positions, &[ma, mb], &scenarios, 6_999)
+                .unwrap()
+                .is_healthy
+        );
     }
 
     #[test]
@@ -1303,7 +1212,7 @@ mod high1_cross_market_regression {
 
 #[cfg(test)]
 mod m9_scenario_cap {
-    //! AUDIT M-9 (2026-07): the stress-scenario count is bounded and ENFORCED.
+    //! The stress-scenario count is bounded and ENFORCED.
     use super::*;
 
     fn flat_scenarios(n: usize) -> Vec<Scenario> {
@@ -1320,7 +1229,10 @@ mod m9_scenario_cap {
     #[test]
     fn rejects_over_cap() {
         let r = assess_margin(&[], &[], &flat_scenarios(MAX_STRESS_SCENARIOS + 1), 0);
-        assert!(r.is_err(), "a scenario vector past the cap must be rejected");
+        assert!(
+            r.is_err(),
+            "a scenario vector past the cap must be rejected"
+        );
     }
 
     #[test]
@@ -1332,6 +1244,9 @@ mod m9_scenario_cap {
             .collect();
         let s = default_scenarios(&markets);
         assert_eq!(s.len(), 5 + 8 * markets.len());
-        assert!(s.len() <= MAX_STRESS_SCENARIOS, "generator exceeded the cap");
+        assert!(
+            s.len() <= MAX_STRESS_SCENARIOS,
+            "generator exceeded the cap"
+        );
     }
 }
