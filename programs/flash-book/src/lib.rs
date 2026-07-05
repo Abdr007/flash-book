@@ -4058,6 +4058,34 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Emergency recovery for a lost or unresponsive attestor. The reserved
+    /// margin and `er_active` flag can otherwise only be lowered by the pinned
+    /// attestor, so if that key dies the reserved portion of a trader's
+    /// collateral is permanently unwithdrawable — the same failure mode the ER
+    /// force-undelegate escape exists to survive. The protocol authority (which
+    /// pinned the attestor at init, so this is within the existing trust model)
+    /// zeroes the reservation and advances the epoch, so a stale in-flight
+    /// attestation cannot replay the old reservation while a recovered attestor
+    /// can still re-attest at a higher epoch. Operationally used only once the ER
+    /// is confirmed down (no order can fill), so zeroing the reservation cannot
+    /// leave a live ER order undercollateralized.
+    pub fn reset_er_margin_attestation(ctx: Context<ResetErMarginAttestation>) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.er_margin.trader_state,
+            ctx.accounts.trader_state.key(),
+            FlashBookError::ErMarginAccountMismatch
+        );
+        ctx.accounts.er_margin.reserved_margin_quote_lots = 0;
+        ctx.accounts.er_margin.epoch = ctx.accounts.er_margin.epoch.saturating_add(1);
+        ctx.accounts.trader_state.load_mut()?.er_active = 0;
+        emit!(ErMarginAttestedEvent {
+            trader_state: ctx.accounts.trader_state.key(),
+            reserved_margin_quote_lots: 0,
+            epoch: ctx.accounts.er_margin.epoch,
+        });
+        Ok(())
+    }
+
     /// Cross-domain (#8) strict withdraw: like `withdraw_collateral` (requires
     /// `open_positions == 0`) but additionally requires post-withdrawal
     /// collateral to cover the trader's ER-reserved margin, so collateral
@@ -16365,6 +16393,32 @@ pub struct AttestErReservedMargin<'info> {
 
     /// Mutated only to flip the `er_active` flag; the attestor is trusted for
     /// that flag alone (it cannot touch collateral).
+    #[account(mut)]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+}
+
+/// Emergency attestor-recovery: protocol-authority-gated reset of a trader's ER
+/// reserved margin (see `reset_er_margin_attestation`).
+#[derive(Accounts)]
+pub struct ResetErMarginAttestation<'info> {
+    pub authority: Signer<'info>,
+
+    /// Protocol singleton — its `authority` gates the reset (the same key that
+    /// pinned the attestor at init).
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+        constraint = insurance_fund.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(
+        mut,
+        seeds = [xmargin::ER_MARGIN_SEED, trader_state.key().as_ref()],
+        bump = er_margin.bump,
+    )]
+    pub er_margin: Account<'info, xmargin::ErMarginAttestation>,
+
     #[account(mut)]
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
 }

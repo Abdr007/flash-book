@@ -11236,6 +11236,127 @@ async fn er_margin_xdomain_withdraw_respects_reservation() {
     assert_eq!(ts.collateral_quote_lots, 50_000);
 }
 
+/// If the attestor is lost, the protocol authority can zero a trader's ER
+/// reservation so the reserved collateral is not permanently stranded; a
+/// non-authority cannot. Advancing the epoch also blocks a stale attestation
+/// replay from reviving the reservation.
+#[tokio::test]
+async fn er_margin_authority_reset_recovers_from_dead_attestor() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone(); // protocol authority
+    let trader = Keypair::new();
+    let attestor = Keypair::new(); // to be "lost"
+    let rando = Keypair::new();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 100_000, &protocol).await;
+    let er_margin =
+        init_er_margin(&mut ctx, &payer, &protocol, trader_state, attestor.pubkey()).await;
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[attest_ix(
+                er_margin,
+                trader_state,
+                attestor.pubkey(),
+                60_000,
+                1,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &attestor],
+            ctx.banks_client.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        fetch::<TraderStateAccount>(&mut ctx.banks_client, trader_state)
+            .await
+            .er_active,
+        1
+    );
+
+    let reset_ix = |signer: Pubkey| {
+        build_ix(
+            flash_book::instruction::ResetErMarginAttestation {},
+            vec![
+                AccountMeta::new_readonly(signer, true),
+                AccountMeta::new_readonly(protocol.insurance_fund, false),
+                AccountMeta::new(er_margin, false),
+                AccountMeta::new(trader_state, false),
+            ],
+        )
+    };
+
+    // Fund rando so it can pay its own tx, then confirm a non-authority cannot reset.
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &rando.pubkey(),
+                1_000_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            ctx.banks_client.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[reset_ix(rando.pubkey())],
+                Some(&rando.pubkey()),
+                &[&rando],
+                ctx.banks_client.get_latest_blockhash().await.unwrap(),
+            ))
+            .await
+            .is_err(),
+        "a non-authority must not be able to reset the attestation"
+    );
+
+    // The protocol authority resets → reservation zeroed, er_active cleared, epoch advanced.
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[reset_ix(payer.pubkey())],
+            Some(&payer.pubkey()),
+            &[&payer],
+            ctx.banks_client.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .expect("protocol authority resets a stranded attestation");
+    let att: flash_book::xmargin::ErMarginAttestation =
+        fetch(&mut ctx.banks_client, er_margin).await;
+    assert_eq!(att.reserved_margin_quote_lots, 0);
+    assert_eq!(att.epoch, 2, "epoch advances past the last attestation");
+    assert_eq!(
+        fetch::<TraderStateAccount>(&mut ctx.banks_client, trader_state)
+            .await
+            .er_active,
+        0,
+        "reset clears er_active so the strict withdraw path re-opens"
+    );
+
+    // A stale attestation at the old epoch cannot revive the reservation.
+    assert!(
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[attest_ix(
+                    er_margin,
+                    trader_state,
+                    attestor.pubkey(),
+                    60_000,
+                    1
+                )],
+                Some(&payer.pubkey()),
+                &[&payer, &attestor],
+                ctx.banks_client.get_latest_blockhash().await.unwrap(),
+            ))
+            .await
+            .is_err(),
+        "a stale-epoch attestation must not revive the reservation after reset"
+    );
+}
+
 fn withdraw_xdomain_ix(
     protocol: &Protocol,
     trader_state: Pubkey,
