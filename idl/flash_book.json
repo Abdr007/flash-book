@@ -13574,8 +13574,9 @@
       "docs": [
         "One-way, authority-gated upgrade of a market's",
         "fill-commitment ring from the v0 layout to v1, enabling per-position",
-        "reduce-in-flight tracking (closes the last F-3 edge: a position shrunk below",
-        "its resting reduce-only, then over-crossed across the match→settle gap).",
+        "reduce-in-flight tracking, closing the last reduce-only edge: a position",
+        "shrunk below its resting reduce-only size, then over-crossed across the",
+        "match→settle gap.",
         "MUST run on the BASE LAYER with the ring UNdelegated (a delegated ring is",
         "owned by the delegation program — realloc would be illegal) and the ring",
         "DRAINED (`produced == settled`; a pending fill would be left without a reduce",
@@ -18206,7 +18207,7 @@
     {
       "code": 7228,
       "name": "RestingOrderTooFarFromOracle",
-      "msg": "Resting order price too far from the oracle — anti-stuffing band (#36)"
+      "msg": "Resting order price too far from the oracle — anti-stuffing band"
     },
     {
       "code": 7300,
