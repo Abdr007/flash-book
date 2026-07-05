@@ -3945,6 +3945,336 @@ async fn update_oracle_from_pyth_rejects_replayed_publish_time() {
 }
 
 #[tokio::test]
+async fn liquidate_position_v2_jit_auction_selects_in_band_rejects_out_of_band() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let liq = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 3_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let liq_state = setup_trader(&mut ctx, &payer, &liq, 100_000, &protocol).await;
+    let taker_pos = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_pda,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+
+    let now = ctx
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    {
+        let acc = ctx
+            .banks_client
+            .get_account(market_pda)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut m = MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+        let slot = ctx.banks_client.get_sysvar::<Clock>().await.unwrap().slot;
+        m.oracle_price_ticks = 98_000;
+        m.oracle_published_at_unix_seconds = now as u64;
+        m.mark_price_ticks = 98_000;
+        m.last_mark_update_slot = slot;
+        m.params.liq_penalty_bps = 100;
+        let mut data = Vec::new();
+        m.try_serialize(&mut data).unwrap();
+        data.resize(acc.data.len(), 0);
+        ctx.set_account(
+            &market_pda,
+            &SolAccount {
+                lamports: acc.lamports,
+                data,
+                owner: acc.owner,
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            }
+            .into(),
+        );
+    }
+
+    let jit_maker = Keypair::new();
+    let nonce: u32 = 2;
+    let (inband_pda, inband_bump) = pda(&[
+        flash_book::state_v3::JitLiquidationOfferAccount::SEED,
+        market_pda.as_ref(),
+        jit_maker.pubkey().as_ref(),
+        &nonce.to_le_bytes(),
+    ]);
+    let _ = inband_bump;
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &jit_maker.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::PlaceJitLiquidationOffer {
+                    nonce,
+                    target_trader: Pubkey::default(),
+                    side: 0,
+                    offer_price_ticks: 97_500,
+                    max_size_lots: 1,
+                    expires_at_slot: 0,
+                    maker_sub_index: 0,
+                },
+                vec![
+                    AccountMeta::new(jit_maker.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(inband_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&jit_maker.pubkey()),
+            &[&jit_maker],
+            bh,
+        ))
+        .await
+        .expect("place in-band JIT offer");
+
+    // Out-of-band offer at 99_000 — ABOVE the fair health price (98_000), so the
+    // H-1 bound must reject it (an off-book close-limit would wedge the position).
+    let oob_nonce: u32 = 3;
+    let (oob_pda, _) = pda(&[
+        flash_book::state_v3::JitLiquidationOfferAccount::SEED,
+        market_pda.as_ref(),
+        jit_maker.pubkey().as_ref(),
+        &oob_nonce.to_le_bytes(),
+    ]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::PlaceJitLiquidationOffer {
+                    nonce: oob_nonce,
+                    target_trader: Pubkey::default(),
+                    side: 0,
+                    offer_price_ticks: 99_000,
+                    max_size_lots: 1,
+                    expires_at_slot: 0,
+                    maker_sub_index: 0,
+                },
+                vec![
+                    AccountMeta::new(jit_maker.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(oob_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&jit_maker.pubkey()),
+            &[&jit_maker],
+            bh,
+        ))
+        .await
+        .expect("place out-of-band JIT offer");
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::LiquidatePositionV2 {
+                    requested_close_lots: 0,
+                },
+                vec![
+                    AccountMeta::new(liq.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new(taker_state, false),
+                    AccountMeta::new(liq_state, false),
+                    AccountMeta::new(taker_pos, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new(inband_pda, false),
+                    AccountMeta::new(oob_pda, false),
+                ],
+            )],
+            Some(&liq.pubkey()),
+            &[&liq],
+            bh,
+        ))
+        .await
+        .expect("underwater liquidation with JIT offers must succeed");
+    let inband_after: flash_book::state_v3::JitLiquidationOfferAccount =
+        fetch(&mut ctx.banks_client, inband_pda).await;
+    let oob_after: flash_book::state_v3::JitLiquidationOfferAccount =
+        fetch(&mut ctx.banks_client, oob_pda).await;
+    // The in-band offer is selected and consumed (the auction now deserializes
+    // offers correctly); the out-of-band offer is rejected on price and untouched.
+    assert_eq!(
+        inband_after.remaining_size_lots, 0,
+        "the in-band JIT offer must be selected and consumed"
+    );
+    assert_eq!(
+        oob_after.remaining_size_lots, 1,
+        "the out-of-band JIT offer (above fair health) must be rejected and left unconsumed"
+    );
+}
+
+/// H-2: the liquidator reward is capped at the position's residual equity valued
+/// at the SYNTHETIC close price, not the pre-penalty health price. A position
+/// with positive equity at health but negative equity at synthetic (the gap is
+/// the liquidation penalty) must yield ZERO reward — otherwise the reward would
+/// be funded by the insurance fund via cover_bad_debt.
+#[tokio::test]
+async fn liquidate_position_v2_reward_capped_at_synthetic_equity() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let liq = Keypair::new();
+    // Collateral (net of open fee) lands in (2_000, 2_980): positive equity at
+    // health 98_000 (−2_000), negative at synthetic 97_020 (−2_980).
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 2_600, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let liq_state = setup_trader(&mut ctx, &payer, &liq, 100_000, &protocol).await;
+    let taker_pos = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_pda,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+
+    let now = ctx
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    {
+        let acc = ctx
+            .banks_client
+            .get_account(market_pda)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut m = MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+        let slot = ctx.banks_client.get_sysvar::<Clock>().await.unwrap().slot;
+        m.oracle_price_ticks = 98_000;
+        m.oracle_published_at_unix_seconds = now as u64;
+        m.mark_price_ticks = 98_000;
+        m.last_mark_update_slot = slot;
+        m.params.liq_penalty_bps = 100;
+        m.params.liquidator_reward_bps = 100;
+        // No auction decay ⇒ the full reward_bps would apply if uncapped.
+        m.params.liquidation_auction_duration_slots = 0;
+        let mut data = Vec::new();
+        m.try_serialize(&mut data).unwrap();
+        data.resize(acc.data.len(), 0);
+        ctx.set_account(
+            &market_pda,
+            &SolAccount {
+                lamports: acc.lamports,
+                data,
+                owner: acc.owner,
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            }
+            .into(),
+        );
+    }
+
+    let liq_before: TraderStateAccount = fetch(&mut ctx.banks_client, liq_state).await;
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::LiquidatePositionV2 {
+                    requested_close_lots: 0,
+                },
+                vec![
+                    AccountMeta::new(liq.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new(taker_state, false),
+                    AccountMeta::new(liq_state, false),
+                    AccountMeta::new(taker_pos, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&liq.pubkey()),
+            &[&liq],
+            bh,
+        ))
+        .await
+        .expect("underwater liquidation must succeed");
+    let liq_after: TraderStateAccount = fetch(&mut ctx.banks_client, liq_state).await;
+    // Reward capped to 0 (synthetic equity < 0): the liquidator's collateral is
+    // unchanged — no reward paid, so none is funded by insurance.
+    assert_eq!(
+        liq_after.collateral_quote_lots, liq_before.collateral_quote_lots,
+        "reward must be capped to 0 when residual equity at synthetic is negative"
+    );
+}
+
+#[tokio::test]
 async fn delegated_book_order_requires_armed() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
