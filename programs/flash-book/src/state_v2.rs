@@ -702,21 +702,41 @@ impl<'a> MarketBookHandle<'a> {
             }
         }
 
-        // The cached best-bid/best-ask pointers are NOT roots
-        // of the DFS above, so a commit can plant a `best` that points at a detached
-        // node (unreachable from any root) whose self-cycle the DFS never inspects;
-        // the first `for_each_best_first` walk then starts there and spins forever
-        // (unbounded successor loop) → permanent brick. Require each cached best be
-        // NIL or a node the tree DFS actually reached (∈ visited).
-        for best in [header.bids_best_index, header.asks_best_index] {
-            if best != NIL {
-                let off = best as usize;
+        // `for_each_best_first` starts its ascending walk at the cached best
+        // pointer, so the best MUST be the tree minimum (the leftmost descendant
+        // of the root): a best that points elsewhere makes matching skip better
+        // liquidity, misreads top-of-book, or — if detached from the tree —
+        // spins the successor walk forever (brick). An empty tree (root == NIL)
+        // has no best. Requiring best == leftmost also pins it in-bounds and
+        // root-reachable, so this subsumes the visited check. Every validly
+        // matching book already satisfies this, so no well-formed book is
+        // rejected.
+        for (best, root) in [
+            (header.bids_best_index, header.bids_root_index),
+            (header.asks_best_index, header.asks_root_index),
+        ] {
+            if root == NIL {
+                require!(best == NIL, crate::errors::FlashBookError::OutOfRange);
+            } else {
+                // Walk left from the root to the minimum. Links were bounds-checked
+                // above; the step bound is defensive (the DFS already proved the
+                // tree acyclic, so the left-chain terminates).
+                let mut cur = root as usize;
+                let mut steps = 0usize;
+                loop {
+                    steps += 1;
+                    require!(
+                        steps <= node_count,
+                        crate::errors::FlashBookError::OutOfRange
+                    );
+                    let left = read_link(cur, 0);
+                    if left == NIL {
+                        break;
+                    }
+                    cur = left as usize;
+                }
                 require!(
-                    off % NODE_TOTAL_BYTES == 0 && off < slab_len,
-                    crate::errors::FlashBookError::OutOfRange
-                );
-                require!(
-                    visited[off / NODE_TOTAL_BYTES],
+                    best as usize == cur,
                     crate::errors::FlashBookError::OutOfRange
                 );
             }
@@ -1755,6 +1775,72 @@ mod tests {
         assert!(
             MarketBookHandle::validate_node_links(&data).is_err(),
             "a live node at/above the bump pointer must be rejected"
+        );
+    }
+
+    // `for_each_best_first` starts at the cached best, so the best must be the
+    // tree minimum (leftmost). A commit that plants a non-minimal best makes
+    // matching skip better liquidity / misread top-of-book. The check must accept
+    // every honestly-built book (best == leftmost) and reject a tampered best.
+    #[test]
+    fn validate_node_links_requires_best_is_tree_minimum() {
+        let read_u32 = |data: &[u8], off: u32, link: usize| -> u32 {
+            let base = MARKET_BOOK_PREFIX_BYTES + off as usize + link;
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&data[base..base + 4]);
+            u32::from_le_bytes(b)
+        };
+
+        // Empty book (both roots NIL, both bests NIL) — accepted.
+        let empty = make_book();
+        assert!(MarketBookHandle::validate_node_links(&empty).is_ok());
+        // A best on an empty tree — rejected.
+        let mut bad_empty = make_book();
+        {
+            let h = MarketBookHandle::from_account_data(&mut bad_empty).unwrap();
+            h.header.bids_best_index = 0;
+        }
+        assert!(MarketBookHandle::validate_node_links(&bad_empty).is_err());
+
+        // Single-node book — best == root == leftmost, accepted.
+        let mut one = make_book();
+        {
+            let mut h = MarketBookHandle::from_account_data(&mut one).unwrap();
+            h.insert_bid(make_order(100, 1, true)).unwrap();
+        }
+        assert!(MarketBookHandle::validate_node_links(&one).is_ok());
+
+        // Multi-node unbalanced book — accepted (insert keeps best == leftmost).
+        let mut data = make_book();
+        {
+            let mut h = MarketBookHandle::from_account_data(&mut data).unwrap();
+            for (p, s) in [(100u64, 1u64), (200, 2), (150, 3), (175, 4), (125, 5)] {
+                h.insert_bid(make_order(p, s, true)).unwrap();
+            }
+        }
+        assert!(
+            MarketBookHandle::validate_node_links(&data).is_ok(),
+            "an honestly-built multi-node book must be accepted"
+        );
+
+        // Tamper: point best at the root's right child (strictly greater than the
+        // root, so never the minimum). Must be rejected.
+        let root = {
+            let h = MarketBookHandle::from_account_data(&mut data).unwrap();
+            h.header.bids_root_index
+        };
+        let right_child = read_u32(&data, root, 4);
+        assert!(
+            right_child != NIL,
+            "test needs a right subtree to tamper with"
+        );
+        {
+            let h = MarketBookHandle::from_account_data(&mut data).unwrap();
+            h.header.bids_best_index = right_child;
+        }
+        assert!(
+            MarketBookHandle::validate_node_links(&data).is_err(),
+            "a best that is not the tree minimum must be rejected"
         );
     }
 
