@@ -3622,6 +3622,175 @@ async fn modify_order_v2_rejects_far_from_oracle() {
     );
 }
 
+/// A reduce-only trigger scoped to one sub-account must not be able to read a
+/// DIFFERENT sub-account's position (both carry `trader == wallet`, so the
+/// (market, trader) constraint alone is insufficient). The trigger's `position`
+/// is bound to (trader, trigger.sub_index): a sub_index=0 trigger executed with
+/// the wallet's sub_index=1 position is rejected with WrongTrader.
+#[tokio::test]
+async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    disarm_fill_commitment(&mut ctx, market_pda).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (insurance, _) = pda(&[InsuranceFundAccount::SEED]);
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    // Init the book so the trigger can inject.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Trader m: main (sub-0) state, a sub-1 state, and a long position ON SUB-1.
+    let m = Keypair::new();
+    let m_main = setup_trader(&mut ctx, &payer, &m, 100_000, &protocol).await;
+    let (m_sub1, _) = pda(&[TraderStateAccount::SEED, m.pubkey().as_ref(), &[1u8]]);
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::OpenTraderSubAccount { sub_index: 1 },
+            vec![
+                AccountMeta::new(m.pubkey(), true),
+                AccountMeta::new(m_sub1, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer, &m],
+    )
+    .await
+    .unwrap();
+
+    let counter = Keypair::new();
+    let counter_state = setup_trader(&mut ctx, &payer, &counter, 100_000, &protocol).await;
+    let (m_sub1_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        m_sub1.as_ref(),
+    ]);
+    let (counter_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        counter_state.as_ref(),
+    ]);
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ApplyFill {
+                size_lots: 1,
+                price_ticks: 100_000,
+                taker_side: 0,
+                taker_was_jit: false,
+                taker_sub_index: 1,
+                maker_sub_index: 0,
+                fill_seq: 1,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(insurance, false),
+                AccountMeta::new(m_sub1, false),
+                AccountMeta::new(counter_state, false),
+                AccountMeta::new(m_sub1_pos, false),
+                AccountMeta::new(counter_pos, false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Reduce-only trigger scoped to SUB-0 (main), fires at oracle <= 100_000.
+    let (trig, _) = pda(&[
+        flash_book::state_v3::TriggerOrderAccountV3::SEED,
+        market_pda.as_ref(),
+        m.pubkey().as_ref(),
+        &[1u8],
+    ]);
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceTriggerOrderV3 {
+                trigger_id: 1,
+                side: 1,
+                kind: 0,
+                size_lots: 1,
+                trigger_price_ticks: 100_000,
+                limit_price_ticks: 100_000,
+                reduce_only: true,
+                expires_at_slot: 0,
+                sub_index: 0,
+                acceptable_price_ticks: 0,
+            },
+            vec![
+                AccountMeta::new(m.pubkey(), true),
+                AccountMeta::new_readonly(m_main, false),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(trig, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer, &m],
+    )
+    .await
+    .unwrap();
+
+    // Execute the sub-0 trigger while passing the SUB-1 position → WrongTrader.
+    let result = send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ExecuteTriggerOrderV3 {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new(trig, false),
+                AccountMeta::new_readonly(m_sub1_pos, false),
+                AccountMeta::new_readonly(program_id(), false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(7104)"),
+        "a sub-0 trigger reading the wallet's sub-1 position must be rejected with WrongTrader, got: {dbg}"
+    );
+}
+
 #[tokio::test]
 async fn delegated_book_order_requires_armed() {
     let pt = make_program_test();
