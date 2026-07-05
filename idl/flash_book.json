@@ -10318,6 +10318,39 @@
           "signer": true
         },
         {
+          "name": "market",
+          "docs": [
+            "The fill's market — supplies `tick_size` for the on-chain PnL",
+            "derivation. Bound to the exposure so a foreign market cannot be",
+            "substituted. Boxed to keep the BPF frame small."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
           "name": "exposure",
           "writable": true,
           "pda": {
@@ -10362,10 +10395,6 @@
         {
           "name": "side",
           "type": "u8"
-        },
-        {
-          "name": "realized_pnl_delta",
-          "type": "i64"
         }
       ]
     },
@@ -20398,6 +20427,16 @@
           },
           {
             "name": "shares",
+            "type": "u64"
+          },
+          {
+            "name": "deposited_at_slot",
+            "docs": [
+              "Slot of the LP's most recent deposit; the minimum-hold (JIT-LP defense)",
+              "measures from here. Lives in the account's pre-existing reserved tail, so",
+              "a position created before this field existed reads 0 and is never",
+              "retroactively locked (`can_withdraw` returns true at slot 0)."
+            ],
             "type": "u64"
           }
         ]

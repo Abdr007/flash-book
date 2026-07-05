@@ -263,6 +263,11 @@ pub struct FlpPositionAccountV3 {
     pub bump: u8,
     pub _pad: [u8; 7],
     pub shares: u64,
+    /// Slot of the LP's most recent deposit; the minimum-hold (JIT-LP defense)
+    /// measures from here. Lives in the account's pre-existing reserved tail, so
+    /// a position created before this field existed reads 0 and is never
+    /// retroactively locked (`can_withdraw` returns true at slot 0).
+    pub deposited_at_slot: u64,
 }
 impl FlpPositionAccountV3 {
     pub const SEED: &'static [u8] = b"flp_position_v3";
@@ -270,6 +275,12 @@ impl FlpPositionAccountV3 {
         8 + 96
     }
 }
+// The struct must fit the reserved account data (`space() = 8 + 96`); the new
+// `deposited_at_slot` field consumes reserved tail, not new allocation.
+const _: () = assert!(
+    core::mem::size_of::<FlpPositionAccountV3>() <= 96,
+    "FlpPositionAccountV3 exceeds its reserved account data"
+);
 
 // ─── JIT liquidation offers v3 ──────────────────────────────────────
 //
