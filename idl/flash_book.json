@@ -8,6 +8,96 @@
   },
   "instructions": [
     {
+      "name": "accept_authority_transfer",
+      "docs": [
+        "GOVERNANCE Phase-2: step 2 — the PENDING authority accepts, committing the",
+        "transfer and closing the pending account (rent → the accepter). Signed by the",
+        "new authority (context constraint), so control can never land on a key that",
+        "can't sign."
+      ],
+      "discriminator": [
+        239,
+        248,
+        177,
+        2,
+        206,
+        97,
+        46,
+        255
+      ],
+      "accounts": [
+        {
+          "name": "new_authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "apply_fill",
       "docs": [
         "Apply a single fill against the taker's and maker's Position PDAs.",
@@ -1043,6 +1133,94 @@
       "args": []
     },
     {
+      "name": "cancel_authority_transfer",
+      "docs": [
+        "GOVERNANCE Phase-2: the current authority cancels a pending transfer (closes",
+        "the pending account, rent → authority) — e.g. if the target key is no longer",
+        "trusted before it accepts."
+      ],
+      "discriminator": [
+        94,
+        131,
+        125,
+        184,
+        183,
+        24,
+        125,
+        229
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "cancel_iceberg_v3",
       "docs": [
         "Cancel a v3 iceberg and close the account."
@@ -1352,6 +1530,90 @@
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "cancel_param_update",
+      "docs": [
+        "GOVERNANCE Phase-2b: cancel a pending timelocked params update (authority-only,",
+        "closes the pending account, rent → authority)."
+      ],
+      "discriminator": [
+        48,
+        233,
+        88,
+        184,
+        201,
+        198,
+        45,
+        199
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  112,
+                  97,
+                  114,
+                  97,
+                  109,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
     },
     {
       "name": "cancel_trigger_order_v3",
@@ -2369,6 +2631,10 @@
         {
           "name": "ttl_seconds",
           "type": "i64"
+        },
+        {
+          "name": "scope_market",
+          "type": "pubkey"
         }
       ]
     },
@@ -3562,6 +3828,102 @@
         }
       ],
       "args": []
+    },
+    {
+      "name": "execute_param_update",
+      "docs": [
+        "GOVERNANCE Phase-2b: execute a matured, hash-matching timelocked params",
+        "update. Requires `now >= eta` AND `keccak(new_params) == stored hash` (so the",
+        "applied params are EXACTLY the pre-announced ones), re-validates defensively,",
+        "applies, and closes the pending account. Authority-only."
+      ],
+      "discriminator": [
+        202,
+        100,
+        72,
+        53,
+        170,
+        243,
+        222,
+        62
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  112,
+                  97,
+                  114,
+                  97,
+                  109,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "new_params",
+          "type": {
+            "defined": {
+              "name": "MarketParams"
+            }
+          }
+        }
+      ]
     },
     {
       "name": "execute_trigger_order_v3",
@@ -4904,6 +5266,125 @@
           "type": "u32"
         }
       ]
+    },
+    {
+      "name": "guardian_veto_param_update",
+      "docs": [
+        "GOVERNANCE Phase-2b follow-up (2026-07): emergency guardian VETO of a pending",
+        "timelocked params update. The guardian (Phase-1 restrict-only key) may cancel a",
+        "pending change during its delay window — the fail-safe brake for a compromised",
+        "authority that proposed a dangerous loosening. Closes the pending account (rent",
+        "→ guardian). Pure addition: does not touch the authority `cancel_param_update`",
+        "path; auth is the guardian-account constraint in the context."
+      ],
+      "discriminator": [
+        62,
+        245,
+        118,
+        232,
+        219,
+        90,
+        235,
+        114
+      ],
+      "accounts": [
+        {
+          "name": "guardian",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "guardian_account",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  103,
+                  117,
+                  97,
+                  114,
+                  100,
+                  105,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  112,
+                  97,
+                  114,
+                  97,
+                  109,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
     },
     {
       "name": "init_book_permission",
@@ -7128,6 +7609,89 @@
       ]
     },
     {
+      "name": "lock_oracle_source",
+      "docs": [
+        "GOVERNANCE Phase-3 (2026-07): ONE-WAY lock of the market's oracle source. Once",
+        "locked, the direct-authority `update_oracle` / `update_oracle_quorum` paths",
+        "revert (`OracleSourceLocked`) — only the Pyth (account-owner + Full) and Lazer",
+        "(Ed25519 precompile + replay nonce) paths remain, removing the compromised-",
+        "authority \"walk the mark within the H-6 per-slot cap\" vector on production",
+        "markets. Authority-only; there is deliberately NO unlock instruction. The flag",
+        "lives in the market's envelope config (already REQUIRED by those paths), so an",
+        "initialized envelope is a precondition."
+      ],
+      "discriminator": [
+        196,
+        245,
+        243,
+        223,
+        244,
+        119,
+        222,
+        66
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "envelope_config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  110,
+                  118,
+                  101,
+                  108,
+                  111,
+                  112,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "mature_position",
       "docs": [
         "Permissionless: advance a position's reserve → matured pipeline.",
@@ -7565,6 +8129,13 @@
               }
             ]
           }
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": [
@@ -8400,6 +8971,9 @@
           "signer": true
         },
         {
+          "name": "trader_state"
+        },
+        {
           "name": "market"
         },
         {
@@ -8511,6 +9085,9 @@
           "name": "trader",
           "writable": true,
           "signer": true
+        },
+        {
+          "name": "trader_state"
         },
         {
           "name": "market"
@@ -8797,6 +9374,13 @@
               }
             ]
           }
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": [
@@ -8940,6 +9524,13 @@
               }
             ]
           }
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": [
@@ -9067,6 +9658,13 @@
               }
             ]
           }
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": [
@@ -9119,6 +9717,9 @@
           "name": "trader",
           "writable": true,
           "signer": true
+        },
+        {
+          "name": "trader_state"
         },
         {
           "name": "market"
@@ -9195,6 +9796,9 @@
           "name": "trader",
           "writable": true,
           "signer": true
+        },
+        {
+          "name": "trader_state"
         },
         {
           "name": "market"
@@ -9299,6 +9903,206 @@
       ]
     },
     {
+      "name": "propose_authority_transfer",
+      "docs": [
+        "GOVERNANCE Phase-2 (2026-07): step 1 of a SAFE 2-step authority transfer. The",
+        "current authority proposes `new_authority`; it does NOT take effect until that",
+        "key calls `accept_authority_transfer` (proving it is live + correct). Prefer",
+        "this over the 1-step `transfer_market_authority`, which can strand a market at",
+        "a mistyped/dead key. Re-proposing overwrites the pending target."
+      ],
+      "discriminator": [
+        57,
+        206,
+        225,
+        129,
+        35,
+        111,
+        174,
+        145
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "new_authority",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "propose_param_update",
+      "docs": [
+        "GOVERNANCE Phase-2b (2026-07): propose a TIMELOCKED market-params update.",
+        "Validates `new_params` (same checks as `update_market_params`), then records",
+        "`keccak(new_params)` + `eta = now + PARAM_UPDATE_TIMELOCK_SECONDS`; does NOT",
+        "apply. `execute_param_update` applies it only after the delay. Authority-only.",
+        "Re-proposing overwrites the pending update (and restarts the clock). The",
+        "immediate `update_market_params` is left in place as the un-timelocked path."
+      ],
+      "discriminator": [
+        15,
+        171,
+        118,
+        239,
+        106,
+        176,
+        100,
+        137
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  112,
+                  97,
+                  114,
+                  97,
+                  109,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "new_params",
+          "type": {
+            "defined": {
+              "name": "MarketParams"
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "reap_expired_orders",
       "docs": [
         "Permissionless expiry-reaper (#36 anti-book-stuffing). Removes GTT orders",
@@ -9393,6 +10197,115 @@
           }
         }
       ]
+    },
+    {
+      "name": "reconcile_unsettled_fill_volume",
+      "docs": [
+        "AUDIT F-4 (2026-07): reconcile `MarketAccount.unsettled_fill_volume` (the",
+        "M-6 matched-but-unsettled OI reserve) back to 0 when the fill-commitment",
+        "ring is fully DRAINED.",
+        "",
+        "The counter lives on `market` and the ring lives on `fill_commitment` — two",
+        "separately-delegated accounts with no atomic co-undelegate (there is no",
+        "`commit_and_undelegate_market`; the counter reaches L1 only via MagicBlock's",
+        "independent auto-commit). If the `market` snapshot leads the ring snapshot",
+        "(auto-commit lag / partial or forced commit), L1 settlement drains the",
+        "entries that arrived and decrements them, but the counter is left holding the",
+        "volume of the entries that never made it — with an empty ring and nothing",
+        "left to settle it back down, and no reset path. Once",
+        "`oi[side] + unsettled_fill_volume + new_size > oi_cap`, every place reverts",
+        "`OpenInterestCapExceeded` FOREVER on that market (a permanent placement brick).",
+        "",
+        "Soundness: when the ring is drained (`produced == settled`) every produced",
+        "fill has settled and decremented the counter, so the TRUE unsettled volume is",
+        "0 by construction. Resetting to 0 here is therefore never a guess and can only",
+        "move the counter toward truth — which is why this is safe to expose",
+        "PERMISSIONLESSLY (no authority gate): a caller can only un-stick a market, not",
+        "harm it. If the ring is NOT drained it reverts `FillRingNotDrained`, so it can",
+        "never zero a counter that still backs pending fills. (The transient",
+        "under-count direction — ring ahead of counter — self-heals on drain and needs",
+        "no action.) The sizes in the ring are keccak commitments, so an exact",
+        "non-drained recompute is impossible; the drained gate is the sound reconcile."
+      ],
+      "discriminator": [
+        185,
+        86,
+        84,
+        89,
+        147,
+        200,
+        33,
+        239
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Permissionless caller (fee payer only). Intentionally unconstrained."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fill_commitment",
+          "docs": [
+            "`buffer_check`, and program-ownership re-asserted before the read. Read-only."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  105,
+                  108,
+                  108,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
     },
     {
       "name": "record_flp_fill_v3",
@@ -10236,6 +11149,102 @@
       ]
     },
     {
+      "name": "set_guardian",
+      "docs": [
+        "GOVERNANCE Phase-1 (2026-07): set (or clear) the market's emergency guardian",
+        "— a key that may only RESTRICT market status (pause/post-only/close), never",
+        "loosen (see `set_market_status`). Authority-only. `Pubkey::default()` clears",
+        "it (disables the guardian path)."
+      ],
+      "discriminator": [
+        147,
+        243,
+        50,
+        121,
+        154,
+        164,
+        50,
+        30
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "guardian_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  103,
+                  117,
+                  97,
+                  114,
+                  100,
+                  105,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "new_guardian",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
       "name": "set_insurance_pause_threshold",
       "docs": [
         "Authority-only: directly set the insurance fund's pause threshold.",
@@ -10415,6 +11424,38 @@
                 "kind": "account",
                 "path": "market.quote_mint",
                 "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "guardian_account",
+          "optional": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  103,
+                  117,
+                  97,
+                  114,
+                  100,
+                  105,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
               }
             ]
           }
@@ -11082,15 +12123,27 @@
         "position's `cum_funding_index_at_entry` to the market's current",
         "index. Idempotent — calling again immediately is a no-op (delta=0).",
         "",
-        "Permissionless: anyone can poke a position to settle. This protects",
-        "the protocol against traders who never close — funding accrues into",
-        "the margin calc forever otherwise. Off-chain keepers will sweep",
-        "stale positions periodically.",
+        "Permissionless: anyone can poke a position to settle. Off-chain keepers",
+        "will sweep stale positions periodically.",
         "",
         "On insufficient collateral to cover positive funding owed, the",
         "position's collateral is drained to zero (it will be liquidated on",
         "the next risk check). We do not fail the tx because that would let",
-        "underwater positions block keepers from settling them."
+        "underwater positions block keepers from settling them.",
+        "",
+        "DORMANT (truth-in-code, 2026-07): the funding RATE driving this —",
+        "`market.last_funding_rate_bps_per_sec` — is initialized to 0 and set to",
+        "nonzero NOWHERE in the program (the rate formula exists only in the",
+        "read-only `view_predicted_funding`; no path stores its result). So",
+        "`advance_indices` accrues ZERO funding and this handler charges/credits",
+        "EXACTLY 0 today — it still advances the side-accrual price index and resets",
+        "the position's funding checkpoint, but moves no value. The plumbing",
+        "(formula, `route_funding`, the conservation tests) is complete and correct",
+        "but UNWIRED; turning funding on is a deliberate feature (compute + store the",
+        "rate, with its own conservation proof and devnet cycle), not a bug fix.",
+        "Until then funding is economically inert and invariant #8 holds trivially.",
+        "Kept (not deleted): the fields are account layout and the handler is a live,",
+        "reachable instruction — removing either would be a layout/ABI regression."
       ],
       "discriminator": [
         11,
@@ -12533,6 +13586,100 @@
       ]
     },
     {
+      "name": "upgrade_fill_commitment_v1",
+      "docs": [
+        "AUDIT F-3 migration (2026-07): one-way, authority-gated upgrade of a market's",
+        "fill-commitment ring from the v0 layout to v1, enabling per-position",
+        "reduce-in-flight tracking (closes the last F-3 edge: a position shrunk below",
+        "its resting reduce-only, then over-crossed across the match→settle gap).",
+        "MUST run on the BASE LAYER with the ring UNdelegated (a delegated ring is",
+        "owned by the delegation program — realloc would be illegal) and the ring",
+        "DRAINED (`produced == settled`; a pending fill would be left without a reduce",
+        "flag — `buffer_upgrade_to_v1` enforces this). Re-running on a v1 ring reverts."
+      ],
+      "discriminator": [
+        189,
+        171,
+        52,
+        130,
+        241,
+        123,
+        116,
+        139
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fill_commitment",
+          "docs": [
+            "which re-asserts program ownership before growing. Bound by the seeds."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  105,
+                  108,
+                  108,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "vault_cancel_order_v3",
       "docs": [
         "Strategist cancels a vault-PDA order."
@@ -13011,6 +14158,50 @@
               {
                 "kind": "account",
                 "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_trader_state",
+          "docs": [
+            "AUDIT C-1 (2026-07): the vault's own TraderState. `vault_place_order_v3`",
+            "rests a `RestingOrderV2` under `(vault_pk, 0)`; when a taker crosses it the",
+            "matcher commits that maker identity into the strict fill-commitment FIFO,",
+            "and `apply_fill` HARD-loads this TraderState (`verify_trader_state_pda`) to",
+            "settle. If it did not exist, the committed fill could never settle, the FIFO",
+            "cursor could never advance, and the market's settlement pipeline would wedge",
+            "PERMANENTLY (the C-1 class the other place paths already gate — this one was",
+            "missed). Requiring the canonical, program-owned PDA here (sub_index 0 ⇒ the",
+            "single-seed derivation, matching `vault_open_trader_state_v3`) makes a vault",
+            "order structurally unable to rest against a non-existent TraderState. Existence",
+            "is enforced by `AccountLoader` (program-owned + valid discriminator); the PDA",
+            "binding to `vault.key()` is enforced by the seed constraint. Read-only. A",
+            "legitimate vault always creates this via `vault_open_trader_state_v3` before",
+            "its first order, so this never false-rejects a valid flow."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  97,
+                  100,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
               }
             ]
           }
@@ -14859,6 +16050,19 @@
       ]
     },
     {
+      "name": "MarketGuardianAccount",
+      "discriminator": [
+        141,
+        220,
+        169,
+        231,
+        244,
+        56,
+        134,
+        220
+      ]
+    },
+    {
       "name": "MarketHaircutStateAccount",
       "discriminator": [
         89,
@@ -14885,6 +16089,19 @@
       ]
     },
     {
+      "name": "MarketPendingAuthorityAccount",
+      "discriminator": [
+        234,
+        133,
+        133,
+        183,
+        44,
+        8,
+        102,
+        145
+      ]
+    },
+    {
       "name": "MarketSideAccrualAccount",
       "discriminator": [
         211,
@@ -14895,6 +16112,19 @@
         160,
         67,
         119
+      ]
+    },
+    {
+      "name": "PendingParamUpdateAccount",
+      "discriminator": [
+        183,
+        2,
+        181,
+        97,
+        145,
+        192,
+        95,
+        180
       ]
     },
     {
@@ -15016,6 +16246,45 @@
     }
   ],
   "events": [
+    {
+      "name": "AuthorityTransferAcceptedEvent",
+      "discriminator": [
+        197,
+        245,
+        131,
+        59,
+        10,
+        170,
+        215,
+        14
+      ]
+    },
+    {
+      "name": "AuthorityTransferCancelledEvent",
+      "discriminator": [
+        192,
+        121,
+        140,
+        224,
+        229,
+        96,
+        13,
+        143
+      ]
+    },
+    {
+      "name": "AuthorityTransferProposedEvent",
+      "discriminator": [
+        219,
+        219,
+        120,
+        196,
+        117,
+        157,
+        182,
+        254
+      ]
+    },
     {
       "name": "AutoDeleveragedEvent",
       "discriminator": [
@@ -15404,6 +16673,19 @@
         0,
         83,
         9
+      ]
+    },
+    {
+      "name": "FillCommitmentUpgradedV1Event",
+      "discriminator": [
+        225,
+        245,
+        213,
+        177,
+        102,
+        122,
+        99,
+        99
       ]
     },
     {
@@ -15927,6 +17209,19 @@
       ]
     },
     {
+      "name": "MarketGuardianChangedEvent",
+      "discriminator": [
+        197,
+        171,
+        163,
+        26,
+        219,
+        233,
+        96,
+        53
+      ]
+    },
+    {
       "name": "MarketInitializedEvent",
       "discriminator": [
         70,
@@ -16005,6 +17300,19 @@
       ]
     },
     {
+      "name": "OracleSourceLockedEvent",
+      "discriminator": [
+        49,
+        54,
+        151,
+        141,
+        101,
+        68,
+        83,
+        9
+      ]
+    },
+    {
       "name": "OracleUpdatedFromLazerEvent",
       "discriminator": [
         185,
@@ -16080,6 +17388,45 @@
         31,
         51,
         45
+      ]
+    },
+    {
+      "name": "ParamUpdateCancelledEvent",
+      "discriminator": [
+        133,
+        246,
+        123,
+        169,
+        199,
+        43,
+        104,
+        200
+      ]
+    },
+    {
+      "name": "ParamUpdateExecutedEvent",
+      "discriminator": [
+        7,
+        222,
+        9,
+        215,
+        9,
+        178,
+        140,
+        71
+      ]
+    },
+    {
+      "name": "ParamUpdateProposedEvent",
+      "discriminator": [
+        30,
+        66,
+        185,
+        127,
+        60,
+        62,
+        114,
+        125
       ]
     },
     {
@@ -16574,6 +17921,19 @@
         217,
         212,
         45
+      ]
+    },
+    {
+      "name": "UnsettledFillVolumeReconciledEvent",
+      "discriminator": [
+        216,
+        106,
+        224,
+        10,
+        121,
+        198,
+        7,
+        6
       ]
     },
     {
@@ -17216,9 +18576,74 @@
       "code": 8315,
       "name": "RefreshTooSoon",
       "msg": "FLP quote refresh rate-limited: the pool's quotes are still fresh"
+    },
+    {
+      "code": 8316,
+      "name": "TimelockNotElapsed",
+      "msg": "Timelock has not elapsed: the proposed governance action is not yet executable"
+    },
+    {
+      "code": 8317,
+      "name": "OracleSourceLocked",
+      "msg": "Oracle source is locked: direct-authority price writes are disabled (Pyth/Lazer only)"
     }
   ],
   "types": [
+    {
+      "name": "AuthorityTransferAcceptedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "new_authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AuthorityTransferCancelledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "cancelled_authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AuthorityTransferProposedEvent",
+      "docs": [
+        "GOVERNANCE Phase-2 (2026-07): 2-step authority transfer lifecycle events."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "new_authority",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
     {
       "name": "AutoDeleveragedEvent",
       "type": {
@@ -18460,6 +19885,38 @@
           },
           {
             "name": "total_bytes",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FillCommitmentUpgradedV1Event",
+      "docs": [
+        "AUDIT F-3 migration (2026-07): emitted when a market's fill-commitment ring is",
+        "upgraded from the v0 layout to v1 (adds reduce-in-flight tracking)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "fill_commitment",
+            "type": "pubkey"
+          },
+          {
+            "name": "cap",
+            "type": "u32"
+          },
+          {
+            "name": "old_bytes",
+            "type": "u32"
+          },
+          {
+            "name": "new_bytes",
             "type": "u32"
           }
         ]
@@ -20095,6 +21552,17 @@
           },
           {
             "name": "cum_funding_index",
+            "docs": [
+              "DORMANT (truth-in-code, 2026-07): funding is plumbed but UNWIRED.",
+              "`last_funding_rate_bps_per_sec` is initialized to 0 and set to nonzero",
+              "NOWHERE in the program (the rate formula lives only in the read-only",
+              "`view_predicted_funding`; nothing stores its result), so `settle_funding`",
+              "accrues and charges EXACTLY 0. `cum_funding_index` therefore never advances",
+              "from funding, and invariant #8 (funding nets to zero) holds trivially.",
+              "Retained (not deleted): these are account layout, and `settle_funding` is a",
+              "live, reachable instruction — turning funding ON is a feature (compute +",
+              "store the rate, with its own conservation proof + devnet cycle), not a fix."
+            ],
             "type": "i128"
           },
           {
@@ -20301,6 +21769,21 @@
               "`FILL_OUTBOX_DESIGN.md`."
             ],
             "type": "u16"
+          },
+          {
+            "name": "unsettled_fill_volume",
+            "docs": [
+              "AUDIT M-6 (2026-07): total base-lot volume of fills that have been MATCHED",
+              "(pushed to the fill-commitment ring) but NOT yet settled by apply_fill /",
+              "apply_flp_fill. Because settled OI (`oi_long/short_lots`) only advances at",
+              "settlement, the per-market OI cap was checkable against stale OI and could be",
+              "overshot by pipelining takers ahead of settlement. The intake cap now checks",
+              "`oi[side] + unsettled_fill_volume + new_size`. Incremented per fill at match",
+              "(produce), decremented per fill at settle — tied 1:1 to the ring's FIFO",
+              "produce/settle lifecycle, so it self-balances (no cancellation accounting;",
+              "cancels produce no fills). Trailing field ⇒ existing accounts read it as 0."
+            ],
+            "type": "u64"
           }
         ]
       }
@@ -20620,13 +22103,81 @@
             "type": "u64"
           },
           {
+            "name": "source_locked",
+            "docs": [
+              "GOVERNANCE Phase-3 (2026-07): one-way oracle-source lock. `1` = the direct",
+              "authority `update_oracle` / `update_oracle_quorum` paths are DISABLED for this",
+              "market (only the Pyth / Lazer paths are accepted) — removing the compromised-",
+              "authority \"walk the mark within the H-6 per-slot cap\" vector entirely. Carved",
+              "from `_reserved` so the account size is unchanged and pre-existing envelopes",
+              "read it back as `0` (unlocked). Set (never cleared — one-way) by",
+              "`lock_oracle_source`; enforced in the two direct-write handlers, which already",
+              "REQUIRE this account (H-6), so the lock cannot be bypassed by omitting it."
+            ],
+            "type": "u8"
+          },
+          {
             "name": "_reserved",
             "type": {
               "array": [
                 "u8",
-                32
+                31
               ]
             }
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketGuardianAccount",
+      "docs": [
+        "GOVERNANCE Phase-1 (2026-07): optional emergency guardian for one market, held",
+        "in a SEPARATE PDA (not a MarketAccount field — adding 32 B there pushed several",
+        "`try_accounts` frames past the 4 KB BPF stack limit). A guardian may only",
+        "RESTRICT market status (→ PostOnly/Paused/Closed, monotonic — the fast, fail-safe",
+        "direction), NEVER loosen (→ Active/Inactive stays authority-only), so a",
+        "compromised guardian can pause/close but never re-open. Absence of this account",
+        "(or `guardian == Pubkey::default()`) = no guardian. Set/cleared by the market",
+        "authority via `set_guardian`; read (optionally) by `set_market_status`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "guardian",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketGuardianChangedEvent",
+      "docs": [
+        "GOVERNANCE Phase-1 (2026-07): emitted when the market's emergency guardian is",
+        "set or cleared via `set_guardian`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_guardian",
+            "type": "pubkey"
+          },
+          {
+            "name": "new_guardian",
+            "type": "pubkey"
           }
         ]
       }
@@ -21357,6 +22908,35 @@
       }
     },
     {
+      "name": "MarketPendingAuthorityAccount",
+      "docs": [
+        "GOVERNANCE Phase-2 (2026-07): pending authority for a 2-step (propose→accept)",
+        "market-authority transfer. Held in its own PDA (not a MarketAccount field — the",
+        "stack constraint, see Phase 1). `propose_authority_transfer` (current authority)",
+        "stores `pending_authority`; `accept_authority_transfer`, signed BY that pending",
+        "key, commits `market.authority` and closes this account. Because the new key must",
+        "itself sign to accept, a transfer can never strand control at a wrong/dead key",
+        "(the failure mode of the 1-step `transfer_market_authority`)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "pending_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
       "name": "MarketSequencerRotatedEvent",
       "type": {
         "kind": "struct",
@@ -21522,6 +23102,22 @@
           {
             "name": "new_status",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OracleSourceLockedEvent",
+      "docs": [
+        "GOVERNANCE Phase-3 (2026-07): emitted when a market's oracle source is locked to",
+        "Pyth/Lazer-only (one-way)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
           }
         ]
       }
@@ -21745,6 +23341,51 @@
       }
     },
     {
+      "name": "ParamUpdateCancelledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ParamUpdateExecutedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ParamUpdateProposedEvent",
+      "docs": [
+        "GOVERNANCE Phase-2b (2026-07): timelocked params-update lifecycle events.",
+        "`eta_unix` on the proposal is the earliest execute time — off-chain monitors",
+        "surface it so LPs/traders can react before the change lands."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "eta_unix",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
       "name": "PartialCollateralWithdrawnEvent",
       "type": {
         "kind": "struct",
@@ -21782,6 +23423,43 @@
               "withdrawal collateral must be ≥ this."
             ],
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PendingParamUpdateAccount",
+      "docs": [
+        "GOVERNANCE Phase-2b (2026-07): a timelocked market-params update. Own PDA (not a",
+        "MarketAccount field — the stack constraint). `propose_param_update` validates the",
+        "new params, stores `keccak(params)` + an `eta_unix` (= now + timelock), and does",
+        "NOT apply. `execute_param_update` applies the params only once `now >= eta` AND",
+        "the supplied params hash to the stored `params_hash` — so the executed change is",
+        "exactly the pre-announced one, after the delay. `cancel_param_update` revokes it."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "params_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "eta_unix",
+            "type": "i64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
           }
         ]
       }
@@ -22521,7 +24199,7 @@
       "name": "SessionTokenAccount",
       "docs": [
         "A revocable, auto-expiring authorization for `session_signer` to act for",
-        "`owner`. 73 bytes + 8 disc."
+        "`owner`. 105 bytes + 8 disc."
       ],
       "type": {
         "kind": "struct",
@@ -22546,6 +24224,16 @@
               "Unix seconds after which the session is invalid (checked on every use)."
             ],
             "type": "i64"
+          },
+          {
+            "name": "scope_market",
+            "docs": [
+              "AUDIT M-9 (2026-07): market scope. `Pubkey::default()` (all-zero) = the",
+              "session may act on ANY market (legacy/opt-out behaviour). A specific market",
+              "key = the session is restricted to that ONE market, so a leaked session key",
+              "cannot dump the owner's collateral across every market. Enforced in `verify`."
+            ],
+            "type": "pubkey"
           },
           {
             "name": "bump",
@@ -23644,6 +25332,27 @@
           },
           {
             "name": "acceptable_price_ticks",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "UnsettledFillVolumeReconciledEvent",
+      "docs": [
+        "AUDIT F-4 (2026-07): emitted when `reconcile_unsettled_fill_volume` resets a",
+        "drifted M-6 counter to 0 on a drained ring. `previous_unsettled` records the",
+        "drift that was cleared (0 if it was already correct)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_unsettled",
             "type": "u64"
           }
         ]

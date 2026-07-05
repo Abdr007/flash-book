@@ -257,6 +257,10 @@ pub enum FlashBookError {
     OracleLazerReplay = 2314,
     #[msg("FLP quote refresh rate-limited: the pool's quotes are still fresh")]
     RefreshTooSoon = 2315,
+    #[msg("Timelock has not elapsed: the proposed governance action is not yet executable")]
+    TimelockNotElapsed = 2316,
+    #[msg("Oracle source is locked: direct-authority price writes are disabled (Pyth/Lazer only)")]
+    OracleSourceLocked = 2317,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

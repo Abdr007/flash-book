@@ -89,7 +89,7 @@ fn ix_release_gain_to_haircut(
         matured_pos_quote_lots: pos.matured,
         original_reserve_at_attach: pos.original,
     };
-    let post = apply_release(pre, gain, now_slot).unwrap();
+    let post = apply_release(pre, gain, now_slot, u64::MAX).unwrap();
     pos.reserve = post.released_reserve_quote_lots;
     pos.attached_at_slot = post.released_attached_at_slot;
     pos.matured = post.matured_pos_quote_lots;

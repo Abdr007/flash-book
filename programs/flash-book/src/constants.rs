@@ -108,6 +108,28 @@ pub const MAX_BASKET_LEGS_N: usize = 4;
 /// the FlpExposureAccount layout is versioned (it currently has no reserved space).
 pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
 
+/// AUDIT M-7 (2026-07): TTL (in slots) stamped on the resting order a REDUCE-ONLY
+/// trigger (stop-loss / take-profit / bracket leg) injects when it fires. The v2
+/// CLOB cannot enforce reduce-only at settlement (a fill is a two-sided exchange
+/// committed to the FIFO ring; rejecting it there wedges the ring, and partial
+/// application breaks conservation), and the matcher — not settlement — is where a
+/// resting order fills. Previously the injected order had `expires_at_slot == 0`
+/// (GTC), so if the position closed between fire and fill it could rest
+/// INDEFINITELY and then OPEN/FLIP a fresh position against the trader's intent.
+/// The matcher skips expired resting orders, so a bounded TTL hard-caps that flip
+/// window: after this many slots the order can never fill and is reaped. ~5 min at
+/// ~0.4s/slot — generous for a genuine stop to fill in any liquid market, yet no
+/// longer unbounded. (Full reduce-only enforcement needs match-time maker-position
+/// awareness — a larger redesign; this bounds the residual risk soundly.)
+pub const REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS: u64 = 750;
+
+/// GOVERNANCE Phase-2b (2026-07): the delay (unix seconds) a proposed market-params
+/// change must wait before it can be executed. 48h gives LPs and traders a window
+/// to see the pre-announced change (the `ParamUpdateProposedEvent` carries the eta)
+/// and exit / react before it lands. The immediate `update_market_params` is
+/// unchanged; this timelocked path is the safer alternative for production markets.
+pub const PARAM_UPDATE_TIMELOCK_SECONDS: i64 = 48 * 60 * 60;
+
 /// ER-stall safety floor: max L1 slots since the mark price last moved (via the
 /// fill-EMA in `apply_fill` or a hard `settle_mark`) before the mark is treated
 /// as STALE. A stalled MagicBlock ER freezes the fill stream, so the mark stops

@@ -22,7 +22,7 @@ pub const SESSION_SEED: &[u8] = b"session";
 pub const MAX_SESSION_TTL_SECONDS: i64 = 24 * 60 * 60;
 
 /// A revocable, auto-expiring authorization for `session_signer` to act for
-/// `owner`. 73 bytes + 8 disc.
+/// `owner`. 105 bytes + 8 disc.
 #[account]
 pub struct SessionTokenAccount {
     /// The real trader the session acts on behalf of.
@@ -31,19 +31,26 @@ pub struct SessionTokenAccount {
     pub session_signer: Pubkey,
     /// Unix seconds after which the session is invalid (checked on every use).
     pub expires_at_unix: i64,
+    /// AUDIT M-9 (2026-07): market scope. `Pubkey::default()` (all-zero) = the
+    /// session may act on ANY market (legacy/opt-out behaviour). A specific market
+    /// key = the session is restricted to that ONE market, so a leaked session key
+    /// cannot dump the owner's collateral across every market. Enforced in `verify`.
+    pub scope_market: Pubkey,
     pub bump: u8,
 }
 
 impl SessionTokenAccount {
-    pub const LEN: usize = 32 + 32 + 8 + 1;
+    pub const LEN: usize = 32 + 32 + 8 + 32 + 1;
 }
 
-/// Verify a session token authorizes `signer` to act right now. Fail-closed:
-/// wrong signer ⇒ Unauthorized; past expiry ⇒ SessionExpired.
+/// Verify a session token authorizes `signer` to act on `market` right now.
+/// Fail-closed: wrong signer ⇒ Unauthorized; past expiry ⇒ SessionExpired;
+/// out-of-scope market ⇒ Unauthorized.
 pub fn verify(
     token: &SessionTokenAccount,
     signer: Pubkey,
     now_unix: i64,
+    market: Pubkey,
 ) -> Result<()> {
     require_keys_eq!(
         token.session_signer,
@@ -53,6 +60,11 @@ pub fn verify(
     require!(
         now_unix <= token.expires_at_unix,
         crate::errors::FlashBookError::SessionExpired
+    );
+    // AUDIT M-9 (2026-07): enforce market scope. Default (all-zero) = unrestricted.
+    require!(
+        token.scope_market == Pubkey::default() || token.scope_market == market,
+        crate::errors::FlashBookError::Unauthorized
     );
     Ok(())
 }
@@ -66,6 +78,7 @@ mod tests {
             owner: Pubkey::new_from_array([1u8; 32]),
             session_signer: Pubkey::new_from_array(signer),
             expires_at_unix: expires,
+            scope_market: Pubkey::default(),
             bump: 0,
         }
     }
@@ -73,21 +86,41 @@ mod tests {
     #[test]
     fn valid_unexpired_session_passes() {
         let t = tok([9u8; 32], 1_000);
-        assert!(verify(&t, Pubkey::new_from_array([9u8; 32]), 999).is_ok());
+        let m = Pubkey::new_from_array([7u8; 32]);
+        assert!(verify(&t, Pubkey::new_from_array([9u8; 32]), 999, m).is_ok());
         // Exactly at expiry is still valid (<=).
-        assert!(verify(&t, Pubkey::new_from_array([9u8; 32]), 1_000).is_ok());
+        assert!(verify(&t, Pubkey::new_from_array([9u8; 32]), 1_000, m).is_ok());
     }
 
     #[test]
     fn wrong_signer_rejected() {
         let t = tok([9u8; 32], 1_000);
-        assert!(verify(&t, Pubkey::new_from_array([8u8; 32]), 999).is_err());
+        let m = Pubkey::new_from_array([7u8; 32]);
+        assert!(verify(&t, Pubkey::new_from_array([8u8; 32]), 999, m).is_err());
     }
 
     #[test]
     fn expired_session_rejected() {
         let t = tok([9u8; 32], 1_000);
-        assert!(verify(&t, Pubkey::new_from_array([9u8; 32]), 1_001).is_err());
+        let m = Pubkey::new_from_array([7u8; 32]);
+        assert!(verify(&t, Pubkey::new_from_array([9u8; 32]), 1_001, m).is_err());
+    }
+
+    #[test]
+    fn out_of_scope_market_rejected() {
+        // AUDIT M-9: a market-scoped session rejects a different market but allows
+        // its own; a default-scope session allows any market.
+        let mut t = tok([9u8; 32], 1_000);
+        let m_a = Pubkey::new_from_array([7u8; 32]);
+        let m_b = Pubkey::new_from_array([8u8; 32]);
+        let signer = Pubkey::new_from_array([9u8; 32]);
+        // Default scope ⇒ any market ok.
+        assert!(verify(&t, signer, 999, m_a).is_ok());
+        assert!(verify(&t, signer, 999, m_b).is_ok());
+        // Scoped to m_a ⇒ m_a ok, m_b rejected.
+        t.scope_market = m_a;
+        assert!(verify(&t, signer, 999, m_a).is_ok());
+        assert!(verify(&t, signer, 999, m_b).is_err());
     }
 
     #[test]

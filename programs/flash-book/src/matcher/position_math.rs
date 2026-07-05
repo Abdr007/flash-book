@@ -54,17 +54,6 @@ pub enum PosMathError {
     DivByZero,
 }
 
-#[inline]
-fn clamp_i128_to_i64(v: i128) -> i64 {
-    if v > i64::MAX as i128 {
-        i64::MAX
-    } else if v < i64::MIN as i128 {
-        i64::MIN
-    } else {
-        v as i64
-    }
-}
-
 /// Apply `(fill_side, fill_size_lots, fill_price_ticks)` to `pos`. Byte-faithful
 /// port of the long-standing `apply_fill_to_position` arithmetic (incl. the H-1
 /// `tick_size` scaling of realized PnL). Returns the new position + realized PnL
@@ -131,7 +120,13 @@ pub fn apply_fill(
         .ok_or(PosMathError::Overflow)?
         .checked_mul(tick_size as i128)
         .ok_or(PosMathError::Overflow)?;
-    let realized = clamp_i128_to_i64(pnl);
+    // AUDIT L-3 (2026-07): REJECT a realized PnL that exceeds i64 rather than
+    // silently saturating it. A clamped value both breaks per-fill value
+    // conservation (the two legs would clamp independently) and, once fed to the
+    // caller's `checked_add`, can revert mid-ring and strand the FIFO. Realistic
+    // markets never approach i64 quote-lots, so a hard reject is safe and fails
+    // the fill cleanly at settlement rather than distorting value.
+    let realized: i64 = i64::try_from(pnl).map_err(|_| PosMathError::Overflow)?;
 
     if fill_size_lots <= pos.size_lots {
         // Shrink (possibly to flat).
@@ -400,5 +395,88 @@ mod tests {
         let p = Pos { side: 0, size_lots: u64::MAX, entry_ticks: 1 };
         // stacking would overflow size add
         assert_eq!(apply_fill(p, 0, u64::MAX, 1, 1), Err(PosMathError::Overflow));
+    }
+}
+
+/// Property tests for the DEPLOYED settlement math. `apply_fill` here is the pure
+/// port that `apply_fill_to_position` (called by the live `apply_fill` /
+/// `apply_flp_fill` handlers) delegates to — so these generalize the fixed-case
+/// unit tests over wide random ranges. They pin the reduce/flip transitions, the
+/// exact tick-scaled realized-PnL value (H-1), and the L-3 overflow reject that the
+/// `#[cfg(kani)]` proofs deliberately leave to host tests (the i128 PnL multiply is
+/// intractable for CBMC). Every outcome is checked against an INDEPENDENT reference
+/// re-derivation of the spec, so a silent drift in the live math fails the test.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4000))]
+
+        #[test]
+        fn apply_fill_matches_independent_reference(
+            side in 0u8..=1,
+            size in 0u64..1_000_000_000,
+            entry in 0u64..10_000_000,
+            fill_side in 0u8..=1,
+            fill_size in 1u64..1_000_000_000,
+            price in 1u64..10_000_000,
+            tick in 1u64..1_000_000,
+        ) {
+            let pos = Pos { side, size_lots: size, entry_ticks: entry };
+            let got = apply_fill(pos, fill_side, fill_size, price, tick);
+
+            if size == 0 {
+                // OPEN from flat: take the fill exactly, realize nothing.
+                let o = got.expect("open never overflows in-range");
+                prop_assert_eq!(o.pos, Pos { side: fill_side, size_lots: fill_size, entry_ticks: price });
+                prop_assert_eq!(o.realized_pnl_quote_lots, 0);
+                prop_assert!(o.reset_funding);
+            } else if side == fill_side {
+                // STACK: exact size sum, VWAP entry bracketed by [min,max], no PnL.
+                let o = got.expect("stack never overflows in-range");
+                prop_assert_eq!(o.pos.side, side);
+                prop_assert_eq!(o.pos.size_lots, size + fill_size);
+                let (lo, hi) = (entry.min(price), entry.max(price));
+                prop_assert!(o.pos.entry_ticks >= lo && o.pos.entry_ticks <= hi);
+                prop_assert_eq!(o.realized_pnl_quote_lots, 0);
+                prop_assert!(!o.reset_funding);
+            } else {
+                // REDUCE / FLIP: realize PnL on the closed lots (independent formula).
+                let closed = fill_size.min(size) as i128;
+                let sign: i128 = if side == SIDE_LONG { 1 } else { -1 };
+                let expected_pnl: i128 = sign * closed * ((price as i128) - (entry as i128)) * (tick as i128);
+                match i64::try_from(expected_pnl) {
+                    Ok(exp) => {
+                        let o = got.expect("in-range reduce/flip must succeed");
+                        prop_assert_eq!(o.realized_pnl_quote_lots, exp, "realized PnL must equal sign·closed·Δticks·tick");
+                        if fill_size <= size {
+                            let ns = size - fill_size;
+                            prop_assert_eq!(o.pos.side, side);
+                            prop_assert_eq!(o.pos.size_lots, ns);
+                            if ns == 0 {
+                                prop_assert_eq!(o.pos.entry_ticks, 0);
+                                prop_assert!(o.reset_funding);
+                            } else {
+                                prop_assert_eq!(o.pos.entry_ticks, entry);
+                                prop_assert!(!o.reset_funding);
+                            }
+                        } else {
+                            // Flip across zero onto the fill side.
+                            prop_assert_eq!(o.pos.side, fill_side);
+                            prop_assert_eq!(o.pos.size_lots, fill_size - size);
+                            prop_assert_eq!(o.pos.entry_ticks, price);
+                            prop_assert!(o.reset_funding);
+                        }
+                    }
+                    Err(_) => {
+                        // L-3: a PnL beyond i64 is a CLEAN reject, never a panic or a
+                        // clamped/distorted value.
+                        prop_assert!(matches!(got, Err(PosMathError::Overflow)));
+                    }
+                }
+            }
+        }
     }
 }

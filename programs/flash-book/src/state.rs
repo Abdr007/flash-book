@@ -282,6 +282,15 @@ pub struct MarketAccount {
     pub oracle_confidence: u64,
     pub oracle_published_at_unix_seconds: u64,
     pub mark_price_ticks: u64,
+    /// DORMANT (truth-in-code, 2026-07): funding is plumbed but UNWIRED.
+    /// `last_funding_rate_bps_per_sec` is initialized to 0 and set to nonzero
+    /// NOWHERE in the program (the rate formula lives only in the read-only
+    /// `view_predicted_funding`; nothing stores its result), so `settle_funding`
+    /// accrues and charges EXACTLY 0. `cum_funding_index` therefore never advances
+    /// from funding, and invariant #8 (funding nets to zero) holds trivially.
+    /// Retained (not deleted): these are account layout, and `settle_funding` is a
+    /// live, reachable instruction — turning funding ON is a feature (compute +
+    /// store the rate, with its own conservation proof + devnet cycle), not a fix.
     pub cum_funding_index: i128,
     pub last_funding_rate_bps_per_sec: i64,
     /// AUDIT M-11 (2026-07): INERT. `VpinState::record_fill` is never called
@@ -390,6 +399,75 @@ pub struct MarketAccount {
     /// truncate fills in the 10 KB log and wedge settlement (the H-2 class). See
     /// `FILL_OUTBOX_DESIGN.md`.
     pub max_batch_orders: u16,
+
+    /// AUDIT M-6 (2026-07): total base-lot volume of fills that have been MATCHED
+    /// (pushed to the fill-commitment ring) but NOT yet settled by apply_fill /
+    /// apply_flp_fill. Because settled OI (`oi_long/short_lots`) only advances at
+    /// settlement, the per-market OI cap was checkable against stale OI and could be
+    /// overshot by pipelining takers ahead of settlement. The intake cap now checks
+    /// `oi[side] + unsettled_fill_volume + new_size`. Incremented per fill at match
+    /// (produce), decremented per fill at settle — tied 1:1 to the ring's FIFO
+    /// produce/settle lifecycle, so it self-balances (no cancellation accounting;
+    /// cancels produce no fills). Trailing field ⇒ existing accounts read it as 0.
+    pub unsettled_fill_volume: u64,
+}
+
+/// GOVERNANCE Phase-1 (2026-07): optional emergency guardian for one market, held
+/// in a SEPARATE PDA (not a MarketAccount field — adding 32 B there pushed several
+/// `try_accounts` frames past the 4 KB BPF stack limit). A guardian may only
+/// RESTRICT market status (→ PostOnly/Paused/Closed, monotonic — the fast, fail-safe
+/// direction), NEVER loosen (→ Active/Inactive stays authority-only), so a
+/// compromised guardian can pause/close but never re-open. Absence of this account
+/// (or `guardian == Pubkey::default()`) = no guardian. Set/cleared by the market
+/// authority via `set_guardian`; read (optionally) by `set_market_status`.
+#[account]
+pub struct MarketGuardianAccount {
+    pub market: Pubkey,
+    pub guardian: Pubkey,
+    pub bump: u8,
+}
+
+impl MarketGuardianAccount {
+    pub const SEED: &'static [u8] = b"market_guardian";
+    pub const LEN: usize = 32 + 32 + 1;
+}
+
+/// GOVERNANCE Phase-2 (2026-07): pending authority for a 2-step (propose→accept)
+/// market-authority transfer. Held in its own PDA (not a MarketAccount field — the
+/// stack constraint, see Phase 1). `propose_authority_transfer` (current authority)
+/// stores `pending_authority`; `accept_authority_transfer`, signed BY that pending
+/// key, commits `market.authority` and closes this account. Because the new key must
+/// itself sign to accept, a transfer can never strand control at a wrong/dead key
+/// (the failure mode of the 1-step `transfer_market_authority`).
+#[account]
+pub struct MarketPendingAuthorityAccount {
+    pub market: Pubkey,
+    pub pending_authority: Pubkey,
+    pub bump: u8,
+}
+
+impl MarketPendingAuthorityAccount {
+    pub const SEED: &'static [u8] = b"pending_authority";
+    pub const LEN: usize = 32 + 32 + 1;
+}
+
+/// GOVERNANCE Phase-2b (2026-07): a timelocked market-params update. Own PDA (not a
+/// MarketAccount field — the stack constraint). `propose_param_update` validates the
+/// new params, stores `keccak(params)` + an `eta_unix` (= now + timelock), and does
+/// NOT apply. `execute_param_update` applies the params only once `now >= eta` AND
+/// the supplied params hash to the stored `params_hash` — so the executed change is
+/// exactly the pre-announced one, after the delay. `cancel_param_update` revokes it.
+#[account]
+pub struct PendingParamUpdateAccount {
+    pub market: Pubkey,
+    pub params_hash: [u8; 32],
+    pub eta_unix: i64,
+    pub bump: u8,
+}
+
+impl PendingParamUpdateAccount {
+    pub const SEED: &'static [u8] = b"pending_params";
+    pub const LEN: usize = 32 + 32 + 8 + 1;
 }
 
 // H1: build-time guard — the struct (incl. the new nonce) must still fit the

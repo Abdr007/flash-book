@@ -832,7 +832,16 @@ pub struct MarketEnvelopeConfigAccount {
     pub gate_passes: u64,
     pub gate_rejects: u64,
 
-    pub _reserved: [u8; 32],
+    /// GOVERNANCE Phase-3 (2026-07): one-way oracle-source lock. `1` = the direct
+    /// authority `update_oracle` / `update_oracle_quorum` paths are DISABLED for this
+    /// market (only the Pyth / Lazer paths are accepted) — removing the compromised-
+    /// authority "walk the mark within the H-6 per-slot cap" vector entirely. Carved
+    /// from `_reserved` so the account size is unchanged and pre-existing envelopes
+    /// read it back as `0` (unlocked). Set (never cleared — one-way) by
+    /// `lock_oracle_source`; enforced in the two direct-write handlers, which already
+    /// REQUIRE this account (H-6), so the lock cannot be bypassed by omitting it.
+    pub source_locked: u8,
+    pub _reserved: [u8; 31],
 }
 
 impl MarketEnvelopeConfigAccount {
@@ -1089,7 +1098,8 @@ mod tests {
             last_observed_price_ticks: 0,
             gate_passes: 0,
             gate_rejects: 0,
-            _reserved: [0; 32],
+            source_locked: 0,
+            _reserved: [0; 31],
         };
         let p = EnvelopeParams::default();
         acc.write_params(&p);

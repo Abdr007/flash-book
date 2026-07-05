@@ -199,9 +199,58 @@ const OFF_CAP: usize = 24; // u32 LE
 const OFF_BUMP: usize = 28; // u8
 const OFF_MARKET: usize = 32; // [u8; 32]
 
-/// Total account size for a given ring capacity.
+/// Total account size for a given ring capacity (v0 layout: header + ring slots).
 pub const fn fill_commit_account_len(cap: usize) -> usize {
     FILL_COMMIT_HEADER_LEN + cap * 32
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUDIT F-3 migration (2026-07): OPTIONAL, backward-compatible v1 layout that adds
+// per-position REDUCE-IN-FLIGHT tracking, CO-LOCATED with the ring so it commits
+// atomically with it (no cross-account ER seam) and needs NO change to the fill
+// preimage (authenticity is untouched). A v1 account appends, after the ring slots:
+//   • a per-slot reduce-only FLAG byte array (`cap` bytes): flag[i]=1 ⇒ ring entry i
+//     is a reduce-only maker fill, so settlement must decrement that position's
+//     in-flight when it settles slot i.
+//   • a small fixed per-position MAP (`FILL_INFLIGHT_SLOTS` × 40 B): (position, lots).
+// The matcher caps a reduce-only cross by `position − inflight[position]` and adds
+// the fill to `inflight`; settlement subtracts it — so two reduce-only orders on one
+// position can never over-reduce across the match→settle gap and flip it, even after
+// the position shrinks. `version` byte (header pad, offset 29) selects the layout:
+// 0 = legacy (existing accounts, unchanged behavior), 1 = with tracking. `buffer_check`
+// validates the length for the account's own version, so v0 accounts are untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Version byte offset (a previously-zero header pad byte; v0 accounts read 0).
+const OFF_VERSION: usize = 29;
+/// Fixed number of per-position in-flight map slots in a v1 account. Bounds the
+/// distinct positions that can have reduce-only fills in flight simultaneously
+/// (rare; a full map fails the matcher closed — a liveness bound, never a flip).
+pub const FILL_INFLIGHT_SLOTS: usize = 32;
+/// One in-flight map slot: position pubkey (32) + pending reduce lots (8).
+const INFLIGHT_SLOT_BYTES: usize = 40;
+
+/// Total account size for the v1 layout (header + ring + per-slot flags + map).
+pub const fn fill_commit_account_len_v1(cap: usize) -> usize {
+    FILL_COMMIT_HEADER_LEN + cap * 32 + cap + FILL_INFLIGHT_SLOTS * INFLIGHT_SLOT_BYTES
+}
+
+/// The layout version stamped in the account (0 = legacy, 1 = with reduce-in-flight).
+pub fn buffer_version(data: &[u8]) -> u8 {
+    if data.len() > OFF_VERSION {
+        data[OFF_VERSION]
+    } else {
+        0
+    }
+}
+
+/// Expected total length for `cap` at the account's stamped version.
+const fn fill_commit_len_for_version(cap: usize, version: u8) -> usize {
+    if version >= 1 {
+        fill_commit_account_len_v1(cap)
+    } else {
+        fill_commit_account_len(cap)
+    }
 }
 
 #[inline]
@@ -245,8 +294,12 @@ pub fn buffer_check(data: &[u8], expected_market: &[u8; 32]) -> Result<u32, Fill
     let mut capb = [0u8; 4];
     capb.copy_from_slice(&data[OFF_CAP..OFF_CAP + 4]);
     let cap = u32::from_le_bytes(capb);
+    // Version-aware length: a v0 account is `header + cap*32` (unchanged); a v1
+    // account additionally carries the per-slot reduce flags + the in-flight map.
+    let version = buffer_version(data);
     if cap == 0
-        || data.len() != fill_commit_account_len(cap as usize)
+        || version > 1
+        || data.len() != fill_commit_len_for_version(cap as usize, version)
         || &data[OFF_MARKET..OFF_MARKET + 32] != expected_market
     {
         return Err(FillRingError::Corrupt);
@@ -309,6 +362,148 @@ pub fn buffer_settle(
         ring_settle(produced, &mut settled, slots, recomputed)?;
     }
     wr_u64(data, OFF_SETTLED, settled);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUDIT F-3 v1: reduce-in-flight accessors. All are NO-OPs of intent unless the
+// account is v1 (the caller gates on `buffer_version(data) == 1`); they compute
+// offsets from `cap` (from `buffer_check`) and never touch the ring/header. The
+// flags array is parallel to the ring slots (index = fill index mod cap); the map
+// is a small fixed open-addressed table of (position pubkey, pending lots).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[inline]
+fn flags_off(cap: usize) -> usize {
+    FILL_COMMIT_HEADER_LEN + cap * 32
+}
+#[inline]
+fn map_off(cap: usize) -> usize {
+    FILL_COMMIT_HEADER_LEN + cap * 32 + cap
+}
+
+/// v1: mark the ring slot for `produced_index` as a reduce-only maker fill.
+pub fn reduce_flag_set(data: &mut [u8], cap: u32, produced_index: u64) {
+    let i = (produced_index % cap as u64) as usize;
+    let off = flags_off(cap as usize) + i;
+    if off < data.len() {
+        data[off] = 1;
+    }
+}
+
+/// v1: read AND clear the reduce-only flag for the slot settlement is consuming
+/// (`settled_index`). Returns true iff it was set (⇒ decrement its in-flight).
+pub fn reduce_flag_take(data: &mut [u8], cap: u32, settled_index: u64) -> bool {
+    let i = (settled_index % cap as u64) as usize;
+    let off = flags_off(cap as usize) + i;
+    if off < data.len() && data[off] != 0 {
+        data[off] = 0;
+        true
+    } else {
+        false
+    }
+}
+
+/// v1: pending reduce-only lots currently in flight for `position` (0 if none).
+pub fn inflight_get(data: &[u8], cap: u32, position: &[u8; 32]) -> u64 {
+    let base = map_off(cap as usize);
+    for s in 0..FILL_INFLIGHT_SLOTS {
+        let off = base + s * INFLIGHT_SLOT_BYTES;
+        if off + INFLIGHT_SLOT_BYTES <= data.len() && &data[off..off + 32] == position {
+            return rd_u64(data, off + 32);
+        }
+    }
+    0
+}
+
+/// v1: add `delta` reduce-only lots to `position`'s in-flight, allocating a map
+/// slot if new. `Err(Full)` iff a new position is needed but the map is full — the
+/// matcher then fails CLOSED (a liveness bound, never an over-reduce/flip).
+pub fn inflight_add(
+    data: &mut [u8],
+    cap: u32,
+    position: &[u8; 32],
+    delta: u64,
+) -> Result<(), FillRingError> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let base = map_off(cap as usize);
+    let mut free: Option<usize> = None;
+    for s in 0..FILL_INFLIGHT_SLOTS {
+        let off = base + s * INFLIGHT_SLOT_BYTES;
+        if off + INFLIGHT_SLOT_BYTES > data.len() {
+            break;
+        }
+        if &data[off..off + 32] == position {
+            let v = rd_u64(data, off + 32).saturating_add(delta);
+            wr_u64(data, off + 32, v);
+            return Ok(());
+        }
+        if free.is_none() && data[off..off + 32].iter().all(|&b| b == 0) {
+            free = Some(off);
+        }
+    }
+    match free {
+        Some(off) => {
+            data[off..off + 32].copy_from_slice(position);
+            wr_u64(data, off + 32, delta);
+            Ok(())
+        }
+        None => Err(FillRingError::Full),
+    }
+}
+
+/// v1: subtract `delta` from `position`'s in-flight, freeing the slot at zero.
+pub fn inflight_sub(data: &mut [u8], cap: u32, position: &[u8; 32], delta: u64) {
+    let base = map_off(cap as usize);
+    for s in 0..FILL_INFLIGHT_SLOTS {
+        let off = base + s * INFLIGHT_SLOT_BYTES;
+        if off + INFLIGHT_SLOT_BYTES > data.len() {
+            break;
+        }
+        if &data[off..off + 32] == position {
+            let v = rd_u64(data, off + 32).saturating_sub(delta);
+            if v == 0 {
+                for b in &mut data[off..off + INFLIGHT_SLOT_BYTES] {
+                    *b = 0;
+                }
+            } else {
+                wr_u64(data, off + 32, v);
+            }
+            return;
+        }
+    }
+}
+
+/// Migrate an already-GROWN v0 buffer to v1: the account must be reallocated to
+/// `fill_commit_account_len_v1(cap)` first; this zeroes the appended flags+map and
+/// stamps version 1. Requires a DRAINED ring (`produced == settled`) so no pending
+/// pre-migration fill is left without a reduce flag.
+pub fn buffer_upgrade_to_v1(data: &mut [u8], market: &[u8; 32]) -> Result<(), FillRingError> {
+    if data.len() < FILL_COMMIT_HEADER_LEN || data[0..8] != FILL_COMMIT_DISC {
+        return Err(FillRingError::Corrupt);
+    }
+    if data[OFF_VERSION] != 0 {
+        return Err(FillRingError::Corrupt); // not a v0 account
+    }
+    let mut capb = [0u8; 4];
+    capb.copy_from_slice(&data[OFF_CAP..OFF_CAP + 4]);
+    let cap = u32::from_le_bytes(capb);
+    if cap == 0
+        || data.len() != fill_commit_account_len_v1(cap as usize)
+        || &data[OFF_MARKET..OFF_MARKET + 32] != market
+    {
+        return Err(FillRingError::Corrupt);
+    }
+    if rd_u64(data, OFF_PRODUCED) != rd_u64(data, OFF_SETTLED) {
+        return Err(FillRingError::Corrupt); // ring must be drained to migrate
+    }
+    let start = flags_off(cap as usize);
+    for b in &mut data[start..] {
+        *b = 0;
+    }
+    data[OFF_VERSION] = 1;
     Ok(())
 }
 
@@ -535,6 +730,131 @@ mod tests {
         assert_eq!(diff, 1, "only the taker_was_jit byte should differ");
         // Domain bumped so pre-upgrade commitments can't be reinterpreted.
         assert_eq!(&p_false[0..8], b"FBfillC2");
+    }
+
+    // AUDIT F-3 v1: a freshly-initialized v0 account grows + migrates to v1, and the
+    // reduce-in-flight map + per-slot flags behave as the matcher/settlement need.
+    fn make_v1(market: &[u8; 32], cap: u32) -> Vec<u8> {
+        let mut data = vec![0u8; fill_commit_account_len(cap as usize)];
+        buffer_init(&mut data, market, cap, 7).unwrap();
+        assert_eq!(buffer_version(&data), 0, "fresh account is v0");
+        // grow to v1 length (handler realloc) then migrate.
+        data.resize(fill_commit_account_len_v1(cap as usize), 0);
+        buffer_upgrade_to_v1(&mut data, market).unwrap();
+        assert_eq!(buffer_version(&data), 1);
+        assert_eq!(buffer_check(&data, market).unwrap(), cap, "v1 length validates");
+        data
+    }
+
+    #[test]
+    fn f3_v1_upgrade_requires_drained_ring_and_v0() {
+        let market = [5u8; 32];
+        let cap = 8u32;
+        let mut data = vec![0u8; fill_commit_account_len(cap as usize)];
+        buffer_init(&mut data, &market, cap, 7).unwrap();
+        data.resize(fill_commit_account_len_v1(cap as usize), 0);
+        // a non-drained ring cannot migrate (a pending fill would miss its flag)
+        wr_u64(&mut data, OFF_PRODUCED, 3);
+        wr_u64(&mut data, OFF_SETTLED, 1);
+        assert!(buffer_upgrade_to_v1(&mut data, &market).is_err());
+        wr_u64(&mut data, OFF_PRODUCED, 3);
+        wr_u64(&mut data, OFF_SETTLED, 3); // drained
+        buffer_upgrade_to_v1(&mut data, &market).unwrap();
+        // double-migrate is rejected (already v1)
+        assert!(buffer_upgrade_to_v1(&mut data, &market).is_err());
+    }
+
+    #[test]
+    fn f3_v1_map_and_flags_roundtrip() {
+        let market = [6u8; 32];
+        let cap = 8u32;
+        let mut d = make_v1(&market, cap);
+        let p1 = [11u8; 32];
+        let p2 = [22u8; 32];
+        assert_eq!(inflight_get(&d, cap, &p1), 0);
+        inflight_add(&mut d, cap, &p1, 40).unwrap();
+        inflight_add(&mut d, cap, &p1, 10).unwrap();
+        inflight_add(&mut d, cap, &p2, 5).unwrap();
+        assert_eq!(inflight_get(&d, cap, &p1), 50);
+        assert_eq!(inflight_get(&d, cap, &p2), 5);
+        inflight_sub(&mut d, cap, &p1, 50); // frees the slot
+        assert_eq!(inflight_get(&d, cap, &p1), 0);
+        assert_eq!(inflight_get(&d, cap, &p2), 5, "p2 untouched");
+        // flags parallel to ring slots (index mod cap)
+        assert!(!reduce_flag_take(&mut d, cap, 1));
+        reduce_flag_set(&mut d, cap, 1);
+        reduce_flag_set(&mut d, cap, 1 + cap as u64); // same slot (wraps)
+        assert!(reduce_flag_take(&mut d, cap, 1), "flag set is observed at settle");
+        assert!(!reduce_flag_take(&mut d, cap, 1), "take clears the flag");
+    }
+
+    #[test]
+    fn f3_v1_map_full_fails_closed() {
+        let market = [7u8; 32];
+        let cap = 8u32;
+        let mut d = make_v1(&market, cap);
+        for i in 0..FILL_INFLIGHT_SLOTS {
+            let mut p = [0u8; 32];
+            p[0] = (i as u8).wrapping_add(1);
+            p[1] = 0xAB;
+            inflight_add(&mut d, cap, &p, 1).unwrap();
+        }
+        // a NEW position with the map full fails closed (never silently over-admits)
+        let overflow = [0xFFu8; 32];
+        assert_eq!(inflight_add(&mut d, cap, &overflow, 1), Err(FillRingError::Full));
+        // but an EXISTING position still accumulates (no new slot needed)
+        let mut p0 = [0u8; 32];
+        p0[0] = 1;
+        p0[1] = 0xAB;
+        inflight_add(&mut d, cap, &p0, 9).unwrap();
+        assert_eq!(inflight_get(&d, cap, &p0), 10);
+    }
+
+    // The property the whole migration exists for: two reduce-only fills on ONE
+    // position, crossed by SEPARATE takers across the settle gap, can NEVER
+    // collectively reduce more than the position — even after the position shrinks.
+    // Models the matcher cap: reducible = position − inflight_get(P).
+    fn cap_and_track(d: &mut [u8], cap: u32, pos_key: &[u8; 32], position: u64, desired: u64, idx: u64) -> u64 {
+        let reducible = position.saturating_sub(inflight_get(d, cap, pos_key));
+        let fill = desired.min(reducible);
+        if fill > 0 {
+            inflight_add(d, cap, pos_key, fill).unwrap();
+            reduce_flag_set(d, cap, idx);
+        }
+        fill
+    }
+
+    #[test]
+    fn f3_v1_two_takers_cannot_over_reduce_stable_position() {
+        let market = [8u8; 32];
+        let cap = 8u32;
+        let mut d = make_v1(&market, cap);
+        let p = [42u8; 32];
+        // position 100; two reduce-only orders of 100 each; two takers try to take 100 each.
+        let f1 = cap_and_track(&mut d, cap, &p, 100, 100, 0);
+        let f2 = cap_and_track(&mut d, cap, &p, 100, 100, 1); // stale snapshot still 100
+        assert_eq!(f1, 100);
+        assert_eq!(f2, 0, "second taker capped to 0 by in-flight — no flip");
+        assert_eq!(f1 + f2, 100, "total reduced == position, never exceeds it");
+    }
+
+    #[test]
+    fn f3_v1_two_takers_cannot_over_reduce_shrunken_position() {
+        let market = [9u8; 32];
+        let cap = 8u32;
+        let mut d = make_v1(&market, cap);
+        let p = [43u8; 32];
+        // The residual the injection clamp couldn't reach: one 100-lot reduce-only
+        // order, position SHRUNK to 50, two takers split-cross it across the gap.
+        let f1 = cap_and_track(&mut d, cap, &p, 50, 50, 0);
+        let f2 = cap_and_track(&mut d, cap, &p, 50, 50, 1); // stale snapshot still 50
+        assert_eq!(f1, 50);
+        assert_eq!(f2, 0, "shrink edge closed: second cross capped to 0 by in-flight");
+        assert_eq!(f1 + f2, 50, "total reduced == shrunken position, never flips");
+        // settlement drains the in-flight back to zero via the flags
+        assert!(reduce_flag_take(&mut d, cap, 0));
+        inflight_sub(&mut d, cap, &p, 50);
+        assert_eq!(inflight_get(&d, cap, &p), 0, "in-flight fully released at settlement");
     }
 
     // §3.2 P3: growing the ring resizes the account, stamps the new cap, and the

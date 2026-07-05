@@ -300,6 +300,134 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// AUDIT F-3 migration (2026-07): one-way, authority-gated upgrade of a market's
+    /// fill-commitment ring from the v0 layout to v1, enabling per-position
+    /// reduce-in-flight tracking (closes the last F-3 edge: a position shrunk below
+    /// its resting reduce-only, then over-crossed across the match→settle gap).
+    /// MUST run on the BASE LAYER with the ring UNdelegated (a delegated ring is
+    /// owned by the delegation program — realloc would be illegal) and the ring
+    /// DRAINED (`produced == settled`; a pending fill would be left without a reduce
+    /// flag — `buffer_upgrade_to_v1` enforces this). Re-running on a v1 ring reverts.
+    pub fn upgrade_fill_commitment_v1(ctx: Context<UpgradeFillCommitmentV1>) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        let fc_ai = ctx.accounts.fill_commitment.to_account_info();
+        require_keys_eq!(*fc_ai.owner, *ctx.program_id, FlashBookError::Unauthorized);
+        let market_bytes = ctx.accounts.market.key().to_bytes();
+
+        // Validate as a v0 account and require a drained ring.
+        let cap = {
+            let data = fc_ai.try_borrow_data()?;
+            let cap = fc::buffer_check(&data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+            require!(fc::buffer_version(&data) == 0, FlashBookError::OutOfRange);
+            require!(
+                fc::buffer_next_index(&data) == fc::buffer_settle_index(&data),
+                FlashBookError::FillRingNotDrained
+            );
+            cap
+        };
+
+        let old_len = fc_ai.data_len();
+        let new_len = fc::fill_commit_account_len_v1(cap as usize);
+        require!(new_len > old_len, FlashBookError::OutOfRange);
+        let additional_bytes = new_len - old_len;
+        require!(
+            additional_bytes
+                <= anchor_lang::solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE,
+            FlashBookError::OutOfRange
+        );
+
+        // Top up rent so the larger account stays rent-exempt.
+        let rent = Rent::get()?;
+        let new_minimum = rent.minimum_balance(new_len);
+        let cur_lamports = fc_ai.lamports();
+        if new_minimum > cur_lamports {
+            let topup = new_minimum.saturating_sub(cur_lamports);
+            anchor_lang::solana_program::program::invoke(
+                &anchor_lang::solana_program::system_instruction::transfer(
+                    &ctx.accounts.authority.key(),
+                    &fc_ai.key(),
+                    topup,
+                ),
+                &[
+                    ctx.accounts.authority.to_account_info(),
+                    fc_ai.clone(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+
+        // Grow in place (zero-inits the appended regions), migrate to v1, and
+        // re-validate so a botched realloc/migrate fails loudly.
+        fc_ai.resize(new_len)?;
+        {
+            let mut data = fc_ai.try_borrow_mut_data()?;
+            fc::buffer_upgrade_to_v1(&mut data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+            fc::buffer_check(&data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+        }
+
+        emit!(FillCommitmentUpgradedV1Event {
+            market: ctx.accounts.market.key(),
+            fill_commitment: fc_ai.key(),
+            cap,
+            old_bytes: old_len as u32,
+            new_bytes: new_len as u32,
+        });
+        Ok(())
+    }
+
+    /// AUDIT F-4 (2026-07): reconcile `MarketAccount.unsettled_fill_volume` (the
+    /// M-6 matched-but-unsettled OI reserve) back to 0 when the fill-commitment
+    /// ring is fully DRAINED.
+    ///
+    /// The counter lives on `market` and the ring lives on `fill_commitment` — two
+    /// separately-delegated accounts with no atomic co-undelegate (there is no
+    /// `commit_and_undelegate_market`; the counter reaches L1 only via MagicBlock's
+    /// independent auto-commit). If the `market` snapshot leads the ring snapshot
+    /// (auto-commit lag / partial or forced commit), L1 settlement drains the
+    /// entries that arrived and decrements them, but the counter is left holding the
+    /// volume of the entries that never made it — with an empty ring and nothing
+    /// left to settle it back down, and no reset path. Once
+    /// `oi[side] + unsettled_fill_volume + new_size > oi_cap`, every place reverts
+    /// `OpenInterestCapExceeded` FOREVER on that market (a permanent placement brick).
+    ///
+    /// Soundness: when the ring is drained (`produced == settled`) every produced
+    /// fill has settled and decremented the counter, so the TRUE unsettled volume is
+    /// 0 by construction. Resetting to 0 here is therefore never a guess and can only
+    /// move the counter toward truth — which is why this is safe to expose
+    /// PERMISSIONLESSLY (no authority gate): a caller can only un-stick a market, not
+    /// harm it. If the ring is NOT drained it reverts `FillRingNotDrained`, so it can
+    /// never zero a counter that still backs pending fills. (The transient
+    /// under-count direction — ring ahead of counter — self-heals on drain and needs
+    /// no action.) The sizes in the ring are keccak commitments, so an exact
+    /// non-drained recompute is impossible; the drained gate is the sound reconcile.
+    pub fn reconcile_unsettled_fill_volume(
+        ctx: Context<ReconcileUnsettledFillVolume>,
+    ) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        let fc_ai = ctx.accounts.fill_commitment.to_account_info();
+        require_keys_eq!(*fc_ai.owner, *ctx.program_id, FlashBookError::Unauthorized);
+        let market_bytes = ctx.accounts.market.key().to_bytes();
+        {
+            let data = fc_ai.try_borrow_data()?;
+            fc::buffer_check(&data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+            require!(
+                fc::buffer_next_index(&data) == fc::buffer_settle_index(&data),
+                FlashBookError::FillRingNotDrained
+            );
+        }
+        let previous_unsettled = ctx.accounts.market.unsettled_fill_volume;
+        ctx.accounts.market.unsettled_fill_volume = 0;
+        emit!(UnsettledFillVolumeReconciledEvent {
+            market: ctx.accounts.market.key(),
+            previous_unsettled,
+        });
+        Ok(())
+    }
+
     /// Grow an existing v2 `market_book` PDA in place by `additional_nodes`
     /// hypertree slots — this is what breaks the 100-node init cap. Only the
     /// market authority may call it (same gate as `init_market_book`).
@@ -1269,6 +1397,9 @@ pub mod flash_book {
             flags,
             expires_at_slot,
             sub_index,
+            &ctx.accounts.trader_state,
+            ctx.program_id,
+            ctx.accounts.position.as_ref(),
         )
     }
 
@@ -1291,6 +1422,7 @@ pub mod flash_book {
             &ctx.accounts.session_token,
             ctx.accounts.session_signer.key(),
             now,
+            ctx.accounts.market.key(),
         )?;
         place_limit_v2_core(
             &ctx.accounts.market,
@@ -1302,6 +1434,9 @@ pub mod flash_book {
             flags,
             expires_at_slot,
             sub_index,
+            &ctx.accounts.trader_state,
+            ctx.program_id,
+            ctx.accounts.position.as_ref(),
         )
     }
 
@@ -1312,6 +1447,10 @@ pub mod flash_book {
     pub fn create_session_token(
         ctx: Context<CreateSessionToken>,
         ttl_seconds: i64,
+        // AUDIT M-9 (2026-07): market scope. Pubkey::default() = unrestricted (any
+        // market); a specific market key restricts the session to that one market,
+        // bounding the blast radius of a leaked session key.
+        scope_market: Pubkey,
     ) -> Result<()> {
         require!(
             ttl_seconds > 0 && ttl_seconds <= session::MAX_SESSION_TTL_SECONDS,
@@ -1325,6 +1464,7 @@ pub mod flash_book {
         token.owner = ctx.accounts.owner.key();
         token.session_signer = ctx.accounts.session_signer.key();
         token.expires_at_unix = expires_at_unix;
+        token.scope_market = scope_market;
         token.bump = ctx.bumps.session_token;
         emit!(SessionTokenEvent {
             owner: token.owner,
@@ -1413,13 +1553,113 @@ pub mod flash_book {
         let oi_cap = p.max_oi_base_lots;
         if oi_cap > 0 {
             let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
-            if cur.saturating_add(size_lots) > oi_cap {
+            // AUDIT M-6 (2026-07): include matched-but-unsettled fill volume so the
+            // cap can't be overshot by pipelining takers ahead of settlement.
+            if cur
+                .saturating_add(market.unsettled_fill_volume)
+                .saturating_add(size_lots)
+                > oi_cap
+            {
                 return err!(FlashBookError::OpenInterestCapExceeded);
             }
         }
 
         let trader_pk = ctx.accounts.trader.key();
         let market_key = market.key();
+
+        // AUDIT C-1 (2026-07): a taker commits taker=(trader, sub_index) into the
+        // fill-commitment ring, and apply_fill hard-loads that TraderState to settle.
+        // Reject an intake whose TraderState does not exist / is not the caller's —
+        // otherwise an uninitialized taker leg permanently wedges the strict FIFO
+        // (mirrors the maker-side gate in place_limit_v2_core).
+        {
+            let ts = ctx.accounts.trader_state.load()?;
+            verify_trader_state_pda(
+                sub_index,
+                trader_pk,
+                ctx.accounts.trader_state.key(),
+                ts.bump,
+                ctx.program_id,
+            )?;
+            require_keys_eq!(ts.trader, trader_pk, FlashBookError::WrongTrader);
+        }
+
+        // AUDIT M-2 (2026-07): intake initial-margin gate — reject an order whose
+        // resulting position on this market would be under-margined (the zero/thin-
+        // collateral "free option"). Pure reduces are exempt; an omitted position is
+        // treated as a full open (strictest), so it cannot be a bypass.
+        {
+            let (pos_info, backing) = if let Some(pos_loader) = ctx.accounts.position.as_ref() {
+                let pdata = pos_loader.load()?;
+                verify_position_pda(
+                    &market_key,
+                    &ctx.accounts.trader_state.key(),
+                    pdata.bump,
+                    &pos_loader.key(),
+                    ctx.program_id,
+                )?;
+                let backing = if pdata.collateral_quote_lots > 0 {
+                    pdata.collateral_quote_lots
+                } else {
+                    ctx.accounts.trader_state.load()?.collateral_quote_lots
+                };
+                (Some((pdata.side, pdata.size_lots)), backing)
+            } else {
+                (None, ctx.accounts.trader_state.load()?.collateral_quote_lots)
+            };
+            assert_intake_initial_margin(
+                side,
+                size_lots,
+                limit_ticks,
+                market.params.initial_margin_ratio_bps,
+                market.params.tick_size,
+                backing,
+                pos_info,
+            )?;
+        }
+
+        // AUDIT M-7 airtight (2026-07): pre-scan remaining_accounts for maker
+        // PositionAccounts on THIS market so the matcher can cap a crossed
+        // reduce-only maker's fill to its reducible size. Read-only; only positions
+        // for reduce-only makers the taker actually crosses need be passed. Tuple:
+        // (position PDA, position side, reducible lots). Non-position accounts
+        // (fill-commitment / outbox) fail `try_from` (disc mismatch) and are skipped.
+        let program_id = ctx.program_id;
+        let mut maker_positions: Vec<(Pubkey, u8, u64)> = Vec::new();
+        for ai in ctx.remaining_accounts.iter() {
+            if let Ok(loader) = AccountLoader::<state::PositionAccount>::try_from(ai) {
+                if let Ok(p) = loader.load() {
+                    if p.market == market_key && p.size_lots > 0 {
+                        maker_positions.push((ai.key(), p.side, p.size_lots));
+                    }
+                }
+            }
+        }
+        // AUDIT F-3 v1: if the fill-commitment ring uses the v1 layout, subtract each
+        // maker position's PENDING (matched-but-unsettled) reduce-only lots from its
+        // reducible. This makes over-reduction impossible ACROSS the match→settle gap
+        // (two takers each reading a stale position snapshot), not just within one
+        // call — closing the residual where a position shrinks below its resting
+        // reduce-only. On a v0 ring this loop is a no-op (reducible == position size).
+        {
+            let mkt = market_key.to_bytes();
+            if let Some(fc_acct) =
+                find_fill_commitment(ctx.remaining_accounts, program_id, &mkt)
+            {
+                if let Ok(fc_data) = fc_acct.try_borrow_data() {
+                    use matcher::fill_commitment as fc;
+                    if fc::buffer_version(&fc_data) == 1 {
+                        if let Ok(cap) = fc::buffer_check(&fc_data, &mkt) {
+                            for entry in maker_positions.iter_mut() {
+                                let pending =
+                                    fc::inflight_get(&fc_data, cap, &entry.0.to_bytes());
+                                entry.2 = entry.2.saturating_sub(pending);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
         let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
@@ -1486,7 +1726,11 @@ pub mod flash_book {
         // crossed levels. (data_idx, maker_order_id, fill_size_lots,
         // fill_price_ticks, maker_pubkey, maker_sub_index) — Phase 2e adds
         // maker_sub_index so the emitted FillEntry carries it for the sequencer.
-        let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey, u8)> =
+        // Tuple: (maker node idx, maker order id, fill lots, fill price, maker
+        // trader, maker sub_index, is_reduce_only). The trailing flag (F-3 v1) lets
+        // the ring-push loop track this fill's reduce-in-flight against the maker's
+        // position so a later taker (before settlement) cannot over-reduce it.
+        let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey, u8, bool)> =
             Vec::with_capacity(walk_limit);
         let mut stp_cancels: Vec<hypertree::DataIndex> = Vec::new();
         let mut stp_aborted = false;
@@ -1519,8 +1763,41 @@ pub mod flash_book {
                         STP_SKIP | _ => return true, // skip self-match, keep walking
                     }
                 }
-                let fill = ask.size_lots.min(remaining);
-                matches.push((idx, ask.order_id, fill, ask.price_ticks, ask.trader, ask.sub_index));
+                let mut fill = ask.size_lots.min(remaining);
+                // AUDIT M-7 airtight: cap a reduce-only maker to its reducible size
+                // (read-only position from remaining_accounts). Fail-closed — an
+                // absent/unmatched position ⇒ skip (cannot reduce ⇒ would open/flip).
+                if ask.flags & state_v2::FLAG_REDUCE_ONLY != 0 {
+                    let pos_key =
+                        derive_maker_position_key(&market_key, &ask.trader, ask.sub_index, program_id);
+                    let capped = match maker_positions.iter_mut().find(|e| e.0 == pos_key) {
+                        Some(entry) => {
+                            let c = match matcher::reduce_only::check_reduce_only(
+                                entry.1, entry.2, ask.side, fill,
+                            ) {
+                                matcher::reduce_only::ReduceOnlyOutcome::Admit => fill,
+                                matcher::reduce_only::ReduceOnlyOutcome::PartialAdmit(cap) => cap,
+                                matcher::reduce_only::ReduceOnlyOutcome::Reject => 0,
+                            };
+                            entry.2 = entry.2.saturating_sub(c);
+                            c
+                        }
+                        None => 0,
+                    };
+                    if capped == 0 {
+                        return true;
+                    }
+                    fill = capped;
+                }
+                matches.push((
+                    idx,
+                    ask.order_id,
+                    fill,
+                    ask.price_ticks,
+                    ask.trader,
+                    ask.sub_index,
+                    ask.flags & state_v2::FLAG_REDUCE_ONLY != 0,
+                ));
                 remaining -= fill;
                 true
             });
@@ -1543,8 +1820,41 @@ pub mod flash_book {
                         _ => return true,
                     }
                 }
-                let fill = bid.size_lots.min(remaining);
-                matches.push((idx, bid.order_id, fill, bid.price_ticks, bid.trader, bid.sub_index));
+                let mut fill = bid.size_lots.min(remaining);
+                // AUDIT M-7 airtight: cap a reduce-only maker to its reducible size
+                // (read-only position from remaining_accounts). Fail-closed — an
+                // absent/unmatched position ⇒ skip (cannot reduce ⇒ would open/flip).
+                if bid.flags & state_v2::FLAG_REDUCE_ONLY != 0 {
+                    let pos_key =
+                        derive_maker_position_key(&market_key, &bid.trader, bid.sub_index, program_id);
+                    let capped = match maker_positions.iter_mut().find(|e| e.0 == pos_key) {
+                        Some(entry) => {
+                            let c = match matcher::reduce_only::check_reduce_only(
+                                entry.1, entry.2, bid.side, fill,
+                            ) {
+                                matcher::reduce_only::ReduceOnlyOutcome::Admit => fill,
+                                matcher::reduce_only::ReduceOnlyOutcome::PartialAdmit(cap) => cap,
+                                matcher::reduce_only::ReduceOnlyOutcome::Reject => 0,
+                            };
+                            entry.2 = entry.2.saturating_sub(c);
+                            c
+                        }
+                        None => 0,
+                    };
+                    if capped == 0 {
+                        return true;
+                    }
+                    fill = capped;
+                }
+                matches.push((
+                    idx,
+                    bid.order_id,
+                    fill,
+                    bid.price_ticks,
+                    bid.trader,
+                    bid.sub_index,
+                    bid.flags & state_v2::FLAG_REDUCE_ONLY != 0,
+                ));
                 remaining -= fill;
                 true
             });
@@ -1586,7 +1896,7 @@ pub mod flash_book {
         // The SBF bump allocator never frees, so a second N-sized Vec plus a
         // serialized fat event would blow the 32 KiB heap past ~100 levels (the old
         // OOM). See FILL_OUTBOX_DESIGN.md / DEEP_BOOK_CU.md.
-        for (maker_idx, _maker_id, fill_size, _fill_price, _maker_trader, _maker_sub_idx) in
+        for (maker_idx, _maker_id, fill_size, _fill_price, _maker_trader, _maker_sub_idx, _ro) in
             &matches
         {
             let new_size = handle.decrement_size_at(*maker_idx, *fill_size)?;
@@ -1598,6 +1908,11 @@ pub mod flash_book {
                 }
             }
         }
+        // AUDIT M-6 (2026-07): base-lot volume of fills pushed to the ring this call.
+        // Set only when the ring push actually happens (armed path); apply_fill /
+        // apply_flp_fill decrement it 1:1 at settlement. Applied to the market AFTER
+        // the residual block (below) where the immutable `market` borrow has ended.
+        let mut matched_ring_volume: u64 = 0;
         if !matches.is_empty() {
             // ── H1 part B (#35) + fill-outbox delivery ──
             // For each fill just crossed on-chain, push a keccak commitment to the
@@ -1671,8 +1986,27 @@ pub mod flash_book {
                     require!(fo_cap >= ring_cap, FlashBookError::FillRingCorrupt);
                 }
                 produced_from = fc::buffer_next_index(&fc_data);
-                for (_maker_idx, maker_id, fill_size, fill_price, maker_trader, maker_sub_idx) in
-                    &matches
+                // AUDIT F-3 v1: on a v1 ring, track each reduce-only fill's lots
+                // against the maker's position in-flight so a later taker (before this
+                // fill settles) sees a reduced reducible (subtracted in the pre-scan
+                // above). `None` on a v0 ring ⇒ tracking is inert (unchanged behavior).
+                let ring_v1_cap: Option<u32> = if fc::buffer_version(&fc_data) == 1 {
+                    Some(
+                        fc::buffer_check(&fc_data, &fc_market_bytes)
+                            .map_err(|_| error!(FlashBookError::FillRingCorrupt))?,
+                    )
+                } else {
+                    None
+                };
+                for (
+                    _maker_idx,
+                    maker_id,
+                    fill_size,
+                    fill_price,
+                    maker_trader,
+                    maker_sub_idx,
+                    is_reduce_only,
+                ) in &matches
                 {
                     let idx = fc::buffer_next_index(&fc_data);
                     let maker_bytes = maker_trader.to_bytes();
@@ -1693,6 +2027,24 @@ pub mod flash_book {
                         fc::FillRingError::Full => error!(FlashBookError::FillRingFull),
                         _ => error!(FlashBookError::FillRingCorrupt),
                     })?;
+                    // AUDIT F-3 v1: reserve this reduce-only fill's lots against the
+                    // maker's position in-flight and mark the ring slot so settlement
+                    // releases it when it settles this index. A full in-flight map fails
+                    // CLOSED (FillRingFull) — a liveness bound, never an over-reduce.
+                    if *is_reduce_only {
+                        if let Some(cap) = ring_v1_cap {
+                            let pos_key = derive_maker_position_key(
+                                &market_key,
+                                maker_trader,
+                                *maker_sub_idx,
+                                program_id,
+                            )
+                            .to_bytes();
+                            fc::inflight_add(&mut fc_data, cap, &pos_key, *fill_size)
+                                .map_err(|_| error!(FlashBookError::FillRingFull))?;
+                            fc::reduce_flag_set(&mut fc_data, cap, idx);
+                        }
+                    }
                     // Mirror the fill DATA into outbox[idx % cap] (heap-free direct
                     // write). The ring's backpressure (`Full` above) guarantees this
                     // slot's prior tenant was already settled — no silent overwrite.
@@ -1715,6 +2067,10 @@ pub mod flash_book {
                     }
                 }
                 produced_to = fc::buffer_next_index(&fc_data);
+                // AUDIT M-6: every fill was pushed to the ring (a push failure would
+                // have reverted the tx), so reserve their base-lot volume against the
+                // OI cap until apply_fill/apply_flp_fill settle and decrement them.
+                matched_ring_volume = matches.iter().fold(0u64, |a, m| a.saturating_add(m.2));
                 // Mirror the ring cursors into the outbox header (stream semantics +
                 // gap detection for the sequencer); apply_fill stays untouched.
                 if let Some(fo_data) = fo_borrow.as_deref_mut() {
@@ -1740,7 +2096,7 @@ pub mod flash_book {
                 // Legacy fat event — only reached at cap ≤ 96 (log-safe). Build the
                 // FillEntry Vec here (kept tiny by the cap) and emit.
                 let mut fills: Vec<FillEntry> = Vec::with_capacity(matches.len());
-                for (_i, maker_id, fill_size, fill_price, maker_trader, maker_sub_idx) in &matches {
+                for (_i, maker_id, fill_size, fill_price, maker_trader, maker_sub_idx, _ro) in &matches {
                     fills.push(FillEntry {
                         maker: *maker_trader,
                         size_lots: *fill_size,
@@ -1807,6 +2163,18 @@ pub mod flash_book {
             };
         }
 
+        // AUDIT M-6: apply the reserved OI volume for the fills pushed to the ring.
+        // Done here (not in the produce block) because the immutable `market` borrow
+        // used for the residual band check above has now ended; `market_book` is a
+        // different account so the live book handle does not alias `market`.
+        if matched_ring_volume > 0 {
+            ctx.accounts.market.unsettled_fill_volume = ctx
+                .accounts
+                .market
+                .unsettled_fill_volume
+                .saturating_add(matched_ring_volume);
+        }
+
         emit!(TakerOrderClearedEvent {
             market: market_key,
             taker: trader_pk,
@@ -1866,6 +2234,7 @@ pub mod flash_book {
             &ctx.accounts.session_token,
             ctx.accounts.session_signer.key(),
             now,
+            ctx.accounts.market.key(),
         )?;
         cancel_v2_core(
             &ctx.accounts.market_book,
@@ -2383,12 +2752,26 @@ pub mod flash_book {
         let amount_quote_lots = amount_u128 as u64;
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
 
-        // Compute new total_capital up-front so the solvency check below can
-        // reason about post-withdraw NAV.
-        let new_total = flp_ro
-            .total_capital_quote_lots
-            .checked_sub(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        // AUDIT H-1 (2026-07): the payout `amount_quote_lots` is a fraction of NAV
+        // (= total_capital + realized_pnl), but the old code decremented ONLY
+        // total_capital by the full payout and never touched realized_pnl. So once
+        // the pool was in profit (realized_pnl > 0 ⇒ NAV > total_capital) the
+        // subtraction underflowed and reverted — the realized profit was
+        // permanently unwithdrawable (the last LP could never exit). Fix: split the
+        // payout across BOTH NAV buckets — draw principal first, then the profit
+        // portion from realized_pnl. NAV then drops by EXACTLY the paid amount,
+        // total_capital can never underflow, and the loss case (amount <=
+        // total_capital ⇒ realized_pnl untouched) is unchanged. Only nav() (the
+        // sum) is used for share pricing, so the capital/pnl split is immaterial
+        // beyond conservation. `amount_quote_lots <= nav` holds (shares_to_burn <=
+        // shares_outstanding, nav > 0), so pnl_reduction <= realized_pnl and the
+        // new realized_pnl stays >= 0 whenever the pool was in profit.
+        let cap_reduction = amount_quote_lots.min(flp_ro.total_capital_quote_lots);
+        let pnl_reduction = amount_quote_lots - cap_reduction;
+        let new_total = flp_ro.total_capital_quote_lots - cap_reduction;
+        let new_realized_pnl: i64 = ((flp_ro.realized_pnl as i128) - (pnl_reduction as i128))
+            .try_into()
+            .map_err(|_| error!(FlashBookError::ArithmeticUnderflow))?;
 
         // Position-aware solvency check. If the FLP has open positions
         // across markets, walk remaining_accounts to compute gross
@@ -2422,7 +2805,7 @@ pub mod flash_book {
             // Post-withdraw NAV = (new_total_capital + realized_pnl) must
             // cover gross exposure. realized_pnl is signed; cap at 0 if
             // negative for the conservative direction (don't credit).
-            let post_nav: i128 = (new_total as i128) + (flp_ro.realized_pnl as i128);
+            let post_nav: i128 = (new_total as i128) + (new_realized_pnl as i128);
             require!(
                 post_nav >= 0 && (post_nav as u128) >= gross_exposure,
                 FlashBookError::FlpWithdrawUndercollateralized
@@ -2453,6 +2836,10 @@ pub mod flash_book {
 
         let flp = &mut ctx.accounts.flp_exposure;
         flp.total_capital_quote_lots = new_total;
+        // AUDIT H-1 (2026-07): persist the profit portion drawn from realized_pnl so
+        // NAV drops by exactly the paid amount (previously realized_pnl was never
+        // decremented on withdraw → profit stranded).
+        flp.realized_pnl = new_realized_pnl;
         flp.lp_shares_outstanding = flp
             .lp_shares_outstanding
             .checked_sub(shares_to_burn)
@@ -3498,10 +3885,15 @@ pub mod flash_book {
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
         let now = Clock::get()?.unix_timestamp;
+        // AUDIT M-9: deposit is value-additive (never withdraws) and not market-
+        // scoped, so pass the token's own scope so the market check is a no-op — a
+        // market-scoped session can still top up the owner's collateral.
+        let session_scope = ctx.accounts.session_token.scope_market;
         session::verify(
             &ctx.accounts.session_token,
             ctx.accounts.session_signer.key(),
             now,
+            session_scope,
         )?;
         // The credited trader_state must be the session token's owner.
         require_keys_eq!(
@@ -3926,15 +4318,27 @@ pub mod flash_book {
     /// position's `cum_funding_index_at_entry` to the market's current
     /// index. Idempotent — calling again immediately is a no-op (delta=0).
     ///
-    /// Permissionless: anyone can poke a position to settle. This protects
-    /// the protocol against traders who never close — funding accrues into
-    /// the margin calc forever otherwise. Off-chain keepers will sweep
-    /// stale positions periodically.
+    /// Permissionless: anyone can poke a position to settle. Off-chain keepers
+    /// will sweep stale positions periodically.
     ///
     /// On insufficient collateral to cover positive funding owed, the
     /// position's collateral is drained to zero (it will be liquidated on
     /// the next risk check). We do not fail the tx because that would let
     /// underwater positions block keepers from settling them.
+    ///
+    /// DORMANT (truth-in-code, 2026-07): the funding RATE driving this —
+    /// `market.last_funding_rate_bps_per_sec` — is initialized to 0 and set to
+    /// nonzero NOWHERE in the program (the rate formula exists only in the
+    /// read-only `view_predicted_funding`; no path stores its result). So
+    /// `advance_indices` accrues ZERO funding and this handler charges/credits
+    /// EXACTLY 0 today — it still advances the side-accrual price index and resets
+    /// the position's funding checkpoint, but moves no value. The plumbing
+    /// (formula, `route_funding`, the conservation tests) is complete and correct
+    /// but UNWIRED; turning funding on is a deliberate feature (compute + store the
+    /// rate, with its own conservation proof and devnet cycle), not a bug fix.
+    /// Until then funding is economically inert and invariant #8 holds trivially.
+    /// Kept (not deleted): the fields are account layout and the handler is a live,
+    /// reachable instruction — removing either would be a layout/ABI regression.
     pub fn settle_funding(ctx: Context<SettleFunding>) -> Result<()> {
         let market = &ctx.accounts.market;
         let mkey = market.key();
@@ -4170,11 +4574,15 @@ pub mod flash_book {
                     && ctx.accounts.maker_position_haircut.is_some()),
             FlashBookError::HaircutNotInitialized
         );
+        // AUDIT M-6 (2026-07): a ring settlement (below) means place_taker reserved
+        // this fill's OI volume at match; release it once settled (decrement below).
+        let ring_settled = fc_opt.is_some();
         if let Some(fc_acct) = fc_opt {
             use matcher::fill_commitment as fc;
             let market_bytes = fc_market_bytes;
             let taker_bytes = ctx.accounts.taker_trader_state.load()?.trader.to_bytes();
-            let maker_bytes = ctx.accounts.maker_trader_state.load()?.trader.to_bytes();
+            let maker_pk = ctx.accounts.maker_trader_state.load()?.trader;
+            let maker_bytes = maker_pk.to_bytes();
             let mut fc_data = fc_acct.try_borrow_mut_data()?;
             let idx = fc::buffer_settle_index(&fc_data);
             let pre = fc::fill_preimage(
@@ -4197,6 +4605,28 @@ pub mod flash_book {
                 fc::FillRingError::Empty => error!(FlashBookError::FillRingEmpty),
                 _ => error!(FlashBookError::FillRingCorrupt),
             })?;
+            // AUDIT F-3 v1: release this maker's reduce-in-flight when its reduce-only
+            // fill settles. The matcher set reduce_flag[idx] and added `size_lots` to
+            // the maker position's in-flight; settlement takes the flag and subtracts
+            // the same lots, so the tracker returns to zero exactly as the ring drains.
+            // `maker`/`maker_sub_index` are committed in the preimage above (the settle
+            // would have failed FillNotCommitted otherwise), so the derived position
+            // key is authentic and matches the matcher's reservation. No-op on v0.
+            if fc::buffer_version(&fc_data) == 1 {
+                if let Ok(cap) = fc::buffer_check(&fc_data, &market_bytes) {
+                    if fc::reduce_flag_take(&mut fc_data, cap, idx) {
+                        let market_pk = ctx.accounts.market.key();
+                        let pos_key = derive_maker_position_key(
+                            &market_pk,
+                            &maker_pk,
+                            maker_sub_index,
+                            ctx.program_id,
+                        )
+                        .to_bytes();
+                        fc::inflight_sub(&mut fc_data, cap, &pos_key, size_lots);
+                    }
+                }
+            }
         }
 
         // init_if_needed zero-copy: a freshly-created PositionAccount has a
@@ -4219,6 +4649,12 @@ pub mod flash_book {
         )?;
 
         let market = &mut ctx.accounts.market;
+        // AUDIT M-6: this ring fill has settled ⇒ release the OI volume place_taker
+        // reserved for it (saturating_sub is defensive; unarmed/no-ring path leaves
+        // the counter at 0 so this is a no-op there).
+        if ring_settled {
+            market.unsettled_fill_volume = market.unsettled_fill_volume.saturating_sub(size_lots);
+        }
         let market_key = market.key();
         let funding_index = market.cum_funding_index;
         let current_batch = market.current_batch;
@@ -4835,6 +5271,14 @@ pub mod flash_book {
         let now_slot = Clock::get()?.slot;
         if taker_pnl_delta != 0 {
             let taker_opted = ctx.accounts.taker_position_haircut.is_some();
+            // AUDIT M-3 / F-2 (2026-07): market warmup FLOOR (h_min) for the reserve-
+            // restart guard (0 when haircut disabled ⇒ unused, position_haircut None).
+            let h_min = ctx
+                .accounts
+                .market_haircut
+                .as_ref()
+                .map(|m| m.h_min_slots)
+                .unwrap_or(0);
             // H6: cover any bankrupt-close shortfall from insurance (was a revert).
             let (shortfall, removed) = apply_realized_pnl_delta_v2(
                 taker_pnl_delta,
@@ -4843,6 +5287,7 @@ pub mod flash_book {
                 &mut ctx.accounts.taker_trader_state,
                 ctx.accounts.taker_position_haircut.as_mut(),
                 now_slot,
+                h_min,
             )?;
             if shortfall > 0 {
                 let trader = ctx.accounts.taker_position.load()?.trader;
@@ -4853,6 +5298,12 @@ pub mod flash_book {
         }
         if maker_pnl_delta != 0 {
             let maker_opted = ctx.accounts.maker_position_haircut.is_some();
+            let h_min = ctx
+                .accounts
+                .market_haircut
+                .as_ref()
+                .map(|m| m.h_min_slots)
+                .unwrap_or(0);
             let (shortfall, removed) = apply_realized_pnl_delta_v2(
                 maker_pnl_delta,
                 maker_pos_isolated_for_pnl,
@@ -4860,6 +5311,7 @@ pub mod flash_book {
                 &mut ctx.accounts.maker_trader_state,
                 ctx.accounts.maker_position_haircut.as_mut(),
                 now_slot,
+                h_min,
             )?;
             if shortfall > 0 {
                 let trader = ctx.accounts.maker_position.load()?.trader;
@@ -5158,8 +5610,28 @@ pub mod flash_book {
             );
         }
 
-        // Wave 26b — optional envelope gate. Rejects out-of-cap moves
-        // before mutating the market.
+        // AUDIT H-6 (2026-07): the per-slot move cap is the solvency backstop, but
+        // envelope_config was an OPTIONAL account the authority could omit, making
+        // this an UNCAPPED arbitrary-price write that drives worse-of liquidations.
+        // Require it so even the authority-trusted path cannot exceed the per-slot
+        // cap (the production Pyth/Lazer paths already mandate the envelope).
+        require!(
+            ctx.accounts.envelope_config.is_some(),
+            FlashBookError::EnvelopeNotInitialized
+        );
+        // GOVERNANCE Phase-3 (2026-07): if this market's oracle source is locked, the
+        // direct-authority price write is DISABLED (only Pyth/Lazer accepted).
+        // Un-bypassable: the envelope account is already REQUIRED just above, so the
+        // lock flag can't be dodged by omitting the account.
+        require!(
+            ctx.accounts
+                .envelope_config
+                .as_ref()
+                .map(|e| e.source_locked == 0)
+                .unwrap_or(true),
+            FlashBookError::OracleSourceLocked
+        );
+        // Wave 26b — envelope gate. Rejects out-of-cap moves before mutating market.
         let now_slot = Clock::get()?.slot;
         gate_oracle_update(
             ctx.accounts.envelope_config.as_mut(),
@@ -5256,7 +5728,25 @@ pub mod flash_book {
         // Write conservative aggregates: median price, max confidence.
         let combined_conf = confidences.iter().copied().max().unwrap_or(0);
 
-        // Wave 26b — optional envelope gate on the accepted median.
+        // AUDIT H-6 (2026-07): envelope move-cap mandatory here too (was optional →
+        // uncapped authority write). See update_oracle.
+        require!(
+            ctx.accounts.envelope_config.is_some(),
+            FlashBookError::EnvelopeNotInitialized
+        );
+        // GOVERNANCE Phase-3 (2026-07): if this market's oracle source is locked, the
+        // direct-authority price write is DISABLED (only Pyth/Lazer accepted).
+        // Un-bypassable: the envelope account is already REQUIRED just above, so the
+        // lock flag can't be dodged by omitting the account.
+        require!(
+            ctx.accounts
+                .envelope_config
+                .as_ref()
+                .map(|e| e.source_locked == 0)
+                .unwrap_or(true),
+            FlashBookError::OracleSourceLocked
+        );
+        // Wave 26b — envelope gate on the accepted median.
         let now_slot = Clock::get()?.slot;
         gate_oracle_update(
             ctx.accounts.envelope_config.as_mut(),
@@ -5455,27 +5945,77 @@ pub mod flash_book {
     ///   Active → Paused:   no order intake; existing positions held
     ///   Any → Closed:      terminal sunset; only liquidation + close
     pub fn set_market_status(
-        ctx: Context<UpdateMarketAuthority>,
+        ctx: Context<SetMarketStatus>,
         new_status: u8,
     ) -> Result<()> {
         require!(new_status <= 4, FlashBookError::OutOfRange);
+        let caller = ctx.accounts.authority.key();
+        let market_key = ctx.accounts.market.key();
+        let is_authority = ctx.accounts.market.authority == caller;
+        // GOVERNANCE Phase-1: the guardian is an OPTIONAL separate PDA. It may act
+        // too, but ONLY to restrict (see the asymmetry below). Absent account or a
+        // zero guardian ⇒ disabled. Bound to THIS market by seeds + a field check.
+        let is_guardian = match ctx.accounts.guardian_account.as_ref() {
+            Some(g) => {
+                g.market == market_key
+                    && g.guardian != Pubkey::default()
+                    && g.guardian == caller
+            }
+            None => false,
+        };
+        require!(is_authority || is_guardian, FlashBookError::Unauthorized);
         let market = &mut ctx.accounts.market;
-        require_keys_eq!(
-            market.authority,
-            ctx.accounts.authority.key(),
-            FlashBookError::Unauthorized
-        );
         // Closed is terminal — cannot reopen.
         require!(
             market.status != MarketStatus::Closed as u8,
             FlashBookError::OutOfRange
         );
+        // GOVERNANCE Phase-1 (2026-07): asymmetric control. A guardian-only caller
+        // (not the authority) may move the market only to a STRICTLY MORE restricted
+        // live status — PostOnly/Paused/Closed, monotonically up the ladder
+        // (Active=1 < PostOnly=2 < Paused=3 < Closed=4) from a live state. It can
+        // never loosen (→ Active/Inactive) nor act on a non-live (Inactive) market,
+        // so a compromised guardian can pause/close but never re-open. The authority
+        // retains full control (any transition, subject to the Closed-terminal rule).
+        if is_guardian && !is_authority {
+            let from_live = market.status == MarketStatus::Active as u8
+                || market.status == MarketStatus::PostOnly as u8
+                || market.status == MarketStatus::Paused as u8;
+            let to_restrict = new_status == MarketStatus::PostOnly as u8
+                || new_status == MarketStatus::Paused as u8
+                || new_status == MarketStatus::Closed as u8;
+            require!(
+                from_live && to_restrict && new_status > market.status,
+                FlashBookError::Unauthorized
+            );
+        }
         let prev = market.status;
         market.status = new_status;
         emit!(MarketStatusChangedEvent {
             market: market.key(),
             previous_status: prev,
             new_status,
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-1 (2026-07): set (or clear) the market's emergency guardian
+    /// — a key that may only RESTRICT market status (pause/post-only/close), never
+    /// loosen (see `set_market_status`). Authority-only. `Pubkey::default()` clears
+    /// it (disables the guardian path).
+    pub fn set_guardian(ctx: Context<SetGuardian>, new_guardian: Pubkey) -> Result<()> {
+        // Authority is enforced by the context constraint (`market.authority ==
+        // authority`). The guardian PDA is created on first use (init_if_needed).
+        let market_key = ctx.accounts.market.key();
+        let g = &mut ctx.accounts.guardian_account;
+        let previous_guardian = g.guardian; // Pubkey::default() on first init
+        g.market = market_key;
+        g.guardian = new_guardian;
+        g.bump = ctx.bumps.guardian_account;
+        emit!(MarketGuardianChangedEvent {
+            market: market_key,
+            previous_guardian,
+            new_guardian,
         });
         Ok(())
     }
@@ -5521,6 +6061,12 @@ pub mod flash_book {
 
         // Sanity bounds on the mutable fields.
         require!(new_params.max_leverage >= 1, FlashBookError::OutOfRange);
+        // AUDIT M-5 (2026-07): never let the staleness bound be zeroed post-init —
+        // that would silently disable the staleness gate on every price consumer.
+        require!(
+            new_params.oracle_staleness_max_seconds > 0,
+            FlashBookError::OutOfRange
+        );
         require!(
             new_params.maintenance_margin_ratio_bps <= new_params.initial_margin_ratio_bps,
             FlashBookError::OutOfRange
@@ -5765,6 +6311,155 @@ pub mod flash_book {
             previous_authority: prev,
             new_authority,
         });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-2 (2026-07): step 1 of a SAFE 2-step authority transfer. The
+    /// current authority proposes `new_authority`; it does NOT take effect until that
+    /// key calls `accept_authority_transfer` (proving it is live + correct). Prefer
+    /// this over the 1-step `transfer_market_authority`, which can strand a market at
+    /// a mistyped/dead key. Re-proposing overwrites the pending target.
+    pub fn propose_authority_transfer(
+        ctx: Context<ProposeAuthorityTransfer>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        require!(new_authority != Pubkey::default(), FlashBookError::OutOfRange);
+        let market_key = ctx.accounts.market.key();
+        let p = &mut ctx.accounts.pending;
+        p.market = market_key;
+        p.pending_authority = new_authority;
+        p.bump = ctx.bumps.pending;
+        emit!(AuthorityTransferProposedEvent {
+            market: market_key,
+            new_authority,
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-2: step 2 — the PENDING authority accepts, committing the
+    /// transfer and closing the pending account (rent → the accepter). Signed by the
+    /// new authority (context constraint), so control can never land on a key that
+    /// can't sign.
+    pub fn accept_authority_transfer(ctx: Context<AcceptAuthorityTransfer>) -> Result<()> {
+        let new_authority = ctx.accounts.pending.pending_authority;
+        let market = &mut ctx.accounts.market;
+        let previous_authority = market.authority;
+        market.authority = new_authority;
+        emit!(AuthorityTransferAcceptedEvent {
+            market: market.key(),
+            previous_authority,
+            new_authority,
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-2: the current authority cancels a pending transfer (closes
+    /// the pending account, rent → authority) — e.g. if the target key is no longer
+    /// trusted before it accepts.
+    pub fn cancel_authority_transfer(ctx: Context<CancelAuthorityTransfer>) -> Result<()> {
+        emit!(AuthorityTransferCancelledEvent {
+            market: ctx.accounts.market.key(),
+            cancelled_authority: ctx.accounts.pending.pending_authority,
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-2b (2026-07): propose a TIMELOCKED market-params update.
+    /// Validates `new_params` (same checks as `update_market_params`), then records
+    /// `keccak(new_params)` + `eta = now + PARAM_UPDATE_TIMELOCK_SECONDS`; does NOT
+    /// apply. `execute_param_update` applies it only after the delay. Authority-only.
+    /// Re-proposing overwrites the pending update (and restarts the clock). The
+    /// immediate `update_market_params` is left in place as the un-timelocked path.
+    pub fn propose_param_update(
+        ctx: Context<ProposeParamUpdate>,
+        new_params: MarketParams,
+    ) -> Result<()> {
+        validate_market_params(&ctx.accounts.market.params, &new_params)?;
+        let market_key = ctx.accounts.market.key();
+        let now = Clock::get()?.unix_timestamp;
+        let eta_unix = now
+            .checked_add(constants::PARAM_UPDATE_TIMELOCK_SECONDS)
+            .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+        let params_hash = hash_params(&new_params)?;
+        let p = &mut ctx.accounts.pending;
+        p.market = market_key;
+        p.params_hash = params_hash;
+        p.eta_unix = eta_unix;
+        p.bump = ctx.bumps.pending;
+        emit!(ParamUpdateProposedEvent {
+            market: market_key,
+            eta_unix,
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-2b: execute a matured, hash-matching timelocked params
+    /// update. Requires `now >= eta` AND `keccak(new_params) == stored hash` (so the
+    /// applied params are EXACTLY the pre-announced ones), re-validates defensively,
+    /// applies, and closes the pending account. Authority-only.
+    pub fn execute_param_update(
+        ctx: Context<ExecuteParamUpdate>,
+        new_params: MarketParams,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now >= ctx.accounts.pending.eta_unix,
+            FlashBookError::TimelockNotElapsed
+        );
+        let supplied_hash = hash_params(&new_params)?;
+        require!(
+            supplied_hash == ctx.accounts.pending.params_hash,
+            FlashBookError::OutOfRange
+        );
+        // Defense-in-depth: re-validate against the current market before applying.
+        validate_market_params(&ctx.accounts.market.params, &new_params)?;
+        let market = &mut ctx.accounts.market;
+        market.params = new_params;
+        emit!(MarketParamsUpdatedEvent {
+            market: market.key(),
+        });
+        emit!(ParamUpdateExecutedEvent {
+            market: market.key(),
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-2b: cancel a pending timelocked params update (authority-only,
+    /// closes the pending account, rent → authority).
+    pub fn cancel_param_update(ctx: Context<CancelParamUpdate>) -> Result<()> {
+        emit!(ParamUpdateCancelledEvent {
+            market: ctx.accounts.market.key(),
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-2b follow-up (2026-07): emergency guardian VETO of a pending
+    /// timelocked params update. The guardian (Phase-1 restrict-only key) may cancel a
+    /// pending change during its delay window — the fail-safe brake for a compromised
+    /// authority that proposed a dangerous loosening. Closes the pending account (rent
+    /// → guardian). Pure addition: does not touch the authority `cancel_param_update`
+    /// path; auth is the guardian-account constraint in the context.
+    pub fn guardian_veto_param_update(
+        ctx: Context<GuardianVetoParamUpdate>,
+    ) -> Result<()> {
+        emit!(ParamUpdateCancelledEvent {
+            market: ctx.accounts.market.key(),
+        });
+        Ok(())
+    }
+
+    /// GOVERNANCE Phase-3 (2026-07): ONE-WAY lock of the market's oracle source. Once
+    /// locked, the direct-authority `update_oracle` / `update_oracle_quorum` paths
+    /// revert (`OracleSourceLocked`) — only the Pyth (account-owner + Full) and Lazer
+    /// (Ed25519 precompile + replay nonce) paths remain, removing the compromised-
+    /// authority "walk the mark within the H-6 per-slot cap" vector on production
+    /// markets. Authority-only; there is deliberately NO unlock instruction. The flag
+    /// lives in the market's envelope config (already REQUIRED by those paths), so an
+    /// initialized envelope is a precondition.
+    pub fn lock_oracle_source(ctx: Context<LockOracleSource>) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        ctx.accounts.envelope_config.source_locked = 1;
+        emit!(OracleSourceLockedEvent { market: market_key });
         Ok(())
     }
 
@@ -7098,6 +7793,14 @@ pub mod flash_book {
                     FlashBookError::OracleTooStale
                 );
             }
+            // AUDIT L-5 (2026-07): `price_within_band` returns true when the oracle
+            // anchor is 0, so a zero oracle on the legacy (unarmed) path would leave
+            // the FLP fill price entirely unbounded. Require a real anchor — fail
+            // closed rather than admit an arbitrary sequencer-signed price.
+            require!(
+                ctx.accounts.market.oracle_price_ticks > 0,
+                FlashBookError::OracleTooStale
+            );
             require!(
                 matcher::flp_quoter::price_within_band(
                     ctx.accounts.market.oracle_price_ticks,
@@ -7136,6 +7839,11 @@ pub mod flash_book {
         )?;
 
         let market = &mut ctx.accounts.market;
+        // AUDIT M-6: this FLP fill (pushed to the ring by place_taker) has settled ⇒
+        // release the OI volume place_taker reserved for it. Only on the ring path.
+        if ring_authenticated {
+            market.unsettled_fill_volume = market.unsettled_fill_volume.saturating_sub(size_lots);
+        }
         let market_key = market.key();
         let funding_index = market.cum_funding_index;
         let current_batch = market.current_batch;
@@ -7373,6 +8081,12 @@ pub mod flash_book {
         let now_slot_flp = Clock::get()?.slot;
         if taker_pnl_delta != 0 {
             let taker_opted = ctx.accounts.taker_position_haircut.is_some();
+            let h_min = ctx
+                .accounts
+                .market_haircut
+                .as_ref()
+                .map(|m| m.h_min_slots)
+                .unwrap_or(0);
             // H6: cover any bankrupt-close shortfall from insurance (was a revert).
             let (shortfall, removed) = apply_realized_pnl_delta_v2(
                 taker_pnl_delta,
@@ -7381,6 +8095,7 @@ pub mod flash_book {
                 &mut ctx.accounts.taker_trader_state,
                 ctx.accounts.taker_position_haircut.as_mut(),
                 now_slot_flp,
+                h_min,
             )?;
             if shortfall > 0 {
                 let trader = ctx.accounts.taker_position.load()?.trader;
@@ -7925,6 +8640,36 @@ pub mod flash_book {
             } else {
                 reward_u128 as u64
             };
+
+            // AUDIT M-4 (2026-07): cap the reward at the position's RESIDUAL EQUITY at
+            // the health price. Previously the reward was bounded only by collateral,
+            // so on a bankrupt close (loss > collateral) it was skimmed before the
+            // close settled and INFLATED the shortfall that `cover_bad_debt` draws
+            // from insurance — a second wallet could liquidate an engineered-bankrupt
+            // position and pocket a reward funded by the insurance fund. equity =
+            // backing_collateral + unrealized_pnl(px); a bankrupt position has
+            // equity <= 0 ⇒ zero reward, so a reward can never originate from
+            // insurance. (A liquidator of a bankrupt position is still compensated via
+            // the penalty / insurance-contribution split in the normal close flow.)
+            let px_diff: i128 = (px as i128) - (position.entry_price_ticks as i128);
+            let upnl_at_px: i128 = (position.size_lots as i128)
+                .saturating_mul(px_diff)
+                .saturating_mul(market.params.tick_size as i128)
+                .saturating_mul(if position.side == 0 { 1 } else { -1 });
+            let backing_collateral: i128 = if position.collateral_quote_lots > 0 {
+                position.collateral_quote_lots as i128
+            } else {
+                ctx.accounts.trader_state.load()?.collateral_quote_lots as i128
+            };
+            let residual_equity: i128 = backing_collateral.saturating_add(upnl_at_px);
+            let equity_cap: u64 = if residual_equity <= 0 {
+                0
+            } else if residual_equity > u64::MAX as i128 {
+                u64::MAX
+            } else {
+                residual_equity as u64
+            };
+            let reward_u64 = reward_u64.min(equity_cap);
 
             // ── Phase 2 isolated-margin reward routing ───────────────────
             // For an isolated position, the liquidator reward comes from
@@ -8810,6 +9555,25 @@ pub mod flash_book {
         require!(trigger_price_ticks > 0, FlashBookError::ZeroPrice);
         require!(limit_price_ticks > 0, FlashBookError::ZeroPrice);
 
+        // AUDIT C-1 (2026-07): bind (trader, sub_index) to a live TraderState at
+        // placement so the order this trigger later injects can never commit a fill
+        // against a non-existent TraderState (which would wedge settlement).
+        {
+            let ts = ctx.accounts.trader_state.load()?;
+            verify_trader_state_pda(
+                sub_index,
+                ctx.accounts.trader.key(),
+                ctx.accounts.trader_state.key(),
+                ts.bump,
+                ctx.program_id,
+            )?;
+            require_keys_eq!(
+                ts.trader,
+                ctx.accounts.trader.key(),
+                FlashBookError::WrongTrader
+            );
+        }
+
         let market = &ctx.accounts.market;
         require!(
             size_lots >= market.params.min_base_lots,
@@ -8943,7 +9707,13 @@ pub mod flash_book {
             return Err(error!(FlashBookError::TriggerSlippageExceeded));
         }
 
-        if trigger.flags & state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY != 0 {
+        // F-3 (2026-07): the position size backing a reduce-only injection. Captured
+        // here so the cumulative-capacity clamp below (after the book handle is open)
+        // can bound TOTAL resting reduce-only for this position, not just this order.
+        let reduce_only_position_size: u64 = if trigger.flags
+            & state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY
+            != 0
+        {
             let position = ctx.accounts.position.load()?;
             require!(position.size_lots > 0, FlashBookError::OutOfRange);
             require!(position.side != trigger.side, FlashBookError::OutOfRange);
@@ -8951,7 +9721,10 @@ pub mod flash_book {
                 trigger.size_lots <= position.size_lots,
                 FlashBookError::OutOfRange
             );
-        }
+            position.size_lots
+        } else {
+            0
+        };
 
         let side = trigger.side;
         let size_lots = trigger.size_lots;
@@ -8960,6 +9733,20 @@ pub mod flash_book {
         let trader_pk = trigger.trader;
         let trigger_sub_index = trigger.sub_index;
         let market_key = market.key();
+        // AUDIT M-7 (2026-07): a REDUCE-ONLY trigger's injected close order must not
+        // rest indefinitely — if the position closes between fire and fill, a GTC
+        // order would later OPEN/FLIP a fresh position against the trader's intent.
+        // The v2 CLOB can't enforce reduce-only at settlement (see the constant), so
+        // bound the order's life: the matcher skips expired resting orders, capping
+        // the flip window at REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS. Entry (non-reduce-
+        // only) triggers rest until filled (0 = GTC), where a "flip" is the intent.
+        let is_reduce_only =
+            trigger.flags & state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY != 0;
+        let injected_expiry: u64 = if is_reduce_only {
+            now.saturating_add(constants::REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS)
+        } else {
+            0
+        };
 
         // Inline order injection into the hypertree.
         let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
@@ -8976,18 +9763,74 @@ pub mod flash_book {
         require!(seq < FLP_SEQ_RESERVED_OFFSET, FlashBookError::OutOfRange);
         handle.header.order_seq_counter = seq;
 
+        // AUDIT F-3 (2026-07): cumulative reduce-only capacity clamp. The per-order
+        // check above bounds ONE injection to the position; it does not bound the SUM
+        // of a position's reduce-only orders. Two (or more) reduce-only orders on one
+        // position — two standalone stops, scale-out legs, or a bracket SL leg plus an
+        // unrelated stop — can otherwise be crossed by SEPARATE takers in the
+        // match→settle gap (the matcher reads a stale per-call position snapshot and
+        // caps each to the full size), collectively over-reducing and FLIPPING the
+        // position into an under-margined maker-side open that M-2 (intake-only) never
+        // gates. Fix: before injecting, sum this position's EXISTING reduce-only
+        // resting orders (same trader+sub_index, same close side) and clamp the new
+        // order so total resting reduce-only never exceeds the position. This closes
+        // the multi-order flip at injection time — no hot-matcher change, no new
+        // account, no ER-write; the book scan mirrors the liquidation path's existing
+        // idiom and this handler is a per-fire keeper call, not the matcher walk.
+        // Scale-out is preserved (partial exits summing ≤ position all fit); only
+        // genuine over-capacity is trimmed. (A residual — a position SHRUNK below its
+        // already-resting reduce-only after injection — still needs the match-time
+        // per-position in-flight migration in F3_REDUCE_ONLY_INFLIGHT_SPEC.md; that
+        // path is far narrower: a deliberate self-shrink-then-overhang self-cross.)
+        let effective_size: u64 = if is_reduce_only {
+            let mut existing: u64 = 0;
+            if side == 0 {
+                handle.for_each_bid_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.flags & state_v2::FLAG_REDUCE_ONLY != 0
+                        && o.trader == trader_pk
+                        && o.sub_index == trigger_sub_index
+                    {
+                        existing = existing.saturating_add(o.size_lots);
+                    }
+                    true
+                });
+            } else {
+                handle.for_each_ask_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    if o.flags & state_v2::FLAG_REDUCE_ONLY != 0
+                        && o.trader == trader_pk
+                        && o.sub_index == trigger_sub_index
+                    {
+                        existing = existing.saturating_add(o.size_lots);
+                    }
+                    true
+                });
+            }
+            let remaining_capacity = reduce_only_position_size.saturating_sub(existing);
+            let eff = size_lots.min(remaining_capacity);
+            // If the position's reduce-only capacity is already fully reserved, there
+            // is nothing to inject — fail closed (the trigger stays active and can fire
+            // once existing reduce-only orders fill/expire and free capacity).
+            require!(eff > 0, FlashBookError::OutOfRange);
+            eff
+        } else {
+            size_lots
+        };
+
         let side_is_bid = side == 0;
         let order = state_v2::RestingOrderV2 {
             order_id: state_v2::encode_order_id(limit_ticks, seq, side_is_bid),
             seq,
             price_ticks: limit_ticks,
-            size_lots,
-            expires_at_slot: 0,
+            size_lots: effective_size,
+            // AUDIT M-7: bound reduce-only close orders (0 = GTC for entries).
+            expires_at_slot: injected_expiry,
             trader: trader_pk,
             last_valid_slot: now as u32,
             side,
             order_type: 0,
-            flags: 0,
+            // AUDIT M-7 airtight (2026-07): mark reduce-only so the matcher caps any
+            // cross of this order to the owner's reducible position (never flips).
+            flags: if is_reduce_only { state_v2::FLAG_REDUCE_ONLY } else { 0 },
             // Phase 2f — propagate the trigger's sub_index into the
             // synthetic order so fills route to the right TraderState.
             sub_index: trigger_sub_index,
@@ -9077,6 +9920,23 @@ pub mod flash_book {
     ) -> Result<()> {
         require!(side <= 1, FlashBookError::OutOfRange);
         require!(slice_size_lots > 0, FlashBookError::ZeroSize);
+        // AUDIT C-1 (2026-07): bind (trader, sub_index) to a live TraderState at
+        // placement (each TWAP slice injects under this sub_index).
+        {
+            let ts = ctx.accounts.trader_state.load()?;
+            verify_trader_state_pda(
+                sub_index,
+                ctx.accounts.trader.key(),
+                ctx.accounts.trader_state.key(),
+                ts.bump,
+                ctx.program_id,
+            )?;
+            require_keys_eq!(
+                ts.trader,
+                ctx.accounts.trader.key(),
+                FlashBookError::WrongTrader
+            );
+        }
         require!(total_size_lots >= slice_size_lots, FlashBookError::OutOfRange);
         require!(limit_price_ticks > 0, FlashBookError::ZeroPrice);
         require!(slot_interval > 0, FlashBookError::OutOfRange);
@@ -9314,6 +10174,23 @@ pub mod flash_book {
     ) -> Result<()> {
         require!(side <= 1, FlashBookError::OutOfRange);
         require!(total_size_lots > 0, FlashBookError::ZeroSize);
+        // AUDIT C-1 (2026-07): bind (trader, sub_index) to a live TraderState at
+        // placement (each iceberg child injects under this sub_index).
+        {
+            let ts = ctx.accounts.trader_state.load()?;
+            verify_trader_state_pda(
+                sub_index,
+                ctx.accounts.trader.key(),
+                ctx.accounts.trader_state.key(),
+                ts.bump,
+                ctx.program_id,
+            )?;
+            require_keys_eq!(
+                ts.trader,
+                ctx.accounts.trader.key(),
+                FlashBookError::WrongTrader
+            );
+        }
         require!(displayed_size_lots > 0, FlashBookError::ZeroSize);
         require!(
             displayed_size_lots <= total_size_lots,
@@ -9550,6 +10427,23 @@ pub mod flash_book {
     ) -> Result<()> {
         require!(parent_side <= 1, FlashBookError::OutOfRange);
         require!(tp_trigger_id != sl_trigger_id, FlashBookError::OutOfRange);
+        // AUDIT C-1 (2026-07): bind (trader, sub_index) to a live TraderState at
+        // placement (bracket legs inject under this sub_index).
+        {
+            let ts = ctx.accounts.trader_state.load()?;
+            verify_trader_state_pda(
+                sub_index,
+                ctx.accounts.trader.key(),
+                ctx.accounts.trader_state.key(),
+                ts.bump,
+                ctx.program_id,
+            )?;
+            require_keys_eq!(
+                ts.trader,
+                ctx.accounts.trader.key(),
+                FlashBookError::WrongTrader
+            );
+        }
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(parent_limit_ticks > 0, FlashBookError::ZeroPrice);
         require!(tp_trigger_price_ticks > 0, FlashBookError::ZeroPrice);
@@ -10320,11 +11214,25 @@ pub mod flash_book {
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
         let acct = &mut ctx.accounts.exposure;
-        let shares = if acct.lp_shares_outstanding == 0 || acct.total_capital_quote_lots == 0 {
+        // AUDIT H-2 (2026-07): price shares on NAV (= total_capital + realized_pnl),
+        // NOT total_capital alone. The old code ignored realized_pnl, so shares
+        // tracked only net principal — the pool's trading PnL was invisible to LP
+        // value, and (worse) an underwater pool still redeemed at the inflated
+        // total_capital basis, draining the SHARED vault. Bootstrap 1:1 only when
+        // there are genuinely no shares; if shares exist but NAV <= 0 the pool is
+        // insolvent → reject rather than dilute the depositor (mirrors the singleton
+        // M-3 guard).
+        let nav_i: i128 =
+            (acct.total_capital_quote_lots as i128) + (acct.realized_pnl as i128);
+        require!(
+            !(acct.lp_shares_outstanding > 0 && nav_i <= 0),
+            FlashBookError::FlpPoolInsolvent
+        );
+        let shares = if acct.lp_shares_outstanding == 0 {
             amount_quote_lots
         } else {
             let s = (amount_quote_lots as u128).saturating_mul(acct.lp_shares_outstanding as u128)
-                / (acct.total_capital_quote_lots as u128).max(1);
+                / (nav_i as u128).max(1);
             if s > u64::MAX as u128 { u64::MAX } else { s as u64 }
         };
         require!(shares > 0, FlashBookError::ZeroSize);
@@ -10372,10 +11280,16 @@ pub mod flash_book {
         );
 
         let total_capital = ctx.accounts.exposure.total_capital_quote_lots;
+        let realized_pnl = ctx.accounts.exposure.realized_pnl;
         let total_shares = ctx.accounts.exposure.lp_shares_outstanding;
         require!(total_shares > 0, FlashBookError::OutOfRange);
 
-        let amount_u128 = (shares_to_burn as u128).saturating_mul(total_capital as u128)
+        // AUDIT H-2 (2026-07): redeem against NAV, not total_capital. On a pool loss
+        // (realized_pnl < 0) NAV < total_capital, so this pays LESS — closing the
+        // over-redemption that drained the shared vault. Reject if NAV <= 0.
+        let nav_i: i128 = (total_capital as i128) + (realized_pnl as i128);
+        require!(nav_i > 0, FlashBookError::FlpPoolInsolvent);
+        let amount_u128 = (shares_to_burn as u128).saturating_mul(nav_i as u128)
             / (total_shares as u128);
         let amount = if amount_u128 > u64::MAX as u128 {
             u64::MAX
@@ -10384,16 +11298,32 @@ pub mod flash_book {
         };
         require!(amount > 0, FlashBookError::ZeroSize);
 
+        // AUDIT H-2 (2026-07): the V3 withdraw had NO vault-balance guard (unlike the
+        // singleton). The shared vault's own balance is the authoritative ceiling on
+        // any release.
+        require!(
+            ctx.accounts.quote_vault.amount >= amount,
+            FlashBookError::InsufficientCollateral
+        );
+
+        // AUDIT H-1/H-2 (2026-07): split the payout across both NAV buckets so NAV
+        // drops by exactly `amount`, total_capital never underflows, and realized
+        // profit is redeemable (previously only total_capital was decremented).
+        let cap_reduction = amount.min(total_capital);
+        let pnl_reduction = amount - cap_reduction;
+        let new_total = total_capital - cap_reduction;
+        let new_realized_pnl: i64 = ((realized_pnl as i128) - (pnl_reduction as i128))
+            .try_into()
+            .map_err(|_| error!(FlashBookError::ArithmeticUnderflow))?;
+
         {
             let acct = &mut ctx.accounts.exposure;
             acct.lp_shares_outstanding = acct
                 .lp_shares_outstanding
                 .checked_sub(shares_to_burn)
                 .ok_or(FlashBookError::ArithmeticUnderflow)?;
-            acct.total_capital_quote_lots = acct
-                .total_capital_quote_lots
-                .checked_sub(amount)
-                .ok_or(FlashBookError::ArithmeticUnderflow)?;
+            acct.total_capital_quote_lots = new_total;
+            acct.realized_pnl = new_realized_pnl;
             let pos = &mut ctx.accounts.position;
             pos.shares = pos
                 .shares
@@ -11306,8 +12236,13 @@ pub mod flash_book {
             matured_pos_quote_lots: pos_haircut.matured_pos_quote_lots,
             original_reserve_at_attach: pos_haircut.original_reserve_at_attach,
         };
-        let post = matcher::haircut::apply_release(pre, gain_quote_lots, now_slot)
-            .map_err(map_haircut_error)?;
+        let post = matcher::haircut::apply_release(
+            pre,
+            gain_quote_lots,
+            now_slot,
+            market_haircut.h_min_slots,
+        )
+        .map_err(map_haircut_error)?;
 
         pos_haircut.released_reserve_quote_lots = post.released_reserve_quote_lots;
         pos_haircut.released_attached_at_slot = post.released_attached_at_slot;
@@ -11371,7 +12306,8 @@ pub mod flash_book {
             cfg.bump = ctx.bumps.envelope_config;
             cfg._pad0 = [0; 7];
             cfg._pad1 = [0; 4];
-            cfg._reserved = [0; 32];
+            cfg.source_locked = 0; // Phase-3: markets start with the direct path OPEN
+            cfg._reserved = [0; 31];
             cfg.version = 0;
             // Wave 26b gate-state defaults (zero = no prior observation).
             cfg.last_observed_slot = 0;
@@ -11912,7 +12848,36 @@ fn place_limit_v2_core(
     flags: u8,
     expires_at_slot: u64,
     sub_index: u8,
+    trader_state: &AccountLoader<'_, TraderStateAccount>,
+    program_id: &Pubkey,
+    // AUDIT M-2 (2026-07): OPTIONAL (trader_state, market) position for the intake
+    // initial-margin gate (None ⇒ treated as a full open — strictest).
+    position: Option<&AccountLoader<'_, state::PositionAccount>>,
 ) -> Result<()> {
+    // AUDIT C-1 (2026-07): bind the (trader, sub_index) TraderState at INTAKE. The
+    // matcher commits this exact (trader, sub_index) into the fill-commitment ring,
+    // and `apply_fill` later HARD-loads that TraderState to settle the fill. If the
+    // account does not exist (an attacker rests/takes with a sub_index whose
+    // TraderState was never created), the committed FIFO entry can NEVER settle —
+    // `load()` fails, the strict FIFO cursor can't advance, and the market's entire
+    // settlement pipeline wedges permanently (no skip/reset ix). Close it here:
+    // require the account to EXIST (AccountLoader enforces program-ownership +
+    // discriminator), be the canonical PDA for (trader_pk, sub_index) — the
+    // sub_index==0 vs >0 seed branch is handled by verify_trader_state_pda — and
+    // belong to trader_pk. Every fill the matcher commits is then guaranteed
+    // loadable at settlement, so no order can strand the ring.
+    {
+        let ts = trader_state.load()?;
+        verify_trader_state_pda(
+            sub_index,
+            trader_pk,
+            trader_state.key(),
+            ts.bump,
+            program_id,
+        )?;
+        require_keys_eq!(ts.trader, trader_pk, FlashBookError::WrongTrader);
+    }
+
     // ── Hot-path validation (collapsed). Single Clock::get(), one
     // bounded match per family of inputs. Branch order matches
     // empirical frequency: malformed inputs rare → fast-path through.
@@ -11966,12 +12931,52 @@ fn place_limit_v2_core(
     let oi_cap = p.max_oi_base_lots;
     if oi_cap > 0 {
         let cur = if side == 0 { market.oi_long_lots } else { market.oi_short_lots };
-        if cur.saturating_add(size_lots) > oi_cap {
+        // AUDIT M-6 (2026-07): include matched-but-unsettled fill volume (see
+        // place_taker) so a resting order can't be admitted past the cap during the
+        // match→settlement gap.
+        if cur
+            .saturating_add(market.unsettled_fill_volume)
+            .saturating_add(size_lots)
+            > oi_cap
+        {
             return err!(FlashBookError::OpenInterestCapExceeded);
         }
     }
 
     let market_key = market.key();
+
+    // AUDIT M-2 (2026-07): intake initial-margin gate (see place_taker). A resting
+    // limit that opens the trader's position must be backed; reduces are exempt; an
+    // omitted position is treated as a full open (strictest) so it cannot bypass.
+    {
+        let (pos_info, backing) = if let Some(pos_loader) = position {
+            let pdata = pos_loader.load()?;
+            verify_position_pda(
+                &market_key,
+                &trader_state.key(),
+                pdata.bump,
+                &pos_loader.key(),
+                program_id,
+            )?;
+            let backing = if pdata.collateral_quote_lots > 0 {
+                pdata.collateral_quote_lots
+            } else {
+                trader_state.load()?.collateral_quote_lots
+            };
+            (Some((pdata.side, pdata.size_lots)), backing)
+        } else {
+            (None, trader_state.load()?.collateral_quote_lots)
+        };
+        assert_intake_initial_margin(
+            side,
+            size_lots,
+            limit_ticks,
+            market.params.initial_margin_ratio_bps,
+            market.params.tick_size,
+            backing,
+            pos_info,
+        )?;
+    }
 
     // Borrow the market_book account data + load the handle.
     let mut book_data = market_book.try_borrow_mut_data()?;
@@ -12097,6 +13102,15 @@ fn initialize_market_inner(
     require!(params.base_lot_size > 0, FlashBookError::OutOfRange);
     require!(params.quote_lot_size > 0, FlashBookError::OutOfRange);
     require!(params.max_leverage >= 1, FlashBookError::OutOfRange);
+    // AUDIT M-5 (2026-07): the consumer staleness gate reads
+    // `params.oracle_staleness_max_seconds`, which was NEVER validated at init —
+    // leaving it 0 silently DISABLES the staleness check on every liquidation /
+    // mark / trigger path, so a frozen or stale oracle is consumed as "fresh".
+    // Require a real positive bound.
+    require!(
+        params.oracle_staleness_max_seconds > 0,
+        FlashBookError::OutOfRange
+    );
     require!(initial_oracle_ticks > 0, FlashBookError::ZeroPrice);
 
     let market = &mut ctx.accounts.market;
@@ -12232,6 +13246,22 @@ pub struct PlaceLimitOrderV2<'info> {
         bump,
     )]
     pub market_book: UncheckedAccount<'info>,
+
+    // AUDIT C-1 (2026-07): the (trader, sub_index) TraderState that this order will
+    // be committed under. Required so a fill can never be committed against a
+    // non-existent TraderState (which would permanently wedge settlement). Existence
+    // is enforced by AccountLoader (program-owned + valid discriminator); the PDA
+    // binding to (trader, sub_index) and `trader` ownership are checked in-handler
+    // by `place_limit_v2_core` via `verify_trader_state_pda` (which handles the
+    // sub_index==0-vs->0 seed branch). Read-only.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    // AUDIT M-2 (2026-07): OPTIONAL (trader_state, market) PositionAccount for the
+    // intake initial-margin gate. When present it is PDA-verified in-handler and
+    // earns a reduce-exemption / correct isolated-vs-cross backing; when omitted the
+    // order is treated as a full open (strictest), so omission cannot bypass the
+    // gate. Optional because a first-ever open has no position account yet.
+    pub position: Option<AccountLoader<'info, state::PositionAccount>>,
     // #35 / H1 part B: the optional per-market FillCommitmentAccount is passed
     // via `remaining_accounts` (truly optional — existing callers pass nothing
     // and keep legacy behaviour; an armed market appends the account). Located +
@@ -12267,6 +13297,15 @@ pub struct PlaceLimitOrderV2Session<'info> {
         bump,
     )]
     pub market_book: UncheckedAccount<'info>,
+
+    // AUDIT C-1 (2026-07): TraderState for (session_token.owner, sub_index). See
+    // PlaceLimitOrderV2 — same anti-wedge existence + PDA binding, validated in
+    // `place_limit_v2_core` against the session's owner identity.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    // AUDIT M-2 (2026-07): OPTIONAL position for the intake initial-margin gate.
+    // See PlaceLimitOrderV2.
+    pub position: Option<AccountLoader<'info, state::PositionAccount>>,
 }
 
 /// Create a session key: owner authorizes `session_signer` for a bounded TTL.
@@ -13199,6 +14238,59 @@ pub struct GrowFillCommitment<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// AUDIT F-3 migration (2026-07): upgrade a market's fill-commitment ring from the
+/// v0 layout to v1 (adds reduce-in-flight tracking). Same authority gate + seed
+/// binding as `GrowFillCommitment`; the ring is reallocated in the handler so it is
+/// an `UncheckedAccount`. MUST run on the base layer with the ring UNdelegated.
+#[derive(Accounts)]
+pub struct UpgradeFillCommitmentV1<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; reallocated via `AccountInfo::resize` in the handler,
+    /// which re-asserts program ownership before growing. Bound by the seeds.
+    #[account(
+        mut,
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// AUDIT F-4 (2026-07): permissionless reconcile of `unsettled_fill_volume` when
+/// the fill-commitment ring is drained. No authority gate — the handler can only
+/// reset the counter to its provably-correct value (0 on a drained ring), so any
+/// signer may un-stick a market whose counter drifted via the ER commit seam.
+#[derive(Accounts)]
+pub struct ReconcileUnsettledFillVolume<'info> {
+    /// Permissionless caller (fee payer only). Intentionally unconstrained.
+    pub caller: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; disc + market binding validated in-handler via
+    /// `buffer_check`, and program-ownership re-asserted before the read. Read-only.
+    #[account(
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
+}
+
 /// Grow a market_book PDA in place (`expand_market_book`). Same authority
 /// gate and seed binding as `InitMarketBook`; the book is reallocated in the
 /// handler so it's `UncheckedAccount` (Anchor can't size a variable account).
@@ -14065,6 +15157,28 @@ pub struct UpdateOracle<'info> {
     pub envelope_config: Option<Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>>,
 }
 
+/// GOVERNANCE Phase-3 (2026-07): one-way oracle-source lock (authority-only). The
+/// flag lives in the market's envelope config (the account the direct oracle paths
+/// already require), so no new account leaks into `update_oracle` — the lock is
+/// enforced there and can't be bypassed.
+#[derive(Accounts)]
+pub struct LockOracleSource<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        mut,
+        seeds = [state_v3::MarketEnvelopeConfigAccount::SEED, market.key().as_ref()],
+        bump = envelope_config.bump,
+        constraint = envelope_config.market == market.key() @ FlashBookError::EnvelopePriceCapInvalid,
+    )]
+    pub envelope_config: Box<Account<'info, state_v3::MarketEnvelopeConfigAccount>>,
+}
+
 /// V3 mark-engine: permissionless `settle_mark` accounts. The caller pays
 /// the tx fee; the per-market `mark_settle_min_slots` rate-limit
 /// prevents spam. No PDA mutations beyond the market itself.
@@ -14106,6 +15220,218 @@ pub struct UpdateMarketAuthority<'info> {
         bump = market.bump,
     )]
     pub market: Account<'info, MarketAccount>,
+}
+
+/// GOVERNANCE Phase-1 (2026-07): `set_market_status` context. Auth is checked
+/// in-handler (authority OR guardian, with the restrict-only asymmetry). The
+/// guardian PDA is OPTIONAL — supplied for a guardian-restrict call, omitted for an
+/// authority call. Kept separate from `UpdateMarketAuthority` so the guardian
+/// account doesn't leak into the other authority-only handlers that share it.
+#[derive(Accounts)]
+pub struct SetMarketStatus<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        seeds = [state::MarketGuardianAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub guardian_account: Option<Account<'info, state::MarketGuardianAccount>>,
+}
+
+/// GOVERNANCE Phase-1 (2026-07): `set_guardian` context — authority-only (context
+/// constraint). Creates the per-market guardian PDA on first use.
+#[derive(Accounts)]
+pub struct SetGuardian<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + state::MarketGuardianAccount::LEN,
+        seeds = [state::MarketGuardianAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub guardian_account: Account<'info, state::MarketGuardianAccount>,
+    pub system_program: Program<'info, System>,
+}
+
+/// GOVERNANCE Phase-2 (2026-07): propose a 2-step authority transfer (authority-only
+/// via the context constraint). Creates the pending PDA on first use.
+#[derive(Accounts)]
+pub struct ProposeAuthorityTransfer<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + state::MarketPendingAuthorityAccount::LEN,
+        seeds = [state::MarketPendingAuthorityAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub pending: Account<'info, state::MarketPendingAuthorityAccount>,
+    pub system_program: Program<'info, System>,
+}
+
+/// GOVERNANCE Phase-2: accept a pending transfer. Auth is the `new_authority`
+/// signer matching the stored `pending_authority` (context constraint) — NOT the
+/// current market authority. Closes the pending account (rent → new_authority).
+#[derive(Accounts)]
+pub struct AcceptAuthorityTransfer<'info> {
+    #[account(mut)]
+    pub new_authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        mut,
+        close = new_authority,
+        seeds = [state::MarketPendingAuthorityAccount::SEED, market.key().as_ref()],
+        bump = pending.bump,
+        constraint = pending.market == market.key() @ FlashBookError::WrongMarket,
+        constraint = pending.pending_authority == new_authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub pending: Account<'info, state::MarketPendingAuthorityAccount>,
+}
+
+/// GOVERNANCE Phase-2: cancel a pending transfer (authority-only). Closes the
+/// pending account (rent → authority).
+#[derive(Accounts)]
+pub struct CancelAuthorityTransfer<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        mut,
+        close = authority,
+        seeds = [state::MarketPendingAuthorityAccount::SEED, market.key().as_ref()],
+        bump = pending.bump,
+        constraint = pending.market == market.key() @ FlashBookError::WrongMarket,
+    )]
+    pub pending: Account<'info, state::MarketPendingAuthorityAccount>,
+}
+
+/// GOVERNANCE Phase-2b (2026-07): propose a timelocked params update (authority-only).
+#[derive(Accounts)]
+pub struct ProposeParamUpdate<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + state::PendingParamUpdateAccount::LEN,
+        seeds = [state::PendingParamUpdateAccount::SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub pending: Account<'info, state::PendingParamUpdateAccount>,
+    pub system_program: Program<'info, System>,
+}
+
+/// GOVERNANCE Phase-2b: execute a matured timelocked params update (authority-only).
+#[derive(Accounts)]
+pub struct ExecuteParamUpdate<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        mut,
+        close = authority,
+        seeds = [state::PendingParamUpdateAccount::SEED, market.key().as_ref()],
+        bump = pending.bump,
+        constraint = pending.market == market.key() @ FlashBookError::WrongMarket,
+    )]
+    pub pending: Account<'info, state::PendingParamUpdateAccount>,
+}
+
+/// GOVERNANCE Phase-2b: cancel a pending timelocked params update (authority-only).
+#[derive(Accounts)]
+pub struct CancelParamUpdate<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    #[account(
+        mut,
+        close = authority,
+        seeds = [state::PendingParamUpdateAccount::SEED, market.key().as_ref()],
+        bump = pending.bump,
+        constraint = pending.market == market.key() @ FlashBookError::WrongMarket,
+    )]
+    pub pending: Account<'info, state::PendingParamUpdateAccount>,
+}
+
+/// GOVERNANCE Phase-2b follow-up: guardian VETO of a pending params update. Auth is
+/// the guardian-account constraint (the caller must be THIS market's set guardian).
+/// Pure addition — independent of `CancelParamUpdate`. Closes the pending (rent →
+/// guardian).
+#[derive(Accounts)]
+pub struct GuardianVetoParamUpdate<'info> {
+    #[account(mut)]
+    pub guardian: Signer<'info>,
+    // Boxed: this context holds three accounts incl. the 1152-byte MarketAccount;
+    // unboxed it tips the try_accounts frame to the 4 KB BPF stack limit. Box moves
+    // it off-frame and derefs transparently for the handler.
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+    #[account(
+        seeds = [state::MarketGuardianAccount::SEED, market.key().as_ref()],
+        bump = guardian_account.bump,
+        constraint = guardian_account.market == market.key() @ FlashBookError::WrongMarket,
+        constraint = guardian_account.guardian != Pubkey::default()
+            && guardian_account.guardian == guardian.key() @ FlashBookError::Unauthorized,
+    )]
+    pub guardian_account: Account<'info, state::MarketGuardianAccount>,
+    #[account(
+        mut,
+        close = guardian,
+        seeds = [state::PendingParamUpdateAccount::SEED, market.key().as_ref()],
+        bump = pending.bump,
+        constraint = pending.market == market.key() @ FlashBookError::WrongMarket,
+    )]
+    pub pending: Account<'info, state::PendingParamUpdateAccount>,
 }
 
 /// M-14 decentralization (Phase 1): create/rotate the per-market sequencer
@@ -15305,6 +16631,26 @@ pub struct FillCommitmentGrownEvent {
     pub new_bytes: u32,
 }
 
+/// AUDIT F-3 migration (2026-07): emitted when a market's fill-commitment ring is
+/// upgraded from the v0 layout to v1 (adds reduce-in-flight tracking).
+#[event]
+pub struct FillCommitmentUpgradedV1Event {
+    pub market: Pubkey,
+    pub fill_commitment: Pubkey,
+    pub cap: u32,
+    pub old_bytes: u32,
+    pub new_bytes: u32,
+}
+
+/// AUDIT F-4 (2026-07): emitted when `reconcile_unsettled_fill_volume` resets a
+/// drifted M-6 counter to 0 on a drained ring. `previous_unsettled` records the
+/// drift that was cleared (0 if it was already correct).
+#[event]
+pub struct UnsettledFillVolumeReconciledEvent {
+    pub market: Pubkey,
+    pub previous_unsettled: u64,
+}
+
 #[event]
 pub struct MarketBookExpandedEvent {
     pub market: Pubkey,
@@ -15863,8 +17209,43 @@ pub struct MarketStatusChangedEvent {
     pub new_status: u8,
 }
 
+/// GOVERNANCE Phase-1 (2026-07): emitted when the market's emergency guardian is
+/// set or cleared via `set_guardian`.
+#[event]
+pub struct MarketGuardianChangedEvent {
+    pub market: Pubkey,
+    pub previous_guardian: Pubkey,
+    pub new_guardian: Pubkey,
+}
+
 #[event]
 pub struct MarketParamsUpdatedEvent {
+    pub market: Pubkey,
+}
+
+/// GOVERNANCE Phase-2b (2026-07): timelocked params-update lifecycle events.
+/// `eta_unix` on the proposal is the earliest execute time — off-chain monitors
+/// surface it so LPs/traders can react before the change lands.
+#[event]
+pub struct ParamUpdateProposedEvent {
+    pub market: Pubkey,
+    pub eta_unix: i64,
+}
+
+#[event]
+pub struct ParamUpdateExecutedEvent {
+    pub market: Pubkey,
+}
+
+#[event]
+pub struct ParamUpdateCancelledEvent {
+    pub market: Pubkey,
+}
+
+/// GOVERNANCE Phase-3 (2026-07): emitted when a market's oracle source is locked to
+/// Pyth/Lazer-only (one-way).
+#[event]
+pub struct OracleSourceLockedEvent {
     pub market: Pubkey,
 }
 
@@ -15915,6 +17296,26 @@ pub struct MarketAuthorityTransferredEvent {
     pub market: Pubkey,
     pub previous_authority: Pubkey,
     pub new_authority: Pubkey,
+}
+
+/// GOVERNANCE Phase-2 (2026-07): 2-step authority transfer lifecycle events.
+#[event]
+pub struct AuthorityTransferProposedEvent {
+    pub market: Pubkey,
+    pub new_authority: Pubkey,
+}
+
+#[event]
+pub struct AuthorityTransferAcceptedEvent {
+    pub market: Pubkey,
+    pub previous_authority: Pubkey,
+    pub new_authority: Pubkey,
+}
+
+#[event]
+pub struct AuthorityTransferCancelledEvent {
+    pub market: Pubkey,
+    pub cancelled_authority: Pubkey,
 }
 
 #[event]
@@ -17533,6 +18934,11 @@ fn apply_realized_pnl_delta_v2<'info>(
     trader_state: &mut AccountLoader<'info, TraderStateAccount>,
     position_haircut: Option<&mut Box<Account<'info, state_v3::PositionHaircutStateAccount>>>,
     now_slot: u64,
+    // AUDIT M-3 / F-2 (2026-07): market warmup FLOOR (h_min). apply_release restarts
+    // the warmup when a release lands on a reserve whose old_elapsed >= h_min (i.e.
+    // maturation has begun), stopping a fresh gain from inheriting matured status.
+    // 0 when the haircut engine is disabled (position_haircut is then None, unused).
+    h_min_slots: u64,
 ) -> Result<(u64, u64)> {
     if delta > 0 {
         if let Some(ph) = position_haircut {
@@ -17548,7 +18954,7 @@ fn apply_realized_pnl_delta_v2<'info>(
                 matured_pos_quote_lots: ph.matured_pos_quote_lots,
                 original_reserve_at_attach: ph.original_reserve_at_attach,
             };
-            let post = matcher::haircut::apply_release(pre, gain_u64, now_slot)
+            let post = matcher::haircut::apply_release(pre, gain_u64, now_slot, h_min_slots)
                 .map_err(map_haircut_error)?;
             ph.released_reserve_quote_lots = post.released_reserve_quote_lots;
             ph.released_attached_at_slot = post.released_attached_at_slot;
@@ -17707,6 +19113,84 @@ fn find_fill_outbox<'a, 'info>(
     None
 }
 
+/// GOVERNANCE Phase-2b (2026-07): shared market-params validation — the immutability
+/// of the measurement primitives + the mutable-field bounds. Used by the timelocked
+/// `propose_param_update` / `execute_param_update` so they enforce EXACTLY the same
+/// invariants as the immediate `update_market_params`. NOTE: this mirrors the inline
+/// checks in `update_market_params`; keep the two in sync (a proptest/BanksClient
+/// test pins a representative rejection on both paths).
+/// GOVERNANCE Phase-2b (2026-07): keccak of the borsh-serialized params — the
+/// commitment stored at propose and re-checked at execute so the applied change is
+/// exactly the pre-announced one. (borsh 1.x dropped the inherent `try_to_vec`;
+/// serialize via `AnchorSerialize` into a buffer, as elsewhere in the crate.)
+fn hash_params(p: &MarketParams) -> Result<[u8; 32]> {
+    use anchor_lang::AnchorSerialize;
+    let mut bytes = Vec::new();
+    AnchorSerialize::serialize(p, &mut bytes).map_err(|_| error!(FlashBookError::OutOfRange))?;
+    Ok(solana_keccak_hasher::hashv(&[&bytes]).0)
+}
+
+fn validate_market_params(current: &MarketParams, new: &MarketParams) -> Result<()> {
+    // Immutability of the measurement primitives.
+    require!(new.tick_size == current.tick_size, FlashBookError::OutOfRange);
+    require!(new.base_lot_size == current.base_lot_size, FlashBookError::OutOfRange);
+    require!(new.quote_lot_size == current.quote_lot_size, FlashBookError::OutOfRange);
+    require!(new.min_base_lots == current.min_base_lots, FlashBookError::OutOfRange);
+    // Mutable-field bounds.
+    require!(new.max_leverage >= 1, FlashBookError::OutOfRange);
+    require!(new.oracle_staleness_max_seconds > 0, FlashBookError::OutOfRange);
+    require!(
+        new.maintenance_margin_ratio_bps <= new.initial_margin_ratio_bps,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        new.flp_max_growth_per_batch_bps <= constants::BPS_DENOM,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        new.oracle_band_bps <= constants::MAX_ORACLE_BAND_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(new.maintenance_margin_ratio_bps < 5_000, FlashBookError::OutOfRange);
+    require!(new.initial_margin_ratio_bps < 5_000, FlashBookError::OutOfRange);
+    require!(
+        new.maintenance_margin_ratio_bps
+            .saturating_add(new.concentration_extra_mmr_bps)
+            < 5_000,
+        FlashBookError::OutOfRange
+    );
+    require!(new.taker_fee_bps <= constants::MAX_FEE_TIER_BPS, FlashBookError::OutOfRange);
+    require!(
+        new.maker_rebate_bps.unsigned_abs() <= constants::MAX_FEE_TIER_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        new.toxicity_tax_max_bps <= constants::MAX_FEE_TIER_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        new.jit_bonus_rebate_bps <= constants::MAX_FEE_TIER_BPS,
+        FlashBookError::OutOfRange
+    );
+    require!(new.liq_penalty_bps <= 5_000, FlashBookError::OutOfRange);
+    require!(
+        new.liquidator_reward_bps <= new.liq_penalty_bps,
+        FlashBookError::OutOfRange
+    );
+    require!(
+        new.funding_rate_max_bps_per_sec <= constants::BPS_DENOM,
+        FlashBookError::OutOfRange
+    );
+    require!(new.funding_per_period_max_bps <= 5_000, FlashBookError::OutOfRange);
+    require!(
+        new.referrer_share_bps <= constants::BPS_DENOM
+            && new.builder_share_bps <= constants::BPS_DENOM
+            && new.creator_share_bps <= constants::BPS_DENOM,
+        FlashBookError::OutOfRange
+    );
+    Ok(())
+}
+
 fn verify_trader_state_pda(
     sub_index: u8,
     trader: Pubkey,
@@ -17755,6 +19239,148 @@ fn verify_position_pda(
     .map_err(|_| error!(FlashBookError::OutOfRange))?;
     require_keys_eq!(expected, *actual, FlashBookError::WrongTrader);
     Ok(())
+}
+
+/// AUDIT M-7 airtight (2026-07): derive the canonical PositionAccount PDA for a
+/// resting maker's `(trader, sub_index)` on `market`, so the matcher can match a
+/// crossed REDUCE-ONLY maker order to its position (supplied read-only via
+/// `remaining_accounts`) and cap the fill to the reducible size. Two derivations
+/// (trader_state → position); invoked ONLY for reduce-only makers (rare on a normal
+/// book), so the `find_program_address` cost is confined to that subset.
+fn derive_maker_position_key(
+    market_key: &Pubkey,
+    trader: &Pubkey,
+    sub_index: u8,
+    program_id: &Pubkey,
+) -> Pubkey {
+    let trader_state = if sub_index == 0 {
+        Pubkey::find_program_address(&[TraderStateAccount::SEED, trader.as_ref()], program_id).0
+    } else {
+        Pubkey::find_program_address(
+            &[TraderStateAccount::SEED, trader.as_ref(), &[sub_index]],
+            program_id,
+        )
+        .0
+    };
+    Pubkey::find_program_address(
+        &[
+            state::PositionAccount::SEED,
+            market_key.as_ref(),
+            trader_state.as_ref(),
+        ],
+        program_id,
+    )
+    .0
+}
+
+/// AUDIT M-2 (2026-07): intake INITIAL-MARGIN gate. A position opened with no (or
+/// insufficient) collateral is a FREE OPTION — nothing to lose to liquidation (bad
+/// debt is socialised to insurance), unbounded upside. Neither order intake nor
+/// settlement previously enforced initial margin on opens (settlement cannot reject
+/// a committed fill without wedging the FIFO ring). This gate rejects, at intake, an
+/// order whose RESULTING position on THIS market would exceed the trader's backing
+/// collateral at the market's initial-margin ratio.
+///
+/// Sound-by-construction — never rejects a legitimate order:
+///   • Pure REDUCE (opposite side, size ≤ current) is EXEMPT — a reduce only lowers
+///     margin, so a depleted / underwater trader can always close.
+///   • `pos == None` (no position passed — incl. a first-ever open, or an omitted
+///     account) ⇒ treated as a pure open of the FULL order size ⇒ the STRICTEST
+///     check ⇒ omitting the account can never BYPASS the gate; only a genuine,
+///     PDA-verified opposite-side position earns the reduce exemption.
+///   • `im_bps == 0` ⇒ the market opted out of initial margin ⇒ no gate.
+///
+/// Residuals (documented, not fund-loss): this is a per-market check — a cross
+/// trader over-leveraged ACROSS markets is caught by liquidation, not here; and a
+/// resting limit that opens as a MAKER is gated at placement (reservation), because
+/// the maker-side open at settlement cannot be rejected. `backing_collateral` is the
+/// caller-selected pool: the position's own collateral for an ISOLATED position,
+/// else the cross pool (`trader_state`), matching where margin actually lives.
+fn assert_intake_initial_margin(
+    side: u8,
+    order_size_lots: u64,
+    limit_ticks: u64,
+    im_bps: u32,
+    tick_size: u64,
+    backing_collateral: u64,
+    pos: Option<(u8, u64)>,
+) -> Result<()> {
+    if im_bps == 0 {
+        return Ok(());
+    }
+    let resulting_size = match pos {
+        None => order_size_lots,
+        Some((pos_side, pos_size)) => {
+            if pos_side == side {
+                pos_size.saturating_add(order_size_lots) // add to same side
+            } else if order_size_lots <= pos_size {
+                return Ok(()); // pure reduce — always improves margin
+            } else {
+                order_size_lots - pos_size // flip: net new exposure on `side`
+            }
+        }
+    };
+    let notional = (resulting_size as u128)
+        .saturating_mul(limit_ticks as u128)
+        .saturating_mul(tick_size as u128);
+    let required_im =
+        notional.saturating_mul(im_bps as u128) / (crate::constants::BPS_DENOM as u128);
+    require!(
+        (backing_collateral as u128) >= required_im,
+        FlashBookError::InsufficientCollateral
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod m2_intake_margin_tests {
+    use super::assert_intake_initial_margin;
+
+    // im_bps = 1000 (10%), tick_size = 1 ⇒ IM(size,price) = size*price*0.10.
+    const IM: u32 = 1000;
+    const TS: u64 = 1;
+
+    #[test]
+    fn zero_collateral_open_rejected() {
+        // First open (no position), 100 lots @ 10 ⇒ notional 1000, IM = 100.
+        assert!(assert_intake_initial_margin(0, 100, 10, IM, TS, 0, None).is_err());
+        assert!(assert_intake_initial_margin(0, 100, 10, IM, TS, 99, None).is_err());
+        assert!(assert_intake_initial_margin(0, 100, 10, IM, TS, 100, None).is_ok());
+    }
+
+    #[test]
+    fn pure_reduce_exempt_even_with_zero_collateral() {
+        // Long 100, SELL 100 (opposite, size <= pos) ⇒ reduce ⇒ exempt.
+        assert!(assert_intake_initial_margin(1, 100, 10, IM, TS, 0, Some((0, 100))).is_ok());
+        // Partial reduce (SELL 40 vs long 100) ⇒ exempt.
+        assert!(assert_intake_initial_margin(1, 40, 10, IM, TS, 0, Some((0, 100))).is_ok());
+    }
+
+    #[test]
+    fn add_same_side_checks_full_resulting_position() {
+        // Long 100, BUY 100 ⇒ resulting 200 @ 10 ⇒ IM = 200.
+        assert!(assert_intake_initial_margin(0, 100, 10, IM, TS, 199, Some((0, 100))).is_err());
+        assert!(assert_intake_initial_margin(0, 100, 10, IM, TS, 200, Some((0, 100))).is_ok());
+    }
+
+    #[test]
+    fn flip_checks_net_new_exposure() {
+        // Long 100, SELL 150 (opposite, size > pos) ⇒ flip to short 50 @ 10 ⇒ IM = 50.
+        assert!(assert_intake_initial_margin(1, 150, 10, IM, TS, 49, Some((0, 100))).is_err());
+        assert!(assert_intake_initial_margin(1, 150, 10, IM, TS, 50, Some((0, 100))).is_ok());
+    }
+
+    #[test]
+    fn omitted_position_is_strictest_no_bypass() {
+        // Omitting the position (None) forces a full-open check even if the trader
+        // actually holds a reducible position ⇒ cannot be used to skip margin.
+        assert!(assert_intake_initial_margin(1, 100, 10, IM, TS, 0, None).is_err());
+    }
+
+    #[test]
+    fn zero_im_market_opts_out() {
+        assert!(assert_intake_initial_margin(0, 1_000_000, 1_000_000, 0, TS, 0, None).is_ok());
+    }
 }
 
 /// H-7 (audit 2026-06): assert `actual` IS the canonical position PDA for
@@ -18187,6 +19813,10 @@ pub struct PlaceTriggerOrderV3<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
 
+    // AUDIT C-1 (2026-07): (trader, sub_index) TraderState — existence enforced by
+    // AccountLoader; PDA + ownership validated in-handler via verify_trader_state_pda.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
     pub market: Account<'info, MarketAccount>,
 
     #[account(
@@ -18483,6 +20113,9 @@ pub struct PlaceTwapOrderV3<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
 
+    // AUDIT C-1 (2026-07): (trader, sub_index) TraderState — see PlaceTriggerOrderV3.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
     pub market: Account<'info, MarketAccount>,
 
     #[account(
@@ -18553,6 +20186,9 @@ pub struct CancelTwapOrderV3<'info> {
 pub struct PlaceIcebergOrderV3<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
+
+    // AUDIT C-1 (2026-07): (trader, sub_index) TraderState — see PlaceTriggerOrderV3.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     pub market: Account<'info, MarketAccount>,
 
@@ -18641,7 +20277,13 @@ pub struct PlaceBracketOrderV3<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
 
-    pub market: Account<'info, MarketAccount>,
+    // AUDIT C-1 (2026-07): (trader, sub_index) TraderState — see PlaceTriggerOrderV3.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    // Boxed (2026-07): moves the 1152-byte MarketAccount off the try_accounts stack
+    // frame — the C-1 trader_state addition otherwise tips this context's frame past
+    // the 4 KB BPF limit. Box<Account<..>> derefs transparently for handler access.
+    pub market: Box<Account<'info, MarketAccount>>,
 
     /// CHECK: market_book PDA — parent injected inline.
     #[account(
@@ -18860,6 +20502,26 @@ pub struct VaultPlaceOrderV3<'info> {
         bump,
     )]
     pub market_book: UncheckedAccount<'info>,
+
+    /// AUDIT C-1 (2026-07): the vault's own TraderState. `vault_place_order_v3`
+    /// rests a `RestingOrderV2` under `(vault_pk, 0)`; when a taker crosses it the
+    /// matcher commits that maker identity into the strict fill-commitment FIFO,
+    /// and `apply_fill` HARD-loads this TraderState (`verify_trader_state_pda`) to
+    /// settle. If it did not exist, the committed fill could never settle, the FIFO
+    /// cursor could never advance, and the market's settlement pipeline would wedge
+    /// PERMANENTLY (the C-1 class the other place paths already gate — this one was
+    /// missed). Requiring the canonical, program-owned PDA here (sub_index 0 ⇒ the
+    /// single-seed derivation, matching `vault_open_trader_state_v3`) makes a vault
+    /// order structurally unable to rest against a non-existent TraderState. Existence
+    /// is enforced by `AccountLoader` (program-owned + valid discriminator); the PDA
+    /// binding to `vault.key()` is enforced by the seed constraint. Read-only. A
+    /// legitimate vault always creates this via `vault_open_trader_state_v3` before
+    /// its first order, so this never false-rejects a valid flow.
+    #[account(
+        seeds = [TraderStateAccount::SEED, vault.key().as_ref()],
+        bump,
+    )]
+    pub vault_trader_state: AccountLoader<'info, TraderStateAccount>,
 }
 
 #[derive(Accounts)]

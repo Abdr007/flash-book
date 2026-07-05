@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Live-ER (MagicBlock) Tier-2 acceptance suite — the CPI round-trip solana-program-test can't cover.",
   "scripts": {
-    "acceptance": "node er_acceptance.mjs"
+    "acceptance": "node er_acceptance.mjs",
+    "audit-fixes": "node audit_fixes_acceptance.mjs"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",

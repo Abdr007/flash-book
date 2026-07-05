@@ -118,6 +118,14 @@ const _: () = assert!(std::mem::size_of::<MarketBookHeader>() == 256);
 ///
 /// Implements `Ord` by `order_id` (which embeds price + seq + side). The
 /// RBT uses this for sort.
+///
+/// AUDIT M-7 airtight (2026-07): `RestingOrderV2.flags` bit1 = REDUCE_ONLY. Set ONLY
+/// by the program when a reduce-only trigger/bracket leg injects its close order
+/// (never settable on a user place path — those reject bit1 at intake). The matcher
+/// caps a crossed reduce-only maker's fill to the maker's reducible position size so
+/// it can only close, never open/flip. See `matcher::reduce_only::check_reduce_only`.
+pub const FLAG_REDUCE_ONLY: u8 = 0b0000_0010;
+
 #[zero_copy]
 pub struct RestingOrderV2 {
     /// `(price << 16) | (seq mod 2^16)`. For bids, the resulting u64
@@ -556,6 +564,17 @@ impl<'a> MarketBookHandle<'a> {
                 crate::errors::FlashBookError::OutOfRange
             );
         }
+        // AUDIT M-1 (2026-07): the bump allocator returns `num_bytes_allocated` as
+        // the next fresh node offset. If a malicious-/buggy-ER commit leaves it
+        // non-node-aligned or past the slab, the next `alloc_node` yields a
+        // misaligned slice (bytemuck alignment panic → placement brick) or an
+        // in-bounds offset that overlaps a live node (silent corruption). Validate
+        // it here on the per-op hot gate so a tampered bump pointer fails closed.
+        require!(
+            header.num_bytes_allocated as usize % NODE_TOTAL_BYTES == 0
+                && header.num_bytes_allocated as usize <= slab_len,
+            crate::errors::FlashBookError::OutOfRange
+        );
         // NOTE: internal RBT node-links (left/right/parent) are NOT walked here — that
         // would add O(capacity) CU to EVERY book op on the hot path. Instead they are
         // validated ONCE, when a book re-enters L1 via `process_undelegation` (the
@@ -609,6 +628,15 @@ impl<'a> MarketBookHandle<'a> {
                     crate::errors::FlashBookError::OutOfRange
                 );
             }
+            // AUDIT L-1 (2026-07): `RBNode.color` (byte offset 12) is a `#[repr(u8)]`
+            // enum with only 0=Black / 1=Red valid; reading any other discriminant as
+            // the enum is UB. `unsafe impl Pod` bypasses bytemuck's variant check, so
+            // validate the byte here. Free/unused slots are zeroed (0=Black), so a
+            // well-formed book always passes; only a tampered color byte fails closed.
+            require!(
+                slab[base + 12] <= 1,
+                crate::errors::FlashBookError::OutOfRange
+            );
         }
 
         // AUDIT HIGH-5 (2026-07): the per-link bounds check above stops an OOB
@@ -671,6 +699,66 @@ impl<'a> MarketBookHandle<'a> {
                 }
             }
         }
+
+        // AUDIT H-3 (2026-07): the cached best-bid/best-ask pointers are NOT roots
+        // of the DFS above, so a commit can plant a `best` that points at a detached
+        // node (unreachable from any root) whose self-cycle the DFS never inspects;
+        // the first `for_each_best_first` walk then starts there and spins forever
+        // (unbounded successor loop) → permanent brick. Require each cached best be
+        // NIL or a node the tree DFS actually reached (∈ visited).
+        for best in [header.bids_best_index, header.asks_best_index] {
+            if best != NIL {
+                let off = best as usize;
+                require!(
+                    off % NODE_TOTAL_BYTES == 0 && off < slab_len,
+                    crate::errors::FlashBookError::OutOfRange
+                );
+                require!(
+                    visited[off / NODE_TOTAL_BYTES],
+                    crate::errors::FlashBookError::OutOfRange
+                );
+            }
+        }
+
+        // AUDIT H-4 (2026-07): the free list is not walked by the tree DFS. A commit
+        // can plant a free list that (a) cycles or (b) aliases a live tree node, so a
+        // later `alloc_node` pops a slot that is still linked in a tree → one physical
+        // slot in two logical positions (use-after-free / type confusion / eventual
+        // brick). Walk the free list from its head with the SHARED `visited` bitmap:
+        // any slot already marked (tree-live, or a free-list revisit = cycle) fails
+        // closed, and the walk is step-bounded. This proves the tree-live and free
+        // sets are disjoint and the free list is acyclic. `FreeListNode.next_index`
+        // sits at byte offset 0 (same slot the DFS read as `left`).
+        {
+            let mut free = header.free_list_head_index;
+            let mut steps = 0usize;
+            while free != NIL {
+                steps += 1;
+                require!(steps <= node_count, crate::errors::FlashBookError::OutOfRange);
+                let off = free as usize;
+                require!(
+                    off % NODE_TOTAL_BYTES == 0
+                        && off
+                            .checked_add(NODE_TOTAL_BYTES)
+                            .is_some_and(|end| end <= slab_len),
+                    crate::errors::FlashBookError::OutOfRange
+                );
+                let ord = off / NODE_TOTAL_BYTES;
+                require!(!visited[ord], crate::errors::FlashBookError::OutOfRange);
+                visited[ord] = true;
+                free = read_link(off, 0);
+            }
+        }
+
+        // AUDIT M-1 (2026-07): fail closed at undelegation on a corrupt bump pointer
+        // too (from_account_data validates it on every subsequent op, but reverting
+        // the undelegate keeps the corrupt book off L1 in the first place).
+        require!(
+            header.num_bytes_allocated as usize % NODE_TOTAL_BYTES == 0
+                && header.num_bytes_allocated as usize <= slab_len,
+            crate::errors::FlashBookError::OutOfRange
+        );
+
         Ok(())
     }
 
@@ -1161,6 +1249,79 @@ mod tests {
         assert_eq!(handle.header.asks_root_index, NIL);
         assert_eq!(handle.header.bids_best_index, NIL);
         assert_eq!(handle.header.asks_best_index, NIL);
+    }
+
+    // AUDIT F-3 (2026-07): validates the cumulative reduce-only capacity scan +
+    // clamp used by `execute_trigger_order_v3` — the exact `for_each_ask_best_first`
+    // predicate (reduce-only flag + same trader + same sub_index) and the
+    // `min(req, position − Σexisting)` math — on a REAL MarketBookHandle. Proves the
+    // scan sums only THIS position's resting reduce-only orders (not other traders,
+    // other sub_indices, or non-reduce-only orders), preserves scale-out (partials
+    // summing ≤ position all fit), and trims genuine over-capacity to 0 (the flip
+    // that F-3 exploits can never be set up).
+    fn insert_ro_ask(
+        handle: &mut MarketBookHandle,
+        seq: u64,
+        trader: Pubkey,
+        sub: u8,
+        size: u64,
+        reduce_only: bool,
+    ) {
+        let mut o = make_order_for(100_000 + seq * 1_000, seq, false /*ask*/, trader);
+        o.size_lots = size;
+        o.sub_index = sub;
+        o.flags = if reduce_only { FLAG_REDUCE_ONLY } else { 0 };
+        handle.insert_ask(o).unwrap();
+    }
+
+    fn scan_ro(handle: &MarketBookHandle, trader: Pubkey, sub: u8) -> u64 {
+        let mut existing = 0u64;
+        handle.for_each_ask_best_first(|_i, o: &RestingOrderV2| {
+            if o.flags & FLAG_REDUCE_ONLY != 0 && o.trader == trader && o.sub_index == sub {
+                existing = existing.saturating_add(o.size_lots);
+            }
+            true
+        });
+        existing
+    }
+
+    fn clamp(position: u64, existing: u64, requested: u64) -> u64 {
+        requested.min(position.saturating_sub(existing))
+    }
+
+    #[test]
+    fn f3_reduce_only_capacity_clamp_scan() {
+        let mut data = make_book();
+        let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+        let trader = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let position = 100u64;
+
+        // Empty book ⇒ full capacity.
+        assert_eq!(scan_ro(&handle, trader, 0), 0);
+        assert_eq!(clamp(position, 0, 100), 100);
+
+        // Scale-out is preserved: first 50-lot exit fits, second 50 still fits (Σ=100).
+        insert_ro_ask(&mut handle, 1, trader, 0, 50, true);
+        assert_eq!(scan_ro(&handle, trader, 0), 50);
+        assert_eq!(clamp(position, 50, 50), 50, "scale-out second partial exit fits");
+
+        insert_ro_ask(&mut handle, 2, trader, 0, 50, true);
+        assert_eq!(scan_ro(&handle, trader, 0), 100);
+        // Over-capacity: a THIRD reduce-only exit is trimmed to 0 — this is exactly
+        // what stops two orders from summing past the position and flipping it.
+        assert_eq!(clamp(position, 100, 50), 0, "F-3: over-capacity reduce-only trimmed to 0");
+
+        // Must NOT count: a different trader, a different sub_index, or a
+        // non-reduce-only order — otherwise the clamp would wrongly block legit orders.
+        insert_ro_ask(&mut handle, 3, other, 0, 100, true); // other trader
+        insert_ro_ask(&mut handle, 4, trader, 1, 100, true); // other position (sub 1)
+        insert_ro_ask(&mut handle, 5, trader, 0, 100, false); // NOT reduce-only
+        assert_eq!(
+            scan_ro(&handle, trader, 0),
+            100,
+            "only this (trader, sub, reduce-only) position's orders are summed"
+        );
     }
 
     #[test]
