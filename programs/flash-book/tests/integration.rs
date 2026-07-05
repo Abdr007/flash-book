@@ -3791,6 +3791,159 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
     );
 }
 
+/// The Pyth pull path must reject a replayed (older or equal) publish_time: the
+/// staleness window only bounds how OLD an accepted price is and the envelope
+/// only bounds the per-slot move, so without a monotonicity guard a caller could
+/// re-post an older in-window price to rewind the oracle to a worse-of value.
+#[tokio::test]
+async fn update_oracle_from_pyth_rejects_replayed_publish_time() {
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let envelope_config = setup_envelope(&mut ctx, &payer, market_pda).await;
+
+    let feed_id = [7u8; 32];
+    let (oracle_config, _) = pda(&[
+        flash_book::state_v3::MarketOracleConfigAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketOracleConfig {
+                    pyth_price_feed_id: feed_id,
+                    max_staleness_seconds: 3600,
+                    max_confidence_bps: 100,
+                    tick_decimals: 0,
+                },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(oracle_config, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Build a Pyth PriceUpdateV2 (Full) for our feed at 100_000 ticks
+    // (price 100_000, exponent 0, tick_decimals 0) with a given publish_time.
+    let build = |publish_time: i64| -> Vec<u8> {
+        let mut d = vec![0u8; 101];
+        d[..8].copy_from_slice(&flash_book::pyth_oracle::PRICE_UPDATE_V2_DISCRIMINATOR);
+        d[40] = 1; // verification level = Full
+        d[41..73].copy_from_slice(&feed_id);
+        d[73..81].copy_from_slice(&100_000i64.to_le_bytes());
+        d[81..89].copy_from_slice(&0u64.to_le_bytes());
+        d[89..93].copy_from_slice(&0i32.to_le_bytes());
+        d[93..101].copy_from_slice(&publish_time.to_le_bytes());
+        d
+    };
+    let price_update = Keypair::new().pubkey();
+    let put = |ctx: &mut solana_program_test::ProgramTestContext, publish_time: i64| {
+        ctx.set_account(
+            &price_update,
+            &SolAccount {
+                lamports: 1_000_000,
+                data: build(publish_time),
+                owner: flash_book::pyth_oracle::PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+    };
+    let pyth_ix = || {
+        build_ix(
+            flash_book::instruction::UpdateOracleFromPyth {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new_readonly(oracle_config, false),
+                AccountMeta::new_readonly(price_update, false),
+                AccountMeta::new(envelope_config, false),
+            ],
+        )
+    };
+
+    let now = ctx
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    // setup_market stamps oracle_published_at = now and program-test's clock does
+    // not advance unix on warp, so rewind the stored publish time into the past to
+    // leave room for a strictly-newer first push.
+    {
+        let acc = ctx
+            .banks_client
+            .get_account(market_pda)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut m = MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+        m.oracle_published_at_unix_seconds = (now - 100) as u64;
+        let mut data = Vec::new();
+        m.try_serialize(&mut data).unwrap();
+        data.resize(acc.data.len(), 0);
+        ctx.set_account(
+            &market_pda,
+            &SolAccount {
+                lamports: acc.lamports,
+                data,
+                owner: acc.owner,
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            }
+            .into(),
+        );
+    }
+
+    // First push (publish_time = now) is accepted and stamps oracle_published_at.
+    put(&mut ctx, now);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[pyth_ix()],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .expect("first fresh Pyth push accepted");
+
+    // Replay an OLDER (still in-window) publish_time → OraclePythReplay (2318).
+    // Advance the slot so the replay tx (byte-identical to the first) is not
+    // deduplicated by a shared blockhash.
+    let s = ctx.banks_client.get_sysvar::<Clock>().await.unwrap().slot;
+    ctx.warp_to_slot(s + 1).unwrap();
+    put(&mut ctx, now - 5);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[pyth_ix()],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8318)"),
+        "a replayed/older Pyth publish_time must be rejected with OraclePythReplay, got: {dbg}"
+    );
+}
+
 #[tokio::test]
 async fn delegated_book_order_requires_armed() {
     let pt = make_program_test();
