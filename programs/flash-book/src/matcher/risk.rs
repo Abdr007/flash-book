@@ -162,103 +162,9 @@ pub fn oi_scaled_mmr_extra_bps(
     (extra.min(max_extra_bps as u128) as u32).min(max_extra_bps)
 }
 
-/// Compose the full effective MMR for a position: stress-lattice tier
-/// + concentration extra (existing) + OI-scaled extra (Wave 28a).
-///
-/// `tiers` is the Hyperliquid-style tier table; pass `&[]` to skip.
-/// `oi_slope` + `oi_max` are the Wave 28a knobs; pass `(0, 0)` to skip.
-pub fn effective_mmr_bps_full(
-    base_mmr_bps: u32,
-    tiers: &[(u64, u32)],
-    position_notional_quote_lots: u128,
-    side_oi_lots: u64,
-    oi_slope_bps_per_million_lots: u32,
-    oi_max_extra_bps: u32,
-) -> u32 {
-    let tier_mmr = tiered_mmr_bps(base_mmr_bps, tiers, position_notional_quote_lots);
-    let oi_extra = oi_scaled_mmr_extra_bps(side_oi_lots, oi_slope_bps_per_million_lots, oi_max_extra_bps);
-    tier_mmr.saturating_add(oi_extra)
-}
-
-/// Hyperliquid-style multi-tier MMR. Each tier is a
-/// `(min_notional_quote_lots, mmr_bps)` pair sorted ascending by notional.
-/// A position's effective MMR = `mmr_bps` of the largest tier whose
-/// `min_notional` is ≤ the position's notional, OR `base_mmr_bps` if no
-/// tier matches (notional below the first tier's threshold).
-///
-/// Example tier table (typical HL BTC market):
-///   [(0,        100),    // tier 1: ≤  ~$1M  → 1.0% MMR
-///    (1_000_000, 200),   // tier 2:  ~$5M    → 2.0% MMR
-///    (5_000_000, 300),   // tier 3: ~$25M    → 3.0% MMR
-///    (25_000_000, 500)]  // tier 4: > $25M   → 5.0% MMR
-///
-/// `tiers` MUST be sorted ascending by `min_notional`; the caller is
-/// responsible for sort order.
-///
-/// NOTE (AUDIT M-1, 2026-07): the on-chain leverage-tier ladder
-/// (`MarketLeverageTiersAccount` + `init/update_market_leverage_tiers`) was
-/// REMOVED — it was governance-configurable but never consulted by the margin
-/// engine (false assurance). This pure helper is retained as an unused,
-/// unit-tested library function; the live per-position MMR is
-/// `MarketSnapshot::effective_mmr_bps` (base + concentration step).
-///
-/// Pure function — no Solana types beyond u64/u32. Unit-tested directly.
-pub fn tiered_mmr_bps(
-    base_mmr_bps: u32,
-    tiers: &[(u64, u32)],
-    position_notional_quote_lots: u128,
-) -> u32 {
-    let mut effective = base_mmr_bps;
-    for (min_notional, tier_mmr) in tiers {
-        if position_notional_quote_lots >= *min_notional as u128 {
-            effective = *tier_mmr;
-        } else {
-            break;
-        }
-    }
-    effective
-}
-
 #[cfg(test)]
-mod tier_tests {
+mod oi_mmr_tests {
     use super::*;
-
-    #[test]
-    fn empty_tiers_returns_base() {
-        assert_eq!(tiered_mmr_bps(100, &[], 0), 100);
-        assert_eq!(tiered_mmr_bps(100, &[], 1_000_000_000), 100);
-    }
-
-    #[test]
-    fn below_first_tier_returns_base() {
-        let tiers = [(1_000_000u64, 200u32), (5_000_000, 300)];
-        assert_eq!(tiered_mmr_bps(100, &tiers, 0), 100);
-        assert_eq!(tiered_mmr_bps(100, &tiers, 999_999), 100);
-    }
-
-    #[test]
-    fn at_or_above_tier_returns_tier_mmr() {
-        let tiers = [(1_000_000u64, 200u32), (5_000_000, 300), (25_000_000, 500)];
-        assert_eq!(tiered_mmr_bps(100, &tiers, 1_000_000), 200);
-        assert_eq!(tiered_mmr_bps(100, &tiers, 4_999_999), 200);
-        assert_eq!(tiered_mmr_bps(100, &tiers, 5_000_000), 300);
-        assert_eq!(tiered_mmr_bps(100, &tiers, 24_999_999), 300);
-        assert_eq!(tiered_mmr_bps(100, &tiers, 25_000_000), 500);
-        assert_eq!(tiered_mmr_bps(100, &tiers, u128::MAX), 500);
-    }
-
-    #[test]
-    fn monotone_in_notional() {
-        let tiers = [(100u64, 150u32), (1_000, 250), (10_000, 400)];
-        let mut prev = tiered_mmr_bps(100, &tiers, 0);
-        for n in [99u128, 100, 999, 1_000, 9_999, 10_000, 1_000_000] {
-            let now = tiered_mmr_bps(100, &tiers, n);
-            assert!(now >= prev, "non-monotone at {}: prev={} now={}", n, prev, now);
-            prev = now;
-        }
-    }
-
-    // ─── Wave 28a tests ─────────────────────────────────────────
 
     #[test]
     fn oi_scaled_zero_slope_returns_zero() {
@@ -291,65 +197,24 @@ mod tier_tests {
     }
 
     #[test]
-    fn effective_mmr_full_stacks_tier_and_oi() {
-        // base 100, tier @ 1M → 200, OI 500k slope 100 cap 1000 → +50.
-        // Effective = 200 + 50 = 250.
-        let tiers = [(1_000_000u64, 200u32)];
-        let r = effective_mmr_bps_full(100, &tiers, 1_500_000, 500_000, 100, 1_000);
-        assert_eq!(r, 250);
-    }
-
-    #[test]
-    fn effective_mmr_full_no_oi_matches_pure_tiered() {
-        let tiers = [(1_000_000u64, 200u32)];
-        let with_oi = effective_mmr_bps_full(100, &tiers, 1_500_000, 0, 100, 1_000);
-        let without = tiered_mmr_bps(100, &tiers, 1_500_000);
-        assert_eq!(with_oi, without);
-    }
-
-    #[test]
-    fn effective_mmr_full_no_tier_matches_pure_oi() {
-        // No tiers → just base + OI extra.
-        let extra = oi_scaled_mmr_extra_bps(1_000_000, 100, 1_000);
-        let composed = effective_mmr_bps_full(100, &[], 0, 1_000_000, 100, 1_000);
-        assert_eq!(composed, 100 + extra);
-    }
-
-    #[test]
-    fn effective_mmr_full_monotone_in_oi() {
-        let tiers = [(1_000u64, 200u32)];
-        let mut prev = 0u32;
-        for oi in [0u64, 100_000, 500_000, 1_000_000, 5_000_000] {
-            let now = effective_mmr_bps_full(100, &tiers, 10_000, oi, 50, 2_000);
-            assert!(now >= prev, "non-monotone at oi={}", oi);
-            prev = now;
-        }
-    }
-
-    #[test]
-    fn hl_btc_table() {
-        // HL's typical BTC tier table:
-        //   <$1M  → base 0.5% MMR (retail tier — uses caller's base_mmr)
-        //   $1M+  → 1.0% MMR
-        //   $5M+  → 2.0%
-        //   $25M+ → 3.0%
-        //   $100M+→ 5.0% (whale tier)
-        let tiers = [
-            (1_000_000u64, 100u32),
-            (5_000_000, 200),
-            (25_000_000, 300),
-            (100_000_000, 500),
-        ];
-        // Tiny retail position (< $1M) → base MMR (50 bps from caller).
-        assert_eq!(tiered_mmr_bps(50, &tiers, 500_000), 50);
-        // $3M position → first tier matches (≥$1M), second doesn't (<$5M).
-        assert_eq!(tiered_mmr_bps(50, &tiers, 3_000_000), 100);
-        // $7M position → second tier active.
-        assert_eq!(tiered_mmr_bps(50, &tiers, 7_000_000), 200);
-        // $30M position → third tier.
-        assert_eq!(tiered_mmr_bps(50, &tiers, 30_000_000), 300);
-        // $200M whale → top tier (5% MMR).
-        assert_eq!(tiered_mmr_bps(50, &tiers, 200_000_000), 500);
+    fn effective_mmr_stacks_concentration_and_oi() {
+        // base 100, concentration extra +50 at threshold, OI 500k
+        // slope 100 cap 1000 → +50. Effective = 100 + 50 + 50 = 200.
+        let snap = MarketSnapshot {
+            market: Pubkey::new_from_array([1; 32]),
+            mark_price: Ticks(100),
+            cum_funding_index: 0,
+            maintenance_margin_bps: 100,
+            tick_size: 1,
+            concentration_threshold_lots: 1_000,
+            concentration_extra_mmr_bps: 50,
+            side_oi_lots: 500_000,
+            oi_mmr_slope_bps_per_million_lots: 100,
+            oi_mmr_max_extra_bps: 1_000,
+        };
+        assert_eq!(snap.effective_mmr_bps(2_000), 200);
+        // Below the concentration threshold the extra drops out.
+        assert_eq!(snap.effective_mmr_bps(500), 150);
     }
 }
 
@@ -1031,18 +896,26 @@ mod mmr_kani_proofs {
         assert!(oi_scaled_mmr_extra_bps(oi, 0, max) == 0);
     }
 
-    /// INV-M4: with no tier table, the effective maintenance margin is NEVER below
-    /// the base floor — the OI surcharge only ADDS, it can never UNDER-margin a
-    /// position below `base_mmr_bps` (saturating_add of a non-negative extra).
+    /// INV-M4: the effective maintenance margin is NEVER below the base
+    /// floor — the concentration and OI surcharges only ADD (saturating),
+    /// so no input can under-margin a position below `maintenance_margin_bps`.
+    /// Proven on the live per-position MMR path used by `assess_margin`.
     #[kani::proof]
     fn effective_mmr_never_below_base_floor() {
-        let base: u32 = kani::any();
-        let notional: u128 = kani::any();
-        let oi: u64 = kani::any();
-        let slope: u32 = kani::any();
-        let max: u32 = kani::any();
-        let eff = effective_mmr_bps_full(base, &[], notional, oi, slope, max);
-        assert!(eff >= base);
+        let snap = MarketSnapshot {
+            market: Pubkey::new_from_array([0; 32]),
+            mark_price: Ticks(kani::any()),
+            cum_funding_index: kani::any(),
+            maintenance_margin_bps: kani::any(),
+            tick_size: kani::any(),
+            concentration_threshold_lots: kani::any(),
+            concentration_extra_mmr_bps: kani::any(),
+            side_oi_lots: kani::any(),
+            oi_mmr_slope_bps_per_million_lots: kani::any(),
+            oi_mmr_max_extra_bps: kani::any(),
+        };
+        let size_lots: u64 = kani::any();
+        assert!(snap.effective_mmr_bps(size_lots) >= snap.maintenance_margin_bps);
     }
 }
 

@@ -5079,75 +5079,6 @@ pub mod flash_book {
             }
         }
 
-        // ── Toxicity tax (VPIN-scaled) ────────────────────────────────
-        // ⚠️ AUDIT M-11 (2026-07): INERT. `vpin_bps` is ALWAYS 0 because
-        // `VpinState::record_fill` is never called (see matcher/vpin.rs), so
-        // this branch NEVER executes regardless of `toxicity_tax_max_bps`. Kept
-        // in place (rather than deleted) to avoid touching the settlement fee
-        // waterfall; it is dead pending VPIN's removal via a state migration.
-        // Charges the taker an extra fee proportional to the market's
-        // current VPIN signal. Compensates the maker — who was on the
-        // wrong side of toxic flow — and tops up the insurance fund.
-        // tax = notional × max_bps × vpin_bps / (10_000 × 10_000)
-        let tax_max_bps = market.params.toxicity_tax_max_bps;
-        let vpin_bps = market.vpin.as_bps();
-        if tax_max_bps > 0 && vpin_bps > 0 {
-            let tax_u128 = notional_u128
-                .saturating_mul(tax_max_bps as u128)
-                .saturating_mul(vpin_bps as u128)
-                / (constants::BPS_DENOM as u128)
-                / (constants::BPS_DENOM as u128);
-            let tax_uncapped: u64 = if tax_u128 > u64::MAX as u128 {
-                u64::MAX
-            } else {
-                tax_u128 as u64
-            };
-            // Cap to taker's available collateral — never fail the fill.
-            let tax = tax_uncapped.min(ctx.accounts.taker_trader_state.load()?.collateral_quote_lots);
-            if tax > 0 {
-                // Deduct from taker.
-                ctx.accounts.taker_trader_state.load_mut()?.collateral_quote_lots -= tax;
-                // Split: insurance fund gets `tox_contribution_bps`, maker
-                // receives the remainder as a toxic-flow rebate.
-                let to_insurance = (tax as u128)
-                    .saturating_mul(ctx.accounts.insurance_fund.toxicity_tax_contribution_bps as u128)
-                    .checked_div(constants::BPS_DENOM as u128)
-                    .ok_or_else(|| error!(FlashBookError::DivisionByZero))?
-                    as u64;
-                let to_maker = tax.saturating_sub(to_insurance);
-                {
-                    let fund = &mut ctx.accounts.insurance_fund;
-                    fund.balance_quote_lots = fund
-                        .balance_quote_lots
-                        .checked_add(to_insurance)
-                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-                    fund.total_contributions = fund
-                        .total_contributions
-                        .saturating_add(to_insurance);
-                }
-                {
-                    let mut maker_state = ctx.accounts.maker_trader_state.load_mut()?;
-                    maker_state.collateral_quote_lots = maker_state
-                        .collateral_quote_lots
-                        .checked_add(to_maker)
-                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-                }
-                market.total_toxicity_tax_collected = market
-                    .total_toxicity_tax_collected
-                    .checked_add(tax)
-                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-                emit!(ToxicityTaxAppliedEvent {
-                    market: market_key,
-                    taker: taker_trader_pk,
-                    maker: maker_trader_pk,
-                    vpin_bps,
-                    tax_quote_lots: tax,
-                    insurance_share: to_insurance,
-                    maker_share: to_maker,
-                });
-            }
-        }
-
         // Scope the position write-guards: they MUST drop before the
         // realized-PnL helpers below re-`load_mut()` the same accounts.
         let (
@@ -7163,7 +7094,9 @@ pub mod flash_book {
         );
         let flp_inputs = matcher::flp_quoter::FlpQuoterInputs {
             oracle_ticks: matcher::lot::Ticks(market.oracle_price_ticks),
-            vpin_bps: market.vpin.as_bps(),
+            // The VPIN accumulator is retired; the quoter's toxicity spread
+            // term is held at zero.
+            vpin_bps: 0,
             realized_vol_bps,
             pool_capital_quote_lots: flp_pool_capital,
             pool_net_quote_lots_signed: flp_net_signed,
@@ -7534,7 +7467,9 @@ pub mod flash_book {
         );
         let flp_inputs = matcher::flp_quoter::FlpQuoterInputs {
             oracle_ticks: matcher::lot::Ticks(market.oracle_price_ticks),
-            vpin_bps: market.vpin.as_bps(),
+            // The VPIN accumulator is retired; the quoter's toxicity spread
+            // term is held at zero.
+            vpin_bps: 0,
             realized_vol_bps,
             pool_capital_quote_lots: flp_pool_capital,
             pool_net_quote_lots_signed: flp_net_signed,
@@ -7945,69 +7880,6 @@ pub mod flash_book {
             .total_fees_collected
             .checked_add(net_fee)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-
-        // ── Toxicity tax (FLP-fill variant) ───────────────────────────
-        // ⚠️ AUDIT M-11 (2026-07): INERT — same VPIN-scaled tax as apply_fill,
-        // and equally dead: `vpin_bps` is always 0 (record_fill is never
-        // called), so this branch NEVER executes. See matcher/vpin.rs.
-        // When active it would route the maker share into flp.total_capital,
-        // lifting NAV/share for all LPs pro-rata (LP toxic-flow rebate).
-        let tax_max_bps = market.params.toxicity_tax_max_bps;
-        let vpin_bps = market.vpin.as_bps();
-        if tax_max_bps > 0 && vpin_bps > 0 {
-            let tax_u128 = notional_u128
-                .saturating_mul(tax_max_bps as u128)
-                .saturating_mul(vpin_bps as u128)
-                / (constants::BPS_DENOM as u128)
-                / (constants::BPS_DENOM as u128);
-            let tax_uncapped: u64 = if tax_u128 > u64::MAX as u128 {
-                u64::MAX
-            } else {
-                tax_u128 as u64
-            };
-            let tax = tax_uncapped.min(ctx.accounts.taker_trader_state.load()?.collateral_quote_lots);
-            if tax > 0 {
-                ctx.accounts.taker_trader_state.load_mut()?.collateral_quote_lots -= tax;
-                let to_insurance = (tax as u128)
-                    .saturating_mul(ctx.accounts.insurance_fund.toxicity_tax_contribution_bps as u128)
-                    .checked_div(constants::BPS_DENOM as u128)
-                    .ok_or_else(|| error!(FlashBookError::DivisionByZero))?
-                    as u64;
-                let to_flp = tax.saturating_sub(to_insurance);
-                {
-                    let fund = &mut ctx.accounts.insurance_fund;
-                    fund.balance_quote_lots = fund
-                        .balance_quote_lots
-                        .checked_add(to_insurance)
-                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-                    fund.total_contributions = fund
-                        .total_contributions
-                        .saturating_add(to_insurance);
-                }
-                {
-                    let flp = &mut ctx.accounts.flp_exposure;
-                    flp.total_capital_quote_lots = flp
-                        .total_capital_quote_lots
-                        .checked_add(to_flp)
-                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-                }
-                market.total_toxicity_tax_collected = market
-                    .total_toxicity_tax_collected
-                    .checked_add(tax)
-                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-                emit!(ToxicityTaxAppliedEvent {
-                    market: market_key,
-                    taker: taker_trader_pk,
-                    // For FLP fills the "maker" is the pool itself. Use the
-                    // flp_exposure PDA address as the maker identity.
-                    maker: ctx.accounts.flp_exposure.key(),
-                    vpin_bps,
-                    tax_quote_lots: tax,
-                    insurance_share: to_insurance,
-                    maker_share: to_flp,
-                });
-            }
-        }
 
         // Scope the position write-guard so it drops before the realized-
         // PnL helper below re-`load_mut()`s the same account.
@@ -16291,11 +16163,13 @@ pub struct ViewPortfolioRisk<'info> {
 
 #[derive(Accounts)]
 pub struct ViewMarket<'info> {
+    // Boxed: an un-boxed MarketAccount deserializes onto the stack and tips
+    // the 4 KB BPF frame for this context.
     #[account(
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
 
     #[account(
         seeds = [FlpExposureAccount::SEED],
@@ -17751,19 +17625,6 @@ pub struct JitLiquidationFilledEvent {
     pub fill_price_ticks: u64,
     pub synthetic_price_ticks: u64,
     pub savings_vs_synthetic_bps: u32,
-}
-
-#[event]
-pub struct ToxicityTaxAppliedEvent {
-    pub market: Pubkey,
-    pub taker: Pubkey,
-    /// The maker who absorbed the toxic flow (or the FLP pool PDA on
-    /// apply_flp_fill).
-    pub maker: Pubkey,
-    pub vpin_bps: u32,
-    pub tax_quote_lots: u64,
-    pub insurance_share: u64,
-    pub maker_share: u64,
 }
 
 #[event]
@@ -20590,8 +20451,8 @@ pub struct InitFlpPerMarketV3<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
-    /// AUDIT M-18 (2026-07): gate on the protocol authority so this per-market
-    /// singleton can't be front-run/captured to control `record_flp_fill_v3`.
+    /// Gated on the protocol authority so this per-market singleton cannot be
+    /// front-run or captured to control `record_flp_fill_v3`.
     #[account(
         seeds = [InsuranceFundAccount::SEED],
         bump = insurance_fund.bump,
@@ -20599,14 +20460,15 @@ pub struct InitFlpPerMarketV3<'info> {
     )]
     pub insurance_fund: Account<'info, InsuranceFundAccount>,
 
-    /// AUDIT M-18 (2026-07): typed as a real MarketAccount (owner + discriminator
-    /// checked) rather than a raw UncheckedAccount, so an arbitrary 32-byte
-    /// "market" cannot be squatted as the exposure seed.
+    /// Typed as a real MarketAccount (owner + discriminator checked) rather
+    /// than a raw UncheckedAccount, so an arbitrary 32-byte "market" cannot be
+    /// squatted as the exposure seed. Boxed: an un-boxed MarketAccount
+    /// deserializes onto the stack and tips the 4 KB BPF frame.
     #[account(
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
 
     #[account(
         init,

@@ -102,11 +102,16 @@ impl InsuranceFund {
 // insurance` is the [CERTORA-TARGET] whole-program invariant.
 // ─────────────────────────────────────────────────────────────────────
 
-/// FULL-invariant solvency (P-SOLV-4): the vault must cover ALL liabilities —
-/// `vault >= total_collateral + flp_capital + insurance`. Stronger than
-/// [`assess_solvency`], which omits trader collateral and so only covers the
-/// protocol-owned subset. Returns `(solvent, surplus)`; `Err(())` iff the summed
-/// liabilities overflow u64 (unreachable for real balances).
+/// Reference model for the full solvency invariant: the vault must cover ALL
+/// liabilities — `vault >= total_collateral + flp_capital + insurance`.
+/// Stronger than [`assess_solvency`], which omits trader collateral and so
+/// only covers the protocol-owned subset. The full sum is unbounded on-chain
+/// (it requires every trader's collateral), so no instruction evaluates this
+/// directly; it exists as the specification that
+/// [`partial_collateral_proves_insolvent`] is machine-proven sound against.
+/// Returns `(solvent, surplus)`; `Err(())` iff the summed liabilities
+/// overflow u64.
+#[cfg(any(kani, test))]
 #[inline]
 pub fn assess_solvency_full(
     vault: u64,

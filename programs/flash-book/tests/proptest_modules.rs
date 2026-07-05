@@ -1,8 +1,6 @@
-//! Property tests for the remaining matcher modules:
+//! Property tests for the pure matcher modules:
 //!
 //!   • flp_quoter   — spread monotonicity, ladder ordering, capacity bounds
-//!   • funding      — sign correctness, rate clamping
-//!   • vpin         — output bounded, monotonic in imbalance
 //!   • insurance    — waterfall conservation, contribution math
 //!
 //! Each property runs against 2,000 random inputs.
@@ -10,11 +8,8 @@
 use anchor_lang::prelude::Pubkey;
 use flash_book::matcher::{
     flp_quoter::{generate_quotes, FlpQuoterInputs, FlpQuoterParams},
-    funding::advance,
     insurance::InsuranceFund,
     lot::Ticks,
-    order::Side,
-    vpin::VpinState,
 };
 use proptest::prelude::*;
 
@@ -139,97 +134,6 @@ proptest! {
         let (out, _) = generate_quotes(flp_params(), flp_inputs(oracle, 0, capital, net_long), trader, 0)?;
         prop_assert!(out.skew_bps <= 0, "skew must be ≤ 0 for net-long pool");
         prop_assert!(out.fair_value.0 <= oracle, "fair_value > oracle with net-long pool");
-    }
-}
-
-// ─── funding ───────────────────────────────────────────────────────────
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(2000))]
-
-    /// premium > 0 (mark > oracle) → rate ≥ 0 (longs pay).
-    #[test]
-    fn funding_rate_sign_matches_premium_sign(
-        mark in 100u64..200u64,
-        oracle in 100u64..200u64,
-        delta_ms in 1u64..60_000u64,
-    ) {
-        let (_, tick) = advance(0, Ticks(mark), Ticks(oracle), delta_ms, 100_000, 10_000)?;
-        if mark > oracle {
-            prop_assert!(tick.rate_bps_per_sec >= 0);
-            prop_assert!(tick.index_delta >= 0);
-        } else if mark < oracle {
-            prop_assert!(tick.rate_bps_per_sec <= 0);
-            prop_assert!(tick.index_delta <= 0);
-        } else {
-            prop_assert_eq!(tick.rate_bps_per_sec, 0);
-            prop_assert_eq!(tick.index_delta, 0);
-        }
-    }
-
-    /// Zero block delta → no index change.
-    #[test]
-    fn funding_zero_delta_no_change(
-        cum in -1_000_000_000i128..1_000_000_000i128,
-        mark in 1u64..1_000_000u64,
-        oracle in 1u64..1_000_000u64,
-    ) {
-        let (new_cum, tick) = advance(cum, Ticks(mark), Ticks(oracle), 0, 100_000, 10_000)?;
-        prop_assert_eq!(new_cum, cum);
-        prop_assert_eq!(tick.index_delta, 0);
-    }
-
-    /// Rate is always within ± rate_max.
-    #[test]
-    fn funding_rate_bounded_by_max(
-        mark in 1u64..10_000_000u64,
-        oracle in 1u64..1_000_000u64,
-        rate_max in 1u32..10_000u32,
-    ) {
-        let (_, tick) = advance(0, Ticks(mark), Ticks(oracle), 1000, 1_000_000_000, rate_max)?;
-        prop_assert!(tick.rate_bps_per_sec.abs() as u32 <= rate_max);
-    }
-}
-
-// ─── vpin ──────────────────────────────────────────────────────────────
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(2000))]
-
-    /// VPIN as_bps is always within [0, 10_000].
-    #[test]
-    fn vpin_bounded(
-        sides in proptest::collection::vec(any::<bool>(), 0..200),
-        bucket in 50u64..500u64,
-        window in 1u32..50u32,
-    ) {
-        let mut v = VpinState::new();
-        for is_long in sides {
-            let side = if is_long { Side::Long } else { Side::Short };
-            v.record_fill(side, 10, bucket, window)?;
-        }
-        let bps = v.as_bps();
-        prop_assert!(bps <= 10_000, "VPIN bps {} > 10000", bps);
-    }
-
-    /// One-sided flow eventually pushes VPIN above 50%.
-    #[test]
-    fn vpin_one_sided_flow_high(bucket in 50u64..200u64, fills in 50u32..200u32) {
-        let mut v = VpinState::new();
-        for _ in 0..fills {
-            v.record_fill(Side::Long, 100, bucket, 5)?;
-        }
-        // After many one-sided buckets, VPIN should reflect strong imbalance.
-        prop_assert!(v.as_bps() > 5_000, "expected VPIN > 50%, got {} bps", v.as_bps());
-    }
-
-    /// Empty record-stream leaves VPIN at zero.
-    #[test]
-    fn vpin_no_fills_zero(bucket in 50u64..500u64, window in 1u32..50u32) {
-        let v = VpinState::new();
-        let _ = bucket;
-        let _ = window;
-        prop_assert_eq!(v.as_bps(), 0);
     }
 }
 
