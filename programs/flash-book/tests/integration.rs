@@ -3622,6 +3622,328 @@ async fn modify_order_v2_rejects_far_from_oracle() {
     );
 }
 
+/// A reduce-only trigger scoped to one sub-account must not be able to read a
+/// DIFFERENT sub-account's position (both carry `trader == wallet`, so the
+/// (market, trader) constraint alone is insufficient). The trigger's `position`
+/// is bound to (trader, trigger.sub_index): a sub_index=0 trigger executed with
+/// the wallet's sub_index=1 position is rejected with WrongTrader.
+#[tokio::test]
+async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    disarm_fill_commitment(&mut ctx, market_pda).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (insurance, _) = pda(&[InsuranceFundAccount::SEED]);
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    // Init the book so the trigger can inject.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Trader m: main (sub-0) state, a sub-1 state, and a long position ON SUB-1.
+    let m = Keypair::new();
+    let m_main = setup_trader(&mut ctx, &payer, &m, 100_000, &protocol).await;
+    let (m_sub1, _) = pda(&[TraderStateAccount::SEED, m.pubkey().as_ref(), &[1u8]]);
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::OpenTraderSubAccount { sub_index: 1 },
+            vec![
+                AccountMeta::new(m.pubkey(), true),
+                AccountMeta::new(m_sub1, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer, &m],
+    )
+    .await
+    .unwrap();
+
+    let counter = Keypair::new();
+    let counter_state = setup_trader(&mut ctx, &payer, &counter, 100_000, &protocol).await;
+    let (m_sub1_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        m_sub1.as_ref(),
+    ]);
+    let (counter_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        counter_state.as_ref(),
+    ]);
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ApplyFill {
+                size_lots: 1,
+                price_ticks: 100_000,
+                taker_side: 0,
+                taker_was_jit: false,
+                taker_sub_index: 1,
+                maker_sub_index: 0,
+                fill_seq: 1,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(insurance, false),
+                AccountMeta::new(m_sub1, false),
+                AccountMeta::new(counter_state, false),
+                AccountMeta::new(m_sub1_pos, false),
+                AccountMeta::new(counter_pos, false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Reduce-only trigger scoped to SUB-0 (main), fires at oracle <= 100_000.
+    let (trig, _) = pda(&[
+        flash_book::state_v3::TriggerOrderAccountV3::SEED,
+        market_pda.as_ref(),
+        m.pubkey().as_ref(),
+        &[1u8],
+    ]);
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceTriggerOrderV3 {
+                trigger_id: 1,
+                side: 1,
+                kind: 0,
+                size_lots: 1,
+                trigger_price_ticks: 100_000,
+                limit_price_ticks: 100_000,
+                reduce_only: true,
+                expires_at_slot: 0,
+                sub_index: 0,
+                acceptable_price_ticks: 0,
+            },
+            vec![
+                AccountMeta::new(m.pubkey(), true),
+                AccountMeta::new_readonly(m_main, false),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(trig, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer, &m],
+    )
+    .await
+    .unwrap();
+
+    // Execute the sub-0 trigger while passing the SUB-1 position → WrongTrader.
+    let result = send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ExecuteTriggerOrderV3 {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new(trig, false),
+                AccountMeta::new_readonly(m_sub1_pos, false),
+                AccountMeta::new_readonly(program_id(), false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(7104)"),
+        "a sub-0 trigger reading the wallet's sub-1 position must be rejected with WrongTrader, got: {dbg}"
+    );
+}
+
+/// The Pyth pull path must reject a replayed (older or equal) publish_time: the
+/// staleness window only bounds how OLD an accepted price is and the envelope
+/// only bounds the per-slot move, so without a monotonicity guard a caller could
+/// re-post an older in-window price to rewind the oracle to a worse-of value.
+#[tokio::test]
+async fn update_oracle_from_pyth_rejects_replayed_publish_time() {
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let envelope_config = setup_envelope(&mut ctx, &payer, market_pda).await;
+
+    let feed_id = [7u8; 32];
+    let (oracle_config, _) = pda(&[
+        flash_book::state_v3::MarketOracleConfigAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketOracleConfig {
+                    pyth_price_feed_id: feed_id,
+                    max_staleness_seconds: 3600,
+                    max_confidence_bps: 100,
+                    tick_decimals: 0,
+                },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(oracle_config, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Build a Pyth PriceUpdateV2 (Full) for our feed at 100_000 ticks
+    // (price 100_000, exponent 0, tick_decimals 0) with a given publish_time.
+    let build = |publish_time: i64| -> Vec<u8> {
+        let mut d = vec![0u8; 101];
+        d[..8].copy_from_slice(&flash_book::pyth_oracle::PRICE_UPDATE_V2_DISCRIMINATOR);
+        d[40] = 1; // verification level = Full
+        d[41..73].copy_from_slice(&feed_id);
+        d[73..81].copy_from_slice(&100_000i64.to_le_bytes());
+        d[81..89].copy_from_slice(&0u64.to_le_bytes());
+        d[89..93].copy_from_slice(&0i32.to_le_bytes());
+        d[93..101].copy_from_slice(&publish_time.to_le_bytes());
+        d
+    };
+    let price_update = Keypair::new().pubkey();
+    let put = |ctx: &mut solana_program_test::ProgramTestContext, publish_time: i64| {
+        ctx.set_account(
+            &price_update,
+            &SolAccount {
+                lamports: 1_000_000,
+                data: build(publish_time),
+                owner: flash_book::pyth_oracle::PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+    };
+    let pyth_ix = || {
+        build_ix(
+            flash_book::instruction::UpdateOracleFromPyth {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new_readonly(oracle_config, false),
+                AccountMeta::new_readonly(price_update, false),
+                AccountMeta::new(envelope_config, false),
+            ],
+        )
+    };
+
+    let now = ctx
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    // setup_market stamps oracle_published_at = now and program-test's clock does
+    // not advance unix on warp, so rewind the stored publish time into the past to
+    // leave room for a strictly-newer first push.
+    {
+        let acc = ctx
+            .banks_client
+            .get_account(market_pda)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut m = MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+        m.oracle_published_at_unix_seconds = (now - 100) as u64;
+        let mut data = Vec::new();
+        m.try_serialize(&mut data).unwrap();
+        data.resize(acc.data.len(), 0);
+        ctx.set_account(
+            &market_pda,
+            &SolAccount {
+                lamports: acc.lamports,
+                data,
+                owner: acc.owner,
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            }
+            .into(),
+        );
+    }
+
+    // First push (publish_time = now) is accepted and stamps oracle_published_at.
+    put(&mut ctx, now);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[pyth_ix()],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .expect("first fresh Pyth push accepted");
+
+    // Replay an OLDER (still in-window) publish_time → OraclePythReplay (2318).
+    // Advance the slot so the replay tx (byte-identical to the first) is not
+    // deduplicated by a shared blockhash.
+    let s = ctx.banks_client.get_sysvar::<Clock>().await.unwrap().slot;
+    ctx.warp_to_slot(s + 1).unwrap();
+    put(&mut ctx, now - 5);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[pyth_ix()],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8318)"),
+        "a replayed/older Pyth publish_time must be rejected with OraclePythReplay, got: {dbg}"
+    );
+}
+
 #[tokio::test]
 async fn delegated_book_order_requires_armed() {
     let pt = make_program_test();
