@@ -1635,6 +1635,31 @@ pub mod flash_book {
                 }
             }
         }
+        // AUDIT F-3 v1: if the fill-commitment ring uses the v1 layout, subtract each
+        // maker position's PENDING (matched-but-unsettled) reduce-only lots from its
+        // reducible. This makes over-reduction impossible ACROSS the match→settle gap
+        // (two takers each reading a stale position snapshot), not just within one
+        // call — closing the residual where a position shrinks below its resting
+        // reduce-only. On a v0 ring this loop is a no-op (reducible == position size).
+        {
+            let mkt = market_key.to_bytes();
+            if let Some(fc_acct) =
+                find_fill_commitment(ctx.remaining_accounts, program_id, &mkt)
+            {
+                if let Ok(fc_data) = fc_acct.try_borrow_data() {
+                    use matcher::fill_commitment as fc;
+                    if fc::buffer_version(&fc_data) == 1 {
+                        if let Ok(cap) = fc::buffer_check(&fc_data, &mkt) {
+                            for entry in maker_positions.iter_mut() {
+                                let pending =
+                                    fc::inflight_get(&fc_data, cap, &entry.0.to_bytes());
+                                entry.2 = entry.2.saturating_sub(pending);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
         let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
@@ -1701,7 +1726,11 @@ pub mod flash_book {
         // crossed levels. (data_idx, maker_order_id, fill_size_lots,
         // fill_price_ticks, maker_pubkey, maker_sub_index) — Phase 2e adds
         // maker_sub_index so the emitted FillEntry carries it for the sequencer.
-        let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey, u8)> =
+        // Tuple: (maker node idx, maker order id, fill lots, fill price, maker
+        // trader, maker sub_index, is_reduce_only). The trailing flag (F-3 v1) lets
+        // the ring-push loop track this fill's reduce-in-flight against the maker's
+        // position so a later taker (before settlement) cannot over-reduce it.
+        let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey, u8, bool)> =
             Vec::with_capacity(walk_limit);
         let mut stp_cancels: Vec<hypertree::DataIndex> = Vec::new();
         let mut stp_aborted = false;
@@ -1760,7 +1789,15 @@ pub mod flash_book {
                     }
                     fill = capped;
                 }
-                matches.push((idx, ask.order_id, fill, ask.price_ticks, ask.trader, ask.sub_index));
+                matches.push((
+                    idx,
+                    ask.order_id,
+                    fill,
+                    ask.price_ticks,
+                    ask.trader,
+                    ask.sub_index,
+                    ask.flags & state_v2::FLAG_REDUCE_ONLY != 0,
+                ));
                 remaining -= fill;
                 true
             });
@@ -1809,7 +1846,15 @@ pub mod flash_book {
                     }
                     fill = capped;
                 }
-                matches.push((idx, bid.order_id, fill, bid.price_ticks, bid.trader, bid.sub_index));
+                matches.push((
+                    idx,
+                    bid.order_id,
+                    fill,
+                    bid.price_ticks,
+                    bid.trader,
+                    bid.sub_index,
+                    bid.flags & state_v2::FLAG_REDUCE_ONLY != 0,
+                ));
                 remaining -= fill;
                 true
             });
@@ -1851,7 +1896,7 @@ pub mod flash_book {
         // The SBF bump allocator never frees, so a second N-sized Vec plus a
         // serialized fat event would blow the 32 KiB heap past ~100 levels (the old
         // OOM). See FILL_OUTBOX_DESIGN.md / DEEP_BOOK_CU.md.
-        for (maker_idx, _maker_id, fill_size, _fill_price, _maker_trader, _maker_sub_idx) in
+        for (maker_idx, _maker_id, fill_size, _fill_price, _maker_trader, _maker_sub_idx, _ro) in
             &matches
         {
             let new_size = handle.decrement_size_at(*maker_idx, *fill_size)?;
@@ -1941,8 +1986,27 @@ pub mod flash_book {
                     require!(fo_cap >= ring_cap, FlashBookError::FillRingCorrupt);
                 }
                 produced_from = fc::buffer_next_index(&fc_data);
-                for (_maker_idx, maker_id, fill_size, fill_price, maker_trader, maker_sub_idx) in
-                    &matches
+                // AUDIT F-3 v1: on a v1 ring, track each reduce-only fill's lots
+                // against the maker's position in-flight so a later taker (before this
+                // fill settles) sees a reduced reducible (subtracted in the pre-scan
+                // above). `None` on a v0 ring ⇒ tracking is inert (unchanged behavior).
+                let ring_v1_cap: Option<u32> = if fc::buffer_version(&fc_data) == 1 {
+                    Some(
+                        fc::buffer_check(&fc_data, &fc_market_bytes)
+                            .map_err(|_| error!(FlashBookError::FillRingCorrupt))?,
+                    )
+                } else {
+                    None
+                };
+                for (
+                    _maker_idx,
+                    maker_id,
+                    fill_size,
+                    fill_price,
+                    maker_trader,
+                    maker_sub_idx,
+                    is_reduce_only,
+                ) in &matches
                 {
                     let idx = fc::buffer_next_index(&fc_data);
                     let maker_bytes = maker_trader.to_bytes();
@@ -1963,6 +2027,24 @@ pub mod flash_book {
                         fc::FillRingError::Full => error!(FlashBookError::FillRingFull),
                         _ => error!(FlashBookError::FillRingCorrupt),
                     })?;
+                    // AUDIT F-3 v1: reserve this reduce-only fill's lots against the
+                    // maker's position in-flight and mark the ring slot so settlement
+                    // releases it when it settles this index. A full in-flight map fails
+                    // CLOSED (FillRingFull) — a liveness bound, never an over-reduce.
+                    if *is_reduce_only {
+                        if let Some(cap) = ring_v1_cap {
+                            let pos_key = derive_maker_position_key(
+                                &market_key,
+                                maker_trader,
+                                *maker_sub_idx,
+                                program_id,
+                            )
+                            .to_bytes();
+                            fc::inflight_add(&mut fc_data, cap, &pos_key, *fill_size)
+                                .map_err(|_| error!(FlashBookError::FillRingFull))?;
+                            fc::reduce_flag_set(&mut fc_data, cap, idx);
+                        }
+                    }
                     // Mirror the fill DATA into outbox[idx % cap] (heap-free direct
                     // write). The ring's backpressure (`Full` above) guarantees this
                     // slot's prior tenant was already settled — no silent overwrite.
@@ -2014,7 +2096,7 @@ pub mod flash_book {
                 // Legacy fat event — only reached at cap ≤ 96 (log-safe). Build the
                 // FillEntry Vec here (kept tiny by the cap) and emit.
                 let mut fills: Vec<FillEntry> = Vec::with_capacity(matches.len());
-                for (_i, maker_id, fill_size, fill_price, maker_trader, maker_sub_idx) in &matches {
+                for (_i, maker_id, fill_size, fill_price, maker_trader, maker_sub_idx, _ro) in &matches {
                     fills.push(FillEntry {
                         maker: *maker_trader,
                         size_lots: *fill_size,
