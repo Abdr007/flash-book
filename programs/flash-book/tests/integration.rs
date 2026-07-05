@@ -4603,7 +4603,7 @@ async fn reconcile_unsettled_fill_volume_resets_only_when_ring_drained() {
             &SolAccount { lamports: a.lamports, data: d, owner: a.owner, executable: a.executable, rent_epoch: a.rent_epoch }.into(),
         );
     }
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bh = ctx.get_new_latest_blockhash().await.unwrap();
     let r = ctx
         .banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -4875,7 +4875,10 @@ async fn f3_upgrade_fill_commitment_v1_and_v1_ring_settles_normally() {
         ix: Instruction,
         signers: &[&Keypair],
     ) -> std::result::Result<(), solana_program_test::BanksClientError> {
-        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        // Force a FRESH blockhash each tx so two identical instructions (the
+        // idempotency check that re-upgrading a v1 ring reverts) can't be deduped by
+        // BanksClient into the first tx's cached result.
+        let bh = ctx.get_new_latest_blockhash().await.unwrap();
         ctx.banks_client
             .process_transaction(Transaction::new_signed_with_payer(
                 &[ix],
