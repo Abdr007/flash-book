@@ -72,7 +72,7 @@ noted).
 | `commit_market_book` / `commit_fill_commitment` / `commit_fill_outbox` | permissionless (ER-side) | Snapshot delegated state back to L1. |
 | `commit_and_undelegate_*` | sequencer-gated | Snapshot + queue undelegation. |
 | `process_undelegation` | delegation-program callback | Finalize undelegation; buffer bound to the canonical DLP PDA. |
-| `force_undelegate_market_book` | permissionless | Escape hatch after ER stall / censorship timeouts (Kani-proven gate). |
+| `force_undelegate_market_book` | permissionless | Intended escape hatch after ER stall / censorship timeouts (Kani-proven gate). **Not executable against the deployed delegation program** — undelegation is validator-driven, so the gate opens but the handler returns `OwnerForceUndelegateUnavailable`; the working exit is sequencer-gated `commit_and_undelegate_market_book` (see `ER_TRUST_BOUNDARY.md` §1.1). |
 | `stamp_book_liveness_baseline` | authority | Stamp a liveness baseline for books delegated before baselines existed. |
 | `er_heartbeat` | sequencer | ER liveness heartbeat (keeps the fast escape shut on quiet-but-live markets). |
 | `init_er_margin_attestation` / `attest_er_reserved_margin` | authority / sequencer | Attest ER-reserved margin for cross-domain withdrawal floors. |

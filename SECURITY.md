@@ -46,8 +46,13 @@ acknowledge within 72 hours.
 - DoS via public RPC (operator responsibility).
 - Off-chain tooling (clients, bots, keepers) — not in this repository.
 - Sequencer reordering/censorship *within* the documented trust model
-  (see below) — mitigations exist (censorship escape, oracle-band mark
-  clamp), but ordering itself is trusted.
+  (see below) — the oracle-band mark clamp mitigates a manipulated mark, but
+  ordering itself is trusted, and the permissionless censorship *exit* is not
+  yet executable against the deployed delegation program (see
+  `ER_TRUST_BOUNDARY.md` §1.1: exit currently depends on sequencer
+  cooperation — a liveness exposure). A report demonstrating trapped funds
+  under a dark/censoring ER is in scope as a known-liveness item, not a new
+  finding.
 
 ## Accepted trust assumptions (documented, not findings)
 

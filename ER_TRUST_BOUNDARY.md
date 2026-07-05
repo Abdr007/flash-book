@@ -42,13 +42,22 @@ closed by a base-layer defense:
 | **Commit a corrupt book** (drive a slab accessor out of bounds, or misread a node) | `from_account_data` bounds-checks all six header node indices and the internal RBT links; fail-closed `OutOfRange` | host (corrupt-index and corrupt-link rejection) |
 | **Replay / reorder a settled batch** | monotonic `fill_seq` (Kani-proven `advance_settlement_seq`) | host + integration |
 | **Drop a fill off the outbox** | outbox `cap >= ring_cap` + ring backpressure (Kani: no silent overwrite) | Kani + integration (256-deep sweep) |
-| **Censor settlement forever** (hold the book hostage on the ER) | permissionless `force_undelegate_market_book` once the ER is stall- or censorship-dark | host (seven cases) + Kani (never fires while live) |
+| **Censor settlement forever** (hold the book hostage on the ER) | *intended:* permissionless `force_undelegate_market_book` once the ER is stall- or censorship-dark. **Not executable today** — the deployed MagicBlock delegation program makes undelegation validator-driven and exposes no owner-callable path, so the handler runs the (Kani-proven) liveness gate and then fails closed with `OwnerForceUndelegateUnavailable`. The working exit is sequencer-gated `commit_and_undelegate_market_book`. See §1.1. | host (seven cases, gate) + Kani (gate never fires while live) |
 | **Trap a market delegated before liveness stamping** | `stamp_book_liveness_baseline` + the two-tier stall/censorship baseline | host |
 | **Steal custody** | the delegation program owns only the *delegated PDAs*, never the vault; collateral never leaves L1 | by construction |
 
-**The residual trust is liveness only:** a dead or withholding ER halts *new*
-matching but cannot take funds or forge state, and the censorship escape
-returns the book to L1 without the sequencer's cooperation.
+**The residual trust is liveness — and, until the trustless escape is wired,
+sequencer cooperation for exit.** A dead or withholding ER cannot take funds or
+forge state (custody and positions stay on L1). But because the permissionless
+`force_undelegate_market_book` escape is not currently executable against the
+deployed delegation program (see §1.1), returning a censored/dark book to L1
+today depends on the sequencer signing `commit_and_undelegate_market_book`. A
+sequencer that is dead or refuses to sign therefore traps the book on the ER —
+so open positions cannot be closed and the collateral backing them cannot be
+withdrawn (withdrawal requires `open_positions == 0`) until the ER returns or
+MagicBlock ships an owner-recovery instruction. Trapped-margin recoverability
+rests on sequencer liveness, not a trustless exit. Nothing is stolen or forged;
+the exposure is liveness/availability, not custody.
 
 **One accepted correctness residual — reduce-only intent across the drain
 window.** A reduce-only maker fill committed to the ring, whose maker
@@ -60,6 +69,36 @@ the only closures break a hard wall (settlement-side clamp breaks
 two-sided conservation; gating liquidation on a drained ring deadlocks
 liquidation when the sequencer withholds a preimage). Detailed in
 [docs/SETTLEMENT.md](docs/SETTLEMENT.md) §3.
+
+### 1.1 Status of the trustless censorship escape
+
+The permissionless exit is **designed and gated but not yet executable against
+the deployed delegation program.** `force_undelegate_market_book` computes the
+Kani-proven two-tier liveness gate (`force_undelegate_allowed`: a fast
+stall/heartbeat path and a longer settlement-liveness censorship backstop) and,
+when the gate opens, currently returns `OwnerForceUndelegateUnavailable` rather
+than emitting a CPI. The reason is external: the upgraded MagicBlock delegation
+program makes undelegation **validator-driven** — `process_undelegate` requires
+the ER validator as a signer plus committed rollup state and exposes no
+owner-callable undelegate path — so an owner-initiated force-undelegate has no
+instruction to call and would be guaranteed to fail. The gate is retained so the
+escape can be re-wired the instant MagicBlock ships an owner-recovery
+instruction.
+
+Consequences for the current deployment:
+
+- The **only** path back to L1 today is `commit_and_undelegate_market_book`,
+  which is sequencer-gated (`payer == market.sequencer`). Exit therefore
+  depends on sequencer cooperation.
+- A dead or censoring sequencer that refuses to sign it traps the delegated
+  book on the ER. Custody is unaffected (the vault and collateral never leave
+  L1; positions are read-only clones), but affected traders cannot close
+  positions or withdraw the collateral backing them until the ER returns.
+- This is a **liveness/availability** exposure, not a custody or correctness
+  one, and it is the single most important item to close before any
+  mainnet-scale claim of a permissionless exit. Closing it requires an
+  owner-recovery primitive from MagicBlock (external), after which the retained
+  gate wires directly to it.
 
 ## 2. What is proven where
 
@@ -137,12 +176,18 @@ never silently accepted. Arm on a quiet market, probe, then resume traffic.
   authority burn) and multisig authorities; moving the live keys to an
   M-of-N multisig is an operational migration —
   [docs/OPERATIONS.md](docs/OPERATIONS.md).
+- **Trustless censorship exit.** Wiring the gated `force_undelegate_market_book`
+  escape to a real owner-recovery instruction (see §1.1). Until MagicBlock
+  ships one, exit from a censored/dark ER depends on sequencer cooperation and
+  trapped-margin recoverability rests on sequencer liveness.
 
 ## 6. Bottom line
 
 Safety at the ER boundary is defended at base-layer choke points that are
 unit-proven and machine-checked. Ordering and liveness rest on a single
-sequencer by explicit, bounded design, with a permissionless exit when it
-fails. What remains outside the unit harness is exactly the set of
-MagicBlock CPI round-trips, which the gated live-ER acceptance suite covers
-on demand.
+sequencer by explicit, bounded design. The permissionless exit for a
+censored/dark ER is designed and gated but **not yet executable** against the
+deployed delegation program (§1.1), so exit currently depends on sequencer
+cooperation — a liveness exposure, not a custody or correctness one. What
+remains outside the unit harness is exactly the set of MagicBlock CPI
+round-trips, which the gated live-ER acceptance suite covers on demand.
