@@ -109,6 +109,7 @@ const expectFail = async (name, fn) => { try { await fn(); bad(name, "was ACCEPT
 console.log(`committee (Phase 2) acceptance — L1=${L1_RPC}`);
 try {
   const ref = await program.account.marketAccount.fetch(REF_MARKET);
+  if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
   const base = Keypair.generate();
   M = pda(["market", base.publicKey, QUOTE]);
   await send(await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [base]);

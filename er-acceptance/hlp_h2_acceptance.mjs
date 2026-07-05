@@ -34,6 +34,7 @@ const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++
 
 console.log(`FLP H-2 live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
+if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const base = Keypair.generate();
 const M = pda(["market", base.publicKey, QUOTE]);
 const BOOK = pda(["market_book", M]);

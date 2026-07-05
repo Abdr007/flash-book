@@ -8,6 +8,7 @@ import fs from "fs";
 import os from "os";
 import anchor from "@coral-xyz/anchor";
 import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
+import { createAssociatedTokenAccountIdempotentInstruction, createTransferInstruction, getAssociatedTokenAddressSync } from "@solana/spl-token";
 const { Program, AnchorProvider, Wallet, BN } = anchor;
 
 const L1_RPC = process.env.L1_RPC || "https://api.devnet.solana.com";
@@ -36,6 +37,7 @@ const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++
 
 console.log(`FLP H-1 live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
+if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const params = ref.params;
 params.takerFeeBps = 0;   // no fee → taker needs no collateral
 params.makerRebateBps = 0; // keep maker_rebate ≤ taker_fee
@@ -53,11 +55,20 @@ const taker = Keypair.generate();
 await sendAs(signer, SystemProgram.transfer({ fromPubkey: signer.publicKey, toPubkey: taker.publicKey, lamports: 60_000_000 }));
 const TS = pda(["trader_state", taker.publicKey]);
 await sendAs(taker, await program.methods.openTraderState().accountsPartial({ trader: taker.publicKey, traderState: TS, systemProgram: sys }).instruction());
+// The intake gate requires initial margin even on a zero-fee market: fund the
+// taker's ATA from the signer and deposit collateral before the cross.
+const takerAta = getAssociatedTokenAddressSync(QUOTE, taker.publicKey);
+const signerAta = getAssociatedTokenAddressSync(QUOTE, signer.publicKey);
+const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const DEPOSIT = 1_000_000_000;
+await sendAs(signer, createAssociatedTokenAccountIdempotentInstruction(signer.publicKey, takerAta, taker.publicKey, QUOTE));
+await sendAs(signer, createTransferInstruction(signerAta, takerAta, signer.publicKey, DEPOSIT));
+await sendAs(taker, await program.methods.depositCollateral(new BN(DEPOSIT)).accountsPartial({ trader: taker.publicKey, traderState: TS, insuranceFund: INS, quoteMint: QUOTE, traderQuoteAta: takerAta, quoteVault: VAULT, tokenProgram: TOKEN_PROGRAM }).instruction());
 const TPOS = pda(["position", M, TS]);
 console.log(`  market ${M.toBase58()}\n`);
 
 console.log("1) taker crosses the FLP ask → a ring commitment is pushed (maker = FLP PDA)");
-await sendAs(taker, await program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
+await sendAs(taker, await program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
 
 console.log("2) a KEEPER settles via the ring path with fill_seq = u64::MAX → must SETTLE (seq ignored)");
 const U64MAX = new BN("18446744073709551615");
