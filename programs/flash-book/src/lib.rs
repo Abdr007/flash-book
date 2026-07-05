@@ -7058,9 +7058,8 @@ pub mod flash_book {
     /// Useful for UIs that need to display "next funding payment" before
     /// the rate crystallises in `settle_funding`.
     ///
-    /// Math is identical to `matcher::funding::advance`'s rate
-    /// computation: premium = (mark - oracle) * 10_000 / oracle; rate
-    /// = clamp(K * premium, ±rate_max_bps_per_sec).
+    /// Rate computation: premium = (mark - oracle) * 10_000 / oracle;
+    /// rate = clamp(K * premium, ±rate_max_bps_per_sec).
     pub fn view_predicted_funding(ctx: Context<ViewMarket>) -> Result<()> {
         let m = &ctx.accounts.market;
         let oracle = m.oracle_price_ticks as i128;

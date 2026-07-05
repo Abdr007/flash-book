@@ -641,7 +641,7 @@ pub fn default_scenarios(markets: &[Pubkey]) -> Vec<Scenario> {
 /// `maker_rebate_bps` is SIGNED (i32) — positive = rebate paid to
 /// maker, negative = fee charged to maker (retail tier 0).
 ///
-/// Same shape as `tiered_mmr_bps` — pure, no Solana types.
+/// Pure — no Solana types.
 pub fn resolve_fee_tier(
     default_maker_rebate_bps: i32,
     default_taker_fee_bps: u32,
@@ -897,7 +897,9 @@ mod isolated_margin_tests {
 /// properties that hold for ANY division result). Runs in the CI Kani job.
 #[cfg(kani)]
 mod mmr_kani_proofs {
-    use super::{effective_mmr_bps_full, oi_scaled_mmr_extra_bps};
+    use super::{oi_scaled_mmr_extra_bps, MarketSnapshot};
+    use crate::matcher::lot::Ticks;
+    use anchor_lang::prelude::Pubkey;
 
     /// The OI surcharge NEVER exceeds its configured cap — a crowded book cannot
     /// be charged more maintenance margin than governance bounded.
