@@ -4838,6 +4838,232 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
     assert_eq!(taker_p.size_lots, 1, "taker size 1 lot");
 }
 
+/// AUDIT F-3 migration: `upgrade_fill_commitment_v1` migrates a market's ring from
+/// v0 to v1 on real SVM (account grows to the v1 length, version byte stamped), and
+/// a v1 ring still settles a normal (non-reduce-only) fill correctly — i.e. the new
+/// version-gated settlement path (reduce_flag_take / inflight_sub) is inert for
+/// ordinary fills and does not regress the honest settle path.
+#[tokio::test]
+async fn f3_upgrade_fill_commitment_v1_and_v1_ring_settles_normally() {
+    use flash_book::matcher::fill_commitment as fc;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    // init book + arm the ring (v0, cap 256).
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitFillCommitment { cap: 256 },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // v0 baseline: version byte 0, length == v0 length.
+    let d0 = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
+    assert_eq!(d0.len(), fc::fill_commit_account_len(256), "v0 length");
+    assert_eq!(d0[29], 0, "fresh ring is v0");
+
+    // MIGRATE to v1 (authority = payer, drained ring).
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::UpgradeFillCommitmentV1 {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(fc_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .expect("v1 upgrade must succeed on a drained v0 ring");
+
+    // v1: grown to the v1 length, version byte stamped 1.
+    let d1 = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
+    assert_eq!(d1.len(), fc::fill_commit_account_len_v1(256), "v1 length");
+    assert_eq!(d1[29], 1, "ring is now v1");
+
+    // re-running the upgrade on a v1 ring reverts.
+    assert!(
+        send(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::UpgradeFillCommitmentV1 {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(fc_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            ),
+            &[&payer],
+        )
+        .await
+        .is_err(),
+        "double-upgrade of a v1 ring must revert"
+    );
+
+    // A NORMAL (non-reduce-only) fill still settles on the v1 ring: maker rests an
+    // ask, taker crosses, apply_fill drains it. Proves the v1-gated settlement path
+    // is inert for ordinary fills.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side: 1,
+                size_lots: 5,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(maker_state, false),
+                AccountMeta::new_readonly(program_id(), false),
+            ],
+        ),
+        &[&payer, &maker],
+    )
+    .await
+    .unwrap();
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceTakerOrderV2 {
+                side: 0,
+                size_lots: 1,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(taker_state, false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new(fc_pda, false),
+            ],
+        ),
+        &[&payer, &taker],
+    )
+    .await
+    .unwrap();
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ApplyFill {
+                size_lots: 1,
+                price_ticks: 100_000,
+                taker_side: 0,
+                taker_was_jit: false,
+                taker_sub_index: 0,
+                maker_sub_index: 0,
+                fill_seq: 1,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(insurance_fund_pda, false),
+                AccountMeta::new(taker_state, false),
+                AccountMeta::new(maker_state, false),
+                AccountMeta::new(taker_pos, false),
+                AccountMeta::new(maker_pos, false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(fc_pda, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .expect("honest committed fill must settle on a v1 ring");
+
+    // Ring drained (1,1) and the in-flight map is untouched (no reduce-only fill).
+    let d = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
+    let mut p = [0u8; 8];
+    p.copy_from_slice(&d[8..16]);
+    let mut s = [0u8; 8];
+    s.copy_from_slice(&d[16..24]);
+    assert_eq!(
+        (u64::from_le_bytes(p), u64::from_le_bytes(s)),
+        (1, 1),
+        "v1 ring settles the normal fill exactly once"
+    );
+    let taker_p: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(taker_p.side, 0);
+    assert_eq!(taker_p.size_lots, 1, "taker long 1 after settling on the v1 ring");
+}
+
 /// PERMISSIONLESS KEEPER (2026-07): on an ARMED market the commitment ring FULLY
 /// constrains settlement — `apply_fill` recomputes `keccak(fill_preimage)` (which
 /// binds both trader identities, side, size, price) and pops it FIFO. So a caller
