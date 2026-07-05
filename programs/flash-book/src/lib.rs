@@ -1761,6 +1761,19 @@ pub mod flash_book {
         // crossing orders may remain on the book, so the residual must NOT rest at
         // `limit_ticks` (it would cross the book). See the residual-rest guard.
         let mut walk_truncated = false;
+        // Bound NODES SCANNED, not just matches produced. The skip branches
+        // below (expired maker, self-match under STP, reduce-only capped to zero)
+        // keep walking WITHOUT pushing a match, so `matches.len() >= walk_limit`
+        // alone lets an attacker seed many near-front skip-only orders (cheap
+        // short-expiry GTTs, or reduce-only orders backed by no position) and
+        // make a later taker scan the whole grown arena — exhausting CU and
+        // DoSing the market's taker flow (the reduce-only branch also derives a
+        // PDA per scan). Capping the scan at a small multiple of `walk_limit`
+        // bounds that work; `walk_truncated` already prevents the residual from
+        // resting across the book, so partial-fill semantics stay correct. A
+        // legitimate cross reaches `walk_limit` matches within this budget.
+        let scan_limit = walk_limit.saturating_mul(4);
+        let mut scanned = 0usize;
 
         // Always walk to detect crossings. post_only check happens
         // AFTER — if matches were found, the order would cross, so
@@ -1768,6 +1781,11 @@ pub mod flash_book {
         // cross conditions.
         if side_is_bid {
             handle.for_each_ask_best_first(|idx, ask| {
+                scanned += 1;
+                if scanned > scan_limit {
+                    walk_truncated = true;
+                    return false;
+                }
                 if matches.len() >= walk_limit {
                     walk_truncated = true;
                     return false;
@@ -1839,6 +1857,11 @@ pub mod flash_book {
             });
         } else {
             handle.for_each_bid_best_first(|idx, bid| {
+                scanned += 1;
+                if scanned > scan_limit {
+                    walk_truncated = true;
+                    return false;
+                }
                 if matches.len() >= walk_limit {
                     walk_truncated = true;
                     return false;
