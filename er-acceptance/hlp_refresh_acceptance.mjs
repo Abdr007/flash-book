@@ -37,6 +37,7 @@ const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++
 
 console.log(`HLP increment-2 (auto-quoter) live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
+if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const ORACLE = 1000; // low so the ~8M global FLP capital yields non-zero levels
 const base = Keypair.generate();
 const M = pda(["market", base.publicKey, QUOTE]);
@@ -56,11 +57,14 @@ const sig1 = await send(await program.methods.flpRefreshQuotes().accountsPartial
 ok(!!sig1, `pool posted its on-book quote ladder LIVE — ${sig1.slice(0, 16)}…`);
 
 console.log("2) taker crosses the pool's best ask (bid 10× oracle to guarantee a cross)");
-await send(await program.methods.placeTakerOrderV2(0, new BN(1), new BN(ORACLE * 10), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
+await send(await program.methods.placeTakerOrderV2(0, new BN(1), new BN(ORACLE * 10), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: pda(["trader_state", signer.publicKey]), position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
 const r = await ring();
 ok(r.produced >= 1, `a taker crossed an AUTO-QUOTED FLP level → ring-committed FLP-maker fill (produced=${r.produced})`);
 
 console.log("3) re-quote (flp_refresh_quotes again) — cancel stale + repost");
+// Quotes still resting from stage 1 are rate-limited for FLP_REFRESH_MIN_SLOTS
+// (50 slots ≈ 20s); wait out the window so this exercises the STALE re-quote.
+await new Promise((r) => setTimeout(r, 25_000));
 const sig3 = await send(await program.methods.flpRefreshQuotes().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, flpExposure: FLP }).instruction());
 ok(!!sig3, `pool re-quoted (cancel stale + repost) LIVE — ${sig3.slice(0, 16)}…`);
 

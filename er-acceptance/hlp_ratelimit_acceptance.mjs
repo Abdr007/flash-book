@@ -36,6 +36,7 @@ const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++
 
 console.log(`HLP permissionless + rate-limit live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
+if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const base = Keypair.generate();
 const M = pda(["market", base.publicKey, QUOTE]);
 const BOOK = pda(["market_book", M]);
@@ -55,13 +56,13 @@ const refreshIx = (who) => program.methods.flpRefreshQuotes().accountsPartial({ 
 // tx signature; fetch its on-chain logs to confirm the SPECIFIC program error.
 const isRateLimited = async (e) => {
   const s = [e.message, JSON.stringify(e.logs || [])].join(" ");
-  if (/0x90b|RefreshTooSoon|Error Number: 2315/i.test(s)) return true;
+  if (/0x207b|0x90b|RefreshTooSoon|Error Number: 8315|Error Number: 2315/i.test(s)) return true;
   const m = String(e.message || e).match(/Transaction\s+([1-9A-HJ-NP-Za-km-z]{40,})/);
   if (m) {
     try {
       const t = await l1.getTransaction(m[1], { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
       const logs = (t?.meta?.logMessages || []).join(" ");
-      if (/0x90b|RefreshTooSoon|Error Number: 2315/i.test(logs)) return true;
+      if (/0x207b|0x90b|RefreshTooSoon|Error Number: 8315|Error Number: 2315/i.test(logs)) return true;
     } catch {}
   }
   return false;

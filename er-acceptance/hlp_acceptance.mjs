@@ -41,6 +41,7 @@ const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++
 
 console.log(`HLP live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
+if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const base = Keypair.generate();
 const M = pda(["market", base.publicKey, QUOTE]);
 const BOOK = pda(["market_book", M]);
@@ -57,7 +58,7 @@ const postSig = await send(await program.methods.flpPostMakerOrder(1, new BN(1),
 ok(!!postSig, `FLP maker order posted LIVE (BPF stack fix holds) — ${postSig.slice(0, 16)}…`);
 
 console.log("2) taker crosses: bid 1 @ 100_000 (place_taker_order_v2)");
-await send(await program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
+await send(await program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: pda(["trader_state", signer.publicKey]), position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
 
 console.log("3) verify the ring recorded the FLP-maker fill");
 const fcData = (await l1.getAccountInfo(FC)).data;

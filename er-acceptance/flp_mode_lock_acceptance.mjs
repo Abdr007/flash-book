@@ -60,6 +60,40 @@ const ok = (c, m) => {
 
 console.log(`FLP mode-lock live acceptance — L1=${L1_RPC}\n`);
 
+// ── Setup: the singleton deposit marks NAV across every LIVE FLP exposure
+// slot, so each registered market must ride in remaining_accounts with a
+// FRESH oracle. Leftover throwaway markets from prior acceptance runs may
+// have a zero staleness bound (pre-bound era) or a stale/absent oracle —
+// heal each: give it a real bound, ensure its envelope config exists, and
+// refresh the oracle at the current mark (zero price move). ──────────────────
+const exp = await program.account.flpExposureAccount.fetch(FLP);
+const liveMarkets = exp.perMarket.filter((s) => s.side !== 255).map((s) => s.market);
+console.log(`  (NAV walk spans ${liveMarkets.length} live exposure slot(s))`);
+for (const mkt of liveMarkets) {
+  const m = await program.account.marketAccount.fetch(mkt);
+  if (!m.params.oracleStalenessMaxSeconds) {
+    m.params.oracleStalenessMaxSeconds = 3600;
+    await send(
+      await program.methods.updateMarketParams(m.params).accountsPartial({ authority: signer.publicKey, market: mkt }).instruction(),
+    );
+  }
+  const env = pda(["envelope", mkt]);
+  if (!(await l1.getAccountInfo(env)))
+    await send(
+      await program.methods
+        .setEnvelopeConfig(14, new BN(100), new BN(10_000), 3_000, 50, new BN(1), new BN(100))
+        .accountsPartial({ authority: signer.publicKey, market: mkt, envelopeConfig: env, systemProgram: sys })
+        .instruction(),
+    );
+  await send(
+    await program.methods
+      .updateOracle(new BN(m.oraclePriceTicks.toString()), new BN(0), new BN(Math.floor(Date.now() / 1000) - 2))
+      .accountsPartial({ authority: signer.publicKey, market: mkt, envelopeConfig: env })
+      .instruction(),
+  );
+}
+const liveMetas = liveMarkets.map((m) => ({ pubkey: m, isSigner: false, isWritable: false }));
+
 // ── Positive: a singleton deposit claims/matches MODE_SINGLETON ──────────────
 const lpPos = pda(["lp_position", signer.publicKey]);
 let sig;
@@ -79,6 +113,7 @@ try {
         tokenProgram: TOKEN,
         systemProgram: sys,
       })
+      .remainingAccounts(liveMetas)
       .instruction(),
   );
   ok(true, `singleton deposit_flp_capital ALLOWED (claims MODE_SINGLETON) — ${sig}`);

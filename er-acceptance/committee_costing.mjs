@@ -47,6 +47,7 @@ const bftThreshold = (n) => Math.floor((2 * n) / 3) + 1;
 
 console.log(`committee costing — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
+if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const base = Keypair.generate();
 const M = pda(["market", base.publicKey, QUOTE]);
 await sendCU([await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction()], [base]);
