@@ -82,6 +82,34 @@ pub fn check_simple_withdraw(collateral: u64, amount: u64, er_reserved: u64) -> 
     Ok(())
 }
 
+/// Resolve the ER reserved margin a collateral-releasing path must leave
+/// behind on the source trader_state. Fail-closed in both directions: an
+/// ER-active source (live attested reservation) must supply its own bound
+/// attestation, and a supplied attestation must belong to the source — a
+/// stranger's (or stale sub-account's) attestation can never understate the
+/// reservation. A source that was never attested (or attested back to zero)
+/// reserves nothing.
+pub fn resolve_er_reserved(
+    source_state: Pubkey,
+    source_er_active: u8,
+    attestation: Option<&ErMarginAttestation>,
+) -> Result<u64> {
+    match attestation {
+        Some(a) => {
+            require_keys_eq!(
+                a.trader_state,
+                source_state,
+                FlashBookError::ErMarginAccountMismatch
+            );
+            Ok(a.reserved_margin_quote_lots)
+        }
+        None => {
+            require!(source_er_active == 0, FlashBookError::UseXDomainWithdraw);
+            Ok(0)
+        }
+    }
+}
+
 /// Cross-domain required-collateral floor for the PARTIAL withdraw path (trader
 /// has filled positions). The existing gate requires post-withdrawal collateral
 /// `>= max(im_required, notional_floor)`; the cross-domain variant adds the ER
@@ -128,6 +156,34 @@ mod tests {
     }
 
     #[test]
+    fn resolve_er_reserved_binds_attestation_and_fails_closed() {
+        let state = Pubkey::new_from_array([7u8; 32]);
+        let other = Pubkey::new_from_array([8u8; 32]);
+        let att = |ts: Pubkey, reserved: u64| ErMarginAttestation {
+            trader_state: ts,
+            attestor: Pubkey::default(),
+            reserved_margin_quote_lots: reserved,
+            epoch: 1,
+            bump: 0,
+        };
+        // Bound attestation ⇒ its reservation, verbatim (even when zero).
+        assert_eq!(
+            resolve_er_reserved(state, 1, Some(&att(state, 42))).unwrap(),
+            42
+        );
+        assert_eq!(
+            resolve_er_reserved(state, 0, Some(&att(state, 0))).unwrap(),
+            0
+        );
+        // A stranger's attestation can never understate the reservation.
+        assert!(resolve_er_reserved(state, 1, Some(&att(other, 0))).is_err());
+        // ER-active with no attestation supplied ⇒ fail closed.
+        assert!(resolve_er_reserved(state, 1, None).is_err());
+        // Never attested ⇒ nothing reserved.
+        assert_eq!(resolve_er_reserved(state, 0, None).unwrap(), 0);
+    }
+
+    #[test]
     fn required_floor_adds_reserved_on_top_of_max() {
         // base = max(im, floor); +er_reserved.
         assert_eq!(required_collateral_with_er(30, 50, 20), 70);
@@ -169,6 +225,37 @@ mod xmargin_kani_proofs {
         if let Ok(next) = advance_epoch(current, proposed) {
             assert!(next > current);
             assert!(next == proposed);
+        }
+    }
+
+    /// FAIL-CLOSED: the reservation resolver never understates the attested
+    /// reserve — with an attestation it returns the bound reservation verbatim
+    /// (or rejects a foreign one), and without one it only ever returns 0 for a
+    /// source that is provably not ER-active.
+    #[kani::proof]
+    fn resolve_er_reserved_never_understates() {
+        let state = Pubkey::new_from_array(kani::any());
+        let er_active: u8 = kani::any();
+        let supplied: bool = kani::any();
+        let att = ErMarginAttestation {
+            trader_state: Pubkey::new_from_array(kani::any()),
+            attestor: Pubkey::new_from_array([0u8; 32]),
+            reserved_margin_quote_lots: kani::any(),
+            epoch: kani::any(),
+            bump: kani::any(),
+        };
+        let attestation = if supplied { Some(&att) } else { None };
+        if let Ok(reserved) = resolve_er_reserved(state, er_active, attestation) {
+            match attestation {
+                Some(a) => {
+                    assert!(a.trader_state == state);
+                    assert!(reserved == a.reserved_margin_quote_lots);
+                }
+                None => {
+                    assert!(er_active == 0);
+                    assert!(reserved == 0);
+                }
+            }
         }
     }
 

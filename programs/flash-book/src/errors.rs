@@ -232,7 +232,7 @@ pub enum FlashBookError {
     #[msg("Withdrawal would leave collateral below the ER-reserved margin for resting orders")]
     ErMarginReserved = 2301,
     #[msg(
-        "Trader is ER-active: collateral withdrawals must use the cross-domain (xdomain) variant"
+        "Trader is ER-active: collateral release must carry the ER margin attestation (xdomain withdraw variant, or the er_margin account on transfers/sweep)"
     )]
     UseXDomainWithdraw = 2302,
     #[msg("Signer is not the authorized attestor for this ER margin attestation")]

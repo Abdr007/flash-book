@@ -12887,6 +12887,18 @@
         {
           "name": "to_state",
           "writable": true
+        },
+        {
+          "name": "er_margin",
+          "docs": [
+            "The SOURCE account's ER reserved-margin attestation. Mandatory whenever",
+            "the source is ER-active (the handler fails closed without it); the",
+            "handler binds it to `from_state`, and the attested reservation must",
+            "stay behind after the sweep. Callers walking positions in",
+            "remaining_accounts must pass the program id here when the source has no",
+            "attestation, so the walk pairs stay aligned."
+          ],
+          "optional": true
         }
       ],
       "args": [
@@ -12957,6 +12969,16 @@
         {
           "name": "sub_trader_state",
           "writable": true
+        },
+        {
+          "name": "er_margin",
+          "docs": [
+            "The SOURCE account's ER reserved-margin attestation. Mandatory whenever",
+            "the source is ER-active (the handler fails closed without it); the",
+            "handler binds it to the source trader_state, and the attested",
+            "reservation must stay behind after the transfer."
+          ],
+          "optional": true
         }
       ],
       "args": [
@@ -13086,6 +13108,16 @@
         {
           "name": "sub_trader_state",
           "writable": true
+        },
+        {
+          "name": "er_margin",
+          "docs": [
+            "The SOURCE account's ER reserved-margin attestation. Mandatory whenever",
+            "the source is ER-active (the handler fails closed without it); the",
+            "handler binds it to the source trader_state, and the attested",
+            "reservation must stay behind after the transfer."
+          ],
+          "optional": true
         }
       ],
       "args": [
@@ -18662,7 +18694,7 @@
     {
       "code": 8302,
       "name": "UseXDomainWithdraw",
-      "msg": "Trader is ER-active: collateral withdrawals must use the cross-domain (xdomain) variant"
+      "msg": "Trader is ER-active: collateral release must carry the ER margin attestation (xdomain withdraw variant, or the er_margin account on transfers/sweep)"
     },
     {
       "code": 8303,

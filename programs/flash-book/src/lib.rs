@@ -3220,11 +3220,16 @@ pub mod flash_book {
             main.open_positions == 0,
             FlashBookError::OpenInterestCapExceeded
         );
-        // Collateral backing live ER resting orders is
-        // locked by `er_active` on the ATTESTED account. Moving it off-account
-        // (even to a sub) would leave those orders unbacked once they fill. Fail
-        // closed exactly like `withdraw_collateral` (lib.rs) does.
-        require!(main.er_active == 0, FlashBookError::UseXDomainWithdraw);
+        // Collateral backing live ER resting orders stays behind: the source
+        // must keep at least its attested reservation after the transfer.
+        // Moving reserved margin off-account (even to a sub) would leave those
+        // orders unbacked once they fill.
+        let er_reserved = xmargin::resolve_er_reserved(
+            ctx.accounts.main_trader_state.key(),
+            main.er_active,
+            ctx.accounts.er_margin.as_deref(),
+        )?;
+        xmargin::check_simple_withdraw(main.collateral_quote_lots, amount, er_reserved)?;
         main.collateral_quote_lots = main
             .collateral_quote_lots
             .checked_sub(amount)
@@ -3265,9 +3270,15 @@ pub mod flash_book {
             sub.open_positions == 0,
             FlashBookError::OpenInterestCapExceeded
         );
-        // Don't let collateral backing live ER resting
-        // orders leave the attested (sub) account. Fail closed like withdraw.
-        require!(sub.er_active == 0, FlashBookError::UseXDomainWithdraw);
+        // Collateral backing live ER resting orders stays behind on the
+        // attested (sub) source: the transfer must leave at least the
+        // reservation.
+        let er_reserved = xmargin::resolve_er_reserved(
+            ctx.accounts.sub_trader_state.key(),
+            sub.er_active,
+            ctx.accounts.er_margin.as_deref(),
+        )?;
+        xmargin::check_simple_withdraw(sub.collateral_quote_lots, amount, er_reserved)?;
         sub.collateral_quote_lots = sub
             .collateral_quote_lots
             .checked_sub(amount)
@@ -3482,7 +3493,7 @@ pub mod flash_book {
             FlashBookError::OutOfRange
         );
         let signer = ctx.accounts.authority.key();
-        let (from_trader, from_open_positions, from_collateral) = {
+        let (from_trader, from_open_positions, from_collateral, from_er_active) = {
             let from = ctx.accounts.from_state.load()?;
             let to = ctx.accounts.to_state.load()?;
             require!(from.trader != to.trader, FlashBookError::OutOfRange);
@@ -3493,11 +3504,24 @@ pub mod flash_book {
             // destination must still be authorized for the signer.
             require!(signer == from.trader, FlashBookError::Unauthorized);
             require!(to.is_authorized(&signer), FlashBookError::Unauthorized);
-            // Don't sweep collateral backing live ER
-            // resting orders off the attested account. Fail closed like withdraw.
-            require!(from.er_active == 0, FlashBookError::UseXDomainWithdraw);
-            (from.trader, from.open_positions, from.collateral_quote_lots)
+            (
+                from.trader,
+                from.open_positions,
+                from.collateral_quote_lots,
+                from.er_active,
+            )
         };
+
+        // Collateral backing live ER resting orders stays behind: the sweep
+        // must leave at least the source's attested reservation.
+        let er_reserved = xmargin::resolve_er_reserved(
+            ctx.accounts.from_state.key(),
+            from_er_active,
+            ctx.accounts.er_margin.as_deref(),
+        )?;
+        if from_open_positions == 0 {
+            xmargin::check_simple_withdraw(from_collateral, amount, er_reserved)?;
+        }
 
         // Position-aware margin gate. If source has open positions:
         //   1. Walk remaining_accounts as [market, position] pairs.
@@ -3592,9 +3616,15 @@ pub mod flash_book {
                 });
                 market_keys.push(market_ai.key());
             }
+            // The ER reservation is not available to back filled positions:
+            // assess health on what remains after both the sweep and the
+            // reservation are set aside.
+            let assessable_collateral = post_sweep_collateral
+                .checked_sub(er_reserved)
+                .ok_or_else(|| error!(FlashBookError::ErMarginReserved))?;
             let scenarios = default_scenarios_fn(&market_keys);
             let assessment =
-                assess_margin_unified_fn(&snaps, &market_snaps, &scenarios, post_sweep_collateral)?;
+                assess_margin_unified_fn(&snaps, &market_snaps, &scenarios, assessable_collateral)?;
             require!(assessment.is_healthy, FlashBookError::TraderLiquidatable);
         }
 
@@ -15290,6 +15320,12 @@ pub struct TransferBetweenSubAccounts<'info> {
         constraint = sub_trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
     )]
     pub sub_trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    /// The SOURCE account's ER reserved-margin attestation. Mandatory whenever
+    /// the source is ER-active (the handler fails closed without it); the
+    /// handler binds it to the source trader_state, and the attested
+    /// reservation must stay behind after the transfer.
+    pub er_margin: Option<Account<'info, xmargin::ErMarginAttestation>>,
 }
 
 #[derive(Accounts)]
@@ -15388,6 +15424,14 @@ pub struct SweepCollateral<'info> {
 
     #[account(mut)]
     pub to_state: AccountLoader<'info, TraderStateAccount>,
+
+    /// The SOURCE account's ER reserved-margin attestation. Mandatory whenever
+    /// the source is ER-active (the handler fails closed without it); the
+    /// handler binds it to `from_state`, and the attested reservation must
+    /// stay behind after the sweep. Callers walking positions in
+    /// remaining_accounts must pass the program id here when the source has no
+    /// attestation, so the walk pairs stay aligned.
+    pub er_margin: Option<Account<'info, xmargin::ErMarginAttestation>>,
 }
 
 #[derive(Accounts)]

@@ -11230,6 +11230,280 @@ async fn partial_withdraw_xdomain_adds_reserved_to_floor() {
 }
 
 #[tokio::test]
+async fn sub_account_transfers_respect_er_reservation() {
+    // An ER-active main account can move its FREE balance to a sub mid-session,
+    // but the attested reservation must stay behind, and the attestation
+    // account is mandatory while ER-active.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let trader = Keypair::new();
+    let attestor = Keypair::new();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let main_state = setup_trader(&mut ctx, &payer, &trader, 100_000, &protocol).await;
+    let er_margin =
+        init_er_margin(&mut ctx, &payer, &protocol, main_state, attestor.pubkey()).await;
+
+    let sub_index: u8 = 1;
+    let (sub_state, _) = pda(&[
+        TraderStateAccount::SEED,
+        trader.pubkey().as_ref(),
+        &[sub_index],
+    ]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::OpenTraderSubAccount { sub_index },
+                vec![
+                    AccountMeta::new(trader.pubkey(), true),
+                    AccountMeta::new(sub_state, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[attest_ix(
+                er_margin,
+                main_state,
+                attestor.pubkey(),
+                60_000,
+                1,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &attestor],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // The optional er_margin slot: None is written as the program id.
+    let transfer = |amount: u64, with_attestation: bool| {
+        build_ix(
+            flash_book::instruction::TransferMainToSub { sub_index, amount },
+            vec![
+                AccountMeta::new_readonly(trader.pubkey(), true),
+                AccountMeta::new(main_state, false),
+                AccountMeta::new(sub_state, false),
+                AccountMeta::new_readonly(
+                    if with_attestation {
+                        er_margin
+                    } else {
+                        program_id()
+                    },
+                    false,
+                ),
+            ],
+        )
+    };
+
+    // ER-active source with no attestation account ⇒ fail closed.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let missing = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[transfer(10_000, false)],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(
+        missing.is_err(),
+        "ER-active transfer must require the attestation account"
+    );
+
+    // 41_000 would leave 59_000 < 60_000 reserved ⇒ reject.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let over = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[transfer(41_000, true)],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await;
+    assert!(
+        over.is_err(),
+        "transfer below the ER reservation must be rejected"
+    );
+
+    // 40_000 leaves exactly 60_000 == reserved ⇒ ok, mid-session.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[transfer(40_000, true)],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let main: TraderStateAccount = fetch(&mut ctx.banks_client, main_state).await;
+    let sub: TraderStateAccount = fetch(&mut ctx.banks_client, sub_state).await;
+    assert_eq!(main.collateral_quote_lots, 60_000);
+    assert_eq!(sub.collateral_quote_lots, 40_000);
+
+    // The sub is NOT ER-active: it needs no attestation to move funds back.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::TransferSubToMain {
+                    sub_index,
+                    amount: 40_000,
+                },
+                vec![
+                    AccountMeta::new_readonly(trader.pubkey(), true),
+                    AccountMeta::new(main_state, false),
+                    AccountMeta::new(sub_state, false),
+                    AccountMeta::new_readonly(program_id(), false),
+                ],
+            )],
+            Some(&trader.pubkey()),
+            &[&trader],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let main: TraderStateAccount = fetch(&mut ctx.banks_client, main_state).await;
+    assert_eq!(main.collateral_quote_lots, 100_000);
+}
+
+#[tokio::test]
+async fn sweep_respects_er_reservation() {
+    // Sweeping collateral to another wallet's account honors the source's
+    // attested ER reservation, exactly like a withdrawal.
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let from = Keypair::new();
+    let to = Keypair::new();
+    let attestor = Keypair::new();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let from_state = setup_trader(&mut ctx, &payer, &from, 100_000, &protocol).await;
+    let to_state = setup_trader(&mut ctx, &payer, &to, 0, &protocol).await;
+    // Authorize `from` on the destination so the sweep's dual-authorization
+    // gate passes.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::SetTraderDelegate {
+                    new_delegate: from.pubkey(),
+                },
+                vec![
+                    AccountMeta::new_readonly(to.pubkey(), true),
+                    AccountMeta::new(to_state, false),
+                ],
+            )],
+            Some(&to.pubkey()),
+            &[&to],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let er_margin =
+        init_er_margin(&mut ctx, &payer, &protocol, from_state, attestor.pubkey()).await;
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[attest_ix(
+                er_margin,
+                from_state,
+                attestor.pubkey(),
+                60_000,
+                1,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &attestor],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // The optional er_margin slot: None is written as the program id.
+    let sweep = |amount: u64, with_attestation: bool| {
+        build_ix(
+            flash_book::instruction::SweepCollateral { amount },
+            vec![
+                AccountMeta::new_readonly(from.pubkey(), true),
+                AccountMeta::new(from_state, false),
+                AccountMeta::new(to_state, false),
+                AccountMeta::new_readonly(
+                    if with_attestation {
+                        er_margin
+                    } else {
+                        program_id()
+                    },
+                    false,
+                ),
+            ],
+        )
+    };
+
+    // ER-active source with no attestation account ⇒ fail closed.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let missing = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[sweep(10_000, false)],
+            Some(&from.pubkey()),
+            &[&from],
+            bh,
+        ))
+        .await;
+    assert!(
+        missing.is_err(),
+        "ER-active sweep must require the attestation account"
+    );
+
+    // 41_000 would leave 59_000 < 60_000 reserved ⇒ reject.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let over = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[sweep(41_000, true)],
+            Some(&from.pubkey()),
+            &[&from],
+            bh,
+        ))
+        .await;
+    assert!(
+        over.is_err(),
+        "sweep below the ER reservation must be rejected"
+    );
+
+    // 40_000 leaves exactly 60_000 == reserved ⇒ ok, mid-session.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[sweep(40_000, true)],
+            Some(&from.pubkey()),
+            &[&from],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let f: TraderStateAccount = fetch(&mut ctx.banks_client, from_state).await;
+    let t: TraderStateAccount = fetch(&mut ctx.banks_client, to_state).await;
+    assert_eq!(f.collateral_quote_lots, 60_000);
+    assert_eq!(t.collateral_quote_lots, 40_000);
+}
+
+#[tokio::test]
 async fn deposit_collateral_session_funds_owner_margin() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
