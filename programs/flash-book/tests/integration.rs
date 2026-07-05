@@ -2751,6 +2751,147 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
     assert_eq!(market.oi_short_lots, 1);
 }
 
+/// A deposit prices shares on NAV inclusive of open-inventory unrealized PnL.
+/// The FLP takes the short side of a taker buy @ 102_000, so it carries a +2000
+/// unrealized gain at the 100_000 oracle. A 1_000_000 deposit then mints FEWER
+/// than the 1_000_000 shares a realized-only NAV would mint (closing the
+/// JIT-depositor dilution), and omitting the open market fails closed.
+#[tokio::test]
+async fn deposit_flp_capital_prices_on_mark_to_market_nav() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    disarm_fill_commitment(&mut ctx, market_pda).await;
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+
+    // FLP short 1 @ 102_000 via a taker buy — a +2000 gain at the 100_000 oracle.
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let fill = build_ix(
+        flash_book::instruction::ApplyFlpFill {
+            size_lots: 1,
+            price_ticks: 102_000,
+            taker_side: 0,
+            taker_sub_index: 0,
+            fill_seq: 1,
+            taker_was_jit: false,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[fill],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Fresh LP.
+    let lp = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &lp.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let lp_ata = create_ata(&mut ctx, &payer, lp.pubkey(), protocol.quote_mint).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp_ata, 10_000_000).await;
+    let (lp_position, _) = pda(&[
+        flash_book::state::LpPositionAccount::SEED,
+        lp.pubkey().as_ref(),
+    ]);
+    let (flp_mode, _) = pda(&[flash_book::state::FlpModeAccount::SEED]);
+    let dep_metas = vec![
+        AccountMeta::new(lp.pubkey(), true),
+        AccountMeta::new(protocol.flp_exposure, false),
+        AccountMeta::new(lp_position, false),
+        AccountMeta::new(flp_mode, false),
+        AccountMeta::new_readonly(protocol.insurance_fund, false),
+        AccountMeta::new_readonly(protocol.quote_mint, false),
+        AccountMeta::new(lp_ata, false),
+        AccountMeta::new(protocol.quote_vault, false),
+        AccountMeta::new_readonly(spl_token_id(), false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ];
+
+    // Without the open market account → fail closed (MissingMarketAccount).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let missing = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::DepositFlpCapital {
+                    amount_quote_lots: 1_000_000,
+                },
+                dep_metas.clone(),
+            )],
+            Some(&lp.pubkey()),
+            &[&lp],
+            bh,
+        ))
+        .await;
+    assert!(
+        format!("{missing:?}").contains("Custom(7212)"),
+        "deposit with open inventory must require the open market account, got: {missing:?}"
+    );
+
+    // With the open market appended → succeeds, MtM-priced (fewer shares).
+    let mut with_market = dep_metas;
+    with_market.push(AccountMeta::new_readonly(market_pda, false));
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::DepositFlpCapital {
+                    amount_quote_lots: 1_000_000,
+                },
+                with_market,
+            )],
+            Some(&lp.pubkey()),
+            &[&lp],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let pos: flash_book::state::LpPositionAccount = fetch(&mut ctx.banks_client, lp_position).await;
+    assert!(
+        pos.shares < 1_000_000 && pos.shares > 990_000,
+        "MtM NAV (> realized) must mint slightly FEWER than 1M shares (~999_600), got {}",
+        pos.shares
+    );
+}
+
 /// HLP (1b) — the POOL-BACKED CLOB full loop: the FLP pool posts a resting maker
 /// quote on the book (`flp_post_maker_order`, owner = the flp_exposure PDA); a
 /// taker crosses it via `place_taker_order_v2`, which pushes a STANDARD fill
