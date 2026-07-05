@@ -403,6 +403,14 @@ pub struct MarketAccount {
     /// the ring's FIFO produce/settle lifecycle, so it self-balances (cancels
     /// produce no fills). Trailing field ⇒ existing accounts read it as 0.
     pub unsettled_fill_volume: u64,
+
+    /// True while the book is delegated to the ER. Set by `delegate_market_book`,
+    /// cleared by `clear_book_delegation` when the book is back on L1. Order
+    /// placement requires the trader's `er_trading_armed` when this is true, so
+    /// an ER order can never be backed by withdrawable collateral. Fail closed:
+    /// a stale `true` only over-requires arming (safe). Trailing field ⇒ existing
+    /// accounts read it as `false`.
+    pub book_delegated: bool,
 }
 
 /// Optional emergency guardian for one market, held in a SEPARATE PDA (not a

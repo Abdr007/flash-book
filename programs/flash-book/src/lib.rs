@@ -632,6 +632,7 @@ pub mod flash_book {
         // escape: even if the sequencer never posts a fill, the censorship
         // timeout starts ticking from here.
         ctx.accounts.market.book_delegated_at_slot = Clock::get()?.slot;
+        ctx.accounts.market.book_delegated = true;
 
         emit!(MarketBookDelegatedEvent {
             market: market_key,
@@ -1523,6 +1524,15 @@ pub mod flash_book {
     ) -> Result<()> {
         // Hot-path validation: collapsed branches, single Clock::get().
         let market = &ctx.accounts.market;
+        // Mandatory ER-trading arm while the book is delegated (see
+        // place_limit_v2_core): an ER order can never be backed by withdrawable
+        // collateral. L1 orders are unaffected.
+        if market.book_delegated {
+            require!(
+                ctx.accounts.trader_state.load()?.er_trading_armed == 1,
+                FlashBookError::ErTradingArmed
+            );
+        }
         let now_slot = Clock::get()?.slot;
 
         if side > 1
@@ -6028,6 +6038,26 @@ pub mod flash_book {
     ///   Active → PostOnly: existing positions trade; new takers blocked
     ///   Active → Paused:   no order intake; existing positions held
     ///   Any → Closed:      terminal sunset; only liquidation + close
+    /// Clear the `book_delegated` flag once the market's book is back on L1
+    /// (undelegated). Authority-gated. Until called, the flag stays `true` and
+    /// order placement keeps requiring the armed lock — fail closed, never a
+    /// fund risk, only an over-requirement of arming while stale.
+    pub fn clear_book_delegation(ctx: Context<ClearBookDelegation>) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+        // The book PDA must actually be back under this program (not delegated).
+        require_keys_eq!(
+            *ctx.accounts.market_book.owner,
+            *ctx.program_id,
+            FlashBookError::AlreadyDelegated
+        );
+        ctx.accounts.market.book_delegated = false;
+        Ok(())
+    }
+
     pub fn set_market_status(ctx: Context<SetMarketStatus>, new_status: u8) -> Result<()> {
         require!(new_status <= 4, FlashBookError::OutOfRange);
         let caller = ctx.accounts.authority.key();
@@ -13109,6 +13139,18 @@ fn place_limit_v2_core(
     // initial-margin gate (None ⇒ treated as a full open — strictest).
     position: Option<&AccountLoader<'_, state::PositionAccount>>,
 ) -> Result<()> {
+    // Mandatory ER-trading arm: while the book is delegated to the ER, the
+    // collateral backing this order settles asynchronously and could otherwise
+    // be withdrawn before the fill lands. Requiring the armed lock (which fails
+    // all withdrawals closed) makes that double-spend impossible, with zero
+    // sequencer trust. L1 (undelegated) orders settle against authoritative
+    // collateral and are unaffected.
+    if market.book_delegated {
+        require!(
+            trader_state.load()?.er_trading_armed == 1,
+            FlashBookError::ErTradingArmed
+        );
+    }
     // Bind the (trader, sub_index) TraderState at INTAKE. The
     // matcher commits this exact (trader, sub_index) into the fill-commitment ring,
     // and `apply_fill` later HARD-loads that TraderState to settle the fill. If the
@@ -15493,6 +15535,24 @@ pub struct UpdateMarketAuthority<'info> {
 /// guardian PDA is OPTIONAL — supplied for a guardian-restrict call, omitted for an
 /// authority call. Kept separate from `UpdateMarketAuthority` so the guardian
 /// account doesn't leak into the other authority-only handlers that share it.
+#[derive(Accounts)]
+pub struct ClearBookDelegation<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+    /// CHECK: the market's book PDA; the handler requires it to be
+    /// program-owned (undelegated) before clearing the flag.
+    #[account(
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
 #[derive(Accounts)]
 pub struct SetMarketStatus<'info> {
     pub authority: Signer<'info>,
