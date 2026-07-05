@@ -2861,18 +2861,79 @@ pub mod flash_book {
             FlashBookError::RateLimited
         );
 
+        // Value the burn on NAV inclusive of any unrealized inventory LOSS,
+        // symmetric with deposit. Deposit prices shares at `nav + mtm`; pricing
+        // withdrawal at realized-only `nav` would let a depositor mint cheap
+        // shares while the pool is underwater (mtm < 0) and redeem them at the
+        // higher realized NAV after the min-hold, extracting the standing LPs'
+        // unrealized drawdown. Charging `min(mtm, 0)` on exit closes that
+        // arbitrage while never paying out uncashed unrealized GAINS (the payout
+        // stays ≤ the realized claim the vault holds, so conservation is
+        // preserved). Uses the L1 oracle (not the ER mark), so it is
+        // ER-stall-independent and fails closed on a stale oracle exactly as
+        // deposit does; a flat pool (markets_count == 0) needs no oracle and
+        // withdraws realized-only, unchanged.
+        let mtm: i128 = {
+            let flp_ro = &ctx.accounts.flp_exposure;
+            if flp_ro.markets_count == 0 {
+                0
+            } else {
+                let now = Clock::get()?.unix_timestamp.max(0) as u64;
+                let mut sum: i128 = 0;
+                let mut matched: u8 = 0;
+                for slot in flp_ro.per_market.iter() {
+                    if slot.side == 255 {
+                        continue;
+                    }
+                    let market_ai = ctx
+                        .remaining_accounts
+                        .iter()
+                        .find(|ai| ai.key() == slot.market)
+                        .ok_or_else(|| error!(FlashBookError::MissingMarketAccount))?;
+                    let m_data = market_ai.try_borrow_data()?;
+                    let m_state = MarketAccount::try_deserialize(&mut &m_data[..])?;
+                    let oracle = m_state.oracle_price_ticks;
+                    let max_age = m_state.params.oracle_staleness_max_seconds as u64;
+                    let published = m_state.oracle_published_at_unix_seconds;
+                    require!(
+                        oracle > 0 && published > 0 && now.saturating_sub(published) <= max_age,
+                        FlashBookError::OracleTooStale
+                    );
+                    sum = sum.saturating_add(flp_slot_unrealized_pnl(
+                        slot.side,
+                        slot.size_lots,
+                        slot.entry_price_ticks,
+                        oracle,
+                        m_state.params.tick_size,
+                    ));
+                    matched += 1;
+                }
+                require!(
+                    matched == flp_ro.markets_count,
+                    FlashBookError::MissingMarketAccount
+                );
+                sum
+            }
+        };
+
         let flp_ro = &ctx.accounts.flp_exposure;
         let nav = flp_ro.nav();
         require!(nav > 0, FlashBookError::InsufficientCollateral);
+        // Exit price = realized NAV minus any unrealized inventory loss. Never
+        // adds unrealized gain, so the payout can never exceed the realized claim
+        // the vault backs.
+        let pricing_nav_i128 = nav.saturating_add(mtm.min(0));
+        require!(pricing_nav_i128 > 0, FlashBookError::FlpPoolInsolvent);
+        let pricing_nav = pricing_nav_i128 as u128;
         let shares_outstanding = flp_ro.lp_shares_outstanding;
         require!(
             shares_outstanding > 0,
             FlashBookError::InsufficientCollateral
         );
 
-        // amount = shares_to_burn × NAV / shares_outstanding
+        // amount = shares_to_burn × pricing_nav / shares_outstanding
         let prod = (shares_to_burn as u128)
-            .checked_mul(nav as u128)
+            .checked_mul(pricing_nav)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         let amount_u128 = prod / (shares_outstanding as u128);
         require!(

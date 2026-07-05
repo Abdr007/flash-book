@@ -2325,6 +2325,145 @@ async fn flp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure()
     );
 }
 
+/// Withdrawal prices the burn on NAV inclusive of the pool's unrealized
+/// inventory LOSS (symmetric with deposit's mark-to-market pricing), so an LP
+/// cannot redeem at the higher realized-only NAV while the pool is underwater
+/// and thereby extract the standing LPs' unrealized drawdown. Inject a
+/// 10_000-quote-lot unrealized loss (FLP long 1 @ 100_000, oracle 90_000,
+/// tick 1) into a 5_000_000-capital / 5_000_000-share pool, then burn
+/// 1_000_000 shares: realized-only pricing would pay 1_000_000, but the
+/// mark-to-market haircut pays 1_000_000 · 4_990_000 / 5_000_000 = 998_000.
+#[tokio::test]
+async fn withdraw_flp_capital_charges_unrealized_loss() {
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    // Payer (treasury) holds 5_000_000 shares against 5_000_000 capital.
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+
+    // Inject an underwater FLP long: 1 lot @ entry 100_000, priced at oracle
+    // 90_000 ⇒ unrealized loss of 10_000 quote lots.
+    let flp_acc = ctx
+        .banks_client
+        .get_account(protocol.flp_exposure)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut flp_state =
+        flash_book::state::FlpExposureAccount::try_deserialize(&mut flp_acc.data.as_slice())
+            .unwrap();
+    flp_state.markets_count = 1;
+    flp_state.per_market[0] = flash_book::state::FlpMarketExposure {
+        market: to_anchor(market_pda),
+        side: 0, // long
+        size_lots: 1,
+        entry_price_ticks: 100_000,
+    };
+    let mut nd = Vec::new();
+    flp_state.try_serialize(&mut nd).unwrap();
+    nd.resize(flp_acc.data.len(), 0);
+    ctx.set_account(
+        &protocol.flp_exposure,
+        &SolAccount {
+            lamports: flp_acc.lamports,
+            data: nd,
+            owner: flp_acc.owner,
+            executable: flp_acc.executable,
+            rent_epoch: flp_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    // Overwrite the market: oracle & mark at 90_000, tick 1, and a large
+    // staleness window so the oracle stays fresh across the min-hold warp.
+    let m_acc = ctx
+        .banks_client
+        .get_account(market_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut m_state =
+        flash_book::state::MarketAccount::try_deserialize(&mut m_acc.data.as_slice()).unwrap();
+    m_state.oracle_price_ticks = 90_000;
+    m_state.mark_price_ticks = 90_000;
+    m_state.oracle_published_at_unix_seconds = 1;
+    m_state.params.oracle_staleness_max_seconds = u32::MAX;
+    m_state.params.tick_size = 1;
+    let mut nmd = Vec::new();
+    m_state.try_serialize(&mut nmd).unwrap();
+    nmd.resize(m_acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: m_acc.lamports,
+            data: nmd,
+            owner: m_acc.owner,
+            executable: m_acc.executable,
+            rent_epoch: m_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    // Advance past the FLP minimum hold so the withdraw is not rate-limited.
+    ctx.warp_to_slot(1_000).unwrap();
+
+    let auth_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
+    let (auth_pos, _) = pda(&[
+        flash_book::state::LpPositionAccount::SEED,
+        payer.pubkey().as_ref(),
+    ]);
+    let withdraw_ix = Instruction {
+        program_id: program_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(auth_pos, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(auth_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(market_pda, false),
+        ],
+        data: flash_book::instruction::WithdrawFlpCapital {
+            shares_to_burn: 1_000_000,
+        }
+        .data(),
+    };
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[withdraw_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // The LP received the haircut payout (998_000), not the realized-only
+    // 1_000_000 — the 2_000 difference is their pro-rata share of the pool's
+    // 10_000 unrealized loss, left behind for the standing LPs.
+    let ata_after = ctx
+        .banks_client
+        .get_account(auth_ata)
+        .await
+        .unwrap()
+        .unwrap();
+    let ata_state =
+        <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(
+            &ata_after.data,
+        )
+        .unwrap();
+    assert_eq!(
+        ata_state.amount, 998_000,
+        "withdraw must charge the unrealized loss (haircut NAV), not pay realized-only"
+    );
+}
+
 #[tokio::test]
 async fn lp_units_withdraw_rejects_other_lps_shares() {
     // Bob cannot burn Alice's shares — the lp_position constraint enforces
