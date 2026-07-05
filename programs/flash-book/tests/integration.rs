@@ -5452,13 +5452,14 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
     assert_eq!(taker_p.size_lots, 1, "taker size 1 lot");
 }
 
-/// `upgrade_fill_commitment_v1` migrates a market's ring from
-/// v0 to v1 on real SVM (account grows to the v1 length, version byte stamped), and
-/// a v1 ring still settles a normal (non-reduce-only) fill correctly — i.e. the new
-/// version-gated settlement path (reduce_flag_take / inflight_sub) is inert for
-/// ordinary fills and does not regress the honest settle path.
+/// A freshly-armed market's ring is born v1 (account at the v1 length, version
+/// byte stamped 1) so the reduce-in-flight tracker is live from the first fill;
+/// the legacy v0→v1 upgrade handler rejects an already-v1 ring. A v1 ring still
+/// settles a normal (non-reduce-only) fill correctly — i.e. the version-gated
+/// settlement path (reduce_flag_take / inflight_sub) is inert for ordinary fills
+/// and does not regress the honest settle path.
 #[tokio::test]
-async fn upgrade_fill_commitment_v1_and_v1_ring_settles_normally() {
+async fn armed_ring_is_v1_at_init_and_settles_normally() {
     use flash_book::matcher::fill_commitment as fc;
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
@@ -5532,19 +5533,26 @@ async fn upgrade_fill_commitment_v1_and_v1_ring_settles_normally() {
     .await
     .unwrap();
 
-    // v0 baseline: version byte 0, length == v0 length.
-    let d0 = ctx
+    // A freshly-armed ring is born v1: v1 length, version byte 1. The
+    // reduce-in-flight tracker is live from the first fill without any upgrade.
+    let d1 = ctx
         .banks_client
         .get_account(fc_pda)
         .await
         .unwrap()
         .unwrap()
         .data;
-    assert_eq!(d0.len(), fc::fill_commit_account_len(256), "v0 length");
-    assert_eq!(d0[29], 0, "fresh ring is v0");
+    assert_eq!(
+        d1.len(),
+        fc::fill_commit_account_len_v1(256),
+        "v1 length at init"
+    );
+    assert_eq!(d1[29], 1, "fresh ring is v1");
 
-    // MIGRATE to v1 (authority = payer, drained ring).
-    send(
+    // The legacy v0→v1 upgrade handler now rejects an already-v1 ring
+    // (`buffer_upgrade_to_v1` requires version 0); it survives only for markets
+    // armed before v1 became the default.
+    let upgrade_res = send(
         &mut ctx,
         build_ix(
             flash_book::instruction::UpgradeFillCommitmentV1 {},
@@ -5557,22 +5565,11 @@ async fn upgrade_fill_commitment_v1_and_v1_ring_settles_normally() {
         ),
         &[&payer],
     )
-    .await
-    .expect("v1 upgrade must succeed on a drained v0 ring");
-
-    // v1: grown to the v1 length, version byte stamped 1.
-    let d1 = ctx
-        .banks_client
-        .get_account(fc_pda)
-        .await
-        .unwrap()
-        .unwrap()
-        .data;
-    assert_eq!(d1.len(), fc::fill_commit_account_len_v1(256), "v1 length");
-    assert_eq!(d1[29], 1, "ring is now v1");
-    // (Re-upgrading a v1 ring reverts — covered at the buffer level by the host test
-    // `f3_v1_upgrade_requires_drained_ring_and_v0`; not repeated here to avoid a
-    // second identical authority-signed tx that BanksClient would dedup.)
+    .await;
+    assert!(
+        upgrade_res.is_err(),
+        "upgrading an already-v1 ring must be rejected"
+    );
 
     // A NORMAL (non-reduce-only) fill still settles on the v1 ring: maker rests an
     // ask, taker crosses, apply_fill drains it. Proves the v1-gated settlement path
@@ -5871,21 +5868,8 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     )
     .await
     .unwrap();
-    send(
-        &mut ctx,
-        build_ix(
-            flash_book::instruction::UpgradeFillCommitmentV1 {},
-            vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
-                AccountMeta::new(fc_pda, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-        ),
-        &[&payer],
-    )
-    .await
-    .expect("upgrade to v1");
+    // The ring is armed at v1 by `init_fill_commitment`, so the reduce-in-flight
+    // tracker is live immediately — no upgrade step needed.
 
     // 1) M opens LONG 10: C rests ask 10, M takes buy 10, settle.
     send(&mut ctx, limit(1, 10, &c, &c_state), &[&payer, &c])
@@ -8007,8 +7991,8 @@ async fn grow_fill_commitment_raises_ring_cap() {
     );
     assert_eq!(
         d.len(),
-        fc::fill_commit_account_len(cap1 as usize),
-        "account resized to match new cap"
+        fc::fill_commit_account_len_v1(cap1 as usize),
+        "account resized to match new cap (v1 layout)"
     );
 }
 

@@ -286,6 +286,33 @@ pub fn buffer_init(
     Ok(())
 }
 
+/// One-time initialize a freshly-allocated account buffer directly at the v1
+/// layout: stamp disc, market, cap, bump, and version 1; zero the counters, ring
+/// slots, per-slot reduce flags, and in-flight map. `data.len()` must equal
+/// `fill_commit_account_len_v1(cap)`. New markets arm at v1 so the
+/// reduce-in-flight tracker is live from the first fill — a v0 ring cannot see a
+/// filled-but-unsettled reduce-only order across the match→settle gap, which lets
+/// several reduce-only orders on one position together flip it.
+pub fn buffer_init_v1(
+    data: &mut [u8],
+    market: &[u8; 32],
+    cap: u32,
+    bump: u8,
+) -> Result<(), FillRingError> {
+    if cap == 0 || data.len() != fill_commit_account_len_v1(cap as usize) {
+        return Err(FillRingError::Corrupt);
+    }
+    for b in data.iter_mut() {
+        *b = 0;
+    }
+    data[0..8].copy_from_slice(&FILL_COMMIT_DISC);
+    data[OFF_CAP..OFF_CAP + 4].copy_from_slice(&cap.to_le_bytes());
+    data[OFF_BUMP] = bump;
+    data[OFF_MARKET..OFF_MARKET + 32].copy_from_slice(market);
+    data[OFF_VERSION] = 1;
+    Ok(())
+}
+
 /// Validate the discriminator, market binding, and self-consistent length.
 pub fn buffer_check(data: &[u8], expected_market: &[u8; 32]) -> Result<u32, FillRingError> {
     if data.len() < FILL_COMMIT_HEADER_LEN || data[0..8] != FILL_COMMIT_DISC {

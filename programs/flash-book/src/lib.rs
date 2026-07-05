@@ -162,7 +162,10 @@ pub mod flash_book {
         let market_key = ctx.accounts.market.key();
         let bump = ctx.bumps.fill_commitment;
 
-        let space = fc::fill_commit_account_len(cap as usize);
+        // Arm at the v1 layout so the reduce-in-flight tracker is live from the
+        // first fill; a v0 ring cannot see a filled-but-unsettled reduce-only
+        // order across the match→settle gap.
+        let space = fc::fill_commit_account_len_v1(cap as usize);
         let rent = Rent::get()?;
         let lamports = rent.minimum_balance(space);
 
@@ -184,7 +187,7 @@ pub mod flash_book {
         )?;
 
         let mut data = ctx.accounts.fill_commitment.try_borrow_mut_data()?;
-        fc::buffer_init(&mut data, &market_key.to_bytes(), cap, bump)
+        fc::buffer_init_v1(&mut data, &market_key.to_bytes(), cap, bump)
             .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
         drop(data);
 
@@ -223,7 +226,7 @@ pub mod flash_book {
 
         let market_bytes = ctx.accounts.market.key().to_bytes();
         // Validate + read the current cap, and require the ring be DRAINED.
-        let old_cap = {
+        let (old_cap, version) = {
             let data = fc_ai.try_borrow_data()?;
             let cap = fc::buffer_check(&data, &market_bytes)
                 .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
@@ -231,7 +234,7 @@ pub mod flash_book {
                 fc::buffer_next_index(&data) == fc::buffer_settle_index(&data),
                 FlashBookError::FillRingNotDrained
             );
-            cap
+            (cap, fc::buffer_version(&data))
         };
 
         let new_cap = old_cap
@@ -239,17 +242,21 @@ pub mod flash_book {
             .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
         // NOTE: grow intentionally raises the ring past `FILL_RING_CAP` (the init
         // default) — it is the per-ER-session fill ceiling; no upper bound here.
-        let additional_bytes = (additional_slots as usize)
-            .checked_mul(32)
-            .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
+        let old_len = fc_ai.data_len();
+        // Version-aware target length: a v1 ring carries the per-slot reduce
+        // flags + in-flight map after the ring, so it grows by more than the ring
+        // bytes alone. Guard the ACTUAL data increase against the per-ix realloc
+        // cap.
+        let new_len = if version >= 1 {
+            fc::fill_commit_account_len_v1(new_cap as usize)
+        } else {
+            fc::fill_commit_account_len(new_cap as usize)
+        };
         require!(
-            additional_bytes
+            new_len.saturating_sub(old_len)
                 <= anchor_lang::solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE,
             FlashBookError::OutOfRange
         );
-
-        let old_len = fc_ai.data_len();
-        let new_len = fc::fill_commit_account_len(new_cap as usize);
 
         // Top up rent so the larger account stays rent-exempt.
         let rent = Rent::get()?;
@@ -276,6 +283,18 @@ pub mod flash_book {
         fc_ai.resize(new_len)?;
         {
             let mut data = fc_ai.try_borrow_mut_data()?;
+            if version >= 1 {
+                // The ring is drained (checked above), so its slots, per-slot
+                // reduce flags, and in-flight map are all logically empty. Growing
+                // the ring shifts the flags+map to a higher offset; re-zero the
+                // whole post-header region so the enlarged ring slots and the
+                // relocated flags/map are clean at the new cap. The header
+                // (absolute produced/settled cursors, cap, market, version) is
+                // left intact.
+                for b in &mut data[fc::FILL_COMMIT_HEADER_LEN..] {
+                    *b = 0;
+                }
+            }
             fc::buffer_set_cap(&mut data, new_cap);
             fc::buffer_check(&data, &market_bytes)
                 .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
