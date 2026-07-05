@@ -267,6 +267,8 @@ pub enum FlashBookError {
     TimelockNotElapsed = 2316,
     #[msg("Oracle source is locked: direct-authority price writes are disabled (Pyth/Lazer only)")]
     OracleSourceLocked = 2317,
+    #[msg("Pyth publish_time not strictly newer than the last accepted price (replay)")]
+    OraclePythReplay = 2318,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

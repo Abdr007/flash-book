@@ -662,6 +662,16 @@ impl<'a> MarketBookHandle<'a> {
             if root == NIL {
                 continue;
             }
+            // A tree root has no parent. The child→parent symmetry check
+            // below validates every non-root node's parent link, but never the
+            // root's own. `successor_index`'s up-walk terminates ONLY on
+            // `parent == NIL`, so a root whose parent points back into the tree
+            // makes the max-node up-walk an unbounded cycle → permanent brick.
+            // Pin every live root's parent to NIL.
+            require!(
+                read_link(root as usize, 8) == NIL,
+                crate::errors::FlashBookError::OutOfRange
+            );
             stack.push(root as usize);
             let mut steps = 0usize;
             while let Some(off) = stack.pop() {
@@ -744,6 +754,22 @@ impl<'a> MarketBookHandle<'a> {
                 free = read_link(off, 0);
             }
         }
+
+        // A bump allocation hands out the slot at `num_bytes_allocated`, so every
+        // LIVE node (tree or free-list — all marked in `visited`) must lie
+        // strictly below it; otherwise the next `alloc_node` returns a slot that
+        // overlaps a live node (aliasing / type confusion / balance corruption).
+        // The alignment/`<= slab_len` checks never tie the bump pointer to the
+        // live set, so a commit could plant a live node above it with an empty
+        // free list. Require the bump pointer to cover every live node.
+        let live_end = visited
+            .iter()
+            .rposition(|&v| v)
+            .map_or(0, |max_ord| (max_ord + 1) * NODE_TOTAL_BYTES);
+        require!(
+            live_end <= header.num_bytes_allocated as usize,
+            crate::errors::FlashBookError::OutOfRange
+        );
 
         // Fail closed at undelegation on a corrupt bump pointer
         // too (from_account_data validates it on every subsequent op, but reverting
@@ -1676,6 +1702,59 @@ mod tests {
         assert!(
             MarketBookHandle::validate_node_links(&data).is_err(),
             "cyclic (but in-bounds) book must be rejected by bounded reachability"
+        );
+    }
+
+    /// A tree root has no parent, but the child→parent symmetry walk never
+    /// inspects the root's own parent link. A commit can point `root.parent`
+    /// back into the tree; `successor_index`'s up-walk terminates only on
+    /// `parent == NIL`, so the max-node up-walk then cycles forever → brick.
+    /// The validator must pin every live root's parent to NIL.
+    #[test]
+    fn validate_node_links_rejects_nonnil_root_parent() {
+        let mut data = make_book();
+        let (root_off, other_off) = {
+            let mut h = MarketBookHandle::from_account_data(&mut data).unwrap();
+            let a = h.insert_bid(make_order(100, 1, true)).unwrap();
+            let b = h.insert_bid(make_order(200, 2, true)).unwrap();
+            let root = h.header.bids_root_index;
+            let other = if root == a { b } else { a };
+            (root, other)
+        };
+        // The well-formed book (root.parent == NIL) passes.
+        assert!(MarketBookHandle::validate_node_links(&data).is_ok());
+        // Corrupt root.parent (offset +8) to another in-tree node.
+        let base = MARKET_BOOK_PREFIX_BYTES + root_off as usize + 8;
+        data[base..base + 4].copy_from_slice(&other_off.to_le_bytes());
+        assert!(
+            MarketBookHandle::validate_node_links(&data).is_err(),
+            "non-NIL root parent must be rejected"
+        );
+    }
+
+    /// Every live node must sit below `num_bytes_allocated`; otherwise the next
+    /// bump `alloc_node` returns a slot overlapping a live node (aliasing /
+    /// type confusion). A commit can under-count the bump pointer with an empty
+    /// free list — the alignment/`<= slab_len` checks accept it. Reject it.
+    #[test]
+    fn validate_node_links_rejects_undercounted_bump_pointer() {
+        let mut data = make_book();
+        {
+            let mut h = MarketBookHandle::from_account_data(&mut data).unwrap();
+            h.insert_bid(make_order(100, 1, true)).unwrap();
+            h.insert_bid(make_order(200, 2, true)).unwrap();
+        }
+        // Two live nodes ⇒ bump pointer covers both; the book passes.
+        assert!(MarketBookHandle::validate_node_links(&data).is_ok());
+        // Shrink the bump pointer so it covers only the first node — the second
+        // live node now sits at/above it and would be re-handed by alloc_node.
+        {
+            let h = MarketBookHandle::from_account_data(&mut data).unwrap();
+            h.header.num_bytes_allocated = NODE_TOTAL_BYTES as u32;
+        }
+        assert!(
+            MarketBookHandle::validate_node_links(&data).is_err(),
+            "a live node at/above the bump pointer must be rejected"
         );
     }
 

@@ -2432,6 +2432,20 @@ pub mod flash_book {
             return err!(FlashBookError::PriceNotOnTick);
         }
 
+        // Anti-stuffing: the re-priced resting order must sit within the band of
+        // the fresh oracle, exactly like `place_limit`/`place_taker`. Without
+        // this, a trader places an in-band order and then modifies it to an
+        // arbitrarily far-from-market price, restoring the free node-arena-
+        // exhaustion vector the band closes. `price_within_band` skips when
+        // `oracle_price_ticks == 0` (no anchor).
+        if !matcher::flp_quoter::price_within_band(
+            market.oracle_price_ticks,
+            new_limit_ticks,
+            crate::constants::MAX_RESTING_ORDER_DEVIATION_BPS,
+        ) {
+            return err!(FlashBookError::RestingOrderTooFarFromOracle);
+        }
+
         // Per-market OI hard cap. Resting orders don't actually move OI
         // (only fills do), so this check is conservative — guards against
         // a market that places a huge limit hoping to manipulate the cap
@@ -8530,14 +8544,27 @@ pub mod flash_book {
             if parsed.expires_at_slot != 0 && current_slot >= parsed.expires_at_slot {
                 continue;
             }
-            // Must beat the synthetic limit. Better for trader =
-            //   close_side==Short: higher price
-            //   close_side==Long : lower price
-            let beats_synthetic = match close_side {
-                Side::Short => parsed.offer_price_ticks > synthetic_limit,
-                Side::Long => parsed.offer_price_ticks < synthetic_limit,
+            // A JIT offer may only TIGHTEN the close from the aggressive
+            // synthetic toward fair value: it must beat the synthetic (better
+            // for the liquidatee) yet never improve past the fair health price.
+            //   close_side==Short: synthetic < offer <= health  (higher = better)
+            //   close_side==Long : health <= offer < synthetic  (lower  = better)
+            // An offer beyond fair value is economically irrational for a maker
+            // and, taken as the resting close-limit, prices the order off-book so
+            // it never crosses; the resting order_type==3 then trips the
+            // duplicate-liquidation guard and wedges the position open forever — a
+            // permissionless liquidation-DoS / bad-debt vector. Bound it.
+            let within_jit_band = match close_side {
+                Side::Short => {
+                    parsed.offer_price_ticks > synthetic_limit
+                        && parsed.offer_price_ticks <= health_price_ticks
+                }
+                Side::Long => {
+                    parsed.offer_price_ticks < synthetic_limit
+                        && parsed.offer_price_ticks >= health_price_ticks
+                }
             };
-            if !beats_synthetic {
+            if !within_jit_band {
                 continue;
             }
             // Pick best so far.
@@ -8670,20 +8697,22 @@ pub mod flash_book {
                 reward_u128 as u64
             };
 
-            // Cap the reward at the position's RESIDUAL EQUITY at the health
-            // price. A collateral-only bound would let the reward be skimmed
-            // on a bankrupt close (loss > collateral) before the close
-            // settles, inflating the shortfall that `cover_bad_debt` draws
-            // from insurance — a second wallet could liquidate an
-            // engineered-bankrupt position and pocket a reward funded by the
-            // insurance fund. equity =
-            // backing_collateral + unrealized_pnl(px); a bankrupt position has
-            // equity <= 0 ⇒ zero reward, so a reward can never originate from
-            // insurance. (A liquidator of a bankrupt position is still compensated via
-            // the penalty / insurance-contribution split in the normal close flow.)
-            let px_diff: i128 = (px as i128) - (position.entry_price_ticks as i128);
-            let upnl_at_px: i128 = (position.size_lots as i128)
-                .saturating_mul(px_diff)
+            // Cap the reward at the position's RESIDUAL EQUITY valued at the
+            // SYNTHETIC CLOSE price — the price the injected close actually
+            // settles at — NOT the pre-penalty health price `px`. Valuing at
+            // `px` ignores the `liq_penalty` the close charges, so
+            // `reward + close_loss` could exceed collateral and the shortfall
+            // would be drawn from insurance via `cover_bad_debt` — a reward
+            // effectively funded by the insurance fund. Valuing at the synthetic
+            // is a conservative floor (a JIT/book fill only lands closer to fair
+            // value, shrinking the loss), so `reward + close_loss <= collateral`
+            // holds and no reward can originate from insurance. A bankrupt
+            // position has equity <= 0 ⇒ zero reward. (A liquidator of a
+            // bankrupt position is still compensated via the penalty /
+            // insurance-contribution split in the normal close flow.)
+            let close_diff: i128 = (synthetic_limit as i128) - (position.entry_price_ticks as i128);
+            let upnl_at_close: i128 = (position.size_lots as i128)
+                .saturating_mul(close_diff)
                 .saturating_mul(market.params.tick_size as i128)
                 .saturating_mul(if position.side == 0 { 1 } else { -1 });
             let backing_collateral: i128 = if position.collateral_quote_lots > 0 {
@@ -8691,7 +8720,7 @@ pub mod flash_book {
             } else {
                 ctx.accounts.trader_state.load()?.collateral_quote_lots as i128
             };
-            let residual_equity: i128 = backing_collateral.saturating_add(upnl_at_px);
+            let residual_equity: i128 = backing_collateral.saturating_add(upnl_at_close);
             let equity_cap: u64 = if residual_equity <= 0 {
                 0
             } else if residual_equity > u64::MAX as i128 {
@@ -9790,6 +9819,22 @@ pub mod flash_book {
         // can bound TOTAL resting reduce-only for this position, not just this order.
         let reduce_only_position_size: u64 =
             if trigger.flags & state_v3::TriggerOrderAccountV3::FLAG_REDUCE_ONLY != 0 {
+                // The position must be the trigger's OWN sub-account position.
+                // Every position of a wallet carries `trader == wallet`, so the
+                // (market, trader) account constraint alone lets a trigger scoped
+                // to one sub-account read a LARGER position on another sub-account
+                // and inflate the reduce-only capacity clamp below. Bind the
+                // position PDA to (trader, trigger.sub_index).
+                require_keys_eq!(
+                    ctx.accounts.position.key(),
+                    derive_maker_position_key(
+                        &market.key(),
+                        &trigger.trader,
+                        trigger.sub_index,
+                        ctx.program_id
+                    ),
+                    FlashBookError::WrongTrader
+                );
                 let position = ctx.accounts.position.load()?;
                 require!(position.size_lots > 0, FlashBookError::OutOfRange);
                 require!(position.side != trigger.side, FlashBookError::OutOfRange);
@@ -10759,6 +10804,18 @@ pub mod flash_book {
         require!(
             ctx.accounts.vault.accept_deposits == 1,
             FlashBookError::OutOfRange
+        );
+
+        // Share pricing uses `collateral_quote_lots`, which ignores the
+        // unrealized PnL of any open vault position. Depositing while a position
+        // is open would mint shares against a NAV that excludes an open gain, so
+        // the depositor captures a slice of PnL the standing LPs funded once the
+        // strategist realizes it. Require the vault FLAT for deposits, mirroring
+        // `vault_withdraw_v3` / `settle_vault_perf_fee_v3`, so LPs enter and exit
+        // only when NAV equals collateral.
+        require!(
+            ctx.accounts.vault_trader_state.load()?.open_positions == 0,
+            FlashBookError::SweepRequiresFlat
         );
 
         // Pull tokens from depositor → quote_vault. Depositor signs as ATA owner.
@@ -11826,6 +11883,17 @@ pub mod flash_book {
         )?;
 
         let market = &mut ctx.accounts.market;
+        // Reject a backward/replayed publish_time. The staleness window only
+        // bounds how OLD an accepted price may be, and the envelope gate only
+        // bounds the per-slot move — neither stops re-posting an older,
+        // still-in-window price to pin/rewind the oracle to a worse-of-window
+        // value (driving wrongful liquidations off `min(mark, oracle)`). The
+        // price must be strictly newer than the last accepted one, mirroring the
+        // Lazer path's replay guard.
+        require!(
+            price_data.publish_time as u64 > market.oracle_published_at_unix_seconds,
+            FlashBookError::OraclePythReplay
+        );
         market.oracle_price_ticks = new_ticks as u64;
         market.oracle_confidence = price_data.conf;
         market.oracle_published_at_unix_seconds = price_data.publish_time as u64;

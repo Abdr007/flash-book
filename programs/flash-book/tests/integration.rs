@@ -8693,6 +8693,157 @@ async fn vault_withdraw_v3_rejects_when_vault_has_open_position() {
     );
 }
 
+/// Share pricing ignores an open position's unrealized PnL, so a deposit while
+/// the vault is NOT flat would mint shares against an understated NAV and let
+/// the depositor skim the standing LPs' share of that PnL once it realizes.
+/// `vault_deposit_v3` must reject a deposit while the vault carries an open
+/// position, mirroring `vault_withdraw_v3` (SweepRequiresFlat, Custom(7214)).
+#[tokio::test]
+async fn vault_deposit_v3_rejects_when_vault_has_open_position() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let vault_id: u8 = 0;
+    let (vault_pda, _) = pda(&[
+        flash_book::state_v3::VaultAccountV3::SEED,
+        payer.pubkey().as_ref(),
+        &[vault_id],
+    ]);
+    let (vault_trader_state, _) = pda(&[TraderStateAccount::SEED, vault_pda.as_ref()]);
+
+    let create_ix = build_ix(
+        flash_book::instruction::CreateVaultV3 {
+            vault_id,
+            name: [0u8; 32],
+            perf_fee_bps: 0,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let open_ts_ix = build_ix(
+        flash_book::instruction::VaultOpenTraderStateV3 {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(vault_pda, false),
+            AccountMeta::new(vault_trader_state, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[create_ix, open_ts_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let depositor = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &depositor.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let depositor_ata = create_ata(&mut ctx, &payer, depositor.pubkey(), protocol.quote_mint).await;
+    mint_tokens(
+        &mut ctx,
+        &payer,
+        protocol.quote_mint,
+        depositor_ata,
+        10_000_000,
+    )
+    .await;
+    let (vault_position, _) = pda(&[
+        flash_book::state_v3::VaultPositionAccountV3::SEED,
+        vault_pda.as_ref(),
+        depositor.pubkey().as_ref(),
+    ]);
+    let deposit_metas = vec![
+        AccountMeta::new(depositor.pubkey(), true),
+        AccountMeta::new(vault_pda, false),
+        AccountMeta::new(vault_position, false),
+        AccountMeta::new_readonly(protocol.insurance_fund, false),
+        AccountMeta::new_readonly(protocol.quote_mint, false),
+        AccountMeta::new(depositor_ata, false),
+        AccountMeta::new(protocol.quote_vault, false),
+        AccountMeta::new(vault_trader_state, false),
+        AccountMeta::new_readonly(spl_token_id(), false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ];
+    // First deposit is while the vault is FLAT — it must succeed.
+    let deposit_ix = build_ix(
+        flash_book::instruction::VaultDepositV3 {
+            amount_quote_lots: 1_000_000,
+        },
+        deposit_metas.clone(),
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[deposit_ix],
+            Some(&depositor.pubkey()),
+            &[&depositor],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Open a position FOR THE VAULT ⇒ vault_trader_state.open_positions == 1.
+    let maker = Keypair::new();
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let _ = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_pda,
+        protocol.insurance_fund,
+        vault_trader_state,
+        maker_state,
+        1,
+    )
+    .await;
+    let vts: TraderStateAccount = fetch(&mut ctx.banks_client, vault_trader_state).await;
+    assert_eq!(vts.open_positions, 1, "vault now carries an open position");
+
+    // A second deposit while the vault is NOT flat must be rejected.
+    let deposit_ix2 = build_ix(
+        flash_book::instruction::VaultDepositV3 {
+            amount_quote_lots: 1_000_000,
+        },
+        deposit_metas,
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[deposit_ix2],
+            Some(&depositor.pubkey()),
+            &[&depositor],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(7214)"),
+        "deposit into a non-flat vault must be rejected with SweepRequiresFlat, got: {dbg}"
+    );
+}
+
 /// place_basket_order_n_v2 must bind each leg's position account to the
 /// canonical PDA `[PositionAccount::SEED, market, trader_state]`. A leg that
 /// references ANOTHER trader's real (initialized, program-owned) position —

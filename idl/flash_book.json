@@ -14894,9 +14894,8 @@
         "Useful for UIs that need to display \"next funding payment\" before",
         "the rate crystallises in `settle_funding`.",
         "",
-        "Math is identical to `matcher::funding::advance`'s rate",
-        "computation: premium = (mark - oracle) * 10_000 / oracle; rate",
-        "= clamp(K * premium, ±rate_max_bps_per_sec)."
+        "Rate computation: premium = (mark - oracle) * 10_000 / oracle;",
+        "rate = clamp(K * premium, ±rate_max_bps_per_sec)."
       ],
       "discriminator": [
         128,
@@ -18558,6 +18557,11 @@
       "code": 8317,
       "name": "OracleSourceLocked",
       "msg": "Oracle source is locked: direct-authority price writes are disabled (Pyth/Lazer only)"
+    },
+    {
+      "code": 8318,
+      "name": "OraclePythReplay",
+      "msg": "Pyth publish_time not strictly newer than the last accepted price (replay)"
     }
   ],
   "types": [
