@@ -4581,7 +4581,8 @@ pub mod flash_book {
             use matcher::fill_commitment as fc;
             let market_bytes = fc_market_bytes;
             let taker_bytes = ctx.accounts.taker_trader_state.load()?.trader.to_bytes();
-            let maker_bytes = ctx.accounts.maker_trader_state.load()?.trader.to_bytes();
+            let maker_pk = ctx.accounts.maker_trader_state.load()?.trader;
+            let maker_bytes = maker_pk.to_bytes();
             let mut fc_data = fc_acct.try_borrow_mut_data()?;
             let idx = fc::buffer_settle_index(&fc_data);
             let pre = fc::fill_preimage(
@@ -4604,6 +4605,28 @@ pub mod flash_book {
                 fc::FillRingError::Empty => error!(FlashBookError::FillRingEmpty),
                 _ => error!(FlashBookError::FillRingCorrupt),
             })?;
+            // AUDIT F-3 v1: release this maker's reduce-in-flight when its reduce-only
+            // fill settles. The matcher set reduce_flag[idx] and added `size_lots` to
+            // the maker position's in-flight; settlement takes the flag and subtracts
+            // the same lots, so the tracker returns to zero exactly as the ring drains.
+            // `maker`/`maker_sub_index` are committed in the preimage above (the settle
+            // would have failed FillNotCommitted otherwise), so the derived position
+            // key is authentic and matches the matcher's reservation. No-op on v0.
+            if fc::buffer_version(&fc_data) == 1 {
+                if let Ok(cap) = fc::buffer_check(&fc_data, &market_bytes) {
+                    if fc::reduce_flag_take(&mut fc_data, cap, idx) {
+                        let market_pk = ctx.accounts.market.key();
+                        let pos_key = derive_maker_position_key(
+                            &market_pk,
+                            &maker_pk,
+                            maker_sub_index,
+                            ctx.program_id,
+                        )
+                        .to_bytes();
+                        fc::inflight_sub(&mut fc_data, cap, &pos_key, size_lots);
+                    }
+                }
+            }
         }
 
         // init_if_needed zero-copy: a freshly-created PositionAccount has a

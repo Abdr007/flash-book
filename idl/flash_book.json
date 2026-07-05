@@ -13586,6 +13586,100 @@
       ]
     },
     {
+      "name": "upgrade_fill_commitment_v1",
+      "docs": [
+        "AUDIT F-3 migration (2026-07): one-way, authority-gated upgrade of a market's",
+        "fill-commitment ring from the v0 layout to v1, enabling per-position",
+        "reduce-in-flight tracking (closes the last F-3 edge: a position shrunk below",
+        "its resting reduce-only, then over-crossed across the match→settle gap).",
+        "MUST run on the BASE LAYER with the ring UNdelegated (a delegated ring is",
+        "owned by the delegation program — realloc would be illegal) and the ring",
+        "DRAINED (`produced == settled`; a pending fill would be left without a reduce",
+        "flag — `buffer_upgrade_to_v1` enforces this). Re-running on a v1 ring reverts."
+      ],
+      "discriminator": [
+        189,
+        171,
+        52,
+        130,
+        241,
+        123,
+        116,
+        139
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fill_commitment",
+          "docs": [
+            "which re-asserts program ownership before growing. Bound by the seeds."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  105,
+                  108,
+                  108,
+                  95,
+                  99,
+                  111,
+                  109,
+                  109,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "vault_cancel_order_v3",
       "docs": [
         "Strategist cancels a vault-PDA order."
@@ -16579,6 +16673,19 @@
         0,
         83,
         9
+      ]
+    },
+    {
+      "name": "FillCommitmentUpgradedV1Event",
+      "discriminator": [
+        225,
+        245,
+        213,
+        177,
+        102,
+        122,
+        99,
+        99
       ]
     },
     {
@@ -19778,6 +19885,38 @@
           },
           {
             "name": "total_bytes",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FillCommitmentUpgradedV1Event",
+      "docs": [
+        "AUDIT F-3 migration (2026-07): emitted when a market's fill-commitment ring is",
+        "upgraded from the v0 layout to v1 (adds reduce-in-flight tracking)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "fill_commitment",
+            "type": "pubkey"
+          },
+          {
+            "name": "cap",
+            "type": "u32"
+          },
+          {
+            "name": "old_bytes",
+            "type": "u32"
+          },
+          {
+            "name": "new_bytes",
             "type": "u32"
           }
         ]
