@@ -10013,9 +10013,14 @@ pub mod flash_book {
         }
 
         // Oracle staleness gate on v3 trigger execution. Same rationale as
-        // the v2 path.
+        // the v2 path. An unstamped oracle (published_at == 0) is treated as
+        // STALE, not skipped: gating on `published > 0` would fail OPEN on a
+        // never-updated oracle, and with oracle_price_ticks == 0 a kind-0
+        // trigger (`oracle <= trigger_price`) would fire unconditionally on a
+        // bogus zero price. Dropping that conjunct makes the age computation
+        // (now − 0) exceed any max_age, so the trigger fails closed instead.
         let oracle_max_age = market.params.oracle_staleness_max_seconds as u64;
-        if oracle_max_age > 0 && market.oracle_published_at_unix_seconds > 0 {
+        if oracle_max_age > 0 {
             let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
             let oracle_age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
             require!(oracle_age <= oracle_max_age, FlashBookError::OracleTooStale);
@@ -10412,9 +10417,12 @@ pub mod flash_book {
         // Only consult the oracle when it's fresh: a stale
         // oracle could bypass or trigger the slippage cap based
         // on stale data; either is wrong. When stale, skip the slice
-        // entirely (TWAP stays active for next interval).
+        // entirely (TWAP stays active for next interval). An unstamped oracle
+        // (published_at == 0) is treated as stale, not skipped — gating on
+        // `published > 0` would let a never-updated (zero) oracle drive the
+        // slippage decision. (now − 0) exceeds any max_age, so it fails closed.
         let oracle_max_age_twap = market.params.oracle_staleness_max_seconds as u64;
-        if oracle_max_age_twap > 0 && market.oracle_published_at_unix_seconds > 0 {
+        if oracle_max_age_twap > 0 {
             let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
             let oracle_age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
             require!(
