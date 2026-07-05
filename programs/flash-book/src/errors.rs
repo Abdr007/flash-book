@@ -269,12 +269,10 @@ pub enum FlashBookError {
     OracleSourceLocked = 2317,
     #[msg("Pyth publish_time not strictly newer than the last accepted price (replay)")]
     OraclePythReplay = 2318,
-    #[msg("Trader is in armed ER-trading mode: every collateral withdrawal is locked until disarm_er_trading")]
-    ErTradingArmed = 2319,
-    #[msg("Cannot disarm ER-trading mode while exposure remains (open positions or attested ER-reserved margin)")]
-    ErDisarmHasExposure = 2320,
     #[msg("FLP system conflict: the other FLP accounting system already holds LP shares (singleton and per-market v3 are mutually exclusive)")]
     FlpSystemModeConflict = 2321,
+    #[msg("Trader has no ER reserved-margin attestation: it must be initialized before trading on a delegated book")]
+    ErMarginNotReady = 2322,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

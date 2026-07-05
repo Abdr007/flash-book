@@ -1524,13 +1524,14 @@ pub mod flash_book {
     ) -> Result<()> {
         // Hot-path validation: collapsed branches, single Clock::get().
         let market = &ctx.accounts.market;
-        // Mandatory ER-trading arm while the book is delegated (see
-        // place_limit_v2_core): an ER order can never be backed by withdrawable
-        // collateral. L1 orders are unaffected.
+        // ER readiness while the book is delegated (see place_limit_v2_core):
+        // the trader's reserved-margin attestation account must exist so the
+        // sequencer can attest the margin this order reserves. L1 orders are
+        // unaffected.
         if market.book_delegated {
             require!(
-                ctx.accounts.trader_state.load()?.er_trading_armed == 1,
-                FlashBookError::ErTradingArmed
+                ctx.accounts.trader_state.load()?.er_margin_ready == 1,
+                FlashBookError::ErMarginNotReady
             );
         }
         let now_slot = Clock::get()?.slot;
@@ -3223,7 +3224,6 @@ pub mod flash_book {
         // locked by `er_active` on the ATTESTED account. Moving it off-account
         // (even to a sub) would leave those orders unbacked once they fill. Fail
         // closed exactly like `withdraw_collateral` (lib.rs) does.
-        require!(main.er_trading_armed == 0, FlashBookError::ErTradingArmed);
         require!(main.er_active == 0, FlashBookError::UseXDomainWithdraw);
         main.collateral_quote_lots = main
             .collateral_quote_lots
@@ -3267,7 +3267,6 @@ pub mod flash_book {
         );
         // Don't let collateral backing live ER resting
         // orders leave the attested (sub) account. Fail closed like withdraw.
-        require!(sub.er_trading_armed == 0, FlashBookError::ErTradingArmed);
         require!(sub.er_active == 0, FlashBookError::UseXDomainWithdraw);
         sub.collateral_quote_lots = sub
             .collateral_quote_lots
@@ -3361,45 +3360,6 @@ pub mod flash_book {
             s.trader
         };
         emit!(TraderReferrerSetEvent { trader, referrer });
-        Ok(())
-    }
-
-    /// Arm cross-domain ER-trading mode on the trader's own account. While
-    /// armed, EVERY path that moves collateral off this account — the four
-    /// withdrawal instructions and the sub-account transfers/sweep — fails
-    /// closed, so collateral backing asynchronously-settling resting orders
-    /// can never be pulled ahead of settlement. Trader-signed and trustless:
-    /// the lock is enforced entirely on L1 and never consults the sequencer.
-    /// Idempotent.
-    pub fn arm_er_trading(ctx: Context<SetErTradingMode>) -> Result<()> {
-        let trader = {
-            let mut s = ctx.accounts.trader_state.load_mut()?;
-            s.er_trading_armed = 1;
-            s.trader
-        };
-        emit!(ErTradingModeEvent {
-            trader,
-            armed: true
-        });
-        Ok(())
-    }
-
-    /// Disarm ER-trading mode, re-enabling withdrawals. Fails closed unless the
-    /// trader has no residual exposure: no open (filled) positions and no
-    /// sequencer-attested ER-reserved margin. The check can only ever REFUSE to
-    /// unlock, never wrongly permit it, so it is safe against under-reporting.
-    pub fn disarm_er_trading(ctx: Context<SetErTradingMode>) -> Result<()> {
-        let trader = {
-            let mut s = ctx.accounts.trader_state.load_mut()?;
-            require!(s.open_positions == 0, FlashBookError::ErDisarmHasExposure);
-            require!(s.er_active == 0, FlashBookError::ErDisarmHasExposure);
-            s.er_trading_armed = 0;
-            s.trader
-        };
-        emit!(ErTradingModeEvent {
-            trader,
-            armed: false
-        });
         Ok(())
     }
 
@@ -3535,7 +3495,6 @@ pub mod flash_book {
             require!(to.is_authorized(&signer), FlashBookError::Unauthorized);
             // Don't sweep collateral backing live ER
             // resting orders off the attested account. Fail closed like withdraw.
-            require!(from.er_trading_armed == 0, FlashBookError::ErTradingArmed);
             require!(from.er_active == 0, FlashBookError::UseXDomainWithdraw);
             (from.trader, from.open_positions, from.collateral_quote_lots)
         };
@@ -3782,9 +3741,6 @@ pub mod flash_book {
         // mutate vault state on a rejected withdrawal).
         {
             let s = ctx.accounts.trader_state.load()?;
-            // Trader-armed cross-domain lock: while armed, no collateral leaves
-            // by any path (trustless — does not consult the sequencer).
-            require!(s.er_trading_armed == 0, FlashBookError::ErTradingArmed);
             // #8 cross-domain: an ER-active trader (one with attested ER-reserved
             // margin for resting orders) MUST withdraw via the xdomain variant,
             // which honors that reservation. Default 0 ⇒ no-op for every trader
@@ -3921,7 +3877,10 @@ pub mod flash_book {
 
     /// Create a trader's ER reserved-margin attestation account. Protocol
     /// authority only — it pins the trusted `attestor` (the ER margin
-    /// sequencer key) that may subsequently update the reservation.
+    /// sequencer key) that may subsequently update the reservation. Also flips
+    /// the trader's `er_margin_ready` flag, which order placement on a
+    /// delegated book requires: every ER order is guaranteed an attestation
+    /// account the sequencer can write its reserved margin into.
     pub fn init_er_margin_attestation(
         ctx: Context<InitErMarginAttestation>,
         attestor: Pubkey,
@@ -3933,6 +3892,7 @@ pub mod flash_book {
         a.reserved_margin_quote_lots = 0;
         a.epoch = 0;
         a.bump = bump;
+        ctx.accounts.trader_state.load_mut()?.er_margin_ready = 1;
         emit!(ErMarginAttestationInitEvent {
             trader_state: ctx.accounts.trader_state.key(),
             attestor,
@@ -3993,9 +3953,6 @@ pub mod flash_book {
         let er_reserved = ctx.accounts.er_margin.reserved_margin_quote_lots;
         {
             let s = ctx.accounts.trader_state.load()?;
-            // Trader-armed cross-domain lock: while armed, no collateral leaves
-            // by any path (trustless — does not consult the sequencer).
-            require!(s.er_trading_armed == 0, FlashBookError::ErTradingArmed);
             require!(
                 s.open_positions == 0,
                 FlashBookError::InsufficientCollateral
@@ -13043,15 +13000,6 @@ fn partial_withdraw_core<'info>(
 ) -> Result<()> {
     require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
 
-    // Trader-armed cross-domain lock: while armed, no collateral leaves the
-    // vault by any path, so collateral backing asynchronously-settling resting
-    // orders can never be withdrawn ahead of settlement. Trustless — it does
-    // not consult the sequencer.
-    require!(
-        trader_state.load()?.er_trading_armed == 0,
-        FlashBookError::ErTradingArmed
-    );
-
     let trader_state_key = trader_state.key();
     let (trader_pk, open, current_collateral) = {
         let s = trader_state.load()?;
@@ -13239,16 +13187,17 @@ fn place_limit_v2_core(
     // initial-margin gate (None ⇒ treated as a full open — strictest).
     position: Option<&AccountLoader<'_, state::PositionAccount>>,
 ) -> Result<()> {
-    // Mandatory ER-trading arm: while the book is delegated to the ER, the
-    // collateral backing this order settles asynchronously and could otherwise
-    // be withdrawn before the fill lands. Requiring the armed lock (which fails
-    // all withdrawals closed) makes that double-spend impossible, with zero
-    // sequencer trust. L1 (undelegated) orders settle against authoritative
-    // collateral and are unaffected.
+    // ER readiness: while the book is delegated to the ER, this order's margin
+    // is reserved cross-domain by the sequencer writing the trader's
+    // `ErMarginAttestation`, which the withdrawal paths honor. Requiring the
+    // attestation account to exist before any ER order can rest guarantees the
+    // sequencer always has somewhere to write that reservation. L1
+    // (undelegated) orders settle against authoritative collateral and are
+    // unaffected.
     if market.book_delegated {
         require!(
-            trader_state.load()?.er_trading_armed == 1,
-            FlashBookError::ErTradingArmed
+            trader_state.load()?.er_margin_ready == 1,
+            FlashBookError::ErMarginNotReady
         );
     }
     // Bind the (trader, sub_index) TraderState at INTAKE. The
@@ -15358,18 +15307,6 @@ pub struct SetTraderReferrer<'info> {
 }
 
 #[derive(Accounts)]
-pub struct SetErTradingMode<'info> {
-    /// The trader signs to arm/disarm their own cross-domain withdrawal lock.
-    pub trader: Signer<'info>,
-
-    #[account(
-        mut,
-        constraint = trader_state.load()?.trader == trader.key() @ FlashBookError::WrongTrader,
-    )]
-    pub trader_state: AccountLoader<'info, TraderStateAccount>,
-}
-
-#[derive(Accounts)]
 pub struct SetTraderDelegate<'info> {
     /// The trader signs to set/clear their own delegate. Only the trader
     /// can change this field — the delegate cannot rotate themselves out.
@@ -16187,8 +16124,10 @@ pub struct InitErMarginAttestation<'info> {
     )]
     pub insurance_fund: Account<'info, InsuranceFundAccount>,
 
-    /// The trader_state this attestation binds to; only its key is used (for
-    /// the PDA seed), so it is not deserialized for content here.
+    /// The trader_state this attestation binds to; keys the PDA seed and gets
+    /// its `er_margin_ready` flag set (which delegated-book order placement
+    /// requires).
+    #[account(mut)]
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     #[account(
@@ -17884,13 +17823,6 @@ pub struct TraderDelegateUpdatedEvent {
 pub struct TraderReferrerSetEvent {
     pub trader: Pubkey,
     pub referrer: Pubkey,
-}
-
-#[event]
-pub struct ErTradingModeEvent {
-    pub trader: Pubkey,
-    /// true = armed (withdrawals locked); false = disarmed.
-    pub armed: bool,
 }
 
 #[event]

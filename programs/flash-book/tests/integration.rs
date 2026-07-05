@@ -4275,7 +4275,7 @@ async fn liquidate_position_v2_reward_capped_at_synthetic_equity() {
 }
 
 #[tokio::test]
-async fn delegated_book_order_requires_armed() {
+async fn delegated_book_order_requires_er_margin_ready() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -4327,19 +4327,10 @@ async fn delegated_book_order_requires_armed() {
             ],
         )
     };
-    let arm = || {
-        build_ix(
-            flash_book::instruction::ArmErTrading {},
-            vec![
-                AccountMeta::new_readonly(mp, true),
-                AccountMeta::new(maker_state, false),
-            ],
-        )
-    };
-
-    // Unarmed order on a delegated book → rejected.
+    // Order on a delegated book with no attestation account → rejected: the
+    // sequencer would have nowhere to write the reserved margin.
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let unarmed = ctx
+    let not_ready = ctx
         .banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[place(101_000)],
@@ -4349,23 +4340,15 @@ async fn delegated_book_order_requires_armed() {
         ))
         .await;
     assert!(
-        unarmed.is_err(),
-        "a delegated-book order must require the armed lock"
+        not_ready.is_err(),
+        "a delegated-book order must require the ER margin attestation"
     );
 
-    // Arm, then the same order is accepted past the gate.
+    // Init the attestation (sets er_margin_ready), then the same order passes
+    // the gate.
+    init_er_margin(&mut ctx, &payer, &protocol, maker_state, payer.pubkey()).await;
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[arm()],
-            Some(&mp),
-            &[&maker],
-            bh,
-        ))
-        .await
-        .unwrap();
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let armed = ctx
+    let ready = ctx
         .banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[place(101_100)],
@@ -4375,8 +4358,8 @@ async fn delegated_book_order_requires_armed() {
         ))
         .await;
     assert!(
-        armed.is_ok(),
-        "an armed trader may place on a delegated book: {armed:?}"
+        ready.is_ok(),
+        "an ER-ready trader may place on a delegated book: {ready:?}"
     );
 }
 
@@ -10808,7 +10791,7 @@ async fn init_er_margin(
         vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
-            AccountMeta::new_readonly(trader_state, false),
+            AccountMeta::new(trader_state, false),
             AccountMeta::new(er_margin, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
