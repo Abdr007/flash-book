@@ -771,6 +771,32 @@ impl LpPositionAccount {
     }
 }
 
+/// Protocol-wide FLP-system lock. The singleton `FlpExposureAccount`
+/// (`apply_flp_fill` books every FLP fill into it) and the per-market v3 FLP
+/// redeem from the SAME vault, so LP shares outstanding in both would
+/// double-count the same realized PnL and let the last redeemers over-withdraw.
+/// This singleton records which system minted shares first; the other system's
+/// share-minting deposit then fails closed. A pure lock — it holds no funds and
+/// no per-market state, so it is a NEW account with its own reserved slack (no
+/// existing layout is resized).
+#[account]
+#[derive(Debug)]
+pub struct FlpModeAccount {
+    pub bump: u8,
+    /// 0 = unset, 1 = singleton, 2 = per-market v3.
+    pub mode: u8,
+    pub _reserved: [u8; 6],
+}
+impl FlpModeAccount {
+    pub const SEED: &'static [u8] = b"flp_mode";
+    pub const MODE_UNSET: u8 = 0;
+    pub const MODE_SINGLETON: u8 = 1;
+    pub const MODE_V3: u8 = 2;
+    pub fn space() -> usize {
+        8 + 8
+    }
+}
+
 /// Per-trader state. Holds collateral, last-settled funding marker, and
 /// position-list pointers (Position PDAs are separate accounts; this is
 /// a lightweight index).

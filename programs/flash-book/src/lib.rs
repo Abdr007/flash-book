@@ -2676,6 +2676,23 @@ pub mod flash_book {
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
 
+        // FLP-system lock: the singleton and per-market v3 pools redeem from the
+        // same vault, so LP shares outstanding in both would double-count the
+        // same realized PnL. Claim the singleton mode on the first mint; reject
+        // if v3 has already claimed it. Checked before any funds move.
+        {
+            let m = &mut ctx.accounts.flp_mode;
+            if m.mode == state::FlpModeAccount::MODE_UNSET {
+                m.mode = state::FlpModeAccount::MODE_SINGLETON;
+                m.bump = ctx.bumps.flp_mode;
+            } else {
+                require!(
+                    m.mode == state::FlpModeAccount::MODE_SINGLETON,
+                    FlashBookError::FlpSystemModeConflict
+                );
+            }
+        }
+
         // SPL transfer from LP's ATA to protocol vault.
         let cpi_accounts = Transfer {
             from: ctx.accounts.authority_quote_ata.to_account_info(),
@@ -11440,6 +11457,22 @@ pub mod flash_book {
     pub fn flp_deposit_v3(ctx: Context<FlpDepositV3>, amount_quote_lots: u64) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
 
+        // FLP-system lock: mutually exclusive with the singleton pool over the
+        // shared vault. Claim the v3 mode on the first mint; reject if the
+        // singleton has already claimed it. Checked before any funds move.
+        {
+            let m = &mut ctx.accounts.flp_mode;
+            if m.mode == state::FlpModeAccount::MODE_UNSET {
+                m.mode = state::FlpModeAccount::MODE_V3;
+                m.bump = ctx.bumps.flp_mode;
+            } else {
+                require!(
+                    m.mode == state::FlpModeAccount::MODE_V3,
+                    FlashBookError::FlpSystemModeConflict
+                );
+            }
+        }
+
         let cpi_accounts = Transfer {
             from: ctx.accounts.lp_quote_ata.to_account_info(),
             to: ctx.accounts.quote_vault.to_account_info(),
@@ -15039,25 +15072,37 @@ pub struct DepositFlpCapital<'info> {
     )]
     pub lp_position: Box<Account<'info, state::LpPositionAccount>>,
 
+    /// Protocol-wide FLP-system lock. Created on the first LP-share mint of
+    /// either system; the singleton and the per-market v3 pool are then mutually
+    /// exclusive on minting shares (they redeem from one vault).
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = state::FlpModeAccount::space(),
+        seeds = [state::FlpModeAccount::SEED],
+        bump,
+    )]
+    pub flp_mode: Box<Account<'info, state::FlpModeAccount>>,
+
     /// Insurance fund PDA — owns the protocol vault.
     #[account(
         seeds = [InsuranceFundAccount::SEED],
         bump = insurance_fund.bump,
     )]
-    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 
     #[account(address = insurance_fund.quote_mint)]
-    pub quote_mint: Account<'info, Mint>,
+    pub quote_mint: Box<Account<'info, Mint>>,
 
     #[account(
         mut,
         associated_token::mint = quote_mint,
         associated_token::authority = authority,
     )]
-    pub authority_quote_ata: Account<'info, TokenAccount>,
+    pub authority_quote_ata: Box<Account<'info, TokenAccount>>,
 
     #[account(mut, address = insurance_fund.quote_vault)]
-    pub quote_vault: Account<'info, TokenAccount>,
+    pub quote_vault: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -21080,6 +21125,17 @@ pub struct FlpDepositV3<'info> {
         bump,
     )]
     pub position: Account<'info, state_v3::FlpPositionAccountV3>,
+
+    /// Protocol-wide FLP-system lock (see `deposit_flp_capital`). Claimed for v3
+    /// on the first v3 share mint; rejects if the singleton already holds shares.
+    #[account(
+        init_if_needed,
+        payer = lp,
+        space = state::FlpModeAccount::space(),
+        seeds = [state::FlpModeAccount::SEED],
+        bump,
+    )]
+    pub flp_mode: Box<Account<'info, state::FlpModeAccount>>,
 
     /// Insurance fund PDA — owns the protocol vault (binds quote_vault + mint).
     #[account(

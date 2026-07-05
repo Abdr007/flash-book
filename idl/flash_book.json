@@ -3749,6 +3749,32 @@
           }
         },
         {
+          "name": "flp_mode",
+          "docs": [
+            "Protocol-wide FLP-system lock. Created on the first LP-share mint of",
+            "either system; the singleton and the per-market v3 pool are then mutually",
+            "exclusive on minting shares (they redeem from one vault)."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  109,
+                  111,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
           "name": "insurance_fund",
           "docs": [
             "Insurance fund PDA — owns the protocol vault."
@@ -4418,6 +4444,31 @@
               {
                 "kind": "account",
                 "path": "lp"
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_mode",
+          "docs": [
+            "Protocol-wide FLP-system lock (see `deposit_flp_capital`). Claimed for v3",
+            "on the first v3 share mint; rejects if the singleton already holds shares."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  109,
+                  111,
+                  100,
+                  101
+                ]
               }
             ]
           }
@@ -16124,6 +16175,19 @@
       ]
     },
     {
+      "name": "FlpModeAccount",
+      "discriminator": [
+        61,
+        26,
+        194,
+        139,
+        55,
+        138,
+        81,
+        235
+      ]
+    },
+    {
       "name": "FlpPositionAccountV3",
       "discriminator": [
         18,
@@ -18766,6 +18830,11 @@
       "code": 8320,
       "name": "ErDisarmHasExposure",
       "msg": "Cannot disarm ER-trading mode while exposure remains (open positions or attested ER-reserved margin)"
+    },
+    {
+      "code": 8321,
+      "name": "FlpSystemModeConflict",
+      "msg": "FLP system conflict: the other FLP accounting system already holds LP shares (singleton and per-market v3 are mutually exclusive)"
     }
   ],
   "types": [
@@ -20570,6 +20639,44 @@
           {
             "name": "entry_price_ticks",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FlpModeAccount",
+      "docs": [
+        "Protocol-wide FLP-system lock. The singleton `FlpExposureAccount`",
+        "(`apply_flp_fill` books every FLP fill into it) and the per-market v3 FLP",
+        "redeem from the SAME vault, so LP shares outstanding in both would",
+        "double-count the same realized PnL and let the last redeemers over-withdraw.",
+        "This singleton records which system minted shares first; the other system's",
+        "share-minting deposit then fails closed. A pure lock — it holds no funds and",
+        "no per-market state, so it is a NEW account with its own reserved slack (no",
+        "existing layout is resized)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "mode",
+            "docs": [
+              "0 = unset, 1 = singleton, 2 = per-market v3."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "_reserved",
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            }
           }
         ]
       }

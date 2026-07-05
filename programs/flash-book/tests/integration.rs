@@ -1669,6 +1669,7 @@ async fn deposit_flp_capital_grows_pool() {
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new(protocol.flp_exposure, false),
             AccountMeta::new(lp_position, false),
+            AccountMeta::new(pda(&[flash_book::state::FlpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
@@ -1713,6 +1714,165 @@ async fn deposit_flp_capital_grows_pool() {
     assert_eq!(vs.amount, 6_000_000);
 }
 
+/// The singleton and per-market v3 FLP pools redeem from one vault, so LP shares
+/// in both would double-count the same PnL. Once the singleton mints shares it
+/// claims the protocol-wide `FlpModeAccount`; a v3 deposit then fails closed
+/// with FlpSystemModeConflict.
+#[tokio::test]
+async fn flp_mode_lock_forbids_v3_after_singleton() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Singleton mints shares → claims MODE_SINGLETON.
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+
+    let result = try_v3_deposit(&mut ctx, &payer, &protocol, market_pda).await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8321)"),
+        "v3 deposit after singleton must be rejected with FlpSystemModeConflict, got: {dbg}"
+    );
+}
+
+/// Reverse direction: once a v3 pool mints shares it claims the mode, and a
+/// singleton `deposit_flp_capital` then fails closed.
+#[tokio::test]
+async fn flp_mode_lock_forbids_singleton_after_v3() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // v3 mints shares first → claims MODE_V3 (must succeed).
+    let ok = try_v3_deposit(&mut ctx, &payer, &protocol, market_pda).await;
+    assert!(ok.is_ok(), "first v3 deposit must succeed, got: {ok:?}");
+
+    // Singleton deposit must now be rejected.
+    let lp_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp_ata, 1_000_000).await;
+    let (lp_position, _) = pda(&[
+        flash_book::state::LpPositionAccount::SEED,
+        payer.pubkey().as_ref(),
+    ]);
+    let ix = build_ix(
+        flash_book::instruction::DepositFlpCapital {
+            amount_quote_lots: 1_000_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(lp_position, false),
+            AccountMeta::new(pda(&[flash_book::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(lp_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8321)"),
+        "singleton deposit after v3 must be rejected with FlpSystemModeConflict, got: {dbg}"
+    );
+}
+
+/// Set up the v3 per-market pool + a funded LP and attempt one v3 deposit.
+/// Returns the deposit tx result so callers can assert allow/reject.
+async fn try_v3_deposit(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    protocol: &Protocol,
+    market_pda: Pubkey,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let (exposure, _) = pda(&[
+        flash_book::state_v3::FlpExposurePerMarketAccountV3::SEED,
+        market_pda.as_ref(),
+    ]);
+    let init_ix = build_ix(
+        flash_book::instruction::InitFlpPerMarketV3 {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let lp = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &lp.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let lp_ata = create_ata(ctx, payer, lp.pubkey(), protocol.quote_mint).await;
+    mint_tokens(ctx, payer, protocol.quote_mint, lp_ata, 10_000_000).await;
+    let (position, _) = pda(&[
+        flash_book::state_v3::FlpPositionAccountV3::SEED,
+        exposure.as_ref(),
+        lp.pubkey().as_ref(),
+    ]);
+    let dep_ix = build_ix(
+        flash_book::instruction::FlpDepositV3 {
+            amount_quote_lots: 1_000_000,
+        },
+        vec![
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new(exposure, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(pda(&[flash_book::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(lp_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[dep_ix],
+            Some(&lp.pubkey()),
+            &[&lp],
+            bh,
+        ))
+        .await
+}
+
 #[tokio::test]
 async fn withdraw_flp_capital_blocked_with_open_positions() {
     // Set markets_count > 0 isn't possible without actual fills, so we
@@ -1742,6 +1902,7 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new(protocol.flp_exposure, false),
             AccountMeta::new(lp_position, false),
+            AccountMeta::new(pda(&[flash_book::state::FlpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
@@ -1844,6 +2005,7 @@ async fn lp_deposit(
             AccountMeta::new(lp.pubkey(), true),
             AccountMeta::new(protocol.flp_exposure, false),
             AccountMeta::new(lp_position, false),
+            AccountMeta::new(pda(&[flash_book::state::FlpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
@@ -8199,6 +8361,7 @@ async fn flp_withdraw_v3_enforces_min_hold() {
             AccountMeta::new(lp.pubkey(), true),
             AccountMeta::new(exposure, false),
             AccountMeta::new(position, false),
+            AccountMeta::new(pda(&[flash_book::state::FlpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
