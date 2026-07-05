@@ -1,10 +1,9 @@
 //! On-chain account types. These are the persistent state that lives in
 //! the ER (when delegated) or on Solana mainnet (when undelegated).
 //!
-//! All structs use Anchor's `#[account]` and have the `discriminator: 8`
-//! byte prefix Anchor expects. Production layouts use zero-copy where
-//! the size justifies it; for v1 of this skeleton we use serde-style
-//! Borsh which is simpler and sufficient under MAX_ORDERS_PER_BATCH.
+//! All structs carry Anchor's 8-byte discriminator prefix. Hot accounts
+//! (`PositionAccount`, `TraderStateAccount`) use zero-copy Pod layouts;
+//! the rest use Borsh, which is sufficient under MAX_ORDERS_PER_BATCH.
 
 use crate::constants::{
     MARK_HISTORY_LEN, MAX_FLP_QUOTE_LEVELS, MAX_ORDERS_PER_BATCH, MAX_POSITIONS_PER_TRADER,
@@ -16,7 +15,7 @@ use crate::matcher::vpin::VpinState;
 use anchor_lang::prelude::*;
 
 /// Per-market parameters. Set at market initialization, updated only via
-/// governance. Mirrors `MarketParams` from the TypeScript reference.
+/// governance.
 #[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize)]
 pub struct MarketParams {
     pub tick_size: u64,
@@ -26,7 +25,7 @@ pub struct MarketParams {
 
     pub taker_fee_bps: u32,
     /// Maker fee/rebate rate. SIGNED — positive = rebate paid to maker
-    /// (legacy semantics, MM incentive); negative = fee charged to maker
+    /// (MM incentive); negative = fee charged to maker
     /// (low-tier retail). Crossing the sign boundary is supported on
     /// the multi-tier fee table (FeeTier rows can mix signs across
     /// volume tiers — e.g. tier 0 = -10 (10 bps maker fee), tier 5 =
@@ -50,7 +49,7 @@ pub struct MarketParams {
     pub flp_spread_beta_bps: u32,
     pub flp_spread_gamma_bps: u32,
     pub flp_spread_kappa_bps: u32,
-    pub flp_spread_delta_bps: u32,    // realized-vol coefficient
+    pub flp_spread_delta_bps: u32, // realized-vol coefficient
     pub flp_inventory_lambda_bps: u32,
     pub flp_depth_floor_lots: u64,
     pub flp_max_growth_per_batch_bps: u32,
@@ -104,13 +103,13 @@ pub struct MarketParams {
     /// the same position. Anti-cascade: prevents one underwater position
     /// from getting hit repeatedly in adjacent blocks (each costs the
     /// liquidatee a separate liquidation order + fee). Typical setting:
-    /// 4-8 slots (~2-4 seconds). 0 = no cooldown (legacy behavior).
+    /// 4-8 slots (~2-4 seconds). 0 = no cooldown.
     pub liquidation_cooldown_slots: u32,
 
     /// Slots over which the liquidator reward grows from base to full.
     /// Dutch-style auction on the REWARD: first responders get a smaller
     /// reward, later responders progressively larger up to the full
-    /// `liquidator_reward_bps`. 0 = reward is always full (legacy).
+    /// `liquidator_reward_bps`. 0 = reward is always full.
     /// Typical setting: 8-16 slots (~4-8 seconds). Encourages a
     /// competitive keeper pool to spread out instead of all racing the
     /// same block.
@@ -164,7 +163,7 @@ pub struct MarketParams {
     pub max_oi_base_lots: u64,
 
     /// Maximum allowed mark-price change per batch in bps. 0 = unlimited
-    /// (legacy / pre-launch markets often run open). When set, the
+    /// (pre-launch markets often run open). When set, the
     /// matcher clamps the post-batch mark to ±this fraction of the
     /// previous mark. Hyperliquid-style anti-flash-crash defense:
     /// prevents a single thin-liquidity batch (or oracle spike that
@@ -185,7 +184,7 @@ pub struct MarketParams {
     pub concentration_extra_mmr_bps: u32,
 
     /// TWAP window length (in batches) for the funding-premium dampener.
-    /// 0 = disabled (legacy single-tick premium). When > 0, the funding
+    /// 0 = disabled (single-tick premium). When > 0, the funding
     /// rate uses the average of the last N batches' (mark - oracle)
     /// premium instead of the instantaneous one — kills funding spikes
     /// from microbursts of toxic flow that move the mark for one batch.
@@ -201,7 +200,7 @@ pub struct MarketParams {
     /// total stays at or under the cap. Smarter than HL where extended
     /// one-way funding can drain a position without a daily ceiling.
     /// Bookkeeping fields live on MarketAccount (period_*).
-    /// 0 = disabled (legacy / HL-equivalent).
+    /// 0 = disabled.
     pub funding_per_period_max_bps: u32,
     /// Period length for the funding cap, in seconds. Typical: 86_400
     /// (24h). Ignored if `funding_per_period_max_bps == 0`.
@@ -212,7 +211,7 @@ pub struct MarketParams {
     /// and whole-market position/OI caps are tightened by a factor of
     /// 4 to defend against snipers in the price-discovery window. After
     /// `current_batch >= bootstrap_period_batches`, normal caps apply.
-    /// 0 = disabled (legacy markets and protocol-curated deploys).
+    /// 0 = disabled (protocol-curated deploys).
     pub bootstrap_period_batches: u32,
 
     /// Symmetric-OI funding dampener. When true, the funding rate is
@@ -261,10 +260,9 @@ pub struct MarketParams {
 pub struct MarketAccount {
     pub authority: Pubkey,
     /// Curated-creator pubkey. Always zeroed by `initialize_market`
-    /// (markets are authority-gated in V3 — no permissionless creator
-    /// share is paid out). When non-default (set via a future
-    /// authority-controlled migration ix), every fill on this market
-    /// emits a CreatorFeeOwedEvent crediting the creator with
+    /// (markets are authority-gated — no permissionless creator share is
+    /// paid out). When non-default, every fill on this market emits a
+    /// CreatorFeeOwedEvent crediting the creator with
     /// `params.creator_share_bps` of net fee.
     pub creator: Pubkey,
     pub flp_pool: Pubkey,
@@ -282,23 +280,20 @@ pub struct MarketAccount {
     pub oracle_confidence: u64,
     pub oracle_published_at_unix_seconds: u64,
     pub mark_price_ticks: u64,
-    /// DORMANT (truth-in-code, 2026-07): funding is plumbed but UNWIRED.
-    /// `last_funding_rate_bps_per_sec` is initialized to 0 and set to nonzero
-    /// NOWHERE in the program (the rate formula lives only in the read-only
-    /// `view_predicted_funding`; nothing stores its result), so `settle_funding`
-    /// accrues and charges EXACTLY 0. `cum_funding_index` therefore never advances
-    /// from funding, and invariant #8 (funding nets to zero) holds trivially.
-    /// Retained (not deleted): these are account layout, and `settle_funding` is a
-    /// live, reachable instruction — turning funding ON is a feature (compute +
-    /// store the rate, with its own conservation proof + devnet cycle), not a fix.
+    /// DORMANT: funding is plumbed but unwired. No instruction ever sets
+    /// `last_funding_rate_bps_per_sec` nonzero (the rate formula lives only in
+    /// the read-only `view_predicted_funding`; nothing stores its result), so
+    /// `settle_funding` accrues and charges exactly 0 and `cum_funding_index`
+    /// never advances. The funding-nets-to-zero invariant holds trivially.
+    /// Both fields are account layout and `settle_funding` is a live,
+    /// reachable instruction; activating funding means computing and storing
+    /// the rate, with its own conservation proof and devnet cycle.
     pub cum_funding_index: i128,
     pub last_funding_rate_bps_per_sec: i64,
-    /// AUDIT M-11 (2026-07): INERT. `VpinState::record_fill` is never called
-    /// anywhere, so `as_bps()` is always 0 → the VPIN-scaled toxicity tax NEVER
-    /// fires and `total_toxicity_tax_collected` never grows. Retained (not
-    /// removed) only because deleting an on-chain field is a state migration
-    /// that would break every existing market; drop it in a future versioned
-    /// realloc. Do NOT rely on this as an active protection.
+    /// Layout-reserved: the VPIN accumulator is retired (see
+    /// `matcher/vpin.rs`). No instruction advances it, every market carries
+    /// the zero value, and `total_toxicity_tax_collected` never grows.
+    /// Removing an on-chain field is a state migration, so the bytes remain.
     pub vpin: VpinState,
     pub oi_long_lots: u64,
     pub oi_short_lots: u64,
@@ -320,39 +315,37 @@ pub struct MarketAccount {
     pub params: MarketParams,
     /// Authorized fill-settlement signer for `apply_fill` / `apply_flp_fill`.
     ///
-    /// SECURITY (C-1): this is DELIBERATELY decoupled from `authority`.
-    /// `authority` is zeroed by the authority-burn ladder
-    /// (`renounce_market_authority`), but settlement must keep working
-    /// after decentralization — so the writer that can post fills is
-    /// gated by this dedicated, separately-rotatable key instead.
+    /// Deliberately decoupled from `authority`: the authority can be burned
+    /// (zeroed) for decentralization, but settlement must keep working — so
+    /// the writer that can post fills is gated by this dedicated,
+    /// separately-rotatable key instead.
     ///
     /// Set to `authority` at init; rotate via `set_market_sequencer`
-    /// (authority-gated, so do it BEFORE burning authority). Markets
-    /// created before this field existed read it back as the zero pubkey
-    /// (additive-migration trailing-zero convention) — which is
-    /// UNSIGNABLE, so `apply_fill` safely halts (refuses forgery) until
-    /// the authority calls `set_market_sequencer`. Fail-closed by design.
+    /// (authority-gated, so rotate BEFORE burning authority). Trailing
+    /// field: accounts serialized before it existed deserialize it as the
+    /// zero pubkey — which is unsignable, so `apply_fill` fails closed
+    /// (refuses every fill) until the authority sets a sequencer.
     pub sequencer: Pubkey,
-    /// H1: monotonic settlement nonce. Every `apply_fill` / `apply_flp_fill`
+    /// Monotonic settlement nonce. Every `apply_fill` / `apply_flp_fill`
     /// must carry a `fill_seq` STRICTLY GREATER than this, after which it is
     /// stored here — so a replayed or out-of-order settlement (a crashed /
     /// restarting sequencer re-emitting an already-applied batch, or a
-    /// compromised key resubmitting one) is rejected on-chain. Carved from the
-    /// existing `space()` headroom (no size change); pre-existing markets read
-    /// back 0 (Borsh zero-slack), so the first real fill (`fill_seq` ≥ 1) passes.
+    /// compromised key resubmitting one) is rejected on-chain. Trailing
+    /// field within `space()` headroom: pre-existing accounts deserialize it
+    /// as 0, so the first real fill (`fill_seq` ≥ 1) passes.
     pub last_settlement_seq: u64,
-    /// C-1 (audit 2026-06): sticky flag — once `init_fill_commitment` arms this
-    /// market, the fill-commitment ring becomes MANDATORY in `apply_fill`, so a
-    /// (compromised) sequencer can no longer bypass the anti-fabrication guard by
-    /// omitting the optional ring account. Additive migration: pre-existing
-    /// markets read back `false` (legacy optional behaviour).
+    /// Sticky flag: once `init_fill_commitment` arms this market, the
+    /// fill-commitment ring is MANDATORY in `apply_fill` — a (compromised)
+    /// sequencer cannot bypass the anti-fabrication guard by omitting the
+    /// optional ring account. Never cleared. Trailing field: accounts
+    /// serialized before it existed deserialize it as `false`.
     pub fill_commitment_required: bool,
-    /// H-2 (audit 2026-06): sticky flag — once `initialize_haircut_state` enables
-    /// the haircut junior-claim engine for this market, the (optional) haircut
-    /// accounts become MANDATORY in `apply_fill`/`apply_flp_fill`. Without this a
+    /// Sticky flag: once `initialize_haircut_state` enables the haircut
+    /// junior-claim engine for this market, the (optional) haircut accounts
+    /// are MANDATORY in `apply_fill`/`apply_flp_fill`. Without this a
     /// settlement could omit them and route positive realized PnL straight to
-    /// collateral with NO Residual/solvency gating (then withdraw it). Additive
-    /// migration: pre-existing markets read back `false`.
+    /// collateral with no Residual/solvency gating (then withdraw it).
+    /// Trailing field: pre-existing accounts deserialize it as `false`.
     pub haircut_enabled: bool,
     /// L1 slot at which the mark price was last actively maintained — written by
     /// BOTH the fill-EMA path in `apply_fill` (every fill = ER alive) and by
@@ -360,10 +353,10 @@ pub struct MarketAccount {
     /// tracks mark FRESHNESS across both update paths so a stalled ER is
     /// detectable. When `current_slot - last_mark_update_slot` exceeds
     /// `constants::MARK_STALENESS_MAX_SLOTS`, liquidation falls back to
-    /// oracle-only pricing and the market auto-pauses. Additive-migration field:
-    /// pre-existing markets read back 0 (trailing-zero convention) — treated as
-    /// "freshness unknown ⇒ liquidate oracle-only" (fail-safe) until the first
-    /// post-upgrade fill/settle stamps it.
+    /// oracle-only pricing and the market auto-pauses. Trailing field:
+    /// accounts serialized before it existed deserialize it as 0 — treated as
+    /// "freshness unknown ⇒ liquidate oracle-only" (fail-safe) until the
+    /// first fill/settle stamps it.
     pub last_mark_update_slot: u64,
     /// L1 slot at which the market book was last delegated to the ER (set by
     /// `delegate_market_book`). Used as the settlement-liveness BASELINE for the
@@ -371,50 +364,50 @@ pub struct MarketAccount {
     /// timeout starts ticking from delegation even if the sequencer NEVER posts a
     /// fill (which would otherwise keep `last_mark_update_slot == 0` and trap
     /// pre-existing positions forever). The gate uses
-    /// `max(last_mark_update_slot, book_delegated_at_slot)`. Additive-migration
-    /// field: pre-existing markets read back 0.
+    /// `max(last_mark_update_slot, book_delegated_at_slot)`. Trailing field:
+    /// pre-existing accounts deserialize it as 0.
     pub book_delegated_at_slot: u64,
-    /// F2/F3 (audit 2026-06): ER liveness HEARTBEAT slot, stamped by the
-    /// sequencer-authenticated `er_heartbeat` ix INDEPENDENT of trade flow. The
-    /// prior staleness signals (`last_mark_update_slot`) only advance on a fill
-    /// or `settle_mark`, so a healthy-but-QUIET market looked "stalled" within
-    /// ~60s and got auto-paused (F2) / force-undelegated (F3). The heartbeat lets
-    /// the chain distinguish "ER alive, no trades" (heartbeat fresh) from "ER
-    /// dead" (heartbeat stale). Auto-pause and the FAST force-undelegate path use
-    /// `max(last_mark_update_slot, last_heartbeat_slot)`; the censorship backstop
-    /// deliberately ignores it (an alive-but-censoring sequencer heartbeats).
-    /// Must be sequencer-authenticated — a permissionless heartbeat would let
-    /// anyone keep a dead market "alive" and block the escape. Additive-migration
-    /// field: pre-existing markets read back 0.
+    /// ER liveness HEARTBEAT slot, stamped by the sequencer-authenticated
+    /// `er_heartbeat` ix independent of trade flow. Fill/settle-driven
+    /// signals (`last_mark_update_slot`) advance only on a fill or
+    /// `settle_mark`, so without a heartbeat a healthy-but-QUIET market is
+    /// indistinguishable from a stalled one and would auto-pause / force-
+    /// undelegate. The heartbeat lets the chain distinguish "ER alive, no
+    /// trades" (heartbeat fresh) from "ER dead" (heartbeat stale).
+    /// Auto-pause and the FAST force-undelegate path use
+    /// `max(last_mark_update_slot, last_heartbeat_slot)`; the censorship
+    /// backstop deliberately ignores it (an alive-but-censoring sequencer
+    /// heartbeats). Must be sequencer-authenticated — a permissionless
+    /// heartbeat would let anyone keep a dead market "alive" and block the
+    /// escape. Trailing field: pre-existing accounts deserialize it as 0.
     pub last_heartbeat_slot: u64,
-    /// Per-market matcher batch cap — the max resting levels a taker may cross in
-    /// one `place_taker_order_v2` tx. Tail-appended additive-migration field
-    /// (`size_of::<MarketAccount>()` measured at 896 B with 256 B free under
-    /// `space() = 1152`; pre-existing markets read this back as `0`). `0` is
-    /// interpreted as the global `MAX_BATCH_ORDERS_PER_SIDE_V2` (96) — the
-    /// log-safe default — so legacy markets are byte-for-byte unchanged. Raised
-    /// (≤ `FILL_RING_CAP` = 256) ONLY by `init_fill_outbox`, which simultaneously
-    /// arms the on-chain fill-outbox so the crossed fills are delivered OFF the
-    /// program log: a cap above the ~96 log-safe point without an outbox would
-    /// truncate fills in the 10 KB log and wedge settlement (the H-2 class). See
-    /// `FILL_OUTBOX_DESIGN.md`.
+    /// Per-market matcher batch cap — the max resting levels a taker may
+    /// cross in one `place_taker_order_v2` tx. Trailing field
+    /// (`size_of::<MarketAccount>()` is 896 B with 256 B free under
+    /// `space() = 1152`; pre-existing accounts deserialize it as `0`). `0`
+    /// means the global `MAX_BATCH_ORDERS_PER_SIDE_V2` (96) — the log-safe
+    /// default. Raised (≤ `FILL_RING_CAP` = 256) ONLY by `init_fill_outbox`,
+    /// which simultaneously arms the on-chain fill-outbox so the crossed
+    /// fills are delivered OFF the program log: a cap above the ~96 log-safe
+    /// point without an outbox would truncate fills in the 10 KB log and
+    /// wedge settlement.
     pub max_batch_orders: u16,
 
-    /// AUDIT M-6 (2026-07): total base-lot volume of fills that have been MATCHED
-    /// (pushed to the fill-commitment ring) but NOT yet settled by apply_fill /
-    /// apply_flp_fill. Because settled OI (`oi_long/short_lots`) only advances at
-    /// settlement, the per-market OI cap was checkable against stale OI and could be
-    /// overshot by pipelining takers ahead of settlement. The intake cap now checks
-    /// `oi[side] + unsettled_fill_volume + new_size`. Incremented per fill at match
-    /// (produce), decremented per fill at settle — tied 1:1 to the ring's FIFO
-    /// produce/settle lifecycle, so it self-balances (no cancellation accounting;
-    /// cancels produce no fills). Trailing field ⇒ existing accounts read it as 0.
+    /// Total base-lot volume of fills that have been MATCHED (pushed to the
+    /// fill-commitment ring) but NOT yet settled by apply_fill /
+    /// apply_flp_fill. Settled OI (`oi_long/short_lots`) only advances at
+    /// settlement, so without this reserve the per-market OI cap could be
+    /// overshot by pipelining takers ahead of settlement; the intake cap
+    /// checks `oi[side] + unsettled_fill_volume + new_size`. Incremented per
+    /// fill at match (produce), decremented per fill at settle — tied 1:1 to
+    /// the ring's FIFO produce/settle lifecycle, so it self-balances (cancels
+    /// produce no fills). Trailing field ⇒ existing accounts read it as 0.
     pub unsettled_fill_volume: u64,
 }
 
-/// GOVERNANCE Phase-1 (2026-07): optional emergency guardian for one market, held
-/// in a SEPARATE PDA (not a MarketAccount field — adding 32 B there pushed several
-/// `try_accounts` frames past the 4 KB BPF stack limit). A guardian may only
+/// Optional emergency guardian for one market, held in a SEPARATE PDA (not a
+/// MarketAccount field — adding 32 B there pushes several `try_accounts`
+/// frames past the 4 KB BPF stack limit). A guardian may only
 /// RESTRICT market status (→ PostOnly/Paused/Closed, monotonic — the fast, fail-safe
 /// direction), NEVER loosen (→ Active/Inactive stays authority-only), so a
 /// compromised guardian can pause/close but never re-open. Absence of this account
@@ -432,13 +425,13 @@ impl MarketGuardianAccount {
     pub const LEN: usize = 32 + 32 + 1;
 }
 
-/// GOVERNANCE Phase-2 (2026-07): pending authority for a 2-step (propose→accept)
-/// market-authority transfer. Held in its own PDA (not a MarketAccount field — the
-/// stack constraint, see Phase 1). `propose_authority_transfer` (current authority)
+/// Pending authority for a 2-step (propose→accept) market-authority
+/// transfer. Held in its own PDA (not a MarketAccount field — the same
+/// stack constraint as the guardian). `propose_authority_transfer` (current authority)
 /// stores `pending_authority`; `accept_authority_transfer`, signed BY that pending
 /// key, commits `market.authority` and closes this account. Because the new key must
 /// itself sign to accept, a transfer can never strand control at a wrong/dead key
-/// (the failure mode of the 1-step `transfer_market_authority`).
+/// (the failure mode the 1-step `transfer_market_authority` permits).
 #[account]
 pub struct MarketPendingAuthorityAccount {
     pub market: Pubkey,
@@ -451,8 +444,8 @@ impl MarketPendingAuthorityAccount {
     pub const LEN: usize = 32 + 32 + 1;
 }
 
-/// GOVERNANCE Phase-2b (2026-07): a timelocked market-params update. Own PDA (not a
-/// MarketAccount field — the stack constraint). `propose_param_update` validates the
+/// A timelocked market-params update. Own PDA (not a MarketAccount field —
+/// the same stack constraint). `propose_param_update` validates the
 /// new params, stores `keccak(params)` + an `eta_unix` (= now + timelock), and does
 /// NOT apply. `execute_param_update` applies the params only once `now >= eta` AND
 /// the supplied params hash to the stored `params_hash` — so the executed change is
@@ -470,9 +463,9 @@ impl PendingParamUpdateAccount {
     pub const LEN: usize = 32 + 32 + 8 + 1;
 }
 
-// H1: build-time guard — the struct (incl. the new nonce) must still fit the
-// allocated `space()` (8 disc + 1152). If a future field overflows it, this
-// fails the build instead of silently corrupting account (de)serialization.
+// Build-time guard — the struct must fit the allocated `space()` (8 disc +
+// 1152). If a future field overflows it, this fails the build instead of
+// silently corrupting account (de)serialization.
 const _: () = assert!(
     ::core::mem::size_of::<MarketAccount>() <= 1152,
     "MarketAccount exceeds its allocated space() — bump space() before adding fields"
@@ -482,7 +475,7 @@ impl MarketAccount {
     pub const SEED: &'static [u8] = b"market";
     /// Effective matcher batch cap. `max_batch_orders` if a market has opted into
     /// a raised cap (always paired with an armed fill-outbox), else the global
-    /// log-safe default `MAX_BATCH_ORDERS_PER_SIDE_V2`. `0` (legacy / unset) ⇒
+    /// log-safe default `MAX_BATCH_ORDERS_PER_SIDE_V2`. `0` (unset) ⇒
     /// default. Clamped to `FILL_RING_CAP` so a corrupt field can never exceed the
     /// commitment-ring / outbox capacity.
     pub fn effective_batch_cap(&self) -> usize {
@@ -494,19 +487,14 @@ impl MarketAccount {
         cap.min(crate::matcher::fill_commitment::FILL_RING_CAP as usize)
     }
     pub fn space() -> usize {
-        // 8 (anchor disc) + struct fields. Borsh-conservative bound.
-        // Actual size computed via std::mem::size_of for the constant fields,
-        // but Anchor needs an explicit number. We pin a generous upper bound.
-        // V3 added `last_mark_settle_slot` (8 B) + four new MarketParams
-        // u32 fields (16 B) → bumped to 1152 for headroom.
+        // 8 (anchor disc) + a pinned upper bound with headroom over
+        // `size_of::<MarketAccount>()` (build-guarded above at ≤ 1152).
         8 + 1152
     }
 }
 
-/// WAVE 22 — Multi-tier fee table. Global per-program, authority-set.
-/// Replaces the legacy single `TraderStateAccount.fee_discount_bps`
-/// pattern (where authority manually sets a per-trader discount) with
-/// the HL / Binance / dYdX standard volume-tier model:
+/// Multi-tier fee table. Global per-program, authority-set. The standard
+/// volume-tier model:
 ///
 ///   • One global tier table (this account, PDA `[b"fee_tiers"]`).
 ///   • Each tier specifies a `min_volume_quote_lots` threshold + the
@@ -517,7 +505,7 @@ impl MarketAccount {
 ///   • `resolve_fee_tier(volume, tiers)` picks the highest tier the
 ///     trader's cumulative window volume satisfies.
 ///
-/// Coexists with the legacy `fee_discount_bps`: tier's bps SUPERSEDE
+/// Coexists with `fee_discount_bps`: tier's bps SUPERSEDE
 /// market default; `fee_discount_bps` then applies as a further
 /// percentage discount (so promo / referral codes can stack on top
 /// of the base tier rate).
@@ -549,8 +537,8 @@ pub struct FeeTiersAccount {
 #[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize, Default)]
 pub struct FeeTier {
     pub min_volume_quote_lots: u64,
-    /// SIGNED maker rate. Positive = rebate paid TO maker (legacy
-    /// MM-incentive semantics); negative = fee charged FROM maker
+    /// SIGNED maker rate. Positive = rebate paid TO maker
+    /// (MM-incentive semantics); negative = fee charged FROM maker
     /// (low-tier retail). Validated to be monotone non-decreasing
     /// across tiers (a higher-volume trader's maker treatment is
     /// never worse than a lower-volume trader's).
@@ -558,8 +546,7 @@ pub struct FeeTier {
     pub taker_fee_bps: u32,
 }
 
-/// HL has 7 tiers (Wood, Bronze, Silver, Gold, Platinum, Diamond, Diamond+).
-/// Binance has 9 (VIP 0-9). 10 covers both with headroom.
+/// Major venues run 7–9 volume tiers; 10 covers both with headroom.
 pub const MAX_FEE_TIERS: usize = 10;
 
 impl FeeTiersAccount {
@@ -573,14 +560,12 @@ impl FeeTiersAccount {
 
 /// Per-(market, trader) open position.
 ///
-/// ─── ISOLATED MARGIN DESIGN (Phase 2) ────────────────────────────────
-/// `collateral_quote_lots` is currently a defined-but-unused field. It
-/// is reserved as the on-chain marker for isolated-margin positions:
+/// ─── ISOLATED-MARGIN MARKER ──────────────────────────────────────────
+/// `collateral_quote_lots` encodes the position's margin mode:
 ///
-///   collateral_quote_lots == 0  → cross margin (default, current
-///                                 behavior). Position is backed by the
-///                                 trader's pooled `TraderStateAccount
-///                                 .collateral_quote_lots`.
+///   collateral_quote_lots == 0  → cross margin (default). The position
+///                                 is backed by the trader's pooled
+///                                 `TraderStateAccount.collateral_quote_lots`.
 ///
 ///   collateral_quote_lots  > 0  → isolated margin. The position is
 ///                                 backed ONLY by this amount; the
@@ -588,31 +573,25 @@ impl FeeTiersAccount {
 ///                                 insulated from this position's
 ///                                 liquidation.
 ///
-/// Phase 2 (separate, audited commit) wires the marker through:
+/// The marker is enforced end-to-end:
 ///
-///   1. `assess_margin_fn` (matcher/risk.rs) — splits the trader's
+///   1. `assess_margin_split` (matcher/risk.rs) splits the trader's
 ///      position set into cross and isolated, evaluates each isolated
 ///      position against its own collateral, and only includes cross
 ///      positions in the pooled-collateral assessment.
-///   2. `liquidate_position_v2` — when liquidating an isolated
-///      position, the penalty + liquidator reward come out of
-///      `position.collateral_quote_lots` first, then the insurance
-///      fund covers any shortfall (the trader's main pool is never
-///      touched — that's the whole point of isolated).
-///   3. New ixs `set_position_isolated(amount)` and
-///      `set_position_cross()` that transfer collateral between
-///      `TraderState.collateral_quote_lots` and
+///   2. `liquidate_position_v2` draws the penalty + liquidator reward
+///      from `position.collateral_quote_lots` first for an isolated
+///      position, with the insurance fund covering any shortfall — the
+///      trader's main pool is never touched.
+///   3. `set_position_isolated(amount)` / `set_position_cross()` move
+///      collateral between `TraderState.collateral_quote_lots` and
 ///      `PositionAccount.collateral_quote_lots`, gated by a
 ///      post-transfer health check on BOTH the cross set and the
 ///      isolated position.
-///
-/// Until Phase 2 lands, no on-chain logic writes to or reads from
-/// this field. Off-chain code may rely on this field staying 0 for
-/// every existing position.
 #[account(zero_copy)]
 #[derive(Debug)]
 pub struct PositionAccount {
-    // CU Phase 1 — zero-copy Pod layout. The i128 is placed FIRST at a
+    // Zero-copy Pod layout. The i128 is placed FIRST at a
     // 16-byte-aligned offset so the byte layout is identical on host
     // (i128 align 16) and SBF (align 8): no implicit padding on either,
     // which bytemuck `Pod` requires. Tail padded to a 16-byte multiple.
@@ -752,12 +731,6 @@ impl FlpExposureAccount {
     }
 }
 
-
-
-
-
-
-
 /// Per-LP share holding. PDA seeded `[b"lp_position", lp.key()]`. Created
 /// lazily on first deposit via `init_if_needed`.
 #[account]
@@ -772,22 +745,20 @@ pub struct LpPositionAccount {
     pub total_deposited_quote_lots: u64,
     /// Cumulative quote-lot withdrawals.
     pub total_withdrawn_quote_lots: u64,
-    /// H8: slot of the most recent deposit. (Re)set on every deposit via
+    /// Slot of the most recent deposit. (Re)set on every deposit via
     /// `jit_lp_defense::extend_lock_on_deposit`; `withdraw_flp_capital` is gated
     /// on `jit_lp_defense::can_withdraw(deposited_at_slot, now, FLP_MIN_HOLD_SLOTS)`
-    /// to defeat flash / short-window deposit→NAV-windfall→redeem. Carved from
-    /// the account's existing allocation slack (`space()` unchanged); pre-existing
-    /// LP accounts deserialize this as 0 (Borsh zero-slack) ⇒ immediately
-    /// withdrawable, so no migration is required.
+    /// to defeat flash / short-window deposit→NAV-windfall→redeem. Trailing
+    /// field within the allocation slack: pre-existing LP accounts
+    /// deserialize it as 0 ⇒ immediately withdrawable.
     pub deposited_at_slot: u64,
 }
 
 impl LpPositionAccount {
     pub const SEED: &'static [u8] = b"lp_position";
     pub fn space() -> usize {
-        // 8 disc + 32 + 1 + 8 + 8 + 8 + 8(deposited_at_slot, H8) = 73. The
-        // `8 + 96` allocation already covers it (39 → 31 bytes of slack), so the
-        // size is unchanged and existing accounts read the new field as 0.
+        // 8 disc + 32 + 1 + 8 + 8 + 8 + 8 (deposited_at_slot) = 73; the
+        // `8 + 96` allocation covers it with 31 bytes of slack.
         8 + 96
     }
 }
@@ -798,7 +769,7 @@ impl LpPositionAccount {
 #[account(zero_copy)]
 #[derive(Debug)]
 pub struct TraderStateAccount {
-    // ── CU Phase 1: zero-copy Pod layout ─────────────────────────────────
+    // ── Zero-copy Pod layout ─────────────────────────────────────────────
     // Fields are ordered by DESCENDING alignment (Pubkey[u8;32] → i64/u64 →
     // i32/u32 → u8 → tail pad) so the struct has NO implicit padding and is
     // `bytemuck::Pod` for `#[account(zero_copy)]`. Only u8/u32/i32/u64/i64
@@ -819,10 +790,10 @@ pub struct TraderStateAccount {
     pub collateral_quote_lots: u64,
     pub realized_pnl_quote_lots: i64,
     pub last_batch_seen: u64,
-    /// Wave 22: rolling notional in the current volume window (quote lots,
+    /// Rolling notional in the current volume window (quote lots,
     /// maker + taker). Reset on window expiry; drives `resolve_fee_tier`.
     pub volume_30d_quote_lots: u64,
-    /// Wave 22: slot the current volume window opened.
+    /// Slot the current volume window opened.
     pub volume_window_start_slot: u64,
 
     /// Toxicity score in bps; updated post-fill. Used for taker-fee tier.
@@ -839,17 +810,16 @@ pub struct TraderStateAccount {
     pub bump: u8,
     /// Number of open positions (each in its own Position PDA).
     pub open_positions: u8,
-    /// Phase 2f — sub-account index. `0` = main; `1..=255` = sub. Set at
+    /// Sub-account index. `0` = main; `1..=255` = sub. Set at
     /// `open_trader_state` (0) / `open_trader_sub_account` (sub_index).
     pub sub_index: u8,
-    /// #8 — cross-domain (ER) margin enforcement flag. `0` = not ER-active:
-    /// the strict L1 withdraw paths apply unchanged (the default for every
-    /// pre-existing account, since this byte was previously zero padding).
-    /// `1` = the trader has ER-reserved margin attested, so collateral
-    /// withdrawals MUST route through the cross-domain variants (which honor
-    /// `ErMarginAttestation`); the strict paths fail closed with
-    /// `UseXDomainWithdraw`. Carved from the former `_pad` tail, so the Pod
-    /// layout and 192-byte size are UNCHANGED — no account migration.
+    /// Cross-domain (ER) margin enforcement flag. `0` = not ER-active: the
+    /// strict L1 withdraw paths apply (and any account whose byte here is
+    /// still zero padding reads as not ER-active). `1` = the trader has
+    /// ER-reserved margin attested, so collateral withdrawals MUST route
+    /// through the cross-domain variants (which honor `ErMarginAttestation`);
+    /// the strict paths fail closed with `UseXDomainWithdraw`. Occupies a
+    /// byte of the `_pad` tail, so the Pod layout stays 192 bytes.
     pub er_active: u8,
     pub _pad: [u8; 4],
 }
@@ -857,7 +827,7 @@ pub struct TraderStateAccount {
 impl TraderStateAccount {
     pub const SEED: &'static [u8] = b"trader_state";
     pub fn space() -> usize {
-        // CU Phase 1: zero-copy Pod account. AccountLoader requires the
+        // Zero-copy Pod account. AccountLoader requires the
         // allocated data length to EQUAL `8 (disc) + size_of::<Self>()`
         // EXACTLY — any "headroom" padding makes `load*()` fail with
         // bytemuck SizeMismatch. The struct is laid out in descending
@@ -873,14 +843,8 @@ impl TraderStateAccount {
     }
 }
 
-// MarketBondAccount removed in Flash Book V3: markets are now
-// authority-gated only and there is no permissionless-deployer-bond
-// infrastructure. Existing on-chain accounts from prior deployments are
-// no longer touched by any instruction.
-
-
-
-
+// Markets are authority-gated only; there is no permissionless-deployer
+// bond account type in this program.
 
 const _: BaseLots = BaseLots(0);
 const _: Ticks = Ticks(0);
@@ -900,4 +864,3 @@ const _: Order = Order {
     post_only: false,
     stp_mode: crate::matcher::order::StpMode::CancelNewest,
 };
-

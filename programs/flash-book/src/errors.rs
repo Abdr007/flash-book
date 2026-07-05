@@ -126,7 +126,9 @@ pub enum FlashBookError {
     InsuranceBelowFloor = 1500,
     #[msg("Insurance fund cannot cover bankruptcy; ADL needed")]
     InsuranceExhausted = 1501,
-    #[msg("Protocol insolvent: summed trader collateral exceeds vault headroom over FLP + insurance")]
+    #[msg(
+        "Protocol insolvent: summed trader collateral exceeds vault headroom over FLP + insurance"
+    )]
     ProtocolInsolvent = 1502,
 
     // ── 1700-1799 delegation (MagicBlock ER) ────────────────────────
@@ -153,7 +155,7 @@ pub enum FlashBookError {
     #[msg("Mark price is too stale (ER stalled); no trustworthy price to liquidate against")]
     MarkTooStale = 1804,
 
-    // ── 1900-1999 haircut (Wave 24) ─────────────────────────────────
+    // ── 1900-1999 haircut ───────────────────────────────────────────
     #[msg("Haircut warmup window inverted (h_min > h_max)")]
     HaircutInvertedWindow = 1900,
     #[msg("Haircut warmup window exceeds absolute cap")]
@@ -171,7 +173,7 @@ pub enum FlashBookError {
     #[msg("Nothing to convert — matured_pos is zero")]
     HaircutNothingToConvert = 1907,
 
-    // ── 2000-2099 envelope (Wave 26) ────────────────────────────────
+    // ── 2000-2099 envelope ──────────────────────────────────────────
     #[msg("Envelope price cap zero or out of range")]
     EnvelopePriceCapInvalid = 2000,
     #[msg("Envelope accrual window zero or too large")]
@@ -191,14 +193,14 @@ pub enum FlashBookError {
     #[msg("Envelope config not initialized for market")]
     EnvelopeNotInitialized = 2008,
 
-    // ── 2100-2199 trigger orders (Wave 27) ──────────────────────────
+    // ── 2100-2199 trigger orders ────────────────────────────────────
     #[msg("Trigger slippage cap breached — oracle moved past acceptable_price")]
     TriggerSlippageExceeded = 2100,
 
     // ── 2200-2299 settlement integrity (H1) ─────────────────────────
     #[msg("Fill sequence not strictly increasing — replayed or out-of-order settlement")]
     FillSeqReplay = 2200,
-    // ── H1 part B: settlement-authenticity fill-commitment queue (#35) ──
+    // ── settlement-authenticity fill-commitment queue ──────────────────
     #[msg("Settled fill does not match the matcher's committed fill — fabricated or out-of-order")]
     FillNotCommitted = 2201,
     #[msg("Fill commitment ring is full — settlement must drain pending fills before more match")]
@@ -229,7 +231,9 @@ pub enum FlashBookError {
     ErEpochReplay = 2300,
     #[msg("Withdrawal would leave collateral below the ER-reserved margin for resting orders")]
     ErMarginReserved = 2301,
-    #[msg("Trader is ER-active: collateral withdrawals must use the cross-domain (xdomain) variant")]
+    #[msg(
+        "Trader is ER-active: collateral withdrawals must use the cross-domain (xdomain) variant"
+    )]
     UseXDomainWithdraw = 2302,
     #[msg("Signer is not the authorized attestor for this ER margin attestation")]
     ErAttestorMismatch = 2303,
@@ -237,7 +241,9 @@ pub enum FlashBookError {
     ErMarginAccountMismatch = 2304,
     #[msg("Owner-initiated force-undelegate is unavailable: the upgraded MagicBlock DLP makes undelegation validator-driven. Undelegate via commit_and_undelegate_market_book on the ER (finalized by process_undelegation)")]
     OwnerForceUndelegateUnavailable = 2305,
-    #[msg("Fill-commitment ring must be fully drained (produced == settled) before it can be grown")]
+    #[msg(
+        "Fill-commitment ring must be fully drained (produced == settled) before it can be grown"
+    )]
     FillRingNotDrained = 2306,
     #[msg("Market batch cap exceeds the log-safe limit but no fill-outbox account was supplied to carry the fills off-log")]
     FillOutboxRequired = 2307,

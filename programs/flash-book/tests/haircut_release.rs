@@ -134,10 +134,7 @@ fn ix_convert_and_credit(
 
     // Land the credit in the appropriate bucket.
     if isolated {
-        buckets.isolated_collateral = buckets
-            .isolated_collateral
-            .checked_add(credit)
-            .unwrap();
+        buckets.isolated_collateral = buckets.isolated_collateral.checked_add(credit).unwrap();
     } else {
         buckets.cross_collateral = buckets.cross_collateral.checked_add(credit).unwrap();
     }
@@ -180,7 +177,10 @@ fn full_release_lifecycle_isolated_position_fully_backed() {
 
     let isolated = ix_release_gain_to_haircut(&mut buckets, &mut pos, 1_000, 0).unwrap();
     assert!(isolated);
-    assert_eq!(buckets.isolated_collateral, 10_000, "gain moved out of bucket");
+    assert_eq!(
+        buckets.isolated_collateral, 10_000,
+        "gain moved out of bucket"
+    );
     assert_eq!(pos.reserve, 1_000);
 
     // Wait through warmup, mature.
@@ -240,7 +240,10 @@ fn release_blocks_when_collateral_insufficient() {
     let mut pos = PositionHaircut::default();
     let r = ix_release_gain_to_haircut(&mut buckets, &mut pos, 1_000, 0);
     assert!(r.is_err());
-    assert_eq!(buckets.isolated_collateral, 100, "no state mutation on failure");
+    assert_eq!(
+        buckets.isolated_collateral, 100,
+        "no state mutation on failure"
+    );
 }
 
 #[test]
@@ -263,8 +266,8 @@ fn seed_residual_signed_deltas() {
 fn many_releases_share_warmup_clock() {
     // Two gains released at different slots within the same warmup combine
     // into one reserve, and the attachment slot is pulled forward
-    // (reserve-weighted) so a late gain cannot inherit an elapsed clock
-    // (AUDIT HIGH-9). Their combined original amount matures on that clock.
+    // (reserve-weighted) so a late gain cannot inherit an elapsed clock.
+    // Their combined original amount matures on that clock.
     let mut market = init_market(10, 100, 100_000);
     let mut buckets = PositionBuckets {
         isolated_collateral: 5_000,
@@ -276,7 +279,7 @@ fn many_releases_share_warmup_clock() {
     assert_eq!(pos.attached_at_slot, 50);
     assert_eq!(pos.original, 1_000);
 
-    // AUDIT HIGH-9 (2026-07): a second release pulls the warmup clock FORWARD,
+    // A second release pulls the warmup clock FORWARD,
     // reserve-weighted, so a large late gain can't inherit an already-elapsed
     // clock and mature instantly:
     //   attached' = (1000*50 + 500*80) / (1000+500) = 90000/1500 = 60.

@@ -1,20 +1,17 @@
-//! Hand-rolled Pyth `PriceUpdateV2` reader — in-house, byte-faithful.
+//! Direct Pyth `PriceUpdateV2` reader.
 //!
-//! ## Why this exists
-//! `pyth-solana-receiver-sdk`'s transitive `pythnet-sdk` is stuck on borsh 0.10
-//! (`borsh::maybestd`), which is INCOMPATIBLE with anchor 1.x's borsh 1.x — so
-//! the SDK blocks the framework modernization the orderbook needs to stay
-//! ecosystem-compatible. flash-book consumes only a tiny, STABLE slice of the
-//! `PriceUpdateV2` account (price / conf / exponent / publish_time under FULL
-//! verification), so we read that layout directly here — the same "hand-roll to
-//! escape a bad dep" pattern already used for the ER CPIs in `er.rs`.
+//! The program consumes only a small, stable slice of the `PriceUpdateV2`
+//! account — price / conf / exponent / publish_time under FULL
+//! verification — so that layout is read directly here rather than through
+//! `pyth-solana-receiver-sdk` (whose transitive `pythnet-sdk` requires
+//! borsh 0.10, incompatible with anchor 1.x's borsh 1.x).
 //!
 //! ## Safety
-//! Byte-correctness is locked by a CAPTURED-FIXTURE test: a real `PriceUpdateV2`
-//! account, serialized by the actual `pyth-solana-receiver-sdk` (in the prior
-//! pyth-as-dev-dep step) is embedded here and the parser must read back the exact
-//! price/conf/exponent/publish_time — so any offset/discriminator drift fails CI,
-//! with NO pyth dependency at build time.
+//! Byte-correctness is locked by a captured-fixture test: a real
+//! `PriceUpdateV2` account serialized by the receiver SDK is embedded below
+//! and the parser must read back the exact price/conf/exponent/publish_time
+//! — any offset/discriminator drift fails CI, with no pyth dependency at
+//! build time.
 
 use anchor_lang::prelude::*;
 
@@ -70,7 +67,10 @@ pub fn get_price_no_older_than_full(
 
     // price_message starts right after the 1-byte `Full` tag.
     let m = 41usize;
-    require!(data.len() >= m + 32 + 8 + 8 + 4 + 8, FlashBookError::OutOfRange);
+    require!(
+        data.len() >= m + 32 + 8 + 8 + 4 + 8,
+        FlashBookError::OutOfRange
+    );
 
     require!(&data[m..m + 32] == feed_id, FlashBookError::OracleTooStale); // MismatchedFeedId
     let price = i64::from_le_bytes(data[m + 32..m + 40].try_into().unwrap());
@@ -78,15 +78,23 @@ pub fn get_price_no_older_than_full(
     let exponent = i32::from_le_bytes(data[m + 48..m + 52].try_into().unwrap());
     let publish_time = i64::from_le_bytes(data[m + 52..m + 60].try_into().unwrap());
 
-    // AUDIT O-2 (2026-06): reject a FUTURE-dated publish_time. `age` uses
+    // Reject a FUTURE-dated publish_time. `age` uses
     // `saturating_sub`, which clamps a future timestamp's age to 0 and would slip it
-    // past the staleness gate (then be stored as "fresh"). Parity with the authority
+    // past the staleness gate (then be stored as "fresh"). Same rule as the authority
     // `update_oracle` path, which already future-rejects.
     require!(publish_time <= now_unix, FlashBookError::OracleTooStale);
     let age = now_unix.saturating_sub(publish_time);
-    require!(age <= max_age_seconds as i64, FlashBookError::OracleTooStale);
+    require!(
+        age <= max_age_seconds as i64,
+        FlashBookError::OracleTooStale
+    );
 
-    Ok(PythPrice { price, conf, exponent, publish_time })
+    Ok(PythPrice {
+        price,
+        conf,
+        exponent,
+        publish_time,
+    })
 }
 
 #[cfg(test)]
@@ -99,12 +107,12 @@ mod tests {
     // while pyth was a dev-dependency (see git history of this module); embedding
     // it lets us drop the pyth dep entirely while still pinning byte-correctness.
     const FIXTURE: [u8; 133] = [
-        34, 241, 35, 99, 157, 126, 244, 205, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171,
+        34, 241, 35, 99, 157, 126, 244, 205, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171,
         171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171,
-        171, 171, 171, 171, 1, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
-        17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 27, 47, 99, 0, 0, 0, 0, 0, 146,
-        16, 0, 0, 0, 0, 0, 0, 248, 255, 255, 255, 128, 225, 78, 104, 0, 0, 0, 0, 127, 225, 78, 104,
-        0, 0, 0, 0, 184, 42, 99, 0, 0, 0, 0, 0, 204, 16, 0, 0, 0, 0, 0, 0, 99, 0, 0, 0, 0, 0, 0, 0,
+        171, 171, 171, 1, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
+        17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 27, 47, 99, 0, 0, 0, 0, 0, 146, 16,
+        0, 0, 0, 0, 0, 0, 248, 255, 255, 255, 128, 225, 78, 104, 0, 0, 0, 0, 127, 225, 78, 104, 0,
+        0, 0, 0, 184, 42, 99, 0, 0, 0, 0, 0, 204, 16, 0, 0, 0, 0, 0, 0, 99, 0, 0, 0, 0, 0, 0, 0,
     ];
     const FEED: [u8; 32] = [0x11; 32];
     const PUB_TIME: i64 = 1_750_000_000;

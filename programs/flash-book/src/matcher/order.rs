@@ -3,9 +3,7 @@
 use super::lot::{BaseLots, Ticks};
 use anchor_lang::prelude::*;
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, AnchorSerialize, AnchorDeserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AnchorSerialize, AnchorDeserialize)]
 #[borsh(use_discriminant = true)]
 #[repr(u8)]
 pub enum Side {
@@ -25,9 +23,7 @@ impl Side {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, AnchorSerialize, AnchorDeserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AnchorSerialize, AnchorDeserialize)]
 #[borsh(use_discriminant = true)]
 #[repr(u8)]
 pub enum OrderType {
@@ -99,4 +95,3 @@ pub struct Order {
     pub post_only: bool,
     pub stp_mode: StpMode,
 }
-

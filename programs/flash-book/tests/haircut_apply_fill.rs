@@ -99,7 +99,10 @@ fn dispatch(
 fn legacy_market_gain_credits_collateral_directly() {
     // No haircut state → v1 behavior. Positive delta credits the
     // appropriate bucket immediately.
-    let mut b = Buckets { iso: 1_000, cross: 0 };
+    let mut b = Buckets {
+        iso: 1_000,
+        cross: 0,
+    };
     dispatch(500, true, &mut b, None, 0).unwrap();
     assert_eq!(b.iso, 1_500);
     assert_eq!(b.cross, 0);
@@ -107,7 +110,10 @@ fn legacy_market_gain_credits_collateral_directly() {
 
 #[test]
 fn legacy_market_loss_debits_collateral_directly() {
-    let mut b = Buckets { iso: 1_000, cross: 5_000 };
+    let mut b = Buckets {
+        iso: 1_000,
+        cross: 5_000,
+    };
     dispatch(-300, false, &mut b, None, 0).unwrap();
     assert_eq!(b.iso, 1_000);
     assert_eq!(b.cross, 4_700);
@@ -117,7 +123,10 @@ fn legacy_market_loss_debits_collateral_directly() {
 fn opted_in_market_gain_routes_to_reserve() {
     // Haircut state present → positive delta goes to reserve, NO
     // collateral mutation.
-    let mut b = Buckets { iso: 1_000, cross: 0 };
+    let mut b = Buckets {
+        iso: 1_000,
+        cross: 0,
+    };
     let mut ph = PosHaircut::default();
     dispatch(500, true, &mut b, Some(&mut ph), 42).unwrap();
     assert_eq!(b.iso, 1_000, "collateral untouched on opted-in market");
@@ -130,7 +139,10 @@ fn opted_in_market_gain_routes_to_reserve() {
 fn opted_in_market_loss_still_debits_collateral_directly() {
     // Loss seniority: even on opted-in markets, losses bypass the
     // haircut and debit collateral.
-    let mut b = Buckets { iso: 1_000, cross: 5_000 };
+    let mut b = Buckets {
+        iso: 1_000,
+        cross: 5_000,
+    };
     let mut ph = PosHaircut::default();
     dispatch(-300, true, &mut b, Some(&mut ph), 42).unwrap();
     assert_eq!(b.iso, 700, "loss debits isolated bucket directly");
@@ -141,8 +153,14 @@ fn opted_in_market_loss_still_debits_collateral_directly() {
 #[test]
 fn opted_in_market_zero_delta_is_noop_with_or_without_haircut() {
     // No-op cases identical between legacy and haircut paths.
-    let mut b1 = Buckets { iso: 1_000, cross: 5_000 };
-    let mut b2 = Buckets { iso: 1_000, cross: 5_000 };
+    let mut b1 = Buckets {
+        iso: 1_000,
+        cross: 5_000,
+    };
+    let mut b2 = Buckets {
+        iso: 1_000,
+        cross: 5_000,
+    };
     let mut ph = PosHaircut::default();
     dispatch(0, true, &mut b1, None, 0).unwrap();
     dispatch(0, true, &mut b2, Some(&mut ph), 0).unwrap();
@@ -156,8 +174,11 @@ fn sequential_gains_on_opted_in_share_clock() {
     // Two consecutive fills with positive PnL on the same opted-in
     // position combine into one warmup pool; the attachment slot is pulled
     // forward (reserve-weighted) so a later gain can't inherit an elapsed
-    // clock (AUDIT HIGH-9): attached = (300*10 + 700*25)/1000 = 20.
-    let mut b = Buckets { iso: 1_000, cross: 0 };
+    // clock: attached = (300*10 + 700*25)/1000 = 20.
+    let mut b = Buckets {
+        iso: 1_000,
+        cross: 0,
+    };
     let mut ph = PosHaircut::default();
     dispatch(300, true, &mut b, Some(&mut ph), 10).unwrap();
     dispatch(700, true, &mut b, Some(&mut ph), 25).unwrap();
@@ -171,7 +192,10 @@ fn sequential_gains_on_opted_in_share_clock() {
 fn gain_then_loss_on_opted_in() {
     // A position can have profit in reserve AND a subsequent loss
     // that debits collateral. The reserve is unaffected by the loss.
-    let mut b = Buckets { iso: 1_000, cross: 0 };
+    let mut b = Buckets {
+        iso: 1_000,
+        cross: 0,
+    };
     let mut ph = PosHaircut::default();
     dispatch(400, true, &mut b, Some(&mut ph), 5).unwrap();
     assert_eq!(ph.reserve, 400);
@@ -185,7 +209,10 @@ fn cross_isolated_routing_under_opted_in_is_orthogonal_to_haircut() {
     // The isolated/cross flag still determines collateral bucket for
     // losses on opted-in markets — only gains route to reserve, and
     // gains don't pick a bucket.
-    let mut b = Buckets { iso: 0, cross: 5_000 };
+    let mut b = Buckets {
+        iso: 0,
+        cross: 5_000,
+    };
     let mut ph = PosHaircut::default();
     // Cross loss debits cross.
     dispatch(-300, false, &mut b, Some(&mut ph), 0).unwrap();
@@ -202,21 +229,51 @@ fn legacy_path_unchanged_under_any_isolated_cross_combination() {
     // The legacy path must behave bit-for-bit as before. Regression
     // guard against accidentally diverging the no-haircut path.
     // Isolated + gain
-    let mut b = Buckets { iso: 100, cross: 200 };
+    let mut b = Buckets {
+        iso: 100,
+        cross: 200,
+    };
     dispatch(50, true, &mut b, None, 0).unwrap();
-    assert_eq!(b, Buckets { iso: 150, cross: 200 });
+    assert_eq!(
+        b,
+        Buckets {
+            iso: 150,
+            cross: 200
+        }
+    );
     // Cross + gain
-    let mut b = Buckets { iso: 100, cross: 200 };
+    let mut b = Buckets {
+        iso: 100,
+        cross: 200,
+    };
     dispatch(50, false, &mut b, None, 0).unwrap();
-    assert_eq!(b, Buckets { iso: 100, cross: 250 });
+    assert_eq!(
+        b,
+        Buckets {
+            iso: 100,
+            cross: 250
+        }
+    );
     // Isolated + loss (saturating)
-    let mut b = Buckets { iso: 30, cross: 200 };
+    let mut b = Buckets {
+        iso: 30,
+        cross: 200,
+    };
     dispatch(-50, true, &mut b, None, 0).unwrap();
     assert_eq!(b, Buckets { iso: 0, cross: 200 });
     // Cross + loss
-    let mut b = Buckets { iso: 30, cross: 200 };
+    let mut b = Buckets {
+        iso: 30,
+        cross: 200,
+    };
     dispatch(-50, false, &mut b, None, 0).unwrap();
-    assert_eq!(b, Buckets { iso: 30, cross: 150 });
+    assert_eq!(
+        b,
+        Buckets {
+            iso: 30,
+            cross: 150
+        }
+    );
 }
 
 impl PartialEq for Buckets {

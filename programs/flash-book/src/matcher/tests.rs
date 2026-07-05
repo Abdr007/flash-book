@@ -1,16 +1,11 @@
-//! Pure-Rust unit tests for the matcher core. Mirror the TypeScript test
-//! suite in `tests/matcher.test.ts` etc.
+//! Unit tests for the pure matcher core.
 
 use super::flp_quoter::{generate_quotes, FlpQuoterInputs, FlpQuoterParams};
 use super::insurance::InsuranceFund;
-use super::liquidation::{
-    compute_shortfall, detect_liquidations, generate_liquidation_orders,
-};
+use super::liquidation::{compute_shortfall, detect_liquidations, generate_liquidation_orders};
 use super::lot::{BaseLots, Ticks};
 use super::order::{Order, OrderType, Side};
-use super::risk::{
-    assess_margin, default_scenarios, MarketSnapshot, PositionSnapshot,
-};
+use super::risk::{assess_margin, default_scenarios, MarketSnapshot, PositionSnapshot};
 use anchor_lang::prelude::Pubkey;
 
 #[test]
@@ -144,7 +139,10 @@ fn risk_hedged_position_collapses_required_margin() {
     let m = sol_market();
     let scenarios = default_scenarios(&[m.market]);
     let unhedged = vec![long_position(m.market, 100, 100)];
-    let hedged = vec![long_position(m.market, 100, 100), short_position(m.market, 100, 100)];
+    let hedged = vec![
+        long_position(m.market, 100, 100),
+        short_position(m.market, 100, 100),
+    ];
 
     let a_unhedged = assess_margin(&unhedged, &[m], &scenarios, 0).unwrap();
     let a_hedged = assess_margin(&hedged, &[m], &scenarios, 0).unwrap();

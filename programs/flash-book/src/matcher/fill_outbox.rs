@@ -94,7 +94,7 @@ const SL_TAKER_SIDE: usize = 88; // u8
 const SL_TAKER_SUB: usize = 89; // u8
 const SL_MAKER_SUB: usize = 90; // u8
 const SL_JIT: usize = 91; // u8
-// bytes 92..96 zero pad
+                          // bytes 92..96 zero pad
 
 /// Pure errors mirroring the ring's; the handler maps onto `FlashBookError`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -327,7 +327,7 @@ mod proofs {
         kani::assume(settled <= produced); // cursors monotonic (ring invariant)
         kani::assume(produced - settled <= ring_cap); // ring `Full` backpressure
         kani::assume(produced >= fo_cap); // a physical wrap has occurred
-        // depth = produced - settled <= ring_cap <= fo_cap  ⇒  produced - fo_cap <= settled
+                                          // depth = produced - settled <= ring_cap <= fo_cap  ⇒  produced - fo_cap <= settled
         let prev_tenant_index = produced - fo_cap;
         assert!(prev_tenant_index <= settled);
     }
@@ -342,7 +342,7 @@ mod proofs {
         assert!(idx < cap as u64);
     }
 
-    /// AUDIT (2026-07): `grow_fill_outbox` requires the outbox be DRAINED
+    /// `grow_fill_outbox` requires the outbox be DRAINED
     /// (`produced == settled`) before it changes `cap`. This proves that gate is
     /// exactly what makes the cap change safe. An occupied slot holds the fill at
     /// some index `idx` with `settled <= idx < produced`, physically at
@@ -359,8 +359,8 @@ mod proofs {
         let idx: u64 = kani::any();
         kani::assume(settled <= produced); // cursors monotonic (ring invariant)
         kani::assume(idx >= settled && idx < produced); // `idx` occupies a slot
-        // A live slot occupant ⇒ depth >= 1 ⇒ not drained. So the
-        // `produced == settled` grow gate provably admits no remappable entry.
+                                                        // A live slot occupant ⇒ depth >= 1 ⇒ not drained. So the
+                                                        // `produced == settled` grow gate provably admits no remappable entry.
         assert!(produced != settled);
     }
 }
@@ -419,10 +419,7 @@ mod tests {
         let mut d = fresh(CAP);
         let taker = [1u8; 32];
         let maker = [2u8; 32];
-        outbox_write_slot(
-            &mut d, CAP, 5, &taker, &maker, 42, 100_000, 777, 1, 3, 4, 1,
-        )
-        .unwrap();
+        outbox_write_slot(&mut d, CAP, 5, &taker, &maker, 42, 100_000, 777, 1, 3, 4, 1).unwrap();
         let s = outbox_read_slot(&d, CAP, 5).unwrap();
         assert_eq!(s.taker, taker);
         assert_eq!(s.maker, maker);

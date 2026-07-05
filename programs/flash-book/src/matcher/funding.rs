@@ -41,4 +41,3 @@ pub fn funding_owed(
     let scaled = prod >> FUNDING_INDEX_FRACTIONAL_BITS;
     Ok(sign * scaled)
 }
-

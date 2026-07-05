@@ -1,4 +1,4 @@
-//! H-haircut: junior-claim profit gating (Wave 24).
+//! H-haircut: junior-claim profit gating.
 //!
 //! Profit is junior to capital. A single global ratio
 //!
@@ -12,13 +12,10 @@
 //! extractable positive PnL across all traders is always ≤ Residual, by
 //! construction.
 //!
-//! References:
-//! - Percolator `spec.md` v12.20.6 §3 (H-invariant)
-//! - flash-book `docs/HAIRCUT_MATH.md`
+//! The formal specification lives in `docs/HAIRCUT_MATH.md`.
 //!
 //! This module is **pure math**. It owns no Solana account types and
-//! takes/returns plain integers. Account wiring lives in `lib.rs`
-//! (Wave 24b).
+//! takes/returns plain integers. Account wiring lives in `lib.rs`.
 //!
 //! ## Reserve / mature pipeline
 //!
@@ -222,15 +219,15 @@ pub fn apply_release(
         .ok_or(HaircutError::Overflow)?;
     let reserve_empty = pre.released_reserve_quote_lots == 0;
     let old_elapsed = now_slot.saturating_sub(pre.released_attached_at_slot);
-    // AUDIT M-3 / F-2 (2026-07): the HIGH-9 size-weighted blend fixed the common
-    // case but NOT `reserve >> gain`: the blend `attached' = (r·a + g·n)/(r+g)`
-    // barely moves the clock, so a fresh gain inherits the OLD reserve's elapsed
-    // time. `matured_fraction` begins maturing at `h_min` (NOT `h_max`), so any
-    // un-drained reserve whose `old_elapsed >= h_min` lets the fresh gain mature
-    // early — near-INSTANTLY once `old_elapsed` approaches `h_max`. The first M-3
-    // fix gated only the fully-matured case (`>= h_max`) and left the whole
-    // `[h_min, h_max)` window open (see the F-2 finding + `poc_*` regression test
-    // below). Correct threshold is `h_min`: BELOW `h_min` nothing has matured yet,
+    // Warmup-clock rule for a fresh gain landing on a non-empty reserve.
+    // A pure size-weighted blend `attached' = (r·a + g·n)/(r+g)` is unsound
+    // when `reserve >> gain`: the blend barely moves the clock, so the fresh
+    // gain inherits the OLD reserve's elapsed time, and because
+    // `matured_fraction` begins maturing at `h_min` (NOT `h_max`), any
+    // un-drained reserve with `old_elapsed >= h_min` would let the fresh gain
+    // mature early — near-instantly as `old_elapsed` approaches `h_max`.
+    // The threshold that closes the whole `[h_min, h_max)` window is `h_min`:
+    // BELOW `h_min` nothing has matured yet,
     // so the blend is harmless (elapsed' <= old_elapsed < h_min ⇒ still 0 matured)
     // and honest steady warming keeps the fair blend; AT/ABOVE `h_min` maturation
     // has begun, so restart the warmup at `now` to stop the fresh gain (and any
@@ -352,7 +349,10 @@ pub fn apply_mature(
     } else {
         // Partial drain — keep both. The remaining tail continues on
         // the original schedule.
-        (pre.released_attached_at_slot, pre.original_reserve_at_attach)
+        (
+            pre.released_attached_at_slot,
+            pre.original_reserve_at_attach,
+        )
     };
     Ok((
         PositionHaircutSnapshot {
@@ -411,8 +411,12 @@ pub fn release_mature_convert_if_ripe(
     market: MarketHaircutSnapshot,
 ) -> Result<(PositionHaircutSnapshot, u64, u64, u64), HaircutError> {
     let after_release = apply_release(pre, gain_quote_lots, now_slot, market.h_min_slots)?;
-    let (after_mature, matured_delta) =
-        apply_mature(after_release, now_slot, market.h_min_slots, market.h_max_slots)?;
+    let (after_mature, matured_delta) = apply_mature(
+        after_release,
+        now_slot,
+        market.h_min_slots,
+        market.h_max_slots,
+    )?;
     if after_mature.matured_pos_quote_lots == 0 {
         return Ok((after_mature, 0, 0, matured_delta));
     }
@@ -465,7 +469,7 @@ pub fn validate_market_params(h_min_slots: u64, h_max_slots: u64) -> Result<(), 
 /// | fee accrual to FLP | +fee | 0 | 0 | +fee |
 /// | fee accrual to insurance | +fee | 0 | +fee | 0 |
 /// | liquidation reward to liquidator | -reward | -reward (from position) | 0 | 0 |
-/// | apply_realized_pnl_delta gain (Wave 24d) | 0 | 0 | 0 | -credit (after convert) |
+/// | apply_realized_pnl_delta gain | 0 | 0 | 0 | -credit (after convert) |
 /// | apply_realized_pnl_delta loss | 0 | -loss (saturating) | 0 | +loss |
 ///
 /// Identity check: Σ ΔResidual over a market's history must equal the
@@ -474,10 +478,7 @@ pub fn validate_market_params(h_min_slots: u64, h_max_slots: u64) -> Result<(), 
 /// vault / collateral balances and trip the kill switch on
 /// divergence.
 #[inline]
-pub fn apply_residual_delta(
-    residual: u128,
-    delta: i128,
-) -> Result<u128, HaircutError> {
+pub fn apply_residual_delta(residual: u128, delta: i128) -> Result<u128, HaircutError> {
     if delta >= 0 {
         let d = delta as u128;
         residual.checked_add(d).ok_or(HaircutError::Overflow)
@@ -549,7 +550,7 @@ pub enum HaircutError {
     ZeroGain,
 }
 
-/// Wave 24e — invariant report from `verify_haircut_invariants`.
+/// Invariant report from `verify_haircut_invariants`.
 ///
 /// Each field is `true` when the invariant holds. The caller can
 /// inspect the bit-array to log a precise reason for failure or to
@@ -613,8 +614,9 @@ impl InvariantReport {
 ///
 /// Does NOT cross-check against on-chain SPL vault / collateral
 /// balances — that needs per-market committed-collateral accounting
-/// (Wave 28). For now, these are the invariants the engine maintains
+/// For now, these are the invariants the engine maintains
 /// purely from its own bookkeeping.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_invariants(
     residual: u128,
     matured_pos_total: u128,
@@ -654,7 +656,14 @@ mod invariant_tests {
     #[test]
     fn defaults_pass_all_invariants() {
         let r = verify_invariants(
-            10_000, 0, 0, 0, DEFAULT_H_MIN_SLOTS, DEFAULT_H_MAX_SLOTS, H_DENOM as u64, 0,
+            10_000,
+            0,
+            0,
+            0,
+            DEFAULT_H_MIN_SLOTS,
+            DEFAULT_H_MAX_SLOTS,
+            H_DENOM as u64,
+            0,
         );
         assert!(r.all_ok(), "{r:?}");
         assert_eq!(r.bitmask(), 0b1_1111);
@@ -670,7 +679,14 @@ mod invariant_tests {
     #[test]
     fn detects_oversized_window() {
         let r = verify_invariants(
-            10_000, 0, 0, 0, 0, ABS_MAX_H_MAX_SLOTS + 1, H_DENOM as u64, 0,
+            10_000,
+            0,
+            0,
+            0,
+            0,
+            ABS_MAX_H_MAX_SLOTS + 1,
+            H_DENOM as u64,
+            0,
         );
         assert!(!r.window_well_formed);
     }
@@ -679,9 +695,7 @@ mod invariant_tests {
     fn detects_cached_h_out_of_range() {
         // h_scaled stored as a value > H_DENOM (impossible if compute_h
         // is the only producer, but defensive).
-        let r = verify_invariants(
-            10_000, 0, 0, 0, 0, 100, (H_DENOM + 1) as u64, 100,
-        );
+        let r = verify_invariants(10_000, 0, 0, 0, 0, 100, (H_DENOM + 1) as u64, 100);
         assert!(!r.cached_h_in_range);
     }
 
@@ -689,27 +703,21 @@ mod invariant_tests {
     fn detects_stale_cached_h() {
         // Residual changed but cache wasn't updated. compute_h(500, 1000)
         // = H_DENOM/2 = 500_000_000, but cached says H_DENOM (no haircut).
-        let r = verify_invariants(
-            500, 1_000, 0, 0, 0, 100, H_DENOM as u64, 100,
-        );
+        let r = verify_invariants(500, 1_000, 0, 0, 0, 100, H_DENOM as u64, 100);
         assert!(!r.cached_h_consistent);
     }
 
     #[test]
     fn detects_excess_dust() {
         // Dust exceeds total flow through pipeline (matured + loss).
-        let r = verify_invariants(
-            10_000, 100, 50, 999, 0, 100, H_DENOM as u64, 0,
-        );
+        let r = verify_invariants(10_000, 100, 50, 999, 0, 100, H_DENOM as u64, 0);
         assert!(!r.dust_within_pipeline_flow);
     }
 
     #[test]
     fn allows_dust_up_to_total_flow() {
         // Dust exactly equal to matured + loss → boundary OK.
-        let r = verify_invariants(
-            10_000, 500, 500, 1_000, 0, 100, H_DENOM as u64, 0,
-        );
+        let r = verify_invariants(10_000, 500, 500, 1_000, 0, 100, H_DENOM as u64, 0);
         assert!(r.dust_within_pipeline_flow);
     }
 
@@ -802,7 +810,7 @@ mod tests {
 
     #[test]
     fn release_advances_clock_reserve_weighted() {
-        // AUDIT HIGH-9 (2026-07): a fresh gain must pull the warmup clock
+        // A fresh gain must pull the warmup clock
         // FORWARD in proportion to its size, so a large late gain cannot inherit
         // an already-elapsed clock and mature instantly. The OLD behavior kept
         // the stale attach slot (10) — that was the warmup-bypass bug.
@@ -825,7 +833,7 @@ mod tests {
 
     #[test]
     fn release_into_fully_matured_reserve_restarts_warmup() {
-        // AUDIT M-3 (2026-07): a large existing reserve that has begun maturing
+        // A large existing reserve that has begun maturing
         // (old_elapsed >= h_min) must NOT let a fresh gain inherit its elapsed clock
         // and mature instantly. The pool's warmup restarts at `now`.
         let h_min = 10u64;
@@ -849,12 +857,12 @@ mod tests {
 
     #[test]
     fn release_in_hmin_hmax_window_restarts_warmup_no_instant_mature() {
-        // AUDIT F-2 (2026-07) regression: the M-3 fix originally gated only the
-        // FULLY-matured case (old_elapsed >= h_max). But maturation begins at h_min,
-        // so a large un-drained reserve with old_elapsed in [h_min, h_max) let a
-        // fresh gain mature near-instantly via the size-weighted blend (r >> g ⇒
-        // attach barely moves). This pins the window closed: reset fires at h_min, so
-        // a gain released at old_elapsed = h_max-1 matures ZERO on the same slot.
+        // Gating only the FULLY-matured case (old_elapsed >= h_max) is not
+        // enough: maturation begins at h_min, so a large un-drained reserve
+        // with old_elapsed in [h_min, h_max) would let a fresh gain mature
+        // near-instantly via the size-weighted blend (r >> g ⇒ attach barely
+        // moves). This pins the window closed: the reset fires at h_min, so a
+        // gain released at old_elapsed = h_max-1 matures ZERO on the same slot.
         let h_min = 100u64;
         let h_max = 1000u64;
         let now = 999u64; // old_elapsed = 999 ∈ [h_min, h_max) — the exploit window.
@@ -870,7 +878,10 @@ mod tests {
         assert_eq!(post.original_reserve_at_attach, 1_000_001_000);
         // Mature at the SAME slot the gain was released ⇒ nothing matures.
         let (_after, delta) = apply_mature(post, now, h_min, h_max).unwrap();
-        assert_eq!(delta, 0, "F-2: fresh gain must serve its own warmup — no instant maturation");
+        assert_eq!(
+            delta, 0,
+            "fresh gain must serve its own warmup — no instant maturation"
+        );
     }
 
     #[test]
@@ -906,7 +917,10 @@ mod tests {
         let (post, delta) = apply_mature(pre, 1_000, 10, 100).unwrap();
         assert_eq!(delta, 1_000);
         assert_eq!(post.released_reserve_quote_lots, 0);
-        assert_eq!(post.released_attached_at_slot, 0, "clock clears on full drain");
+        assert_eq!(
+            post.released_attached_at_slot, 0,
+            "clock clears on full drain"
+        );
         assert_eq!(post.matured_pos_quote_lots, 1_000);
     }
 
@@ -1031,7 +1045,6 @@ mod tests {
     }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────
 // Formal verification — Kani proof harnesses.
 //
@@ -1132,7 +1145,11 @@ mod kani_proofs {
         kani::assume(matured <= B);
         kani::assume(h <= D);
 
-        let backed = if residual < matured { residual } else { matured };
+        let backed = if residual < matured {
+            residual
+        } else {
+            matured
+        };
         // compute_h guarantees the haircut never credits beyond the backing:
         kani::assume(matured * h <= backed * D);
 
@@ -1140,7 +1157,6 @@ mod kani_proofs {
         // credit ≤ (backed·D)/D = backed ≤ residual
         assert!(credit <= residual, "credit must be backed by residual");
     }
-
 
     // ── Invariant proof on the REAL function (division-free bound) ────────
 

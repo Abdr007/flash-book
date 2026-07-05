@@ -18,8 +18,8 @@
 //! Run: `cargo test -p flash-book --test proptest_haircut`.
 
 use flash_book::matcher::haircut::{
-    apply_convert, apply_mature, apply_release, compute_h, convert_with_haircut,
-    matured_fraction, PositionHaircutSnapshot, H_DENOM,
+    apply_convert, apply_mature, apply_release, compute_h, convert_with_haircut, matured_fraction,
+    PositionHaircutSnapshot, H_DENOM,
 };
 use proptest::prelude::*;
 

@@ -1,5 +1,5 @@
-use bytemuck::{Pod, Zeroable};
 use crate::trace;
+use bytemuck::{Pod, Zeroable};
 use std::cmp::Ordering;
 
 use super::{
@@ -743,12 +743,10 @@ where
 
             row_str += if node.parent == NIL {
                 "- "
+            } else if self.is_left_child::<V>(index) {
+                "└ "
             } else {
-                if self.is_left_child::<V>(index) {
-                    "└ "
-                } else {
-                    "┌ "
-                }
+                "┌ "
             };
 
             let color: char = if node.color == Color::Black { 'B' } else { 'R' };
@@ -1213,7 +1211,7 @@ impl<'a, V: Payload> RedBlackTree<'a, V> {
             self.set_color::<V>(sibling_index, Color::Black);
             return (current_index, parent_index);
         }
-        return (NIL, NIL);
+        (NIL, NIL)
     }
 
     /// Insert a node into the subtree without fixing. This node could be a leaf
@@ -1801,7 +1799,7 @@ pub(crate) mod test {
         let _tree1: RedBlackTree<TestOrderBid> = init_simple_tree(&mut data1);
         let _tree2: RedBlackTree<TestOrderBid> = init_simple_tree(&mut data2);
         assert_ne!(
-            get_helper::<RBNode<TestOrderBid>>(&mut data1, 1 * TEST_BLOCK_WIDTH),
+            get_helper::<RBNode<TestOrderBid>>(&mut data1, TEST_BLOCK_WIDTH),
             get_helper::<RBNode<TestOrderBid>>(&mut data2, 2 * TEST_BLOCK_WIDTH)
         );
     }
@@ -1828,7 +1826,7 @@ pub(crate) mod test {
         let mut tree: RedBlackTree<TestOrderBid> = RedBlackTree::new(&mut data, NIL, NIL);
 
         tree.insert(TEST_BLOCK_WIDTH * 0, TestOrderBid::new(0));
-        tree.insert(TEST_BLOCK_WIDTH * 1, TestOrderBid::new(1064));
+        tree.insert(TEST_BLOCK_WIDTH, TestOrderBid::new(1064));
         tree.insert(TEST_BLOCK_WIDTH * 2, TestOrderBid::new(4128));
         tree.insert(TEST_BLOCK_WIDTH * 3, TestOrderBid::new(2192));
         tree.insert(TEST_BLOCK_WIDTH * 4, TestOrderBid::new(5256));
@@ -1867,7 +1865,7 @@ pub(crate) mod test {
     #[test]
     fn test_regression_1() {
         let mut data: [u8; 100000] = [0; 100000];
-        *get_mut_helper(&mut data, 1 * TEST_BLOCK_WIDTH) = RBNode {
+        *get_mut_helper(&mut data, TEST_BLOCK_WIDTH) = RBNode {
             left: NIL,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
@@ -1877,7 +1875,7 @@ pub(crate) mod test {
             value: TestOrderBid::new(1),
         };
         *get_mut_helper(&mut data, 2 * TEST_BLOCK_WIDTH) = RBNode {
-            left: 1 * TEST_BLOCK_WIDTH,
+            left: TEST_BLOCK_WIDTH,
             right: 4 * TEST_BLOCK_WIDTH,
             parent: 5 * TEST_BLOCK_WIDTH,
             color: Color::Red,
@@ -1968,7 +1966,7 @@ pub(crate) mod test {
     #[test]
     fn test_regression_2() {
         let mut data: [u8; 100000] = [0; 100000];
-        *get_mut_helper(&mut data, 1 * TEST_BLOCK_WIDTH) = RBNode {
+        *get_mut_helper(&mut data, TEST_BLOCK_WIDTH) = RBNode {
             left: NIL,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
@@ -1978,7 +1976,7 @@ pub(crate) mod test {
             value: TestOrderBid::new(1),
         };
         *get_mut_helper(&mut data, 2 * TEST_BLOCK_WIDTH) = RBNode {
-            left: 1 * TEST_BLOCK_WIDTH,
+            left: TEST_BLOCK_WIDTH,
             right: 4 * TEST_BLOCK_WIDTH,
             parent: 6 * TEST_BLOCK_WIDTH,
             color: Color::Red,
@@ -2073,7 +2071,7 @@ pub(crate) mod test {
     #[test]
     fn test_regression_3() {
         let mut data: [u8; 100000] = [0; 100000];
-        *get_mut_helper(&mut data, 1 * TEST_BLOCK_WIDTH) = RBNode {
+        *get_mut_helper(&mut data, TEST_BLOCK_WIDTH) = RBNode {
             left: NIL,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
@@ -2083,7 +2081,7 @@ pub(crate) mod test {
             value: TestOrderBid::new(1),
         };
         *get_mut_helper(&mut data, 2 * TEST_BLOCK_WIDTH) = RBNode {
-            left: 1 * TEST_BLOCK_WIDTH,
+            left: TEST_BLOCK_WIDTH,
             right: 4 * TEST_BLOCK_WIDTH,
             parent: 5 * TEST_BLOCK_WIDTH,
             color: Color::Black,
@@ -2201,14 +2199,14 @@ pub(crate) mod test {
         let mut data: [u8; 100000] = [0; 100000];
         *get_mut_helper(&mut data, 0 * TEST_BLOCK_WIDTH) = RBNode {
             left: 2 * TEST_BLOCK_WIDTH,
-            right: 1 * TEST_BLOCK_WIDTH,
+            right: TEST_BLOCK_WIDTH,
             parent: NIL,
             color: Color::Red,
             value: TestOrderAsk::new(0),
             payload_type: 0,
             _unused_padding: 0,
         };
-        *get_mut_helper(&mut data, 1 * TEST_BLOCK_WIDTH) = RBNode {
+        *get_mut_helper(&mut data, TEST_BLOCK_WIDTH) = RBNode {
             left: NIL,
             right: NIL,
             parent: 0 * TEST_BLOCK_WIDTH,
@@ -2245,7 +2243,7 @@ pub(crate) mod test {
             _unused_padding: 0,
         };
         let mut tree: RedBlackTree<TestOrderAsk> =
-            RedBlackTree::new(&mut data, 0 * TEST_BLOCK_WIDTH, 1 * TEST_BLOCK_WIDTH);
+            RedBlackTree::new(&mut data, 0 * TEST_BLOCK_WIDTH, TEST_BLOCK_WIDTH);
         tree.verify_rb_tree::<TestOrderBid>();
         tree.pretty_print::<TestOrderBid>();
 
@@ -2256,7 +2254,7 @@ pub(crate) mod test {
     #[test]
     fn test_regression_5() {
         let mut data: [u8; 100000] = [0; 100000];
-        *get_mut_helper(&mut data, 1 * TEST_BLOCK_WIDTH) = RBNode {
+        *get_mut_helper(&mut data, TEST_BLOCK_WIDTH) = RBNode {
             left: 2 * TEST_BLOCK_WIDTH,
             right: 3 * TEST_BLOCK_WIDTH,
             parent: NIL,
@@ -2268,7 +2266,7 @@ pub(crate) mod test {
         *get_mut_helper(&mut data, 2 * TEST_BLOCK_WIDTH) = RBNode {
             left: 4 * TEST_BLOCK_WIDTH,
             right: 22 * TEST_BLOCK_WIDTH,
-            parent: 1 * TEST_BLOCK_WIDTH,
+            parent: TEST_BLOCK_WIDTH,
             color: Color::Red,
             payload_type: 0,
             _unused_padding: 0,
@@ -2277,7 +2275,7 @@ pub(crate) mod test {
         *get_mut_helper(&mut data, 3 * TEST_BLOCK_WIDTH) = RBNode {
             left: 29 * TEST_BLOCK_WIDTH,
             right: 5 * TEST_BLOCK_WIDTH,
-            parent: 1 * TEST_BLOCK_WIDTH,
+            parent: TEST_BLOCK_WIDTH,
             color: Color::Red,
             payload_type: 0,
             _unused_padding: 0,
@@ -2573,7 +2571,7 @@ pub(crate) mod test {
         };
 
         let mut tree: RedBlackTree<TestOrderBid> =
-            RedBlackTree::new(&mut data, 1 * TEST_BLOCK_WIDTH, 15 * TEST_BLOCK_WIDTH);
+            RedBlackTree::new(&mut data, TEST_BLOCK_WIDTH, 15 * TEST_BLOCK_WIDTH);
         tree.verify_rb_tree::<TestOrderBid>();
 
         tree.remove_by_index(6 * TEST_BLOCK_WIDTH);
@@ -2658,7 +2656,7 @@ pub(crate) mod test {
         let mut tree: RedBlackTree<TestOrder2> = RedBlackTree::new(&mut data, NIL, NIL);
 
         tree.insert(TEST_BLOCK_WIDTH * 0, TestOrder2::new(1000, 1234));
-        tree.insert(TEST_BLOCK_WIDTH * 1, TestOrder2::new(1000, 2345));
+        tree.insert(TEST_BLOCK_WIDTH, TestOrder2::new(1000, 2345));
         tree.insert(TEST_BLOCK_WIDTH * 2, TestOrder2::new(1000, 3456));
         tree.insert(TEST_BLOCK_WIDTH * 3, TestOrder2::new(1000, 4567));
         tree.insert(TEST_BLOCK_WIDTH * 4, TestOrder2::new(1000, 5678));

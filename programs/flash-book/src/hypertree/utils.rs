@@ -58,8 +58,8 @@ impl From<bool> for PodBool {
 
 #[test]
 fn test_pod_bool() {
-    assert_eq!(PodBool::from_bool(false).0 == 1, false);
-    assert_eq!(PodBool::from(false).0 == 1, false);
+    assert!(PodBool::from_bool(false).0 != 1);
+    assert!(PodBool::from(false).0 != 1);
 }
 
 #[test]

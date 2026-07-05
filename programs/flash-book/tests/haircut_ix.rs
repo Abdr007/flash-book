@@ -95,17 +95,11 @@ fn ix_mature(
     pos.attached_at_slot = post.released_attached_at_slot;
     pos.matured = post.matured_pos_quote_lots;
     pos.original_reserve_at_attach = post.original_reserve_at_attach;
-    market.matured_pos_total = market
-        .matured_pos_total
-        .checked_add(delta as u128)
-        .unwrap();
+    market.matured_pos_total = market.matured_pos_total.checked_add(delta as u128).unwrap();
     delta
 }
 
-fn ix_convert(
-    pos: &mut PositionHaircutState,
-    market: &mut MarketHaircutState,
-) -> (u64, u64) {
+fn ix_convert(pos: &mut PositionHaircutState, market: &mut MarketHaircutState) -> (u64, u64) {
     let pre = PositionHaircutSnapshot {
         released_reserve_quote_lots: pos.reserve,
         released_attached_at_slot: pos.attached_at_slot,

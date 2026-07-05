@@ -19,11 +19,11 @@ use anchor_lang::prelude::*;
 #[derive(Debug, Clone, Copy)]
 pub struct FlpQuoterParams {
     pub base_spread_bps: u32,
-    pub alpha_bps: u32,           // VPIN coefficient
-    pub beta_bps: u32,            // utilization coefficient
-    pub gamma_bps: u32,           // OI imbalance coefficient
-    pub kappa_bps: u32,           // depth amortization (Q/depth_floor)
-    pub delta_bps: u32,           // realized-volatility coefficient
+    pub alpha_bps: u32, // VPIN coefficient
+    pub beta_bps: u32,  // utilization coefficient
+    pub gamma_bps: u32, // OI imbalance coefficient
+    pub kappa_bps: u32, // depth amortization (Q/depth_floor)
+    pub delta_bps: u32, // realized-volatility coefficient
     pub inventory_lambda_bps: u32,
     pub depth_floor_lots: u64,
     pub max_growth_per_batch_bps: u32,
@@ -69,7 +69,10 @@ pub fn generate_quotes(
     }
 
     // OI imbalance in bps (signed). Positive = traders net-long.
-    let oi_total = inputs.oi_long_lots.checked_add(inputs.oi_short_lots).or_overflow()?;
+    let oi_total = inputs
+        .oi_long_lots
+        .checked_add(inputs.oi_short_lots)
+        .or_overflow()?;
     let oi_imb_bps: i32 = if oi_total > 0 {
         let diff: i128 = (inputs.oi_long_lots as i128) - (inputs.oi_short_lots as i128);
         ((diff * BPS_DENOM as i128) / oi_total as i128) as i32
@@ -89,8 +92,8 @@ pub fn generate_quotes(
     };
 
     // skew_bps = -lambda * inv_bps / BPS_DENOM (so lambda is in bps too).
-    let skew_bps = -((params.inventory_lambda_bps as i64 * inv_bps as i64)
-        / BPS_DENOM as i64) as i32;
+    let skew_bps =
+        -((params.inventory_lambda_bps as i64 * inv_bps as i64) / BPS_DENOM as i64) as i32;
 
     // fair_value = oracle * (1 + skew_bps/BPS_DENOM)
     let fair_value = apply_bps_signed(inputs.oracle_ticks, skew_bps)?;
@@ -148,17 +151,23 @@ pub fn generate_quotes(
             .checked_mul(i)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         // s_bps = base + α·vpin + β·u + γ·|oi_imb| + κ·(Q/depth_floor)·BPS
-        let oi_term = (params.gamma_bps as u64 * (oi_imb_bps.unsigned_abs() as u64)) / BPS_DENOM as u64;
+        let oi_term =
+            (params.gamma_bps as u64 * (oi_imb_bps.unsigned_abs() as u64)) / BPS_DENOM as u64;
         let depth_term = if params.depth_floor_lots > 0 {
-            ((cum_size as u128) * (params.kappa_bps as u128) / (params.depth_floor_lots as u128)) as u64
+            ((cum_size as u128) * (params.kappa_bps as u128) / (params.depth_floor_lots as u128))
+                as u64
         } else {
             0
         };
-        let vol_term = (params.delta_bps as u64 * inputs.realized_vol_bps as u64) / BPS_DENOM as u64;
+        let vol_term =
+            (params.delta_bps as u64 * inputs.realized_vol_bps as u64) / BPS_DENOM as u64;
         let s_bps = (params.base_spread_bps as u64)
             .checked_add((params.alpha_bps as u64 * inputs.vpin_bps as u64) / BPS_DENOM as u64)
             .or_overflow()?
-            .checked_add((params.beta_bps as u64 * inputs.pool_gross_utilization_bps as u64) / BPS_DENOM as u64)
+            .checked_add(
+                (params.beta_bps as u64 * inputs.pool_gross_utilization_bps as u64)
+                    / BPS_DENOM as u64,
+            )
             .or_overflow()?
             .checked_add(oi_term)
             .or_overflow()?
@@ -234,7 +243,7 @@ fn align_tick(price: Ticks, tick_size: u64) -> Ticks {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// #35 / H1 part B — FLP fill-price authenticity bound.
+// FLP fill-price authenticity bound.
 //
 // FLP fills are quotes against pool liquidity, not on-chain resting orders, so
 // they cannot be bound by the matcher's fill-commitment ring (which covers book

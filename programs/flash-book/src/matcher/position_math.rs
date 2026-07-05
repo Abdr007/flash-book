@@ -54,10 +54,11 @@ pub enum PosMathError {
     DivByZero,
 }
 
-/// Apply `(fill_side, fill_size_lots, fill_price_ticks)` to `pos`. Byte-faithful
-/// port of the long-standing `apply_fill_to_position` arithmetic (incl. the H-1
-/// `tick_size` scaling of realized PnL). Returns the new position + realized PnL
-/// + funding-reset flag, or a `PosMathError` on any checked-arithmetic edge.
+/// Apply `(fill_side, fill_size_lots, fill_price_ticks)` to `pos` — the
+/// settlement arithmetic `apply_fill` / `apply_flp_fill` route through,
+/// including the `tick_size` scaling of realized PnL. Returns the new
+/// position + realized PnL + funding-reset flag, or a `PosMathError` on any
+/// checked-arithmetic edge.
 pub fn apply_fill(
     pos: Pos,
     fill_side: u8,
@@ -120,7 +121,7 @@ pub fn apply_fill(
         .ok_or(PosMathError::Overflow)?
         .checked_mul(tick_size as i128)
         .ok_or(PosMathError::Overflow)?;
-    // AUDIT L-3 (2026-07): REJECT a realized PnL that exceeds i64 rather than
+    // REJECT a realized PnL that exceeds i64 rather than
     // silently saturating it. A clamped value both breaks per-fill value
     // conservation (the two legs would clamp independently) and, once fed to the
     // caller's `checked_add`, can revert mid-ring and strand the FIFO. Realistic
@@ -187,7 +188,11 @@ mod proofs {
         let price: u64 = kani::any();
         let ts: u64 = kani::any();
         kani::assume(ts >= 1);
-        let flat = Pos { side, size_lots: 0, entry_ticks: entry };
+        let flat = Pos {
+            side,
+            size_lots: 0,
+            entry_ticks: entry,
+        };
         let o = apply_fill(flat, fs, size, price, ts).unwrap();
         assert!(o.pos.side == fs && o.pos.size_lots == size && o.pos.entry_ticks == price);
         assert!(o.realized_pnl_quote_lots == 0 && o.reset_funding);
@@ -210,7 +215,11 @@ mod proofs {
         let fp: u64 = kani::any();
         let ts: u64 = kani::any();
         kani::assume(ts >= 1 && s0 >= 1 && s0 < B && fs < B && e0 < B && fp < B);
-        let p = Pos { side, size_lots: s0, entry_ticks: e0 };
+        let p = Pos {
+            side,
+            size_lots: s0,
+            entry_ticks: e0,
+        };
         let o = apply_fill(p, side, fs, fp, ts).unwrap();
         assert!(o.pos.size_lots == s0 + fs);
         assert!(o.pos.side == side);
@@ -225,7 +234,7 @@ mod proofs {
     // Kani proofs here therefore cover the transition STRUCTURE (open/stack paths
     // and the "no PnL without a reduction" invariant, which don't hit the i128 PnL
     // multiply); the reduce/flip size+side transitions and the exact PnL values —
-    // including V2 parity — are pinned by exhaustive-by-case host tests.
+    // are pinned by exhaustive-by-case host tests.
 
     /// Realized PnL is nonzero ONLY on a reduction: opening from flat and
     /// stacking the same side both realize exactly zero, for all inputs.
@@ -240,11 +249,33 @@ mod proofs {
         let ts: u64 = kani::any();
         kani::assume(ts >= 1 && s0 < B && fs < B && e0 < B && fp < B);
         // flat → open
-        let o_open = apply_fill(Pos { side, size_lots: 0, entry_ticks: e0 }, side, fs, fp, ts).unwrap();
+        let o_open = apply_fill(
+            Pos {
+                side,
+                size_lots: 0,
+                entry_ticks: e0,
+            },
+            side,
+            fs,
+            fp,
+            ts,
+        )
+        .unwrap();
         assert!(o_open.realized_pnl_quote_lots == 0);
         // same side → stack
         kani::assume(s0 >= 1);
-        let o_stack = apply_fill(Pos { side, size_lots: s0, entry_ticks: e0 }, side, fs, fp, ts).unwrap();
+        let o_stack = apply_fill(
+            Pos {
+                side,
+                size_lots: s0,
+                entry_ticks: e0,
+            },
+            side,
+            fs,
+            fp,
+            ts,
+        )
+        .unwrap();
         assert!(o_stack.realized_pnl_quote_lots == 0);
     }
 }
@@ -255,8 +286,26 @@ mod tests {
 
     #[test]
     fn open_from_flat() {
-        let o = apply_fill(Pos { side: 0, size_lots: 0, entry_ticks: 0 }, 1, 5, 100, 1).unwrap();
-        assert_eq!(o.pos, Pos { side: 1, size_lots: 5, entry_ticks: 100 });
+        let o = apply_fill(
+            Pos {
+                side: 0,
+                size_lots: 0,
+                entry_ticks: 0,
+            },
+            1,
+            5,
+            100,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            o.pos,
+            Pos {
+                side: 1,
+                size_lots: 5,
+                entry_ticks: 100
+            }
+        );
         assert_eq!(o.realized_pnl_quote_lots, 0);
         assert!(o.reset_funding);
     }
@@ -264,9 +313,20 @@ mod tests {
     #[test]
     fn stack_vwap() {
         // long 10 @ 100, add long 10 @ 200 → 20 @ 150
-        let p = Pos { side: 0, size_lots: 10, entry_ticks: 100 };
+        let p = Pos {
+            side: 0,
+            size_lots: 10,
+            entry_ticks: 100,
+        };
         let o = apply_fill(p, 0, 10, 200, 1).unwrap();
-        assert_eq!(o.pos, Pos { side: 0, size_lots: 20, entry_ticks: 150 });
+        assert_eq!(
+            o.pos,
+            Pos {
+                side: 0,
+                size_lots: 20,
+                entry_ticks: 150
+            }
+        );
         assert_eq!(o.realized_pnl_quote_lots, 0);
         assert!(!o.reset_funding);
     }
@@ -274,16 +334,31 @@ mod tests {
     #[test]
     fn reduce_long_at_profit() {
         // long 10 @ 100, sell 4 @ 120, tick 3 → realize +4*20*3 = +240, left long 6 @ 100
-        let p = Pos { side: 0, size_lots: 10, entry_ticks: 100 };
+        let p = Pos {
+            side: 0,
+            size_lots: 10,
+            entry_ticks: 100,
+        };
         let o = apply_fill(p, 1, 4, 120, 3).unwrap();
-        assert_eq!(o.pos, Pos { side: 0, size_lots: 6, entry_ticks: 100 });
+        assert_eq!(
+            o.pos,
+            Pos {
+                side: 0,
+                size_lots: 6,
+                entry_ticks: 100
+            }
+        );
         assert_eq!(o.realized_pnl_quote_lots, 240);
         assert!(!o.reset_funding);
     }
 
     #[test]
     fn close_to_flat_resets() {
-        let p = Pos { side: 0, size_lots: 10, entry_ticks: 100 };
+        let p = Pos {
+            side: 0,
+            size_lots: 10,
+            entry_ticks: 100,
+        };
         let o = apply_fill(p, 1, 10, 120, 1).unwrap();
         assert_eq!(o.pos.size_lots, 0);
         assert_eq!(o.pos.entry_ticks, 0);
@@ -295,9 +370,20 @@ mod tests {
     fn flip_short_to_long() {
         // short 5 @ 100, buy 8 @ 90, tick 1 → short profit +5*(100-90)=+50 on closed 5,
         // then long 3 @ 90.
-        let p = Pos { side: 1, size_lots: 5, entry_ticks: 100 };
+        let p = Pos {
+            side: 1,
+            size_lots: 5,
+            entry_ticks: 100,
+        };
         let o = apply_fill(p, 0, 8, 90, 1).unwrap();
-        assert_eq!(o.pos, Pos { side: 0, size_lots: 3, entry_ticks: 90 });
+        assert_eq!(
+            o.pos,
+            Pos {
+                side: 0,
+                size_lots: 3,
+                entry_ticks: 90
+            }
+        );
         // short: sign = -1; pnl = -1*5*(90-100)*1 = +50
         assert_eq!(o.realized_pnl_quote_lots, 50);
         assert!(o.reset_funding);
@@ -307,9 +393,19 @@ mod tests {
     fn matches_v2_notional_return_formula() {
         // long 10 lots @ entry 100, close @ 120, tick 1.
         // flash-book: 10 · (120−100) · 1 = 200.
-        let fb = apply_fill(Pos { side: 0, size_lots: 10, entry_ticks: 100 }, 1, 10, 120, 1)
-            .unwrap()
-            .realized_pnl_quote_lots;
+        let fb = apply_fill(
+            Pos {
+                side: 0,
+                size_lots: 10,
+                entry_ticks: 100,
+            },
+            1,
+            10,
+            120,
+            1,
+        )
+        .unwrap()
+        .realized_pnl_quote_lots;
         // V2: (mark−entry)/entry · size_usd, size_usd = notional = 10·100·1 = 1000.
         //     (120−100)/100 · 1000 = 0.2 · 1000 = 200.
         let notional = 10.0 * 100.0 * 1.0;
@@ -336,18 +432,42 @@ mod tests {
                             // PnL = sign·fill·Δ·tick.
                             if s0 >= 2 {
                                 let fs = s0 - 1;
-                                let o = apply_fill(Pos { side, size_lots: s0, entry_ticks: e0 }, opp, fs, fp, ts).unwrap();
+                                let o = apply_fill(
+                                    Pos {
+                                        side,
+                                        size_lots: s0,
+                                        entry_ticks: e0,
+                                    },
+                                    opp,
+                                    fs,
+                                    fp,
+                                    ts,
+                                )
+                                .unwrap();
                                 assert_eq!(o.pos.side, side);
                                 assert_eq!(o.pos.size_lots, s0 - fs);
                                 assert_eq!(
                                     o.realized_pnl_quote_lots as i128,
-                                    sign * (fs as i128) * ((fp as i128) - (e0 as i128)) * (ts as i128)
+                                    sign * (fs as i128)
+                                        * ((fp as i128) - (e0 as i128))
+                                        * (ts as i128)
                                 );
                             }
                             // FLIP (fill > size): lands on opp side, residual =
                             // fill−size, entry = fill price, PnL on CLOSED lots (s0).
                             let fs = s0 + 2;
-                            let o = apply_fill(Pos { side, size_lots: s0, entry_ticks: e0 }, opp, fs, fp, ts).unwrap();
+                            let o = apply_fill(
+                                Pos {
+                                    side,
+                                    size_lots: s0,
+                                    entry_ticks: e0,
+                                },
+                                opp,
+                                fs,
+                                fp,
+                                ts,
+                            )
+                            .unwrap();
                             assert_eq!(o.pos.side, opp);
                             assert_eq!(o.pos.size_lots, fs - s0);
                             assert_eq!(o.pos.entry_ticks, fp);
@@ -358,7 +478,8 @@ mod tests {
                             );
                             // V2 RECONCILIATION (division-free): flash-book's
                             // exact-integer PnL equals V2's return-formula value.
-                            let fb: i128 = (s0 as i128) * ((fp as i128) - (e0 as i128)) * (ts as i128);
+                            let fb: i128 =
+                                (s0 as i128) * ((fp as i128) - (e0 as i128)) * (ts as i128);
                             let notional: i128 = (s0 as i128) * (e0 as i128) * (ts as i128);
                             assert_eq!(fb * (e0 as i128), ((fp as i128) - (e0 as i128)) * notional);
                         }
@@ -379,10 +500,25 @@ mod tests {
                 for e0 in 1u64..=8 {
                     for fs in 1u64..=8 {
                         for fp in 1u64..=8 {
-                            let o = apply_fill(Pos { side, size_lots: s0, entry_ticks: e0 }, side, fs, fp, 1).unwrap();
+                            let o = apply_fill(
+                                Pos {
+                                    side,
+                                    size_lots: s0,
+                                    entry_ticks: e0,
+                                },
+                                side,
+                                fs,
+                                fp,
+                                1,
+                            )
+                            .unwrap();
                             assert_eq!(o.pos.size_lots, s0 + fs);
                             let (lo, hi) = if e0 < fp { (e0, fp) } else { (fp, e0) };
-                            assert!(o.pos.entry_ticks >= lo && o.pos.entry_ticks <= hi, "s0={s0} e0={e0} fs={fs} fp={fp} -> {}", o.pos.entry_ticks);
+                            assert!(
+                                o.pos.entry_ticks >= lo && o.pos.entry_ticks <= hi,
+                                "s0={s0} e0={e0} fs={fs} fp={fp} -> {}",
+                                o.pos.entry_ticks
+                            );
                         }
                     }
                 }
@@ -392,9 +528,16 @@ mod tests {
 
     #[test]
     fn overflow_is_error_not_panic() {
-        let p = Pos { side: 0, size_lots: u64::MAX, entry_ticks: 1 };
+        let p = Pos {
+            side: 0,
+            size_lots: u64::MAX,
+            entry_ticks: 1,
+        };
         // stacking would overflow size add
-        assert_eq!(apply_fill(p, 0, u64::MAX, 1, 1), Err(PosMathError::Overflow));
+        assert_eq!(
+            apply_fill(p, 0, u64::MAX, 1, 1),
+            Err(PosMathError::Overflow)
+        );
     }
 }
 

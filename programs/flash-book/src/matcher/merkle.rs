@@ -55,7 +55,10 @@ mod proofs {
     fn mock(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
         let mut o = [0u8; 32];
         for i in 0..32 {
-            o[i] = l[i].wrapping_mul(3).wrapping_add(r[i].wrapping_mul(7)).wrapping_add(i as u8);
+            o[i] = l[i]
+                .wrapping_mul(3)
+                .wrapping_add(r[i].wrapping_mul(7))
+                .wrapping_add(i as u8);
         }
         o
     }
@@ -122,9 +125,19 @@ mod tests {
         let n1 = kc(&c, &d);
         let root = kc(&kc(&a, &b), &n1);
         // wrong leaf
-        assert!(!verify_inclusion(leaf(9), &[(b, false), (n1, false)], root, kc));
+        assert!(!verify_inclusion(
+            leaf(9),
+            &[(b, false), (n1, false)],
+            root,
+            kc
+        ));
         // wrong sibling
-        assert!(!verify_inclusion(a, &[(leaf(9), false), (n1, false)], root, kc));
+        assert!(!verify_inclusion(
+            a,
+            &[(leaf(9), false), (n1, false)],
+            root,
+            kc
+        ));
         // wrong side (claim b is on the left) → different root
         assert!(!verify_inclusion(a, &[(b, true), (n1, false)], root, kc));
         // non-member with a fabricated proof cannot hit the root

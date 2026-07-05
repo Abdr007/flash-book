@@ -4,9 +4,7 @@
 //! state shape. The on-chain ix is a direct passthrough — passing
 //! here proves the runtime behavior.
 
-use flash_book::matcher::envelope::{
-    gate_price_move, EnvelopeError, EnvelopeParams,
-};
+use flash_book::matcher::envelope::{gate_price_move, EnvelopeError, EnvelopeParams};
 
 #[derive(Debug, Clone, Copy)]
 struct EnvelopeCfg {

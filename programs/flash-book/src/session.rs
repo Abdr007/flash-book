@@ -31,7 +31,7 @@ pub struct SessionTokenAccount {
     pub session_signer: Pubkey,
     /// Unix seconds after which the session is invalid (checked on every use).
     pub expires_at_unix: i64,
-    /// AUDIT M-9 (2026-07): market scope. `Pubkey::default()` (all-zero) = the
+    /// Market scope. `Pubkey::default()` (all-zero) = the
     /// session may act on ANY market (legacy/opt-out behaviour). A specific market
     /// key = the session is restricted to that ONE market, so a leaked session key
     /// cannot dump the owner's collateral across every market. Enforced in `verify`.
@@ -61,7 +61,7 @@ pub fn verify(
         now_unix <= token.expires_at_unix,
         crate::errors::FlashBookError::SessionExpired
     );
-    // AUDIT M-9 (2026-07): enforce market scope. Default (all-zero) = unrestricted.
+    // Enforce market scope. Default (all-zero) = unrestricted.
     require!(
         token.scope_market == Pubkey::default() || token.scope_market == market,
         crate::errors::FlashBookError::Unauthorized
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn out_of_scope_market_rejected() {
-        // AUDIT M-9: a market-scoped session rejects a different market but allows
+        // A market-scoped session rejects a different market but allows
         // its own; a default-scope session allows any market.
         let mut t = tok([9u8; 32], 1_000);
         let m_a = Pubkey::new_from_array([7u8; 32]);

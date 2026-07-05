@@ -25,8 +25,8 @@ use anchor_lang::prelude::Pubkey;
 use flash_book::matcher::lot::Ticks;
 use flash_book::matcher::order::Side;
 use flash_book::matcher::risk::{
-    assess_margin, assess_margin_split, assess_margin_unified,
-    default_scenarios, MarketSnapshot, PositionSnapshot,
+    assess_margin, assess_margin_split, assess_margin_unified, default_scenarios, MarketSnapshot,
+    PositionSnapshot,
 };
 use proptest::prelude::*;
 

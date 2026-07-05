@@ -1,9 +1,8 @@
-//! A/K/F/B per-side lazy accrual indices (Wave 25 scaffold).
+//! A/K/F/B per-side lazy accrual indices.
 //!
-//! Pure types and math. Wave 24 lands the haircut module; Wave 25
-//! rewires the funding / mark / ADL settle paths onto these indices.
-//! This file ships the data structures + the elementary index-advance
-//! and snapshot-settle primitives so Wave 25 begins from a tested core.
+//! Pure types and math: the data structures plus the elementary
+//! index-advance and snapshot-settle primitives the funding / mark / ADL
+//! settle paths operate on.
 //!
 //! ## The four side indices
 //!
@@ -31,34 +30,27 @@
 //! touches the chain. Closes the throughput ceiling on the ER's
 //! sub-second tick.
 //!
-//! See Percolator `spec.md` v12.20.6 §3 (Invariant 2) for the formal
-//! definitions and `percolator.rs::accrue_market_to` for the reference
-//! implementation. The flash-book port adapts the scaling to our
-//! `(USD_UNIT = 10^6, BPS_DENOM = 10^4, FUNDING_INDEX_FRACTIONAL_BITS
-//! = 64)` conventions.
+//! Scaling conventions: `USD_UNIT = 10^6`, `BPS_DENOM = 10^4`,
+//! `FUNDING_INDEX_FRACTIONAL_BITS = 64`.
 
 /// Multiplier denominator for `A`. Starting value of every side is
 /// `ADL_ONE`; reductions scale all opposing positions pro-rata.
-/// Matches Percolator's `ADL_ONE = 10^15` for compatibility with the
-/// reference proofs and to give 15 decimals of headroom against
-/// repeated ADL passes.
+/// 10^15 gives 15 decimals of headroom against repeated ADL passes.
 pub const ADL_ONE: u128 = 1_000_000_000_000_000;
 
 /// Precision threshold below which a side enters DrainOnly mode (no
-/// new OI; existing positions can only close). Mirrors Percolator's
-/// `MIN_A_SIDE = 10^14`. Once A drops here, the side state machine
-/// transitions to DrainOnly → ResetPending → Normal over time.
+/// new OI; existing positions can only close). Once A drops here, the
+/// side state machine transitions DrainOnly → ResetPending → Normal
+/// over time.
 pub const MIN_A_SIDE: u128 = 100_000_000_000_000;
 
 /// Position-quantity scale. `basis_i` is the position's lot size at
 /// attach, multiplied by `POS_SCALE` for fixed-point K/F math.
-/// Matches Percolator's `POS_SCALE = 10^6`.
 pub const POS_SCALE: u128 = 1_000_000;
 
 /// Funding denominator. Funding rates are accumulated as
 /// `funding_rate_e9 × price × dt × A` and divided by
-/// `FUNDING_DEN × A_attach × POS_SCALE` on settle. Matches
-/// Percolator's `FUNDING_DEN = 10^9`.
+/// `FUNDING_DEN × A_attach × POS_SCALE` on settle.
 pub const FUNDING_DEN: u128 = 1_000_000_000;
 
 /// Side state machine.
@@ -101,7 +93,7 @@ pub struct SideAccrual {
     /// Monotonic epoch counter. Bumps on every Drain → Normal cycle.
     pub epoch: u32,
     /// `slot_last`: last slot at which K/F advanced. Used to gate
-    /// per-slot price-move caps (Wave 26).
+    /// per-slot price-move caps.
     pub slot_last: u64,
     /// Last oracle price observed at `slot_last`. Needed to compute
     /// `Δprice` deltas without re-reading the oracle on every accrual.
@@ -247,7 +239,7 @@ pub fn pnl_delta_from_f(basis_lots: u64, f_now: i128, f_snap: i128, a_snap: u128
     scaled / denom
 }
 
-// ─── Wave 25b — Index advance + position settle helpers ────────────
+// ─── Index advance + position settle helpers ───────────────────────
 
 /// Advance a side's K and F indices given a new oracle price and a
 /// funding rate. Pure math.
@@ -261,14 +253,9 @@ pub fn pnl_delta_from_f(basis_lots: u64, f_now: i128, f_snap: i128, a_snap: u128
 /// scales with any ADL reductions that happened since attach.
 ///
 /// Returns `Ok` when the advance is admissible; the caller is expected
-/// to gate `p_new` against the envelope (Wave 26b) before invoking
+/// to gate `p_new` against the envelope before invoking
 /// this — the helper itself doesn't re-validate.
-pub fn advance_indices(
-    side: &mut SideAccrual,
-    p_new: u64,
-    funding_rate_e9: i64,
-    now_slot: u64,
-) {
+pub fn advance_indices(side: &mut SideAccrual, p_new: u64, funding_rate_e9: i64, now_slot: u64) {
     if side.slot_last == 0 {
         // First observation — seed and skip the delta math.
         side.slot_last = now_slot;
@@ -297,8 +284,7 @@ pub fn advance_indices(
     // accumulation — wire-in calls with funding sign appropriate to
     // the side.
     if funding_rate_e9 != 0 {
-        let f_per_slot: i128 = (side.price_last as i128)
-            .saturating_mul(funding_rate_e9 as i128);
+        let f_per_slot: i128 = (side.price_last as i128).saturating_mul(funding_rate_e9 as i128);
         let f_delta: i128 = f_per_slot
             .saturating_mul(dt as i128)
             .saturating_mul(side.a as i128);
@@ -346,9 +332,9 @@ pub fn refresh_position_snapshot(pos: &mut PositionSnapshot, side: &SideAccrual)
     pos.epoch_snap = side.epoch;
 }
 
-/// Reduce A on a side by a factor `numerator / denominator`. Wave 25b
-/// replacement for `auto_deleverage`'s bankruptcy-price math: shrink
-/// every opposing position pro-rata by scaling A. Idempotent through
+/// Reduce A on a side by a factor `numerator / denominator` — the
+/// index-based form of `auto_deleverage`'s pro-rata shrink: scaling A
+/// shrinks every opposing position pro-rata. Idempotent through
 /// the settle math — opposing positions read the new A on their next
 /// touch and self-shrink via `effective_lots`.
 ///
@@ -482,7 +468,7 @@ mod tests {
         assert_eq!(pnl_delta_from_f(1_000, 100, 0, 0), 0);
     }
 
-    // ─── Wave 25b tests ─────────────────────────────────────────────
+    // ─── Index-advance + settle tests ───────────────────────────────
 
     #[test]
     fn advance_indices_first_observation_seeds_only() {
@@ -549,12 +535,14 @@ mod tests {
 
     #[test]
     fn refresh_position_snapshot_captures_full_state() {
-        let mut s = SideAccrual::default();
-        s.a = MIN_A_SIDE / 2;
-        s.k = 12_345;
-        s.f = -678;
-        s.b = 99;
-        s.epoch = 7;
+        let s = SideAccrual {
+            a: MIN_A_SIDE / 2,
+            k: 12_345,
+            f: -678,
+            b: 99,
+            epoch: 7,
+            ..SideAccrual::default()
+        };
         let mut p = PositionSnapshot::default();
         refresh_position_snapshot(&mut p, &s);
         assert_eq!(p.a_snap, s.a);

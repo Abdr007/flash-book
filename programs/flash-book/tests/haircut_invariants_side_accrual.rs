@@ -104,10 +104,11 @@ fn side_accrual_inits_to_unit_state() {
 
 #[test]
 fn side_accrual_drain_pending_normal_cycle() {
-    let mut s = SideAccrual::default();
-
-    // 1. A drops below threshold → DrainOnly.
-    s.a = MIN_A_SIDE - 1;
+    // 1. A below threshold → DrainOnly.
+    let mut s = SideAccrual {
+        a: MIN_A_SIDE - 1,
+        ..SideAccrual::default()
+    };
     let t = step_mode(&mut s, 1_000);
     assert_eq!(t, SideModeTransition::EnteredDrain);
     assert_eq!(s.mode, SideMode::DrainOnly);

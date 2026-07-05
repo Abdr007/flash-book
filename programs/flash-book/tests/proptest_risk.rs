@@ -7,8 +7,8 @@
 //!
 //!   1. required_margin ≥ 0 for any portfolio
 //!   2. equity = collateral + Σ unrealized_pnl − Σ funding_owed  (linearity)
-//!   3. is_healthy ↔ (collateral − funding) ≥ required (C-1 frame; NOT equity,
-//!      which would double-count unrealized PnL)
+//!   3. is_healthy ↔ (collateral − funding) ≥ required (the available-
+//!      collateral frame; NOT equity, which would double-count unrealized PnL)
 //!   4. hedge always reduces required margin: M(long+short) < M(long alone)
 //!   5. monotonic collateral: more collateral can only make you healthier
 //!
@@ -17,11 +17,11 @@
 //! by-product.
 
 use anchor_lang::prelude::Pubkey;
+use flash_book::matcher::lot::Ticks;
+use flash_book::matcher::order::Side;
 use flash_book::matcher::risk::{
     assess_margin, default_scenarios, MarketSnapshot, PositionSnapshot,
 };
-use flash_book::matcher::order::Side;
-use flash_book::matcher::lot::Ticks;
 use proptest::prelude::*;
 
 const MARKET_PK_BYTES: [u8; 32] = [42u8; 32];
@@ -74,10 +74,13 @@ proptest! {
         }
         let scenarios = default_scenarios(&[m.market]);
         let a = assess_margin(&positions, &[m], &scenarios, collateral)?;
-        // u64 is non-negative by type. The assertion is on equity sign:
-        // even with no collateral and worst PnL, equity_signed must be a
-        // valid i128.
-        prop_assert!(a.required_quote_lots <= u64::MAX);
+        // The health verdict is exactly the comparison of available
+        // collateral (collateral − funding; funding is 0 here — all funding
+        // indices in this fixture are zero) against required margin.
+        prop_assert_eq!(
+            a.is_healthy,
+            collateral as i128 >= a.required_quote_lots as i128
+        );
     }
 
     /// More collateral never makes the trader less healthy.
@@ -143,9 +146,9 @@ proptest! {
         );
     }
 
-    /// is_healthy is exactly AVAILABLE collateral ≥ required (C-1 frame).
+    /// is_healthy is exactly AVAILABLE collateral ≥ required.
     ///
-    /// Post-C-1 (audit 2026-06), health gates on `collateral − funding`, NOT on
+    /// Health gates on `collateral − funding`, NOT on
     /// `equity_signed` (which re-adds unrealized PnL at the mark and double-counts
     /// it — the scenario `required` already carries PnL via −pnl_stressed). These
     /// fixtures set both funding indices to 0, so funding is 0 and the available
@@ -210,11 +213,7 @@ proptest! {
         let b = assess_margin(&double, &[m], &scenarios, 0)?;
         let twice_a = a.required_quote_lots.saturating_mul(2);
         let tolerance: u64 = 100; // generous bound on integer truncation
-        let diff = if b.required_quote_lots > twice_a {
-            b.required_quote_lots - twice_a
-        } else {
-            twice_a - b.required_quote_lots
-        };
+        let diff = b.required_quote_lots.abs_diff(twice_a);
         prop_assert!(
             diff <= tolerance,
             "expected b.required ≈ 2*a.required ± {} (got a={}, b={})",

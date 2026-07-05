@@ -1,16 +1,15 @@
-//! Pyth Lazer oracle ingestion (WAVE 24g) — hand-rolled, dependency-free.
+//! Pyth Lazer oracle ingestion — dependency-free.
 //!
 //! Pyth Lazer is Pyth's low-latency push oracle: a trusted Lazer signer
-//! Ed25519-signs a compact binary payload of feed prices. We verify the
-//! signature via the Solana Ed25519 SigVerify precompile (instruction
-//! introspection — the same security model Jupiter Perps uses) and then parse
-//! the payload to extract the price for our configured feed.
+//! Ed25519-signs a compact binary payload of feed prices. The signature is
+//! verified via the Solana Ed25519 SigVerify precompile (instruction
+//! introspection), and the payload is then parsed to extract the price for
+//! the configured feed.
 //!
-//! Why hand-rolled: the `pyth-lazer-*` crates pin a solana-program / borsh
-//! stack incompatible with our anchor 1.x + spl-token v6 build (same conflict
-//! that forced the hand-rolled Pyth-pull parser in `pyth_oracle.rs` and the
-//! hand-rolled ER CPIs in `er.rs`). The wire format below is byte-faithful to
-//! the real Lazer Solana payload (verified against a live mainnet message).
+//! The wire format is implemented directly (the `pyth-lazer-*` crates pin a
+//! solana-program / borsh stack incompatible with the anchor 1.x +
+//! spl-token v6 build) and matches the live Lazer Solana payload; the
+//! parser is regression-pinned against a captured mainnet message below.
 //!
 //! SECURITY: this module does NOT itself check the Ed25519 signature math — the
 //! native Ed25519 precompile does that and aborts the tx if it fails. Our job
@@ -78,7 +77,10 @@ impl<'a> Cursor<'a> {
         Self { b, p: 0 }
     }
     fn take(&mut self, n: usize) -> LzResult<&'a [u8]> {
-        let s = self.b.get(self.p..self.p + n).ok_or(LazerError::Truncated)?;
+        let s = self
+            .b
+            .get(self.p..self.p + n)
+            .ok_or(LazerError::Truncated)?;
         self.p += n;
         Ok(s)
     }
@@ -124,7 +126,10 @@ impl<'a> Cursor<'a> {
 ///     repeated num_properties times:
 ///       prop_id: u8
 ///       value:   (Price=i64, Exponent=i16, Confidence=u64, ...)
-pub fn parse_lazer_price(payload: &[u8], feed_id: u32) -> core::result::Result<LazerPrice, LazerError> {
+pub fn parse_lazer_price(
+    payload: &[u8],
+    feed_id: u32,
+) -> core::result::Result<LazerPrice, LazerError> {
     let mut c = Cursor::new(payload);
     if c.u32()? != LAZER_PAYLOAD_MAGIC {
         return Err(LazerError::BadMagic);
@@ -151,7 +156,13 @@ pub fn parse_lazer_price(payload: &[u8], feed_id: u32) -> core::result::Result<L
         if fid == feed_id {
             let price = price.ok_or(LazerError::NoPrice)?;
             let exponent = exponent.ok_or(LazerError::NoExponent)?;
-            return Ok(LazerPrice { price, exponent, confidence, timestamp_us, channel });
+            return Ok(LazerPrice {
+                price,
+                exponent,
+                confidence,
+                timestamp_us,
+                channel,
+            });
         }
     }
     Err(LazerError::FeedNotFound)
@@ -235,8 +246,12 @@ pub fn verify_ed25519_precompile(
         return Err(ProgramError::InvalidArgument);
     }
     let _ = sig_off;
-    let pk = d.get(pk_off..pk_off + 32).ok_or(ProgramError::InvalidArgument)?;
-    let msg = d.get(msg_off..msg_off + msg_size).ok_or(ProgramError::InvalidArgument)?;
+    let pk = d
+        .get(pk_off..pk_off + 32)
+        .ok_or(ProgramError::InvalidArgument)?;
+    let msg = d
+        .get(msg_off..msg_off + msg_size)
+        .ok_or(ProgramError::InvalidArgument)?;
     if pk != signer.as_slice() {
         return Err(ProgramError::InvalidArgument); // wrong / untrusted signer
     }
@@ -283,11 +298,17 @@ mod tests {
 
     #[test]
     fn missing_feed_rejected() {
-        assert_eq!(parse_lazer_price(REAL_MSG, 999), Err(LazerError::FeedNotFound));
+        assert_eq!(
+            parse_lazer_price(REAL_MSG, 999),
+            Err(LazerError::FeedNotFound)
+        );
     }
 
     #[test]
     fn truncated_rejected() {
-        assert_eq!(parse_lazer_price(&REAL_MSG[..10], 6), Err(LazerError::Truncated));
+        assert_eq!(
+            parse_lazer_price(&REAL_MSG[..10], 6),
+            Err(LazerError::Truncated)
+        );
     }
 }

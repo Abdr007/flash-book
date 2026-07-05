@@ -3,8 +3,8 @@
 //! Each property runs over 2000 random cases.
 
 use flash_book::matcher::envelope::{
-    gate_price_move, prove_envelope, EnvelopeError, EnvelopeParams,
-    ABS_MAX_ACCRUAL_DT_SLOTS, ABS_MAX_PRICE_MOVE_BPS_PER_SLOT,
+    gate_price_move, prove_envelope, EnvelopeError, EnvelopeParams, ABS_MAX_ACCRUAL_DT_SLOTS,
+    ABS_MAX_PRICE_MOVE_BPS_PER_SLOT,
 };
 use proptest::prelude::*;
 
