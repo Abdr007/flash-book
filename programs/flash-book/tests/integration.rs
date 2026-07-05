@@ -556,6 +556,30 @@ async fn zero_initial_margin(ctx: &mut solana_program_test::ProgramTestContext, 
     );
 }
 
+/// Force `book_delegated` on a market (simulates the ER-delegated state that
+/// `solana-program-test` cannot produce via the real DLP).
+async fn set_book_delegated(ctx: &mut solana_program_test::ProgramTestContext, market: Pubkey) {
+    use solana_sdk::account::Account as SolAccount;
+    let acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
+    let mut m =
+        flash_book::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    m.book_delegated = true;
+    let mut data = Vec::new();
+    m.try_serialize(&mut data).unwrap();
+    data.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &market,
+        &SolAccount {
+            lamports: acc.lamports,
+            data,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
+}
+
 /// Initialize an additional market on an already-initialized protocol.
 /// Used by multi-market tests. Returns (market PDA, order_buffer PDA, base, quote).
 async fn setup_additional_market(
@@ -3201,6 +3225,109 @@ async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
         near.is_ok(),
         "an in-band resting limit must be accepted: {near:?}"
     );
+}
+
+#[tokio::test]
+async fn delegated_book_order_requires_armed() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let maker = Keypair::new();
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let mp = maker.pubkey();
+
+    // Simulate the ER-delegated book state.
+    set_book_delegated(&mut ctx, market_pda).await;
+
+    let place = |price: u64| {
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side: 1,
+                size_lots: 1,
+                limit_ticks: price, // in-band (oracle 100_000)
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(mp, true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(maker_state, false),
+                AccountMeta::new_readonly(program_id(), false),
+            ],
+        )
+    };
+    let arm = || {
+        build_ix(
+            flash_book::instruction::ArmErTrading {},
+            vec![
+                AccountMeta::new_readonly(mp, true),
+                AccountMeta::new(maker_state, false),
+            ],
+        )
+    };
+
+    // Unarmed order on a delegated book → rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let unarmed = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(101_000)],
+            Some(&mp),
+            &[&maker],
+            bh,
+        ))
+        .await;
+    assert!(
+        unarmed.is_err(),
+        "a delegated-book order must require the armed lock"
+    );
+
+    // Arm, then the same order is accepted past the gate.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[arm()],
+            Some(&mp),
+            &[&maker],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let armed = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(101_100)],
+            Some(&mp),
+            &[&maker],
+            bh,
+        ))
+        .await;
+    assert!(armed.is_ok(), "an armed trader may place on a delegated book: {armed:?}");
 }
 
 /// Permissionless expiry-reaper: an EXPIRED GTT order is reclaimed by anyone,
