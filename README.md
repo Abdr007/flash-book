@@ -40,9 +40,14 @@ so the venue integrates it with minimal work. See
   fill into a FIFO ring; L1 settlement verifies-and-pops each fill against
   it. Ordering and liveness trust the sequencer; fund-safety does not
   ([ER_TRUST_BOUNDARY.md](ER_TRUST_BOUNDARY.md)).
-- **The exits don't need permission.** If the ER goes dark or censors,
-  anyone can force-undelegate the market back to L1 after a proven-silent
-  timeout — Kani-proven to never fire while the ER is live.
+- **Custody never depends on the ER.** Positions and collateral stay on L1, so
+  a dark or censoring ER can never take or forge funds. A permissionless
+  force-undelegate exit is *designed and Kani-gated* (never fires while the ER
+  is live), but it is **not yet executable** against the deployed MagicBlock
+  delegation program — undelegation there is validator-driven, so exit from a
+  censored/dark ER currently depends on the sequencer signing
+  `commit_and_undelegate`. That is a liveness exposure, not a custody one; see
+  [ER_TRUST_BOUNDARY.md](ER_TRUST_BOUNDARY.md) §1.1.
 - **Risk is proven, not asserted.** Solvency, conservation, margin-floor,
   ring-authenticity, and liveness invariants carry machine-checked proofs
   wired into CI; a regression that breaks an invariant fails the build.
