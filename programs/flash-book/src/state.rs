@@ -406,10 +406,11 @@ pub struct MarketAccount {
 
     /// True while the book is delegated to the ER. Set by `delegate_market_book`,
     /// cleared by `clear_book_delegation` when the book is back on L1. Order
-    /// placement requires the trader's `er_trading_armed` when this is true, so
-    /// an ER order can never be backed by withdrawable collateral. Fail closed:
-    /// a stale `true` only over-requires arming (safe). Trailing field ⇒ existing
-    /// accounts read it as `false`.
+    /// placement requires the trader's `er_margin_ready` when this is true, so
+    /// every ER order belongs to a trader whose reserved margin the sequencer
+    /// can attest. Fail closed: a stale `true` only over-requires the
+    /// attestation account (safe). Trailing field ⇒ existing accounts read it
+    /// as `false`.
     pub book_delegated: bool,
 }
 
@@ -855,16 +856,16 @@ pub struct TraderStateAccount {
     /// the strict paths fail closed with `UseXDomainWithdraw`. Occupies a
     /// byte of the `_pad` tail, so the Pod layout stays 192 bytes.
     pub er_active: u8,
-    /// Trader-armed cross-domain lock. `1` = the trader has explicitly entered
-    /// ER-trading mode, so their collateral backs resting orders that settle
-    /// asynchronously; while armed, EVERY withdrawal path fails closed. Unlike
-    /// `er_active` (sequencer-attested), this is set only by the trader via
-    /// `arm_er_trading` and cleared only by `disarm_er_trading` after it proves
-    /// no live exposure remains — so the lock never depends on the sequencer.
+    /// ER-readiness flag. `1` = this trader's `ErMarginAttestation` account
+    /// exists (set once by `init_er_margin_attestation`, never cleared), so the
+    /// sequencer can always attest the margin reserved by the trader's live ER
+    /// orders. Order placement on a delegated book requires it; withdrawals
+    /// never consult it — the reserved-margin gate (`er_active` +
+    /// `ErMarginAttestation`) is what protects collateral backing ER orders.
     /// Carved from the `_pad` tail: accounts written before this field existed
-    /// read it as `0` (not armed), so every pre-existing trader is unchanged and
+    /// read it as `0` (not ready), so every pre-existing trader is unchanged and
     /// the Pod layout stays 192 bytes.
-    pub er_trading_armed: u8,
+    pub er_margin_ready: u8,
     pub _pad: [u8; 3],
 }
 

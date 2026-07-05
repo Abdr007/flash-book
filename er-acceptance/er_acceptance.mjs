@@ -194,11 +194,15 @@ try {
     const dep = (trader, traderState, tAta, extra) => program.methods.depositCollateral(new BN(DEPOSIT)).accountsPartial({ trader, traderState, insuranceFund: INS, quoteMint: QUOTE, traderQuoteAta: tAta, quoteVault: VAULT, tokenProgram: TOKEN_PROGRAM }).instruction();
     await send(l1, await dep(signer.publicKey, makerTS, makerAta), []);
     await send(l1, await dep(taker.publicKey, takerTS, takerAta), [taker]);
-    // Arm ER-trading mode on L1 before delegation: while the book is delegated,
-    // order placement REQUIRES er_trading_armed (H-1 trustless lock). The armed
-    // flag lives on the (non-delegated) trader-state, read as a clone on the ER.
-    await send(l1, await program.methods.armErTrading().accountsPartial({ trader: signer.publicKey, traderState: makerTS }).instruction(), []);
-    await send(l1, await program.methods.armErTrading().accountsPartial({ trader: taker.publicKey, traderState: takerTS }).instruction(), [taker]);
+    // Set up ER margin attestations on L1: order placement on a delegated book
+    // requires er_margin_ready (set by initErMarginAttestation), so the sequencer
+    // always has an account to attest reserved margin into. The flag lives on the
+    // (non-delegated) trader-state, read as a clone on the ER. Idempotent — the
+    // maker's attestation may persist from a prior run.
+    const initAttest = (traderState) => program.methods.initErMarginAttestation(signer.publicKey).accountsPartial({ authority: signer.publicKey, insuranceFund: INS, traderState, erMargin: pda(["er_margin", traderState]), systemProgram: sys }).instruction();
+    if (!(await l1.getAccountInfo(pda(["er_margin", makerTS]))))
+      await send(l1, await initAttest(makerTS), []);
+    await send(l1, await initAttest(takerTS), []);
   });
   await sleep(2000);
   await stage("ER rest bids + taker sweep (4 fills; commitments + outbox on the ER)", async () => {

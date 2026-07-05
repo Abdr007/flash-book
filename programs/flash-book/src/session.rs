@@ -17,9 +17,11 @@ use anchor_lang::prelude::*;
 /// PDA seed for a session token.
 pub const SESSION_SEED: &[u8] = b"session";
 
-/// Hard cap on a session's lifetime (24h). Bounds the blast radius of a leaked
-/// session key — it expires regardless, and the owner can revoke sooner.
-pub const MAX_SESSION_TTL_SECONDS: i64 = 24 * 60 * 60;
+/// Hard cap on a session's lifetime (7 days) — one approval covers a week of
+/// one-click trading. Bounds the blast radius of a leaked session key: it can
+/// only place/cancel (never withdraw), it expires regardless, and the owner
+/// can revoke sooner.
+pub const MAX_SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 /// A revocable, auto-expiring authorization for `session_signer` to act for
 /// `owner`. 105 bytes + 8 disc.
@@ -124,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn ttl_cap_is_one_day() {
-        assert_eq!(MAX_SESSION_TTL_SECONDS, 86_400);
+    fn ttl_cap_is_seven_days() {
+        assert_eq!(MAX_SESSION_TTL_SECONDS, 604_800);
     }
 }

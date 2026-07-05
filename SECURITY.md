@@ -66,6 +66,21 @@ the code and the documentation tell the same story an external auditor will:
   the wrong account (trader-state PDAs are re-derived at settlement), and a
   censoring or dead ER can be permissionlessly force-undelegated after a
   proven-silent timeout. Full statement: `ER_TRUST_BOUNDARY.md` §1.
+- **Sequencer-attested ER reserved margin (the withdraw-anytime window).**
+  Collateral is authoritative on L1 while resting orders live on the ER, so
+  the margin a live ER order reserves reaches L1 only through the
+  sequencer-signed `attest_er_reserved_margin` (epoch-monotonic, replay-proof).
+  Every collateral-releasing path — withdraw, partial withdraw, sub-account
+  transfers, sweep — enforces `post-release collateral ≥ attested
+  reservation`, so a trader withdraws only free balance at any time, with no
+  arm/lock step. The residual is the attestation lag: an order placed and a
+  withdrawal raced before the next attestation can leave that order's fill
+  under-margined by at most the raced amount, for at most one attestation
+  interval. The sequencer attests on every ER commit/heartbeat, bounding the
+  window to seconds; it is the same single-sequencer trust already accepted
+  for ordering, not an expansion of it. A trustless replacement (proving
+  order-book state onto L1) is staged, not shipped. Full statement:
+  `ER_TRUST_BOUNDARY.md` §1.2.
 - **TEE privacy enforcement is validator-side.** For private books, the
   on-chain program manages the permission allow-list; the read-gating
   itself is enforced by the MagicBlock Private ER (TEE). `docs/PRIVACY.md`.
