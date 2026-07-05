@@ -3327,7 +3327,10 @@ async fn delegated_book_order_requires_armed() {
             bh,
         ))
         .await;
-    assert!(armed.is_ok(), "an armed trader may place on a delegated book: {armed:?}");
+    assert!(
+        armed.is_ok(),
+        "an armed trader may place on a delegated book: {armed:?}"
+    );
 }
 
 /// Permissionless expiry-reaper: an EXPIRED GTT order is reclaimed by anyone,

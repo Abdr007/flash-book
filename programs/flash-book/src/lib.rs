@@ -3306,7 +3306,10 @@ pub mod flash_book {
             s.er_trading_armed = 1;
             s.trader
         };
-        emit!(ErTradingModeEvent { trader, armed: true });
+        emit!(ErTradingModeEvent {
+            trader,
+            armed: true
+        });
         Ok(())
     }
 
@@ -3322,7 +3325,10 @@ pub mod flash_book {
             s.er_trading_armed = 0;
             s.trader
         };
-        emit!(ErTradingModeEvent { trader, armed: false });
+        emit!(ErTradingModeEvent {
+            trader,
+            armed: false
+        });
         Ok(())
     }
 
