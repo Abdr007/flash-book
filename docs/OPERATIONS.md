@@ -14,17 +14,19 @@ proven; what remains is executing the migration on live markets and keys.
 Reduce-only orders are enforced in two tiers
 ([SETTLEMENT.md](SETTLEMENT.md) §3):
 
-- **v0 (every market, default):** the injection-time capacity clamp closes
+- **v0 (legacy markets only):** the injection-time capacity clamp closes
   the primary over-reduce vector at match time, plus a TTL on injected
-  close orders.
-- **v1 (opt-in per market):** the fill-commitment ring's v1 layout adds
-  per-position reduce-in-flight tracking co-located with the ring, so the
-  tracker commits atomically with settlement. This closes the last edge:
-  a position shrunk below its resting reduce-only size, then over-crossed
-  across the match→settle gap.
+  close orders. Only markets whose fill-commitment ring was armed before v1
+  became the default carry the v0 layout.
+- **v1 (default for every new market):** `init_fill_commitment` arms the ring
+  at the v1 layout, which adds per-position reduce-in-flight tracking
+  co-located with the ring, so the tracker commits atomically with settlement.
+  This closes the last edge: a position shrunk below its resting reduce-only
+  size, then over-crossed across the match→settle gap.
 
-A v0 market is safe against the primary vector; **full closure requires the
-one-time v1 upgrade on each live market.**
+New markets are born v1, so no action is needed for them. This runbook applies
+only to **legacy v0 markets**: they are safe against the primary vector, and
+**full closure requires the one-time v1 upgrade on each such market.**
 
 ### The instruction
 
