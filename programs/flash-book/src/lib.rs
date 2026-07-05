@@ -1148,6 +1148,11 @@ pub mod flash_book {
             fc::buffer_check(&rd, &market_key.to_bytes())
                 .map_err(|_| error!(FlashBookError::FillRingCorrupt))?
         };
+        // `max_batch_orders` is a u16. A ring grown past u16::MAX would truncate
+        // on the cast below (wrapping the batch cap — potentially to 0, halting
+        // matching), so reject a cap that does not fit rather than silently
+        // corrupt it. Unreachable at the default cap (FILL_RING_CAP = 256).
+        require!(ring_cap <= u16::MAX as u32, FlashBookError::OutOfRange);
 
         let bump = ctx.bumps.fill_outbox;
         // Create at `min(ring_cap, FILL_OUTBOX_INIT_CAP)`. For a ring_cap <= 105 the
@@ -12039,6 +12044,14 @@ pub mod flash_book {
             max_confidence_bps > 0 && max_confidence_bps <= 1000,
             FlashBookError::OutOfRange
         );
+        // Bound the price-scaling exponent. `tick_decimals` feeds
+        // `10^(exponent + tick_decimals)`; a value outside a sane range only ever
+        // overflows the checked power later (a confusing runtime revert), so
+        // reject it at config time. ±18 covers every real feed exponent.
+        require!(
+            (-18..=18).contains(&tick_decimals),
+            FlashBookError::OutOfRange
+        );
 
         let cfg = &mut ctx.accounts.oracle_config;
         cfg.bump = ctx.bumps.oracle_config;
@@ -12081,6 +12094,11 @@ pub mod flash_book {
         // gate has a sane ceiling.
         require!(
             max_confidence_bps > 0 && max_confidence_bps <= 1000,
+            FlashBookError::OutOfRange
+        );
+        // Bound the price-scaling exponent (see init_market_oracle_config).
+        require!(
+            (-18..=18).contains(&tick_decimals),
             FlashBookError::OutOfRange
         );
 
@@ -19577,6 +19595,15 @@ fn compute_realized_pnl_routing(
 /// discriminator immediately if absent; it is a no-op for an account that is
 /// already initialized.
 fn stamp_zc_discriminator(ai: &AccountInfo<'_>, disc: &[u8]) -> Result<()> {
+    // Bounds-check before slicing: every current caller passes an Anchor-`init`'d
+    // account sized to its struct (>= 8 bytes), but an unchecked `[..8]` /
+    // `[..disc.len()]` would panic on a short account, so gate it so a future
+    // caller (or a truncated account) fails closed instead of bricking the ix.
+    let data_len = ai.try_borrow_data()?.len();
+    require!(
+        data_len >= disc.len() && disc.len() >= 8,
+        FlashBookError::OutOfRange
+    );
     let is_fresh = ai.try_borrow_data()?[..8].iter().all(|&b| b == 0);
     if is_fresh {
         ai.try_borrow_mut_data()?[..disc.len()].copy_from_slice(disc);
