@@ -10,7 +10,7 @@
     {
       "name": "accept_authority_transfer",
       "docs": [
-        "GOVERNANCE Phase-2: step 2 — the PENDING authority accepts, committing the",
+        "Step 2 — the PENDING authority accepts, committing the",
         "transfer and closing the pending account (rent → the accepter). Signed by the",
         "new authority (context constraint), so control can never land on a key that",
         "can't sign."
@@ -189,13 +189,13 @@
         {
           "name": "taker_trader_state",
           "docs": [
-            "Phase 2d: dropped strict seed so ApplyFill can route fills to",
+            "Dropped strict seed so ApplyFill can route fills to",
             "sub-account TraderStates. The position PDAs below bind each",
-            "trader_state to its position via Phase 2c trader_state.key()-",
-            "based derivation. Phase 2e (RestingOrderV2.sub_index) will",
-            "extend this so the sequencer can identify which sub-account a",
-            "resting order belongs to at fill time; until then this relaxation",
-            "is structurally safe — the position seed pair is the binding —",
+            "trader_state to its position via trader_state.key()-based",
+            "derivation. `RestingOrderV2.sub_index` lets the sequencer identify",
+            "which sub-account a resting order belongs to at fill time; the",
+            "relaxation is structurally safe — the position seed pair is the",
+            "binding —",
             "but only the main TraderState is reachable via the current",
             "matcher fill-routing logic."
           ],
@@ -266,9 +266,9 @@
         {
           "name": "fee_tiers",
           "docs": [
-            "WAVE 22 phase 2: optional global fee-tier table. When supplied,",
+            "Optional global fee-tier table. When supplied,",
             "per-trader maker rebate / taker fee bps are resolved from this",
-            "account against the trader's `volume_30d_quote_lots` (HL/Binance",
+            "account against the trader's `volume_30d_quote_lots` (the standard",
             "pattern). When omitted (None), apply_fill falls back to the flat",
             "`market.params.{maker_rebate_bps, taker_fee_bps}` per the",
             "pre-tier behavior. Singleton PDA at `[b\"fee_tiers\"]`."
@@ -278,13 +278,13 @@
         {
           "name": "market_haircut",
           "docs": [
-            "WAVE 24d — optional per-market H-haircut state. When provided",
+            "Optional per-market H-haircut state. When provided",
             "(along with the per-position haircut accounts below), positive",
             "realized PnL on this fill routes into the position's reserve",
             "instead of crediting collateral directly. Losses always debit",
             "collateral (loss seniority).",
             "",
-            "When omitted: bit-for-bit identical to pre-Wave-24d behavior."
+            "When omitted: gains credit collateral directly (no haircut routing)."
           ],
           "writable": true,
           "optional": true,
@@ -515,7 +515,7 @@
         {
           "name": "taker_trader_state",
           "docs": [
-            "Phase 2d: dropped strict seed — see ApplyFill above."
+            "Dropped strict seed — see ApplyFill above."
           ],
           "writable": true
         },
@@ -576,7 +576,7 @@
         {
           "name": "fee_tiers",
           "docs": [
-            "WAVE 22 phase 2 (FLP path): optional global fee-tier table.",
+            "Optional global fee-tier table.",
             "When supplied, the TAKER's `taker_fee_bps` is resolved per",
             "their rolling-window volume. FLP-side maker rebate stays flat",
             "(FLP IS the protocol — tier-tier semantics don't apply on the",
@@ -588,7 +588,7 @@
         {
           "name": "market_haircut",
           "docs": [
-            "WAVE 24d — optional H-haircut routing on the FLP fill path.",
+            "Optional H-haircut routing on the FLP fill path.",
             "Same opt-in shape as ApplyFill: provide market_haircut +",
             "taker_position_haircut to route the trader's positive PnL into",
             "the reserve. FLP itself doesn't accumulate realized PnL on a",
@@ -789,11 +789,11 @@
         "",
         "Action:",
         "• close `close_size` lots from BOTH at the bankruptcy price",
-        "• underwater realizes loss (Phase 2h: routed to",
+        "• underwater realizes loss (routed to",
         "position.collateral_quote_lots if isolated, else",
         "trader_state.collateral_quote_lots; saturating at 0 in both",
         "cases — the insurance fund waterfall absorbs the remainder)",
-        "• counter realizes profit at bp (Phase 2h: credited to",
+        "• counter realizes profit at bp (credited to",
         "position.collateral_quote_lots if isolated, else",
         "trader_state.collateral_quote_lots; checked_add for",
         "overflow safety)",
@@ -886,7 +886,7 @@
         {
           "name": "underwater_trader_state",
           "docs": [
-            "Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above."
+            "Dropped strict seed — see LiquidatePortfolioV2 above."
           ],
           "writable": true
         },
@@ -922,7 +922,7 @@
         {
           "name": "counter_trader_state",
           "docs": [
-            "Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above."
+            "Dropped strict seed — see LiquidatePortfolioV2 above."
           ],
           "writable": true
         },
@@ -958,10 +958,10 @@
         {
           "name": "side_accrual",
           "docs": [
-            "Wave 25b (optional, additive): the per-market side-accrual account.",
-            "When supplied, `auto_deleverage` reduces the counter side's `A` and",
-            "drives the side state machine. Omit it (None) to keep the EXACT",
-            "pre-Wave-25b ADL. Bound to the market in the handler."
+            "Optional, additive: the per-market side-accrual account. When",
+            "supplied, `auto_deleverage` reduces the counter side's `A` and",
+            "drives the side state machine. Omit it (None) to run ADL without",
+            "multiplier accounting. Bound to the market in the handler."
           ],
           "writable": true,
           "optional": true
@@ -977,7 +977,7 @@
     {
       "name": "burn_market_authority",
       "docs": [
-        "Wave 30 — Authority burn. Permanently relinquish authority over",
+        "Authority burn. Permanently relinquish authority over",
         "this market by setting `market.authority` to `Pubkey::default()`.",
         "This is a one-way operation: once burned, no further",
         "`update_market_params`, `set_market_status`, or",
@@ -1135,9 +1135,9 @@
     {
       "name": "cancel_authority_transfer",
       "docs": [
-        "GOVERNANCE Phase-2: the current authority cancels a pending transfer (closes",
-        "the pending account, rent → authority) — e.g. if the target key is no longer",
-        "trusted before it accepts."
+        "The current authority cancels a pending transfer (closes",
+        "the pending account, rent → authority) — e.g. when trust in the target",
+        "key is withdrawn before it accepts."
       ],
       "discriminator": [
         94,
@@ -1318,10 +1318,9 @@
       "name": "cancel_order_v2",
       "docs": [
         "V2 cancel: remove a resting order from the hypertree. Validates",
-        "that the caller is the original trader (orders carry trader pubkey",
-        "inline in wave 18 — wave 19 indirects through a seat). Refunds no",
-        "SPL tokens — the v2 book has no escrow yet (wave 19's free-funds",
-        "optimisation handles that).",
+        "that the caller is the original trader (orders carry the trader",
+        "pubkey inline). Refunds no SPL tokens — the v2 book holds no escrow;",
+        "collateral never leaves the trader's account on placement.",
         "",
         "The off-chain SDK derives `order_id` via",
         "`encode_order_id(price_ticks, seq, side == 0)` from the",
@@ -1534,7 +1533,7 @@
     {
       "name": "cancel_param_update",
       "docs": [
-        "GOVERNANCE Phase-2b: cancel a pending timelocked params update (authority-only,",
+        "Cancel a pending timelocked params update (authority-only,",
         "closes the pending account, rent → authority)."
       ],
       "discriminator": [
@@ -2152,7 +2151,7 @@
     {
       "name": "commit_batch",
       "docs": [
-        "M-14 decentralization (Phase 2): PERMISSIONLESSLY commit a",
+        "PERMISSIONLESSLY commit a",
         "committee-attested state transition. **NOT a batch auction (no FBA)** —",
         "matching stays a continuous price-time CLOB; this only records the state",
         "root the validator set threshold-signed over the fills the continuous book",
@@ -2387,8 +2386,8 @@
       "name": "commit_market_book",
       "docs": [
         "ON THE ER: snapshot the delegated `market_book` back to L1 while staying",
-        "delegated (`ScheduleCommit` Magic Action). Keeper-driven (permissionless,",
-        "like Phoenix-ER — the validator/magic program enforce commit semantics)."
+        "delegated (`ScheduleCommit` Magic Action). Keeper-driven and",
+        "permissionless — the validator/magic program enforce commit semantics."
       ],
       "discriminator": [
         22,
@@ -2433,14 +2432,14 @@
         "current `h`, with the dust accrued to the market's haircut state (drains",
         "to insurance via `flush_haircut_dust`).",
         "",
-        "H9: the credit IS now landed on the trader's collateral via",
-        "`apply_realized_pnl_delta` (isolated→position bucket, else→cross pool),",
-        "conserving value — `residual` is debited by the same `credit`. Previously",
-        "(the never-completed \"Wave 24c\") the residual was debited but collateral",
-        "was never credited, BURNING the matured PnL and letting anyone",
-        "permissionlessly ratchet `residual` → `h→0` for all traders. Convert is",
-        "now gated to the trader / their delegate. `PositionConvertedEvent` carries",
-        "the credit amount for indexers."
+        "The credit lands on the trader's collateral via",
+        "`apply_realized_pnl_delta` (isolated → position bucket, else → cross",
+        "pool), conserving value — `residual` is debited by the same `credit`.",
+        "Debiting residual without crediting collateral would burn the matured",
+        "PnL and let anyone permissionlessly ratchet `residual` → `h→0` for",
+        "all traders, which is why convert is gated to the trader / their",
+        "delegate. `PositionConvertedEvent` carries the credit amount for",
+        "indexers."
       ],
       "discriminator": [
         143,
@@ -2487,7 +2486,7 @@
           "name": "trader_state",
           "docs": [
             "H9: the converted matured PnL is credited here (isolated bucket if the",
-            "position is isolated, else the cross pool). Phase 2c FIX (audit 2026-06):",
+            "Position is isolated, else the cross pool).",
             "declared BEFORE `position` and relaxed (no seed) so the position PDA can",
             "be keyed by `trader_state.key()` — the old wallet-keyed seed never matched",
             "a Phase-2c position. The position seeds + identity constraint below bind",
@@ -3186,7 +3185,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: dropped strict `seeds = [SEED, trader.key().as_ref()]`",
+            "Dropped strict `seeds = [SEED, trader.key().as_ref()]`",
             "so this ix accepts either the main TraderState PDA or any sub-",
             "account TraderState PDA. The `.trader == trader.key()`",
             "constraint proves the signer owns the trader_state passed in",
@@ -3767,11 +3766,12 @@
     {
       "name": "er_heartbeat",
       "docs": [
-        "ER LIVENESS HEARTBEAT (F2/F3, audit 2026-06). Sequencer-authenticated,",
-        "trade-flow-INDEPENDENT proof that the MagicBlock ER is alive. The prior",
-        "liveness signal (`last_mark_update_slot`) only advances on a committed",
-        "fill or `settle_mark`, so a healthy-but-quiet market looked \"stalled\"",
-        "within ~60s and was wrongly auto-paused (F2) / force-undelegated (F3).",
+        "ER LIVENESS HEARTBEAT. Sequencer-authenticated, trade-flow-INDEPENDENT",
+        "proof that the MagicBlock ER is alive. A fill-derived liveness signal",
+        "alone (`last_mark_update_slot`, advancing only on a committed fill or",
+        "`settle_mark`) would make a healthy-but-quiet market look stalled and",
+        "wrongly auto-pause or force-undelegate it; the heartbeat decouples",
+        "liveness from trade flow.",
         "",
         "The ER operator calls this every < `MARK_STALENESS_MAX_SLOTS` slots as a",
         "keepalive (cheap: one field write, no oracle, no book). It MUST be gated",
@@ -3832,7 +3832,7 @@
     {
       "name": "execute_param_update",
       "docs": [
-        "GOVERNANCE Phase-2b: execute a matured, hash-matching timelocked params",
+        "Execute a matured, hash-matching timelocked params",
         "update. Requires `now >= eta` AND `keccak(new_params) == stored hash` (so the",
         "applied params are EXACTLY the pre-announced ones), re-validates defensively,",
         "applies, and closes the pending account. Authority-only."
@@ -3989,7 +3989,7 @@
           "name": "position",
           "docs": [
             "Trader's position — required for reduce-only triggers.",
-            "Phase 2c: dropped strict seed (TriggerOrderAccountV3 is",
+            "Dropped strict seed (TriggerOrderAccountV3 is",
             "wallet-scoped; Anchor cannot derive trader_state PDA inside",
             "the seeds expression). Identity is enforced by data fields.",
             "Sub-account triggers require a TriggerOrderAccountV3 schema",
@@ -3999,7 +3999,7 @@
         {
           "name": "sibling_trigger",
           "docs": [
-            "AUDIT HIGH-7 (2026-07) — OCO sibling leg. REQUIRED when `trigger_order`",
+            "OCO sibling leg. REQUIRED when `trigger_order`",
             "is a bracket leg (`flags & FLAG_HAS_SIBLING`); the handler validates it",
             "is the genuine paired leg and deactivates it so both legs of a bracket",
             "can never both fire. `None` for standalone triggers (backward compatible)."
@@ -4391,10 +4391,10 @@
         {
           "name": "quote_vault",
           "docs": [
-            "Protocol vault — credited. C1: MUST be the canonical insurance-fund vault.",
-            "Previously unbound `#[account(mut)]`, which let an attacker pass a",
-            "self-owned destination and still be minted FLP shares redeemable against",
-            "the real vault (Cashio-class drain)."
+            "Protocol vault — credited. MUST be the canonical insurance-fund",
+            "vault: an unbound `#[account(mut)]` here would let an attacker pass a",
+            "self-owned destination and still be minted FLP shares redeemable",
+            "against the real vault."
           ],
           "writable": true
         },
@@ -4421,7 +4421,7 @@
         "the book, owned by the pool (`trader = flp_exposure` PDA). A taker crossing",
         "it becomes a normal ring-committed BOOK fill (maker = the FLP PDA), settled",
         "by the FLP-maker settlement path — so the pool provides on-book liquidity",
-        "that real MMs can improve on (the Hyperliquid HLP model, solving CLOB",
+        "that real MMs can improve on (a pool-backed passive maker, solving CLOB",
         "cold-start). Authority-gated for now (the on-chain quoter drives this in a",
         "later increment); POST-ONLY by construction — an FLP quote must REST, so it",
         "is rejected if it would cross the opposite best (that would make the pool a",
@@ -4807,11 +4807,10 @@
         "fund. Keeper hook; runs at most once per slot per market in",
         "practice (the dust accrues slowly from many converts).",
         "",
-        "Wave 24b lands the math + event emission. Actual SPL transfer",
-        "from haircut state's claim into the insurance fund's balance",
-        "counter happens here; the underlying vault token doesn't move",
-        "(insurance and haircut both live in the same vault) — only the",
-        "accounting counters do."
+        "The transfer is an accounting move from the haircut state's claim",
+        "into the insurance fund's balance counter; the underlying vault",
+        "token doesn't move (insurance and haircut both live in the same",
+        "vault) — only the counters do."
       ],
       "discriminator": [
         37,
@@ -5006,10 +5005,9 @@
         "move cap stored in the envelope config. Returns successfully",
         "iff the move is admissible; reverts otherwise.",
         "",
-        "This is the surface Wave 26b will hook into the mark-EMA",
-        "update path inside `apply_fill`. Today it's a callable ix so",
-        "off-chain bots / sequencers can pre-flight a price update",
-        "without simulating the full apply_fill."
+        "Callable pre-flight surface for the envelope gate the oracle-update",
+        "paths enforce: off-chain bots / sequencers can check a price move",
+        "without simulating a full update."
       ],
       "discriminator": [
         236,
@@ -5270,7 +5268,7 @@
     {
       "name": "guardian_veto_param_update",
       "docs": [
-        "GOVERNANCE Phase-2b follow-up (2026-07): emergency guardian VETO of a pending",
+        "Emergency guardian VETO of a pending",
         "timelocked params update. The guardian (Phase-1 restrict-only key) may cancel a",
         "pending change during its delay window — the fail-safe brake for a compromised",
         "authority that proposed a dangerous loosening. Closes the pending account (rent",
@@ -5660,9 +5658,9 @@
       "name": "init_fee_tiers",
       "docs": [
         "Initialize the protocol-wide fee tier table. Authority signs.",
-        "Multi-tier volume-based fees — HL / Binance / dYdX standard.",
+        "Multi-tier volume-based fees, standard across major venues.",
         "`volume_window_slots` = how many slots the rolling window covers",
-        "(HL: 14d ≈ 3_024_000 slots @ 0.4s/slot). Tiers MUST be:",
+        "(14d ≈ 3_024_000 slots @ 0.4s/slot). Tiers MUST be:",
         "• non-empty, length ≤ MAX_FEE_TIERS = 10",
         "• sorted ascending by `min_volume_quote_lots`",
         "• first tier has `min_volume_quote_lots == 0` (default tier)",
@@ -5693,7 +5691,7 @@
         {
           "name": "insurance_fund",
           "docs": [
-            "AUDIT M-18 (2026-07): this is a first-caller-wins singleton at a fixed",
+            "This is a first-caller-wins singleton at a fixed",
             "PDA. Without an authority gate an attacker could front-run genesis,",
             "pin themselves as `fee_tiers.authority`, lock out the operator, and set",
             "the global fee schedule. Gate on the protocol authority."
@@ -5769,7 +5767,7 @@
     {
       "name": "init_fill_commitment",
       "docs": [
-        "Allocate the per-market `FillCommitmentAccount` (#35 / H1 part B). A raw",
+        "Allocate the per-market `FillCommitmentAccount`. A raw",
         "PDA at `[fill_commit, market]` holding the consume-and-clear fill ring:",
         "the matcher pushes a keccak commitment for every fill it crosses on-chain,",
         "and settlement may only consume a matching, oldest-pending entry — so a",
@@ -6015,8 +6013,8 @@
         {
           "name": "insurance_fund",
           "docs": [
-            "AUDIT M-18 (2026-07): gate on the protocol authority so this per-market",
-            "singleton can't be front-run/captured to control `record_flp_fill_v3`."
+            "Gated on the protocol authority so this per-market singleton cannot be",
+            "front-run or captured to control `record_flp_fill_v3`."
           ],
           "pda": {
             "seeds": [
@@ -6045,9 +6043,10 @@
         {
           "name": "market",
           "docs": [
-            "AUDIT M-18 (2026-07): typed as a real MarketAccount (owner + discriminator",
-            "checked) rather than a raw UncheckedAccount, so an arbitrary 32-byte",
-            "\"market\" cannot be squatted as the exposure seed."
+            "Typed as a real MarketAccount (owner + discriminator checked) rather",
+            "than a raw UncheckedAccount, so an arbitrary 32-byte \"market\" cannot be",
+            "squatted as the exposure seed. Boxed: an un-boxed MarketAccount",
+            "deserializes onto the stack and tips the 4 KB BPF frame."
           ],
           "pda": {
             "seeds": [
@@ -6116,7 +6115,7 @@
     {
       "name": "init_lazer_oracle_config",
       "docs": [
-        "AUDIT CR-2: authority-gated binding for the Lazer oracle path. Creates",
+        "Authority-gated binding for the Lazer oracle path. Creates",
         "the market's `oracle_config` with `source = SOURCE_LAZER` plus the",
         "canonical `lazer_feed_id` and `tick_decimals`, so the permissionless",
         "`update_oracle_from_lazer` can validate its (untrusted) caller args",
@@ -6207,12 +6206,8 @@
         "This is the foundation for the wave-18 orderbook rewrite. The",
         "account is `UncheckedAccount` because the data layout",
         "(256-byte header + 8000-byte dynamic node array) is large",
-        "enough that Anchor's `#[account(zero_copy)]` derive choke on",
-        "the `[u8; 8000]` field. Manifest's exact pattern.",
-        "",
-        "This ix runs ALONGSIDE the legacy `initialize_order_buffer` for",
-        "now; once the matcher is fully migrated (wave 18d-e), the",
-        "legacy ix is deprecated and removed."
+        "enough that Anchor's `#[account(zero_copy)]` derive chokes on",
+        "the `[u8; 8000]` field, so the layout is validated by hand."
       ],
       "discriminator": [
         74,
@@ -6263,8 +6258,9 @@
           "docs": [
             "handler. Anchor's `init` constraint can't size this (8264 B",
             "with the [u8; 8000] field), and `#[account(zero_copy)]` rejects",
-            "large array fields in its derive expansion. Manifest's pattern.",
-            "Owner check happens implicitly via the seeds derivation."
+            "large array fields in its derive expansion, so allocation and layout",
+            "are handled by hand. Owner check happens implicitly via the seeds",
+            "derivation."
           ],
           "writable": true,
           "pda": {
@@ -6393,8 +6389,7 @@
       "docs": [
         "Permissionless: lazy-init a per-position `PositionHaircutStateAccount`.",
         "Called once per (market, position) before the first",
-        "`release_gain_to_haircut` against it. Wave 24d/e will replace",
-        "this with `init_if_needed` inside `apply_fill`'s gain path."
+        "`release_gain_to_haircut` against it."
       ],
       "discriminator": [
         223,
@@ -6418,7 +6413,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2c FIX (audit 2026-06): position PDA is keyed by the trader_state",
+            "Position PDA is keyed by the trader_state",
             "account, not the wallet. Relaxed (no seed); the `position` seeds bind it",
             "canonically and the `market` account below supplies the market key."
           ]
@@ -6426,10 +6421,10 @@
         {
           "name": "market",
           "docs": [
-            "WAVE 24f FIX (haircut/position deadlock): the market is supplied",
-            "EXPLICITLY rather than read from `position.load()?.market`. This breaks",
-            "the chicken-and-egg: on a `haircut_enabled` market `apply_fill` requires",
-            "the per-position haircut to pre-exist, but the old struct could only init",
+            "The market is supplied EXPLICITLY rather than read from",
+            "`position.load()?.market`. This breaks a chicken-and-egg deadlock: on",
+            "a `haircut_enabled` market `apply_fill` requires the per-position",
+            "haircut to pre-exist, but a position-derived market could only init",
             "it AFTER the position existed — which only `apply_fill` can create — so a",
             "brand-new trader could never open a first position. Keying off",
             "`market` + `trader_state` lets us pre-init the haircut for a position that",
@@ -6827,7 +6822,7 @@
         {
           "name": "insurance_fund",
           "docs": [
-            "AUDIT CRITICAL-1 (2026-07): admin-gate this permissionless singleton",
+            "Admin-gate this permissionless singleton",
             "init to the protocol authority so it cannot be front-run/captured to",
             "mint shares against the shared vault."
           ],
@@ -7209,8 +7204,9 @@
       "docs": [
         "Authority-only: initialize the per-market side accrual state.",
         "Both sides start in Normal mode with A == ADL_ONE and K/F/B",
-        "at zero. Wave 25b will rewire `settle_funding` and",
-        "`auto_deleverage` to operate on this account.",
+        "at zero. `settle_funding` advances the per-side K/F indices on this",
+        "account; `auto_deleverage` reduces the counter side's ADL",
+        "multiplier A.",
         "",
         "Idempotent in the sense that re-running the ix on an existing",
         "account is impossible (Anchor's `init` constraint)."
@@ -7307,17 +7303,16 @@
     {
       "name": "liquidate_portfolio_v2",
       "docs": [
-        "V2: cross-market portfolio liquidation against the hypertree-backed",
-        "book. Pure parity port of v1's `liquidate_portfolio`:",
+        "Cross-market portfolio liquidation against the hypertree-backed",
+        "book:",
         "• Walks remaining_accounts in (market, position) pairs",
         "• Verifies owner program + trader/market binding for each pair",
         "• Builds the joint cross-market scenario lattice",
         "• Stress-checks via assess_margin_fn",
-        "• Injects synthetic close on EXECUTION market only",
+        "• Injects the synthetic close on the EXECUTION market only",
         "",
-        "Only the injection target differs (hypertree, not v1 buffer). The",
-        "order_type byte is set to 3 (Liquidation) so wave 19e's matcher",
-        "mapping promotes it to FIFO liquidation priority."
+        "The order_type byte is set to 3 (Liquidation) so the matcher's",
+        "FIFO mapping promotes it to liquidation priority."
       ],
       "discriminator": [
         183,
@@ -7393,11 +7388,11 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: dropped strict seed — sub-account TraderStates have",
+            "Dropped strict seed — sub-account TraderStates have",
             "PDAs at `[SEED, wallet, &[sub_index]]` which the self-referential",
             "seed `[SEED, trader_state.trader.as_ref()]` does not match.",
             "Identity is enforced by the `execution_position` PDA below,",
-            "which is keyed on `trader_state.key()` (Phase 2c). The matched",
+            "Which is keyed on `trader_state.key()`. The matched",
             "pair is what binds the liquidatee."
           ]
         },
@@ -7438,11 +7433,10 @@
         "V2: liquidate an unhealthy position by injecting a synthetic",
         "close order into the hypertree-backed book.",
         "",
-        "PURE PARITY PORT of v1's `liquidate_position` — same cooldown",
-        "gate, same stress-lattice health check, same Dutch-auction",
-        "reward curve, same `oracle ± penalty_bps` limit pricing, same",
-        "position timing updates. Only the order injection target",
-        "differs: hypertree, not v1 buffer. The order_type byte is set",
+        "Applies the liquidation pipeline: cooldown gate, stress-lattice",
+        "health check, Dutch-auction reward curve, `oracle ± penalty_bps`",
+        "limit pricing, and position timing updates, injecting the close",
+        "order into the hypertree book. The order_type byte is set",
         "to 3 (Liquidation) so the matcher's FIFO mapping (mirror of",
         "v1's `slot_to_order`) places it AHEAD of regular limits at",
         "the same price tier — same priority semantics as v1."
@@ -7526,8 +7520,8 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: dropped strict seed — see LiquidatePortfolioV2 above.",
-            "The `position` PDA below binds liquidatee identity via Phase 2c",
+            "Dropped strict seed — see LiquidatePortfolioV2 above.",
+            "The `position` PDA below binds liquidatee identity via",
             "trader_state.key()-based derivation."
           ],
           "writable": true
@@ -7564,10 +7558,9 @@
         {
           "name": "position",
           "docs": [
-            "MUT — wave 19e fixes a v1 latent bug: v1's LiquidatePosition has",
-            "this WITHOUT `mut`, so writes to `unhealthy_since_slot` /",
-            "`last_liquidated_at_slot` silently don't persist. Anchor doesn't",
-            "serialize back accounts not declared mut. v2 correctly marks it."
+            "MUT is load-bearing: the handler writes `unhealthy_since_slot` /",
+            "`last_liquidated_at_slot`, and Anchor silently drops writes to",
+            "accounts not declared mut."
           ],
           "writable": true,
           "pda": {
@@ -7611,7 +7604,7 @@
     {
       "name": "lock_oracle_source",
       "docs": [
-        "GOVERNANCE Phase-3 (2026-07): ONE-WAY lock of the market's oracle source. Once",
+        "ONE-WAY lock of the market's oracle source. Once",
         "locked, the direct-authority `update_oracle` / `update_oracle_quorum` paths",
         "revert (`OracleSourceLocked`) — only the Pyth (account-owner + Full) and Lazer",
         "(Ed25519 precompile + replay nonce) paths remain, removing the compromised-",
@@ -7750,7 +7743,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2c FIX (audit 2026-06): positions are PDA-keyed by the trader_state",
+            "Positions are PDA-keyed by the trader_state",
             "account, NOT the wallet. Relaxed (no seed) — the `position` seeds below",
             "bind it to the canonical trader_state (a wrong one derives a different PDA",
             "→ ConstraintSeeds), and the identity constraint re-checks",
@@ -7876,15 +7869,14 @@
     {
       "name": "migrate_position_to_trader_state_key",
       "docs": [
-        "Phase 2c migration — move a Position from the LEGACY PDA",
-        "`[POS_SEED, market, wallet]` to the NEW Phase 2c PDA",
-        "`[POS_SEED, market, trader_state.key()]`. The new derivation",
-        "makes sub-account positions distinct from main, which is the",
-        "prerequisite for sub-account trading.",
+        "Migrate a Position from the legacy PDA `[POS_SEED, market, wallet]`",
+        "to the canonical PDA `[POS_SEED, market, trader_state.key()]`. The",
+        "trader-state-keyed derivation makes sub-account positions distinct",
+        "from main, which is the prerequisite for sub-account trading.",
         "",
-        "Per (wallet, market). Only main-account positions need to be",
-        "migrated — sub-account positions don't exist pre-2c. The legacy",
-        "PDA is closed and rent refunded to the trader. The new PDA is",
+        "Per (wallet, market). Only legacy wallet-keyed positions need",
+        "migration — sub-account positions only ever exist at the canonical",
+        "derivation. The legacy PDA is closed and rent refunded to the trader. The new PDA is",
         "init'd with the same on-chain state (size, side, entry, funding",
         "indices, realized PnL, isolated collateral, timing fields).",
         "",
@@ -8000,7 +7992,8 @@
         {
           "name": "new_position",
           "docs": [
-            "NEW position at the Phase 2c PDA. `init` (not init_if_needed) so",
+            "NEW position at the canonical trader-state-keyed PDA. `init` (not",
+            "init_if_needed) so",
             "migration can only run when the new slot is empty — protects",
             "against accidental double-migration overwriting state."
           ],
@@ -8260,14 +8253,14 @@
       "name": "partial_withdraw_collateral",
       "docs": [
         "Partial withdrawal that allows traders with open positions to",
-        "pull out collateral above the safety floor. Hyperliquid pattern:",
+        "pull out collateral above the safety floor.",
         "post-withdrawal collateral must satisfy",
         "`remaining >= max(IM_required, WITHDRAWAL_FLOOR_BPS * notional)`",
         "where:",
         "• IM_required is the standard initial-margin requirement under",
         "the joint stress lattice (same engine as place_limit_order_v2",
         "intake — `assess_margin_fn`)",
-        "• WITHDRAWAL_FLOOR_BPS = 1000 (10% of total notional) — HL's",
+        "• WITHDRAWAL_FLOOR_BPS = 1000 (10% of total notional) — the",
         "anti-deposit-then-withdraw guard prevents a trader from",
         "temporarily topping up to satisfy IM, placing a trade, then",
         "immediately yanking the temporary collateral leaving only",
@@ -8301,7 +8294,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: relaxed seed — see DepositCollateral above."
+            "Relaxed seed — see DepositCollateral above."
           ],
           "writable": true
         },
@@ -8633,10 +8626,10 @@
     {
       "name": "place_basket_order_n_v2",
       "docs": [
-        "V2 N-leg basket order. Pure parity port of `place_basket_order_n`",
-        "— same K-distinct-markets guard, per-leg intake, caps, joint",
-        "stress lattice, rate limit. remaining_accounts layout: triples",
-        "of (market, market_book, position) per leg, so 3 × K accounts."
+        "N-leg basket order: K-distinct-markets guard, per-leg intake",
+        "validation, caps, a joint stress-lattice margin gate, and the basket",
+        "rate limit. remaining_accounts layout: triples of",
+        "(market, market_book, position) per leg, so 3 × K accounts."
       ],
       "discriminator": [
         215,
@@ -8656,7 +8649,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: relaxed seed — accepts main or sub-account TraderState."
+            "Relaxed seed — accepts main or sub-account TraderState."
           ],
           "writable": true
         },
@@ -8701,12 +8694,10 @@
     {
       "name": "place_basket_order_v2",
       "docs": [
-        "V2 2-leg basket order against the hypertree-backed book. Pure",
-        "parity port of `place_basket_order` — same distinct-market guard,",
-        "same per-leg intake validation, same per-market caps, same joint",
-        "stress-lattice margin gate, same rate limit. Only the injection",
-        "target differs (per-market market_book PDA, not per-market",
-        "order_buffer)."
+        "2-leg basket order against the hypertree-backed book: distinct-market",
+        "guard, per-leg intake validation, per-market caps, a joint",
+        "stress-lattice margin gate across both legs, and the basket rate",
+        "limit. Both legs inject into their per-market `market_book` PDAs."
       ],
       "discriminator": [
         139,
@@ -8727,7 +8718,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: relaxed seed — accepts main or sub-account TraderState."
+            "Relaxed seed — accepts main or sub-account TraderState."
           ],
           "writable": true
         },
@@ -9291,9 +9282,8 @@
         "",
         "Validation mirrors the legacy ix's intake: status-active gate,",
         "min-base-lots, tick alignment, size cap. Then constructs a",
-        "`RestingOrderV2` carrying the trader pubkey inline (free-funds",
-        "indirection comes in wave 19) and inserts into the bids or asks",
-        "RBT inside the `MarketBookHandle`.",
+        "`RestingOrderV2` carrying the trader pubkey inline and inserts it",
+        "into the bids or asks RBT inside the `MarketBookHandle`.",
         "",
         "`flags` accepts the same bitfield as v1: bit0 post_only, bit1",
         "reduce_only, bit2 ioc, bit3 jit, bits 4-5 stp_mode."
@@ -9905,7 +9895,7 @@
     {
       "name": "propose_authority_transfer",
       "docs": [
-        "GOVERNANCE Phase-2 (2026-07): step 1 of a SAFE 2-step authority transfer. The",
+        "Step 1 of a SAFE 2-step authority transfer. The",
         "current authority proposes `new_authority`; it does NOT take effect until that",
         "key calls `accept_authority_transfer` (proving it is live + correct). Prefer",
         "this over the 1-step `transfer_market_authority`, which can strand a market at",
@@ -10004,7 +9994,7 @@
     {
       "name": "propose_param_update",
       "docs": [
-        "GOVERNANCE Phase-2b (2026-07): propose a TIMELOCKED market-params update.",
+        "Propose a TIMELOCKED market-params update.",
         "Validates `new_params` (same checks as `update_market_params`), then records",
         "`keccak(new_params)` + `eta = now + PARAM_UPDATE_TIMELOCK_SECONDS`; does NOT",
         "apply. `execute_param_update` applies it only after the delay. Authority-only.",
@@ -10105,7 +10095,7 @@
     {
       "name": "reap_expired_orders",
       "docs": [
-        "Permissionless expiry-reaper (#36 anti-book-stuffing). Removes GTT orders",
+        "Permissionless anti-book-stuffing expiry-reaper. Removes GTT orders",
         "whose `expires_at_slot` has passed, reclaiming node-arena space so a market",
         "self-heals from stale-order accumulation. ANYONE may call it — but only a",
         "GENUINELY-expired GTT order is ever removed: a live order or a GTC order",
@@ -10201,7 +10191,7 @@
     {
       "name": "reconcile_unsettled_fill_volume",
       "docs": [
-        "AUDIT F-4 (2026-07): reconcile `MarketAccount.unsettled_fill_volume` (the",
+        "Reconcile `MarketAccount.unsettled_fill_volume` (the",
         "M-6 matched-but-unsettled OI reserve) back to 0 when the fill-commitment",
         "ring is fully DRAINED.",
         "",
@@ -10382,15 +10372,14 @@
     {
       "name": "release_gain_to_haircut",
       "docs": [
-        "Wave 24c — interim: route an explicit amount of a position's",
+        "Interim: route an explicit amount of a position's",
         "already-credited collateral INTO the haircut reserve.",
         "",
-        "This is what Wave 24d will do automatically inside `apply_fill`:",
-        "when a fill realizes positive PnL on an opted-in market, the",
-        "credit flows to the reserve instead of straight to collateral.",
-        "Until that wire-in lands, this ix lets the sequencer / authority",
-        "retroactively opt a position into the haircut by moving N lots",
-        "of its collateral into the reserve.",
+        "`apply_fill` performs this routing automatically on haircut-enabled",
+        "markets: a fill that realizes positive PnL flows the credit to the",
+        "reserve instead of straight to collateral. This ix additionally lets",
+        "the authority retroactively opt a position into the haircut by",
+        "moving N lots of its collateral into the reserve.",
         "",
         "Authority-gated (market.authority) for safety — anyone calling",
         "this could move trader funds into a reserve the trader doesn't",
@@ -10447,7 +10436,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2c FIX (audit 2026-06): declared BEFORE `position` and relaxed (no",
+            "Declared BEFORE `position` and relaxed (no",
             "seed) so the position PDA can be keyed by `trader_state.key()` — the old",
             "wallet-keyed seed never matched a Phase-2c position. The cross bucket this",
             "handler debits lives on this account; the position seeds + identity",
@@ -10614,7 +10603,7 @@
     {
       "name": "reseat_order_seq_counter",
       "docs": [
-        "AUDIT M-8 (2026-07): reseat the per-market order-sequence counter.",
+        "Reseat the per-market order-sequence counter.",
         "",
         "`order_seq_counter` is monotonic and 24-bit-encodable, and was never",
         "reset — so a market BRICKS (rejects ALL new orders with",
@@ -10765,11 +10754,10 @@
       "name": "seed_residual",
       "docs": [
         "Authority-only: set/grow the per-market Residual explicitly.",
-        "Interim mechanism until Wave 28's per-market FLP attribution",
-        "wires Residual into automatic delta-tracking on every money",
-        "move. Production deployments should reconcile against on-chain",
-        "balances before each call. Signed deltas — pass negative to",
-        "shrink (e.g. on payout audit)."
+        "Residual is a governance-reconciled input: production deployments",
+        "reconcile against on-chain balances before each call",
+        "(`verify_collateral_solvency` provides the on-chain over-statement",
+        "check). Signed deltas — pass negative to shrink."
       ],
       "discriminator": [
         252,
@@ -11151,7 +11139,7 @@
     {
       "name": "set_guardian",
       "docs": [
-        "GOVERNANCE Phase-1 (2026-07): set (or clear) the market's emergency guardian",
+        "Set (or clear) the market's emergency guardian",
         "— a key that may only RESTRICT market status (pause/post-only/close), never",
         "loosen (see `set_market_status`). Authority-only. `Pubkey::default()` clears",
         "it (disables the guardian path)."
@@ -11499,9 +11487,9 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: relaxed seed — accepts main or sub-account",
+            "Relaxed seed — accepts main or sub-account",
             "TraderState. The `target_position` PDA seeds use",
-            "`trader_state.key()` (Phase 2c), so positions are correctly",
+            "`trader_state.key()`, so positions are correctly",
             "scoped to whichever TraderState transitioned."
           ],
           "writable": true
@@ -11577,11 +11565,10 @@
         "(b) the isolated position itself (its new collateral vs its",
         "own maintenance margin under stress)",
         "",
-        "Phase 2 constraint: AT MOST ONE position can be isolated per",
+        "Constraint: AT MOST ONE position can be isolated per",
         "trader (the one being modified). If the trader has another",
         "position that's already isolated (`collateral_quote_lots > 0`),",
-        "this ix rejects — un-isolate it first. Phase 3 lifts this to",
-        "multi-isolated-positions.",
+        "this ix rejects — un-isolate it first.",
         "",
         "remaining_accounts layout: alternating (market, position) pairs",
         "for every OTHER position the trader has a non-zero size on. The",
@@ -11606,9 +11593,9 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: relaxed seed — accepts main or sub-account",
+            "Relaxed seed — accepts main or sub-account",
             "TraderState. The `target_position` PDA seeds use",
-            "`trader_state.key()` (Phase 2c), so positions are correctly",
+            "`trader_state.key()`, so positions are correctly",
             "scoped to whichever TraderState transitioned."
           ],
           "writable": true
@@ -11683,7 +11670,7 @@
       "docs": [
         "Set the per-position leverage cap. Trader (or delegate) signs.",
         "`cap` must be ∈ [1, market.params.max_leverage]. Pass 0 to clear",
-        "(revert to using market default). Hyperliquid pattern: lets risk-",
+        "(revert to using market default). Lets risk-",
         "conscious traders limit their effective leverage on a single",
         "position without affecting their other positions or the market's",
         "global cap. The cap is enforced at place_limit_order intake on",
@@ -11786,7 +11773,7 @@
     {
       "name": "set_sequencer_committee",
       "docs": [
-        "M-14 decentralization (Phase 1 scaffold): create/rotate the market's",
+        "Create/rotate the market's",
         "sequencer committee. Authority-gated. Validates the BFT quorum config",
         "(`3·threshold > 2·N`, `1 ≤ threshold ≤ N ≤ MAX`) + a distinct, non-zero",
         "validator set, stores it, and bumps the rotation epoch. **Scaffolding:**",
@@ -11891,7 +11878,7 @@
       "docs": [
         "Set or rotate the trader's builder pubkey + the maximum fee share",
         "(in bps of net fee) the trader authorizes the builder to collect.",
-        "Pass Pubkey::default() to revoke. Hyperliquid builder-codes model:",
+        "Pass Pubkey::default() to revoke. Builder-codes model:",
         "a third-party UI/wallet/aggregator routing flow earns a share of",
         "the protocol fee, capped by the user's approved max. Trader signs",
         "— neither the protocol authority nor the builder can install one",
@@ -11925,7 +11912,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: relaxed seed — accepts main or sub-account TraderState."
+            "Relaxed seed — accepts main or sub-account TraderState."
           ],
           "writable": true
         }
@@ -11951,7 +11938,7 @@
         "",
         "Use cases:",
         "• Master/hot-key split: master holds funds; hot key trades",
-        "(Hyperliquid + dYdX standard pattern).",
+        "(the standard perp-DEX delegate pattern).",
         "• Multi-sig subaccount manager.",
         "• MM bot keypair authorized to manage a vault's positions."
       ],
@@ -11977,7 +11964,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: relaxed seed — accepts main or sub-account TraderState."
+            "Relaxed seed — accepts main or sub-account TraderState."
           ],
           "writable": true
         }
@@ -11995,11 +11982,11 @@
         "Set a trader's per-trader fee discount in bps off the base taker",
         "fee. Authority-only. Off-chain volume tracking sets this based on",
         "30-day rolling notional — the universal pattern at every CEX",
-        "(Binance, OKX, Bybit, Hyperliquid).",
+        "(the standard referral mechanic on major venues).",
         "",
         "`discount_bps` is bounded to `MAX_FEE_DISCOUNT_BPS` = 10_000 (100%) —",
         "a discount can reach a zero taker fee but never a negative one.",
-        "M-5 (audit 2026-06): the old 12_000 cap allowed a negative top-tier",
+        "The old 12_000 cap allowed a negative top-tier",
         "fee whose rebate was credited but never debited (unbacked mint); the",
         "tier is removed by capping at 100%. See `constants::MAX_FEE_DISCOUNT_BPS`."
       ],
@@ -12055,7 +12042,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: dropped strict seed so the authority can target a",
+            "Dropped strict seed so the authority can target a",
             "sub-account TraderState too. No additional constraint needed —",
             "the `authority` Signer is gated by `insurance_fund.authority`",
             "above, so only the protocol authority can call this ix."
@@ -12101,7 +12088,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: relaxed seed — accepts main or sub-account TraderState."
+            "Relaxed seed — accepts main or sub-account TraderState."
           ],
           "writable": true
         }
@@ -12131,7 +12118,7 @@
         "the next risk check). We do not fail the tx because that would let",
         "underwater positions block keepers from settling them.",
         "",
-        "DORMANT (truth-in-code, 2026-07): the funding RATE driving this —",
+        "DORMANT: the funding RATE driving this —",
         "`market.last_funding_rate_bps_per_sec` — is initialized to 0 and set to",
         "nonzero NOWHERE in the program (the rate formula exists only in the",
         "read-only `view_predicted_funding`; no path stores its result). So",
@@ -12206,9 +12193,9 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: dropped strict seed so settle_funding can operate on",
+            "Dropped strict seed so settle_funding can operate on",
             "sub-account TraderStates too. The position PDA below binds the",
-            "pair via Phase 2c trader_state.key()-based seeds."
+            "pair via trader_state.key()-based seeds."
           ],
           "writable": true
         },
@@ -12275,10 +12262,10 @@
         {
           "name": "side_accrual",
           "docs": [
-            "Wave 25b (optional, additive): the per-market side-accrual account.",
-            "When supplied, `settle_funding` advances its K/F indices. Omit it",
-            "(None) on markets that have not initialized side accrual — behavior is",
-            "then byte-identical to pre-Wave-25b. Bound to the market in the handler."
+            "Optional, additive: the per-market side-accrual account. When",
+            "supplied, `settle_funding` advances its K/F indices. Omit it (None)",
+            "on markets that have not initialized side accrual — settlement then",
+            "runs without index advancement. Bound to the market in the handler."
           ],
           "writable": true,
           "optional": true
@@ -12459,7 +12446,7 @@
     {
       "name": "slash_equivocation",
       "docs": [
-        "M-14 decentralization (Phase 2.6): PERMISSIONLESSLY slash a validator that",
+        "PERMISSIONLESSLY slash a validator that",
         "PROVABLY equivocated — Ed25519-signed two conflicting batches at the SAME",
         "consensus height (`epoch`, `batch_seq`) but with DIFFERENT content. Both",
         "signatures are verified by the native precompile against the SAME validator",
@@ -12586,7 +12573,7 @@
       "docs": [
         "PERMISSIONLESS one-shot: stamp the force-undelegate liveness baseline for a",
         "market whose book was DELEGATED BEFORE the censorship-escape upgrade shipped",
-        "(so `book_delegated_at_slot == 0`). F1 (audit 2026-06): without this, such a",
+        "(so `book_delegated_at_slot == 0`). Without this, such a",
         "market whose ER then goes dark with NO committed fill keeps",
         "`last_mark_update_slot == 0` too, so `force_undelegate_allowed` returns false",
         "forever and traders are trapped — exactly the population the escape exists to",
@@ -12721,7 +12708,7 @@
         {
           "name": "from_state",
           "docs": [
-            "Phase 2d: dropped strict seeds so sweep can move collateral",
+            "Dropped strict seeds so sweep can move collateral",
             "between main and sub-account TraderStates (and between two",
             "sub-accounts). The handler's `is_authorized(&authority.key())`",
             "gate on each side ensures the signer owns/delegates BOTH",
@@ -12746,16 +12733,14 @@
       "docs": [
         "Move `amount` quote-lots from the trader's MAIN trader_state into",
         "their sub-account at `sub_index`. Useful as a \"savings\" or",
-        "strategy-segregation pattern — the sub-account is isolated from",
-        "the main account's trading exposure until Phase 2 wires trading",
-        "from sub-accounts.",
+        "strategy-segregation pattern — the sub-account's exposure is",
+        "isolated from the main account's.",
         "",
         "REJECTS if the main account has open positions whose maintenance",
         "margin would be violated by the withdrawal — caller must close",
         "or reduce exposure first. (Implemented by reading",
         "`main.open_positions` and refusing the transfer when > 0. The",
-        "looser, position-aware check is deferred to Phase 2 alongside",
-        "the assess_margin refactor.)"
+        "open_positions == 0 rule is deliberately conservative.)"
       ],
       "discriminator": [
         65,
@@ -12823,7 +12808,7 @@
         "Transfer market authority (e.g. for key rotation). Only the current",
         "market authority may sign.",
         "",
-        "AUDIT F4 (2026-07): rejects a transfer to the zero key — that would be",
+        "Rejects a transfer to the zero key — that would be",
         "an *irreversible* authority burn masquerading as a rotation. Burning is",
         "a deliberate, separate action (`burn_market_authority`)."
       ],
@@ -12884,8 +12869,7 @@
       "docs": [
         "Mirror of `transfer_main_to_sub`: move `amount` quote-lots from",
         "the sub-account back to main. Same guard — refuses if the sub",
-        "account has open positions (which it can't have until Phase 2",
-        "wires trading; included now for forward-compatibility)."
+        "account has open positions."
       ],
       "discriminator": [
         165,
@@ -13092,7 +13076,7 @@
         "the price from a verified Pyth account (the Pyth-pull ix). Both gates",
         "are first-class — do not strip one assuming the other suffices.",
         "",
-        "Hardened against the JELLY/POPCAT class of attacks (Hyperliquid 2025):",
+        "Hardened against oracle-manipulation squeezes on thin markets:",
         "",
         "1. **Staleness check**: rejects updates where",
         "`now - published_at > params.oracle_staleness_max_seconds`.",
@@ -13153,10 +13137,10 @@
         {
           "name": "envelope_config",
           "docs": [
-            "Wave 26b — optional envelope gate. When supplied, the proposed",
+            "Optional envelope gate. When supplied, the proposed",
             "price move is checked against `gate_price_move(p_last, p_new,",
             "dt_slots, max_price_move_bps_per_slot)`. Reject → entire ix",
-            "reverts. When omitted: pre-Wave-26b behavior (no gate)."
+            "reverts. When omitted: no gate is applied."
           ],
           "writable": true,
           "optional": true,
@@ -13201,7 +13185,7 @@
     {
       "name": "update_oracle_from_lazer",
       "docs": [
-        "WAVE 24g — push a price from a Pyth **Lazer** signed payload.",
+        "Push a price from a Pyth **Lazer** signed payload.",
         "",
         "The trust anchor is the Ed25519 signature the Lazer publisher placed",
         "over `payload`. The Solana Ed25519 SigVerify precompile (which the",
@@ -13291,9 +13275,9 @@
         {
           "name": "envelope_config",
           "docs": [
-            "AUDIT H-4 fix: the per-slot price-move cap is MANDATORY on this",
-            "permissionless path (previously `Option`, so the caller could omit it",
-            "and write an un-capped move). Created once via `set_envelope_config`."
+            "The per-slot price-move cap is MANDATORY on this permissionless",
+            "path — were the account optional, the caller could omit it and write",
+            "an un-capped move. Created once via `set_envelope_config`."
           ],
           "writable": true,
           "pda": {
@@ -13425,9 +13409,9 @@
         {
           "name": "envelope_config",
           "docs": [
-            "AUDIT H-4 fix: the per-slot price-move cap is MANDATORY on this",
-            "permissionless path. Previously `Option`, so any caller could omit the",
-            "account and write an un-capped move. The envelope is created once via",
+            "The per-slot price-move cap is MANDATORY on this permissionless",
+            "path — were the account optional, any caller could omit it and write",
+            "an un-capped move. The envelope is created once via",
             "`set_envelope_config`; markets using the permissionless Pyth-pull path",
             "must have it. (The trusted authority `update_oracle` path keeps it",
             "optional — that caller is already trusted.)"
@@ -13525,10 +13509,10 @@
         {
           "name": "envelope_config",
           "docs": [
-            "Wave 26b — optional envelope gate. When supplied, the proposed",
+            "Optional envelope gate. When supplied, the proposed",
             "price move is checked against `gate_price_move(p_last, p_new,",
             "dt_slots, max_price_move_bps_per_slot)`. Reject → entire ix",
-            "reverts. When omitted: pre-Wave-26b behavior (no gate)."
+            "reverts. When omitted: no gate is applied."
           ],
           "writable": true,
           "optional": true,
@@ -13588,7 +13572,7 @@
     {
       "name": "upgrade_fill_commitment_v1",
       "docs": [
-        "AUDIT F-3 migration (2026-07): one-way, authority-gated upgrade of a market's",
+        "One-way, authority-gated upgrade of a market's",
         "fill-commitment ring from the v0 layout to v1, enabling per-position",
         "reduce-in-flight tracking (closes the last F-3 edge: a position shrunk below",
         "its resting reduce-only, then over-crossed across the match→settle gap).",
@@ -13963,10 +13947,10 @@
         {
           "name": "quote_vault",
           "docs": [
-            "Protocol vault — credited. C1: MUST be the canonical insurance-fund vault.",
-            "Previously unbound `#[account(mut)]`, which let an attacker pass a",
-            "self-owned destination and still be credited collateral + minted shares",
-            "redeemable against the real vault (Cashio-class drain)."
+            "Protocol vault — credited. MUST be the canonical insurance-fund",
+            "vault: an unbound `#[account(mut)]` here would let an attacker pass a",
+            "self-owned destination and still be credited collateral + minted",
+            "shares redeemable against the real vault."
           ],
           "writable": true
         },
@@ -14165,7 +14149,7 @@
         {
           "name": "vault_trader_state",
           "docs": [
-            "AUDIT C-1 (2026-07): the vault's own TraderState. `vault_place_order_v3`",
+            "The vault's own TraderState. `vault_place_order_v3`",
             "rests a `RestingOrderV2` under `(vault_pk, 0)`; when a taker crosses it the",
             "matcher commits that maker identity into the strict fill-commitment FIFO,",
             "and `apply_fill` HARD-loads this TraderState (`verify_trader_state_pda`) to",
@@ -14478,7 +14462,7 @@
         {
           "name": "haircut_state",
           "docs": [
-            "AUDIT M-6 (2026-07): optional — when supplied, its `residual` is checked",
+            "Optional — when supplied, its `residual` is checked",
             "to be backed by the vault surplus. `None` = legacy behavior (backward",
             "compatible; existing callers are unaffected)."
           ],
@@ -14499,8 +14483,8 @@
         "params. Emits a structured event with `passed: bool`. Lets",
         "keepers / monitors verify periodically that the params still",
         "satisfy the envelope inequality (in case future changes to",
-        "the envelope's absolute bounds make a previously-valid config",
-        "no longer prove)."
+        "the envelope's absolute bounds invalidate a config that proved",
+        "at set time)."
       ],
       "discriminator": [
         127,
@@ -14548,7 +14532,7 @@
     {
       "name": "verify_haircut_invariants",
       "docs": [
-        "Wave 24e — Permissionless: walk all internal-consistency",
+        "Permissionless: walk all internal-consistency",
         "invariants over the market's haircut state and emit a structured",
         "report event.",
         "",
@@ -14560,7 +14544,7 @@
         "• dust_accrued ≤ realized_loss_total + matured_pos_total",
         "",
         "Does NOT cross-check against the live SPL vault balance — that",
-        "needs per-market committed-collateral accounting (Wave 28).",
+        "Needs per-market committed-collateral accounting.",
         "Keepers should run this every N slots; downstream monitoring",
         "catches `HaircutInvariantsCheckedEvent` and pages if `passed`",
         "drops to false."
@@ -14685,7 +14669,7 @@
     {
       "name": "verify_protocol_solvency",
       "docs": [
-        "Wave 24f — Permissionless: probe the protocol-level solvency",
+        "Permissionless: probe the protocol-level solvency",
         "invariant by reading on-chain balances directly. Asserts",
         "`vault.amount ≥ insurance.balance + flp.total_capital`. Any",
         "deviation indicates accounting drift between the SPL vault and",
@@ -14873,8 +14857,8 @@
         "",
         "SDK callers simulate the tx and read the event from logs without",
         "paying for a state mutation. Single-call portfolio risk for UIs",
-        "that previously had to fetch every position + market separately",
-        "and run `previewPortfolioRisk` client-side.",
+        "that would otherwise fetch every position + market separately and",
+        "recompute portfolio risk client-side.",
         "",
         "Pass `[]` for remaining_accounts if the trader has no open",
         "positions (returns equity == collateral, required == 0,",
@@ -14894,7 +14878,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: view-only ix; relaxed seed accepts any TraderState."
+            "View-only ix; relaxed seed accepts any TraderState."
           ]
         }
       ],
@@ -15163,7 +15147,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "Phase 2d: relaxed seed — see DepositCollateral above."
+            "Relaxed seed — see DepositCollateral above."
           ],
           "writable": true
         },
@@ -17716,19 +17700,6 @@
       ]
     },
     {
-      "name": "ToxicityTaxAppliedEvent",
-      "discriminator": [
-        72,
-        112,
-        205,
-        30,
-        93,
-        52,
-        219,
-        190
-      ]
-    },
-    {
       "name": "TraderBuilderUpdatedEvent",
       "discriminator": [
         21,
@@ -18628,7 +18599,7 @@
     {
       "name": "AuthorityTransferProposedEvent",
       "docs": [
-        "GOVERNANCE Phase-2 (2026-07): 2-step authority transfer lifecycle events."
+        "2-step authority transfer lifecycle events."
       ],
       "type": {
         "kind": "struct",
@@ -18819,7 +18790,7 @@
     {
       "name": "BatchAttestation",
       "docs": [
-        "PHASE 2: the last committee-attested state transition per market. `commit_batch`",
+        "The last committee-attested state transition per market. `commit_batch`",
         "advances it when ≥`threshold` distinct validators sign a batch that chains onto",
         "`last_state_root` with a strictly-greater `last_batch_seq`.",
         "",
@@ -18927,7 +18898,7 @@
     {
       "name": "BatchHeader",
       "docs": [
-        "Phase 2 batch header — the state transition the committee threshold-signs.",
+        "Batch header — the state transition the committee threshold-signs.",
         "NOT an auction batch (no FBA); `fills_merkle_root` commits to the fills the",
         "continuous CLOB already matched, and `prev/new_state_root` chain the book +",
         "position state across committed batches."
@@ -19534,8 +19505,8 @@
           {
             "name": "maker_rebate_bps",
             "docs": [
-              "SIGNED maker rate. Positive = rebate paid TO maker (legacy",
-              "MM-incentive semantics); negative = fee charged FROM maker",
+              "SIGNED maker rate. Positive = rebate paid TO maker",
+              "(MM-incentive semantics); negative = fee charged FROM maker",
               "(low-tier retail). Validated to be monotone non-decreasing",
               "across tiers (a higher-volume trader's maker treatment is",
               "never worse than a lower-volume trader's)."
@@ -19552,10 +19523,8 @@
     {
       "name": "FeeTiersAccount",
       "docs": [
-        "WAVE 22 — Multi-tier fee table. Global per-program, authority-set.",
-        "Replaces the legacy single `TraderStateAccount.fee_discount_bps`",
-        "pattern (where authority manually sets a per-trader discount) with",
-        "the HL / Binance / dYdX standard volume-tier model:",
+        "Multi-tier fee table. Global per-program, authority-set. The standard",
+        "volume-tier model:",
         "",
         "• One global tier table (this account, PDA `[b\"fee_tiers\"]`).",
         "• Each tier specifies a `min_volume_quote_lots` threshold + the",
@@ -19566,7 +19535,7 @@
         "• `resolve_fee_tier(volume, tiers)` picks the highest tier the",
         "trader's cumulative window volume satisfies.",
         "",
-        "Coexists with the legacy `fee_discount_bps`: tier's bps SUPERSEDE",
+        "Coexists with `fee_discount_bps`: tier's bps SUPERSEDE",
         "market default; `fee_discount_bps` then applies as a further",
         "percentage discount (so promo / referral codes can stack on top",
         "of the base tier rate).",
@@ -19745,7 +19714,7 @@
           {
             "name": "taker_sub_index",
             "docs": [
-              "Phase 2e — sub-account index of the taker. Same routing rule",
+              "Sub-account index of the taker. Same routing rule",
               "as `FillEntry.maker_sub_index`, but for the taker side."
             ],
             "type": "u8"
@@ -19893,7 +19862,7 @@
     {
       "name": "FillCommitmentUpgradedV1Event",
       "docs": [
-        "AUDIT F-3 migration (2026-07): emitted when a market's fill-commitment ring is",
+        "Emitted when a market's fill-commitment ring is",
         "upgraded from the v0 layout to v1 (adds reduce-in-flight tracking)."
       ],
       "type": {
@@ -19953,7 +19922,7 @@
           {
             "name": "maker_sub_index",
             "docs": [
-              "Phase 2e — sub-account index of the matched maker. The",
+              "Sub-account index of the matched maker. The",
               "sequencer reads this to derive",
               "`[STATE_SEED, maker.as_ref(), &[maker_sub_index]]` and pass that",
               "account as `maker_trader_state` to ApplyFill. `0` = main."
@@ -20734,10 +20703,9 @@
           {
             "name": "sub_index",
             "docs": [
-              "Phase 2f — sub_index repurposes the first byte of the prior",
-              "`_pad0: [u8; 4]`. Pre-Phase-2f accounts have this byte as 0",
-              "(main TraderState) by virtue of the zero-initialised allocation,",
-              "so the change is layout-compatible."
+              "Sub-account index; occupies the first byte of a former",
+              "`_pad0: [u8; 4]`. Accounts serialized before the field existed",
+              "carry 0 here (main TraderState)."
             ],
             "type": "u8"
           },
@@ -21066,8 +21034,8 @@
           {
             "name": "maker_sub_index",
             "docs": [
-              "Phase 2f — maker's sub-account index. Repurposed from the first",
-              "byte of the prior `_pad0: [u8; 2]`. When the JIT offer fires",
+              "Maker's sub-account index; occupies the first byte of a former",
+              "`_pad0: [u8; 2]`. When the JIT offer fires",
               "against an underwater position, the synthetic close order picks",
               "up this sub_index so the maker rebate / position update lands",
               "on the right maker TraderState."
@@ -21315,13 +21283,12 @@
           {
             "name": "deposited_at_slot",
             "docs": [
-              "H8: slot of the most recent deposit. (Re)set on every deposit via",
+              "Slot of the most recent deposit. (Re)set on every deposit via",
               "`jit_lp_defense::extend_lock_on_deposit`; `withdraw_flp_capital` is gated",
               "on `jit_lp_defense::can_withdraw(deposited_at_slot, now, FLP_MIN_HOLD_SLOTS)`",
-              "to defeat flash / short-window deposit→NAV-windfall→redeem. Carved from",
-              "the account's existing allocation slack (`space()` unchanged); pre-existing",
-              "LP accounts deserialize this as 0 (Borsh zero-slack) ⇒ immediately",
-              "withdrawable, so no migration is required."
+              "to defeat flash / short-window deposit→NAV-windfall→redeem. Trailing",
+              "field within the allocation slack: pre-existing LP accounts",
+              "deserialize it as 0 ⇒ immediately withdrawable."
             ],
             "type": "u64"
           }
@@ -21334,7 +21301,7 @@
         "Multi-threshold margin warning. Emitted when a trader's account-level",
         "margin ratio crosses an alert threshold (75% → caution, 50% → warn,",
         "25% → critical) so off-chain UIs can push notifications BEFORE",
-        "liquidation. Hyperliquid pattern: gives users runway to add collateral",
+        "liquidation. Gives users runway to add collateral",
         "or de-risk instead of being surprised by an MMR breach."
       ],
       "type": {
@@ -21482,10 +21449,9 @@
             "name": "creator",
             "docs": [
               "Curated-creator pubkey. Always zeroed by `initialize_market`",
-              "(markets are authority-gated in V3 — no permissionless creator",
-              "share is paid out). When non-default (set via a future",
-              "authority-controlled migration ix), every fill on this market",
-              "emits a CreatorFeeOwedEvent crediting the creator with",
+              "(markets are authority-gated — no permissionless creator share is",
+              "paid out). When non-default, every fill on this market emits a",
+              "CreatorFeeOwedEvent crediting the creator with",
               "`params.creator_share_bps` of net fee."
             ],
             "type": "pubkey"
@@ -21553,15 +21519,14 @@
           {
             "name": "cum_funding_index",
             "docs": [
-              "DORMANT (truth-in-code, 2026-07): funding is plumbed but UNWIRED.",
-              "`last_funding_rate_bps_per_sec` is initialized to 0 and set to nonzero",
-              "NOWHERE in the program (the rate formula lives only in the read-only",
-              "`view_predicted_funding`; nothing stores its result), so `settle_funding`",
-              "accrues and charges EXACTLY 0. `cum_funding_index` therefore never advances",
-              "from funding, and invariant #8 (funding nets to zero) holds trivially.",
-              "Retained (not deleted): these are account layout, and `settle_funding` is a",
-              "live, reachable instruction — turning funding ON is a feature (compute +",
-              "store the rate, with its own conservation proof + devnet cycle), not a fix."
+              "DORMANT: funding is plumbed but unwired. No instruction ever sets",
+              "`last_funding_rate_bps_per_sec` nonzero (the rate formula lives only in",
+              "the read-only `view_predicted_funding`; nothing stores its result), so",
+              "`settle_funding` accrues and charges exactly 0 and `cum_funding_index`",
+              "never advances. The funding-nets-to-zero invariant holds trivially.",
+              "Both fields are account layout and `settle_funding` is a live,",
+              "reachable instruction; activating funding means computing and storing",
+              "the rate, with its own conservation proof and devnet cycle."
             ],
             "type": "i128"
           },
@@ -21572,12 +21537,10 @@
           {
             "name": "vpin",
             "docs": [
-              "AUDIT M-11 (2026-07): INERT. `VpinState::record_fill` is never called",
-              "anywhere, so `as_bps()` is always 0 → the VPIN-scaled toxicity tax NEVER",
-              "fires and `total_toxicity_tax_collected` never grows. Retained (not",
-              "removed) only because deleting an on-chain field is a state migration",
-              "that would break every existing market; drop it in a future versioned",
-              "realloc. Do NOT rely on this as an active protection."
+              "Layout-reserved: the VPIN accumulator is retired (see",
+              "`matcher/vpin.rs`). No instruction advances it, every market carries",
+              "the zero value, and `total_toxicity_tax_collected` never grows.",
+              "Removing an on-chain field is a state migration, so the bytes remain."
             ],
             "type": {
               "defined": {
@@ -21654,54 +21617,52 @@
             "docs": [
               "Authorized fill-settlement signer for `apply_fill` / `apply_flp_fill`.",
               "",
-              "SECURITY (C-1): this is DELIBERATELY decoupled from `authority`.",
-              "`authority` is zeroed by the authority-burn ladder",
-              "(`renounce_market_authority`), but settlement must keep working",
-              "after decentralization — so the writer that can post fills is",
-              "gated by this dedicated, separately-rotatable key instead.",
+              "Deliberately decoupled from `authority`: the authority can be burned",
+              "(zeroed) for decentralization, but settlement must keep working — so",
+              "the writer that can post fills is gated by this dedicated,",
+              "separately-rotatable key instead.",
               "",
               "Set to `authority` at init; rotate via `set_market_sequencer`",
-              "(authority-gated, so do it BEFORE burning authority). Markets",
-              "created before this field existed read it back as the zero pubkey",
-              "(additive-migration trailing-zero convention) — which is",
-              "UNSIGNABLE, so `apply_fill` safely halts (refuses forgery) until",
-              "the authority calls `set_market_sequencer`. Fail-closed by design."
+              "(authority-gated, so rotate BEFORE burning authority). Trailing",
+              "field: accounts serialized before it existed deserialize it as the",
+              "zero pubkey — which is unsignable, so `apply_fill` fails closed",
+              "(refuses every fill) until the authority sets a sequencer."
             ],
             "type": "pubkey"
           },
           {
             "name": "last_settlement_seq",
             "docs": [
-              "H1: monotonic settlement nonce. Every `apply_fill` / `apply_flp_fill`",
+              "Monotonic settlement nonce. Every `apply_fill` / `apply_flp_fill`",
               "must carry a `fill_seq` STRICTLY GREATER than this, after which it is",
               "stored here — so a replayed or out-of-order settlement (a crashed /",
               "restarting sequencer re-emitting an already-applied batch, or a",
-              "compromised key resubmitting one) is rejected on-chain. Carved from the",
-              "existing `space()` headroom (no size change); pre-existing markets read",
-              "back 0 (Borsh zero-slack), so the first real fill (`fill_seq` ≥ 1) passes."
+              "compromised key resubmitting one) is rejected on-chain. Trailing",
+              "field within `space()` headroom: pre-existing accounts deserialize it",
+              "as 0, so the first real fill (`fill_seq` ≥ 1) passes."
             ],
             "type": "u64"
           },
           {
             "name": "fill_commitment_required",
             "docs": [
-              "C-1 (audit 2026-06): sticky flag — once `init_fill_commitment` arms this",
-              "market, the fill-commitment ring becomes MANDATORY in `apply_fill`, so a",
-              "(compromised) sequencer can no longer bypass the anti-fabrication guard by",
-              "omitting the optional ring account. Additive migration: pre-existing",
-              "markets read back `false` (legacy optional behaviour)."
+              "Sticky flag: once `init_fill_commitment` arms this market, the",
+              "fill-commitment ring is MANDATORY in `apply_fill` — a (compromised)",
+              "sequencer cannot bypass the anti-fabrication guard by omitting the",
+              "optional ring account. Never cleared. Trailing field: accounts",
+              "serialized before it existed deserialize it as `false`."
             ],
             "type": "bool"
           },
           {
             "name": "haircut_enabled",
             "docs": [
-              "H-2 (audit 2026-06): sticky flag — once `initialize_haircut_state` enables",
-              "the haircut junior-claim engine for this market, the (optional) haircut",
-              "accounts become MANDATORY in `apply_fill`/`apply_flp_fill`. Without this a",
+              "Sticky flag: once `initialize_haircut_state` enables the haircut",
+              "junior-claim engine for this market, the (optional) haircut accounts",
+              "are MANDATORY in `apply_fill`/`apply_flp_fill`. Without this a",
               "settlement could omit them and route positive realized PnL straight to",
-              "collateral with NO Residual/solvency gating (then withdraw it). Additive",
-              "migration: pre-existing markets read back `false`."
+              "collateral with no Residual/solvency gating (then withdraw it).",
+              "Trailing field: pre-existing accounts deserialize it as `false`."
             ],
             "type": "bool"
           },
@@ -21714,10 +21675,10 @@
               "tracks mark FRESHNESS across both update paths so a stalled ER is",
               "detectable. When `current_slot - last_mark_update_slot` exceeds",
               "`constants::MARK_STALENESS_MAX_SLOTS`, liquidation falls back to",
-              "oracle-only pricing and the market auto-pauses. Additive-migration field:",
-              "pre-existing markets read back 0 (trailing-zero convention) — treated as",
-              "\"freshness unknown ⇒ liquidate oracle-only\" (fail-safe) until the first",
-              "post-upgrade fill/settle stamps it."
+              "oracle-only pricing and the market auto-pauses. Trailing field:",
+              "accounts serialized before it existed deserialize it as 0 — treated as",
+              "\"freshness unknown ⇒ liquidate oracle-only\" (fail-safe) until the",
+              "first fill/settle stamps it."
             ],
             "type": "u64"
           },
@@ -21730,58 +21691,58 @@
               "timeout starts ticking from delegation even if the sequencer NEVER posts a",
               "fill (which would otherwise keep `last_mark_update_slot == 0` and trap",
               "pre-existing positions forever). The gate uses",
-              "`max(last_mark_update_slot, book_delegated_at_slot)`. Additive-migration",
-              "field: pre-existing markets read back 0."
+              "`max(last_mark_update_slot, book_delegated_at_slot)`. Trailing field:",
+              "pre-existing accounts deserialize it as 0."
             ],
             "type": "u64"
           },
           {
             "name": "last_heartbeat_slot",
             "docs": [
-              "F2/F3 (audit 2026-06): ER liveness HEARTBEAT slot, stamped by the",
-              "sequencer-authenticated `er_heartbeat` ix INDEPENDENT of trade flow. The",
-              "prior staleness signals (`last_mark_update_slot`) only advance on a fill",
-              "or `settle_mark`, so a healthy-but-QUIET market looked \"stalled\" within",
-              "~60s and got auto-paused (F2) / force-undelegated (F3). The heartbeat lets",
-              "the chain distinguish \"ER alive, no trades\" (heartbeat fresh) from \"ER",
-              "dead\" (heartbeat stale). Auto-pause and the FAST force-undelegate path use",
-              "`max(last_mark_update_slot, last_heartbeat_slot)`; the censorship backstop",
-              "deliberately ignores it (an alive-but-censoring sequencer heartbeats).",
-              "Must be sequencer-authenticated — a permissionless heartbeat would let",
-              "anyone keep a dead market \"alive\" and block the escape. Additive-migration",
-              "field: pre-existing markets read back 0."
+              "ER liveness HEARTBEAT slot, stamped by the sequencer-authenticated",
+              "`er_heartbeat` ix independent of trade flow. Fill/settle-driven",
+              "signals (`last_mark_update_slot`) advance only on a fill or",
+              "`settle_mark`, so without a heartbeat a healthy-but-QUIET market is",
+              "indistinguishable from a stalled one and would auto-pause / force-",
+              "undelegate. The heartbeat lets the chain distinguish \"ER alive, no",
+              "trades\" (heartbeat fresh) from \"ER dead\" (heartbeat stale).",
+              "Auto-pause and the FAST force-undelegate path use",
+              "`max(last_mark_update_slot, last_heartbeat_slot)`; the censorship",
+              "backstop deliberately ignores it (an alive-but-censoring sequencer",
+              "heartbeats). Must be sequencer-authenticated — a permissionless",
+              "heartbeat would let anyone keep a dead market \"alive\" and block the",
+              "escape. Trailing field: pre-existing accounts deserialize it as 0."
             ],
             "type": "u64"
           },
           {
             "name": "max_batch_orders",
             "docs": [
-              "Per-market matcher batch cap — the max resting levels a taker may cross in",
-              "one `place_taker_order_v2` tx. Tail-appended additive-migration field",
-              "(`size_of::<MarketAccount>()` measured at 896 B with 256 B free under",
-              "`space() = 1152`; pre-existing markets read this back as `0`). `0` is",
-              "interpreted as the global `MAX_BATCH_ORDERS_PER_SIDE_V2` (96) — the",
-              "log-safe default — so legacy markets are byte-for-byte unchanged. Raised",
-              "(≤ `FILL_RING_CAP` = 256) ONLY by `init_fill_outbox`, which simultaneously",
-              "arms the on-chain fill-outbox so the crossed fills are delivered OFF the",
-              "program log: a cap above the ~96 log-safe point without an outbox would",
-              "truncate fills in the 10 KB log and wedge settlement (the H-2 class). See",
-              "`FILL_OUTBOX_DESIGN.md`."
+              "Per-market matcher batch cap — the max resting levels a taker may",
+              "cross in one `place_taker_order_v2` tx. Trailing field",
+              "(`size_of::<MarketAccount>()` is 896 B with 256 B free under",
+              "`space() = 1152`; pre-existing accounts deserialize it as `0`). `0`",
+              "means the global `MAX_BATCH_ORDERS_PER_SIDE_V2` (96) — the log-safe",
+              "default. Raised (≤ `FILL_RING_CAP` = 256) ONLY by `init_fill_outbox`,",
+              "which simultaneously arms the on-chain fill-outbox so the crossed",
+              "fills are delivered OFF the program log: a cap above the ~96 log-safe",
+              "point without an outbox would truncate fills in the 10 KB log and",
+              "wedge settlement."
             ],
             "type": "u16"
           },
           {
             "name": "unsettled_fill_volume",
             "docs": [
-              "AUDIT M-6 (2026-07): total base-lot volume of fills that have been MATCHED",
-              "(pushed to the fill-commitment ring) but NOT yet settled by apply_fill /",
-              "apply_flp_fill. Because settled OI (`oi_long/short_lots`) only advances at",
-              "settlement, the per-market OI cap was checkable against stale OI and could be",
-              "overshot by pipelining takers ahead of settlement. The intake cap now checks",
-              "`oi[side] + unsettled_fill_volume + new_size`. Incremented per fill at match",
-              "(produce), decremented per fill at settle — tied 1:1 to the ring's FIFO",
-              "produce/settle lifecycle, so it self-balances (no cancellation accounting;",
-              "cancels produce no fills). Trailing field ⇒ existing accounts read it as 0."
+              "Total base-lot volume of fills that have been MATCHED (pushed to the",
+              "fill-commitment ring) but NOT yet settled by apply_fill /",
+              "apply_flp_fill. Settled OI (`oi_long/short_lots`) only advances at",
+              "settlement, so without this reserve the per-market OI cap could be",
+              "overshot by pipelining takers ahead of settlement; the intake cap",
+              "checks `oi[side] + unsettled_fill_volume + new_size`. Incremented per",
+              "fill at match (produce), decremented per fill at settle — tied 1:1 to",
+              "the ring's FIFO produce/settle lifecycle, so it self-balances (cancels",
+              "produce no fills). Trailing field ⇒ existing accounts read it as 0."
             ],
             "type": "u64"
           }
@@ -21791,11 +21752,11 @@
     {
       "name": "MarketAuthorityBurnedEvent",
       "docs": [
-        "Wave 24f — emitted on every `verify_protocol_solvency` invocation.",
+        "Emitted on every `verify_protocol_solvency` invocation.",
         "Carries the full balance snapshot so monitors can detect drift even",
         "in the absence of `passed: false` (e.g., surplus declining over time",
         "might signal a slow leak).",
-        "Wave 30 — emitted when an authority permanently burns their",
+        "Emitted when an authority permanently burns their",
         "control over a market. One-way state change; the market is now",
         "fully decentralised."
       ],
@@ -22072,7 +22033,7 @@
           {
             "name": "last_observed_slot",
             "docs": [
-              "Wave 26b — runtime gate state. Tracks the (slot, price) at which",
+              "Runtime gate state. Tracks the (slot, price) at which",
               "the engine last observed an oracle update on this market. Used",
               "to compute `dt_slots` and `|Δp|` for `gate_price_move`. Updated",
               "after every successful oracle update on opted-in markets.",
@@ -22105,14 +22066,15 @@
           {
             "name": "source_locked",
             "docs": [
-              "GOVERNANCE Phase-3 (2026-07): one-way oracle-source lock. `1` = the direct",
-              "authority `update_oracle` / `update_oracle_quorum` paths are DISABLED for this",
-              "market (only the Pyth / Lazer paths are accepted) — removing the compromised-",
-              "authority \"walk the mark within the H-6 per-slot cap\" vector entirely. Carved",
-              "from `_reserved` so the account size is unchanged and pre-existing envelopes",
-              "read it back as `0` (unlocked). Set (never cleared — one-way) by",
-              "`lock_oracle_source`; enforced in the two direct-write handlers, which already",
-              "REQUIRE this account (H-6), so the lock cannot be bypassed by omitting it."
+              "One-way oracle-source lock. `1` = the direct authority",
+              "`update_oracle` / `update_oracle_quorum` paths are DISABLED for this",
+              "market (only the Pyth / Lazer paths are accepted) — removing the",
+              "compromised-authority \"walk the mark within the per-slot cap\" vector",
+              "entirely. Occupies a former `_reserved` byte, so the account size is",
+              "unchanged and envelopes serialized before it read `0` (unlocked).",
+              "Set (never cleared — one-way) by `lock_oracle_source`; enforced in",
+              "the two direct-write handlers, which REQUIRE this account, so the",
+              "lock cannot be bypassed by omitting it."
             ],
             "type": "u8"
           },
@@ -22131,9 +22093,9 @@
     {
       "name": "MarketGuardianAccount",
       "docs": [
-        "GOVERNANCE Phase-1 (2026-07): optional emergency guardian for one market, held",
-        "in a SEPARATE PDA (not a MarketAccount field — adding 32 B there pushed several",
-        "`try_accounts` frames past the 4 KB BPF stack limit). A guardian may only",
+        "Optional emergency guardian for one market, held in a SEPARATE PDA (not a",
+        "MarketAccount field — adding 32 B there pushes several `try_accounts`",
+        "frames past the 4 KB BPF stack limit). A guardian may only",
         "RESTRICT market status (→ PostOnly/Paused/Closed, monotonic — the fast, fail-safe",
         "direction), NEVER loosen (→ Active/Inactive stays authority-only), so a",
         "compromised guardian can pause/close but never re-open. Absence of this account",
@@ -22161,7 +22123,7 @@
     {
       "name": "MarketGuardianChangedEvent",
       "docs": [
-        "GOVERNANCE Phase-1 (2026-07): emitted when the market's emergency guardian is",
+        "Emitted when the market's emergency guardian is",
         "set or cleared via `set_guardian`."
       ],
       "type": {
@@ -22234,8 +22196,7 @@
           {
             "name": "realized_loss_total_quote_lots",
             "docs": [
-              "Cumulative realized losses (informational; used for fee",
-              "distribution to FLP in Wave 28)."
+              "Cumulative realized losses (informational)."
             ],
             "type": "u128"
           },
@@ -22345,8 +22306,8 @@
           {
             "name": "source",
             "docs": [
-              "0 = legacy trusted `update_oracle` (devnet only). 1 = Pyth pull.",
-              "Future: 2 = Switchboard, 3 = TWAP, etc."
+              "0 = trusted `update_oracle` (devnet only). 1 = Pyth pull.",
+              "2 = Lazer signed payloads."
             ],
             "type": "u8"
           },
@@ -22363,9 +22324,9 @@
             "name": "lazer_feed_id",
             "docs": [
               "Lazer feed id, bound at config init when `source == SOURCE_LAZER`.",
-              "AUDIT CR-2 fix: carved from the former `_pad0: [u8; 6]` (now `[u8; 2]`).",
-              "Borsh field order + total size are preserved, so pre-existing configs",
-              "(which had 6 zero pad bytes here) deserialize this as 0."
+              "Occupies 4 bytes of a former `_pad0: [u8; 6]` (now `[u8; 2]`);",
+              "Borsh field order + total size are preserved, so configs serialized",
+              "with 6 zero pad bytes here deserialize this as 0."
             ],
             "type": "u32"
           },
@@ -22416,15 +22377,15 @@
           {
             "name": "last_lazer_timestamp_us",
             "docs": [
-              "AUDIT (2026-07): Lazer replay-nonce. The strictly-increasing",
-              "publisher-attested microsecond timestamp of the last accepted Lazer",
-              "price. `update_oracle_from_lazer` rejects any payload whose `timestamp_us`",
+              "Lazer replay-nonce: the strictly-increasing publisher-attested",
+              "microsecond timestamp of the last accepted Lazer price.",
+              "`update_oracle_from_lazer` rejects any payload whose `timestamp_us`",
               "is not greater, so a public signed payload cannot be re-posted (or an",
-              "older one applied) within the staleness window. APPENDED after `_pad1` —",
-              "the account was always allocated 128 B (space) while the struct serialized",
-              "to 96 B, so pre-existing configs deserialize this trailing field as 0",
-              "(first Lazer update then seeds it). Borsh field order + offsets of every",
-              "prior field are unchanged (same technique as the CR-2 `lazer_feed_id` carve)."
+              "older one applied) within the staleness window. Trailing field — the",
+              "account is allocated 128 B while the struct serializes to 96 B, so",
+              "configs serialized without it deserialize this as 0 (the first Lazer",
+              "update seeds it). Borsh field order + offsets of every prior field",
+              "are unchanged."
             ],
             "type": "u64"
           }
@@ -22468,7 +22429,7 @@
       "name": "MarketParams",
       "docs": [
         "Per-market parameters. Set at market initialization, updated only via",
-        "governance. Mirrors `MarketParams` from the TypeScript reference."
+        "governance."
       ],
       "type": {
         "kind": "struct",
@@ -22497,7 +22458,7 @@
             "name": "maker_rebate_bps",
             "docs": [
               "Maker fee/rebate rate. SIGNED — positive = rebate paid to maker",
-              "(legacy semantics, MM incentive); negative = fee charged to maker",
+              "(MM incentive); negative = fee charged to maker",
               "(low-tier retail). Crossing the sign boundary is supported on",
               "the multi-tier fee table (FeeTier rows can mix signs across",
               "volume tiers — e.g. tier 0 = -10 (10 bps maker fee), tier 5 =",
@@ -22663,7 +22624,7 @@
               "the same position. Anti-cascade: prevents one underwater position",
               "from getting hit repeatedly in adjacent blocks (each costs the",
               "liquidatee a separate liquidation order + fee). Typical setting:",
-              "4-8 slots (~2-4 seconds). 0 = no cooldown (legacy behavior)."
+              "4-8 slots (~2-4 seconds). 0 = no cooldown."
             ],
             "type": "u32"
           },
@@ -22673,7 +22634,7 @@
               "Slots over which the liquidator reward grows from base to full.",
               "Dutch-style auction on the REWARD: first responders get a smaller",
               "reward, later responders progressively larger up to the full",
-              "`liquidator_reward_bps`. 0 = reward is always full (legacy).",
+              "`liquidator_reward_bps`. 0 = reward is always full.",
               "Typical setting: 8-16 slots (~4-8 seconds). Encourages a",
               "competitive keeper pool to spread out instead of all racing the",
               "same block."
@@ -22755,7 +22716,7 @@
             "name": "mark_change_max_bps",
             "docs": [
               "Maximum allowed mark-price change per batch in bps. 0 = unlimited",
-              "(legacy / pre-launch markets often run open). When set, the",
+              "(pre-launch markets often run open). When set, the",
               "matcher clamps the post-batch mark to ±this fraction of the",
               "previous mark. Hyperliquid-style anti-flash-crash defense:",
               "prevents a single thin-liquidity batch (or oracle spike that",
@@ -22787,7 +22748,7 @@
             "name": "funding_premium_twap_window",
             "docs": [
               "TWAP window length (in batches) for the funding-premium dampener.",
-              "0 = disabled (legacy single-tick premium). When > 0, the funding",
+              "0 = disabled (single-tick premium). When > 0, the funding",
               "rate uses the average of the last N batches' (mark - oracle)",
               "premium instead of the instantaneous one — kills funding spikes",
               "from microbursts of toxic flow that move the mark for one batch.",
@@ -22807,7 +22768,7 @@
               "total stays at or under the cap. Smarter than HL where extended",
               "one-way funding can drain a position without a daily ceiling.",
               "Bookkeeping fields live on MarketAccount (period_*).",
-              "0 = disabled (legacy / HL-equivalent)."
+              "0 = disabled."
             ],
             "type": "u32"
           },
@@ -22827,7 +22788,7 @@
               "and whole-market position/OI caps are tightened by a factor of",
               "4 to defend against snipers in the price-discovery window. After",
               "`current_batch >= bootstrap_period_batches`, normal caps apply.",
-              "0 = disabled (legacy markets and protocol-curated deploys)."
+              "0 = disabled (protocol-curated deploys)."
             ],
             "type": "u32"
           },
@@ -22910,13 +22871,13 @@
     {
       "name": "MarketPendingAuthorityAccount",
       "docs": [
-        "GOVERNANCE Phase-2 (2026-07): pending authority for a 2-step (propose→accept)",
-        "market-authority transfer. Held in its own PDA (not a MarketAccount field — the",
-        "stack constraint, see Phase 1). `propose_authority_transfer` (current authority)",
+        "Pending authority for a 2-step (propose→accept) market-authority",
+        "transfer. Held in its own PDA (not a MarketAccount field — the same",
+        "stack constraint as the guardian). `propose_authority_transfer` (current authority)",
         "stores `pending_authority`; `accept_authority_transfer`, signed BY that pending",
         "key, commits `market.authority` and closes this account. Because the new key must",
         "itself sign to accept, a transfer can never strand control at a wrong/dead key",
-        "(the failure mode of the 1-step `transfer_market_authority`)."
+        "(the failure mode the 1-step `transfer_market_authority` permits)."
       ],
       "type": {
         "kind": "struct",
@@ -23109,7 +23070,7 @@
     {
       "name": "OracleSourceLockedEvent",
       "docs": [
-        "GOVERNANCE Phase-3 (2026-07): emitted when a market's oracle source is locked to",
+        "Emitted when a market's oracle source is locked to",
         "Pyth/Lazer-only (one-way)."
       ],
       "type": {
@@ -23323,7 +23284,7 @@
     {
       "name": "OrderSeqCounterReseatEvent",
       "docs": [
-        "AUDIT M-8 (2026-07) — emitted when the authority reseats a market's",
+        "Emitted when the authority reseats a market's",
         "order-sequence counter (only permitted on a fully empty book)."
       ],
       "type": {
@@ -23367,7 +23328,7 @@
     {
       "name": "ParamUpdateProposedEvent",
       "docs": [
-        "GOVERNANCE Phase-2b (2026-07): timelocked params-update lifecycle events.",
+        "Timelocked params-update lifecycle events.",
         "`eta_unix` on the proposal is the earliest execute time — off-chain monitors",
         "surface it so LPs/traders can react before the change lands."
       ],
@@ -23430,8 +23391,8 @@
     {
       "name": "PendingParamUpdateAccount",
       "docs": [
-        "GOVERNANCE Phase-2b (2026-07): a timelocked market-params update. Own PDA (not a",
-        "MarketAccount field — the stack constraint). `propose_param_update` validates the",
+        "A timelocked market-params update. Own PDA (not a MarketAccount field —",
+        "the same stack constraint). `propose_param_update` validates the",
         "new params, stores `keccak(params)` + an `eta_unix` (= now + timelock), and does",
         "NOT apply. `execute_param_update` applies the params only once `now >= eta` AND",
         "the supplied params hash to the stored `params_hash` — so the executed change is",
@@ -23524,14 +23485,12 @@
       "docs": [
         "Per-(market, trader) open position.",
         "",
-        "─── ISOLATED MARGIN DESIGN (Phase 2) ────────────────────────────────",
-        "`collateral_quote_lots` is currently a defined-but-unused field. It",
-        "is reserved as the on-chain marker for isolated-margin positions:",
+        "─── ISOLATED-MARGIN MARKER ──────────────────────────────────────────",
+        "`collateral_quote_lots` encodes the position's margin mode:",
         "",
-        "collateral_quote_lots == 0  → cross margin (default, current",
-        "behavior). Position is backed by the",
-        "trader's pooled `TraderStateAccount",
-        ".collateral_quote_lots`.",
+        "collateral_quote_lots == 0  → cross margin (default). The position",
+        "is backed by the trader's pooled",
+        "`TraderStateAccount.collateral_quote_lots`.",
         "",
         "collateral_quote_lots  > 0  → isolated margin. The position is",
         "backed ONLY by this amount; the",
@@ -23539,27 +23498,21 @@
         "insulated from this position's",
         "liquidation.",
         "",
-        "Phase 2 (separate, audited commit) wires the marker through:",
+        "The marker is enforced end-to-end:",
         "",
-        "1. `assess_margin_fn` (matcher/risk.rs) — splits the trader's",
+        "1. `assess_margin_split` (matcher/risk.rs) splits the trader's",
         "position set into cross and isolated, evaluates each isolated",
         "position against its own collateral, and only includes cross",
         "positions in the pooled-collateral assessment.",
-        "2. `liquidate_position_v2` — when liquidating an isolated",
-        "position, the penalty + liquidator reward come out of",
-        "`position.collateral_quote_lots` first, then the insurance",
-        "fund covers any shortfall (the trader's main pool is never",
-        "touched — that's the whole point of isolated).",
-        "3. New ixs `set_position_isolated(amount)` and",
-        "`set_position_cross()` that transfer collateral between",
-        "`TraderState.collateral_quote_lots` and",
+        "2. `liquidate_position_v2` draws the penalty + liquidator reward",
+        "from `position.collateral_quote_lots` first for an isolated",
+        "position, with the insurance fund covering any shortfall — the",
+        "trader's main pool is never touched.",
+        "3. `set_position_isolated(amount)` / `set_position_cross()` move",
+        "collateral between `TraderState.collateral_quote_lots` and",
         "`PositionAccount.collateral_quote_lots`, gated by a",
         "post-transfer health check on BOTH the cross set and the",
-        "isolated position.",
-        "",
-        "Until Phase 2 lands, no on-chain logic writes to or reads from",
-        "this field. Off-chain code may rely on this field staying 0 for",
-        "every existing position."
+        "isolated position."
       ],
       "serialization": "bytemuck",
       "repr": {
@@ -24086,13 +24039,12 @@
     {
       "name": "SequencerCommittee",
       "docs": [
-        "The M-of-N validator committee that will authorize settlement once the",
-        "decentralized-sequencer endgame lands (see `docs/DECENTRALIZED_SEQUENCER.md`).",
-        "PHASE 1 is scaffolding: this account + its governance ix",
+        "The M-of-N validator committee for decentralized settlement",
+        "attestation. This account + its governance ix",
         "(`set_sequencer_committee`) + the Kani-proven quorum logic",
-        "(`matcher::committee`) exist and are validated, but settlement authorization",
-        "is NOT yet generalized to it — so landing this changes no runtime behavior.",
-        "Seeds: `[b\"seq_committee\", market]`."
+        "(`matcher::committee`) validate committee-attested batches via",
+        "`commit_batch`; per-fill settlement authorization remains gated by",
+        "`market.sequencer`. Seeds: `[b\"seq_committee\", market]`."
       ],
       "type": {
         "kind": "struct",
@@ -24152,10 +24104,10 @@
           {
             "name": "jailed_mask",
             "docs": [
-              "PHASE 2.6 — equivocation jail bitmask: bit `i` set ⇒ `validators[i]` was",
+              "Equivocation jail bitmask: bit `i` set ⇒ `validators[i]` was",
               "PROVABLY caught double-signing conflicting batches (`slash_equivocation`)",
-              "and no longer counts toward a quorum. Carved from the former `_reserved`",
-              "(backward-compatible: pre-existing committees read it as 0 = none jailed)."
+              "and no longer counts toward a quorum. Occupies former `_reserved`",
+              "bytes: committees serialized before it read 0 = none jailed."
             ],
             "type": "u64"
           },
@@ -24228,7 +24180,7 @@
           {
             "name": "scope_market",
             "docs": [
-              "AUDIT M-9 (2026-07): market scope. `Pubkey::default()` (all-zero) = the",
+              "Market scope. `Pubkey::default()` (all-zero) = the",
               "session may act on ANY market (legacy/opt-out behaviour). A specific market",
               "key = the session is restricted to that ONE market, so a leaked session key",
               "cannot dump the owner's collateral across every market. Enforced in `verify`."
@@ -24269,7 +24221,7 @@
     {
       "name": "SideAccrualAdvancedEvent",
       "docs": [
-        "Wave 25b: `settle_funding` advanced the per-side K/F accrual indices."
+        "`settle_funding` advanced the per-side K/F accrual indices."
       ],
       "type": {
         "kind": "struct",
@@ -24316,7 +24268,7 @@
     {
       "name": "SideAdlAppliedEvent",
       "docs": [
-        "Wave 25b: `auto_deleverage` reduced the counter side's ADL multiplier `A`",
+        "`auto_deleverage` reduced the counter side's ADL multiplier `A`",
         "and (possibly) advanced its side-mode state machine."
       ],
       "type": {
@@ -24416,9 +24368,8 @@
       "docs": [
         "CLOB summary — emitted at the END of `place_taker_order_v2`. One",
         "per CLOB-style placement, regardless of how many fills landed.",
-        "Mirrors Phoenix's \"OrderPlaced + Fills\" composite event but as a",
-        "single summary so off-chain consumers can detect \"this is a CLOB",
-        "path order\" vs a pure resting limit."
+        "A single summary event (rather than per-fill events) so off-chain",
+        "consumers can detect a CLOB-path order vs a pure resting limit."
       ],
       "type": {
         "kind": "struct",
@@ -24475,46 +24426,6 @@
               "Hypertree node index of the residual resting order (NIL if none)."
             ],
             "type": "u32"
-          }
-        ]
-      }
-    },
-    {
-      "name": "ToxicityTaxAppliedEvent",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "taker",
-            "type": "pubkey"
-          },
-          {
-            "name": "maker",
-            "docs": [
-              "The maker who absorbed the toxic flow (or the FLP pool PDA on",
-              "apply_flp_fill)."
-            ],
-            "type": "pubkey"
-          },
-          {
-            "name": "vpin_bps",
-            "type": "u32"
-          },
-          {
-            "name": "tax_quote_lots",
-            "type": "u64"
-          },
-          {
-            "name": "insurance_share",
-            "type": "u64"
-          },
-          {
-            "name": "maker_share",
-            "type": "u64"
           }
         ]
       }
@@ -24583,8 +24494,7 @@
           {
             "name": "maker_rebate_bps",
             "docs": [
-              "SIGNED — positive = maker rebate, negative = maker fee",
-              "(wave 22 negative-fee semantics)."
+              "SIGNED — positive = maker rebate, negative = maker fee."
             ],
             "type": "i32"
           },
@@ -24695,7 +24605,7 @@
           {
             "name": "volume_30d_quote_lots",
             "docs": [
-              "Wave 22: rolling notional in the current volume window (quote lots,",
+              "Rolling notional in the current volume window (quote lots,",
               "maker + taker). Reset on window expiry; drives `resolve_fee_tier`."
             ],
             "type": "u64"
@@ -24703,7 +24613,7 @@
           {
             "name": "volume_window_start_slot",
             "docs": [
-              "Wave 22: slot the current volume window opened."
+              "Slot the current volume window opened."
             ],
             "type": "u64"
           },
@@ -24751,7 +24661,7 @@
           {
             "name": "sub_index",
             "docs": [
-              "Phase 2f — sub-account index. `0` = main; `1..=255` = sub. Set at",
+              "Sub-account index. `0` = main; `1..=255` = sub. Set at",
               "`open_trader_state` (0) / `open_trader_sub_account` (sub_index)."
             ],
             "type": "u8"
@@ -24759,14 +24669,13 @@
           {
             "name": "er_active",
             "docs": [
-              "#8 — cross-domain (ER) margin enforcement flag. `0` = not ER-active:",
-              "the strict L1 withdraw paths apply unchanged (the default for every",
-              "pre-existing account, since this byte was previously zero padding).",
-              "`1` = the trader has ER-reserved margin attested, so collateral",
-              "withdrawals MUST route through the cross-domain variants (which honor",
-              "`ErMarginAttestation`); the strict paths fail closed with",
-              "`UseXDomainWithdraw`. Carved from the former `_pad` tail, so the Pod",
-              "layout and 192-byte size are UNCHANGED — no account migration."
+              "Cross-domain (ER) margin enforcement flag. `0` = not ER-active: the",
+              "strict L1 withdraw paths apply (and any account whose byte here is",
+              "still zero padding reads as not ER-active). `1` = the trader has",
+              "ER-reserved margin attested, so collateral withdrawals MUST route",
+              "through the cross-domain variants (which honor `ErMarginAttestation`);",
+              "the strict paths fail closed with `UseXDomainWithdraw`. Occupies a",
+              "byte of the `_pad` tail, so the Pod layout stays 192 bytes."
             ],
             "type": "u8"
           },
@@ -24785,7 +24694,7 @@
     {
       "name": "TraderTierUpgradedEvent",
       "docs": [
-        "WAVE 22 — emitted by `apply_fill` whenever a trader crosses a tier",
+        "Emitted by `apply_fill` whenever a trader crosses a tier",
         "boundary (maker OR taker). Off-chain UIs surface \"🎉 You upgraded",
         "to VIP3!\" pushes. Silent when no tier change."
       ],
@@ -24816,7 +24725,7 @@
       "docs": [
         "Per-fill trading-rewards eligibility event. Off-chain accrual",
         "computes per-trader points (notional × multipliers × time-windows).",
-        "Hyperliquid HYPE-distribution model — minimal on-chain footprint",
+        "Points-program pattern — minimal on-chain footprint",
         "(one event per fill, no extra writes) so emissions can be indexed",
         "at zero on-chain cost."
       ],
@@ -24850,8 +24759,8 @@
       "name": "TriggerOrderAccountV3",
       "docs": [
         "V3 trigger order. Seeds: `[b\"trigger_v3\", market, trader, trigger_id]`.",
-        "Distinct from legacy `[b\"trigger\", ...]` so legacy + v3 triggers can",
-        "coexist during a migration window."
+        "Distinct from the v1 `[b\"trigger\", ...]` prefix so both PDA families",
+        "can coexist without collision."
       ],
       "type": {
         "kind": "struct",
@@ -24907,9 +24816,9 @@
           {
             "name": "sub_index",
             "docs": [
-              "Phase 2f — TraderState sub-account index this trigger fires",
-              "against. Pre-Phase-2f accounts read back as 0 (main) from the",
-              "trailing zeros of their allocated `space()`. ExecuteTriggerOrderV3",
+              "TraderState sub-account index this trigger fires against.",
+              "Accounts serialized before this field existed read it as 0 (main)",
+              "from the trailing zeros of their allocation. ExecuteTriggerOrderV3",
               "copies this into the synthetic RestingOrderV2.sub_index so the",
               "resulting fill is routed to the right TraderState."
             ],
@@ -24918,12 +24827,11 @@
           {
             "name": "acceptable_price_ticks",
             "docs": [
-              "Wave 27a — slippage cap on trigger execution (GMX V2 acceptablePrice",
-              "pattern). When > 0, the trigger refuses to fire if the oracle has",
-              "moved past `acceptable_price_ticks` in the direction unfavorable",
-              "to the resulting order. Pre-Wave-27a triggers read this back as 0",
-              "(from the trailing zeros of `space()`), meaning \"no cap, legacy",
-              "behavior\" — full backward compatibility.",
+              "Slippage cap on trigger execution (acceptable-price pattern).",
+              "When > 0, the trigger refuses to fire if the oracle has moved past",
+              "`acceptable_price_ticks` in the direction unfavorable to the",
+              "resulting order. Trailing field: accounts serialized before it",
+              "existed read 0, meaning \"no cap\".",
               "",
               "Direction rules:",
               "- side == 0 (long, buying): refuse if `oracle > acceptable_price`.",
@@ -24943,14 +24851,13 @@
           {
             "name": "sibling_trigger_id",
             "docs": [
-              "AUDIT HIGH-7 (2026-07) — OCO link. For a bracket leg, this holds the",
-              "sibling leg's `trigger_id`; when this leg FIRES, the executor must pass",
-              "the sibling `TriggerOrderAccountV3` and it is deactivated, so both legs",
-              "of a bracket can never both fire (which previously let a whipsaw",
-              "double-fill flip the position). Set iff `flags & FLAG_HAS_SIBLING`.",
-              "Pre-existing accounts read this as 0 (no sibling) from the trailing",
-              "zeros of `space()`, and `FLAG_HAS_SIBLING` is unset — full backward",
-              "compatibility (non-bracket triggers are unaffected)."
+              "OCO link. For a bracket leg, this holds the sibling leg's",
+              "`trigger_id`; when this leg FIRES, the executor must pass the",
+              "sibling `TriggerOrderAccountV3` and it is deactivated, so both legs",
+              "of a bracket can never both fire (a whipsaw double-fill would flip",
+              "the position). Set iff `flags & FLAG_HAS_SIBLING`. Trailing field:",
+              "pre-existing accounts read 0 (no sibling) with `FLAG_HAS_SIBLING`",
+              "unset — non-bracket triggers are unaffected."
             ],
             "type": "u8"
           },
@@ -25069,7 +24976,7 @@
     {
       "name": "TriggerOrderV3SlippageCancelledEvent",
       "docs": [
-        "Wave 27a — emitted when a trigger fires but the oracle has gapped",
+        "Emitted when a trigger fires but the oracle has gapped",
         "past the trader's acceptable_price slippage cap. The trigger",
         "deactivates rather than filling at a much worse price than intended."
       ],
@@ -25166,7 +25073,7 @@
           {
             "name": "sub_index",
             "docs": [
-              "Phase 2f — same semantics as TriggerOrderAccountV3.sub_index.",
+              "Same semantics as TriggerOrderAccountV3.sub_index.",
               "Every child slice the TWAP emits carries this sub_index in its",
               "RestingOrderV2."
             ],
@@ -25175,20 +25082,19 @@
           {
             "name": "acceptable_price_ticks",
             "docs": [
-              "Wave 27b — same shape as `TriggerOrderAccountV3.acceptable_price_ticks`.",
+              "Same shape as `TriggerOrderAccountV3.acceptable_price_ticks`.",
               "Each TWAP slice is checked against this cap before injection.",
               "A slice that would fire while oracle is beyond the cap is",
               "**skipped** (not the TWAP deactivated) — the TWAP itself stays",
               "active so subsequent slices can fire if price returns within",
-              "bounds. `0 = no cap` (legacy behavior)."
+              "bounds. `0` = no cap."
             ],
             "type": "u64"
           },
           {
             "name": "_reserved",
             "docs": [
-              "Reserved. Pre-Wave-27b TWAPs read this as zero from the",
-              "trailing space()."
+              "Reserved; reads as zero from the trailing allocation."
             ],
             "type": {
               "array": [
@@ -25307,7 +25213,7 @@
     {
       "name": "TwapSliceV3SlippageSkippedEvent",
       "docs": [
-        "Wave 27b — emitted when a TWAP slice would fire but the slippage",
+        "Emitted when a TWAP slice would fire but the slippage",
         "cap is breached. The slice is skipped; the TWAP stays active for",
         "future intervals."
       ],
@@ -25340,7 +25246,7 @@
     {
       "name": "UnsettledFillVolumeReconciledEvent",
       "docs": [
-        "AUDIT F-4 (2026-07): emitted when `reconcile_unsettled_fill_volume` resets a",
+        "Emitted when `reconcile_unsettled_fill_volume` resets a",
         "drifted M-6 counter to 0 on a drained ring. `previous_unsettled` records the",
         "drift that was cleared (0 if it was already correct)."
       ],
@@ -25686,30 +25592,18 @@
         "fields": [
           {
             "name": "buy_pending",
-            "docs": [
-              "Pending buy volume in current open bucket."
-            ],
             "type": "u64"
           },
           {
             "name": "sell_pending",
-            "docs": [
-              "Pending sell volume in current open bucket."
-            ],
             "type": "u64"
           },
           {
             "name": "buckets_observed",
-            "docs": [
-              "Number of buckets observed so far."
-            ],
             "type": "u64"
           },
           {
             "name": "value_q32_32",
-            "docs": [
-              "Q32.32 fixed-point VPIN value (0 = balanced, FIXED_ONE = max imbalance)."
-            ],
             "type": "u64"
           }
         ]
