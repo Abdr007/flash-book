@@ -2670,8 +2670,8 @@ pub mod flash_book {
     ///
     /// Shares minted = amount × shares_outstanding / NAV. Bootstrap
     /// (NAV ≤ 0 or shares_outstanding == 0) mints 1:1.
-    pub fn deposit_flp_capital(
-        ctx: Context<DepositFlpCapital>,
+    pub fn deposit_flp_capital<'info>(
+        ctx: Context<'info, DepositFlpCapital<'info>>,
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
@@ -2702,16 +2702,70 @@ pub mod flash_book {
         let cpi_ctx = CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts);
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
+        // Value open FLP inventory at the fresh, trustless oracle and fold it
+        // into the share-pricing NAV, so a depositor cannot mint shares against
+        // realized-only NAV while the pool carries an unrealized gain (diluting
+        // standing LPs) — or be over-credited by an unrealized loss. The ORACLE
+        // (not the ER mark) is used: it is ER-independent, so this never blocks
+        // on an ER stall; a stale oracle fails closed, because a deposit must not
+        // price on an untrustworthy value. Withdrawal payout stays realized-only
+        // (unrealized gains are not cash in the vault), so this is additive to
+        // share pricing and never pays out or breaks conservation. Each open
+        // market must be supplied in `remaining_accounts`.
+        let mtm: i128 = {
+            let flp_ro = &ctx.accounts.flp_exposure;
+            if flp_ro.markets_count == 0 {
+                0
+            } else {
+                let now = Clock::get()?.unix_timestamp.max(0) as u64;
+                let mut sum: i128 = 0;
+                let mut matched: u8 = 0;
+                for slot in flp_ro.per_market.iter() {
+                    if slot.side == 255 {
+                        continue;
+                    }
+                    let market_ai = ctx
+                        .remaining_accounts
+                        .iter()
+                        .find(|ai| ai.key() == slot.market)
+                        .ok_or_else(|| error!(FlashBookError::MissingMarketAccount))?;
+                    let m_data = market_ai.try_borrow_data()?;
+                    let m_state = MarketAccount::try_deserialize(&mut &m_data[..])?;
+                    let oracle = m_state.oracle_price_ticks;
+                    let max_age = m_state.params.oracle_staleness_max_seconds as u64;
+                    let published = m_state.oracle_published_at_unix_seconds;
+                    require!(
+                        oracle > 0 && published > 0 && now.saturating_sub(published) <= max_age,
+                        FlashBookError::OracleTooStale
+                    );
+                    sum = sum.saturating_add(flp_slot_unrealized_pnl(
+                        slot.side,
+                        slot.size_lots,
+                        slot.entry_price_ticks,
+                        oracle,
+                        m_state.params.tick_size,
+                    ));
+                    matched += 1;
+                }
+                require!(
+                    matched == flp_ro.markets_count,
+                    FlashBookError::MissingMarketAccount
+                );
+                sum
+            }
+        };
+
         let flp = &mut ctx.accounts.flp_exposure;
-        let nav = flp.nav();
+        // Share price uses NAV inclusive of unrealized inventory PnL.
+        let pricing_nav = flp.nav().saturating_add(mtm);
         let shares_outstanding = flp.lp_shares_outstanding;
 
-        // Only bootstrap 1:1 when there are genuinely NO
-        // shares yet. If shares exist but NAV has fallen <= 0 (pool insolvent
-        // after trading losses), minting 1:1 against the stale supply silently
-        // dilutes the new depositor into near-worthless legacy shares. Reject.
+        // Only bootstrap 1:1 when there are genuinely NO shares yet. If shares
+        // exist but the mark-to-market NAV has fallen <= 0 (pool insolvent after
+        // trading losses), minting against it would dilute the depositor into
+        // near-worthless legacy shares. Reject.
         require!(
-            !(shares_outstanding > 0 && nav <= 0),
+            !(shares_outstanding > 0 && pricing_nav <= 0),
             FlashBookError::FlpPoolInsolvent
         );
         // Compute shares to mint. Bootstrap (no shares yet) mints 1:1 — the
@@ -2722,7 +2776,7 @@ pub mod flash_book {
             let prod = (amount_quote_lots as u128)
                 .checked_mul(shares_outstanding as u128)
                 .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-            let s = prod / (nav as u128);
+            let s = prod / (pricing_nav as u128);
             require!(s <= u64::MAX as u128, FlashBookError::ArithmeticOverflow);
             s as u64
         };
@@ -19670,6 +19724,54 @@ fn derive_maker_position_key(
         program_id,
     )
     .0
+}
+
+/// Unrealized PnL of one FLP inventory position, in quote-lots, valued at a
+/// price. `side` 0 = long (gain when price > entry), 1 = short (gain when price
+/// < entry). Pure so the sign/scale is unit-testable independent of the handler.
+fn flp_slot_unrealized_pnl(
+    side: u8,
+    size_lots: u64,
+    entry_ticks: u64,
+    price_ticks: u64,
+    tick_size: u64,
+) -> i128 {
+    let diff = (price_ticks as i128) - (entry_ticks as i128);
+    let sign: i128 = if side == 0 { 1 } else { -1 };
+    (size_lots as i128)
+        .saturating_mul(diff)
+        .saturating_mul(tick_size as i128)
+        .saturating_mul(sign)
+}
+
+#[cfg(test)]
+mod flp_mtm_tests {
+    use super::flp_slot_unrealized_pnl;
+
+    #[test]
+    fn long_gain_and_loss() {
+        // long 100 @ entry 100, tick 1: +10 ticks ⇒ +1000, -10 ticks ⇒ -1000.
+        assert_eq!(flp_slot_unrealized_pnl(0, 100, 100, 110, 1), 1000);
+        assert_eq!(flp_slot_unrealized_pnl(0, 100, 100, 90, 1), -1000);
+    }
+
+    #[test]
+    fn short_gain_and_loss() {
+        // short 100 @ entry 100: price DOWN is a gain, UP is a loss.
+        assert_eq!(flp_slot_unrealized_pnl(1, 100, 100, 90, 1), 1000);
+        assert_eq!(flp_slot_unrealized_pnl(1, 100, 100, 110, 1), -1000);
+    }
+
+    #[test]
+    fn flat_at_entry_is_zero() {
+        assert_eq!(flp_slot_unrealized_pnl(0, 100, 100, 100, 1), 0);
+        assert_eq!(flp_slot_unrealized_pnl(1, 100, 100, 100, 1), 0);
+    }
+
+    #[test]
+    fn tick_size_scales() {
+        assert_eq!(flp_slot_unrealized_pnl(0, 100, 100, 110, 5), 5000);
+    }
 }
 
 /// Intake INITIAL-MARGIN gate. A position opened with no (or
