@@ -6606,9 +6606,12 @@ pub mod flash_book {
             FlashBookError::OutOfRange
         );
         let market_key = ctx.accounts.market.key();
+        let proposer = ctx.accounts.market.authority;
         let p = &mut ctx.accounts.pending;
         p.market = market_key;
         p.pending_authority = new_authority;
+        // Bind the proposer so a later authority change invalidates this pending.
+        p.proposed_by = proposer;
         p.bump = ctx.bumps.pending;
         emit!(AuthorityTransferProposedEvent {
             market: market_key,
@@ -6622,6 +6625,14 @@ pub mod flash_book {
     /// new authority (context constraint), so control can never land on a key that
     /// can't sign.
     pub fn accept_authority_transfer(ctx: Context<AcceptAuthorityTransfer>) -> Result<()> {
+        // Reject a pending whose proposer is no longer the authority: a 1-step
+        // transfer_market_authority (or a re-key) that left this pending behind
+        // must not let its stale target displace the current authority.
+        require_keys_eq!(
+            ctx.accounts.pending.proposed_by,
+            ctx.accounts.market.authority,
+            FlashBookError::Unauthorized
+        );
         let new_authority = ctx.accounts.pending.pending_authority;
         let market = &mut ctx.accounts.market;
         let previous_authority = market.authority;

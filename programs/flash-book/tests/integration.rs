@@ -6202,6 +6202,111 @@ async fn two_step_authority_transfer_requires_new_key_to_accept() {
     );
 }
 
+/// A pending 2-step transfer proposed by an authority that is subsequently
+/// replaced (here via the 1-step transfer_market_authority) can NOT be accepted
+/// to displace the new authority: `accept_authority_transfer` requires the
+/// pending's `proposed_by` to still equal the current `market.authority`.
+#[tokio::test]
+async fn stale_pending_authority_cannot_displace_new_authority() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone(); // authority A
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (pending_pda, _) = pda(&[
+        flash_book::state::MarketPendingAuthorityAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let alice = Keypair::new(); // stale 2-step target
+    let bob = Keypair::new(); // new authority via 1-step
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+    for k in [&alice, &bob] {
+        send(
+            &mut ctx,
+            system_instruction::transfer(&payer.pubkey(), &k.pubkey(), 1_000_000_000),
+            &[&payer],
+        )
+        .await
+        .unwrap();
+    }
+
+    // A proposes Alice (2-step).
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ProposeAuthorityTransfer {
+                new_authority: alice.pubkey(),
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(pending_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .expect("A proposes Alice");
+
+    // A then 1-step transfers to Bob WITHOUT cancelling the pending.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::TransferMarketAuthority {
+                new_authority: bob.pubkey(),
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .expect("A 1-step transfers to Bob");
+
+    // Alice tries to accept the now-stale pending → must fail; Bob keeps control.
+    assert!(
+        send(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::AcceptAuthorityTransfer {},
+                vec![
+                    AccountMeta::new(alice.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(pending_pda, false),
+                ],
+            ),
+            &[&alice],
+        )
+        .await
+        .is_err(),
+        "a pending proposed by the replaced authority must not be acceptable"
+    );
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda)
+            .await
+            .authority,
+        bob.pubkey(),
+        "authority stays with the 1-step transferee"
+    );
+}
+
 /// A guardian may RESTRICT market status (pause /
 /// post-only / close) but NEVER loosen it (unpause stays authority-only), and
 /// `set_guardian` is authority-only. Asymmetric emergency control via a separate

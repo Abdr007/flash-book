@@ -445,12 +445,18 @@ impl MarketGuardianAccount {
 pub struct MarketPendingAuthorityAccount {
     pub market: Pubkey,
     pub pending_authority: Pubkey,
+    /// The authority that PROPOSED this transfer. `accept_authority_transfer`
+    /// requires it to still equal `market.authority`, so a pending proposed by
+    /// an authority that has since been replaced (via the 1-step
+    /// `transfer_market_authority` or a re-propose) can never displace the
+    /// current authority.
+    pub proposed_by: Pubkey,
     pub bump: u8,
 }
 
 impl MarketPendingAuthorityAccount {
     pub const SEED: &'static [u8] = b"pending_authority";
-    pub const LEN: usize = 32 + 32 + 1;
+    pub const LEN: usize = 32 + 32 + 32 + 1;
 }
 
 /// A timelocked market-params update. Own PDA (not a MarketAccount field —
