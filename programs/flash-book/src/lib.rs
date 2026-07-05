@@ -9283,6 +9283,7 @@ pub mod flash_book {
             market,
             adl_clock.unix_timestamp.max(0) as u64,
             adl_clock.slot,
+            underwater.side == 0,
         )?;
         let market_snap = RiskMarketSnap {
             market: market.key(),
@@ -9658,6 +9659,7 @@ pub mod flash_book {
                 exec_market,
                 liq_now_unix,
                 liq_current_slot,
+                exec_position.side == 0,
             )?),
             cum_funding_index: exec_market.cum_funding_index,
             maintenance_margin_bps: exec_market.params.maintenance_margin_ratio_bps,
@@ -9747,6 +9749,7 @@ pub mod flash_book {
                     &market,
                     liq_now_unix,
                     liq_current_slot,
+                    position.side == 0,
                 )?),
                 cum_funding_index: market.cum_funding_index,
                 maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
@@ -9794,7 +9797,12 @@ pub mod flash_book {
         // HEALTH mark (as the portfolio assessment above does), NOT the raw
         // oracle — avoids injecting a 0/stale-priced close when the oracle is
         // unset/stale but the mark is fresh.
-        let px = effective_health_mark(exec_market, liq_now_unix, liq_current_slot)? as u128;
+        let px = effective_health_mark(
+            exec_market,
+            liq_now_unix,
+            liq_current_slot,
+            exec_position.side == 0,
+        )? as u128;
         let penalty_delta = (px * penalty) / constants::BPS_DENOM as u128;
         let limit = match close_side {
             Side::Short => px.saturating_sub(penalty_delta) as u64,
@@ -18322,38 +18330,65 @@ pub struct BasketLeg {
     pub post_only: bool,
 }
 
-/// ER-stall mark freshness (P-LIQ-2) for the cross-margin risk walk. Returns the
-/// mark to feed `assess_margin` for `market`: the live mark when it is fresh, or
-/// the oracle ALONE when the mark is stale (a stalled ER froze the fill stream).
-/// A stale mark with no usable / fresh oracle has no trustworthy price ⇒ errors
-/// so the caller refuses to liquidate (fail-safe). Mirrors the single-position
-/// gate in `liquidate_position_v2` so `liquidate_portfolio_v2` cannot be driven
-/// by a frozen mark on any leg.
-fn effective_health_mark(market: &MarketAccount, now_unix: u64, current_slot: u64) -> Result<u64> {
+/// Dual-source health price (P-LIQ-1/2) for the cross-margin risk walk and ADL.
+/// Returns the price to feed `assess_margin` for `market`, using the SAME proven
+/// selection as the single-position `liquidate_position_v2`. FRESH mark ⇒
+/// worse-of(mark, oracle) for the position's direction (a fresh oracle move
+/// immediately tips the position, and the EMA-lagging mark can't hide adverse
+/// liquidity); previously this path used the mark ALONE, so the portfolio/ADL
+/// surface could carry a position under-margined by up to the mark↔oracle gap
+/// versus the single-position surface. STALE mark ⇒ oracle ALONE (a stalled ER
+/// froze the fill stream), and only a configured + published + fresh oracle —
+/// else no trustworthy price ⇒ error, so the caller refuses to liquidate
+/// (fail-safe).
+/// The oracle is folded into the worse-of only when it is trustworthy for
+/// health (configured + published, and required-fresh below); otherwise it is
+/// passed as 0 so the worse-of prices off the mark alone. `is_long` is the
+/// position's direction in `market`.
+fn effective_health_mark(
+    market: &MarketAccount,
+    now_unix: u64,
+    current_slot: u64,
+    is_long: bool,
+) -> Result<u64> {
+    let mark_t = market.mark_price_ticks;
+    let oracle_t = market.oracle_price_ticks;
+    let oracle_max_age = market.params.oracle_staleness_max_seconds as u64;
+    let published = market.oracle_published_at_unix_seconds;
+
+    // A configured + published oracle folded into the worse-of MUST be fresh —
+    // else refuse rather than price health off a possibly-stale oracle.
+    if oracle_max_age > 0 && published > 0 {
+        require!(
+            now_unix.saturating_sub(published) <= oracle_max_age,
+            FlashBookError::OracleTooStale
+        );
+    }
     let mark_stale = market.last_mark_update_slot == 0
         || current_slot.saturating_sub(market.last_mark_update_slot)
             > constants::MARK_STALENESS_MAX_SLOTS;
-    if !mark_stale {
-        return Ok(market.mark_price_ticks);
+    // When the mark is stale the oracle is the SOLE price ⇒ it must be
+    // configured + published (freshness already enforced above).
+    if mark_stale {
+        require!(oracle_max_age > 0, FlashBookError::MarkTooStale);
+        require!(published > 0, FlashBookError::MarkTooStale);
     }
-    // Stale mark ⇒ price off the oracle alone — but only a PROVABLY-fresh,
-    // Non-zero oracle. the oracle is now the SOLE health
-    // price, so freshness is MANDATORY, not "checked only if configured". An
-    // unconfigured staleness window (max_age == 0) or a never-stamped publish
-    // time (published_at == 0) leaves the oracle unvalidated — treat it as
-    // untrusted and refuse to liquidate (fail-safe), exactly as this function's
-    // contract states, rather than pricing a liquidation off an unproven oracle.
-    let oracle = market.oracle_price_ticks;
-    require!(oracle > 0, FlashBookError::MarkTooStale);
-    let max_age = market.params.oracle_staleness_max_seconds as u64;
-    require!(max_age > 0, FlashBookError::MarkTooStale);
-    require!(
-        market.oracle_published_at_unix_seconds > 0,
-        FlashBookError::MarkTooStale
-    );
-    let age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
-    require!(age <= max_age, FlashBookError::OracleTooStale);
-    Ok(oracle)
+    // Only a trustworthy oracle is folded in; otherwise pass 0 (worse-of prices
+    // off the mark alone).
+    let oracle_for_health = if oracle_max_age > 0 && published > 0 {
+        oracle_t
+    } else {
+        0
+    };
+    match matcher::liquidation::health_price_with_staleness(
+        mark_t,
+        oracle_for_health,
+        mark_stale,
+        is_long,
+    ) {
+        Some((hp, _)) => Ok(hp),
+        None => Err(error!(FlashBookError::MarkTooStale)),
+    }
 }
 
 /// Validate per-leg intake gates: status, size/price floors, tick alignment.
