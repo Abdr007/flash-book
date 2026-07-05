@@ -269,6 +269,10 @@ pub enum FlashBookError {
     OracleSourceLocked = 2317,
     #[msg("Pyth publish_time not strictly newer than the last accepted price (replay)")]
     OraclePythReplay = 2318,
+    #[msg("Trader is in armed ER-trading mode: every collateral withdrawal is locked until disarm_er_trading")]
+    ErTradingArmed = 2319,
+    #[msg("Cannot disarm ER-trading mode while exposure remains (open positions or attested ER-reserved margin)")]
+    ErDisarmHasExposure = 2320,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
