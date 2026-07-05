@@ -1,7 +1,21 @@
 # F-3 — Airtight reduce-only across the match→settle gap (implementation spec)
 
-Status: **PRIMARY VECTOR CLOSED (shipped); one narrow edge migration-gated.** Author:
-audit-remediation follow-up, 2026-07.
+Status: **FULLY CLOSED (shipped).** Primary vector via the injection clamp; the last edge via the
+v1 fill-commitment migration below. Author: audit-remediation follow-up, 2026-07.
+
+### The migration is now SHIPPED (2026-07) — co-located reduce-in-flight, no ER seam
+The "requires ER-writable per-position state" blocker below is resolved by a key design choice: the
+per-position reduce-in-flight tracker is **co-located inside the fill-commitment account** (a v1
+layout), so it commits **atomically with the settlement ring** — no separate account, no
+cross-account ER seam, and **no change to the fill preimage** (authenticity untouched). It is
+backward-compatible + version-gated: v0 rings (and every pre-existing market/test) are byte-identical;
+a market opts in via `upgrade_fill_commitment_v1` (authority-gated, drained ring). On a v1 ring the
+matcher caps a reduce-only cross by `position − in-flight[position]` and adds the fill to in-flight;
+`apply_fill` releases it on settlement (the maker + sub_index are preimage-committed, so the position
+key is authentic). This closes the shrink edge (a second taker reading a stale position snapshot now
+sees `reducible = position − in-flight`, capping it to 0). Shipped in commits `679766c` (layout),
+`bbcad82` (upgrade ix), `17978aa` (matcher), `7265efd` (settlement), `fde8c22` (e2e test). The
+sections below are retained as the design rationale.
 
 ### Shipped mitigation (the safe part) — injection-time cumulative capacity clamp
 A safe, complete fix for the **multi-order** flip — the demonstrated exploit — ships in
