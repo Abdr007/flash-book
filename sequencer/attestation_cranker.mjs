@@ -8,14 +8,19 @@
 // resting-order initial margin, and attests any change on L1 — bounding the
 // documented attestation-lag window to roughly one poll interval.
 //
-// Reservation policy (v1): for every resting order,
+// Reservation policy (v2): a trader's reservation is the sum of
 //     im = ceil(size_lots × price_ticks × tick_size × initial_margin_ratio_bps / 10_000)
-// summed per (trader, sub_index) → trader_state. Conservative and simple:
-// every resting order reserves its full-open initial margin. Fills that are
-// committed but not yet settled are NOT separately reserved — the sequencer
-// that runs this cranker also drives settlement, so that window is its own
-// promptness; folding outbox-derived unsettled fills into the reservation is
-// the natural next hardening.
+// over (a) every RESTING order on the book, and (b) every UNSETTLED fill —
+// outbox rows at absolute indices [ring.settled, ring.produced), reserved for
+// BOTH the taker and the maker (an FLP virtual-quote fill, maker ==
+// Pubkey::default(), reserves only the taker side). A fill therefore keeps its
+// margin reserved seamlessly from the moment the order rests until apply_fill
+// settles it into a position the filled-position gate covers — the
+// order-fills-then-withdraw-before-settlement window is closed.
+//
+// Book, ring, and outbox are snapshotted in ONE getMultipleAccountsInfo call
+// per market, so an in-flight fill cannot fall between two reads for more
+// than a single poll interval.
 //
 // Usage:
 //   L1_RPC=<l1> ER_RPC=<er> MARKETS=<mkt1,mkt2,…> node attestation_cranker.mjs
@@ -109,19 +114,58 @@ function decodeRestingOrders(data) {
   return orders;
 }
 
+// ── unsettled-fill decoding (fill outbox addressed by the ring's cursors) ────
+// Ring header: produced u64 @8, settled u64 @16 — `settled` is authoritative
+// (apply_fill advances it). Outbox: 64B header (cap u32 @24) + 96B slots:
+// taker @0, maker @32, size u64 @64, price u64 @72, taker_side @88,
+// taker_sub @89, maker_sub @90. Slot for absolute fill index i = i % cap.
+const DEFAULT_PUBKEY = Buffer.alloc(32);
+function decodeUnsettledFills(ringData, outboxData) {
+  const produced = ringData.readBigUInt64LE(8);
+  const settled = ringData.readBigUInt64LE(16);
+  const cap = BigInt(outboxData.readUInt32LE(24));
+  if (cap === 0n || produced < settled || produced - settled > cap) {
+    throw new Error(`inconsistent ring/outbox cursors (produced=${produced} settled=${settled} cap=${cap})`);
+  }
+  const fills = [];
+  for (let i = settled; i < produced; i++) {
+    const off = 64 + Number(i % cap) * 96;
+    if (off + 96 > outboxData.length) throw new Error("outbox slot out of bounds");
+    fills.push({
+      taker: outboxData.subarray(off, off + 32),
+      maker: outboxData.subarray(off + 32, off + 64),
+      sizeLots: outboxData.readBigUInt64LE(off + 64),
+      priceTicks: outboxData.readBigUInt64LE(off + 72),
+      takerSub: outboxData.readUInt8(off + 89),
+      makerSub: outboxData.readUInt8(off + 90),
+    });
+  }
+  return fills;
+}
+
 // ── reservation computation ───────────────────────────────────────────────────
 const BPS = 10_000n;
-function computeReservations(orders, tickSize, imBps) {
+function imFor(sizeLots, priceTicks, tickSize, imBps) {
+  return (sizeLots * priceTicks * tickSize * imBps + BPS - 1n) / BPS; // ceil — rounds toward the protocol
+}
+function computeReservations(orders, fills, tickSize, imBps) {
   const perState = new Map(); // trader_state base58 → { pubkey, reserved: bigint }
-  for (const o of orders) {
-    if (o.sizeLots === 0n) continue;
-    const notional = o.sizeLots * o.priceTicks * tickSize;
-    const im = (notional * imBps + BPS - 1n) / BPS; // ceil — rounds toward the protocol
-    const ts = traderStatePda(o.trader, o.subIndex);
+  const add = (traderBytes, subIndex, im) => {
+    const ts = traderStatePda(new PublicKey(traderBytes), subIndex);
     const key = ts.toBase58();
     const cur = perState.get(key) || { pubkey: ts, reserved: 0n };
     cur.reserved += im;
     perState.set(key, cur);
+  };
+  for (const o of orders) {
+    if (o.sizeLots === 0n) continue;
+    add(o.trader.toBuffer(), o.subIndex, imFor(o.sizeLots, o.priceTicks, tickSize, imBps));
+  }
+  for (const f of fills) {
+    if (f.sizeLots === 0n) continue;
+    const im = imFor(f.sizeLots, f.priceTicks, tickSize, imBps);
+    add(f.taker, f.takerSub, im);
+    if (!f.maker.equals(DEFAULT_PUBKEY)) add(f.maker, f.makerSub, im); // FLP fills reserve pool margin, not a trader's
   }
   return perState;
 }
@@ -140,29 +184,40 @@ async function attest(traderState, reserved, epoch) {
   return await sendAndConfirmTransaction(l1, tx, [attestor], { commitment: "confirmed", skipPreflight: true, maxRetries: 5 });
 }
 
-// Read a book account: from the ER when delegated there, else from L1.
-async function fetchBook(bookPda) {
+// Read the (book, ring, outbox) trio in ONE call — a same-slot snapshot on
+// whichever domain currently holds them (ER when delegated, else L1).
+async function fetchMarketAccounts(meta) {
+  const keys = [meta.book, meta.ring, meta.outbox];
   if (er) {
     try {
-      const a = await er.getAccountInfo(bookPda);
-      if (a?.data?.length) return a.data;
+      const a = await er.getMultipleAccountsInfo(keys);
+      if (a?.[0]?.data?.length) return a.map((x) => x?.data ?? null);
     } catch {
       /* fall through to L1 */
     }
   }
-  const a = await l1.getAccountInfo(bookPda);
-  return a?.data ?? null;
+  const a = await l1.getMultipleAccountsInfo(keys);
+  return a.map((x) => x?.data ?? null);
 }
 
 // ── main loop ─────────────────────────────────────────────────────────────────
 const marketMeta = new Map(); // market base58 → { book, tickSize, imBps }
+// Market params load lazily and retry every pass until the market exists, so
+// the cranker can be pointed at a market that is created after it starts.
 async function loadMarketMeta(marketPk) {
-  const m = await program.account.marketAccount.fetch(marketPk);
-  marketMeta.set(marketPk.toBase58(), {
-    book: pda(["market_book", marketPk]),
-    tickSize: BigInt(m.params.tickSize.toString()),
-    imBps: BigInt(m.params.initialMarginRatioBps),
-  });
+  try {
+    const m = await program.account.marketAccount.fetch(marketPk);
+    marketMeta.set(marketPk.toBase58(), {
+      book: pda(["market_book", marketPk]),
+      ring: pda(["fill_commit", marketPk]),
+      outbox: pda(["fill_outbox", marketPk]),
+      tickSize: BigInt(m.params.tickSize.toString()),
+      imBps: BigInt(m.params.initialMarginRatioBps),
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Trader states whose last-known reservation is nonzero — the set that must be
@@ -184,17 +239,20 @@ async function pass() {
   // per-trader_state, spanning that trader's orders on every market).
   const wanted = new Map(); // trader_state base58 → { pubkey, reserved }
   for (const mkt of MARKETS) {
+    if (!marketMeta.has(mkt) && !(await loadMarketMeta(new PublicKey(mkt)))) continue;
     const meta = marketMeta.get(mkt);
-    const data = await fetchBook(meta.book);
-    if (!data) continue;
-    let orders;
+    const [bookData, ringData, outboxData] = await fetchMarketAccounts(meta);
+    if (!bookData) continue;
+    let orders, fills;
     try {
-      orders = decodeRestingOrders(data);
+      orders = decodeRestingOrders(bookData);
+      // A market without a ring/outbox has no unsettled-fill surface to track.
+      fills = ringData && outboxData ? decodeUnsettledFills(ringData, outboxData) : [];
     } catch (e) {
       log(`WARN market ${mkt}: ${e.message}`);
       continue;
     }
-    for (const [key, v] of computeReservations(orders, meta.tickSize, meta.imBps)) {
+    for (const [key, v] of computeReservations(orders, fills, meta.tickSize, meta.imBps)) {
       const cur = wanted.get(key) || { pubkey: v.pubkey, reserved: 0n };
       cur.reserved += v.reserved;
       wanted.set(key, cur);
@@ -235,7 +293,9 @@ async function pass() {
 
 log(`attestation cranker — attestor ${attestor.publicKey.toBase58()}`);
 log(`L1=${L1_RPC} ER=${ER_RPC || "(none — L1 books only)"} markets=${MARKETS.length} interval=${INTERVAL_MS}ms`);
-for (const mkt of MARKETS) await loadMarketMeta(new PublicKey(mkt));
+for (const mkt of MARKETS) {
+  if (!(await loadMarketMeta(new PublicKey(mkt)))) log(`market ${mkt} not found yet — will retry each pass`);
+}
 await reconcileStartup();
 for (;;) {
   const t0 = Date.now();
