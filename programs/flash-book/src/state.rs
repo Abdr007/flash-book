@@ -821,7 +821,17 @@ pub struct TraderStateAccount {
     /// the strict paths fail closed with `UseXDomainWithdraw`. Occupies a
     /// byte of the `_pad` tail, so the Pod layout stays 192 bytes.
     pub er_active: u8,
-    pub _pad: [u8; 4],
+    /// Trader-armed cross-domain lock. `1` = the trader has explicitly entered
+    /// ER-trading mode, so their collateral backs resting orders that settle
+    /// asynchronously; while armed, EVERY withdrawal path fails closed. Unlike
+    /// `er_active` (sequencer-attested), this is set only by the trader via
+    /// `arm_er_trading` and cleared only by `disarm_er_trading` after it proves
+    /// no live exposure remains — so the lock never depends on the sequencer.
+    /// Carved from the `_pad` tail: accounts written before this field existed
+    /// read it as `0` (not armed), so every pre-existing trader is unchanged and
+    /// the Pod layout stays 192 bytes.
+    pub er_trading_armed: u8,
+    pub _pad: [u8; 3],
 }
 
 impl TraderStateAccount {
