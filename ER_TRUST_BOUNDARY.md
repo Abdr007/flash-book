@@ -100,6 +100,42 @@ Consequences for the current deployment:
   owner-recovery primitive from MagicBlock (external), after which the retained
   gate wires directly to it.
 
+### 1.2 Cross-domain reserved margin — withdraw anytime, and the attestation window
+
+Collateral never leaves L1, but resting orders live on the delegated book, so
+L1 cannot see the margin a live ER order will require when it fills. The
+bridge is the per-trader `ErMarginAttestation`: the sequencer's pinned
+attestor writes the total initial margin reserved by the trader's live ER
+orders (`attest_er_reserved_margin`, strictly-increasing epoch, replay-proof),
+and **every** collateral-releasing instruction — `withdraw_collateral` (and
+its xdomain variant), both partial-withdraw variants, both sub-account
+transfers, and `sweep_collateral` — enforces the same invariant:
+
+```
+withdrawable = collateral − max(IM_filled, floor) − er_reserved
+```
+
+Free balance is withdrawable at any time, mid-session, with open positions
+and resting orders; the reservation stays behind. There is no arm step, no
+lock, and no "turn off trading to withdraw." Order placement on a delegated
+book requires the trader's attestation account to exist (`er_margin_ready`),
+so the sequencer always has somewhere to write the reservation.
+
+**The accepted residual is the attestation lag.** The reservation lands on L1
+only when the sequencer attests, which is after an order rests. A trader who
+places an ER order and withdraws before the next attestation can leave that
+order's eventual fill under-margined — bounded by the raced amount and by one
+attestation interval. Mitigation is cadence: the sequencer attests on every
+ER commit/heartbeat, so the window is seconds. This is squarely inside the
+already-accepted single-sequencer trust of §1 (the same operator is already
+trusted for ordering and for honest fill commitment), not an expansion of it;
+a sequencer that under-attests can cause bounded under-margining, never theft
+(the vault only ever pays out against the trader's own balance). It is
+documented here as an accepted residual — not solved. The trustless
+replacement (order-book state proven onto L1 so the reservation needs no
+attestor) is staged as future infrastructure and is explicitly out of scope
+for the current deployment.
+
 ## 2. What is proven where
 
 **Tier 1 — proven in the unit harness (host + `solana-program-test`).**
@@ -109,7 +145,8 @@ the corrupt-state rejection (one choke point — `from_account_data` — that
 every book-reading handler funnels through), the `fill_seq` replay guard,
 the outbox no-overwrite proof, the JIT bind, the force-undelegate gate, and
 the ER-margin attestation suite (epoch replay, wrong attestor,
-cross-domain withdraw, session funds).
+cross-domain withdraw and partial withdraw, reservation-gated sub-account
+transfers and sweep, session funds).
 
 **Tier 2 — needs a live ER.** Only the MagicBlock CPI round-trips, because
 the harness loads neither the delegation program nor the Magic program:
