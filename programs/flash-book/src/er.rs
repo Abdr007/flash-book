@@ -225,11 +225,13 @@ pub fn cpi_delegate(
 /// Pure decision for the permissionless force-undelegate timeout gate
 /// (`force_undelegate_market_book`). Returns true iff the ER has been silent for
 /// STRICTLY MORE than `timeout_slots`. The liveness baseline is the more recent
-/// of the last committed fill (`last_mark_update_slot`) and the delegation slot
-/// (`book_delegated_at_slot`); the latter closes the "delegate then never fill"
-/// trap. A 0 baseline (book not delegated via the upgraded path) is never
-/// escapable. Extracted pure so the "never fires while the ER is live" property
-/// is host-tested and Kani-proven, and the handler calls the proven function.
+/// of the last REAL settlement (`last_settlement_slot`, advanced only by
+/// `apply_fill` / `apply_flp_fill` — never by the permissionless `settle_mark`)
+/// and the delegation slot (`book_delegated_at_slot`); the latter closes the
+/// "delegate then never fill" trap. A 0 baseline (book not delegated via the
+/// upgraded path) is never escapable. Extracted pure so the "never fires while
+/// the ER is live" property is host-tested and Kani-proven, and the handler
+/// calls the proven function.
 /// Two-tier so a healthy-but-QUIET market is not griefed off the ER, while a
 /// CENSORING sequencer still cannot trap funds.
 ///   • FAST path — the ER shows NO liveness of any kind (no fill, no heartbeat,
@@ -243,7 +245,7 @@ pub fn cpi_delegate(
 #[inline]
 pub fn force_undelegate_allowed(
     current_slot: u64,
-    last_mark_update_slot: u64,
+    last_settlement_slot: u64,
     last_heartbeat_slot: u64,
     book_delegated_at_slot: u64,
     stall_timeout_slots: u64,
@@ -251,7 +253,7 @@ pub fn force_undelegate_allowed(
 ) -> bool {
     // FAST: any liveness signal (fill, heartbeat, or the delegation baseline).
     let er_baseline = max3(
-        last_mark_update_slot,
+        last_settlement_slot,
         last_heartbeat_slot,
         book_delegated_at_slot,
     );
@@ -259,8 +261,8 @@ pub fn force_undelegate_allowed(
         er_baseline != 0 && current_slot.saturating_sub(er_baseline) > stall_timeout_slots;
 
     // BACKSTOP: settlement liveness only (heartbeat deliberately excluded).
-    let settle_baseline = if last_mark_update_slot > book_delegated_at_slot {
-        last_mark_update_slot
+    let settle_baseline = if last_settlement_slot > book_delegated_at_slot {
+        last_settlement_slot
     } else {
         book_delegated_at_slot
     };

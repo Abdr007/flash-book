@@ -661,7 +661,11 @@ pub mod flash_book {
     /// not the censored continuation). Ties exit to liveness, not goodwill.
     pub fn force_undelegate_market_book(ctx: Context<ForceUndelegateMarketBook>) -> Result<()> {
         let current_slot = Clock::get()?.slot;
-        let last_fill = ctx.accounts.market.last_mark_update_slot;
+        // The settlement-liveness baseline MUST be a real fill, not the mark
+        // slot: `settle_mark` is permissionless and would let a censoring
+        // sequencer keep this escape shut forever by spamming it. `apply_fill` /
+        // `apply_flp_fill` advance `last_settlement_slot` on genuine settlement.
+        let last_fill = ctx.accounts.market.last_settlement_slot;
         let heartbeat = ctx.accounts.market.last_heartbeat_slot;
         let delegated_at = ctx.accounts.market.book_delegated_at_slot;
         // Kani-proven gate (F2/F3): opens only when the ER shows NO liveness of any
@@ -5769,6 +5773,11 @@ pub mod flash_book {
         // MARK_STALENESS_MAX_SLOTS → `liquidate_position_v2` falls back to
         // oracle-only health pricing and `verify_market_invariants` auto-pauses.
         market.last_mark_update_slot = Clock::get()?.slot;
+        // Honest settlement-liveness signal for the force-undelegate escape and
+        // the S7 auto-pause: unlike the mark slot above, this advances ONLY on a
+        // real committed fill (never on the permissionless settle_mark), so a
+        // censoring sequencer cannot keep the escape shut by spamming settle_mark.
+        market.last_settlement_slot = Clock::get()?.slot;
 
         // ── Multi-threshold margin warning ──────────────────────────
         // Single-position equity-vs-MMR view (cheap, no portfolio walk):
@@ -6153,15 +6162,18 @@ pub mod flash_book {
         // than MARK_STALENESS_MAX_SLOTS it is presumed stalled. Auto-pause so no
         // new orders land against a frozen book until it recovers.
         //
-        // Liveness is `max(last_mark_update_slot,
-        // last_heartbeat_slot)`, NOT the mark alone. A healthy-but-quiet market
-        // legitimately stops stamping `last_mark_update_slot` (no fills, no
-        // `settle_mark`), but a live ER keeps `er_heartbeat` fresh — so it stays
-        // Active. Only a market with no fill AND no heartbeat (ER actually down)
-        // auto-pauses. Guard on `> 0` so a legacy market that has never stamped
-        // either field is not paused on missing data (liquidation already prices
-        // such markets oracle-only).
-        let liveness_slot = market.last_mark_update_slot.max(market.last_heartbeat_slot);
+        // Liveness is `max(last_settlement_slot, last_heartbeat_slot)`, NOT the
+        // mark slot. A healthy-but-quiet market legitimately settles no fills,
+        // but a live ER keeps `er_heartbeat` fresh — so it stays Active. Only a
+        // market with no real settlement AND no heartbeat (ER actually down)
+        // auto-pauses. `last_settlement_slot` (not `last_mark_update_slot`) is
+        // used deliberately: the permissionless `settle_mark` bumps the mark
+        // slot, so a down ER could otherwise be kept "alive" — evading this
+        // pause — by anyone spamming settle_mark while the L1 oracle stays fresh.
+        // Guard on `> 0` so a legacy market that has never stamped either field
+        // is not paused on missing data (liquidation already prices such markets
+        // oracle-only).
+        let liveness_slot = market.last_settlement_slot.max(market.last_heartbeat_slot);
         if liveness_slot > 0 {
             let current_slot = Clock::get()?.slot;
             let liveness_age = current_slot.saturating_sub(liveness_slot);
@@ -8098,6 +8110,9 @@ pub mod flash_book {
             )
             .map_err(|_| error!(FlashBookError::FillSeqReplay))?
         };
+        // Honest settlement-liveness signal (see apply_fill): an FLP fill is a
+        // real settlement, so advance it here too — never via settle_mark.
+        ctx.accounts.market.last_settlement_slot = Clock::get()?.slot;
 
         // ── FLP fill-price authenticity band ────────────
         // FLP fills aren't matcher-produced on-chain, so they can't ride the
