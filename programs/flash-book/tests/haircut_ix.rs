@@ -1,13 +1,13 @@
-//! Wave 24b integration tests: state-transition logic for the four
-//! new haircut ix handlers, exercised at the algorithmic layer.
+//! State-transition tests for the four haircut instruction handlers,
+//! exercised at the algorithmic layer.
 //!
 //! These tests don't spin up `solana-program-test`. They model the ix
 //! bodies as plain mutations on the same account-struct types the
-//! handlers operate on, asserting the full Wave 24b conservation laws
+//! handlers operate on, asserting the haircut conservation laws
 //! end-to-end:
 //!
 //!   - initialize_haircut_state seeds (residual, h_min, h_max) correctly
-//!   - apply_release (off-chain proxy for Wave 24c) accumulates to reserve
+//!   - apply_release accumulates to reserve
 //!   - mature_position drains reserve → matured + bumps market total
 //!   - convert_position floor-credits + dust + decrements residual
 //!   - flush_haircut_dust moves accounting to insurance
@@ -61,10 +61,10 @@ fn ix_initialize(h_min: u64, h_max: u64, initial_residual: u128) -> MarketHaircu
     }
 }
 
-/// Wave 24c wire-in proxy: positive realized PnL bypasses
+/// Release-path proxy: positive realized PnL bypasses
 /// `apply_realized_pnl_delta`'s collateral credit and adds to the
-/// position's reserve instead. (Wave 24c will wire this into
-/// `apply_fill`; Wave 24b just tests the algorithm.)
+/// position's reserve instead (the algorithm `apply_fill` routes
+/// through on haircut-enabled markets).
 fn ix_release(pos: &mut PositionHaircutState, gain: u64, now_slot: u64) {
     let pre = PositionHaircutSnapshot {
         released_reserve_quote_lots: pos.reserve,

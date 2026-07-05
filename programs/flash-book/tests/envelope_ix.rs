@@ -1,4 +1,4 @@
-//! Wave 26a integration tests — envelope config + verify + gate ix.
+//! Envelope config + verify + gate instruction tests.
 //!
 //! Mirrors the on-chain handlers as algorithmic operations on the
 //! pure `EnvelopeParams` struct. The ix bodies are direct passthrough

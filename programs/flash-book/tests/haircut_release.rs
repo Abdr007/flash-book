@@ -1,5 +1,3 @@
-//! Wave 24c integration tests.
-//!
 //! Exercises the *release path* end-to-end at the algorithmic layer:
 //!
 //!   trader gain credited to collateral (legacy flow)
@@ -113,8 +111,8 @@ fn ix_mature(pos: &mut PositionHaircut, market: &mut MarketHaircut, now_slot: u6
     delta
 }
 
-// Mirror of convert_position + the Wave 24d wire-in that lands credit
-// into the trader's collateral bucket. (Wave 24c's on-chain ix doesn't
+// Mirror of convert_position + the apply_fill wire-in that lands credit
+// into the trader's collateral bucket. (The release ix itself doesn't
 // land the credit yet; this test layer simulates the full intended
 // flow.)
 fn ix_convert_and_credit(
@@ -134,7 +132,7 @@ fn ix_convert_and_credit(
     let (post, credit, dust) = apply_convert(pre, h);
     pos.matured = post.matured_pos_quote_lots;
 
-    // Land the credit in the appropriate bucket — Wave 24d wire-in.
+    // Land the credit in the appropriate bucket.
     if isolated {
         buckets.isolated_collateral = buckets
             .isolated_collateral

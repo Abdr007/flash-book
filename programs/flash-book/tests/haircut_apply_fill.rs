@@ -1,5 +1,3 @@
-//! Wave 24d integration tests.
-//!
 //! Verifies the routing behaviour of `apply_realized_pnl_delta_v2` —
 //! the dispatcher that replaces `apply_realized_pnl_delta`'s direct
 //! credit with H-haircut reserve routing whenever the position has

@@ -214,7 +214,7 @@ proptest! {
 // ─── I-6 Loss seniority ─────────────────────────────────────────────
 // Encoded structurally: apply_release rejects zero-gain (and would
 // reject negative if the signature allowed it). The wire-in module
-// (Wave 24b) is responsible for routing losses to the existing
+// is responsible for routing losses to the existing
 // `compute_realized_pnl_routing` path WITHOUT calling any
 // haircut::apply_* function. We assert that property statically here:
 // any signature in this crate that takes a loss must not touch

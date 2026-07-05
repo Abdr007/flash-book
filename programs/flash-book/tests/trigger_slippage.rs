@@ -1,5 +1,4 @@
-//! Wave 27a integration tests — `acceptable_price` slippage cap on
-//! v3 trigger orders (GMX V2 pattern).
+//! `acceptable_price` slippage cap on v3 trigger orders.
 //!
 //! Verifies `TriggerOrderAccountV3::slippage_cap_breached` directly
 //! (the pure function the on-chain handler delegates to) and walks
@@ -11,7 +10,7 @@ use flash_book::state_v3::TriggerOrderAccountV3;
 
 #[test]
 fn cap_zero_means_no_cap_regardless_of_side_or_oracle() {
-    // Legacy / pre-Wave-27a triggers (acceptable_price_ticks == 0)
+    // Triggers with no cap set (acceptable_price_ticks == 0)
     // never breach — full backward compat.
     assert!(!TriggerOrderAccountV3::slippage_cap_breached(0, 0, 1_000_000));
     assert!(!TriggerOrderAccountV3::slippage_cap_breached(0, 1, 1_000_000));

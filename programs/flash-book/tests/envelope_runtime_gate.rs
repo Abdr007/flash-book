@@ -1,4 +1,4 @@
-//! Wave 26b integration tests — runtime envelope gate semantics.
+//! Runtime envelope gate semantics.
 //!
 //! Mirrors `gate_oracle_update`'s body as plain Rust over the same
 //! state shape. The on-chain ix is a direct passthrough — passing

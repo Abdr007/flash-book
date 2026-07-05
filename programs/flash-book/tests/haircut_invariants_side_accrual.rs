@@ -1,7 +1,5 @@
-//! Wave 24e + 25a integration tests.
-//!
-//! 24e: `verify_haircut_invariants` reports against various states.
-//! 25a: `MarketSideAccrualAccount` round-trip + state machine flow.
+//! Integration tests for `verify_haircut_invariants` reporting and the
+//! `MarketSideAccrualAccount` round-trip + state-machine flow.
 //!
 //! Tests exercise the algorithms at the same shape the on-chain ix
 //! handlers operate on; the on-chain wire-in is direct passthrough
@@ -12,7 +10,7 @@ use flash_book::matcher::side_accrual::{
     epoch_advance, step_mode, SideAccrual, SideMode, SideModeTransition, ADL_ONE, MIN_A_SIDE,
 };
 
-// ─── Wave 24e: verify_haircut_invariants ────────────────────────────
+// ─── verify_haircut_invariants ──────────────────────────────────────
 
 #[test]
 fn invariants_healthy_market_passes() {
@@ -88,7 +86,7 @@ fn invariants_report_is_compact_serialization() {
     assert_eq!(bm, 0b0_1101);
 }
 
-// ─── Wave 25a: MarketSideAccrualAccount mirror ──────────────────────
+// ─── MarketSideAccrualAccount mirror ────────────────────────────────
 
 /// Mirror of `MarketSideAccrualAccount::init` body. Verifies both sides
 /// start in the unit state. Tested algorithmically here; on-chain init

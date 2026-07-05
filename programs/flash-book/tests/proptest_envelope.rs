@@ -1,4 +1,4 @@
-//! Property tests for the per-slot envelope (Wave 26).
+//! Property tests for the per-slot envelope.
 //!
 //! Each property runs over 2000 random cases.
 
