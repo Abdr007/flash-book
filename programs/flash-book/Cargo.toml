@@ -23,7 +23,6 @@ anchor-spl = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
 solana-security-txt = "1.1.1"
-ephemeral-rollups-sdk = { version = "0.15.4", features = ["anchor"] }
 solana-keccak-hasher = "2.2.1"
 
 [dev-dependencies]

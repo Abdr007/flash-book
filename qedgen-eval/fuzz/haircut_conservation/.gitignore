@@ -1,5 +1,0 @@
-target/
-crashes/
-corpus/
-.fuzz-cache/
-*.lcov

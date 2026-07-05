@@ -1,5 +1,0 @@
-{
-  "command": "codegen",
-  "stderr": "parse error in haircut_conservation.qedspec:\n  line 18, col 2: found ''r'' at 548..549 expected ''v'', or ''n''",
-  "timestamp": "2026-06-24T13:11:44.153336000Z"
-}
