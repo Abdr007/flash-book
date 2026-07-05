@@ -3389,6 +3389,98 @@ async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
     );
 }
 
+/// modify_order_v2 must re-apply the anti-stuffing oracle band: an order placed
+/// in-band cannot be re-priced to a far-from-oracle level. Place an ask @ 140_000
+/// (inside the 50% band around the 100_000 oracle), then modify it to 200_000
+/// (100% above) and assert RestingOrderTooFarFromOracle.
+#[tokio::test]
+async fn modify_order_v2_rejects_far_from_oracle() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let maker = Keypair::new();
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let metas = vec![
+        AccountMeta::new(maker.pubkey(), true),
+        AccountMeta::new(market_pda, false),
+        AccountMeta::new(book_pda, false),
+        AccountMeta::new_readonly(maker_state, false),
+        AccountMeta::new_readonly(program_id(), false),
+    ];
+
+    // Place an in-band ask @ 140_000 (accepted, seq 1).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::PlaceLimitOrderV2 {
+                    side: 1,
+                    size_lots: 1,
+                    limit_ticks: 140_000,
+                    flags: 0,
+                    expires_at_slot: 0,
+                    sub_index: 0,
+                },
+                metas.clone(),
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Modify that order to 200_000 — out of band — must be rejected.
+    let order_id = flash_book::state_v2::encode_order_id(140_000, 1, false);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::ModifyOrderV2 {
+                    side: 1,
+                    old_order_id: order_id,
+                    new_size_lots: 1,
+                    new_limit_ticks: 200_000,
+                    new_flags: 0,
+                    new_expires_at_slot: 0,
+                },
+                metas,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(7228)"),
+        "modify to a far-from-oracle price must be rejected with RestingOrderTooFarFromOracle, got: {dbg}"
+    );
+}
+
 #[tokio::test]
 async fn delegated_book_order_requires_armed() {
     let pt = make_program_test();
