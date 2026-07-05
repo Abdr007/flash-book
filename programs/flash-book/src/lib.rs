@@ -13206,9 +13206,13 @@ fn partial_withdraw_core<'info>(
         assessment.required_quote_lots
     };
 
-    // (b) withdrawal floor: 10% of total notional.
-    let notional_floor_u128 = total_notional_quote.saturating_mul(WITHDRAWAL_FLOOR_BPS as u128)
-        / (constants::BPS_DENOM as u128);
+    // (b) withdrawal floor: 10% of total notional. Round UP — this is a
+    // protective floor the trader must leave behind, so flooring it would let
+    // them retain up to one quote-lot less than intended. `div_ceil` is
+    // identical on exact multiples.
+    let notional_floor_u128 = total_notional_quote
+        .saturating_mul(WITHDRAWAL_FLOOR_BPS as u128)
+        .div_ceil(constants::BPS_DENOM as u128);
     let notional_floor = if notional_floor_u128 > u64::MAX as u128 {
         u64::MAX
     } else {
@@ -19885,8 +19889,12 @@ fn assert_intake_initial_margin(
     let notional = (resulting_size as u128)
         .saturating_mul(limit_ticks as u128)
         .saturating_mul(tick_size as u128);
-    let required_im =
-        notional.saturating_mul(im_bps as u128) / (crate::constants::BPS_DENOM as u128);
+    // Round the initial-margin requirement UP: it is owed to the protocol, so
+    // flooring would understate it and let a trader open up to one quote-lot
+    // under-margined. `div_ceil` is identical on exact multiples.
+    let required_im = notional
+        .saturating_mul(im_bps as u128)
+        .div_ceil(crate::constants::BPS_DENOM as u128);
     require!(
         (backing_collateral as u128) >= required_im,
         FlashBookError::InsufficientCollateral
@@ -19942,6 +19950,14 @@ mod m2_intake_margin_tests {
     #[test]
     fn zero_im_market_opts_out() {
         assert!(assert_intake_initial_margin(0, 1_000_000, 1_000_000, 0, TS, 0, None).is_ok());
+    }
+
+    #[test]
+    fn im_requirement_rounds_up_not_down() {
+        // notional = 3 lots @ 3 = 9; IM at 1000 bps = 9*1000/10000 = 0.9.
+        // Flooring gives 0 (a free dust open); rounding up requires 1.
+        assert!(assert_intake_initial_margin(0, 3, 3, IM, TS, 0, None).is_err());
+        assert!(assert_intake_initial_margin(0, 3, 3, IM, TS, 1, None).is_ok());
     }
 }
 
