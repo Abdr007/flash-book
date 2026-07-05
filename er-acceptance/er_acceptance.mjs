@@ -194,6 +194,11 @@ try {
     const dep = (trader, traderState, tAta, extra) => program.methods.depositCollateral(new BN(DEPOSIT)).accountsPartial({ trader, traderState, insuranceFund: INS, quoteMint: QUOTE, traderQuoteAta: tAta, quoteVault: VAULT, tokenProgram: TOKEN_PROGRAM }).instruction();
     await send(l1, await dep(signer.publicKey, makerTS, makerAta), []);
     await send(l1, await dep(taker.publicKey, takerTS, takerAta), [taker]);
+    // Arm ER-trading mode on L1 before delegation: while the book is delegated,
+    // order placement REQUIRES er_trading_armed (H-1 trustless lock). The armed
+    // flag lives on the (non-delegated) trader-state, read as a clone on the ER.
+    await send(l1, await program.methods.armErTrading().accountsPartial({ trader: signer.publicKey, traderState: makerTS }).instruction(), []);
+    await send(l1, await program.methods.armErTrading().accountsPartial({ trader: taker.publicKey, traderState: takerTS }).instruction(), [taker]);
   });
   await sleep(2000);
   await stage("ER rest bids + taker sweep (4 fills; commitments + outbox on the ER)", async () => {
