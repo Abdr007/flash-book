@@ -8681,7 +8681,11 @@ pub mod flash_book {
                     Ok(d) => d,
                     Err(_) => continue,
                 };
-                let mut slice: &[u8] = &data[8..];
+                // try_deserialize_unchecked handles the 8-byte discriminator
+                // itself, so pass the FULL slice — `data[8..]` would skip a second
+                // 8 bytes and mis-read the offer (every candidate then parses to
+                // garbage and is dropped, silently disabling the JIT auction).
+                let mut slice: &[u8] = &data[..];
                 match anchor_lang::AccountDeserialize::try_deserialize_unchecked(&mut slice) {
                     Ok(v) => {
                         drop(data);
@@ -8765,15 +8769,18 @@ pub mod flash_book {
                 let acct = &ctx.remaining_accounts[best_idx];
                 // Re-borrow, update remaining_size, serialize back.
                 let mut data = acct.try_borrow_mut_data()?;
-                let mut slice: &[u8] = &data[8..];
+                // try_deserialize_unchecked / try_serialize both handle the 8-byte
+                // discriminator themselves, so pass the FULL account slice — not
+                // `data[8..]`, which would skip a second 8 bytes (mis-read the
+                // offer / write the discriminator into the body).
+                let mut slice: &[u8] = &data[..];
                 let mut offer: state_v3::JitLiquidationOfferAccount =
                     anchor_lang::AccountDeserialize::try_deserialize_unchecked(&mut slice)?;
                 offer.remaining_size_lots = offer
                     .remaining_size_lots
                     .checked_sub(fill_size)
                     .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
-                // Serialize back. Anchor account: 8-byte disc + body.
-                let mut writer: &mut [u8] = &mut data[8..];
+                let mut writer: &mut [u8] = &mut data[..];
                 anchor_lang::AccountSerialize::try_serialize(&offer, &mut writer)?;
                 drop(data);
 
