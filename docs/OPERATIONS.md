@@ -126,7 +126,46 @@ confirm a probe transaction signed by the OLD key is rejected with
 
 ---
 
+## 3. FLP accounting: exactly one system per market
+
+Flash Book carries two FLP (pool-as-counterparty) accounting systems, and both
+mint LP shares redeemable against the **same** protocol vault
+(`insurance_fund.quote_vault`):
+
+- **Singleton** — `FlpExposureAccount` (`[b"flp_exposure"]`), holding per-market
+  inventory in `per_market[]`. Its realized PnL is booked automatically at
+  settlement by `apply_flp_fill`; capital enters/exits via
+  `deposit_flp_capital` / `withdraw_flp_capital`.
+- **Per-market v3** — `FlpExposurePerMarketAccountV3`
+  (`[b"flp_per_market", market]`). Its realized PnL is booked by the
+  keeper-driven `record_flp_fill_v3`; capital enters/exits via
+  `flp_deposit_v3` / `flp_withdraw_v3`.
+
+### The constraint
+
+**Run at most ONE of these on any given market.** There is deliberately no
+on-chain interlock coupling the two (an airtight guard would require a versioned
+`MarketAccount` layout field, which the account has no reserved slack for). If a
+market is operated with LP capital in *both* systems and the same economic fills
+are booked into both, the combined redeemable NAV
+(`NAV_singleton + NAV_v3`) can exceed the vault's true FLP backing, so the last
+redeemers over-withdraw and the shortfall socializes onto everyone else. This is
+an operational misconfiguration, not an unprivileged exploit: both booking paths
+are privileged (settlement sequencer / insurance-fund authority), and a market
+that only ever uses one system is unaffected.
+
+### Ordering, per market
+
+1. Pick the system at market bring-up. Default to the **singleton** unless a
+   per-market share ledger is specifically required.
+2. Never call `deposit_flp_capital` / `record_flp_fill_v3` (v3) against a market
+   that already carries capital or inventory in the other system.
+3. If migrating a market between systems, fully drain and zero the source
+   system (no shares outstanding, no inventory) before seeding the target.
+
 ## Residual gates that are neither code nor ops runbooks
 
 - **Professional external audit** — see [../SECURITY.md](../SECURITY.md).
 - **Live volume** on the target venue.
+- **FLP one-system-per-market** — §3 above; an operational invariant, not a
+  code interlock.
