@@ -73,10 +73,26 @@ pub fn get_price_no_older_than_full(
     );
 
     require!(&data[m..m + 32] == feed_id, FlashBookError::OracleTooStale); // MismatchedFeedId
-    let price = i64::from_le_bytes(data[m + 32..m + 40].try_into().unwrap());
-    let conf = u64::from_le_bytes(data[m + 40..m + 48].try_into().unwrap());
-    let exponent = i32::from_le_bytes(data[m + 48..m + 52].try_into().unwrap());
-    let publish_time = i64::from_le_bytes(data[m + 52..m + 60].try_into().unwrap());
+    let price = i64::from_le_bytes(
+        data[m + 32..m + 40]
+            .try_into()
+            .map_err(|_| error!(crate::FlashBookError::OutOfRange))?,
+    );
+    let conf = u64::from_le_bytes(
+        data[m + 40..m + 48]
+            .try_into()
+            .map_err(|_| error!(crate::FlashBookError::OutOfRange))?,
+    );
+    let exponent = i32::from_le_bytes(
+        data[m + 48..m + 52]
+            .try_into()
+            .map_err(|_| error!(crate::FlashBookError::OutOfRange))?,
+    );
+    let publish_time = i64::from_le_bytes(
+        data[m + 52..m + 60]
+            .try_into()
+            .map_err(|_| error!(crate::FlashBookError::OutOfRange))?,
+    );
 
     // Reject a FUTURE-dated publish_time. `age` uses
     // `saturating_sub`, which clamps a future timestamp's age to 0 and would slip it

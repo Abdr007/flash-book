@@ -12,7 +12,6 @@ pub mod insurance;
 pub mod jit_lp_defense;
 pub mod liquidation;
 pub mod lot;
-pub mod merkle;
 pub mod order;
 pub mod position_math;
 pub mod reduce_only;

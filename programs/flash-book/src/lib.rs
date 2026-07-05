@@ -9681,7 +9681,7 @@ pub mod flash_book {
                     acceptable_price_ticks <= trigger_price_ticks,
                     FlashBookError::OutOfRange
                 ),
-                _ => unreachable!(),
+                _ => return Err(error!(FlashBookError::OutOfRange)),
             }
         }
 
@@ -9936,18 +9936,17 @@ pub mod flash_book {
             & state_v3::TriggerOrderAccountV3::FLAG_HAS_SIBLING
             != 0;
         if has_sibling {
-            let is_valid = {
-                let trigger = &ctx.accounts.trigger_order;
-                let sibling = ctx
-                    .accounts
-                    .sibling_trigger
-                    .as_ref()
-                    .ok_or_else(|| error!(FlashBookError::OutOfRange))?;
-                trigger.is_oco_sibling(sibling)
-            };
-            require!(is_valid, FlashBookError::OutOfRange);
-            ctx.accounts.sibling_trigger.as_mut().unwrap().flags &=
-                !state_v3::TriggerOrderAccountV3::FLAG_ACTIVE;
+            let trigger_key_side = &ctx.accounts.trigger_order;
+            let sibling = ctx
+                .accounts
+                .sibling_trigger
+                .as_mut()
+                .ok_or_else(|| error!(FlashBookError::OutOfRange))?;
+            require!(
+                trigger_key_side.is_oco_sibling(sibling),
+                FlashBookError::OutOfRange
+            );
+            sibling.flags &= !state_v3::TriggerOrderAccountV3::FLAG_ACTIVE;
         }
 
         emit!(TriggerOrderV3ExecutedEvent {
@@ -10049,7 +10048,7 @@ pub mod flash_book {
                     acceptable_price_ticks <= limit_price_ticks,
                     FlashBookError::OutOfRange
                 ),
-                _ => unreachable!(),
+                _ => return Err(error!(FlashBookError::OutOfRange)),
             }
         }
 

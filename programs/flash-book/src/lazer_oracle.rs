@@ -88,16 +88,32 @@ impl<'a> Cursor<'a> {
         Ok(self.take(1)?[0])
     }
     fn i16(&mut self) -> LzResult<i16> {
-        Ok(i16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(i16::from_le_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| LazerError::Truncated)?,
+        ))
     }
     fn u32(&mut self) -> LzResult<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| LazerError::Truncated)?,
+        ))
     }
     fn u64(&mut self) -> LzResult<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_le_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| LazerError::Truncated)?,
+        ))
     }
     fn i64(&mut self) -> LzResult<i64> {
-        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(i64::from_le_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| LazerError::Truncated)?,
+        ))
     }
     /// Skip a property value whose property-id we don't care about, by size.
     fn skip_prop(&mut self, prop_id: u8) -> LzResult<()> {
