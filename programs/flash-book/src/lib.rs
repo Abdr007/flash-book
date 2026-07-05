@@ -11221,47 +11221,52 @@ pub mod flash_book {
         size_lots: u64,
         price_ticks: u64,
         side: u8,
-        realized_pnl_delta: i64,
     ) -> Result<()> {
         require!(side <= 1, FlashBookError::OutOfRange);
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(price_ticks > 0, FlashBookError::ZeroPrice);
 
+        let tick_size = ctx.accounts.market.params.tick_size;
         let acct = &mut ctx.accounts.exposure;
         require!(
             acct.authority == ctx.accounts.authority.key(),
             FlashBookError::Unauthorized
         );
 
-        if acct.size_lots == 0 {
-            acct.side = side;
-            acct.size_lots = size_lots;
-            acct.entry_price_ticks = price_ticks;
-        } else if acct.side == side {
-            let new_size = acct.size_lots.saturating_add(size_lots);
-            let new_entry_u128 = (acct.entry_price_ticks as u128)
-                .saturating_mul(acct.size_lots as u128)
-                .saturating_add((price_ticks as u128).saturating_mul(size_lots as u128))
-                / new_size as u128;
-            acct.size_lots = new_size;
-            acct.entry_price_ticks = if new_entry_u128 > u64::MAX as u128 {
-                u64::MAX
+        // Derive the realized PnL from this fill against the pool's stored
+        // inventory VWAP through the SAME Kani-proven core trader fills use
+        // (`position_math`) — open / stack-VWAP / reduce-flip with H-1 PnL. The
+        // caller no longer supplies (and so cannot fabricate) an unbacked PnL
+        // delta that would inflate LP NAV over the shared vault; the recorded PnL
+        // is now a pure function of the reported (side, size, price) and the
+        // pool's own inventory.
+        use matcher::position_math as pm;
+        let cur = pm::Pos {
+            side: if acct.size_lots == 0 {
+                pm::SIDE_LONG
             } else {
-                new_entry_u128 as u64
-            };
-        } else if size_lots <= acct.size_lots {
-            acct.size_lots -= size_lots;
-            if acct.size_lots == 0 {
-                acct.side = 255;
-                acct.entry_price_ticks = 0;
-            }
-        } else {
-            let remaining = size_lots - acct.size_lots;
-            acct.side = side;
-            acct.size_lots = remaining;
-            acct.entry_price_ticks = price_ticks;
-        }
+                acct.side
+            },
+            size_lots: acct.size_lots,
+            entry_ticks: acct.entry_price_ticks,
+        };
+        let outcome =
+            pm::apply_fill(cur, side, size_lots, price_ticks, tick_size).map_err(|e| match e {
+                pm::PosMathError::Overflow => error!(FlashBookError::ArithmeticOverflow),
+                pm::PosMathError::Underflow => error!(FlashBookError::ArithmeticUnderflow),
+                pm::PosMathError::DivByZero => error!(FlashBookError::DivisionByZero),
+            })?;
 
+        if outcome.pos.size_lots == 0 {
+            acct.side = 255; // empty marker
+            acct.size_lots = 0;
+            acct.entry_price_ticks = 0;
+        } else {
+            acct.side = outcome.pos.side;
+            acct.size_lots = outcome.pos.size_lots;
+            acct.entry_price_ticks = outcome.pos.entry_ticks;
+        }
+        let realized_pnl_delta = outcome.realized_pnl_quote_lots;
         acct.realized_pnl = acct.realized_pnl.saturating_add(realized_pnl_delta);
 
         emit!(FlpFillRecordedV3Event {
@@ -11335,6 +11340,9 @@ pub mod flash_book {
             .shares
             .checked_add(shares)
             .ok_or(FlashBookError::ArithmeticOverflow)?;
+        // Reset the minimum-hold lock on every deposit (a top-up extends it), so
+        // a JIT depositor cannot sneak in before a NAV-lifting fill and redeem.
+        pos.deposited_at_slot = matcher::jit_lp_defense::extend_lock_on_deposit(Clock::get()?.slot);
 
         emit!(FlpDepositedV3Event {
             market: acct.market,
@@ -11350,6 +11358,20 @@ pub mod flash_book {
     /// Withdraw FLP capital by burning shares + SPL release.
     pub fn flp_withdraw_v3(ctx: Context<FlpWithdrawV3>, shares_to_burn: u64) -> Result<()> {
         require!(shares_to_burn > 0, FlashBookError::ZeroSize);
+
+        // Minimum-hold JIT-LP defense (mirrors the singleton `withdraw_flp_capital`):
+        // an LP cannot flash-deposit just before a NAV-lifting `record_flp_fill_v3`
+        // and redeem the windfall without bearing risk. `deposited_at_slot == 0`
+        // (a position created before the field existed) ⇒ `can_withdraw` true, so
+        // no lock is retroactively imposed.
+        require!(
+            matcher::jit_lp_defense::can_withdraw(
+                ctx.accounts.position.deposited_at_slot,
+                Clock::get()?.slot,
+                constants::FLP_MIN_HOLD_SLOTS,
+            ),
+            FlashBookError::RateLimited
+        );
 
         let market_key = ctx.accounts.exposure.market;
         let pos_shares = ctx.accounts.position.shares;
@@ -20796,6 +20818,16 @@ pub struct InitFlpPerMarketV3<'info> {
 #[derive(Accounts)]
 pub struct RecordFlpFillV3<'info> {
     pub authority: Signer<'info>,
+
+    /// The fill's market — supplies `tick_size` for the on-chain PnL
+    /// derivation. Bound to the exposure so a foreign market cannot be
+    /// substituted. Boxed to keep the BPF frame small.
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.key() == exposure.market @ FlashBookError::WrongMarket,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
 
     #[account(
         mut,

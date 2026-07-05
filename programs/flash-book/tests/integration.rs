@@ -8012,6 +8012,222 @@ async fn grow_fill_commitment_raises_ring_cap() {
     );
 }
 
+/// `flp_withdraw_v3` enforces the minimum-hold JIT-LP defense (mirroring the
+/// singleton `withdraw_flp_capital`): an LP that deposits and immediately tries
+/// to redeem — well inside `FLP_MIN_HOLD_SLOTS` — is rejected with RateLimited,
+/// so a JIT depositor cannot slip in front of a NAV-lifting `record_flp_fill_v3`
+/// and capture the windfall without bearing risk.
+#[tokio::test]
+async fn flp_withdraw_v3_enforces_min_hold() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let (exposure, _) = pda(&[
+        flash_book::state_v3::FlpExposurePerMarketAccountV3::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    // Init the per-market FLP exposure (authority = payer = insurance-fund authority).
+    let init_ix = build_ix(
+        flash_book::instruction::InitFlpPerMarketV3 {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Fund an LP + its quote ATA.
+    let lp = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &lp.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let lp_ata = create_ata(&mut ctx, &payer, lp.pubkey(), protocol.quote_mint).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp_ata, 10_000_000).await;
+
+    let (position, _) = pda(&[
+        flash_book::state_v3::FlpPositionAccountV3::SEED,
+        exposure.as_ref(),
+        lp.pubkey().as_ref(),
+    ]);
+
+    // Deposit — stamps `deposited_at_slot = now`.
+    let deposit_ix = build_ix(
+        flash_book::instruction::FlpDepositV3 {
+            amount_quote_lots: 1_000_000,
+        },
+        vec![
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new(exposure, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(lp_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[deposit_ix],
+            Some(&lp.pubkey()),
+            &[&lp],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Immediate withdraw — far inside the 150-slot hold ⇒ RateLimited (Custom(7208)).
+    let withdraw_ix = build_ix(
+        flash_book::instruction::FlpWithdrawV3 { shares_to_burn: 1 },
+        vec![
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new(exposure, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new(lp_ata, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[withdraw_ix],
+            Some(&lp.pubkey()),
+            &[&lp],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(7208)"),
+        "immediate v3 FLP withdraw must be rejected with RateLimited, got: {dbg}"
+    );
+}
+
+/// `record_flp_fill_v3` derives realized PnL on-chain from the reported fill
+/// against the pool's stored inventory VWAP — the caller no longer supplies (and
+/// cannot fabricate) a PnL delta. Open the FLP long 10 @ 100, then close 10 @
+/// 110: with tick_size 1 the pool realizes exactly 10*(110-100) = 100 quote-lots
+/// and the inventory returns to empty.
+#[tokio::test]
+async fn record_flp_fill_v3_derives_realized_pnl_on_chain() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let (exposure, _) = pda(&[
+        flash_book::state_v3::FlpExposurePerMarketAccountV3::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    let init_ix = build_ix(
+        flash_book::instruction::InitFlpPerMarketV3 {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let record_metas = vec![
+        AccountMeta::new_readonly(payer.pubkey(), true),
+        AccountMeta::new_readonly(market_pda, false),
+        AccountMeta::new(exposure, false),
+    ];
+
+    // Open long 10 @ 100 — no realized PnL.
+    let open_ix = build_ix(
+        flash_book::instruction::RecordFlpFillV3 {
+            size_lots: 10,
+            price_ticks: 100,
+            side: 0,
+        },
+        record_metas.clone(),
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[open_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let e0: flash_book::state_v3::FlpExposurePerMarketAccountV3 =
+        fetch(&mut ctx.banks_client, exposure).await;
+    assert_eq!(e0.realized_pnl, 0, "open realizes no PnL");
+    assert_eq!((e0.side, e0.size_lots), (0, 10), "long 10 open");
+
+    // Close 10 @ 110 → realized PnL = 10*(110-100)*tick_size(1) = 100.
+    let close_ix = build_ix(
+        flash_book::instruction::RecordFlpFillV3 {
+            size_lots: 10,
+            price_ticks: 110,
+            side: 1,
+        },
+        record_metas,
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[close_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let e1: flash_book::state_v3::FlpExposurePerMarketAccountV3 =
+        fetch(&mut ctx.banks_client, exposure).await;
+    assert_eq!(e1.realized_pnl, 100, "derived close PnL = 10*(110-100)");
+    assert_eq!(e1.size_lots, 0, "inventory closed to flat");
+    assert_eq!(e1.side, 255, "empty marker after full close");
+}
+
 /// ER-layer coverage (honest scope): a faithful delegate→commit→undelegate
 /// round-trip needs a live MagicBlock ER (the handlers CPI into the delegation
 /// program, absent here) and is a devnet lifecycle test. What IS real and
