@@ -273,6 +273,8 @@ pub enum FlashBookError {
     ErTradingArmed = 2319,
     #[msg("Cannot disarm ER-trading mode while exposure remains (open positions or attested ER-reserved margin)")]
     ErDisarmHasExposure = 2320,
+    #[msg("FLP system conflict: the other FLP accounting system already holds LP shares (singleton and per-market v3 are mutually exclusive)")]
+    FlpSystemModeConflict = 2321,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
