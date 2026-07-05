@@ -138,7 +138,7 @@ the EMA clamp? Check `FillBatchEvent` history.
 **Detection**: `FundingSettledEvent` rates > 1% per hour or rapid
 sign-flips slot-to-slot.
 
-**Immediate**: nothing if Wave 37 (funding velocity smoothing) is
+**Immediate**: nothing if funding-velocity smoothing is
 wired in. Pre-wire-in, authority can call `update_market_params` to
 tighten `funding_per_period_max_bps`.
 
@@ -201,7 +201,7 @@ For every P0 / P1:
 | `set_market_status(Active)` | Restore | per-market authority |
 | Envelope tightening | Lower `max_price_move_bps_per_slot` | per-market authority |
 | Burn authority | Permanent decentralization (irreversible) | per-market authority |
-| FLP deposit pause | (Wave 28 future) — block new FLP deposits | per-market authority |
+| FLP deposit pause | (future) — block new FLP deposits | per-market authority |
 
 Once `burn_market_authority` has been called, NONE of the above admin
 kill switches are available. Operators should burn only after a market

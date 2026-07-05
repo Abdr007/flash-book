@@ -1,14 +1,13 @@
 # H-Haircut Math
 
-Formal spec for flash-book's **junior-claim profit gating** primitive
-introduced in Wave 24. Math is adapted from Percolator `spec.md`
-v12.20.6 §3 to flash-book's lot/decimal conventions
-(`USD_UNIT = 10^6`, `BPS_DENOM = 10^4`).
+Formal spec for flash-book's **junior-claim profit gating** primitive,
+in flash-book's lot/decimal conventions (`USD_UNIT = 10^6`,
+`BPS_DENOM = 10^4`).
 
 The pure-function core lives at
 `programs/flash-book/src/matcher/haircut.rs`; this document is the
-normative reference for that module's behaviour and the integration
-contract for Wave 24b (wire-in to `apply_realized_pnl_delta`).
+normative reference for that module's behaviour and for its wire-in to
+`apply_realized_pnl_delta`.
 
 ## 1. Goal
 
@@ -260,34 +259,28 @@ each property over 2000 random cases.
 
 ## 11. References
 
-- Percolator `spec.md` v12.20.6 §3 — `aeyakovenko/percolator/blob/master/spec.md`.
-- Percolator `percolator.rs::convert_released_pnl_not_atomic` — reference implementation.
 - Tarun Chitra, *Autodeleveraging: Impossibilities and Optimization*, arXiv:2512.01112 — motivation for the junior-claim design (Hyperliquid Oct 10 2025 ADL overshoot).
 - The "realized PnL doesn't materialise to collateral on close" failure mode this primitive structurally resolves (see `docs/MARGIN_MATH.md`).
 
-## 12. Wire-in plan (Wave 24b)
+## 12. Wire-in (integration contract)
 
-This wave (24) ships the pure module + sibling PDAs only. Wire-in
-(Wave 24b) needs to:
+The on-chain wire-in consists of:
 
-1. **Init / migrate**: add `initialize_haircut_state(market)` ix that
-   seeds `MarketHaircutStateAccount` with current Residual derived
-   from the live vault / collateral / insurance balances.
-2. **Replace `apply_realized_pnl_delta` positive-gain path**: route
-   positive deltas through `apply_release` onto a
-   `PositionHaircutStateAccount` (init-if-needed), instead of
+1. **Init**: `initialize_haircut_state(market)` seeds
+   `MarketHaircutStateAccount` with the Residual derived from the live
+   vault / collateral / insurance balances, and enables the engine on
+   the market (sticky).
+2. **`apply_realized_pnl_delta` positive-gain path**: on
+   haircut-enabled markets, positive deltas route through
+   `apply_release` onto a `PositionHaircutStateAccount` instead of
    crediting collateral directly. Losses (negative deltas) keep the
-   existing path.
-3. **Permissionless `mature_position(market, position)`**: anyone can
-   call to advance `released_reserve → matured_pos` for a given
-   position. Pays the caller a tiny tip from the matured delta as
-   an incentive to keep state fresh.
-4. **Permissionless `convert_position(market, position)`**: anyone
-   can call to convert the position's `matured_pos` to collateral at
-   the current `h`. Pays caller a tip. The trader can also call this
-   themselves (free for their own positions).
-5. **`flush_haircut_dust(market)`**: drain
-   `dust_accrued_quote_lots` to the insurance fund. Permissionless.
+   direct path.
+3. **`mature_position(market, position)`** (permissionless): advances
+   `released_reserve → matured_pos` for a position.
+4. **`convert_position(market, position)`**: converts the position's
+   `matured_pos` to collateral at the current `h`.
+5. **`flush_haircut_dust(market)`** (permissionless): drains
+   `dust_accrued_quote_lots` to the insurance fund.
 6. **Residual delta-tracking hooks**:
    - `deposit_collateral`: Residual += deposit_amount only if the
      deposit goes to the vault surplus, not to a position bucket
@@ -307,15 +300,13 @@ This wave (24) ships the pure module + sibling PDAs only. Wire-in
      debited). Residual change = -reward + collateral_freed.
      Net: Residual increases by `collateral_freed - reward` ≥ 0
      when reward ≤ collateral_freed.
-   - The single source of truth for these adjustments will be a new
-     `apply_residual_delta()` helper that every money-moving ix
-     calls.
+   - The single source of truth for these adjustments is the
+     `apply_residual_delta()` helper that money-moving paths call.
 7. **Sanity check ix**: `verify_haircut_invariants(market)` reads
    on-chain balances, recomputes Residual, asserts equality with
    `MarketHaircutStateAccount.residual_quote_lots` within a tolerance,
    trips the kill switch if not.
 
-Wave 24b is a separate commit because (a) it touches the apply_fill
-hot path, (b) it requires the Residual seeding ix, and (c) it needs
-its own test surface. Keeping Wave 24 additive makes the math review
-independent of the wire-in review.
+The pure math and the wire-in are reviewable independently: the module
+owns no account types, and the handlers are direct passthroughs to the
+proven pure functions.

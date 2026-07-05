@@ -154,7 +154,7 @@ pub mod flash_book {
         // A cap `<= 105` keeps BOTH the ring (≤3,424 B) and a matching outbox
         // (≤10,144 B) one-CPI delegate-safe → the whole off-log pipeline runs ON the
         // ER. Up to 256 is the L1 deep-sweep (the outbox can't be ER-delegated past
-        // ~105 — the 10,240 B/ix buffer-create cap; see FILL_OUTBOX_DESIGN.md §10).
+        // ~105 — the 10,240 B/ix buffer-create cap; see docs/SETTLEMENT.md §2).
         require!(
             cap >= MAX_BATCH_ORDERS_PER_SIDE_V2 as u32 && cap <= fc::FILL_RING_CAP,
             FlashBookError::OutOfRange
@@ -294,8 +294,9 @@ pub mod flash_book {
 
     /// One-way, authority-gated upgrade of a market's
     /// fill-commitment ring from the v0 layout to v1, enabling per-position
-    /// reduce-in-flight tracking (closes the last F-3 edge: a position shrunk below
-    /// its resting reduce-only, then over-crossed across the match→settle gap).
+    /// reduce-in-flight tracking, closing the last reduce-only edge: a position
+    /// shrunk below its resting reduce-only size, then over-crossed across the
+    /// match→settle gap.
     /// MUST run on the BASE LAYER with the ring UNdelegated (a delegated ring is
     /// owned by the delegation program — realloc would be illegal) and the ring
     /// DRAINED (`produced == settled`; a pending fill would be left without a reduce
@@ -1093,7 +1094,7 @@ pub mod flash_book {
         )
     }
 
-    // ── Fill-Outbox (FILL_OUTBOX_DESIGN.md) ──────────────────────────────────
+    // ── Fill-Outbox (docs/SETTLEMENT.md) ─────────────────────────────────────
     // The fill-outbox is an additive on-chain DATA mirror of the keccak
     // commitment ring: the matcher writes each crossed fill's data into it so the
     // sequencer reads fills via `getAccountInfo` instead of the 10 KB-bounded
@@ -1217,8 +1218,8 @@ pub mod flash_book {
         // `FILL_RING_CAP` is the init default, and grow raises the per-ER-session
         // fill ceiling (the matcher clamps `walk_limit` to `FILL_RING_CAP`
         // independently via `effective_batch_cap`). The Kani proofs are
-        // cap-agnostic, so no upper bound applies here. (Audit LOW #2 was a
-        // false positive — verified by the deep-book tests that grow to 512.)
+        // cap-agnostic, so no upper bound applies here; the deep-book tests
+        // grow the ring to 512 and stay green.
         let additional_bytes = (additional_slots as usize)
             .checked_mul(fo::FILL_OUTBOX_SLOT_LEN)
             .ok_or(error!(FlashBookError::ArithmeticOverflow))?;
@@ -1913,7 +1914,7 @@ pub mod flash_book {
         // parallel `Vec<FillEntry>` — on the outbox path no such Vec exists at all.
         // The SBF bump allocator never frees, so a second N-sized Vec plus a
         // serialized fat event would blow the 32 KiB heap past ~100 levels (the old
-        // OOM). See FILL_OUTBOX_DESIGN.md / DEEP_BOOK_CU.md.
+        // OOM). See docs/SETTLEMENT.md.
         for (maker_idx, _maker_id, fill_size, _fill_price, _maker_trader, _maker_sub_idx, _ro) in
             &matches
         {
@@ -9854,9 +9855,10 @@ pub mod flash_book {
         // idiom and this handler is a per-fire keeper call, not the matcher walk.
         // Scale-out is preserved (partial exits summing ≤ position all fit); only
         // genuine over-capacity is trimmed. (A residual — a position SHRUNK below its
-        // already-resting reduce-only after injection — still needs the match-time
-        // per-position in-flight migration in F3_REDUCE_ONLY_INFLIGHT_SPEC.md; that
-        // path is far narrower: a deliberate self-shrink-then-overhang self-cross.)
+        // already-resting reduce-only after injection — is closed by the v1
+        // fill-commitment reduce-in-flight tracking on upgraded markets; see
+        // docs/SETTLEMENT.md §3. That path is far narrower: a deliberate
+        // self-shrink-then-overhang self-cross.)
         let effective_size: u64 = if is_reduce_only {
             let mut existing: u64 = 0;
             if side == 0 {
@@ -16972,7 +16974,7 @@ pub const BOOK_DEPTH_LEVELS: usize = 4;
 ///    NOT help — it repeats the 86-byte header per chunk, using MORE log bytes.
 ///    Reaching 256+ requires moving fill data off logs into an on-chain
 ///    fill-outbox account (read via getAccountInfo) — a future architectural
-///    change, not a matcher tweak. See DEEP_BOOK_CU.md.
+///    change, not a matcher tweak. See docs/SETTLEMENT.md.
 /// 2. **32 KiB SBF heap.** `matches` is pre-sized to this cap (one alloc, no
 ///    doubling-realloc leak — the SBF bump allocator never frees), and coexists
 ///    with the `fills` Vec + the serialized event. Peak ≈ cap × ~175 B. The old

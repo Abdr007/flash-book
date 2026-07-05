@@ -2490,7 +2490,7 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
 
     let trader = Keypair::new();
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
-    // Phase 2c: Position PDAs key on the trader_state PDA, not the wallet.
+    // Position PDAs key on the trader_state PDA, not the wallet.
     let (taker_pos, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -3612,10 +3612,10 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
     assert!(result.is_err(), "dispersed-oracle update should fail");
 }
 
-// ─── Phase 2d — sub-account trading enablement tests ────────────────
+// ─── Sub-account trading enablement tests ───────────────────────────
 
 /// A sub-account can be the `trader_state` for `deposit_collateral` after
-/// the Phase 2d seed relaxation. Verifies the deposited collateral lands
+/// the relaxed trader-state seed. Verifies the deposited collateral lands
 /// on the SUB account, not the main — proving cross-pool isolation works
 /// at the deposit boundary.
 #[tokio::test]
@@ -3705,7 +3705,7 @@ async fn deposit_collateral_credits_sub_account_when_used_as_trader_state() {
 }
 
 /// A signer cannot deposit using another trader's TraderState as the
-/// `trader_state` argument, even though Phase 2d dropped the
+/// `trader_state` argument, even though the context dropped the
 /// `seeds = [SEED, signer.key().as_ref()]` constraint. The handler-side
 /// `trader_state.trader == trader.key()` check enforces ownership.
 #[tokio::test]
@@ -3757,7 +3757,7 @@ async fn deposit_collateral_rejects_wrong_trader_state() {
 }
 
 /// Migrate a Position from the legacy `(market, wallet)` PDA to the
-/// new Phase 2c `(market, trader_state)` PDA. After migration the
+/// canonical `(market, trader_state)` PDA. After migration the
 /// legacy address is closed (rent refunded) and the new address holds
 /// the same on-chain state.
 #[tokio::test]
@@ -6716,7 +6716,7 @@ async fn deep_book_matching_cu_curve() {
     );
 }
 
-/// FILL-OUTBOX end-to-end (FILL_OUTBOX_DESIGN.md): a market that arms a fill-outbox
+/// FILL-OUTBOX end-to-end (docs/SETTLEMENT.md): a market that arms a fill-outbox
 /// and raises its batch cap to 256 crosses **256 levels in a single tx, in the
 /// DEFAULT 32 KiB heap** (no heap-frame request) — the fills are delivered through
 /// the on-chain outbox ACCOUNT, not the 10 KB-bounded program log. Asserts:
@@ -7403,10 +7403,10 @@ async fn cu_benchmark_settlement_and_risk_paths() {
     );
 }
 
-/// Phase 2g coverage end-to-end: open a winning position then close
+/// Realized-PnL materialisation end-to-end: open a winning position then close
 /// it, verify the realized PnL actually materialises on the trader's
 /// `trader_state.collateral_quote_lots`. This is the bug the prior
-/// MARGIN_MATH §8.1 documented and Phase 2g fixed; this test proves
+/// MARGIN_MATH §8.1 specifies; this test proves
 /// the fix works on-chain, not just at the routing-math layer.
 #[tokio::test]
 async fn apply_fill_materialises_realized_pnl_on_winning_close() {
@@ -7528,12 +7528,12 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
 
     let taker_after_close: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
 
-    // The Phase 2g materialisation check:
+    // The realized-PnL materialisation check:
     let expected_after_close = collateral_after_open + 10_000 - 55;
     assert_eq!(
         taker_after_close.collateral_quote_lots, expected_after_close,
         "realized PnL must materialise on trader_state.collateral_quote_lots \
-         (Phase 2g). Got {}, expected {} (+10_000 PnL credit - 55 close fee)",
+         (realized-PnL materialisation). Got {}, expected {} (+10_000 PnL credit - 55 close fee)",
         taker_after_close.collateral_quote_lots, expected_after_close,
     );
 
@@ -7542,13 +7542,13 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
         fetch(&mut ctx.banks_client, taker_pos).await;
     assert_eq!(pos_after_close.size_lots, 0);
     // realized_pnl_quote_lots accumulates lifetime PnL on the position
-    // (informational tally — Phase 2g routes the collateral move via
+    // (informational tally — materialisation routes the collateral move via
     // trader_state). For this single-fill close we expect the PnL
     // delta we just verified.
     assert_eq!(pos_after_close.realized_pnl_quote_lots, 10_000);
 }
 
-/// Phase 2i coverage: an honest-sequencer fill works; a hostile
+/// Sub-index PDA binding: an honest-sequencer fill works; a hostile
 /// sequencer that passes the wrong sub-account TraderState PDA is
 /// rejected with WrongTrader. This locks in the 1-byte routing-attack
 /// surface fix.
@@ -7607,7 +7607,7 @@ async fn apply_fill_rejects_wrong_sub_index_trader_state() {
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
 
     // ── Attack: the sequencer passes the SUB TraderState account but
-    //    claims taker_sub_index = 0 in the ix data. Phase 2i derives
+    //    claims taker_sub_index = 0 in the ix data. ApplyFill derives
     //    the expected PDA from (taker_sub_state.trader, 0) — which is
     //    the MAIN PDA — and compares against the actual passed key
     //    (the sub PDA). Mismatch → WrongTrader. ─────────────────────
@@ -7649,7 +7649,7 @@ async fn apply_fill_rejects_wrong_sub_index_trader_state() {
         .await;
     assert!(
         result.is_err(),
-        "ApplyFill must reject wrong-sub_index trader_state (Phase 2i)"
+        "ApplyFill must reject wrong-sub_index trader_state"
     );
 }
 

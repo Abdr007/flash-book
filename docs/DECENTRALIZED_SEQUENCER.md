@@ -1,166 +1,82 @@
-# Decentralized sequencer — M-14 endgame (design)
+# Decentralized sequencer — design and on-chain status
 
-> Status: **design**. This is the architecture + phased plan for removing the
-> single-sequencer trust point (audit residual **M-14**) while keeping a
-> **continuous, price-time CLOB** — explicitly **not** FBA. The full system is a
-> multi-month distributed-systems buildout; this doc scopes it and specifies the
-> concrete on-chain primitive so implementation can proceed in safe, verifiable
-> phases. It does not itself change program behavior.
+Flash Book today runs one sequencer per market: it operates the continuous
+CLOB on the Ephemeral Rollup and signs fill settlement. What that single
+party can and cannot do is bounded on-chain — fill **authenticity** is
+enforced by the commitment ring, settlement replay/reorder by the monotone
+fill sequence, and the mark is pinned to the trustless oracle band — but
+fill **ordering** and **liveness** remain a single-operator trust
+assumption, stated precisely in `ER_TRUST_BOUNDARY.md`.
 
-## 1. Goal & non-goals
+This document describes the committee primitive that already exists
+on-chain as the additive first step toward removing that assumption, and
+the target architecture the primitive is designed for. It is explicitly
+**not** a batch-auction design: matching stays a continuous price-time
+CLOB; consensus would decide only the *input order*.
 
-**Goal.** No single party can choose fill ordering or nudge the mark within the
-band. Trust moves from *one* sequencer to an *M-of-N* validator committee that
-agrees on order flow via BFT consensus.
+## What exists on-chain today
 
-**Non-goals.**
-- **No FBA / batch auctions.** Continuous matching with strict price-time priority
-  is the product edge (sub-50ms, real time priority — the Hyperliquid/dYdX model,
-  not the CoW/Injective batch model). Consensus decides the *input order*; matching
-  stays continuous and deterministic.
-- No change to the proven settlement math (`apply_fill`, haircut, margin, FLP). We
-  change **who is authorized to settle**, not **how a fill settles**.
+Three instructions, all additive and off the settlement hot path —
+settlement authorization is **not** gated on any of this, so a committee
+can be stood up and exercised without touching funds:
 
-## 2. Where we are (and the exact residual)
+1. **`set_sequencer_committee`** (authority): creates or rotates a
+   `SequencerCommittee` PDA — up to `MAX_COMMITTEE_VALIDATORS` (32)
+   distinct validators and a BFT threshold validated against
+   `3·threshold > 2·N`. Rotation bumps the epoch and clears jail state.
+   `N = 1, threshold = 1` reproduces the single-sequencer configuration.
+2. **`commit_batch`** (permissionless): records a committee-attested state
+   transition on the `BatchAttestation` PDA. It verifies the epoch matches
+   the active committee, `batch_seq` strictly increases (replay/reorder
+   guard), `prev_state_root` chains onto the last committed root, and at
+   least `threshold` **distinct**, un-jailed validators each Ed25519-signed
+   the keccak digest of the canonical batch message (native precompile,
+   checked by instruction introspection). No single signer authorizes a
+   batch — the quorum does.
+3. **`slash_equivocation`** (permissionless): jails a validator on a fraud
+   proof — two precompile-verified signatures by the same validator over
+   conflicting batches at the same `(epoch, batch_seq)`. A jailed
+   validator's attestations stop counting toward any quorum; governance
+   re-forms the committee to clear jail state.
 
-Today, per market: one off-chain `sequencer` runs the continuous CLOB, pushes
-`keccak` fill commitments (the §3.2 ring), and calls `apply_fill`.
+The quorum membership, threshold-intersection, and equivocation predicates
+are pure functions in `matcher/committee.rs`, Kani-proven independent of
+account plumbing.
 
-Already enforced on-chain (so the residual is *narrow*):
-- **Authenticity** — a sequencer cannot fabricate / alter / reprice a fill
-  (commitment ring recompute at settlement).
-- **No reorder / replay at settlement** — monotonic `fill_seq`
-  (`advance_settlement_seq`, Kani-proven).
-- **Mark pinned to the trustless oracle** — always-on ≤5% band clamp (#215).
-
-**Residual (M-14):** a single sequencer still (a) chooses *which* crossable order
-to service first among simultaneously-arriving orders, and (b) sets the mark
-*within* the tight band. Both are irreducible without decentralizing *who
-sequences*.
-
-## 3. Target architecture (BFT-consensus continuous CLOB)
+## Target architecture
 
 ```
- traders ──orders──►  Validator set (N; f Byzantine, N ≥ 3f+1)
-                         │  1. shared mempool of signed orders
-                         │  2. BFT consensus on the ORDER-FLOW SEQUENCE
-                         │     (HotStuff/HyperBFT-class; one leader per view,
-                         │      2f+1 votes commit a block = an ordered batch)
-                         │  3. each validator DETERMINISTICALLY replays the
-                         │     agreed order sequence through the SAME CLOB
-                         │     engine → identical fills + mark (state machine
-                         │     replication)
-                         │  4. 2f+1 validators threshold-sign the batch:
-                         │     { prev_state_root, fills_merkle_root,
-                         │       new_state_root, mark, epoch, seq }
-                         ▼
-                  L1 / ER settlement (flash-book program)
-                   verify M-of-N committee sigs over the batch root,
-                   then settle the batch (existing apply_fill math)
+ traders ──orders──►  Validator set (N ≥ 3f+1)
+                        │ 1. shared mempool of signed orders
+                        │ 2. BFT consensus on the ORDER-FLOW SEQUENCE
+                        │ 3. each validator deterministically replays the
+                        │    agreed sequence through the same CLOB engine
+                        │    (state-machine replication → identical fills)
+                        │ 4. 2f+1 validators threshold-sign the batch
+                        ▼
+                 L1 / ER settlement (this program)
+                  verify the committee attestation, then settle via the
+                  existing apply_fill math
 ```
 
-Because the *sequence* is consensus-determined and matching is a deterministic
-function of it, no single validator controls ordering or the mark. Safety needs
-2f+1 honest; a minority cannot forge a batch (can't reach threshold) nor reorder
-(the committed sequence is signed).
+Because the sequence is consensus-determined and matching is a
+deterministic function of it, no single validator controls ordering or the
+mark. The settlement *math* never changes — only **who is authorized to
+settle** generalizes from one signer to a quorum.
 
-## 4. On-chain changes (the flash-book program part — bounded & specifiable)
+## What remains (future work, in dependency order)
 
-This is the part that lives in this repo. Four additions, all additive/versioned:
+1. **Fill-inclusion binding**: a settlement path that requires a fill to
+   prove membership in an attested batch root (an inclusion-proof fold
+   consumed at settlement). Nothing on-chain consumes inclusion proofs
+   today.
+2. **The off-chain system**: the BFT consensus engine, the deterministic
+   CLOB replica run by every validator, validator clients, and the
+   staking/slashing economics. This is the engineering bulk and lives
+   outside this repository.
+3. **Cutover**: gate settlement on a valid committee attestation, rotate
+   1-of-1 → M-of-N on devnet under the live acceptance suite, then mainnet.
 
-1. **Sequencer committee.** New PDA `SequencerCommittee { market, epoch,
-   validators: Vec<Pubkey> (≤ MAX_N), threshold: u8, ... }`, or generalize
-   `market.sequencer` → committee id. `threshold = 2f+1`.
-2. **Threshold-attestation settlement.** A `settle_batch` path that verifies
-   **≥ threshold** ed25519 signatures (Ed25519 precompile, batched — same
-   introspection pattern as `update_oracle_from_lazer`) over
-   `keccak(prev_state_root ‖ fills_merkle_root ‖ new_state_root ‖ mark ‖ epoch ‖
-   batch_seq)`, then applies the fills via the **existing** `apply_fill` math.
-   `batch_seq` is monotonic (reuse the `advance_settlement_seq` guard) — the batch
-   analog of per-fill replay protection.
-3. **State-root binding.** The batch carries `prev_state_root` / `new_state_root`
-   (a commitment to the book/positions transition) so a partial or forged batch
-   fails to chain — settlement advances only on a validly-signed, correctly-chained
-   transition.
-4. **Committee governance.** Authority (→ multisig/DAO) rotates the validator set
-   at epoch boundaries: `set_committee(epoch, validators, threshold)`, with the old
-   committee finalizing its last batch before handoff. Optional **staking/slashing**
-   PDA: validators stake; two conflicting signed batches at the same `batch_seq` are
-   slashable (submitted as a fraud proof).
-
-None of this touches the settlement *math* or the FIFO ring semantics — it wraps
-**authorization** in an M-of-N check instead of a single signer.
-
-## 5. Off-chain (the multi-month buildout — NOT this repo)
-
-- **Consensus engine.** A HotStuff/HyperBFT-class BFT (candidates:
-  Malachite/Tendermint-core, or a purpose-built HotStuff-2). Leader per view,
-  pipelined commits, sub-second finality.
-- **Deterministic CLOB replica.** The exact matching engine, run identically by
-  every validator over the agreed order sequence (state-machine replication). Must
-  be byte-deterministic (fixed tick math, no wall-clock in matching).
-- **Validator client + mempool + networking**, batch threshold-signing, L1/ER
-  submission, epoch/rotation coordination.
-- **Economics:** stake, rewards, slashing conditions, validator onboarding.
-
-This is where the real engineering-months live.
-
-## 6. Migration — phased, each phase shippable & safe
-
-- **Phase 0 (done).** Single sequencer + authenticity + monotonic `fill_seq` +
-  mark clamp. The residual is *bounded*, not open.
-- **Phase 1 — DONE (#218).** `SequencerCommittee` PDA + authority-gated
-  `set_sequencer_committee` + the Kani-proven BFT-quorum logic
-  (`matcher::committee`). `N = 1, threshold = 1` reproduces the single sequencer,
-  so **zero behavior change**; the primitive + governance now exist. Deployed +
-  live-ER 7/7.
-- **Phase 2 — DONE (#219).** `commit_batch`: permissionless commit of a
-  **committee-attested state transition** — verifies `≥ threshold` **distinct**
-  validators each Ed25519-signed the canonical batch (native precompile over the
-  keccak digest), with epoch check, strictly-increasing `batch_seq`
-  (replay/reorder guard) and `prev→new` state-root chaining, recorded on the
-  `BatchAttestation` PDA. **Verified live 9/9** on devnet (`committee_acceptance.mjs`):
-  3-of-4 quorum accepted; sub-quorum / forged-sig / non-member / replay /
-  broken-chain rejected; a chained batch under a *different* quorum accepted.
-- **Phase 2.5 — DONE.** `matcher::merkle` — the pure, generic, Kani-proven
-  fill-**inclusion** fold (a fill's leaf → `fills_merkle_root`). The bridge a future
-  `settle_batch` uses to prove a specific fill belongs to an attested batch.
-- **Phase 3 (off-chain).** Build the BFT consensus engine + deterministic CLOB
-  replica + validator client. *(The engineering-months; separate system.)*
-- **Phase 4.** Wire settlement to require a valid committee attestation + fill
-  inclusion; stand up the validator set on devnet, rotate 1-of-1 → M-of-N, run the
-  live acceptance suite against the committee, then mainnet.
-
-Each phase is independently reviewable; Phases 1/2/2.5 are safe because they are
-**additive and off the settlement hot path** — settlement is not yet gated on the
-attestation (Phase 4), so they move no funds while the off-chain engine is built.
-
-## 7. The concrete first PR (Phase 1)
-
-Smallest safe step that lays the foundation without changing behavior:
-
-- Add `SequencerCommittee` PDA (default `N=1` = the current `market.sequencer`).
-- Add `settle_batch` that verifies `threshold` Ed25519 sigs over the batch root and
-  dispatches to the existing per-fill settlement, with a monotonic `batch_seq`.
-- Keep the existing single-signer `apply_fill` as the `N=1` fast path (no regression).
-- Host tests: threshold verification (1-of-1 accept; 0 sigs reject; wrong-root
-  reject) + `batch_seq` monotonicity (mirror `advance_settlement_seq` proofs).
-- The live-ER acceptance suite runs unchanged (1-of-1 == today), proving no
-  behavior change.
-
-Estimated: a focused, well-tested PR — the on-chain scaffold for decentralization,
-shippable through the same four-check CI + live-ER path as every Round-2 fix.
-
-## 8. Security notes
-
-- **Trust shift:** from "1 honest sequencer" to "≥ 2f+1 of N honest validators."
-  Safety (no forged/reordered fills) holds under < N/3 Byzantine; liveness needs
-  2f+1 responsive.
-- **Ordering discretion → removed:** the committed order-flow sequence is signed by
-  the quorum; a leader that censors/reorders is replaced by view-change and is
-  slashable, so no single party sets ordering or the mark.
-- **Composability:** the state-root chaining + monotonic `batch_seq` are the batch
-  analogs of the fill-commitment authenticity + `fill_seq` we already prove — the
-  security argument extends, it doesn't restart.
-- **What it does NOT solve:** oracle trust (still Pyth/Lazer), the MagicBlock DLP
-  escape hatch (M-16, upstream), and validator economics (a social/incentive layer).
+Until that cutover, the honest description of the deployed system is the
+single-sequencer trust model with on-chain authenticity — not a
+decentralized sequencer.

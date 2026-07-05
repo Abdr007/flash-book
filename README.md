@@ -1,129 +1,106 @@
 # Flash Book
 
-An open-source perpetual-futures DEX on Solana: a continuous central limit
-order book (CLOB) on a hypertree, a risk engine with machine-checked
-solvency invariants, and a library of order types and risk controls.
+**The machine-proven on-chain orderbook engine built to power [flash.trade](https://flash.trade).**
 
-**Devnet. Not audited. Not production-ready.**
-Program ID `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq` (see `Anchor.toml`).
+A continuous central-limit order book for perpetual futures that matches on a
+MagicBlock Ephemeral Rollup and settles on Solana L1, with every fill
+authenticated against an on-chain commitment ring. Currently deployed to
+devnet; not yet live on flash.trade, not yet externally audited.
 
-This repository is the **on-chain program only**. Clients, bots, keepers,
-and simulators are intentionally not included — build them against the IDL.
+## Spec sheet
 
-## Verified status
+| | |
+|---|---|
+| Matching | Price-time priority CLOB on a red-black-tree slab (hypertree) |
+| Place at depth | **13.0–14.1k CU, flat across a 511-level book** (O(log n) insertion) |
+| Taker sweep | **~14.7k CU base + ~1.2k CU per level crossed**, incl. the per-fill keccak settlement commitment; a 96-level sweep clears in one tx (129k CU) in the default 32 KiB heap |
+| Settlement | Two-phase: match on the ER → `apply_fill` on L1 verifies every fill against the keccak commitment ring; a fabricated fill cannot settle |
+| Formal verification | **57 Kani proof harnesses** on the deployed risk/settlement paths + **Lean theorems** (haircut conservation, OI/MMR, funding) at the real value domain + Certora property specs |
+| Tests | 565 host/integration tests (the integration suite runs the real compiled `.so` in the BPF VM) + a live MagicBlock devnet ER round-trip acceptance suite |
+| Risk engine | Stress-lattice portfolio margin, worse-of(mark, oracle) liquidation pricing, ADL at true bankruptcy, insurance waterfall, junior-claim profit haircut |
+| Surface | 146 instructions · 137 events · 109 error codes ([IDL](idl/flash_book.json)) |
+| Program | `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq` (devnet) |
 
-Everything below is reproducible from this repo with the commands shown.
+Reproduce the CU numbers: [docs/SETTLEMENT.md](docs/SETTLEMENT.md). Proof
+inventory: [docs/FORMAL_VERIFICATION.md](docs/FORMAL_VERIFICATION.md).
 
-| Check | Command | Result |
-|---|---|---|
-| Build | `cargo build-sbf --manifest-path programs/flash-book/Cargo.toml` | clean |
-| Tests | `BPF_OUT_DIR=$PWD/target/deploy cargo test -p flash-book` | 675 pass |
-| Proofs | `cargo kani --features no-entrypoint` | 5 verified |
-| CU bench | `BPF_OUT_DIR=$PWD/target/deploy cargo test -p flash-book --test integration cu_benchmark -- --ignored --nocapture` | `apply_fill` open ≈ 42k CU |
+## What this is
 
-- **Formal verification.** Kani/CBMC proofs of the haircut accounting:
-  dust conservation (`credit + dust == matured`, `credit ≤ matured`),
-  single-convert solvency (`credit ≤ residual`), and `matured_fraction`
-  bounds. Details + method: [`docs/FORMAL_VERIFICATION.md`](docs/FORMAL_VERIFICATION.md).
-- **Compute units.** `apply_fill` measured and reduced ~24–28% by removing
-  a `find_program_address` bump-search from the hot path. Full breakdown:
-  [`docs/CU_OPTIMIZATION.md`](docs/CU_OPTIMIZATION.md).
+Flash Book is the settlement and matching engine — the on-chain program only.
+Clients, keepers, bots, and UIs are built against the IDL. It is being built
+to power the Orderbook tab of flash.trade; the public surface (IDL, account
+layouts, events, error codes) is kept stable and math-identical to Flash V2
+so the venue integrates it with minimal work. See
+[docs/V2_INTEGRATION.md](docs/V2_INTEGRATION.md).
 
-## What's in the box
+- **Hot path on an Ephemeral Rollup.** The order book, fill-commitment ring,
+  and fill outbox are delegated to a MagicBlock ER for sub-50ms matching.
+  Positions, collateral, and the vault never leave L1.
+- **Settlement cannot be forged.** Matching pushes a keccak commitment per
+  fill into a FIFO ring; L1 settlement verifies-and-pops each fill against
+  it. Ordering and liveness trust the sequencer; fund-safety does not
+  ([ER_TRUST_BOUNDARY.md](ER_TRUST_BOUNDARY.md)).
+- **The exits don't need permission.** If the ER goes dark or censors,
+  anyone can force-undelegate the market back to L1 after a proven-silent
+  timeout — Kani-proven to never fire while the ER is live.
+- **Risk is proven, not asserted.** Solvency, conservation, margin-floor,
+  ring-authenticity, and liveness invariants carry machine-checked proofs
+  wired into CI; a regression that breaks an invariant fails the build.
+- **Private books.** A market can run on a TEE-backed Private ER where only
+  allow-listed readers see depth and flow ([docs/PRIVACY.md](docs/PRIVACY.md)).
+
+## Architecture
 
 ```
-programs/flash-book/   on-chain Solana program (Rust + Anchor)
-idl/                   generated program IDL (interface descriptor)
-docs/                  architecture, math, formal-verification, deployment
+                    L1 (Solana)                          Ephemeral Rollup
+  ┌──────────────────────────────────────┐    ┌──────────────────────────────┐
+  │ collateral vault · positions ·       │    │ market book (hypertree) ·    │
+  │ trader states · insurance · FLP ·    │    │ fill-commitment ring ·       │
+  │ governance · oracle configs          │    │ fill outbox                  │
+  │                                      │    │                              │
+  │  apply_fill ◀──verify-and-pop─────────────── place_taker_order_v2        │
+  │  (ring-authenticated settlement)     │    │ (matching, ~15k CU)          │
+  └──────────────────────────────────────┘    └──────────────────────────────┘
 ```
 
-## What it is
+Full tour: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Instruction
+reference: [docs/INSTRUCTIONS.md](docs/INSTRUCTIONS.md). Settlement design
+and measured compute: [docs/SETTLEMENT.md](docs/SETTLEMENT.md).
 
-A Solana program implementing a perpetual-futures orderbook:
+## Security
 
-- **Hypertree-backed continuous CLOB** — a `market_book` PDA backed by a
-  zero-copy red-black tree, accessed via raw byte slicing on the matcher
-  hot path (no Anchor deserialization). Grows in place past its initial
-  capacity via `expand_market_book`.
-- **Risk engine** — H-haircut junior-claim PnL gating (machine-checked
-  solvency), A/K/F/B cumulative side indices for lazy O(1) per-position
-  settlement, an initialization-time per-slot envelope check that rejects
-  unsafe market parameters, and stress-lattice scenario margin.
-- **Order types & controls** — limit, market, IOC, FOK, post-only, trigger
-  (stop / take-profit) with slippage caps, TWAP, iceberg, OCO brackets,
-  peg, MIT, trailing-stop, reduce-only, min-fill-size, conditional-cancel.
-- **Liquidation** — JIT-auction synthetic close with a Dutch reward,
-  per-position cooldown, and a dual-source `worse-of(mark, oracle)` price
-  gate.
-- **Anti-MEV** — self-trade prevention, VPIN toxicity gating on the FLP
-  quoter, vol-adaptive oracle band, aggressor round-trip tax.
-- **Decentralization** — `burn_market_authority` permanently relinquishes
-  per-market authority (one-way).
-- **MagicBlock ER** — delegate/commit/undelegate instructions for running
-  the matcher on an Ephemeral Rollup (devnet integration).
+Status, threat model, accepted trust assumptions, and how to report a
+vulnerability: [SECURITY.md](SECURITY.md). The single-sequencer trust
+boundary is documented precisely in
+[ER_TRUST_BOUNDARY.md](ER_TRUST_BOUNDARY.md) — it is a bounded, stated
+assumption, not an omission. Operational steps required before mainnet
+(per-market fill-commitment v1 upgrade, multisig authority migration):
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
 
-See [`docs/FEATURES.md`](docs/FEATURES.md) for the module matrix and
-[`docs/INSTRUCTIONS.md`](docs/INSTRUCTIONS.md) for the instruction set.
-
-## What it is NOT
-
-- **Not on mainnet.** Devnet only.
-- **Not externally audited.** Internal audit only — [`docs/AUDIT.md`](docs/AUDIT.md).
-- **No off-chain components in this repo** (SDK, bot, keepers, simulator).
-- **No FBA / commit-reveal.** The continuous CLOB is the deliberate pick.
-- **The off-chain sequencer is a single point of trust** for fill ordering
-  (it is authenticated on-chain and cannot route fills to the wrong
-  account, but can reorder/censor). See [`SECURITY.md`](SECURITY.md).
-
-## Build, test, verify
+## Build & test
 
 ```bash
-# Build + test
-cargo build-sbf --manifest-path programs/flash-book/Cargo.toml
-cargo test -p flash-book
+# Build the SBF artifact (platform-tools v1.52 = rustc 1.89; earlier
+# releases cannot compile edition2024 dependencies).
+cargo build-sbf --tools-version v1.52 \
+  --manifest-path programs/flash-book/Cargo.toml --sbf-out-dir target/deploy
 
-# Formal-verification proofs (one-time: cargo install --locked kani-verifier && cargo kani setup)
-cargo kani --features no-entrypoint
+# Host + integration tests (the integration suite loads the compiled .so).
+SBF_OUT_DIR=$PWD/target/deploy cargo test -p flash-book --all-targets
 
-# Regenerate the IDL after on-chain changes
-anchor idl build -o idl/flash_book.json
+# Formal verification.
+cargo kani --package flash-book --features no-entrypoint
 
-# Devnet deploy (requires a funded keypair)
-anchor deploy --program-name flash_book --provider.cluster devnet
+# Live MagicBlock devnet ER acceptance (needs a funded devnet keypair).
+cd er-acceptance && npm install && \
+  L1_RPC=https://api.devnet.solana.com \
+  ER_RPC=https://devnet-as.magicblock.app npm run acceptance
 ```
 
-Staged path to mainnet: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
-
-## Documentation
-
-**Design & math** — [`ARCHITECTURE`](docs/ARCHITECTURE.md) ·
-[`MATH`](docs/MATH.md) · [`MARGIN_MATH`](docs/MARGIN_MATH.md) ·
-[`HAIRCUT_MATH`](docs/HAIRCUT_MATH.md) ·
-[`FORMAL_VERIFICATION`](docs/FORMAL_VERIFICATION.md) ·
-[`FEATURES`](docs/FEATURES.md) · [`INSTRUCTIONS`](docs/INSTRUCTIONS.md) ·
-[`SUB_ACCOUNT_TRADING`](docs/SUB_ACCOUNT_TRADING.md)
-
-**Operations** — [`DEPLOYMENT`](docs/DEPLOYMENT.md) ·
-[`PARAMETER_PLAYBOOK`](docs/PARAMETER_PLAYBOOK.md) ·
-[`PYTH_INTEGRATION`](docs/PYTH_INTEGRATION.md) ·
-[`INCIDENT_RESPONSE`](docs/INCIDENT_RESPONSE.md) ·
-[`LP_GUIDE`](docs/LP_GUIDE.md)
-
-**Audit & performance** — [`AUDIT`](docs/AUDIT.md) ·
-[`SAFETY`](docs/SAFETY.md) · [`CU_OPTIMIZATION`](docs/CU_OPTIMIZATION.md)
-
-## Contributing
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Deployment runbook: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## License
 
-See [`LICENSE`](LICENSE). The vendored hypertree under
-`programs/flash-book/src/hypertree/` is GPL-3.0 —
-[`LICENSE-HYPERTREE`](LICENSE-HYPERTREE).
-
-## Disclaimer
-
-Open-source research and engineering output. Not financial advice, not a
-production system, not a solicitation to deposit capital. Mainnet is gated
-on an external audit.
+MIT, except `programs/flash-book/src/hypertree/` — vendored from
+[Manifest](https://github.com/Bonasa-Tech/manifest) under **GPL-3.0-only**
+(see [LICENSE-HYPERTREE](LICENSE-HYPERTREE)).

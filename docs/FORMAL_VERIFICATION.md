@@ -1,29 +1,35 @@
 # Formal Verification
 
-Flash Book's risk engine carries **machine-checked proofs** of its core
-solvency invariants, written as [Kani](https://model-checking.github.io/kani/)
-proof harnesses and discharged by CBMC. These are not sampled tests: each
-harness lets `kani::any()` range over the *entire* input domain symbolically,
-and the model checker proves the assertion holds for **every** value, or
-returns a concrete counterexample.
+Flash Book carries **57 Kani proof harnesses** (discharged by CBMC), **6 Lean
+theorems** at the real production divisors, a formal property specification
+(`certora/PROPERTIES.md`), and eight property-test suites. A Kani harness is
+not a sampled test: `kani::any()` ranges over the *entire* input domain
+symbolically, and the model checker proves the assertion for **every** value
+or returns a concrete counterexample. CI runs the full Kani suite and builds
+the Lean proofs on every PR; any broken invariant fails the build.
 
-The first target is the **haircut conservation math** (`matcher/haircut.rs`) —
-the accounting that decides how much realized profit a trader may withdraw when
-the protocol is under-collateralized. Getting this wrong mints or burns value,
-so it is exactly where a proof (not a test) earns its keep.
+## Kani coverage (57 harnesses, by module)
 
-## What is proven
-
-Harnesses live in `programs/flash-book/src/matcher/haircut.rs`
-(`#[cfg(kani)] mod kani_proofs`). All five verify, 0 failures, each in < 1 s.
-
-| Harness | Invariant | What it proves |
+| Module | # | Properties proven |
 |---|---|---|
-| `proof_dust_conservation` | #4 Dust conservation | `credit ≤ matured` **and** `credit + dust == matured` for every `h ∈ [0, H_DENOM]` — no quote lot is created or destroyed by a haircut. |
-| `proof_solvency_single_convert` | #1 Solvency | Converting a position's full matured PnL credits `≤ residual` — the **non-printing** guarantee: traders collectively withdraw no more than the real residual backing the profit pool. |
-| `proof_matured_fraction_bounds` | #3 Maturation bounds | `matured_fraction(..) ≤ reserve`, is `0` before the warmup window opens, and `== reserve` after it closes. Verified against the **real** function. |
-| `proof_div_pow2_boundary` | — | Marks the CBMC division-completeness boundary (see below). |
-| `proof_assume_sanity` | — | Confirms `kani::assume` constrains the domain. |
+| `matcher/haircut` | 7 | Dust conservation (`credit + dust == matured`, nothing minted or burned), single-convert solvency (credit ≤ residual — the non-printing bound), maturation bounds, residual-delta exactness + round-trip conservation, the CBMC division boundary controls. |
+| `matcher/fill_commitment` | 7 | Settlement ring: never over-settles, depth-bounded, rejects uncommitted/fabricated fills, no double-settle; settlement nonce strictly monotone (replay/reorder rejected), advance strict + exact, chain monotone. |
+| `state_v2` | 6 | Order-id price-time priority: better price fills first on both sides, FIFO sequence tiebreak, id injectivity (no collisions among live orders), guard-admitted orders never collide, seq guard matches the encoding precondition. |
+| `lib` (settlement frame) | 6 | Realized-PnL routing credits exactly one bucket on gain and is bounded/one-sided on loss; cross-loss shortfall conserves and never over-credits; funding routing conserves value, is bounded and one-signed, zero is a no-op. |
+| `matcher/risk` | 5 | Effective MMR never below the base floor (proven on the live `MarketSnapshot::effective_mmr_bps` path), OI surcharge capped and disabled at zero slope, healthy ⇒ survives stress, health verdict independent of mark PnL (no double-count). |
+| `matcher/liquidation` | 5 | Health price is always one of the two real sources and the worse one for the side (long and short), fresh mark equals worse-of, stale mark falls back to oracle-only. |
+| `matcher/insurance` | 4 | Solvent ⟺ vault covers the protocol buckets; surplus exact when solvent; the full-invariant reference model; the one-sided partial-collateral insolvency detector is sound (never fires on a solvent state). |
+| `matcher/position_math` | 3 | Open-from-flat exact, same-side stacking exact, no realized PnL without a reduction. |
+| `matcher/flp_quoter` | 3 | Pool fill-price band accepts the oracle price (no false reject) and rejects gross fabrication; required floor conservative. |
+| `matcher/fill_outbox` | 3 | Write index in bounds, no silent overwrite, drained grow has no remappable pending slot. |
+| `matcher/committee` | 3 | Valid BFT config implies quorum intersection, equivocation ⟺ same height + different digest, jail is effective. |
+| `xmargin` | 3 | ER-reserved margin floor preserved by simple withdrawals, epoch strictly increases. |
+| `er` | 2 | The force-undelegate gate only fires when a liveness baseline is genuinely stale; a market with a fresh heartbeat AND recent settlement can never be forced off the ER. |
+
+Every proven pure function is the one the deployed handler routes through
+(`apply_fill` → `advance_settlement_seq`, `liquidate_position_v2` →
+`worse_of_health_price`, `assess_margin` → the proven gate, …), so the
+proofs bind to the shipped logic, not a copy.
 
 ## Running
 
@@ -41,6 +47,9 @@ cargo kani --features no-entrypoint --harness proof_dust_conservation
 `--features no-entrypoint` excludes the Solana program entrypoint so Kani
 verifies the library in isolation. CI runs the suite on every PR (see
 `.github/workflows/ci.yml`, job `kani`).
+
+The haircut examples below illustrate how the harnesses handle CBMC's
+division limits; the same discipline applies across the suite.
 
 ## A note on the divisor (read this before extending the proofs)
 
@@ -116,42 +125,35 @@ surcharge, and funding:
 | `funding_zero_when_no_index_move` | `delta == 0 ⇒ owed == 0` (no accrual from a static index) | — |
 
 All six are `#print axioms`-clean — they depend only on `propext`,
-`Classical.choice`, `Quot.sound` (no `sorry`). Build + reproduction steps are in
-[`formal_verification/lean/README.md`](../formal_verification/lean/README.md).
-The `convert` state-machine shape was scaffolded by QEDGen
-(`qedgen codegen` from a `.qedspec`); the proof bodies are hand-written.
+`Classical.choice`, `Quot.sound` (no `sorry`). Build + reproduction steps are
+in [`formal_verification/lean/README.md`](../formal_verification/lean/README.md).
 
 So the two solvency-critical haircut bounds now hold **both** ways: Kani proves
 the divisor-agnostic structural statement (fast, in CI), and Lean proves the
 exact production-constant statement.
 
-## Roadmap
+## Property-test suites
 
-- **Monotonicity (#2)** — `h1 ≤ h2 ⇒ credit(h1) ≤ credit(h2)`. The harness is
-  straightforward but its two free multiplies exceed the SAT backend's reach;
-  parked until a stronger division/UNSAT backend is wired in.
-- Extend coverage to the matching engine (`state_v2.rs` hypertree ordering
-  invariants) and the margin/liquidation gates.
+Eight proptest suites (2,000 cases per property) complement the proofs where
+the state space is structural rather than arithmetic: `proptest_book`
+(model-based book consistency under random insert/cancel), `proptest_risk`,
+`proptest_isolated`, `proptest_liquidation`, `proptest_haircut`,
+`proptest_envelope`, `proptest_modules`, `proptest_new_features`. The
+BanksClient integration suite loads the compiled SBF binary and exercises the
+real BPF-VM execution path.
 
-## Settlement-authenticity & gate proofs (#35/#36/FV-sweep)
+## Property specification
 
-Beyond the haircut/MMR/funding core, the settlement and liquidation gates carry
-their own Kani harnesses (all `VERIFICATION: SUCCESSFUL`):
+`certora/PROPERTIES.md` states the full protocol invariant set (solvency,
+conservation, matching priority, settlement authenticity) with per-property
+status — machine-proven today (Kani/Lean) or specified for a future prover
+run — and is the hand-off document for external verification.
 
-| Harness (module) | Property |
-|---|---|
-| `matcher::fill_commitment` ring ×4 | consume-and-clear ring: settlement never outruns production, depth-bounded, fabricated/out-of-order fill rejected, no double-settle (INV-S1/S2) |
-| `matcher::fill_commitment` nonce ×3 | **P-SETTLE-1** settlement nonce strictly monotone — replay/reorder rejected, advance is strict + exact, chain monotone |
-| `matcher::flp_quoter` band ×2 | **#35 FLP / #36 resting** price band: accepts the oracle price (no false reject), rejects 2×/0× oracle (catastrophe bound), overflow-free |
-| `matcher::liquidation` health ×3 | **P-LIQ-1** worse-of(mark, oracle): always the worse of the two real sources for the side, never a fabricated price |
-| `state_v2` order-id ×4 | **P-MATCH-1/2** price-time priority of the `order_id` encoding: better price first (asks↑/bids↓), FIFO seq tiebreak both sides (rules out the old LIFO-bid bug), id injective on live orders |
-| `matcher::insurance` solvency ×2 | **P-SOLV-4** (protocol buckets) solvent⟺vault≥insurance+FLP; surplus exact (vault accounts to insurance+FLP+surplus) |
-| `matcher::haircut` residual ×2 | **P-SOLV-5** (delta core) residual delta applied exactly + perfectly invertible (tracking never drifts) |
+## Known limits
 
-Each handler routes through the proven pure function (e.g. `apply_fill`/
-`apply_flp_fill` → `advance_settlement_seq`; `liquidate_position_v2` →
-`worse_of_health_price`), so the proof binds to the deployed logic, not a copy.
-
-CBMC note (reconfirmed): equality of two free *symbolic* multiplies is the SAT
-backend's limit — band inputs are bounded to a large realistic range, and the
-tautological "predicate == its definition" identity is intentionally not a harness.
+- Haircut credit monotonicity in `h` (`h1 ≤ h2 ⇒ credit(h1) ≤ credit(h2)`)
+  exceeds the SAT backend's reach (two free multiplies); the bound is covered
+  by tests and by the Lean cap/monotonicity theorems on the adjacent surfaces.
+- Equality of two free symbolic multiplies is the SAT backend's limit — band
+  inputs are bounded to a large realistic range, and the tautological
+  "predicate == its definition" identity is intentionally not a harness.

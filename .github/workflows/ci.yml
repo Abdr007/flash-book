@@ -96,7 +96,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Builds the 7 Lean theorems (Haircut/OiMmr/Funding) at the real divisors —
+      # Builds the Lean theorems (Haircut/OiMmr/Funding) at the real divisors —
       # the cases CBMC can't reach (non-pow2 division, 128-bit multiply). Uses the
       # prebuilt Mathlib cache so the job is minutes, not an hour. A `sorry` or a
       # broken proof fails the build. See formal_verification/lean/README.md.

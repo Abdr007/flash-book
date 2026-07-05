@@ -1,5 +1,5 @@
 //! Fill-Outbox — on-chain fill-DATA mirror (lifts the per-tx batch cap past the
-//! program-log ceiling). See `FILL_OUTBOX_DESIGN.md` for the full rationale.
+//! program-log ceiling). See `docs/SETTLEMENT.md` for the full rationale.
 //!
 //! ## Why this exists
 //! `place_taker_order_v2` ships each crossed fill's economic data to the off-chain

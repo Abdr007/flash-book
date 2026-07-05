@@ -73,7 +73,7 @@ async function stage(name, fn) {
   catch (e) { stages.push({ name, ok: false, err: String(e.message || e).slice(0, 160) }); console.log(`  ✗ ${name}: ${String(e.message || e).slice(0, 160)}`); throw e; }
 }
 
-// outbox account decode (raw layout — see SEQUENCER_OUTBOX_CUTOVER.md §2b)
+// outbox account decode (raw layout — see docs/SETTLEMENT.md §4)
 function decodeOutbox(data) {
   return { produced: Number(data.readBigUInt64LE(8)), settled: Number(data.readBigUInt64LE(16)), cap: data.readUInt32LE(24) };
 }
@@ -90,7 +90,7 @@ console.log("market", M.toBase58());
 // FULL outbox (10,144 B) one-CPI delegate-safe (< 10,240 B), so the entire off-log
 // pipeline — book + §3.2 ring + fill-outbox — delegates to the ER. (At cap 256 the
 // outbox can't be ER-delegated; that's the L1 deep-sweep config. See
-// FILL_OUTBOX_DESIGN.md §10.) This round-trip therefore covers the FULL ER pipeline.
+// docs/SETTLEMENT.md §2.) This round-trip therefore covers the FULL ER pipeline.
 const CAP = 105;
 
 try {

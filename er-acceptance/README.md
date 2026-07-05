@@ -53,7 +53,7 @@ test could (they don't delegate):
    `init_fill_commitment(cap)`; at **`cap ≤ 105`** both the ring and the full outbox
    are one-CPI delegate-safe, and the suite's "delegate book + ring + OUTBOX" stage
    now **PASSES on the live ER** (verified). `cap` up to 256 is the L1 deep-sweep. So
-   one mechanism serves both environments (see `../FILL_OUTBOX_DESIGN.md` §8, §10).
+   one mechanism serves both environments (see `../docs/SETTLEMENT.md` §2).
 2. **Routing — RESOLVED (full round-trip now GREEN, 7/7 stages).** Three pieces:
    (a) **pin the ER validator** (`MAS1Dt9qreoRMQ14YQuhg8UTZMMzDdKhmkZMECCzk57`, the
    MagicBlock devnet ER) at delegate time — `null` leaves the owning validator

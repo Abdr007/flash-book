@@ -559,7 +559,7 @@ refunds rent to the trader. The new account is `init` (not
 `init_if_needed`) so a second migration attempt against an existing
 new position fails — protects against accidental double-migration.
 
-`docs/SUB_ACCOUNT_TRADING.md` covers the architectural rationale and
+`docs/ARCHITECTURE.md` covers the architectural rationale and
 the remaining Phase 2d/2e work (RestingOrderV2 schema + matcher fill
 routing) required for sub-accounts to PLACE orders rather than just
 hold collateral.
