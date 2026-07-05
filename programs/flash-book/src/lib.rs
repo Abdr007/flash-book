@@ -300,6 +300,84 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// AUDIT F-3 migration (2026-07): one-way, authority-gated upgrade of a market's
+    /// fill-commitment ring from the v0 layout to v1, enabling per-position
+    /// reduce-in-flight tracking (closes the last F-3 edge: a position shrunk below
+    /// its resting reduce-only, then over-crossed across the match→settle gap).
+    /// MUST run on the BASE LAYER with the ring UNdelegated (a delegated ring is
+    /// owned by the delegation program — realloc would be illegal) and the ring
+    /// DRAINED (`produced == settled`; a pending fill would be left without a reduce
+    /// flag — `buffer_upgrade_to_v1` enforces this). Re-running on a v1 ring reverts.
+    pub fn upgrade_fill_commitment_v1(ctx: Context<UpgradeFillCommitmentV1>) -> Result<()> {
+        use matcher::fill_commitment as fc;
+        let fc_ai = ctx.accounts.fill_commitment.to_account_info();
+        require_keys_eq!(*fc_ai.owner, *ctx.program_id, FlashBookError::Unauthorized);
+        let market_bytes = ctx.accounts.market.key().to_bytes();
+
+        // Validate as a v0 account and require a drained ring.
+        let cap = {
+            let data = fc_ai.try_borrow_data()?;
+            let cap = fc::buffer_check(&data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+            require!(fc::buffer_version(&data) == 0, FlashBookError::OutOfRange);
+            require!(
+                fc::buffer_next_index(&data) == fc::buffer_settle_index(&data),
+                FlashBookError::FillRingNotDrained
+            );
+            cap
+        };
+
+        let old_len = fc_ai.data_len();
+        let new_len = fc::fill_commit_account_len_v1(cap as usize);
+        require!(new_len > old_len, FlashBookError::OutOfRange);
+        let additional_bytes = new_len - old_len;
+        require!(
+            additional_bytes
+                <= anchor_lang::solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE,
+            FlashBookError::OutOfRange
+        );
+
+        // Top up rent so the larger account stays rent-exempt.
+        let rent = Rent::get()?;
+        let new_minimum = rent.minimum_balance(new_len);
+        let cur_lamports = fc_ai.lamports();
+        if new_minimum > cur_lamports {
+            let topup = new_minimum.saturating_sub(cur_lamports);
+            anchor_lang::solana_program::program::invoke(
+                &anchor_lang::solana_program::system_instruction::transfer(
+                    &ctx.accounts.authority.key(),
+                    &fc_ai.key(),
+                    topup,
+                ),
+                &[
+                    ctx.accounts.authority.to_account_info(),
+                    fc_ai.clone(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+
+        // Grow in place (zero-inits the appended regions), migrate to v1, and
+        // re-validate so a botched realloc/migrate fails loudly.
+        fc_ai.resize(new_len)?;
+        {
+            let mut data = fc_ai.try_borrow_mut_data()?;
+            fc::buffer_upgrade_to_v1(&mut data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+            fc::buffer_check(&data, &market_bytes)
+                .map_err(|_| error!(FlashBookError::FillRingCorrupt))?;
+        }
+
+        emit!(FillCommitmentUpgradedV1Event {
+            market: ctx.accounts.market.key(),
+            fill_commitment: fc_ai.key(),
+            cap,
+            old_bytes: old_len as u32,
+            new_bytes: new_len as u32,
+        });
+        Ok(())
+    }
+
     /// AUDIT F-4 (2026-07): reconcile `MarketAccount.unsettled_fill_volume` (the
     /// M-6 matched-but-unsettled OI reserve) back to 0 when the fill-commitment
     /// ring is fully DRAINED.
@@ -14055,6 +14133,34 @@ pub struct GrowFillCommitment<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// AUDIT F-3 migration (2026-07): upgrade a market's fill-commitment ring from the
+/// v0 layout to v1 (adds reduce-in-flight tracking). Same authority gate + seed
+/// binding as `GrowFillCommitment`; the ring is reallocated in the handler so it is
+/// an `UncheckedAccount`. MUST run on the base layer with the ring UNdelegated.
+#[derive(Accounts)]
+pub struct UpgradeFillCommitmentV1<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    /// CHECK: PDA we own; reallocated via `AccountInfo::resize` in the handler,
+    /// which re-asserts program ownership before growing. Bound by the seeds.
+    #[account(
+        mut,
+        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub fill_commitment: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 /// AUDIT F-4 (2026-07): permissionless reconcile of `unsettled_fill_volume` when
 /// the fill-commitment ring is drained. No authority gate — the handler can only
 /// reset the counter to its provably-correct value (0 on a drained ring), so any
@@ -16416,6 +16522,17 @@ pub struct FillCommitmentGrownEvent {
     pub fill_commitment: Pubkey,
     pub old_cap: u32,
     pub new_cap: u32,
+    pub old_bytes: u32,
+    pub new_bytes: u32,
+}
+
+/// AUDIT F-3 migration (2026-07): emitted when a market's fill-commitment ring is
+/// upgraded from the v0 layout to v1 (adds reduce-in-flight tracking).
+#[event]
+pub struct FillCommitmentUpgradedV1Event {
+    pub market: Pubkey,
+    pub fill_commitment: Pubkey,
+    pub cap: u32,
     pub old_bytes: u32,
     pub new_bytes: u32,
 }
