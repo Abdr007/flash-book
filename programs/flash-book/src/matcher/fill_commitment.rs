@@ -760,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_v1_upgrade_requires_drained_ring_and_v0() {
+    fn v1_upgrade_requires_drained_ring_and_v0() {
         let market = [5u8; 32];
         let cap = 8u32;
         let mut data = vec![0u8; fill_commit_account_len(cap as usize)];
@@ -778,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_v1_map_and_flags_roundtrip() {
+    fn v1_map_and_flags_roundtrip() {
         let market = [6u8; 32];
         let cap = 8u32;
         let mut d = make_v1(&market, cap);
@@ -805,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_v1_map_full_fails_closed() {
+    fn v1_map_full_fails_closed() {
         let market = [7u8; 32];
         let cap = 8u32;
         let mut d = make_v1(&market, cap);
@@ -851,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_v1_two_takers_cannot_over_reduce_stable_position() {
+    fn v1_two_takers_cannot_over_reduce_stable_position() {
         let market = [8u8; 32];
         let cap = 8u32;
         let mut d = make_v1(&market, cap);
@@ -865,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_v1_two_takers_cannot_over_reduce_shrunken_position() {
+    fn v1_two_takers_cannot_over_reduce_shrunken_position() {
         let market = [9u8; 32];
         let cap = 8u32;
         let mut d = make_v1(&market, cap);
@@ -892,6 +892,68 @@ mod tests {
             0,
             "in-flight fully released at settlement"
         );
+    }
+
+    // The no-flip invariant, machine-checked over the COMPLETE bounded domain:
+    // for every initial position size P0 and every interleaving of taker
+    // crosses (any desired size) and settlements across the match→settle gap,
+    // the total lots ever admitted against the position never exceeds P0, and
+    // the settled position never goes below zero (never flips). Models exactly
+    // the matcher/settlement discipline: a cross reads the L1 position clone
+    // (which only moves at settlement) minus the ring's in-flight; a
+    // settlement shrinks the position and releases the same in-flight lots.
+    // Exhaustive: P0 ∈ 0..=3, five steps, each step ∈ {settle-oldest} ∪
+    // {cross desired ∈ 0..=3} — 4 × 5^5 = 12,500 full lifecycles.
+    #[test]
+    fn v1_inflight_bounds_total_reduction_exhaustive() {
+        let market = [10u8; 32];
+        let cap = 8u32;
+        let p = [44u8; 32];
+        for p0 in 0u64..=3 {
+            // 5 steps, each encoded 0..=4: 0 = settle oldest pending,
+            // 1..=4 = taker cross with desired = step - 1 (0..=3 lots).
+            for combo in 0u32..5u32.pow(5) {
+                let mut d = make_v1(&market, cap);
+                let mut pos = p0; // L1 truth; moves only at settlement
+                let mut pending: Vec<u64> = Vec::new(); // matched, unsettled
+                let mut applied_total = 0u64;
+                let mut idx = 0u64;
+                let mut c = combo;
+                for _ in 0..5 {
+                    let step = c % 5;
+                    c /= 5;
+                    if step == 0 {
+                        if let Some(lots) = pending.first().copied() {
+                            pending.remove(0);
+                            assert!(reduce_flag_take(
+                                &mut d,
+                                cap,
+                                idx - pending.len() as u64 - 1
+                            ));
+                            inflight_sub(&mut d, cap, &p, lots);
+                            assert!(pos >= lots, "settlement would flip the position");
+                            pos -= lots;
+                        }
+                    } else {
+                        let desired = (step - 1) as u64;
+                        let fill = cap_and_track(&mut d, cap, &p, pos, desired, idx);
+                        if fill > 0 {
+                            pending.push(fill);
+                            idx += 1;
+                            applied_total += fill;
+                        }
+                    }
+                    assert!(
+                        applied_total <= p0,
+                        "over-reduce: applied {applied_total} > P0 {p0} (combo {combo})"
+                    );
+                    assert!(
+                        applied_total.saturating_sub(p0 - pos) <= pos,
+                        "pending exceeds remaining position (combo {combo})"
+                    );
+                }
+            }
+        }
     }
 
     // §3.2 P3: growing the ring resizes the account, stamps the new cap, and the

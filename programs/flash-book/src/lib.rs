@@ -1719,7 +1719,7 @@ pub mod flash_book {
         // fill_price_ticks, maker_pubkey, maker_sub_index) — maker_sub_index
         // is included so the emitted FillEntry carries it for the sequencer.
         // Tuple: (maker node idx, maker order id, fill lots, fill price, maker
-        // trader, maker sub_index, is_reduce_only). The trailing flag (F-3 v1) lets
+        // trader, maker sub_index, is_reduce_only). The trailing flag (v1 rings) lets
         // the ring-push loop track this fill's reduce-in-flight against the maker's
         // position so a later taker (before settlement) cannot over-reduce it.
         let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey, u8, bool)> =
@@ -9786,7 +9786,7 @@ pub mod flash_book {
             return Err(error!(FlashBookError::TriggerSlippageExceeded));
         }
 
-        // F-3: the position size backing a reduce-only injection. Captured
+        // The position size backing a reduce-only injection. Captured
         // here so the cumulative-capacity clamp below (after the book handle is open)
         // can bound TOTAL resting reduce-only for this position, not just this order.
         let reduce_only_position_size: u64 =

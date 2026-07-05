@@ -5458,7 +5458,7 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
 /// version-gated settlement path (reduce_flag_take / inflight_sub) is inert for
 /// ordinary fills and does not regress the honest settle path.
 #[tokio::test]
-async fn f3_upgrade_fill_commitment_v1_and_v1_ring_settles_normally() {
+async fn upgrade_fill_commitment_v1_and_v1_ring_settles_normally() {
     use flash_book::matcher::fill_commitment as fc;
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
@@ -5694,7 +5694,7 @@ async fn f3_upgrade_fill_commitment_v1_and_v1_ring_settles_normally() {
 /// caps the second cross by `position − in-flight` = 0 — so M reduces to exactly flat
 /// and never flips. Settlement then releases the in-flight back to zero.
 #[tokio::test]
-async fn f3_v1_reduce_only_trigger_two_takers_cannot_flip_position() {
+async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     use flash_book::matcher::fill_commitment as fc;
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;

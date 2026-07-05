@@ -216,6 +216,28 @@ Operational note: full closure on a **live** market requires the one-time
 `upgrade_fill_commitment_v1` call per market (see the operations runbook);
 a v0 market has layers 1–2 (the primary vector) but not layer 3.
 
+### Accepted residual — reduce-only intent vs. an orthogonal position change
+
+All three layers bound reduce-only against the position *as the fill sees
+it*. One residual is inherent to asynchronous settlement and is accepted,
+not fixed: if a reduce-only maker fill is committed to the ring, and then —
+in the window after the ring is undelegated to L1 but before `apply_fill`
+drains that fill — the maker's position is independently taken to flat by
+`liquidate_position_v2` / `liquidate_portfolio_v2` / `auto_deleverage`,
+the committed fill settles against a now-flat position and opens the
+opposite side. The reduce-only *intent* is violated.
+
+This is bounded and fund-safe: fund conservation and OI balance hold (the
+opposite side is a real two-sided fill, no value is minted); the opened
+position is immediately liquidatable, so the system self-heals; the
+magnitude is capped by the injected order size and the ~5-minute TTL. It
+is not code-fixed because both candidate fixes break a hard wall —
+clamping the fill at settlement breaks two-sided conservation (the FIFO
+wall), and gating liquidation on a drained ring deadlocks liquidation
+whenever the sequencer withholds a pending fill's preimage (a genuinely
+bad position could not be liquidated). Match-time enforcement cannot see a
+future L1 liquidation. See `ER_TRUST_BOUNDARY.md` §1.
+
 ---
 
 ## 4 · Sequencer read-path contract

@@ -1248,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_reduce_only_capacity_clamp_scan() {
+    fn reduce_only_capacity_clamp_scan() {
         let mut data = make_book();
         let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
         let trader = Pubkey::new_unique();
@@ -1275,7 +1275,7 @@ mod tests {
         assert_eq!(
             clamp(position, 100, 50),
             0,
-            "F-3: over-capacity reduce-only trimmed to 0"
+            "over-capacity reduce-only trimmed to 0"
         );
 
         // Must NOT count: a different trader, a different sub_index, or a

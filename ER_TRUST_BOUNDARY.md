@@ -50,6 +50,17 @@ closed by a base-layer defense:
 matching but cannot take funds or forge state, and the censorship escape
 returns the book to L1 without the sequencer's cooperation.
 
+**One accepted correctness residual — reduce-only intent across the drain
+window.** A reduce-only maker fill committed to the ring, whose maker
+position is independently liquidated/ADL'd to flat on L1 before that fill
+drains, settles into an opposite position — violating the reduce-only
+*intent*, but not fund-safety: conservation and OI balance hold, and the
+opened position is immediately liquidatable. It is not code-fixed because
+the only closures break a hard wall (settlement-side clamp breaks
+two-sided conservation; gating liquidation on a drained ring deadlocks
+liquidation when the sequencer withholds a preimage). Detailed in
+[docs/SETTLEMENT.md](docs/SETTLEMENT.md) §3.
+
 ## 2. What is proven where
 
 **Tier 1 — proven in the unit harness (host + `solana-program-test`).**
