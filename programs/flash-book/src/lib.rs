@@ -5018,6 +5018,12 @@ pub mod flash_book {
         // by default), matching the intent.
         let taker_pos_isolated = ctx.accounts.taker_position.load()?.collateral_quote_lots > 0;
         let maker_pos_isolated = ctx.accounts.maker_position.load()?.collateral_quote_lots > 0;
+        // What the taker actually paid. The taker fee is capped at their
+        // collateral (not reverted, which would wedge the FIFO ring), and the
+        // maker rebate is funded out of that fee — so the rebate is later capped
+        // at this figure. Crediting the maker more than was collected would mint
+        // unbacked value on a fill against an under-collateralized taker.
+        let taker_fee_paid;
         {
             if taker_fee > 0 {
                 // CAP the fee at the taker's available
@@ -5039,6 +5045,9 @@ pub mod flash_book {
                     paid
                 };
                 net_fee = net_fee.saturating_sub(taker_fee.saturating_sub(paid));
+                taker_fee_paid = paid;
+            } else {
+                taker_fee_paid = 0;
             }
             if taker_negative_rebate_u128 > 0 {
                 let neg_rebate_u64 = if taker_negative_rebate_u128 > u64::MAX as u128 {
@@ -5065,6 +5074,14 @@ pub mod flash_book {
         // pays a fee (negative-rebate retail tier). Mutually
         // exclusive: at most one of `maker_rebate` / `maker_fee` is
         // non-zero per the sign split above.
+        //
+        // Cap the rebate at the fee the taker actually paid. `net_fee` was
+        // already reduced by the taker's uncollected shortfall (so insurance is
+        // not over-credited); this closes the matching leg so the maker credit
+        // can never exceed what was collected — keeping the fee legs
+        // (taker debit == maker credit + insurance credit) exactly conserved on
+        // a fill against an under-collateralized taker.
+        let maker_rebate = maker_rebate.min(taker_fee_paid);
         {
             if maker_rebate > 0 {
                 if maker_pos_isolated {
