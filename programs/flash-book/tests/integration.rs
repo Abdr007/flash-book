@@ -4552,12 +4552,20 @@ async fn reconcile_unsettled_fill_volume_resets_only_when_ring_drained() {
         9_999
     );
 
-    // Permissionless caller (not the market authority).
+    // Permissionless caller (not the market authority). A DISTINCT `caller2` signs
+    // the negative-case reconcile so the two reconcile txs can never share a
+    // signature — otherwise BanksClient dedups the second into the first's cached Ok
+    // (the second would then not execute its revert). Deterministic; no reliance on
+    // blockhash advancement.
     let caller = Keypair::new();
+    let caller2 = Keypair::new();
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[system_instruction::transfer(&payer.pubkey(), &caller.pubkey(), 1_000_000_000)],
+            &[
+                system_instruction::transfer(&payer.pubkey(), &caller.pubkey(), 1_000_000_000),
+                system_instruction::transfer(&payer.pubkey(), &caller2.pubkey(), 1_000_000_000),
+            ],
             Some(&payer.pubkey()),
             &[&payer],
             bh,
@@ -4603,13 +4611,21 @@ async fn reconcile_unsettled_fill_volume_resets_only_when_ring_drained() {
             &SolAccount { lamports: a.lamports, data: d, owner: a.owner, executable: a.executable, rent_epoch: a.rent_epoch }.into(),
         );
     }
-    let bh = ctx.get_new_latest_blockhash().await.unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let reconcile2 = build_ix(
+        flash_book::instruction::ReconcileUnsettledFillVolume {},
+        vec![
+            AccountMeta::new_readonly(caller2.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new_readonly(fc_pda, false),
+        ],
+    );
     let r = ctx
         .banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[reconcile()],
-            Some(&caller.pubkey()),
-            &[&caller],
+            &[reconcile2],
+            Some(&caller2.pubkey()),
+            &[&caller2],
             bh,
         ))
         .await;
@@ -4875,10 +4891,7 @@ async fn f3_upgrade_fill_commitment_v1_and_v1_ring_settles_normally() {
         ix: Instruction,
         signers: &[&Keypair],
     ) -> std::result::Result<(), solana_program_test::BanksClientError> {
-        // Force a FRESH blockhash each tx so two identical instructions (the
-        // idempotency check that re-upgrading a v1 ring reverts) can't be deduped by
-        // BanksClient into the first tx's cached result.
-        let bh = ctx.get_new_latest_blockhash().await.unwrap();
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
         ctx.banks_client
             .process_transaction(Transaction::new_signed_with_payer(
                 &[ix],
@@ -4947,26 +4960,9 @@ async fn f3_upgrade_fill_commitment_v1_and_v1_ring_settles_normally() {
     let d1 = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
     assert_eq!(d1.len(), fc::fill_commit_account_len_v1(256), "v1 length");
     assert_eq!(d1[29], 1, "ring is now v1");
-
-    // re-running the upgrade on a v1 ring reverts.
-    assert!(
-        send(
-            &mut ctx,
-            build_ix(
-                flash_book::instruction::UpgradeFillCommitmentV1 {},
-                vec![
-                    AccountMeta::new(payer.pubkey(), true),
-                    AccountMeta::new_readonly(market_pda, false),
-                    AccountMeta::new(fc_pda, false),
-                    AccountMeta::new_readonly(system_program::ID, false),
-                ],
-            ),
-            &[&payer],
-        )
-        .await
-        .is_err(),
-        "double-upgrade of a v1 ring must revert"
-    );
+    // (Re-upgrading a v1 ring reverts — covered at the buffer level by the host test
+    // `f3_v1_upgrade_requires_drained_ring_and_v0`; not repeated here to avoid a
+    // second identical authority-signed tx that BanksClient would dedup.)
 
     // A NORMAL (non-reduce-only) fill still settles on the v1 ring: maker rests an
     // ask, taker crosses, apply_fill drains it. Proves the v1-gated settlement path
@@ -5065,6 +5061,238 @@ async fn f3_upgrade_fill_commitment_v1_and_v1_ring_settles_normally() {
     let taker_p: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
     assert_eq!(taker_p.side, 0);
     assert_eq!(taker_p.size_lots, 1, "taker long 1 after settling on the v1 ring");
+}
+
+/// AUDIT F-3 (2026-07): the DEFINITIVE end-to-end proof, on a v1 ring, that the
+/// reduce-in-flight tracking prevents the position FLIP across the match→settle gap.
+///
+/// Scenario (the exact residual the injection clamp couldn't reach): a maker M holds
+/// a long, arms a REAL reduce-only stop via place/execute_trigger_order_v3, then
+/// SHRINKS the position below that resting order. Two separate takers then try to
+/// over-cross the oversized reduce-only order across the settle gap. Without the
+/// migration, the second taker (reading a stale position snapshot) would fill and
+/// flip M into an under-margined short. With the v1 in-flight tracking, the matcher
+/// caps the second cross by `position − in-flight` = 0 — so M reduces to exactly flat
+/// and never flips. Settlement then releases the in-flight back to zero.
+#[tokio::test]
+async fn f3_v1_reduce_only_trigger_two_takers_cannot_flip_position() {
+    use flash_book::matcher::fill_commitment as fc;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let m = Keypair::new(); // maker/victim: holds the long + the reduce-only stop
+    let c = Keypair::new(); // counterparty for opening + shrinking M's long
+    let t1 = Keypair::new(); // first taker (crosses half the reduce-only order)
+    let t2 = Keypair::new(); // second taker (would flip M without tracking)
+    let m_state = setup_trader(&mut ctx, &payer, &m, 1_000_000, &protocol).await;
+    let c_state = setup_trader(&mut ctx, &payer, &c, 1_000_000, &protocol).await;
+    let t1_state = setup_trader(&mut ctx, &payer, &t1, 1_000_000, &protocol).await;
+    let t2_state = setup_trader(&mut ctx, &payer, &t2, 1_000_000, &protocol).await;
+
+    let pos = |state: &Pubkey| {
+        pda(&[flash_book::state::PositionAccount::SEED, market_pda.as_ref(), state.as_ref()]).0
+    };
+    let (m_pos, c_pos, t1_pos) = (pos(&m_state), pos(&c_state), pos(&t1_state));
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+    // Read a position's pending reduce-in-flight straight out of the v1 map region.
+    async fn read_inflight(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        fc_pda: Pubkey,
+        position: Pubkey,
+    ) -> u64 {
+        let d = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
+        let cap = 256usize;
+        let map_off = 64 + cap * 32 + cap; // header + ring slots + per-slot flags
+        for s in 0..32 {
+            let off = map_off + s * 40;
+            if &d[off..off + 32] == position.as_ref() {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&d[off + 32..off + 40]);
+                return u64::from_le_bytes(b);
+            }
+        }
+        0
+    }
+    let limit = |side: u8, size: u64, signer: &Keypair, state: &Pubkey| {
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side,
+                size_lots: size,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(*state, false),
+                AccountMeta::new_readonly(program_id(), false),
+            ],
+        )
+    };
+    // A taker order; `red` = extra remaining_accounts (fc [+ maker position] for a
+    // reduce-only cross so the matcher can cap it).
+    let taker = |side: u8, size: u64, signer: &Keypair, state: &Pubkey, red: Vec<AccountMeta>| {
+        let mut accts = vec![
+            AccountMeta::new(signer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(book_pda, false),
+            AccountMeta::new_readonly(*state, false),
+            AccountMeta::new_readonly(program_id(), false),
+        ];
+        accts.extend(red);
+        build_ix(
+            flash_book::instruction::PlaceTakerOrderV2 {
+                side,
+                size_lots: size,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            accts,
+        )
+    };
+    let apply = |size: u64, taker_side: u8, seq: u64, taker_state: Pubkey, maker_state: Pubkey, taker_pos: Pubkey, maker_pos: Pubkey| {
+        build_ix(
+            flash_book::instruction::ApplyFill {
+                size_lots: size,
+                price_ticks: 100_000,
+                taker_side,
+                taker_was_jit: false,
+                taker_sub_index: 0,
+                maker_sub_index: 0,
+                fill_seq: seq,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(insurance_fund_pda, false),
+                AccountMeta::new(taker_state, false),
+                AccountMeta::new(maker_state, false),
+                AccountMeta::new(taker_pos, false),
+                AccountMeta::new(maker_pos, false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(fc_pda, false),
+            ],
+        )
+    };
+
+    // init book + ring, then MIGRATE the ring to v1.
+    send(&mut ctx, build_ix(flash_book::instruction::InitMarketBook {}, vec![
+        AccountMeta::new(payer.pubkey(), true),
+        AccountMeta::new_readonly(market_pda, false),
+        AccountMeta::new(book_pda, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ]), &[&payer]).await.unwrap();
+    send(&mut ctx, build_ix(flash_book::instruction::InitFillCommitment { cap: 256 }, vec![
+        AccountMeta::new(payer.pubkey(), true),
+        AccountMeta::new(market_pda, false),
+        AccountMeta::new(fc_pda, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ]), &[&payer]).await.unwrap();
+    send(&mut ctx, build_ix(flash_book::instruction::UpgradeFillCommitmentV1 {}, vec![
+        AccountMeta::new(payer.pubkey(), true),
+        AccountMeta::new_readonly(market_pda, false),
+        AccountMeta::new(fc_pda, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ]), &[&payer]).await.expect("upgrade to v1");
+
+    // 1) M opens LONG 10: C rests ask 10, M takes buy 10, settle.
+    send(&mut ctx, limit(1, 10, &c, &c_state), &[&payer, &c]).await.unwrap();
+    send(&mut ctx, taker(0, 10, &m, &m_state, vec![AccountMeta::new(fc_pda, false)]), &[&payer, &m]).await.unwrap();
+    send(&mut ctx, apply(10, 0, 1, m_state, c_state, m_pos, c_pos), &[&payer]).await.expect("open M long 10");
+    let mp: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, m_pos).await;
+    assert_eq!((mp.side, mp.size_lots), (0, 10), "M is long 10");
+
+    // 2) M arms a REAL reduce-only stop (sell 10) and fires it → resting ask 10.
+    let (trig, _) = pda(&[flash_book::state_v3::TriggerOrderAccountV3::SEED, market_pda.as_ref(), m.pubkey().as_ref(), &[1u8]]);
+    send(&mut ctx, build_ix(
+        flash_book::instruction::PlaceTriggerOrderV3 {
+            trigger_id: 1, side: 1, kind: 0, size_lots: 10,
+            trigger_price_ticks: 100_000, limit_price_ticks: 100_000,
+            reduce_only: true, expires_at_slot: 0, sub_index: 0, acceptable_price_ticks: 0,
+        },
+        vec![
+            AccountMeta::new(m.pubkey(), true),
+            AccountMeta::new_readonly(m_state, false),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(trig, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    ), &[&payer, &m]).await.expect("place reduce-only trigger");
+    send(&mut ctx, build_ix(
+        flash_book::instruction::ExecuteTriggerOrderV3 {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(book_pda, false),
+            AccountMeta::new(trig, false),
+            AccountMeta::new_readonly(m_pos, false),
+            AccountMeta::new_readonly(program_id(), false), // sibling None
+        ],
+    ), &[&payer]).await.expect("fire reduce-only trigger → resting ask 10");
+
+    // 3) M SHRINKS long 10 → 5: C rests bid 5, M takes sell 5, settle. Now the
+    //    resting reduce-only ask (10) exceeds M's position (5).
+    send(&mut ctx, limit(0, 5, &c, &c_state), &[&payer, &c]).await.unwrap();
+    send(&mut ctx, taker(1, 5, &m, &m_state, vec![AccountMeta::new(fc_pda, false)]), &[&payer, &m]).await.unwrap();
+    send(&mut ctx, apply(5, 1, 2, m_state, c_state, m_pos, c_pos), &[&payer]).await.expect("shrink M to long 5");
+    let mp: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, m_pos).await;
+    assert_eq!((mp.side, mp.size_lots), (0, 5), "M shrunk to long 5, reduce-only ask 10 now over-hangs");
+
+    // 4) TAKER 1 crosses 5 of M's reduce-only ask. In-flight is now 5; DON'T settle.
+    send(&mut ctx, taker(0, 5, &t1, &t1_state, vec![
+        AccountMeta::new(fc_pda, false),
+        AccountMeta::new_readonly(m_pos, false),
+    ]), &[&payer, &t1]).await.expect("taker 1 crosses reduce-only");
+    let d = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
+    let (mut p, mut s) = ([0u8; 8], [0u8; 8]);
+    p.copy_from_slice(&d[8..16]); s.copy_from_slice(&d[16..24]);
+    assert_eq!((u64::from_le_bytes(p), u64::from_le_bytes(s)), (3, 2), "ring: 1 fill pending (taker 1)");
+    assert_eq!(read_inflight(&mut ctx, fc_pda, m_pos).await, 5, "M's reduce-in-flight is 5");
+
+    // 5) TAKER 2 tries to over-cross the remaining 5 across the settle gap. The
+    //    matcher caps it by position(5) − in-flight(5) = 0, so it produces NOTHING.
+    send(&mut ctx, taker(0, 5, &t2, &t2_state, vec![
+        AccountMeta::new(fc_pda, false),
+        AccountMeta::new_readonly(m_pos, false),
+    ]), &[&payer, &t2]).await.expect("taker 2 tx succeeds but produces no reduce-only fill");
+    let d = ctx.banks_client.get_account(fc_pda).await.unwrap().unwrap().data;
+    p.copy_from_slice(&d[8..16]);
+    assert_eq!(u64::from_le_bytes(p), 3, "F-3: taker 2 produced NO fill — the over-reduce is blocked");
+
+    // 6) Settle taker 1's fill: M long 5 → 0 (flat). Never flipped. In-flight released.
+    send(&mut ctx, apply(5, 0, 3, t1_state, m_state, t1_pos, m_pos), &[&payer]).await.expect("settle taker 1");
+    let mp: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, m_pos).await;
+    assert_eq!(mp.size_lots, 0, "F-3 PROVEN: M reduced to flat, NEVER flipped to a short");
+    assert_eq!(read_inflight(&mut ctx, fc_pda, m_pos).await, 0, "in-flight released at settlement");
 }
 
 /// PERMISSIONLESS KEEPER (2026-07): on an ARMED market the commitment ring FULLY
