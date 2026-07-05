@@ -4,8 +4,10 @@
 //
 //   rest orders on ER → cranker attests the exact computed reservation →
 //   strict withdraw fails closed → over-withdraw rejected → free balance
-//   withdrawable mid-session → taker consumes the orders → cranker attests 0 →
-//   er_active clears → the strict path re-opens.
+//   withdrawable mid-session → taker consumes the orders → the reservation
+//   PERSISTS as unsettled-fill margin (maker AND taker) and the last lots stay
+//   locked → on an L1-resident market the same fills SETTLE via apply_fill and
+//   the cranker releases exactly the settled market's reservation.
 //
 // GATED: runs only when ER_RPC is set; skips cleanly (exit 0) otherwise.
 //
@@ -147,7 +149,14 @@ try {
   const BOOK = pda(["market_book", M]);
   const FC = pda(["fill_commit", M]);
   const FO = pda(["fill_outbox", M]);
-  console.log("market", M.toBase58());
+  // Market B (L1-resident, created mid-run — the cranker watches it from spawn
+  // and picks it up lazily) proves release-at-settlement.
+  const baseB = Keypair.generate();
+  const MB = pda(["market", baseB.publicKey, QUOTE]);
+  const BOOKB = pda(["market_book", MB]);
+  const FCB = pda(["fill_commit", MB]);
+  const FOB = pda(["fill_outbox", MB]);
+  console.log("market A", M.toBase58(), "| market B", MB.toBase58());
 
   await stage("L1 init market + book + ring + outbox", async () => {
     await send(l1, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [base]);
@@ -194,7 +203,7 @@ try {
 
   await stage("spawn the attestation cranker (no manual attests from here on)", async () => {
     cranker = spawn(process.execPath, [new URL("./attestation_cranker.mjs", import.meta.url).pathname], {
-      env: { ...process.env, L1_RPC, ER_RPC, MARKETS: M.toBase58(), INTERVAL_MS: "1500" },
+      env: { ...process.env, L1_RPC, ER_RPC, MARKETS: `${M.toBase58()},${MB.toBase58()}`, INTERVAL_MS: "1500" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     cranker.stdout.on("data", (d) => process.stdout.write(`    [cranker] ${d}`));
@@ -257,24 +266,75 @@ try {
       .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
   });
 
-  await stage("cranker attests 0 once the orders are consumed → er_active clears", async () => {
-    await until("cranker attestation back to 0", async () => {
-      const a = await program.account.erMarginAttestation.fetch(makerEM);
-      return BigInt(a.reservedMarginQuoteLots.toString()) === 0n ? a : null;
+  await stage("cranker carries the reservation through the UNSETTLED-FILL window (maker + taker)", async () => {
+    // The orders left the book, but their fills sit in the outbox awaiting
+    // settlement: the maker's reservation must persist and the taker must gain
+    // an equal one — no gap between order margin and fill margin.
+    await until(`taker attestation == ${expected}`, async () => {
+      const a = await program.account.erMarginAttestation.fetch(takerEM);
+      return BigInt(a.reservedMarginQuoteLots.toString()) === expected ? a : null;
     });
-    const ts = await program.account.traderStateAccount.fetch(makerTS);
-    if (ts.erActive !== 0) throw new Error("er_active must clear when the cranker attests 0");
+    const m = await program.account.erMarginAttestation.fetch(makerEM);
+    if (BigInt(m.reservedMarginQuoteLots.toString()) !== expected)
+      throw new Error(`maker reservation ${m.reservedMarginQuoteLots}, expected ${expected} (must persist through the fill window)`);
+    return `maker ${expected} persists, taker ${expected} appears`;
   });
 
-  await stage("L1 strict withdraw re-opens (withdraw-anytime, still no lock anywhere)", async () => {
-    // Only the former reservation remains; with the attestation back at 0 the
-    // strict path releases it down to the last lot.
-    const ts = await program.account.traderStateAccount.fetch(makerTS);
-    const rest = BigInt(ts.collateralQuoteLots.toString());
-    const sig = await send(l1, await strictWithdrawIx(new BN(rest.toString())), [maker]);
-    const after = await program.account.traderStateAccount.fetch(makerTS);
-    if (after.collateralQuoteLots.toNumber() !== 0) throw new Error(`collateral ${after.collateralQuoteLots} after full withdraw`);
-    return `withdrew the remaining ${rest} — account fully drained; ${sig.slice(0, 20)}…`;
+  await stage("maker's last lots NOT withdrawable while its fills are unsettled → rejected (ErMarginReserved)", async () =>
+    expectErr(l1, await xdomainWithdrawIx(1_000), [maker], ERR_ER_MARGIN_RESERVED, "withdraw against unsettled fills"));
+
+  // ════ Market B (L1-resident): the same window RELEASES at settlement ════
+  await stage("B: L1 init market + book + ring + outbox (cranker picks it up lazily)", async () => {
+    await send(l1, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: baseB.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: MB, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [baseB]);
+    await send(l1, await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: MB, marketBook: BOOKB, systemProgram: sys }).instruction(), []);
+    await send(l1, await program.methods.initFillCommitment(105).accountsPartial({ authority: signer.publicKey, market: MB, fillCommitment: FCB, systemProgram: sys }).instruction(), []);
+    await send(l1, await program.methods.initFillOutbox().accountsPartial({ authority: signer.publicKey, market: MB, fillOutbox: FOB, fillCommitment: FCB, systemProgram: sys }).instruction(), []);
+  });
+
+  await stage("B: maker re-deposits + rests 4 bids on the L1 book → reservation stacks across markets", async () => {
+    await send(l1, await program.methods.depositCollateral(new BN(1_000_000_000)).accountsPartial({ trader: maker.publicKey, traderState: makerTS, insuranceFund: INS, quoteMint: QUOTE, traderQuoteAta: makerAta, quoteVault: VAULT, tokenProgram: TOKEN_PROGRAM }).instruction(), [maker]);
+    for (let i = 0; i < 4; i++)
+      await send(l1, await program.methods.placeLimitOrderV2(0, new BN(1), new BN(90000 - i * 10), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: MB, marketBook: BOOKB, traderState: makerTS, position: null }).instruction(), [maker]);
+    await until(`maker attestation == ${expected * 2n} (A fills + B orders)`, async () => {
+      const a = await program.account.erMarginAttestation.fetch(makerEM);
+      return BigInt(a.reservedMarginQuoteLots.toString()) === expected * 2n ? a : null;
+    });
+    return `maker reservation ${expected * 2n} = ${expected} unsettled A-fills + ${expected} resting B-orders`;
+  });
+
+  await stage("B: taker sweeps on L1 → both sides reserved for BOTH markets' unsettled fills", async () => {
+    await send(l1, await program.methods.placeTakerOrderV2(1, new BN(4), new BN(1), 0, new BN(0), 0)
+      .accountsPartial({ trader: taker.publicKey, market: MB, marketBook: BOOKB, traderState: takerTS, position: null })
+      .remainingAccounts([{ pubkey: FCB, isWritable: true, isSigner: false }, { pubkey: FOB, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
+    await until(`taker attestation == ${expected * 2n}`, async () => {
+      const a = await program.account.erMarginAttestation.fetch(takerEM);
+      return BigInt(a.reservedMarginQuoteLots.toString()) === expected * 2n ? a : null;
+    });
+  });
+
+  const makerPosB = pda(["position", MB, makerTS]);
+  const takerPosB = pda(["position", MB, takerTS]);
+  await stage("B: apply_fill × 4 settles → cranker releases EXACTLY the settled market's reservation", async () => {
+    for (let i = 0; i < 4; i++) {
+      const tick = 90000 - i * 10;
+      await send(l1, await program.methods.applyFill(new BN(1), new BN(tick), 1, false, 0, 0, new BN(i + 1))
+        .accountsPartial({ sequencer: signer.publicKey, market: MB, insuranceFund: INS, takerTraderState: takerTS, makerTraderState: makerTS, takerPosition: takerPosB, makerPosition: makerPosB, feeTiers: null, marketHaircut: null, takerPositionHaircut: null, makerPositionHaircut: null, systemProgram: sys })
+        .remainingAccounts([{ pubkey: FCB, isWritable: true, isSigner: false }]).instruction(), [], 600_000);
+    }
+    await until(`maker attestation back to ${expected} (B settled, A persists)`, async () => {
+      const a = await program.account.erMarginAttestation.fetch(makerEM);
+      return BigInt(a.reservedMarginQuoteLots.toString()) === expected ? a : null;
+    });
+    const t = await program.account.erMarginAttestation.fetch(takerEM);
+    if (BigInt(t.reservedMarginQuoteLots.toString()) !== expected)
+      throw new Error(`taker reservation ${t.reservedMarginQuoteLots}, expected ${expected}`);
+    return `both sides released ${expected} at settlement; market A's unsettled ${expected} correctly persists`;
+  });
+
+  await stage("maker still withdraws free balance mid-everything (partial xdomain, position walk)", async () => {
+    const sig = await send(l1, await program.methods.partialWithdrawCollateralXdomain(new BN(100_000)).accountsPartial({ trader: maker.publicKey, traderState: makerTS, erMargin: makerEM, insuranceFund: INS, quoteMint: QUOTE, traderQuoteAta: makerAta, quoteVault: VAULT, tokenProgram: TOKEN_PROGRAM })
+      .remainingAccounts([{ pubkey: MB, isWritable: false, isSigner: false }, { pubkey: makerPosB, isWritable: false, isSigner: false }]).instruction(), [maker], 600_000);
+    return sig.slice(0, 20) + "…";
   });
 } catch (e) {
   // a stage already logged the failure; fall through to the report
@@ -286,5 +346,5 @@ const passed = stages.filter((s) => s.ok).length;
 console.log(`\n========== CRANKER ACCEPTANCE: ${passed}/${stages.length} stages ==========`);
 for (const s of stages) console.log(`  ${s.ok ? "PASS" : "FAIL"}  ${s.name}${s.ok ? "" : "  — " + s.err}`);
 const allOk = stages.length > 0 && stages.every((s) => s.ok);
-console.log(allOk ? "\nCRANKER PASS ✅ (the production attestation loop bounds the withdraw-anytime window with zero manual steps)" : "\nCRANKER INCOMPLETE ❌ (see first FAIL above)");
+console.log(allOk ? "\nCRANKER PASS ✅ (orders AND unsettled fills stay reserved with zero manual steps; released exactly at settlement)" : "\nCRANKER INCOMPLETE ❌ (see first FAIL above)");
 process.exit(allOk ? 0 : 1);
