@@ -1650,6 +1650,13 @@ pub mod flash_book {
                 backing,
                 pos_info,
             )?;
+            // Keep the trader within the cross-margin stress lattice's position
+            // budget: reject opening a NEW market once already at the cap. Reduces
+            // / adds on a market the trader already holds are exempt.
+            assert_open_position_budget(
+                ctx.accounts.trader_state.load()?.open_positions,
+                pos_info,
+            )?;
         }
 
         // Pre-scan remaining_accounts for maker
@@ -13601,6 +13608,10 @@ fn place_limit_v2_core(
             backing,
             pos_info,
         )?;
+        // Keep the trader within the cross-margin stress lattice's position
+        // budget: reject a resting order that would OPEN a new market once already
+        // at the cap. Reduces / adds on a market already held are exempt.
+        assert_open_position_budget(trader_state.load()?.open_positions, pos_info)?;
     }
 
     // Borrow the market_book account data + load the handle.
@@ -20161,6 +20172,73 @@ fn assert_intake_initial_margin(
         FlashBookError::InsufficientCollateral
     );
     Ok(())
+}
+
+/// Intake OPEN-POSITION-COUNT gate. The cross-margin stress lattice is sized for
+/// at most `MAX_POSITIONS_PER_TRADER` positions (that bounds `MAX_STRESS_SCENARIOS`);
+/// past it, `assess_margin` rejects the over-long scenario vector and the trader
+/// lands in a fail-closed corner — it can no longer pass a portfolio margin check
+/// to withdraw or open, only reduce. This gate keeps the common case out of that
+/// corner: at intake, an order that would OPEN a NEW position slot on a market
+/// where the trader is currently flat is rejected once the trader already holds
+/// `MAX_POSITIONS_PER_TRADER` positions.
+///
+/// Sound-by-construction — never rejects a legitimate reduce:
+///   • `pos == Some((_, size > 0))` ⇒ the trader is already open on THIS market
+///     (the position PDA is verified against this market by the caller), so the
+///     order adds to / reduces / flips an EXISTING slot and cannot raise the slot
+///     count ⇒ exempt.
+///   • `pos == None` or `Some((_, 0))` ⇒ the trader is flat here ⇒ the order can
+///     open a new slot ⇒ gated. Omitting the position only makes the check
+///     STRICTER, never a bypass.
+///
+/// Best-effort by design: the counter increments at SETTLEMENT (a fill going
+/// flat→non-flat), which cannot reject, so a burst of new-market opens from below
+/// the cap can still race past it. `assess_margin`'s scenario-length check remains
+/// the hard backstop that prevents any under-margining in that tail.
+fn assert_open_position_budget(open_positions: u8, pos: Option<(u8, u64)>) -> Result<()> {
+    let opens_new_slot = match pos {
+        None => true,
+        Some((_, size)) => size == 0,
+    };
+    if opens_new_slot {
+        require!(
+            (open_positions as usize) < crate::constants::MAX_POSITIONS_PER_TRADER,
+            FlashBookError::TooManyOpenPositions
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod m2_open_position_budget_tests {
+    use super::assert_open_position_budget;
+    use crate::constants::MAX_POSITIONS_PER_TRADER;
+
+    const CAP: u8 = MAX_POSITIONS_PER_TRADER as u8;
+
+    #[test]
+    fn open_below_cap_ok_at_cap_rejected() {
+        // Flat on this market (None) ⇒ opening a new slot.
+        assert!(assert_open_position_budget(CAP - 1, None).is_ok());
+        assert!(assert_open_position_budget(CAP, None).is_err());
+        assert!(assert_open_position_budget(CAP + 1, None).is_err());
+    }
+
+    #[test]
+    fn zero_size_position_counts_as_new_open() {
+        // A position account that exists but is flat (size 0) still opens a slot.
+        assert!(assert_open_position_budget(CAP, Some((0, 0))).is_err());
+        assert!(assert_open_position_budget(CAP - 1, Some((1, 0))).is_ok());
+    }
+
+    #[test]
+    fn already_open_on_market_is_exempt_even_at_cap() {
+        // Live position on THIS market ⇒ add/reduce/flip an existing slot ⇒ exempt,
+        // so a trader at the cap can still manage every position they hold.
+        assert!(assert_open_position_budget(CAP, Some((0, 100))).is_ok());
+        assert!(assert_open_position_budget(CAP + 5, Some((1, 1))).is_ok());
+    }
 }
 
 #[cfg(test)]
