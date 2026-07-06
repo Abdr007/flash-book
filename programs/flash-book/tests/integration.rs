@@ -1757,6 +1757,8 @@ struct Reconciled {
     // FLP per-market inventory keyed by market → (size_lots, side), taken from
     // the absolute flp_size_after / flp_side_after the FLP fill carries.
     flp: std::collections::HashMap<Pubkey, (u64, u8)>,
+    // Per-position haircut reserve keyed by position → reserve_after (absolute).
+    haircut_reserve: std::collections::HashMap<Pubkey, u64>,
 }
 
 impl Reconciled {
@@ -1782,8 +1784,8 @@ impl Reconciled {
         use flash_book::matcher::position_math as pm;
         use flash_book::{
             CollateralDepositedEvent, CollateralWithdrawnEvent, FillAppliedEvent,
-            FlpFillAppliedEvent, FundingCrankedEvent, FundingSettledEvent, OrderCancelledV2Event,
-            OrderPlacedV2Event,
+            FlpFillAppliedEvent, FundingCrankedEvent, FundingSettledEvent,
+            GainReleasedToHaircutEvent, OrderCancelledV2Event, OrderPlacedV2Event,
         };
         for line in logs {
             let Some(b64) = line.strip_prefix("Program data: ") else {
@@ -1863,6 +1865,12 @@ impl Reconciled {
                 if let Ok(e) = FlpFillAppliedEvent::try_from_slice(body) {
                     self.flp
                         .insert(e.market, (e.flp_size_after, e.flp_side_after));
+                }
+            } else if disc
+                == <GainReleasedToHaircutEvent as anchor_lang::Discriminator>::DISCRIMINATOR
+            {
+                if let Ok(e) = GainReleasedToHaircutEvent::try_from_slice(body) {
+                    self.haircut_reserve.insert(e.position, e.reserve_after);
                 }
             }
         }
@@ -2285,6 +2293,120 @@ async fn d19_reconciler_rebuilds_flp_inventory_from_a_flp_fill() {
         (size, side),
         (entry.size_lots, entry.side),
         "event-reconstructed FLP inventory == on-chain"
+    );
+}
+
+#[tokio::test]
+async fn d19_reconciler_rebuilds_haircut_reserve_from_release() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    disarm_fill_commitment(&mut ctx, market_pda).await;
+
+    // A cross position via apply_fill, then the haircut engine enabled and a real
+    // gain release into the reserve.
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 50_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 50_000, &protocol).await;
+    let pos = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_pda,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+    let (haircut_state, _) = pda(&[
+        flash_book::state_v3::MarketHaircutStateAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let (pos_hc, _) = pda(&[
+        flash_book::state_v3::PositionHaircutStateAccount::SEED,
+        market_pda.as_ref(),
+        pos.as_ref(),
+    ]);
+
+    // Enable the haircut engine (h_min=0), then lazy-init the position's state.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitializeHaircutState {
+                    h_min_slots: 0,
+                    h_max_slots: 1,
+                    initial_residual_quote_lots: 1000,
+                },
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(haircut_state, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitPositionHaircutState {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(taker_state, false),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new_readonly(pos, false),
+                    AccountMeta::new_readonly(haircut_state, false),
+                    AccountMeta::new(pos_hc, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Release 1000 of the trader's collateral into the reserve — capture the event.
+    let mut recon = Reconciled::default();
+    let release_ix = build_ix(
+        flash_book::instruction::ReleaseGainToHaircut {
+            gain_quote_lots: 1000,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(pos, false),
+            AccountMeta::new(haircut_state, false),
+            AccountMeta::new(pos_hc, false),
+        ],
+    );
+    let logs = send_capture(&mut ctx, release_ix, &payer.pubkey(), &[&payer]).await;
+    recon.apply_logs(&logs);
+
+    // ── Reconstructed haircut reserve == on-chain PositionHaircutState. ──
+    let oc: flash_book::state_v3::PositionHaircutStateAccount =
+        fetch(&mut ctx.banks_client, pos_hc).await;
+    assert_eq!(
+        *recon
+            .haircut_reserve
+            .get(&pos)
+            .expect("haircut reserve reconstructed"),
+        oc.released_reserve_quote_lots,
+        "event-reconstructed haircut reserve == on-chain"
+    );
+    assert_eq!(
+        oc.released_reserve_quote_lots, 1000,
+        "reserve holds the released gain"
     );
 }
 
