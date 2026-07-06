@@ -19,8 +19,13 @@ pub const SESSION_SEED: &[u8] = b"session";
 
 /// Hard cap on a session's lifetime (7 days) — one approval covers a week of
 /// one-click trading. Bounds the blast radius of a leaked session key: it can
-/// only place/cancel (never withdraw), it expires regardless, and the owner
-/// can revoke sooner.
+/// only place/cancel (never withdraw or move collateral), and the owner can
+/// revoke it. Expiry and revocation are enforced against the clock and token
+/// clone seen by the executing runtime: session trades run on the ER, so both
+/// bounds hold to the same degree the ER's clock and account clones are honest
+/// — i.e. within the same single-sequencer trust the rest of the ER path already
+/// assumes. The custody bound (place/cancel only, own trader_state only) does
+/// NOT depend on that trust and holds unconditionally.
 pub const MAX_SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 /// A revocable, auto-expiring authorization for `session_signer` to act for
