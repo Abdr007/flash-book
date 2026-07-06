@@ -1551,15 +1551,7 @@ pub mod flash_book {
         }
         let now_slot = Clock::get()?.slot;
 
-        if side > 1
-            || size_lots == 0
-            || limit_ticks == 0
-            || (flags & !0b0111_1111) != 0
-            // H4: reduce_only (bit1) is NOT enforced on the v2 CLOB — reject it
-            // loudly rather than silently no-op a "protective close" (which could
-            // OPEN/FLIP a position if the original is already gone).
-            || (flags & 0b0000_0010) != 0
-        {
+        if side > 1 || size_lots == 0 || limit_ticks == 0 || (flags & !0b0111_1111) != 0 {
             return err!(FlashBookError::OutOfRange);
         }
         if expires_at_slot != 0 && expires_at_slot <= now_slot {
@@ -1569,6 +1561,7 @@ pub mod flash_book {
         let p = &market.params;
         if market.status != MarketStatus::Active as u8
             && market.status != MarketStatus::PostOnly as u8
+            && market.status != MarketStatus::CloseOnly as u8
         {
             return err!(FlashBookError::OutOfRange);
         }
@@ -1578,6 +1571,46 @@ pub mod flash_book {
         if limit_ticks % p.tick_size != 0 {
             return err!(FlashBookError::PriceNotOnTick);
         }
+
+        // reduce_only (bit1), or a market in CloseOnly wind-down: cap the taker to
+        // its own reducible size so it can
+        // ONLY lower exposure — never open or flip. Fail-closed on an absent /
+        // foreign / flat / same-side position (nothing to reduce ⇒ reject). The
+        // cap uses the taker's freshest committed position; a reduce racing an
+        // unsettled fill is bounded by the drain-window residual (SETTLEMENT.md
+        // §3), never a silent open. Shadowing `size_lots` here makes the OI cap,
+        // margin gate, and match walk below all use the capped size.
+        let reduce_only = flags & state_v2::FLAG_REDUCE_ONLY != 0
+            || market.status == MarketStatus::CloseOnly as u8;
+        let size_lots = if reduce_only {
+            let pos_loader = ctx
+                .accounts
+                .position
+                .as_ref()
+                .ok_or_else(|| error!(FlashBookError::ReduceOnlyNoPosition))?;
+            let pdata = pos_loader.load()?;
+            verify_position_pda(
+                &market.key(),
+                &ctx.accounts.trader_state.key(),
+                pdata.bump,
+                &pos_loader.key(),
+                ctx.program_id,
+            )?;
+            match matcher::reduce_only::check_reduce_only(
+                pdata.side,
+                pdata.size_lots,
+                side,
+                size_lots,
+            ) {
+                matcher::reduce_only::ReduceOnlyOutcome::Admit => size_lots,
+                matcher::reduce_only::ReduceOnlyOutcome::PartialAdmit(cap) => cap,
+                matcher::reduce_only::ReduceOnlyOutcome::Reject => {
+                    return err!(FlashBookError::ReduceOnlyNoPosition)
+                }
+            }
+        } else {
+            size_lots
+        };
 
         // Per-market OI hard cap — mirror the limit path (MATCH-H1). Without
         // this guard a taker (filled portion + resting residual) bypasses the
@@ -1624,8 +1657,10 @@ pub mod flash_book {
         // Intake initial-margin gate — reject an order whose
         // resulting position on this market would be under-margined (the zero/thin-
         // collateral "free option"). Pure reduces are exempt; an omitted position is
-        // treated as a full open (strictest), so it cannot be a bypass.
-        {
+        // treated as a full open (strictest), so it cannot be a bypass. A reduce-only
+        // taker is capped above to its reducible size, so it can only lower exposure
+        // and needs no initial margin.
+        if !reduce_only {
             let (pos_info, backing) = if let Some(pos_loader) = ctx.accounts.position.as_ref() {
                 let pdata = pos_loader.load()?;
                 verify_position_pda(
@@ -6282,7 +6317,7 @@ pub mod flash_book {
     }
 
     pub fn set_market_status(ctx: Context<SetMarketStatus>, new_status: u8) -> Result<()> {
-        require!(new_status <= 4, FlashBookError::OutOfRange);
+        require!(new_status <= 5, FlashBookError::OutOfRange);
         let caller = ctx.accounts.authority.key();
         let market_key = ctx.accounts.market.key();
         let is_authority = ctx.accounts.market.authority == caller;
@@ -13518,29 +13553,33 @@ fn place_limit_v2_core(
     // empirical frequency: malformed inputs rare → fast-path through.
     let now_slot = Clock::get()?.slot;
 
-    // Fast input guards (most-common-pass first).
-    if side > 1
-        || size_lots == 0
-        || limit_ticks == 0
-        || (flags & !0b0111_1111) != 0
-        // H4: reduce_only (bit1) is NOT enforced on the v2 CLOB (there is no
-        // settlement-time reduce-only check; matcher::reduce_only is uncalled).
-        // Reject it LOUDLY so a trader cannot set a "protective close" that
-        // would silently OPEN or FLIP a position. (Full enforcement = separate feature.)
-        || (flags & 0b0000_0010) != 0
-    {
+    // Fast input guards (most-common-pass first). reduce_only (bit1) is honored:
+    // a resting reduce-only order is capped to its reducible size by the
+    // symmetric, inflight-aware maker clamp in the taker walk, so it can never
+    // open or flip a position.
+    if side > 1 || size_lots == 0 || limit_ticks == 0 || (flags & !0b0111_1111) != 0 {
         return err!(FlashBookError::OutOfRange);
     }
     if expires_at_slot != 0 && expires_at_slot <= now_slot {
         return err!(FlashBookError::OutOfRange);
     }
 
-    // Market-state guards.
+    // Market-state guards. A CloseOnly market admits intake but forces every
+    // resting order reduce-only (below), so positions can only be wound down.
     let p = &market.params;
-    if market.status != MarketStatus::Active as u8 && market.status != MarketStatus::PostOnly as u8
+    if market.status != MarketStatus::Active as u8
+        && market.status != MarketStatus::PostOnly as u8
+        && market.status != MarketStatus::CloseOnly as u8
     {
         return err!(FlashBookError::OutOfRange);
     }
+    // In CloseOnly the order is forced reduce-only regardless of the caller's flag,
+    // so the symmetric maker clamp caps it to the position's reducible size.
+    let flags = if market.status == MarketStatus::CloseOnly as u8 {
+        flags | state_v2::FLAG_REDUCE_ONLY
+    } else {
+        flags
+    };
     if size_lots < p.min_base_lots {
         return err!(FlashBookError::SizeBelowMinLot);
     }
@@ -13605,19 +13644,27 @@ fn place_limit_v2_core(
         } else {
             (None, trader_state.load()?.collateral_quote_lots)
         };
-        assert_intake_initial_margin(
-            side,
-            size_lots,
-            limit_ticks,
-            market.params.initial_margin_ratio_bps,
-            market.params.tick_size,
-            backing,
-            pos_info,
-        )?;
-        // Keep the trader within the cross-margin stress lattice's position
-        // budget: reject a resting order that would OPEN a new market once already
-        // at the cap. Reduces / adds on a market already held are exempt.
-        assert_open_position_budget(trader_state.load()?.open_positions, pos_info)?;
+        // A reduce-only order is exempt from BOTH opening gates: the maker clamp
+        // caps it to the position's reducible size, so it can only lower exposure —
+        // it never needs initial margin (requiring it would wrongly reject a
+        // full-close larger than the position, whose excess never fills) and it
+        // never opens a new position slot (so it can't breach the stress-lattice
+        // budget).
+        if flags & state_v2::FLAG_REDUCE_ONLY == 0 {
+            assert_intake_initial_margin(
+                side,
+                size_lots,
+                limit_ticks,
+                market.params.initial_margin_ratio_bps,
+                market.params.tick_size,
+                backing,
+                pos_info,
+            )?;
+            // Keep the trader within the cross-margin stress lattice's position
+            // budget: reject a resting order that would OPEN a new market once
+            // already at the cap. Reduces / adds on a market already held are exempt.
+            assert_open_position_budget(trader_state.load()?.open_positions, pos_info)?;
+        }
     }
 
     // Borrow the market_book account data + load the handle.
@@ -18654,6 +18701,11 @@ pub enum MarketStatus {
     PostOnly = 2,
     Paused = 3,
     Closed = 4,
+    // Wind-down: order intake is open but every order is forced reduce-only, so
+    // positions can only be closed, never opened or grown. Authority-only (it is
+    // deliberately outside the guardian's monotonic restrict ladder). Numbered
+    // last to keep the existing on-chain status values stable.
+    CloseOnly = 5,
 }
 
 /// Inject one basket leg into a hypertree-backed market_book PDA.

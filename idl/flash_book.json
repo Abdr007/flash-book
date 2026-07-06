@@ -18956,6 +18956,11 @@
       "code": 8323,
       "name": "TooManyOpenPositions",
       "msg": "Trader already holds the maximum number of open positions: close one before opening a new market"
+    },
+    {
+      "code": 8324,
+      "name": "ReduceOnlyNoPosition",
+      "msg": "Reduce-only order has no opposing position to reduce (absent, foreign, flat, or same-side)"
     }
   ],
   "types": [

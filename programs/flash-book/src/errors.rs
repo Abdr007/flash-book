@@ -275,6 +275,8 @@ pub enum FlashBookError {
     ErMarginNotReady = 2322,
     #[msg("Trader already holds the maximum number of open positions: close one before opening a new market")]
     TooManyOpenPositions = 2323,
+    #[msg("Reduce-only order has no opposing position to reduce (absent, foreign, flat, or same-side)")]
+    ReduceOnlyNoPosition = 2324,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
