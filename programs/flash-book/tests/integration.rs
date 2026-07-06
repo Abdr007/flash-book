@@ -1754,6 +1754,9 @@ struct Reconciled {
     book: std::collections::HashMap<u64, (u64, u64, u8)>,
     // Insurance-fund balance delta, summed from the per-fill contribution.
     insurance: i128,
+    // FLP per-market inventory keyed by market → (size_lots, side), taken from
+    // the absolute flp_size_after / flp_side_after the FLP fill carries.
+    flp: std::collections::HashMap<Pubkey, (u64, u8)>,
 }
 
 impl Reconciled {
@@ -1779,7 +1782,8 @@ impl Reconciled {
         use flash_book::matcher::position_math as pm;
         use flash_book::{
             CollateralDepositedEvent, CollateralWithdrawnEvent, FillAppliedEvent,
-            FundingCrankedEvent, FundingSettledEvent, OrderCancelledV2Event, OrderPlacedV2Event,
+            FlpFillAppliedEvent, FundingCrankedEvent, FundingSettledEvent, OrderCancelledV2Event,
+            OrderPlacedV2Event,
         };
         for line in logs {
             let Some(b64) = line.strip_prefix("Program data: ") else {
@@ -1854,6 +1858,11 @@ impl Reconciled {
             } else if disc == <OrderCancelledV2Event as anchor_lang::Discriminator>::DISCRIMINATOR {
                 if let Ok(e) = OrderCancelledV2Event::try_from_slice(body) {
                     self.book.remove(&e.order_seq);
+                }
+            } else if disc == <FlpFillAppliedEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
+                if let Ok(e) = FlpFillAppliedEvent::try_from_slice(body) {
+                    self.flp
+                        .insert(e.market, (e.flp_size_after, e.flp_side_after));
                 }
             }
         }
@@ -2211,6 +2220,71 @@ async fn d19_reconciler_rebuilds_book_from_orders() {
     assert_eq!(
         recon_orders, decoded,
         "event-reconstructed book == byte-decoded on-chain slab"
+    );
+}
+
+#[tokio::test]
+async fn d19_reconciler_rebuilds_flp_inventory_from_a_flp_fill() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    disarm_fill_commitment(&mut ctx, market_pda).await;
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    let trader = Keypair::new();
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        trader_state.as_ref(),
+    ]);
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+
+    let mut recon = Reconciled::default();
+    // FLP is the maker: trader buys 1 lot @ 100_000 from the FLP, which takes the
+    // opposite (short) side. FlpFillApplied carries the absolute FLP inventory.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFlpFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_sub_index: 0,
+            fill_seq: 1,
+            taker_was_jit: false,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(trader_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let logs = send_capture(&mut ctx, ix, &payer.pubkey(), &[&payer]).await;
+    recon.apply_logs(&logs);
+
+    // ── Reconstructed FLP inventory == on-chain per-market entry. ──
+    let flp: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
+    let entry = flp
+        .per_market
+        .iter()
+        .find(|e| e.side != 255 && e.market == to_anchor(market_pda))
+        .expect("FLP entry on this market");
+    let (size, side) = *recon
+        .flp
+        .get(&market_pda)
+        .expect("FLP inventory reconstructed");
+    assert_eq!(
+        (size, side),
+        (entry.size_lots, entry.side),
+        "event-reconstructed FLP inventory == on-chain"
     );
 }
 
