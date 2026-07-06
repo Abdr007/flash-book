@@ -72,6 +72,23 @@ jobs:
           path: target/deploy/flash_book.so
           if-no-files-found: error
 
+  v2-bridge:
+    name: V2 bridge SDK tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # The adapter builds instructions from the committed IDL and reconciles PnL
+      # in exact integers; the SDK suite round-trips every instruction/account
+      # through anchor's coders and checks the identity beyond 2^53.
+      - name: Install + test
+        working-directory: v2-bridge
+        run: |
+          npm ci
+          npm test
+
   kani:
     name: Formal verification (Kani)
     runs-on: ubuntu-latest
