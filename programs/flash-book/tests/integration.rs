@@ -7518,6 +7518,77 @@ async fn reduce_only_taker_without_position_is_rejected_fail_closed() {
     );
 }
 
+/// A market in CloseOnly wind-down forces EVERY order reduce-only: a plain taker
+/// (flags = 0, no reduce-only bit) that would open a position is rejected fail-
+/// closed (`ReduceOnlyNoPosition` = Custom(8323)), so positions can only be closed.
+#[tokio::test]
+async fn close_only_market_forces_reduce_only_and_blocks_openers() {
+    use flash_book::matcher::fill_commitment as fc;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 1_000_000, &protocol).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
+
+    // Authority moves the market to CloseOnly (status 5).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::SetMarketStatus { new_status: 5 },
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new_readonly(program_id(), false), // guardian None
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .expect("authority sets CloseOnly");
+
+    // Plain taker (flags = 0, NO reduce-only bit), no position → forced reduce-only
+    // by the market ⇒ fail-closed.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::PlaceTakerOrderV2 {
+                    side: 0,
+                    size_lots: 1,
+                    limit_ticks: 100_000,
+                    flags: 0,
+                    expires_at_slot: 0,
+                    sub_index: 0,
+                },
+                vec![
+                    AccountMeta::new(taker.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(taker_state, false),
+                    AccountMeta::new_readonly(program_id(), false), // position None
+                    AccountMeta::new(fc_pda, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &taker],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8323)"),
+        "CloseOnly market must force reduce-only and reject an opener, got {dbg}"
+    );
+}
+
 /// PERMISSIONLESS KEEPER: on an ARMED market the commitment ring FULLY
 /// constrains settlement — `apply_fill` recomputes `keccak(fill_preimage)` (which
 /// binds both trader identities, side, size, price) and pops it FIFO. So a caller

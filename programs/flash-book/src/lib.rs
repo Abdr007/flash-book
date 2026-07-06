@@ -1555,6 +1555,7 @@ pub mod flash_book {
         let p = &market.params;
         if market.status != MarketStatus::Active as u8
             && market.status != MarketStatus::PostOnly as u8
+            && market.status != MarketStatus::CloseOnly as u8
         {
             return err!(FlashBookError::OutOfRange);
         }
@@ -1565,14 +1566,16 @@ pub mod flash_book {
             return err!(FlashBookError::PriceNotOnTick);
         }
 
-        // reduce_only (bit1): cap the taker to its own reducible size so it can
+        // reduce_only (bit1), or a market in CloseOnly wind-down: cap the taker to
+        // its own reducible size so it can
         // ONLY lower exposure — never open or flip. Fail-closed on an absent /
         // foreign / flat / same-side position (nothing to reduce ⇒ reject). The
         // cap uses the taker's freshest committed position; a reduce racing an
         // unsettled fill is bounded by the drain-window residual (SETTLEMENT.md
         // §3), never a silent open. Shadowing `size_lots` here makes the OI cap,
         // margin gate, and match walk below all use the capped size.
-        let reduce_only = flags & state_v2::FLAG_REDUCE_ONLY != 0;
+        let reduce_only = flags & state_v2::FLAG_REDUCE_ONLY != 0
+            || market.status == MarketStatus::CloseOnly as u8;
         let size_lots = if reduce_only {
             let pos_loader = ctx
                 .accounts
@@ -6301,7 +6304,7 @@ pub mod flash_book {
     }
 
     pub fn set_market_status(ctx: Context<SetMarketStatus>, new_status: u8) -> Result<()> {
-        require!(new_status <= 4, FlashBookError::OutOfRange);
+        require!(new_status <= 5, FlashBookError::OutOfRange);
         let caller = ctx.accounts.authority.key();
         let market_key = ctx.accounts.market.key();
         let is_authority = ctx.accounts.market.authority == caller;
@@ -13548,12 +13551,22 @@ fn place_limit_v2_core(
         return err!(FlashBookError::OutOfRange);
     }
 
-    // Market-state guards.
+    // Market-state guards. A CloseOnly market admits intake but forces every
+    // resting order reduce-only (below), so positions can only be wound down.
     let p = &market.params;
-    if market.status != MarketStatus::Active as u8 && market.status != MarketStatus::PostOnly as u8
+    if market.status != MarketStatus::Active as u8
+        && market.status != MarketStatus::PostOnly as u8
+        && market.status != MarketStatus::CloseOnly as u8
     {
         return err!(FlashBookError::OutOfRange);
     }
+    // In CloseOnly the order is forced reduce-only regardless of the caller's flag,
+    // so the symmetric maker clamp caps it to the position's reducible size.
+    let flags = if market.status == MarketStatus::CloseOnly as u8 {
+        flags | state_v2::FLAG_REDUCE_ONLY
+    } else {
+        flags
+    };
     if size_lots < p.min_base_lots {
         return err!(FlashBookError::SizeBelowMinLot);
     }
@@ -18669,6 +18682,11 @@ pub enum MarketStatus {
     PostOnly = 2,
     Paused = 3,
     Closed = 4,
+    // Wind-down: order intake is open but every order is forced reduce-only, so
+    // positions can only be closed, never opened or grown. Authority-only (it is
+    // deliberately outside the guardian's monotonic restrict ladder). Numbered
+    // last to keep the existing on-chain status values stable.
+    CloseOnly = 5,
 }
 
 /// Inject one basket leg into a hypertree-backed market_book PDA.
