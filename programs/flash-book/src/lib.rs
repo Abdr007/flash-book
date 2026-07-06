@@ -4694,6 +4694,49 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Permissionless funding crank: advance `cum_funding_index` by one tick of
+    /// `rate · Δt` from the current (mark, oracle) premium, gated to the market's
+    /// rate cap and a clamped Δt. This is the SOLE writer of the index besides
+    /// its init-to-zero. It moves NO value itself — positions realize funding
+    /// later via `settle_funding` (the Kani-proven `route_funding` path,
+    /// Δcollateral == −Δresidual). A first-ever or same-second call, or a market
+    /// with no oracle anchor, accrues exactly nothing.
+    pub fn crank_funding(ctx: Context<CrankFunding>) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let market = &mut ctx.accounts.market;
+        let now = Clock::get()?.unix_timestamp.max(0) as u64;
+        // A first observation only SEEDS the clock — never accrue the rate over
+        // an uninitialised (0) timestamp, which would be an unbounded Δt.
+        if market.last_funding_crank_unix == 0 {
+            market.last_funding_crank_unix = now;
+            return Ok(());
+        }
+        let dt = now.saturating_sub(market.last_funding_crank_unix);
+        let (delta, rate) = matcher::funding::funding_index_delta(
+            market.mark_price_ticks,
+            market.oracle_price_ticks,
+            dt,
+            market.params.funding_rate_k_bps,
+            market.params.funding_rate_max_bps_per_sec,
+            market.params.funding_period_seconds,
+        )?;
+        if delta != 0 {
+            market.cum_funding_index = market
+                .cum_funding_index
+                .checked_add(delta)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            market.last_funding_rate_bps_per_sec = rate;
+        }
+        market.last_funding_crank_unix = now;
+        emit!(FundingCrankedEvent {
+            market: market_key,
+            cum_funding_index: market.cum_funding_index,
+            rate_bps_per_sec: market.last_funding_rate_bps_per_sec,
+            dt_seconds: dt,
+        });
+        Ok(())
+    }
+
     /// Apply a single fill against the taker's and maker's Position PDAs.
     /// Called by the off-chain sequencer once per `FillEntry` row in a
     /// `FillBatchEvent` emitted from `place_taker_order_v2`, or by an
@@ -15842,6 +15885,19 @@ pub struct SettleMark<'info> {
     pub market: Account<'info, MarketAccount>,
 }
 
+#[derive(Accounts)]
+pub struct CrankFunding<'info> {
+    /// Permissionless caller (anyone can crank the funding index).
+    pub caller: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+}
+
 /// F2/F3: ER liveness heartbeat. NOT permissionless — the handler requires
 /// `sequencer.key() == market.sequencer`, so only the genuine ER operator can
 /// attest liveness (a permissionless heartbeat would block the censorship escape).
@@ -18100,6 +18156,17 @@ pub struct FundingSettledEvent {
     /// = trader received.
     pub owed_quote_lots: i64,
     pub new_collateral: u64,
+}
+
+#[event]
+pub struct FundingCrankedEvent {
+    pub market: Pubkey,
+    /// Q64.64 cumulative funding index after this tick.
+    pub cum_funding_index: i128,
+    /// Clamped funding rate stamped this tick (bps per second, signed).
+    pub rate_bps_per_sec: i64,
+    /// Seconds elapsed since the previous crank (pre-clamp).
+    pub dt_seconds: u64,
 }
 
 #[event]
@@ -21390,12 +21457,14 @@ pub struct VaultPlaceOrderV3<'info> {
     )]
     pub vault: Account<'info, state_v3::VaultAccountV3>,
 
+    /// Boxed: an un-boxed 1152-byte MarketAccount deserializes onto the stack and
+    /// tips this context's `try_accounts` frame past the 4 KB BPF limit.
     #[account(
         mut,
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
 
     /// CHECK: market_book PDA — disc validated inside handler.
     #[account(

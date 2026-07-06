@@ -423,6 +423,13 @@ pub struct MarketAccount {
     /// which the escape treats via the `book_delegated_at_slot` baseline exactly
     /// as a never-stamped mark was.
     pub last_settlement_slot: u64,
+    /// Unix time of the last funding-index advance by the funding crank. The
+    /// crank accrues `rate · (now − last_funding_crank_unix)` into
+    /// `cum_funding_index` and then restamps this. Trailing field ⇒ pre-existing
+    /// accounts read it as 0; the crank treats 0 as "never cranked" and only
+    /// seeds the timestamp (no accrual on the first tick), so it can never apply
+    /// a rate over an unbounded Δt from an uninitialised clock.
+    pub last_funding_crank_unix: u64,
 }
 
 /// Optional emergency guardian for one market, held in a SEPARATE PDA (not a

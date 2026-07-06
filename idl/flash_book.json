@@ -2655,6 +2655,67 @@
       "args": []
     },
     {
+      "name": "crank_funding",
+      "docs": [
+        "Permissionless funding crank: advance `cum_funding_index` by one tick of",
+        "`rate · Δt` from the current (mark, oracle) premium, gated to the market's",
+        "rate cap and a clamped Δt. This is the SOLE writer of the index besides",
+        "its init-to-zero. It moves NO value itself — positions realize funding",
+        "later via `settle_funding` (the Kani-proven `route_funding` path,",
+        "Δcollateral == −Δresidual). A first-ever or same-second call, or a market",
+        "with no oracle anchor, accrues exactly nothing."
+      ],
+      "discriminator": [
+        83,
+        30,
+        120,
+        80,
+        177,
+        60,
+        27,
+        119
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Permissionless caller (anyone can crank the funding index)."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "create_session_token",
       "docs": [
         "Create a SESSION KEY: authorize `session_signer` to trade for the signing",
@@ -12484,6 +12545,10 @@
         },
         {
           "name": "market",
+          "docs": [
+            "Boxed: an un-boxed 1152-byte MarketAccount deserializes onto the stack and",
+            "tips this context's `try_accounts` frame past the 4 KB BPF limit."
+          ],
           "pda": {
             "seeds": [
               {
@@ -14454,6 +14519,10 @@
         },
         {
           "name": "market",
+          "docs": [
+            "Boxed: an un-boxed 1152-byte MarketAccount deserializes onto the stack and",
+            "tips this context's `try_accounts` frame past the 4 KB BPF limit."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -17201,6 +17270,19 @@
         109,
         27,
         108
+      ]
+    },
+    {
+      "name": "FundingCrankedEvent",
+      "discriminator": [
+        4,
+        233,
+        249,
+        115,
+        134,
+        231,
+        183,
+        25
       ]
     },
     {
@@ -20901,6 +20983,39 @@
       }
     },
     {
+      "name": "FundingCrankedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "cum_funding_index",
+            "docs": [
+              "Q64.64 cumulative funding index after this tick."
+            ],
+            "type": "i128"
+          },
+          {
+            "name": "rate_bps_per_sec",
+            "docs": [
+              "Clamped funding rate stamped this tick (bps per second, signed)."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "dt_seconds",
+            "docs": [
+              "Seconds elapsed since the previous crank (pre-clamp)."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "FundingPeriodCapHitEvent",
       "docs": [
         "Emitted when funding hits the per-period cap and is scaled to fit.",
@@ -22209,6 +22324,18 @@
               "fresh. Trailing field ⇒ existing accounts read it as 0 (never settled),",
               "which the escape treats via the `book_delegated_at_slot` baseline exactly",
               "as a never-stamped mark was."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_funding_crank_unix",
+            "docs": [
+              "Unix time of the last funding-index advance by the funding crank. The",
+              "crank accrues `rate · (now − last_funding_crank_unix)` into",
+              "`cum_funding_index` and then restamps this. Trailing field ⇒ pre-existing",
+              "accounts read it as 0; the crank treats 0 as \"never cranked\" and only",
+              "seeds the timestamp (no accrual on the first tick), so it can never apply",
+              "a rate over an unbounded Δt from an uninitialised clock."
             ],
             "type": "u64"
           }

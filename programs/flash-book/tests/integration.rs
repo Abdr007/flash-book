@@ -1576,6 +1576,96 @@ async fn initialize_market_writes_state() {
     // market_book PDA initialized separately via init_market_book.
 }
 
+/// The permissionless funding crank seeds its clock on the first tick (no
+/// accrual), and only moves `cum_funding_index` when a live oracle anchor is
+/// present — a market with no oracle price accrues nothing (the fail-safe). The
+/// crank moves no collateral itself; value flows later through the Kani-proven
+/// `settle_funding` / `route_funding` path. The exact rate·Δt accrual is covered
+/// by the `funding_index_delta` unit tests + proptest + Kani proof and the live
+/// devnet acceptance (a real wall clock; solana-program-test does not advance
+/// unix_timestamp deterministically).
+#[tokio::test]
+async fn crank_funding_seeds_and_gates_on_oracle() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // A NON-authority signer — the crank is permissionless.
+    let cranker = Keypair::new();
+    let crank_ix = || {
+        build_ix(
+            flash_book::instruction::CrankFunding {},
+            vec![
+                AccountMeta::new_readonly(cranker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+            ],
+        )
+    };
+    // First tick: a permissionless caller seeds the crank clock; no accrual.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[crank_ix()],
+            Some(&payer.pubkey()),
+            &[&payer, &cranker],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m.cum_funding_index, 0, "first crank seeds only, no accrual");
+    assert_ne!(
+        m.last_funding_crank_unix, 0,
+        "clock seeded on the first tick"
+    );
+
+    // Fail-safe: with NO oracle anchor (oracle_price_ticks == 0) the crank accrues
+    // nothing even with a premium-shaped mark and a far-past last-crank time — it
+    // can never move the index off a stale/absent price.
+    let acc = ctx
+        .banks_client
+        .get_account(market_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut st = MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    st.oracle_price_ticks = 0;
+    st.mark_price_ticks = 110_000;
+    st.last_funding_crank_unix = 1;
+    let mut data = Vec::new();
+    st.try_serialize(&mut data).unwrap();
+    data.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: acc.lamports,
+            data,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[crank_ix()],
+            Some(&payer.pubkey()),
+            &[&payer, &cranker],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        m.cum_funding_index, 0,
+        "no oracle anchor -> crank accrues nothing"
+    );
+}
+
 #[tokio::test]
 async fn update_market_params_rejects_immutable_primitive_change() {
     let pt = make_program_test();
