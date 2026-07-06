@@ -20152,6 +20152,28 @@
           {
             "name": "batch_num",
             "type": "u64"
+          },
+          {
+            "name": "taker_fee_paid",
+            "docs": [
+              "Quote-lots actually debited from the taker as fee, and credited to the",
+              "maker as rebate, on this fill — the exact fee-side collateral deltas, so",
+              "the collateral change is fully reconstructable from the event stream."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "maker_rebate_paid",
+            "type": "u64"
+          },
+          {
+            "name": "insurance_contribution_paid",
+            "docs": [
+              "Quote-lots credited to the insurance fund on this fill (the net-fee",
+              "contribution). The sole insurance-balance mutation apply_fill makes, so",
+              "the insurance balance is reconstructable from the event stream."
+            ],
+            "type": "u64"
           }
         ]
       }

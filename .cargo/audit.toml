@@ -31,4 +31,12 @@ ignore = [
     # Reachable only from the host RPC/client networking stack; the on-chain
     # program does no networking. Patched in >=0.11.15.
     "RUSTSEC-2026-0185",
+    # crossbeam-epoch 0.9.18 — invalid pointer dereference in the `fmt::Pointer`
+    # impl for `Atomic`/`Shared`. Dev/test tree only: pulled solely via
+    # solana-program-test → solana-client → solana-streamer → governor → dashmap
+    # → rayon (a dev-dependency); `cargo tree -p flash-book -i crossbeam-epoch
+    # -e no-dev` is empty and it is not linked into flash_book.so. The vulnerable
+    # path only triggers when formatting an already-invalid atomic pointer, which
+    # the test harness never does. Pinned by the Solana 3.x stack.
+    "RUSTSEC-2026-0204",
 ]
