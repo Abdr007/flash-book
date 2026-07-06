@@ -9,6 +9,12 @@
 //! verifies every fill against that ring.
 
 #![allow(unexpected_cfgs)]
+// Machine-enforced panic-free guarantee on runtime paths: no `.unwrap()` /
+// `.expect()` may reach the deployed program. Scoped to `not(test)` so unit and
+// property tests keep using them freely. A genuinely-infallible runtime use must
+// opt out explicitly with `#[allow(clippy::unwrap_used)]` and a justifying
+// comment — there are currently none.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
