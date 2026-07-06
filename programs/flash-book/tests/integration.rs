@@ -1707,15 +1707,37 @@ fn recon_b64(s: &str) -> Option<Vec<u8>> {
 struct Reconciled {
     collateral: std::collections::HashMap<Pubkey, i128>,
     funding_index: std::collections::HashMap<Pubkey, i128>,
+    // Per-trader position, rebuilt by replaying FillApplied through the SAME
+    // position_math the program settles with. `tick_size` is immutable market
+    // config (a reconciler knows it from the market, not per-event).
+    positions: std::collections::HashMap<Pubkey, flash_book::matcher::position_math::Pos>,
+    tick_size: u64,
 }
 
 impl Reconciled {
+    // Open interest derived from the reconstructed positions (long/short lots).
+    fn oi(&self) -> (u64, u64) {
+        let (mut long, mut short) = (0u64, 0u64);
+        for p in self.positions.values() {
+            if p.size_lots == 0 {
+                continue;
+            }
+            if p.side == flash_book::matcher::position_math::SIDE_LONG {
+                long += p.size_lots;
+            } else {
+                short += p.size_lots;
+            }
+        }
+        (long, short)
+    }
+
     // Replay every event in a transaction's logs into the reconstructed state
     // using only the deltas the events carry (never `new_balance`).
     fn apply_logs(&mut self, logs: &[String]) {
+        use flash_book::matcher::position_math as pm;
         use flash_book::{
-            CollateralDepositedEvent, CollateralWithdrawnEvent, FundingCrankedEvent,
-            FundingSettledEvent,
+            CollateralDepositedEvent, CollateralWithdrawnEvent, FillAppliedEvent,
+            FundingCrankedEvent, FundingSettledEvent,
         };
         for line in logs {
             let Some(b64) = line.strip_prefix("Program data: ") else {
@@ -1745,6 +1767,36 @@ impl Reconciled {
             } else if disc == <FundingCrankedEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
                 if let Ok(e) = FundingCrankedEvent::try_from_slice(body) {
                     self.funding_index.insert(e.market, e.cum_funding_index);
+                }
+            } else if disc == <FillAppliedEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
+                if let Ok(e) = FillAppliedEvent::try_from_slice(body) {
+                    let flat = pm::Pos {
+                        side: 0,
+                        size_lots: 0,
+                        entry_ticks: 0,
+                    };
+                    // Both legs settle through the SAME core; the maker takes the
+                    // opposite side of the taker at the same size/price.
+                    let taker_prev = self.positions.get(&e.taker).copied().unwrap_or(flat);
+                    if let Ok(o) = pm::apply_fill(
+                        taker_prev,
+                        e.taker_side,
+                        e.size_lots,
+                        e.price_ticks,
+                        self.tick_size,
+                    ) {
+                        self.positions.insert(e.taker, o.pos);
+                    }
+                    let maker_prev = self.positions.get(&e.maker).copied().unwrap_or(flat);
+                    if let Ok(o) = pm::apply_fill(
+                        maker_prev,
+                        1 - e.taker_side,
+                        e.size_lots,
+                        e.price_ticks,
+                        self.tick_size,
+                    ) {
+                        self.positions.insert(e.maker, o.pos);
+                    }
                 }
             }
         }
@@ -1842,6 +1894,108 @@ async fn d19_reconciler_rebuilds_collateral_and_funding_from_events() {
             .expect("market funding index reconstructed"),
         market.cum_funding_index,
         "event-reconstructed funding index == on-chain"
+    );
+}
+
+#[tokio::test]
+async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // Immutable market config the reconciler is told (tick_size = 1 by default).
+    let mut recon = Reconciled {
+        tick_size: 1,
+        ..Default::default()
+    };
+
+    // A real fill: taker buys 1 lot @ 100_000 from maker. apply_fill creates both
+    // positions, moves OI, and emits FillApplied — the reconciler rebuilds the
+    // positions through the SAME position_math and derives OI from them.
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+            fill_seq: 2,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let logs = send_capture(&mut ctx, ix, &payer.pubkey(), &[&payer]).await;
+    recon.apply_logs(&logs);
+
+    // ── Reconstructed positions == on-chain PositionAccounts (byte-for-byte on
+    // side/size/entry), rebuilt purely from FillApplied. ──
+    let oc_taker: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, taker_pos).await;
+    let oc_maker: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, maker_pos).await;
+    let rt = recon
+        .positions
+        .get(&taker.pubkey())
+        .expect("taker position reconstructed");
+    let rm = recon
+        .positions
+        .get(&maker.pubkey())
+        .expect("maker position reconstructed");
+    assert_eq!(
+        (rt.side, rt.size_lots, rt.entry_ticks),
+        (
+            oc_taker.side,
+            oc_taker.size_lots,
+            oc_taker.entry_price_ticks
+        ),
+        "taker position reconstructed from FillApplied == on-chain"
+    );
+    assert_eq!(
+        (rm.side, rm.size_lots, rm.entry_ticks),
+        (
+            oc_maker.side,
+            oc_maker.size_lots,
+            oc_maker.entry_price_ticks
+        ),
+        "maker position reconstructed from FillApplied == on-chain"
+    );
+
+    // ── Reconstructed OI == on-chain market OI. ──
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        recon.oi(),
+        (market.oi_long_lots, market.oi_short_lots),
+        "event-reconstructed OI == on-chain"
     );
 }
 
