@@ -1674,6 +1674,43 @@ async fn crank_funding_seeds_and_gates_on_oracle() {
 // Positions, OI, FLP NAV, insurance, and the book follow the same pattern on
 // their own events (FillApplied, OrderPlaced/Cancelled, FlpFillApplied, …).
 
+// Byte-faithful decode of the resting orders in an on-chain market_book slab:
+// walk both RB-trees from their header roots via the RBNode left/right pointers
+// and read each RestingOrderV2 payload. Layout: 8-byte disc + 256-byte header,
+// then 96-byte nodes (16-byte RBNode header {left,right,parent,color,...} + the
+// 80-byte payload). Header roots: bids_root_index @112, asks_root_index @120.
+// RBNode links AND the header roots are stored as BYTE OFFSETS into the slab
+// (NODE_TOTAL_BYTES-aligned), not node indices — mirror that exactly. Payload
+// offsets within the node: seq @+8, price_ticks @+16, size_lots @+24, side @+76
+// (relative to payload start = node + 16). Returns (seq, price, size, side) for
+// every live resting order.
+fn decode_book_slab(data: &[u8]) -> Vec<(u64, u64, u64, u8)> {
+    const PREFIX: usize = 264;
+    const NODE: usize = 96;
+    const NIL: u32 = 0x7FFF_FFFF;
+    let u32_at = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for root in [u32_at(112), u32_at(120)] {
+        let mut stack = vec![root];
+        while let Some(off) = stack.pop() {
+            if off >= NIL || !seen.insert(off) {
+                continue;
+            }
+            let node = PREFIX + off as usize; // link value is already a byte offset
+            if node + NODE > data.len() {
+                continue;
+            }
+            stack.push(u32_at(node)); // left child (byte offset)
+            stack.push(u32_at(node + 4)); // right child (byte offset)
+            let p = node + 16; // payload start
+            out.push((u64_at(p + 8), u64_at(p + 16), u64_at(p + 24), data[p + 76]));
+        }
+    }
+    out
+}
+
 // Minimal standard-base64 decoder — keeps the reconciler dependency-free.
 fn recon_b64(s: &str) -> Option<Vec<u8>> {
     let mut inv = [255u8; 256];
@@ -1712,6 +1749,9 @@ struct Reconciled {
     // config (a reconciler knows it from the market, not per-event).
     positions: std::collections::HashMap<Pubkey, flash_book::matcher::position_math::Pos>,
     tick_size: u64,
+    // Resting orders keyed by seq → (price_ticks, size_lots, side), rebuilt from
+    // OrderPlaced (insert) and OrderCancelled (remove).
+    book: std::collections::HashMap<u64, (u64, u64, u8)>,
 }
 
 impl Reconciled {
@@ -1737,7 +1777,7 @@ impl Reconciled {
         use flash_book::matcher::position_math as pm;
         use flash_book::{
             CollateralDepositedEvent, CollateralWithdrawnEvent, FillAppliedEvent,
-            FundingCrankedEvent, FundingSettledEvent,
+            FundingCrankedEvent, FundingSettledEvent, OrderCancelledV2Event, OrderPlacedV2Event,
         };
         for line in logs {
             let Some(b64) = line.strip_prefix("Program data: ") else {
@@ -1801,6 +1841,15 @@ impl Reconciled {
                     // taker's fee debit and the maker's rebate credit.
                     *self.collateral.entry(e.taker).or_default() -= e.taker_fee_paid as i128;
                     *self.collateral.entry(e.maker).or_default() += e.maker_rebate_paid as i128;
+                }
+            } else if disc == <OrderPlacedV2Event as anchor_lang::Discriminator>::DISCRIMINATOR {
+                if let Ok(e) = OrderPlacedV2Event::try_from_slice(body) {
+                    self.book
+                        .insert(e.seq, (e.price_ticks, e.size_lots, e.side));
+                }
+            } else if disc == <OrderCancelledV2Event as anchor_lang::Discriminator>::DISCRIMINATOR {
+                if let Ok(e) = OrderCancelledV2Event::try_from_slice(body) {
+                    self.book.remove(&e.order_seq);
                 }
             }
         }
@@ -2040,6 +2089,112 @@ async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
             t.pubkey()
         );
     }
+}
+
+#[tokio::test]
+async fn d19_reconciler_rebuilds_book_from_orders() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    // Init the v2 hypertree book.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let maker = Keypair::new();
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 1_000_000, &protocol).await;
+    let mut recon = Reconciled::default();
+
+    // Three resting limits within the anti-stuffing band (oracle == 100_000):
+    // two bids and one ask, none crossing (no opposing liquidity).
+    let place = |side: u8, price: u64| {
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side,
+                size_lots: 1,
+                limit_ticks: price,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(maker_state, false),
+                AccountMeta::new_readonly(program_id(), false),
+            ],
+        )
+    };
+    for (side, price) in [(0u8, 90_000u64), (0, 95_000), (1, 110_000)] {
+        let logs = send_capture(&mut ctx, place(side, price), &maker.pubkey(), &[&maker]).await;
+        recon.apply_logs(&logs);
+    }
+    assert_eq!(recon.book.len(), 3, "three resting orders reconstructed");
+
+    // Cancel the 95_000 bid — the reconciler removes it from the book.
+    let seq_95 = *recon
+        .book
+        .iter()
+        .find(|(_, v)| v.0 == 95_000)
+        .expect("95k order reconstructed")
+        .0;
+    let order_id = flash_book::state_v2::encode_order_id(95_000, seq_95, true);
+    let logs = send_capture(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::CancelOrderV2 { side: 0, order_id },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+            ],
+        ),
+        &maker.pubkey(),
+        &[&maker],
+    )
+    .await;
+    recon.apply_logs(&logs);
+    assert_eq!(recon.book.len(), 2, "book has two orders after the cancel");
+
+    // ── Decode the on-chain slab (walk both RB-trees) and assert the
+    // event-reconstructed book equals it, order-for-order. ──
+    let book_acc = ctx
+        .banks_client
+        .get_account(book_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut decoded = decode_book_slab(&book_acc.data);
+    decoded.sort_unstable();
+    let mut recon_orders: Vec<(u64, u64, u64, u8)> = recon
+        .book
+        .iter()
+        .map(|(seq, &(price, size, side))| (*seq, price, size, side))
+        .collect();
+    recon_orders.sort_unstable();
+    assert_eq!(
+        recon_orders, decoded,
+        "event-reconstructed book == byte-decoded on-chain slab"
+    );
 }
 
 #[tokio::test]
