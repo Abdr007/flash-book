@@ -1752,6 +1752,8 @@ struct Reconciled {
     // Resting orders keyed by seq → (price_ticks, size_lots, side), rebuilt from
     // OrderPlaced (insert) and OrderCancelled (remove).
     book: std::collections::HashMap<u64, (u64, u64, u8)>,
+    // Insurance-fund balance delta, summed from the per-fill contribution.
+    insurance: i128,
 }
 
 impl Reconciled {
@@ -1838,9 +1840,11 @@ impl Reconciled {
                         self.positions.insert(e.maker, o.pos);
                     }
                     // Fee-side collateral deltas now carried by the event: the
-                    // taker's fee debit and the maker's rebate credit.
+                    // taker's fee debit and the maker's rebate credit, plus the
+                    // insurance-fund contribution.
                     *self.collateral.entry(e.taker).or_default() -= e.taker_fee_paid as i128;
                     *self.collateral.entry(e.maker).or_default() += e.maker_rebate_paid as i128;
+                    self.insurance += e.insurance_contribution_paid as i128;
                 }
             } else if disc == <OrderPlacedV2Event as anchor_lang::Discriminator>::DISCRIMINATOR {
                 if let Ok(e) = OrderPlacedV2Event::try_from_slice(body) {
@@ -2030,6 +2034,8 @@ async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
+    let insurance_before: InsuranceFundAccount =
+        fetch(&mut ctx.banks_client, insurance_fund_pda).await;
     let logs = send_capture(&mut ctx, ix, &payer.pubkey(), &[&payer]).await;
     recon.apply_logs(&logs);
 
@@ -2089,6 +2095,17 @@ async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
             t.pubkey()
         );
     }
+
+    // ── Insurance balance reconstructed from the fill's contribution == the
+    // real on-chain delta. ──
+    let insurance_after: InsuranceFundAccount =
+        fetch(&mut ctx.banks_client, insurance_fund_pda).await;
+    assert_eq!(
+        recon.insurance,
+        insurance_after.balance_quote_lots as i128 - insurance_before.balance_quote_lots as i128,
+        "event-reconstructed insurance contribution == on-chain balance delta"
+    );
+    assert!(recon.insurance > 0, "fee'd fill credited insurance");
 }
 
 #[tokio::test]
