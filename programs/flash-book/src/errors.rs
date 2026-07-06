@@ -273,6 +273,8 @@ pub enum FlashBookError {
     FlpSystemModeConflict = 2321,
     #[msg("Trader has no ER reserved-margin attestation: it must be initialized before trading on a delegated book")]
     ErMarginNotReady = 2322,
+    #[msg("Reduce-only order has no opposing position to reduce (absent, foreign, flat, or same-side)")]
+    ReduceOnlyNoPosition = 2323,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
