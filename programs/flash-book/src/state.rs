@@ -412,6 +412,17 @@ pub struct MarketAccount {
     /// attestation account (safe). Trailing field ⇒ existing accounts read it
     /// as `false`.
     pub book_delegated: bool,
+
+    /// Slot of the last REAL settlement (a committed fill applied via
+    /// `apply_fill` / `apply_flp_fill`). Unlike `last_mark_update_slot` — which
+    /// the permissionless `settle_mark` also bumps — this advances ONLY on
+    /// genuine settlement, so it is the honest liveness signal for the
+    /// force-undelegate escape and the S7 auto-pause: a censoring sequencer that
+    /// heartbeats and spams `settle_mark` but settles no fills cannot keep this
+    /// fresh. Trailing field ⇒ existing accounts read it as 0 (never settled),
+    /// which the escape treats via the `book_delegated_at_slot` baseline exactly
+    /// as a never-stamped mark was.
+    pub last_settlement_slot: u64,
 }
 
 /// Optional emergency guardian for one market, held in a SEPARATE PDA (not a
@@ -445,12 +456,18 @@ impl MarketGuardianAccount {
 pub struct MarketPendingAuthorityAccount {
     pub market: Pubkey,
     pub pending_authority: Pubkey,
+    /// The authority that PROPOSED this transfer. `accept_authority_transfer`
+    /// requires it to still equal `market.authority`, so a pending proposed by
+    /// an authority that has since been replaced (via the 1-step
+    /// `transfer_market_authority` or a re-propose) can never displace the
+    /// current authority.
+    pub proposed_by: Pubkey,
     pub bump: u8,
 }
 
 impl MarketPendingAuthorityAccount {
     pub const SEED: &'static [u8] = b"pending_authority";
-    pub const LEN: usize = 32 + 32 + 1;
+    pub const LEN: usize = 32 + 32 + 32 + 1;
 }
 
 /// A timelocked market-params update. Own PDA (not a MarketAccount field —

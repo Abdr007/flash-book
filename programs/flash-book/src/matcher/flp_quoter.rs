@@ -92,8 +92,17 @@ pub fn generate_quotes(
     };
 
     // skew_bps = -lambda * inv_bps / BPS_DENOM (so lambda is in bps too).
-    let skew_bps =
-        -((params.inventory_lambda_bps as i64 * inv_bps as i64) / BPS_DENOM as i64) as i32;
+    // `inventory_lambda_bps` is an unbounded governance u32, so `lambda * inv_bps
+    // / BPS_DENOM` can exceed i32::MAX — a bare `as i32` would truncate and flip
+    // the skew's sign (quoting TOWARD inventory), and an inner value of exactly
+    // i32::MIN would panic on the unary minus (quoting DoS). Compute in i64 and
+    // clamp to ±BPS_DENOM (±100%) BEFORE the cast and negation: a skew beyond
+    // ±100% of the oracle is economically meaningless (`apply_bps_signed` already
+    // floors a negative fair value to 0), so the clamp never binds on a sane
+    // config and fails safe on a misconfigured one.
+    let skew_magnitude =
+        (params.inventory_lambda_bps as i64).saturating_mul(inv_bps as i64) / BPS_DENOM as i64;
+    let skew_bps = -(skew_magnitude.clamp(-(BPS_DENOM as i64), BPS_DENOM as i64)) as i32;
 
     // fair_value = oracle * (1 + skew_bps/BPS_DENOM)
     let fair_value = apply_bps_signed(inputs.oracle_ticks, skew_bps)?;
@@ -376,5 +385,51 @@ mod inventory_cap_tests {
         assert_eq!(inventory_cap_skip(-1500, 1000), (false, true)); // over short cap
         assert_eq!(inventory_cap_skip(999, 1000), (false, false)); // just under → quote both
         assert_eq!(inventory_cap_skip(5000, 0), (false, false)); // no capital → no cap
+    }
+}
+
+#[cfg(test)]
+mod skew_totality_tests {
+    use super::*;
+
+    /// A pathological governance `inventory_lambda_bps` must neither panic (the
+    /// old `-(x as i32)` hit `i32::MIN` and reverted on the unary minus) nor
+    /// truncate its sign (quoting toward inventory). With the pool net-long the
+    /// skew must stay negative (quote lower to shed inventory) and clamp to
+    /// −BPS_DENOM.
+    #[test]
+    fn extreme_lambda_does_not_panic_and_skews_against_inventory() {
+        let params = FlpQuoterParams {
+            base_spread_bps: 0,
+            alpha_bps: 0,
+            beta_bps: 0,
+            gamma_bps: 0,
+            kappa_bps: 0,
+            delta_bps: 0,
+            // lambda = i32::MIN magnitude: pre-fix `-(... as i32)` panicked here.
+            inventory_lambda_bps: 2_147_483_648,
+            depth_floor_lots: 1,
+            max_growth_per_batch_bps: 100,
+            levels: 1,
+            tick_size: 1,
+        };
+        let inputs = FlpQuoterInputs {
+            oracle_ticks: Ticks(100_000),
+            vpin_bps: 0,
+            realized_vol_bps: 0,
+            pool_capital_quote_lots: 1_000,
+            // Net LONG far beyond capital ⇒ inv_bps clamps to +BPS_DENOM.
+            pool_net_quote_lots_signed: 1_000_000,
+            pool_gross_utilization_bps: 0,
+            oi_long_lots: 0,
+            oi_short_lots: 0,
+        };
+        let (out, _) = generate_quotes(params, inputs, Pubkey::default(), 0)
+            .expect("extreme lambda must not panic or error");
+        assert_eq!(
+            out.skew_bps,
+            -(BPS_DENOM as i32),
+            "net-long inventory must skew fair value DOWN, clamped at -100%"
+        );
     }
 }

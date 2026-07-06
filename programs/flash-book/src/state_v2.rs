@@ -662,6 +662,25 @@ impl<'a> MarketBookHandle<'a> {
             if root == NIL {
                 continue;
             }
+            // The root index comes straight from the untrusted header and is read
+            // via the unchecked `read_link` on the very next line, and again as a
+            // slab offset by the DFS. `from_account_data` bounds- and
+            // alignment-checks the header roots before use; this gate must mirror
+            // that BEFORE its first deref, or a committed root of `9600`
+            // (node-count boundary) or `NIL − 1` slices out of range (panic, not
+            // the clean reject this gate exists to guarantee), and a misaligned
+            // in-bounds root is accepted here yet rejected by every later
+            // `from_account_data` — bricking the market. A well-formed root is
+            // always node-aligned and wholly in-slab, so this never rejects a
+            // valid book.
+            let root_off = root as usize;
+            require!(
+                root_off % NODE_TOTAL_BYTES == 0
+                    && root_off
+                        .checked_add(NODE_TOTAL_BYTES)
+                        .is_some_and(|end| end <= slab_len),
+                crate::errors::FlashBookError::OutOfRange
+            );
             // A tree root has no parent. The child→parent symmetry check
             // below validates every non-root node's parent link, but never the
             // root's own. `successor_index`'s up-walk terminates ONLY on
@@ -1749,6 +1768,53 @@ mod tests {
         assert!(
             MarketBookHandle::validate_node_links(&data).is_err(),
             "non-NIL root parent must be rejected"
+        );
+    }
+
+    /// A committed root index that is out of range or misaligned must be
+    /// CLEANLY REJECTED, never dereferenced. The root is read via the unchecked
+    /// `read_link` (and later as a slab offset), so without a bounds+alignment
+    /// gate an out-of-range root slices past the slab (panic → validator brick),
+    /// and a misaligned-but-in-bounds root is accepted here yet rejected by every
+    /// subsequent `from_account_data` (permanent market brick). A well-formed root
+    /// is always node-aligned and wholly in-slab, so neither is a valid book.
+    #[test]
+    fn validate_node_links_rejects_out_of_range_root() {
+        let slab_len = make_book().len() - MARKET_BOOK_PREFIX_BYTES;
+
+        // A node-aligned root exactly at the slab end: `off + NODE_TOTAL_BYTES`
+        // exceeds the slab, so `read_link(root, 8)` would slice out of range.
+        let mut oob = make_book();
+        {
+            let h = MarketBookHandle::from_account_data(&mut oob).unwrap();
+            h.header.bids_root_index = slab_len as u32;
+        }
+        assert!(
+            MarketBookHandle::validate_node_links(&oob).is_err(),
+            "an out-of-range root must be rejected, not panic"
+        );
+
+        // A wildly out-of-range root (NIL − 1, not the empty sentinel).
+        let mut huge = make_book();
+        {
+            let h = MarketBookHandle::from_account_data(&mut huge).unwrap();
+            h.header.bids_root_index = NIL - 1;
+        }
+        assert!(
+            MarketBookHandle::validate_node_links(&huge).is_err(),
+            "a huge out-of-range root must be rejected, not panic"
+        );
+
+        // A misaligned, in-bounds root (offset 4): would be accepted without the
+        // alignment gate, then rejected by from_account_data → brick.
+        let mut misaligned = make_book();
+        {
+            let h = MarketBookHandle::from_account_data(&mut misaligned).unwrap();
+            h.header.bids_root_index = 4;
+        }
+        assert!(
+            MarketBookHandle::validate_node_links(&misaligned).is_err(),
+            "a misaligned root must be rejected"
         );
     }
 

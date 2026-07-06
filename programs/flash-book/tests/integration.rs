@@ -2325,6 +2325,145 @@ async fn flp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure()
     );
 }
 
+/// Withdrawal prices the burn on NAV inclusive of the pool's unrealized
+/// inventory LOSS (symmetric with deposit's mark-to-market pricing), so an LP
+/// cannot redeem at the higher realized-only NAV while the pool is underwater
+/// and thereby extract the standing LPs' unrealized drawdown. Inject a
+/// 10_000-quote-lot unrealized loss (FLP long 1 @ 100_000, oracle 90_000,
+/// tick 1) into a 5_000_000-capital / 5_000_000-share pool, then burn
+/// 1_000_000 shares: realized-only pricing would pay 1_000_000, but the
+/// mark-to-market haircut pays 1_000_000 · 4_990_000 / 5_000_000 = 998_000.
+#[tokio::test]
+async fn withdraw_flp_capital_charges_unrealized_loss() {
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    // Payer (treasury) holds 5_000_000 shares against 5_000_000 capital.
+    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+
+    // Inject an underwater FLP long: 1 lot @ entry 100_000, priced at oracle
+    // 90_000 ⇒ unrealized loss of 10_000 quote lots.
+    let flp_acc = ctx
+        .banks_client
+        .get_account(protocol.flp_exposure)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut flp_state =
+        flash_book::state::FlpExposureAccount::try_deserialize(&mut flp_acc.data.as_slice())
+            .unwrap();
+    flp_state.markets_count = 1;
+    flp_state.per_market[0] = flash_book::state::FlpMarketExposure {
+        market: to_anchor(market_pda),
+        side: 0, // long
+        size_lots: 1,
+        entry_price_ticks: 100_000,
+    };
+    let mut nd = Vec::new();
+    flp_state.try_serialize(&mut nd).unwrap();
+    nd.resize(flp_acc.data.len(), 0);
+    ctx.set_account(
+        &protocol.flp_exposure,
+        &SolAccount {
+            lamports: flp_acc.lamports,
+            data: nd,
+            owner: flp_acc.owner,
+            executable: flp_acc.executable,
+            rent_epoch: flp_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    // Overwrite the market: oracle & mark at 90_000, tick 1, and a large
+    // staleness window so the oracle stays fresh across the min-hold warp.
+    let m_acc = ctx
+        .banks_client
+        .get_account(market_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut m_state =
+        flash_book::state::MarketAccount::try_deserialize(&mut m_acc.data.as_slice()).unwrap();
+    m_state.oracle_price_ticks = 90_000;
+    m_state.mark_price_ticks = 90_000;
+    m_state.oracle_published_at_unix_seconds = 1;
+    m_state.params.oracle_staleness_max_seconds = u32::MAX;
+    m_state.params.tick_size = 1;
+    let mut nmd = Vec::new();
+    m_state.try_serialize(&mut nmd).unwrap();
+    nmd.resize(m_acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: m_acc.lamports,
+            data: nmd,
+            owner: m_acc.owner,
+            executable: m_acc.executable,
+            rent_epoch: m_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    // Advance past the FLP minimum hold so the withdraw is not rate-limited.
+    ctx.warp_to_slot(1_000).unwrap();
+
+    let auth_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
+    let (auth_pos, _) = pda(&[
+        flash_book::state::LpPositionAccount::SEED,
+        payer.pubkey().as_ref(),
+    ]);
+    let withdraw_ix = Instruction {
+        program_id: program_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(auth_pos, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(auth_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(market_pda, false),
+        ],
+        data: flash_book::instruction::WithdrawFlpCapital {
+            shares_to_burn: 1_000_000,
+        }
+        .data(),
+    };
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[withdraw_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // The LP received the haircut payout (998_000), not the realized-only
+    // 1_000_000 — the 2_000 difference is their pro-rata share of the pool's
+    // 10_000 unrealized loss, left behind for the standing LPs.
+    let ata_after = ctx
+        .banks_client
+        .get_account(auth_ata)
+        .await
+        .unwrap()
+        .unwrap();
+    let ata_state =
+        <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(
+            &ata_after.data,
+        )
+        .unwrap();
+    assert_eq!(
+        ata_state.amount, 998_000,
+        "withdraw must charge the unrealized loss (haircut NAV), not pay realized-only"
+    );
+}
+
 #[tokio::test]
 async fn lp_units_withdraw_rejects_other_lps_shares() {
     // Bob cannot burn Alice's shares — the lp_position constraint enforces
@@ -6060,6 +6199,111 @@ async fn two_step_authority_transfer_requires_new_key_to_accept() {
             .authority,
         new_auth.pubkey(),
         "authority still the (un-cancelled) new key"
+    );
+}
+
+/// A pending 2-step transfer proposed by an authority that is subsequently
+/// replaced (here via the 1-step transfer_market_authority) can NOT be accepted
+/// to displace the new authority: `accept_authority_transfer` requires the
+/// pending's `proposed_by` to still equal the current `market.authority`.
+#[tokio::test]
+async fn stale_pending_authority_cannot_displace_new_authority() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone(); // authority A
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (pending_pda, _) = pda(&[
+        flash_book::state::MarketPendingAuthorityAccount::SEED,
+        market_pda.as_ref(),
+    ]);
+    let alice = Keypair::new(); // stale 2-step target
+    let bob = Keypair::new(); // new authority via 1-step
+
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+    for k in [&alice, &bob] {
+        send(
+            &mut ctx,
+            system_instruction::transfer(&payer.pubkey(), &k.pubkey(), 1_000_000_000),
+            &[&payer],
+        )
+        .await
+        .unwrap();
+    }
+
+    // A proposes Alice (2-step).
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ProposeAuthorityTransfer {
+                new_authority: alice.pubkey(),
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(pending_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .expect("A proposes Alice");
+
+    // A then 1-step transfers to Bob WITHOUT cancelling the pending.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::TransferMarketAuthority {
+                new_authority: bob.pubkey(),
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .expect("A 1-step transfers to Bob");
+
+    // Alice tries to accept the now-stale pending → must fail; Bob keeps control.
+    assert!(
+        send(
+            &mut ctx,
+            build_ix(
+                flash_book::instruction::AcceptAuthorityTransfer {},
+                vec![
+                    AccountMeta::new(alice.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(pending_pda, false),
+                ],
+            ),
+            &[&alice],
+        )
+        .await
+        .is_err(),
+        "a pending proposed by the replaced authority must not be acceptable"
+    );
+    assert_eq!(
+        fetch::<MarketAccount>(&mut ctx.banks_client, market_pda)
+            .await
+            .authority,
+        bob.pubkey(),
+        "authority stays with the 1-step transferee"
     );
 }
 
@@ -10990,6 +11234,127 @@ async fn er_margin_xdomain_withdraw_respects_reservation() {
         .expect("strict withdraw must work again once the reservation clears");
     let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
     assert_eq!(ts.collateral_quote_lots, 50_000);
+}
+
+/// If the attestor is lost, the protocol authority can zero a trader's ER
+/// reservation so the reserved collateral is not permanently stranded; a
+/// non-authority cannot. Advancing the epoch also blocks a stale attestation
+/// replay from reviving the reservation.
+#[tokio::test]
+async fn er_margin_authority_reset_recovers_from_dead_attestor() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone(); // protocol authority
+    let trader = Keypair::new();
+    let attestor = Keypair::new(); // to be "lost"
+    let rando = Keypair::new();
+
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    let trader_state = setup_trader(&mut ctx, &payer, &trader, 100_000, &protocol).await;
+    let er_margin =
+        init_er_margin(&mut ctx, &payer, &protocol, trader_state, attestor.pubkey()).await;
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[attest_ix(
+                er_margin,
+                trader_state,
+                attestor.pubkey(),
+                60_000,
+                1,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &attestor],
+            ctx.banks_client.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        fetch::<TraderStateAccount>(&mut ctx.banks_client, trader_state)
+            .await
+            .er_active,
+        1
+    );
+
+    let reset_ix = |signer: Pubkey| {
+        build_ix(
+            flash_book::instruction::ResetErMarginAttestation {},
+            vec![
+                AccountMeta::new_readonly(signer, true),
+                AccountMeta::new_readonly(protocol.insurance_fund, false),
+                AccountMeta::new(er_margin, false),
+                AccountMeta::new(trader_state, false),
+            ],
+        )
+    };
+
+    // Fund rando so it can pay its own tx, then confirm a non-authority cannot reset.
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &rando.pubkey(),
+                1_000_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            ctx.banks_client.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[reset_ix(rando.pubkey())],
+                Some(&rando.pubkey()),
+                &[&rando],
+                ctx.banks_client.get_latest_blockhash().await.unwrap(),
+            ))
+            .await
+            .is_err(),
+        "a non-authority must not be able to reset the attestation"
+    );
+
+    // The protocol authority resets → reservation zeroed, er_active cleared, epoch advanced.
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[reset_ix(payer.pubkey())],
+            Some(&payer.pubkey()),
+            &[&payer],
+            ctx.banks_client.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .expect("protocol authority resets a stranded attestation");
+    let att: flash_book::xmargin::ErMarginAttestation =
+        fetch(&mut ctx.banks_client, er_margin).await;
+    assert_eq!(att.reserved_margin_quote_lots, 0);
+    assert_eq!(att.epoch, 2, "epoch advances past the last attestation");
+    assert_eq!(
+        fetch::<TraderStateAccount>(&mut ctx.banks_client, trader_state)
+            .await
+            .er_active,
+        0,
+        "reset clears er_active so the strict withdraw path re-opens"
+    );
+
+    // A stale attestation at the old epoch cannot revive the reservation.
+    assert!(
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[attest_ix(
+                    er_margin,
+                    trader_state,
+                    attestor.pubkey(),
+                    60_000,
+                    1
+                )],
+                Some(&payer.pubkey()),
+                &[&payer, &attestor],
+                ctx.banks_client.get_latest_blockhash().await.unwrap(),
+            ))
+            .await
+            .is_err(),
+        "a stale-epoch attestation must not revive the reservation after reset"
+    );
 }
 
 fn withdraw_xdomain_ix(

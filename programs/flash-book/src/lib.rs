@@ -661,7 +661,11 @@ pub mod flash_book {
     /// not the censored continuation). Ties exit to liveness, not goodwill.
     pub fn force_undelegate_market_book(ctx: Context<ForceUndelegateMarketBook>) -> Result<()> {
         let current_slot = Clock::get()?.slot;
-        let last_fill = ctx.accounts.market.last_mark_update_slot;
+        // The settlement-liveness baseline MUST be a real fill, not the mark
+        // slot: `settle_mark` is permissionless and would let a censoring
+        // sequencer keep this escape shut forever by spamming it. `apply_fill` /
+        // `apply_flp_fill` advance `last_settlement_slot` on genuine settlement.
+        let last_fill = ctx.accounts.market.last_settlement_slot;
         let heartbeat = ctx.accounts.market.last_heartbeat_slot;
         let delegated_at = ctx.accounts.market.book_delegated_at_slot;
         // Kani-proven gate (F2/F3): opens only when the ER shows NO liveness of any
@@ -1148,6 +1152,11 @@ pub mod flash_book {
             fc::buffer_check(&rd, &market_key.to_bytes())
                 .map_err(|_| error!(FlashBookError::FillRingCorrupt))?
         };
+        // `max_batch_orders` is a u16. A ring grown past u16::MAX would truncate
+        // on the cast below (wrapping the batch cap — potentially to 0, halting
+        // matching), so reject a cap that does not fit rather than silently
+        // corrupt it. Unreachable at the default cap (FILL_RING_CAP = 256).
+        require!(ring_cap <= u16::MAX as u32, FlashBookError::OutOfRange);
 
         let bump = ctx.bumps.fill_outbox;
         // Create at `min(ring_cap, FILL_OUTBOX_INIT_CAP)`. For a ring_cap <= 105 the
@@ -1761,6 +1770,19 @@ pub mod flash_book {
         // crossing orders may remain on the book, so the residual must NOT rest at
         // `limit_ticks` (it would cross the book). See the residual-rest guard.
         let mut walk_truncated = false;
+        // Bound NODES SCANNED, not just matches produced. The skip branches
+        // below (expired maker, self-match under STP, reduce-only capped to zero)
+        // keep walking WITHOUT pushing a match, so `matches.len() >= walk_limit`
+        // alone lets an attacker seed many near-front skip-only orders (cheap
+        // short-expiry GTTs, or reduce-only orders backed by no position) and
+        // make a later taker scan the whole grown arena — exhausting CU and
+        // DoSing the market's taker flow (the reduce-only branch also derives a
+        // PDA per scan). Capping the scan at a small multiple of `walk_limit`
+        // bounds that work; `walk_truncated` already prevents the residual from
+        // resting across the book, so partial-fill semantics stay correct. A
+        // legitimate cross reaches `walk_limit` matches within this budget.
+        let scan_limit = walk_limit.saturating_mul(4);
+        let mut scanned = 0usize;
 
         // Always walk to detect crossings. post_only check happens
         // AFTER — if matches were found, the order would cross, so
@@ -1768,6 +1790,11 @@ pub mod flash_book {
         // cross conditions.
         if side_is_bid {
             handle.for_each_ask_best_first(|idx, ask| {
+                scanned += 1;
+                if scanned > scan_limit {
+                    walk_truncated = true;
+                    return false;
+                }
                 if matches.len() >= walk_limit {
                     walk_truncated = true;
                     return false;
@@ -1839,6 +1866,11 @@ pub mod flash_book {
             });
         } else {
             handle.for_each_bid_best_first(|idx, bid| {
+                scanned += 1;
+                if scanned > scan_limit {
+                    walk_truncated = true;
+                    return false;
+                }
                 if matches.len() >= walk_limit {
                     walk_truncated = true;
                     return false;
@@ -2861,18 +2893,79 @@ pub mod flash_book {
             FlashBookError::RateLimited
         );
 
+        // Value the burn on NAV inclusive of any unrealized inventory LOSS,
+        // symmetric with deposit. Deposit prices shares at `nav + mtm`; pricing
+        // withdrawal at realized-only `nav` would let a depositor mint cheap
+        // shares while the pool is underwater (mtm < 0) and redeem them at the
+        // higher realized NAV after the min-hold, extracting the standing LPs'
+        // unrealized drawdown. Charging `min(mtm, 0)` on exit closes that
+        // arbitrage while never paying out uncashed unrealized GAINS (the payout
+        // stays ≤ the realized claim the vault holds, so conservation is
+        // preserved). Uses the L1 oracle (not the ER mark), so it is
+        // ER-stall-independent and fails closed on a stale oracle exactly as
+        // deposit does; a flat pool (markets_count == 0) needs no oracle and
+        // withdraws realized-only, unchanged.
+        let mtm: i128 = {
+            let flp_ro = &ctx.accounts.flp_exposure;
+            if flp_ro.markets_count == 0 {
+                0
+            } else {
+                let now = Clock::get()?.unix_timestamp.max(0) as u64;
+                let mut sum: i128 = 0;
+                let mut matched: u8 = 0;
+                for slot in flp_ro.per_market.iter() {
+                    if slot.side == 255 {
+                        continue;
+                    }
+                    let market_ai = ctx
+                        .remaining_accounts
+                        .iter()
+                        .find(|ai| ai.key() == slot.market)
+                        .ok_or_else(|| error!(FlashBookError::MissingMarketAccount))?;
+                    let m_data = market_ai.try_borrow_data()?;
+                    let m_state = MarketAccount::try_deserialize(&mut &m_data[..])?;
+                    let oracle = m_state.oracle_price_ticks;
+                    let max_age = m_state.params.oracle_staleness_max_seconds as u64;
+                    let published = m_state.oracle_published_at_unix_seconds;
+                    require!(
+                        oracle > 0 && published > 0 && now.saturating_sub(published) <= max_age,
+                        FlashBookError::OracleTooStale
+                    );
+                    sum = sum.saturating_add(flp_slot_unrealized_pnl(
+                        slot.side,
+                        slot.size_lots,
+                        slot.entry_price_ticks,
+                        oracle,
+                        m_state.params.tick_size,
+                    ));
+                    matched += 1;
+                }
+                require!(
+                    matched == flp_ro.markets_count,
+                    FlashBookError::MissingMarketAccount
+                );
+                sum
+            }
+        };
+
         let flp_ro = &ctx.accounts.flp_exposure;
         let nav = flp_ro.nav();
         require!(nav > 0, FlashBookError::InsufficientCollateral);
+        // Exit price = realized NAV minus any unrealized inventory loss. Never
+        // adds unrealized gain, so the payout can never exceed the realized claim
+        // the vault backs.
+        let pricing_nav_i128 = nav.saturating_add(mtm.min(0));
+        require!(pricing_nav_i128 > 0, FlashBookError::FlpPoolInsolvent);
+        let pricing_nav = pricing_nav_i128 as u128;
         let shares_outstanding = flp_ro.lp_shares_outstanding;
         require!(
             shares_outstanding > 0,
             FlashBookError::InsufficientCollateral
         );
 
-        // amount = shares_to_burn × NAV / shares_outstanding
+        // amount = shares_to_burn × pricing_nav / shares_outstanding
         let prod = (shares_to_burn as u128)
-            .checked_mul(nav as u128)
+            .checked_mul(pricing_nav)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         let amount_u128 = prod / (shares_outstanding as u128);
         require!(
@@ -3965,6 +4058,34 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Emergency recovery for a lost or unresponsive attestor. The reserved
+    /// margin and `er_active` flag can otherwise only be lowered by the pinned
+    /// attestor, so if that key dies the reserved portion of a trader's
+    /// collateral is permanently unwithdrawable — the same failure mode the ER
+    /// force-undelegate escape exists to survive. The protocol authority (which
+    /// pinned the attestor at init, so this is within the existing trust model)
+    /// zeroes the reservation and advances the epoch, so a stale in-flight
+    /// attestation cannot replay the old reservation while a recovered attestor
+    /// can still re-attest at a higher epoch. Operationally used only once the ER
+    /// is confirmed down (no order can fill), so zeroing the reservation cannot
+    /// leave a live ER order undercollateralized.
+    pub fn reset_er_margin_attestation(ctx: Context<ResetErMarginAttestation>) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.er_margin.trader_state,
+            ctx.accounts.trader_state.key(),
+            FlashBookError::ErMarginAccountMismatch
+        );
+        ctx.accounts.er_margin.reserved_margin_quote_lots = 0;
+        ctx.accounts.er_margin.epoch = ctx.accounts.er_margin.epoch.saturating_add(1);
+        ctx.accounts.trader_state.load_mut()?.er_active = 0;
+        emit!(ErMarginAttestedEvent {
+            trader_state: ctx.accounts.trader_state.key(),
+            reserved_margin_quote_lots: 0,
+            epoch: ctx.accounts.er_margin.epoch,
+        });
+        Ok(())
+    }
+
     /// Cross-domain (#8) strict withdraw: like `withdraw_collateral` (requires
     /// `open_positions == 0`) but additionally requires post-withdrawal
     /// collateral to cover the trader's ER-reserved margin, so collateral
@@ -5018,6 +5139,12 @@ pub mod flash_book {
         // by default), matching the intent.
         let taker_pos_isolated = ctx.accounts.taker_position.load()?.collateral_quote_lots > 0;
         let maker_pos_isolated = ctx.accounts.maker_position.load()?.collateral_quote_lots > 0;
+        // What the taker actually paid. The taker fee is capped at their
+        // collateral (not reverted, which would wedge the FIFO ring), and the
+        // maker rebate is funded out of that fee — so the rebate is later capped
+        // at this figure. Crediting the maker more than was collected would mint
+        // unbacked value on a fill against an under-collateralized taker.
+        let taker_fee_paid;
         {
             if taker_fee > 0 {
                 // CAP the fee at the taker's available
@@ -5039,6 +5166,9 @@ pub mod flash_book {
                     paid
                 };
                 net_fee = net_fee.saturating_sub(taker_fee.saturating_sub(paid));
+                taker_fee_paid = paid;
+            } else {
+                taker_fee_paid = 0;
             }
             if taker_negative_rebate_u128 > 0 {
                 let neg_rebate_u64 = if taker_negative_rebate_u128 > u64::MAX as u128 {
@@ -5065,6 +5195,14 @@ pub mod flash_book {
         // pays a fee (negative-rebate retail tier). Mutually
         // exclusive: at most one of `maker_rebate` / `maker_fee` is
         // non-zero per the sign split above.
+        //
+        // Cap the rebate at the fee the taker actually paid. `net_fee` was
+        // already reduced by the taker's uncollected shortfall (so insurance is
+        // not over-credited); this closes the matching leg so the maker credit
+        // can never exceed what was collected — keeping the fee legs
+        // (taker debit == maker credit + insurance credit) exactly conserved on
+        // a fill against an under-collateralized taker.
+        let maker_rebate = maker_rebate.min(taker_fee_paid);
         {
             if maker_rebate > 0 {
                 if maker_pos_isolated {
@@ -5663,6 +5801,11 @@ pub mod flash_book {
         // MARK_STALENESS_MAX_SLOTS → `liquidate_position_v2` falls back to
         // oracle-only health pricing and `verify_market_invariants` auto-pauses.
         market.last_mark_update_slot = Clock::get()?.slot;
+        // Honest settlement-liveness signal for the force-undelegate escape and
+        // the S7 auto-pause: unlike the mark slot above, this advances ONLY on a
+        // real committed fill (never on the permissionless settle_mark), so a
+        // censoring sequencer cannot keep the escape shut by spamming settle_mark.
+        market.last_settlement_slot = Clock::get()?.slot;
 
         // ── Multi-threshold margin warning ──────────────────────────
         // Single-position equity-vs-MMR view (cheap, no portfolio walk):
@@ -6047,15 +6190,18 @@ pub mod flash_book {
         // than MARK_STALENESS_MAX_SLOTS it is presumed stalled. Auto-pause so no
         // new orders land against a frozen book until it recovers.
         //
-        // Liveness is `max(last_mark_update_slot,
-        // last_heartbeat_slot)`, NOT the mark alone. A healthy-but-quiet market
-        // legitimately stops stamping `last_mark_update_slot` (no fills, no
-        // `settle_mark`), but a live ER keeps `er_heartbeat` fresh — so it stays
-        // Active. Only a market with no fill AND no heartbeat (ER actually down)
-        // auto-pauses. Guard on `> 0` so a legacy market that has never stamped
-        // either field is not paused on missing data (liquidation already prices
-        // such markets oracle-only).
-        let liveness_slot = market.last_mark_update_slot.max(market.last_heartbeat_slot);
+        // Liveness is `max(last_settlement_slot, last_heartbeat_slot)`, NOT the
+        // mark slot. A healthy-but-quiet market legitimately settles no fills,
+        // but a live ER keeps `er_heartbeat` fresh — so it stays Active. Only a
+        // market with no real settlement AND no heartbeat (ER actually down)
+        // auto-pauses. `last_settlement_slot` (not `last_mark_update_slot`) is
+        // used deliberately: the permissionless `settle_mark` bumps the mark
+        // slot, so a down ER could otherwise be kept "alive" — evading this
+        // pause — by anyone spamming settle_mark while the L1 oracle stays fresh.
+        // Guard on `> 0` so a legacy market that has never stamped either field
+        // is not paused on missing data (liquidation already prices such markets
+        // oracle-only).
+        let liveness_slot = market.last_settlement_slot.max(market.last_heartbeat_slot);
         if liveness_slot > 0 {
             let current_slot = Clock::get()?.slot;
             let liveness_age = current_slot.saturating_sub(liveness_slot);
@@ -6500,9 +6646,12 @@ pub mod flash_book {
             FlashBookError::OutOfRange
         );
         let market_key = ctx.accounts.market.key();
+        let proposer = ctx.accounts.market.authority;
         let p = &mut ctx.accounts.pending;
         p.market = market_key;
         p.pending_authority = new_authority;
+        // Bind the proposer so a later authority change invalidates this pending.
+        p.proposed_by = proposer;
         p.bump = ctx.bumps.pending;
         emit!(AuthorityTransferProposedEvent {
             market: market_key,
@@ -6516,6 +6665,14 @@ pub mod flash_book {
     /// new authority (context constraint), so control can never land on a key that
     /// can't sign.
     pub fn accept_authority_transfer(ctx: Context<AcceptAuthorityTransfer>) -> Result<()> {
+        // Reject a pending whose proposer is no longer the authority: a 1-step
+        // transfer_market_authority (or a re-key) that left this pending behind
+        // must not let its stale target displace the current authority.
+        require_keys_eq!(
+            ctx.accounts.pending.proposed_by,
+            ctx.accounts.market.authority,
+            FlashBookError::Unauthorized
+        );
         let new_authority = ctx.accounts.pending.pending_authority;
         let market = &mut ctx.accounts.market;
         let previous_authority = market.authority;
@@ -7981,6 +8138,9 @@ pub mod flash_book {
             )
             .map_err(|_| error!(FlashBookError::FillSeqReplay))?
         };
+        // Honest settlement-liveness signal (see apply_fill): an FLP fill is a
+        // real settlement, so advance it here too — never via settle_mark.
+        ctx.accounts.market.last_settlement_slot = Clock::get()?.slot;
 
         // ── FLP fill-price authenticity band ────────────
         // FLP fills aren't matcher-produced on-chain, so they can't ride the
@@ -9166,6 +9326,7 @@ pub mod flash_book {
             market,
             adl_clock.unix_timestamp.max(0) as u64,
             adl_clock.slot,
+            underwater.side == 0,
         )?;
         let market_snap = RiskMarketSnap {
             market: market.key(),
@@ -9541,6 +9702,7 @@ pub mod flash_book {
                 exec_market,
                 liq_now_unix,
                 liq_current_slot,
+                exec_position.side == 0,
             )?),
             cum_funding_index: exec_market.cum_funding_index,
             maintenance_margin_bps: exec_market.params.maintenance_margin_ratio_bps,
@@ -9630,6 +9792,7 @@ pub mod flash_book {
                     &market,
                     liq_now_unix,
                     liq_current_slot,
+                    position.side == 0,
                 )?),
                 cum_funding_index: market.cum_funding_index,
                 maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
@@ -9677,7 +9840,12 @@ pub mod flash_book {
         // HEALTH mark (as the portfolio assessment above does), NOT the raw
         // oracle — avoids injecting a 0/stale-priced close when the oracle is
         // unset/stale but the mark is fresh.
-        let px = effective_health_mark(exec_market, liq_now_unix, liq_current_slot)? as u128;
+        let px = effective_health_mark(
+            exec_market,
+            liq_now_unix,
+            liq_current_slot,
+            exec_position.side == 0,
+        )? as u128;
         let penalty_delta = (px * penalty) / constants::BPS_DENOM as u128;
         let limit = match close_side {
             Side::Short => px.saturating_sub(penalty_delta) as u64,
@@ -9935,9 +10103,14 @@ pub mod flash_book {
         }
 
         // Oracle staleness gate on v3 trigger execution. Same rationale as
-        // the v2 path.
+        // the v2 path. An unstamped oracle (published_at == 0) is treated as
+        // STALE, not skipped: gating on `published > 0` would fail OPEN on a
+        // never-updated oracle, and with oracle_price_ticks == 0 a kind-0
+        // trigger (`oracle <= trigger_price`) would fire unconditionally on a
+        // bogus zero price. Dropping that conjunct makes the age computation
+        // (now − 0) exceed any max_age, so the trigger fails closed instead.
         let oracle_max_age = market.params.oracle_staleness_max_seconds as u64;
-        if oracle_max_age > 0 && market.oracle_published_at_unix_seconds > 0 {
+        if oracle_max_age > 0 {
             let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
             let oracle_age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
             require!(oracle_age <= oracle_max_age, FlashBookError::OracleTooStale);
@@ -10334,9 +10507,12 @@ pub mod flash_book {
         // Only consult the oracle when it's fresh: a stale
         // oracle could bypass or trigger the slippage cap based
         // on stale data; either is wrong. When stale, skip the slice
-        // entirely (TWAP stays active for next interval).
+        // entirely (TWAP stays active for next interval). An unstamped oracle
+        // (published_at == 0) is treated as stale, not skipped — gating on
+        // `published > 0` would let a never-updated (zero) oracle drive the
+        // slippage decision. (now − 0) exceeds any max_age, so it fails closed.
         let oracle_max_age_twap = market.params.oracle_staleness_max_seconds as u64;
-        if oracle_max_age_twap > 0 && market.oracle_published_at_unix_seconds > 0 {
+        if oracle_max_age_twap > 0 {
             let now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
             let oracle_age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
             require!(
@@ -11930,6 +12106,14 @@ pub mod flash_book {
             max_confidence_bps > 0 && max_confidence_bps <= 1000,
             FlashBookError::OutOfRange
         );
+        // Bound the price-scaling exponent. `tick_decimals` feeds
+        // `10^(exponent + tick_decimals)`; a value outside a sane range only ever
+        // overflows the checked power later (a confusing runtime revert), so
+        // reject it at config time. ±18 covers every real feed exponent.
+        require!(
+            (-18..=18).contains(&tick_decimals),
+            FlashBookError::OutOfRange
+        );
 
         let cfg = &mut ctx.accounts.oracle_config;
         cfg.bump = ctx.bumps.oracle_config;
@@ -11972,6 +12156,11 @@ pub mod flash_book {
         // gate has a sane ceiling.
         require!(
             max_confidence_bps > 0 && max_confidence_bps <= 1000,
+            FlashBookError::OutOfRange
+        );
+        // Bound the price-scaling exponent (see init_market_oracle_config).
+        require!(
+            (-18..=18).contains(&tick_decimals),
             FlashBookError::OutOfRange
         );
 
@@ -13128,9 +13317,13 @@ fn partial_withdraw_core<'info>(
         assessment.required_quote_lots
     };
 
-    // (b) withdrawal floor: 10% of total notional.
-    let notional_floor_u128 = total_notional_quote.saturating_mul(WITHDRAWAL_FLOOR_BPS as u128)
-        / (constants::BPS_DENOM as u128);
+    // (b) withdrawal floor: 10% of total notional. Round UP — this is a
+    // protective floor the trader must leave behind, so flooring it would let
+    // them retain up to one quote-lot less than intended. `div_ceil` is
+    // identical on exact multiples.
+    let notional_floor_u128 = total_notional_quote
+        .saturating_mul(WITHDRAWAL_FLOOR_BPS as u128)
+        .div_ceil(constants::BPS_DENOM as u128);
     let notional_floor = if notional_floor_u128 > u64::MAX as u128 {
         u64::MAX
     } else {
@@ -16204,6 +16397,32 @@ pub struct AttestErReservedMargin<'info> {
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
 }
 
+/// Emergency attestor-recovery: protocol-authority-gated reset of a trader's ER
+/// reserved margin (see `reset_er_margin_attestation`).
+#[derive(Accounts)]
+pub struct ResetErMarginAttestation<'info> {
+    pub authority: Signer<'info>,
+
+    /// Protocol singleton — its `authority` gates the reset (the same key that
+    /// pinned the attestor at init).
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+        constraint = insurance_fund.authority == authority.key() @ FlashBookError::Unauthorized,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    #[account(
+        mut,
+        seeds = [xmargin::ER_MARGIN_SEED, trader_state.key().as_ref()],
+        bump = er_margin.bump,
+    )]
+    pub er_margin: Account<'info, xmargin::ErMarginAttestation>,
+
+    #[account(mut)]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+}
+
 /// Cross-domain strict withdraw — `WithdrawCollateral` plus the trader's ER
 /// reserved-margin attestation (read-only); the handler enforces post-withdrawal
 /// collateral `>= er_reserved`.
@@ -18180,38 +18399,65 @@ pub struct BasketLeg {
     pub post_only: bool,
 }
 
-/// ER-stall mark freshness (P-LIQ-2) for the cross-margin risk walk. Returns the
-/// mark to feed `assess_margin` for `market`: the live mark when it is fresh, or
-/// the oracle ALONE when the mark is stale (a stalled ER froze the fill stream).
-/// A stale mark with no usable / fresh oracle has no trustworthy price ⇒ errors
-/// so the caller refuses to liquidate (fail-safe). Mirrors the single-position
-/// gate in `liquidate_position_v2` so `liquidate_portfolio_v2` cannot be driven
-/// by a frozen mark on any leg.
-fn effective_health_mark(market: &MarketAccount, now_unix: u64, current_slot: u64) -> Result<u64> {
+/// Dual-source health price (P-LIQ-1/2) for the cross-margin risk walk and ADL.
+/// Returns the price to feed `assess_margin` for `market`, using the SAME proven
+/// selection as the single-position `liquidate_position_v2`. FRESH mark ⇒
+/// worse-of(mark, oracle) for the position's direction (a fresh oracle move
+/// immediately tips the position, and the EMA-lagging mark can't hide adverse
+/// liquidity); previously this path used the mark ALONE, so the portfolio/ADL
+/// surface could carry a position under-margined by up to the mark↔oracle gap
+/// versus the single-position surface. STALE mark ⇒ oracle ALONE (a stalled ER
+/// froze the fill stream), and only a configured + published + fresh oracle —
+/// else no trustworthy price ⇒ error, so the caller refuses to liquidate
+/// (fail-safe).
+/// The oracle is folded into the worse-of only when it is trustworthy for
+/// health (configured + published, and required-fresh below); otherwise it is
+/// passed as 0 so the worse-of prices off the mark alone. `is_long` is the
+/// position's direction in `market`.
+fn effective_health_mark(
+    market: &MarketAccount,
+    now_unix: u64,
+    current_slot: u64,
+    is_long: bool,
+) -> Result<u64> {
+    let mark_t = market.mark_price_ticks;
+    let oracle_t = market.oracle_price_ticks;
+    let oracle_max_age = market.params.oracle_staleness_max_seconds as u64;
+    let published = market.oracle_published_at_unix_seconds;
+
+    // A configured + published oracle folded into the worse-of MUST be fresh —
+    // else refuse rather than price health off a possibly-stale oracle.
+    if oracle_max_age > 0 && published > 0 {
+        require!(
+            now_unix.saturating_sub(published) <= oracle_max_age,
+            FlashBookError::OracleTooStale
+        );
+    }
     let mark_stale = market.last_mark_update_slot == 0
         || current_slot.saturating_sub(market.last_mark_update_slot)
             > constants::MARK_STALENESS_MAX_SLOTS;
-    if !mark_stale {
-        return Ok(market.mark_price_ticks);
+    // When the mark is stale the oracle is the SOLE price ⇒ it must be
+    // configured + published (freshness already enforced above).
+    if mark_stale {
+        require!(oracle_max_age > 0, FlashBookError::MarkTooStale);
+        require!(published > 0, FlashBookError::MarkTooStale);
     }
-    // Stale mark ⇒ price off the oracle alone — but only a PROVABLY-fresh,
-    // Non-zero oracle. the oracle is now the SOLE health
-    // price, so freshness is MANDATORY, not "checked only if configured". An
-    // unconfigured staleness window (max_age == 0) or a never-stamped publish
-    // time (published_at == 0) leaves the oracle unvalidated — treat it as
-    // untrusted and refuse to liquidate (fail-safe), exactly as this function's
-    // contract states, rather than pricing a liquidation off an unproven oracle.
-    let oracle = market.oracle_price_ticks;
-    require!(oracle > 0, FlashBookError::MarkTooStale);
-    let max_age = market.params.oracle_staleness_max_seconds as u64;
-    require!(max_age > 0, FlashBookError::MarkTooStale);
-    require!(
-        market.oracle_published_at_unix_seconds > 0,
-        FlashBookError::MarkTooStale
-    );
-    let age = now_unix.saturating_sub(market.oracle_published_at_unix_seconds);
-    require!(age <= max_age, FlashBookError::OracleTooStale);
-    Ok(oracle)
+    // Only a trustworthy oracle is folded in; otherwise pass 0 (worse-of prices
+    // off the mark alone).
+    let oracle_for_health = if oracle_max_age > 0 && published > 0 {
+        oracle_t
+    } else {
+        0
+    };
+    match matcher::liquidation::health_price_with_staleness(
+        mark_t,
+        oracle_for_health,
+        mark_stale,
+        is_long,
+    ) {
+        Some((hp, _)) => Ok(hp),
+        None => Err(error!(FlashBookError::MarkTooStale)),
+    }
 }
 
 /// Validate per-leg intake gates: status, size/price floors, tick alignment.
@@ -19464,6 +19710,15 @@ fn compute_realized_pnl_routing(
 /// discriminator immediately if absent; it is a no-op for an account that is
 /// already initialized.
 fn stamp_zc_discriminator(ai: &AccountInfo<'_>, disc: &[u8]) -> Result<()> {
+    // Bounds-check before slicing: every current caller passes an Anchor-`init`'d
+    // account sized to its struct (>= 8 bytes), but an unchecked `[..8]` /
+    // `[..disc.len()]` would panic on a short account, so gate it so a future
+    // caller (or a truncated account) fails closed instead of bricking the ix.
+    let data_len = ai.try_borrow_data()?.len();
+    require!(
+        data_len >= disc.len() && disc.len() >= 8,
+        FlashBookError::OutOfRange
+    );
     let is_fresh = ai.try_borrow_data()?[..8].iter().all(|&b| b == 0);
     if is_fresh {
         ai.try_borrow_mut_data()?[..disc.len()].copy_from_slice(disc);
@@ -19807,8 +20062,12 @@ fn assert_intake_initial_margin(
     let notional = (resulting_size as u128)
         .saturating_mul(limit_ticks as u128)
         .saturating_mul(tick_size as u128);
-    let required_im =
-        notional.saturating_mul(im_bps as u128) / (crate::constants::BPS_DENOM as u128);
+    // Round the initial-margin requirement UP: it is owed to the protocol, so
+    // flooring would understate it and let a trader open up to one quote-lot
+    // under-margined. `div_ceil` is identical on exact multiples.
+    let required_im = notional
+        .saturating_mul(im_bps as u128)
+        .div_ceil(crate::constants::BPS_DENOM as u128);
     require!(
         (backing_collateral as u128) >= required_im,
         FlashBookError::InsufficientCollateral
@@ -19864,6 +20123,14 @@ mod m2_intake_margin_tests {
     #[test]
     fn zero_im_market_opts_out() {
         assert!(assert_intake_initial_margin(0, 1_000_000, 1_000_000, 0, TS, 0, None).is_ok());
+    }
+
+    #[test]
+    fn im_requirement_rounds_up_not_down() {
+        // notional = 3 lots @ 3 = 9; IM at 1000 bps = 9*1000/10000 = 0.9.
+        // Flooring gives 0 (a free dust open); rounding up requires 1.
+        assert!(assert_intake_initial_margin(0, 3, 3, IM, TS, 0, None).is_err());
+        assert!(assert_intake_initial_margin(0, 3, 3, IM, TS, 1, None).is_ok());
     }
 }
 
