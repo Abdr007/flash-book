@@ -20165,6 +20165,15 @@
           {
             "name": "maker_rebate_paid",
             "type": "u64"
+          },
+          {
+            "name": "insurance_contribution_paid",
+            "docs": [
+              "Quote-lots credited to the insurance fund on this fill (the net-fee",
+              "contribution). The sole insurance-balance mutation apply_fill makes, so",
+              "the insurance balance is reconstructable from the event stream."
+            ],
+            "type": "u64"
           }
         ]
       }

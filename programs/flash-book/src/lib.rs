@@ -5330,6 +5330,7 @@ pub mod flash_book {
         // For negative-fee tier the contribution is reduced by what we
         // paid out as taker rebate — protocol absorbs the cost from its
         // share, never from maker rebate or insurance balance.
+        let insurance_contribution_paid;
         {
             let fund = &mut ctx.accounts.insurance_fund;
             let contribution = (net_fee as u128)
@@ -5347,6 +5348,7 @@ pub mod flash_book {
                 .checked_add(contribution_u64)
                 .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
             fund.total_contributions = fund.total_contributions.saturating_add(contribution_u64);
+            insurance_contribution_paid = contribution_u64;
         }
         market.total_fees_collected = market
             .total_fees_collected
@@ -5755,6 +5757,7 @@ pub mod flash_book {
             batch_num: current_batch,
             taker_fee_paid,
             maker_rebate_paid: maker_rebate,
+            insurance_contribution_paid,
         });
 
         // ── V3 mark-price engine: last-trade-price tracking ─────────
@@ -18217,6 +18220,10 @@ pub struct FillAppliedEvent {
     /// the collateral change is fully reconstructable from the event stream.
     pub taker_fee_paid: u64,
     pub maker_rebate_paid: u64,
+    /// Quote-lots credited to the insurance fund on this fill (the net-fee
+    /// contribution). The sole insurance-balance mutation apply_fill makes, so
+    /// the insurance balance is reconstructable from the event stream.
+    pub insurance_contribution_paid: u64,
 }
 
 #[event]
