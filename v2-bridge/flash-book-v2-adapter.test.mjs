@@ -52,6 +52,39 @@ test("reconciliation is an EXACT integer identity over the grid", () => {
   }
 });
 
+// Wider differential sweep: large sizes/prices/ticks push the product far beyond
+// 2^53, so a passing exact identity proves the reconciliation is genuine i128
+// math (BigInt), not float that happens to agree on small inputs.
+test("reconciliation stays exact over a wide tick × size × price grid", () => {
+  const ticks = [1n, 2n, 7n, 100n, 1000n, 1_000_000n];
+  const sizes = [1n, 5n, 1000n, 1_000_000n];
+  // entry/mark up to 2^40 (the ORDER_ID price field width).
+  const prices = [1n, 1000n, 1_000_000n, 4_294_967_296n, 1_099_511_627_775n];
+  let combos = 0;
+  for (const side of [SIDE_LONG, SIDE_SHORT]) {
+    const sign = side === SIDE_LONG ? 1n : -1n;
+    for (const tick of ticks) {
+      for (const size of sizes) {
+        for (const entry of prices) {
+          for (const mark of prices) {
+            const v2 = flashBookPositionToV2(
+              { side, sizeLots: size, entryPriceTicks: entry },
+              mark,
+              { tickSize: tick },
+            );
+            assert.equal(v2._fbPnlQuoteLots, v2._v2PnlQuoteLots);
+            assert.equal(v2.reconciled, true);
+            assert.equal(v2._fbPnlQuoteLots, sign * size * (mark - entry) * tick);
+            combos++;
+          }
+        }
+      }
+    }
+  }
+  // 2 sides × 6 ticks × 4 sizes × 5 entries × 5 marks.
+  assert.equal(combos, 1200);
+});
+
 test("PnL uses no floating point (large values stay exact)", () => {
   // Values that would lose precision in float64 (> 2^53).
   const size = 1_000_000n;
