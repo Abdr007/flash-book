@@ -4344,6 +4344,40 @@
           }
         },
         {
+          "name": "market",
+          "docs": [
+            "The pool's market — supplies the fresh L1 oracle and `tick_size` used to",
+            "mark the pool's open inventory into share-pricing NAV. Seeds-bound to",
+            "`exposure.market` so a foreign market cannot be substituted. Boxed to keep",
+            "the BPF frame small."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
           "name": "position",
           "writable": true,
           "pda": {
@@ -4407,7 +4441,8 @@
         {
           "name": "insurance_fund",
           "docs": [
-            "Insurance fund PDA — owns the protocol vault (binds quote_vault + mint)."
+            "Insurance fund PDA — owns the protocol vault (binds quote_vault + mint).",
+            "Boxed to keep the `market`-augmented context's BPF frame under 4 KB."
           ],
           "pda": {
             "seeds": [
@@ -4847,6 +4882,40 @@
                 "kind": "account",
                 "path": "exposure.market",
                 "account": "FlpExposurePerMarketAccountV3"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "docs": [
+            "The pool's market — supplies the fresh L1 oracle and `tick_size` used to",
+            "mark the pool's open inventory into the exit NAV, and the mark used for the",
+            "post-withdraw solvency floor. Seeds-bound to `exposure.market` so a foreign",
+            "market cannot be substituted. Boxed to keep the BPF frame small."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
               }
             ]
           }
@@ -10866,6 +10935,99 @@
               }
             ]
           }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "reset_er_margin_attestation",
+      "docs": [
+        "Emergency recovery for a lost or unresponsive attestor. The reserved",
+        "margin and `er_active` flag can otherwise only be lowered by the pinned",
+        "attestor, so if that key dies the reserved portion of a trader's",
+        "collateral is permanently unwithdrawable — the same failure mode the ER",
+        "force-undelegate escape exists to survive. The protocol authority (which",
+        "pinned the attestor at init, so this is within the existing trust model)",
+        "zeroes the reservation and advances the epoch, so a stale in-flight",
+        "attestation cannot replay the old reservation while a recovered attestor",
+        "can still re-attest at a higher epoch. Operationally used only once the ER",
+        "is confirmed down (no order can fill), so zeroing the reservation cannot",
+        "leave a live ER order undercollateralized."
+      ],
+      "discriminator": [
+        121,
+        91,
+        5,
+        150,
+        45,
+        152,
+        78,
+        13
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "insurance_fund",
+          "docs": [
+            "Protocol singleton — its `authority` gates the reset (the same key that",
+            "pinned the attestor at init)."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "er_margin",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  114,
+                  95,
+                  109,
+                  97,
+                  114,
+                  103,
+                  105,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "trader_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_state",
+          "writable": true
         }
       ],
       "args": []
@@ -22034,6 +22196,21 @@
               "as `false`."
             ],
             "type": "bool"
+          },
+          {
+            "name": "last_settlement_slot",
+            "docs": [
+              "Slot of the last REAL settlement (a committed fill applied via",
+              "`apply_fill` / `apply_flp_fill`). Unlike `last_mark_update_slot` — which",
+              "the permissionless `settle_mark` also bumps — this advances ONLY on",
+              "genuine settlement, so it is the honest liveness signal for the",
+              "force-undelegate escape and the S7 auto-pause: a censoring sequencer that",
+              "heartbeats and spams `settle_mark` but settles no fills cannot keep this",
+              "fresh. Trailing field ⇒ existing accounts read it as 0 (never settled),",
+              "which the escape treats via the `book_delegated_at_slot` baseline exactly",
+              "as a never-stamped mark was."
+            ],
+            "type": "u64"
           }
         ]
       }
@@ -23177,6 +23354,17 @@
           },
           {
             "name": "pending_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "proposed_by",
+            "docs": [
+              "The authority that PROPOSED this transfer. `accept_authority_transfer`",
+              "requires it to still equal `market.authority`, so a pending proposed by",
+              "an authority that has since been replaced (via the 1-step",
+              "`transfer_market_authority` or a re-propose) can never displace the",
+              "current authority."
+            ],
             "type": "pubkey"
           },
           {

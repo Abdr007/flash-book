@@ -11705,8 +11705,23 @@ pub mod flash_book {
         let cpi_ctx = CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts);
         token::transfer(cpi_ctx, amount_quote_lots)?;
 
+        // Mark the pool's open inventory to the fresh L1 oracle and fold it into
+        // the share-pricing NAV (full mark, both directions — symmetric with the
+        // singleton `deposit_flp_capital`). Without it a depositor entering while
+        // the pool carries an unrealized GAIN would over-mint shares and dilute
+        // standing LPs, and one entering against an unrealized LOSS would
+        // under-mint; either way realized-only NAV misprices the entry. A stale
+        // oracle fails closed here exactly as it does for the singleton.
+        let mtm: i128 = flp_v3_inventory_mtm(
+            ctx.accounts.exposure.side,
+            ctx.accounts.exposure.size_lots,
+            ctx.accounts.exposure.entry_price_ticks,
+            &ctx.accounts.market,
+            Clock::get()?.unix_timestamp,
+        )?;
+
         let acct = &mut ctx.accounts.exposure;
-        // Price shares on NAV (= total_capital + realized_pnl),
+        // Price shares on NAV (= total_capital + realized_pnl + unrealized mark),
         // NOT total_capital alone. The old code ignored realized_pnl, so shares
         // tracked only net principal — the pool's trading PnL was invisible to LP
         // value, and (worse) an underwater pool still redeemed at the inflated
@@ -11714,7 +11729,8 @@ pub mod flash_book {
         // there are genuinely no shares; if shares exist but NAV <= 0 the pool is
         // insolvent → reject rather than dilute the depositor (mirrors the singleton
         // M-3 guard).
-        let nav_i: i128 = (acct.total_capital_quote_lots as i128) + (acct.realized_pnl as i128);
+        let nav_i: i128 =
+            (acct.total_capital_quote_lots as i128) + (acct.realized_pnl as i128) + mtm;
         require!(
             !(acct.lp_shares_outstanding > 0 && nav_i <= 0),
             FlashBookError::FlpPoolInsolvent
@@ -11796,13 +11812,35 @@ pub mod flash_book {
         let total_shares = ctx.accounts.exposure.lp_shares_outstanding;
         require!(total_shares > 0, FlashBookError::OutOfRange);
 
-        // Redeem against NAV, not total_capital. On a pool loss
-        // (realized_pnl < 0) NAV < total_capital, so this pays LESS — closing the
-        // over-redemption that drained the shared vault. Reject if NAV <= 0.
+        // Mark the pool's open inventory to the fresh L1 oracle. The exit price
+        // charges any unrealized LOSS but never pays out an uncashed unrealized
+        // GAIN (`mtm.min(0)`), symmetric with the singleton `withdraw_flp_capital`:
+        // pricing withdrawal at realized-only NAV while deposit prices at
+        // `nav + mtm` would let a depositor mint cheap shares into an underwater
+        // pool and redeem them at the higher realized NAV after the min-hold,
+        // extracting standing LPs' drawdown from the SHARED vault. Charging the
+        // loss closes that arbitrage; never crediting the gain keeps the payout
+        // <= the realized claim the vault actually backs (conservation).
+        let side = ctx.accounts.exposure.side;
+        let size_lots = ctx.accounts.exposure.size_lots;
+        let entry_ticks = ctx.accounts.exposure.entry_price_ticks;
+        let mtm: i128 = flp_v3_inventory_mtm(
+            side,
+            size_lots,
+            entry_ticks,
+            &ctx.accounts.market,
+            Clock::get()?.unix_timestamp,
+        )?;
+
+        // Redeem against NAV, not total_capital. The realized claim (NAV) must be
+        // positive, and the exit price (NAV minus any unrealized loss) must also
+        // stay positive — a pool underwater past its realized buffer is insolvent.
         let nav_i: i128 = (total_capital as i128) + (realized_pnl as i128);
         require!(nav_i > 0, FlashBookError::FlpPoolInsolvent);
+        let pricing_nav_i: i128 = nav_i.saturating_add(mtm.min(0));
+        require!(pricing_nav_i > 0, FlashBookError::FlpPoolInsolvent);
         let amount_u128 =
-            (shares_to_burn as u128).saturating_mul(nav_i as u128) / (total_shares as u128);
+            (shares_to_burn as u128).saturating_mul(pricing_nav_i as u128) / (total_shares as u128);
         let amount = if amount_u128 > u64::MAX as u128 {
             u64::MAX
         } else {
@@ -11827,6 +11865,21 @@ pub mod flash_book {
         let new_realized_pnl: i64 = ((realized_pnl as i128) - (pnl_reduction as i128))
             .try_into()
             .map_err(|_| error!(FlashBookError::ArithmeticUnderflow))?;
+
+        // Position-aware solvency floor (mirrors the singleton). While the pool
+        // holds open inventory, post-withdraw NAV must still cover its gross
+        // exposure at the current mark, so a withdrawal cannot leave the remaining
+        // LPs backing a position larger than the capital left behind.
+        if side != 255 && size_lots > 0 {
+            let gross_exposure = (size_lots as u128)
+                .saturating_mul(ctx.accounts.market.mark_price_ticks as u128)
+                .saturating_mul(ctx.accounts.market.params.tick_size as u128);
+            let post_nav: i128 = (new_total as i128) + (new_realized_pnl as i128);
+            require!(
+                post_nav >= 0 && (post_nav as u128) >= gross_exposure,
+                FlashBookError::FlpWithdrawUndercollateralized
+            );
+        }
 
         {
             let acct = &mut ctx.accounts.exposure;
@@ -19982,6 +20035,39 @@ fn flp_slot_unrealized_pnl(
         .saturating_mul(sign)
 }
 
+/// Mark a v3 per-market FLP pool's open inventory to the market's fresh L1
+/// oracle, returning the signed unrealized PnL in quote lots (0 when flat).
+/// Fails closed (`OracleTooStale`) when the pool holds inventory but the oracle
+/// is missing/stale, so deposit and withdraw can never price shares off a
+/// degraded mark. Uses the L1 oracle, not the ER mark, so it is
+/// ER-stall-independent — identical to the singleton pool's marking.
+fn flp_v3_inventory_mtm(
+    side: u8,
+    size_lots: u64,
+    entry_ticks: u64,
+    market: &MarketAccount,
+    now_unix: i64,
+) -> Result<i128> {
+    if side == 255 || size_lots == 0 {
+        return Ok(0);
+    }
+    let now = now_unix.max(0) as u64;
+    let oracle = market.oracle_price_ticks;
+    let max_age = market.params.oracle_staleness_max_seconds as u64;
+    let published = market.oracle_published_at_unix_seconds;
+    require!(
+        oracle > 0 && published > 0 && now.saturating_sub(published) <= max_age,
+        FlashBookError::OracleTooStale
+    );
+    Ok(flp_slot_unrealized_pnl(
+        side,
+        size_lots,
+        entry_ticks,
+        oracle,
+        market.params.tick_size,
+    ))
+}
+
 #[cfg(test)]
 mod flp_mtm_tests {
     use super::flp_slot_unrealized_pnl;
@@ -21469,6 +21555,17 @@ pub struct FlpDepositV3<'info> {
     )]
     pub exposure: Account<'info, state_v3::FlpExposurePerMarketAccountV3>,
 
+    /// The pool's market — supplies the fresh L1 oracle and `tick_size` used to
+    /// mark the pool's open inventory into share-pricing NAV. Seeds-bound to
+    /// `exposure.market` so a foreign market cannot be substituted. Boxed to keep
+    /// the BPF frame small.
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.key() == exposure.market @ FlashBookError::WrongMarket,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
     #[account(
         init_if_needed,
         payer = lp,
@@ -21490,14 +21587,15 @@ pub struct FlpDepositV3<'info> {
     pub flp_mode: Box<Account<'info, state::FlpModeAccount>>,
 
     /// Insurance fund PDA — owns the protocol vault (binds quote_vault + mint).
+    /// Boxed to keep the `market`-augmented context's BPF frame under 4 KB.
     #[account(
         seeds = [InsuranceFundAccount::SEED],
         bump = insurance_fund.bump,
     )]
-    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 
     #[account(address = insurance_fund.quote_mint)]
-    pub quote_mint: Account<'info, Mint>,
+    pub quote_mint: Box<Account<'info, Mint>>,
 
     /// LP's USDC ATA — debited. C1: bound to the protocol quote mint + the LP
     /// so a foreign/worthless-mint source cannot be substituted.
@@ -21506,14 +21604,14 @@ pub struct FlpDepositV3<'info> {
         associated_token::mint = quote_mint,
         associated_token::authority = lp,
     )]
-    pub lp_quote_ata: Account<'info, TokenAccount>,
+    pub lp_quote_ata: Box<Account<'info, TokenAccount>>,
 
     /// Protocol vault — credited. MUST be the canonical insurance-fund
     /// vault: an unbound `#[account(mut)]` here would let an attacker pass a
     /// self-owned destination and still be minted FLP shares redeemable
     /// against the real vault.
     #[account(mut, address = insurance_fund.quote_vault)]
-    pub quote_vault: Account<'info, TokenAccount>,
+    pub quote_vault: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -21530,6 +21628,17 @@ pub struct FlpWithdrawV3<'info> {
         bump = exposure.bump,
     )]
     pub exposure: Account<'info, state_v3::FlpExposurePerMarketAccountV3>,
+
+    /// The pool's market — supplies the fresh L1 oracle and `tick_size` used to
+    /// mark the pool's open inventory into the exit NAV, and the mark used for the
+    /// post-withdraw solvency floor. Seeds-bound to `exposure.market` so a foreign
+    /// market cannot be substituted. Boxed to keep the BPF frame small.
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+        constraint = market.key() == exposure.market @ FlashBookError::WrongMarket,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
 
     #[account(
         mut,

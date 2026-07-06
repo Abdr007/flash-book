@@ -1852,6 +1852,7 @@ async fn try_v3_deposit(
         vec![
             AccountMeta::new(lp.pubkey(), true),
             AccountMeta::new(exposure, false),
+            AccountMeta::new_readonly(market_pda, false),
             AccountMeta::new(position, false),
             AccountMeta::new(pda(&[flash_book::state::FlpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
@@ -9472,6 +9473,7 @@ async fn flp_withdraw_v3_enforces_min_hold() {
         vec![
             AccountMeta::new(lp.pubkey(), true),
             AccountMeta::new(exposure, false),
+            AccountMeta::new_readonly(market_pda, false),
             AccountMeta::new(position, false),
             AccountMeta::new(pda(&[flash_book::state::FlpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
@@ -9499,6 +9501,7 @@ async fn flp_withdraw_v3_enforces_min_hold() {
         vec![
             AccountMeta::new(lp.pubkey(), true),
             AccountMeta::new(exposure, false),
+            AccountMeta::new_readonly(market_pda, false),
             AccountMeta::new(position, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new(protocol.quote_vault, false),
@@ -9615,6 +9618,185 @@ async fn record_flp_fill_v3_derives_realized_pnl_on_chain() {
     assert_eq!(e1.realized_pnl, 100, "derived close PnL = 10*(110-100)");
     assert_eq!(e1.size_lots, 0, "inventory closed to flat");
     assert_eq!(e1.side, 255, "empty marker after full close");
+}
+
+/// `flp_deposit_v3` / `flp_withdraw_v3` must price shares on NAV *inclusive of the
+/// unrealized mark* of the pool's open inventory — not realized-only. Here the
+/// pool holds a long opened at entry 200_000 while the fresh L1 oracle marks
+/// 100_000 (tick_size 1), so the inventory carries a 10*(100_000-200_000) =
+/// -1_000_000 unrealized loss that exactly cancels the standing LP's 1_000_000
+/// capital: true NAV is 0. A realized-only deposit would still see NAV =
+/// total_capital = 1_000_000 and happily mint a second LP into an insolvent pool
+/// (socializing the drawdown onto the shared vault). With the mark folded in, the
+/// deposit is rejected `FlpPoolInsolvent` (Custom(8308)).
+#[tokio::test]
+async fn flp_deposit_v3_marks_inventory_and_rejects_when_insolvent() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let (exposure, _) = pda(&[
+        flash_book::state_v3::FlpExposurePerMarketAccountV3::SEED,
+        market_pda.as_ref(),
+    ]);
+
+    // Init the per-market FLP exposure (authority = payer).
+    let init_ix = build_ix(
+        flash_book::instruction::InitFlpPerMarketV3 {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Fund LP1 and deposit into the (flat) pool → mints 1_000_000 shares 1:1.
+    let lp1 = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &lp1.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let lp1_ata = create_ata(&mut ctx, &payer, lp1.pubkey(), protocol.quote_mint).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp1_ata, 10_000_000).await;
+    let (pos1, _) = pda(&[
+        flash_book::state_v3::FlpPositionAccountV3::SEED,
+        exposure.as_ref(),
+        lp1.pubkey().as_ref(),
+    ]);
+    let dep1 = build_ix(
+        flash_book::instruction::FlpDepositV3 {
+            amount_quote_lots: 1_000_000,
+        },
+        vec![
+            AccountMeta::new(lp1.pubkey(), true),
+            AccountMeta::new(exposure, false),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(pos1, false),
+            AccountMeta::new(pda(&[flash_book::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(lp1_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[dep1],
+            Some(&lp1.pubkey()),
+            &[&lp1],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Authority opens an underwater long: entry 200_000 against the 100_000
+    // oracle mark ⇒ -1_000_000 unrealized loss (size 10 × 100_000 × tick 1).
+    let open_ix = build_ix(
+        flash_book::instruction::RecordFlpFillV3 {
+            size_lots: 10,
+            price_ticks: 200_000,
+            side: 0,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(exposure, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[open_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // LP2 tries to deposit. True NAV (1_000_000 capital − 1_000_000 mark) is 0,
+    // so an MTM-aware pool rejects it as insolvent.
+    let lp2 = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &lp2.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let lp2_ata = create_ata(&mut ctx, &payer, lp2.pubkey(), protocol.quote_mint).await;
+    mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp2_ata, 10_000_000).await;
+    let (pos2, _) = pda(&[
+        flash_book::state_v3::FlpPositionAccountV3::SEED,
+        exposure.as_ref(),
+        lp2.pubkey().as_ref(),
+    ]);
+    let dep2 = build_ix(
+        flash_book::instruction::FlpDepositV3 {
+            amount_quote_lots: 1_000_000,
+        },
+        vec![
+            AccountMeta::new(lp2.pubkey(), true),
+            AccountMeta::new(exposure, false),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(pos2, false),
+            AccountMeta::new(pda(&[flash_book::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(lp2_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[dep2],
+            Some(&lp2.pubkey()),
+            &[&lp2],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8308)"),
+        "deposit into an MTM-insolvent v3 pool must be rejected FlpPoolInsolvent, got: {dbg}"
+    );
 }
 
 /// ER-layer coverage (honest scope): a faithful delegate→commit→undelegate
