@@ -1666,6 +1666,185 @@ async fn crank_funding_seeds_and_gates_on_oracle() {
     );
 }
 
+// ── D19: event-replay reconciler ───────────────────────────────────────────
+// Reconstructs value-bearing state from the emitted event stream ALONE — no
+// account reads happen during replay — then asserts it matches the on-chain
+// accounts. This is the observability / data-availability guarantee: the events
+// are sufficient to rebuild collateral and the funding index from their deltas.
+// Positions, OI, FLP NAV, insurance, and the book follow the same pattern on
+// their own events (FillApplied, OrderPlaced/Cancelled, FlpFillApplied, …).
+
+// Minimal standard-base64 decoder — keeps the reconciler dependency-free.
+fn recon_b64(s: &str) -> Option<Vec<u8>> {
+    let mut inv = [255u8; 256];
+    for (i, c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
+        inv[*c as usize] = i as u8;
+    }
+    let mut out = Vec::new();
+    let (mut buf, mut bits) = (0u32, 0u8);
+    for &c in s.trim().as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        let v = inv[c as usize];
+        if v == 255 {
+            return None;
+        }
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+#[derive(Default)]
+struct Reconciled {
+    collateral: std::collections::HashMap<Pubkey, i128>,
+    funding_index: std::collections::HashMap<Pubkey, i128>,
+}
+
+impl Reconciled {
+    // Replay every event in a transaction's logs into the reconstructed state
+    // using only the deltas the events carry (never `new_balance`).
+    fn apply_logs(&mut self, logs: &[String]) {
+        use flash_book::{
+            CollateralDepositedEvent, CollateralWithdrawnEvent, FundingCrankedEvent,
+            FundingSettledEvent,
+        };
+        for line in logs {
+            let Some(b64) = line.strip_prefix("Program data: ") else {
+                continue;
+            };
+            let Some(bytes) = recon_b64(b64) else {
+                continue;
+            };
+            if bytes.len() < 8 {
+                continue;
+            }
+            let (disc, body) = bytes.split_at(8);
+            if disc == <CollateralDepositedEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
+                if let Ok(e) = CollateralDepositedEvent::try_from_slice(body) {
+                    *self.collateral.entry(e.trader).or_default() += e.amount as i128;
+                }
+            } else if disc
+                == <CollateralWithdrawnEvent as anchor_lang::Discriminator>::DISCRIMINATOR
+            {
+                if let Ok(e) = CollateralWithdrawnEvent::try_from_slice(body) {
+                    *self.collateral.entry(e.trader).or_default() -= e.amount as i128;
+                }
+            } else if disc == <FundingSettledEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
+                if let Ok(e) = FundingSettledEvent::try_from_slice(body) {
+                    *self.collateral.entry(e.trader).or_default() -= e.owed_quote_lots as i128;
+                }
+            } else if disc == <FundingCrankedEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
+                if let Ok(e) = FundingCrankedEvent::try_from_slice(body) {
+                    self.funding_index.insert(e.market, e.cum_funding_index);
+                }
+            }
+        }
+    }
+}
+
+async fn send_capture(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    ix: Instruction,
+    fee_payer: &Pubkey,
+    signers: &[&Keypair],
+) -> Vec<String> {
+    let bh = ctx.get_new_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(fee_payer), signers, bh);
+    let r = ctx
+        .banks_client
+        .process_transaction_with_metadata(tx)
+        .await
+        .unwrap();
+    r.result.expect("tx ok");
+    r.metadata.expect("metadata present").log_messages
+}
+
+#[tokio::test]
+async fn d19_reconciler_rebuilds_collateral_and_funding_from_events() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let mut recon = Reconciled::default();
+
+    // Two traders opened with ZERO collateral, funded by explicit deposits whose
+    // events we capture and replay. The reconciler SUMS the per-deposit deltas.
+    let traders = [Keypair::new(), Keypair::new()];
+    let mut states = Vec::new();
+    for t in &traders {
+        let ts = setup_trader(&mut ctx, &payer, t, 0, &protocol).await;
+        states.push(ts);
+        let ata = create_ata(&mut ctx, &payer, t.pubkey(), protocol.quote_mint).await;
+        mint_tokens(&mut ctx, &payer, protocol.quote_mint, ata, 1_000_000).await;
+        for amt in [120_000u64, 55_000, 3_000] {
+            let ix = build_ix(
+                flash_book::instruction::DepositCollateral {
+                    amount_quote_lots: amt,
+                },
+                vec![
+                    AccountMeta::new_readonly(t.pubkey(), true),
+                    AccountMeta::new(ts, false),
+                    AccountMeta::new_readonly(protocol.insurance_fund, false),
+                    AccountMeta::new_readonly(protocol.quote_mint, false),
+                    AccountMeta::new(ata, false),
+                    AccountMeta::new(protocol.quote_vault, false),
+                    AccountMeta::new_readonly(spl_token_id(), false),
+                ],
+            );
+            let logs = send_capture(&mut ctx, ix, &t.pubkey(), &[t]).await;
+            recon.apply_logs(&logs);
+        }
+    }
+
+    // Two funding cranks: the first only seeds the clock (no event); the second
+    // emits FundingCrankedEvent carrying the authoritative index.
+    let cranker = Keypair::new();
+    let crank_ix = || {
+        build_ix(
+            flash_book::instruction::CrankFunding {},
+            vec![
+                AccountMeta::new_readonly(cranker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+            ],
+        )
+    };
+    let _ = send_capture(&mut ctx, crank_ix(), &payer.pubkey(), &[&payer, &cranker]).await;
+    let logs = send_capture(&mut ctx, crank_ix(), &payer.pubkey(), &[&payer, &cranker]).await;
+    recon.apply_logs(&logs);
+
+    // ── Assert the event-reconstructed state matches the on-chain accounts. ──
+    for (t, ts) in traders.iter().zip(&states) {
+        let onchain: TraderStateAccount = fetch(&mut ctx.banks_client, *ts).await;
+        assert_eq!(
+            *recon
+                .collateral
+                .get(&t.pubkey())
+                .expect("trader reconstructed"),
+            onchain.collateral_quote_lots as i128,
+            "event-reconstructed collateral == on-chain (trader {})",
+            t.pubkey()
+        );
+    }
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        *recon
+            .funding_index
+            .get(&market_pda)
+            .expect("market funding index reconstructed"),
+        market.cum_funding_index,
+        "event-reconstructed funding index == on-chain"
+    );
+}
+
 #[tokio::test]
 async fn update_market_params_rejects_immutable_primitive_change() {
     let pt = make_program_test();
