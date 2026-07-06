@@ -142,4 +142,109 @@ proptest! {
         let _ = MarketBookHandle::from_account_data(&mut probe);
         let _ = MarketBookHandle::validate_node_links(&data);
     }
+
+    /// The load-only fuzzes above prove `from_account_data` / `validate_node_links`
+    /// are total. But after an undelegate a book that PASSES validation becomes
+    /// user-writable, and validation deliberately checks only STRUCTURE (acyclic,
+    /// parent-symmetric, in-bounds links) — not RB/BST invariants. So a
+    /// structurally-sound-but-RB-invalid committed book can reach the WRITE path,
+    /// whose rotations (`insert_fix`/`remove_fix`, swap-with-successor) are the one
+    /// surface the load-only tests never drive. This asserts that surface is total
+    /// too: on any corrupted-but-validated book, best-first walks terminate and
+    /// inserts/removes never panic, read OOB, or loop. (RB/BST-invalidity may yield
+    /// mis-ordered matching — a correctness issue — but never a memory-safety one.)
+    #[test]
+    fn write_path_is_total_on_corrupted_but_validated_book(
+        inserts in prop::collection::vec((any::<bool>(), 1u64..64), 0..40),
+        mutations in prop::collection::vec((any::<usize>(), any::<u8>()), 0..48),
+        post_inserts in prop::collection::vec((any::<bool>(), 1u64..64), 0..8),
+    ) {
+        let mut data = vec![0u8; MARKET_BOOK_TOTAL_BYTES];
+        MarketBookHandle::write_disc_and_init_header(
+            &mut data,
+            0,
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+        )
+        .unwrap();
+        {
+            let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
+            for (i, (is_bid, price)) in inserts.iter().enumerate() {
+                let o = order(*price, (i as u64) + 1, *is_bid);
+                if *is_bid {
+                    let _ = handle.insert_bid(o);
+                } else {
+                    let _ = handle.insert_ask(o);
+                }
+            }
+        }
+        let len = data.len();
+        for (off, val) in mutations {
+            data[off % len] = val;
+        }
+
+        // Only drive writes on books that pass the on-chain gate — exactly the
+        // precondition production enforces before a book is writable.
+        if MarketBookHandle::validate_node_links(&data).is_ok() {
+            if let Ok(mut handle) = MarketBookHandle::from_account_data(&mut data) {
+                // Best-first walks must terminate and never OOB. Collect a bounded
+                // set of live indices to later remove.
+                let mut bid_idxs = Vec::new();
+                handle.for_each_bid_best_first(|idx, _| {
+                    bid_idxs.push(idx);
+                    bid_idxs.len() < 64
+                });
+                let mut ask_idxs = Vec::new();
+                handle.for_each_ask_best_first(|idx, _| {
+                    ask_idxs.push(idx);
+                    ask_idxs.len() < 64
+                });
+
+                // Inserts drive insert_fix rotations on the (possibly RB-invalid) tree.
+                for (j, (is_bid, price)) in post_inserts.iter().enumerate() {
+                    let seq = (inserts.len() as u64) + (j as u64) + 1;
+                    let o = order(*price, seq, *is_bid);
+                    if *is_bid {
+                        let _ = handle.insert_bid(o);
+                    } else {
+                        let _ = handle.insert_ask(o);
+                    }
+                }
+
+                // Removes drive remove_fix / swap-with-successor. Re-check liveness
+                // via a bounded walk before each remove so a prior swap can never
+                // hand us a freed slot (a test artifact, not a production path) —
+                // the target may still be an interior node, exercising the swap.
+                for target in bid_idxs {
+                    let mut live = false;
+                    handle.for_each_bid_best_first(|idx, _| {
+                        if idx == target {
+                            live = true;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if live {
+                        handle.remove_bid_node(target);
+                    }
+                }
+                for target in ask_idxs {
+                    let mut live = false;
+                    handle.for_each_ask_best_first(|idx, _| {
+                        if idx == target {
+                            live = true;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if live {
+                        handle.remove_ask_node(target);
+                    }
+                }
+            }
+        }
+    }
 }
