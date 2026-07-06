@@ -5753,6 +5753,8 @@ pub mod flash_book {
             size_lots,
             price_ticks,
             batch_num: current_batch,
+            taker_fee_paid,
+            maker_rebate_paid: maker_rebate,
         });
 
         // ── V3 mark-price engine: last-trade-price tracking ─────────
@@ -18210,6 +18212,11 @@ pub struct FillAppliedEvent {
     pub size_lots: u64,
     pub price_ticks: u64,
     pub batch_num: u64,
+    /// Quote-lots actually debited from the taker as fee, and credited to the
+    /// maker as rebate, on this fill — the exact fee-side collateral deltas, so
+    /// the collateral change is fully reconstructable from the event stream.
+    pub taker_fee_paid: u64,
+    pub maker_rebate_paid: u64,
 }
 
 #[event]
