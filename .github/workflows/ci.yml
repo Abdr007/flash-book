@@ -113,7 +113,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned toolchain: a `-D warnings` clippy gate on a floating `@stable`
+      # breaks whenever a new Rust release adds a lint that fires on existing
+      # code. Pin to the version the tree is validated against; bump deliberately.
+      - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -142,8 +145,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the toolchain the committed IDL was generated with, so
+      # `anchor idl build` is reproducible run-to-run.
+      - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
+      # anchor-cli links against libudev (via hidapi); the runner needs the dev
+      # package + pkg-config before `cargo install`.
+      - name: Install anchor-cli build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
       - name: Install Solana toolchain
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
