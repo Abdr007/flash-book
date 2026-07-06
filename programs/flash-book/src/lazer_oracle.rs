@@ -327,4 +327,31 @@ mod tests {
             Err(LazerError::Truncated)
         );
     }
+
+    /// Mutation/truncation fuzzer: the REAL message always parses, and no mutated
+    /// or truncated payload may panic — the parser fails closed, never crashes.
+    #[test]
+    fn lazer_parser_survives_mutated_and_truncated_input() {
+        assert!(parse_lazer_price(REAL_MSG, 6).is_ok());
+        let mut rng: u64 = 0x5EED_0000_2026_0007;
+        let mut next = || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            rng >> 33
+        };
+        for _ in 0..20_000 {
+            let mut m = REAL_MSG.to_vec();
+            let flips = 1 + next() % 4;
+            for _ in 0..flips {
+                let idx = (next() % m.len() as u64) as usize;
+                m[idx] = (next() & 0xFF) as u8;
+            }
+            let feed = (next() % 1000) as u32;
+            let _ = parse_lazer_price(&m, feed);
+        }
+        for len in 0..=REAL_MSG.len() {
+            let _ = parse_lazer_price(&REAL_MSG[..len], 6);
+        }
+    }
 }
