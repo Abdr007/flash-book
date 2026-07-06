@@ -214,6 +214,20 @@ try {
       .accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: takerTS, position: null })
       .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
   });
+  await stage("ER reduce-only taker with no position is rejected fail-closed (ReduceOnlyNoPosition)", async () => {
+    // Same intake code runs on the delegated book: a reduce-only taker (flag bit1)
+    // with no opposing position must fail-closed on the ER, never open. The taker
+    // holds no position here (positions form only at post-undelegate settlement),
+    // and a rejected order never touches the ring, so this leaves the round-trip
+    // untouched. FLAG_REDUCE_ONLY = 2; ReduceOnlyNoPosition = Anchor Custom(8324)/0x2084.
+    const roIx = await program.methods.placeTakerOrderV2(1, new BN(1), new BN(1), 2, new BN(0), 0)
+      .accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: takerTS, position: null })
+      .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction();
+    let rejected = false;
+    try { await send(er, roIx, [taker], 1_400_000); }
+    catch (e) { rejected = /0x2084|8324|ReduceOnlyNoPosition/i.test(String(e.message || e) + (e.logs || []).join("")); }
+    if (!rejected) throw new Error("reduce-only taker with no position was NOT rejected on the ER");
+  });
 
   // ── ER: commit the (book, ring, outbox) snapshot to L1 ──
   await stage("ER commit_* → L1 snapshot", async () => {

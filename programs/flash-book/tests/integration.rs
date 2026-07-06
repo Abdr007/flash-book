@@ -1576,6 +1576,96 @@ async fn initialize_market_writes_state() {
     // market_book PDA initialized separately via init_market_book.
 }
 
+/// The permissionless funding crank seeds its clock on the first tick (no
+/// accrual), and only moves `cum_funding_index` when a live oracle anchor is
+/// present — a market with no oracle price accrues nothing (the fail-safe). The
+/// crank moves no collateral itself; value flows later through the Kani-proven
+/// `settle_funding` / `route_funding` path. The exact rate·Δt accrual is covered
+/// by the `funding_index_delta` unit tests + proptest + Kani proof and the live
+/// devnet acceptance (a real wall clock; solana-program-test does not advance
+/// unix_timestamp deterministically).
+#[tokio::test]
+async fn crank_funding_seeds_and_gates_on_oracle() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // A NON-authority signer — the crank is permissionless.
+    let cranker = Keypair::new();
+    let crank_ix = || {
+        build_ix(
+            flash_book::instruction::CrankFunding {},
+            vec![
+                AccountMeta::new_readonly(cranker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+            ],
+        )
+    };
+    // First tick: a permissionless caller seeds the crank clock; no accrual.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[crank_ix()],
+            Some(&payer.pubkey()),
+            &[&payer, &cranker],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m.cum_funding_index, 0, "first crank seeds only, no accrual");
+    assert_ne!(
+        m.last_funding_crank_unix, 0,
+        "clock seeded on the first tick"
+    );
+
+    // Fail-safe: with NO oracle anchor (oracle_price_ticks == 0) the crank accrues
+    // nothing even with a premium-shaped mark and a far-past last-crank time — it
+    // can never move the index off a stale/absent price.
+    let acc = ctx
+        .banks_client
+        .get_account(market_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut st = MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    st.oracle_price_ticks = 0;
+    st.mark_price_ticks = 110_000;
+    st.last_funding_crank_unix = 1;
+    let mut data = Vec::new();
+    st.try_serialize(&mut data).unwrap();
+    data.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: acc.lamports,
+            data,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[crank_ix()],
+            Some(&payer.pubkey()),
+            &[&payer, &cranker],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        m.cum_funding_index, 0,
+        "no oracle anchor -> crank accrues nothing"
+    );
+}
+
 #[tokio::test]
 async fn update_market_params_rejects_immutable_primitive_change() {
     let pt = make_program_test();
@@ -7462,6 +7552,130 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
         read_inflight(&mut ctx, fc_pda, m_pos).await,
         0,
         "in-flight released at settlement"
+    );
+}
+
+/// A reduce-only taker with NO opposing position is rejected fail-closed
+/// (`ReduceOnlyNoPosition` = Anchor Custom(8324)) rather than silently opening.
+/// This also proves the reduce-only flag is now HONORED at intake — previously
+/// any reduce-only order was blanket-rejected as `OutOfRange` (Custom(7003)).
+/// Positive capping is covered by the maker-clamp test above and the exhaustive
+/// `check_reduce_only` unit tests.
+#[tokio::test]
+async fn reduce_only_taker_without_position_is_rejected_fail_closed() {
+    use flash_book::matcher::fill_commitment as fc;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 1_000_000, &protocol).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::PlaceTakerOrderV2 {
+                    side: 0,
+                    size_lots: 1,
+                    limit_ticks: 100_000,
+                    flags: flash_book::state_v2::FLAG_REDUCE_ONLY,
+                    expires_at_slot: 0,
+                    sub_index: 0,
+                },
+                vec![
+                    AccountMeta::new(taker.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(taker_state, false),
+                    AccountMeta::new_readonly(program_id(), false), // position None
+                    AccountMeta::new(fc_pda, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &taker],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8324)"),
+        "reduce-only taker with no position must fail-closed as ReduceOnlyNoPosition, got {dbg}"
+    );
+}
+
+/// A market in CloseOnly wind-down forces EVERY order reduce-only: a plain taker
+/// (flags = 0, no reduce-only bit) that would open a position is rejected fail-
+/// closed (`ReduceOnlyNoPosition` = Custom(8324)), so positions can only be closed.
+#[tokio::test]
+async fn close_only_market_forces_reduce_only_and_blocks_openers() {
+    use flash_book::matcher::fill_commitment as fc;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 1_000_000, &protocol).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
+
+    // Authority moves the market to CloseOnly (status 5).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::SetMarketStatus { new_status: 5 },
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new_readonly(program_id(), false), // guardian None
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .expect("authority sets CloseOnly");
+
+    // Plain taker (flags = 0, NO reduce-only bit), no position → forced reduce-only
+    // by the market ⇒ fail-closed.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::PlaceTakerOrderV2 {
+                    side: 0,
+                    size_lots: 1,
+                    limit_ticks: 100_000,
+                    flags: 0,
+                    expires_at_slot: 0,
+                    sub_index: 0,
+                },
+                vec![
+                    AccountMeta::new(taker.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(taker_state, false),
+                    AccountMeta::new_readonly(program_id(), false), // position None
+                    AccountMeta::new(fc_pda, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &taker],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(8324)"),
+        "CloseOnly market must force reduce-only and reject an opener, got {dbg}"
     );
 }
 

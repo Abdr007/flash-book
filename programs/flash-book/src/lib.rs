@@ -9,6 +9,12 @@
 //! verifies every fill against that ring.
 
 #![allow(unexpected_cfgs)]
+// Machine-enforced panic-free guarantee on runtime paths: no `.unwrap()` /
+// `.expect()` may reach the deployed program. Scoped to `not(test)` so unit and
+// property tests keep using them freely. A genuinely-infallible runtime use must
+// opt out explicitly with `#[allow(clippy::unwrap_used)]` and a justifying
+// comment — there are currently none.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
@@ -1545,15 +1551,7 @@ pub mod flash_book {
         }
         let now_slot = Clock::get()?.slot;
 
-        if side > 1
-            || size_lots == 0
-            || limit_ticks == 0
-            || (flags & !0b0111_1111) != 0
-            // H4: reduce_only (bit1) is NOT enforced on the v2 CLOB — reject it
-            // loudly rather than silently no-op a "protective close" (which could
-            // OPEN/FLIP a position if the original is already gone).
-            || (flags & 0b0000_0010) != 0
-        {
+        if side > 1 || size_lots == 0 || limit_ticks == 0 || (flags & !0b0111_1111) != 0 {
             return err!(FlashBookError::OutOfRange);
         }
         if expires_at_slot != 0 && expires_at_slot <= now_slot {
@@ -1563,6 +1561,7 @@ pub mod flash_book {
         let p = &market.params;
         if market.status != MarketStatus::Active as u8
             && market.status != MarketStatus::PostOnly as u8
+            && market.status != MarketStatus::CloseOnly as u8
         {
             return err!(FlashBookError::OutOfRange);
         }
@@ -1572,6 +1571,46 @@ pub mod flash_book {
         if limit_ticks % p.tick_size != 0 {
             return err!(FlashBookError::PriceNotOnTick);
         }
+
+        // reduce_only (bit1), or a market in CloseOnly wind-down: cap the taker to
+        // its own reducible size so it can
+        // ONLY lower exposure — never open or flip. Fail-closed on an absent /
+        // foreign / flat / same-side position (nothing to reduce ⇒ reject). The
+        // cap uses the taker's freshest committed position; a reduce racing an
+        // unsettled fill is bounded by the drain-window residual (SETTLEMENT.md
+        // §3), never a silent open. Shadowing `size_lots` here makes the OI cap,
+        // margin gate, and match walk below all use the capped size.
+        let reduce_only = flags & state_v2::FLAG_REDUCE_ONLY != 0
+            || market.status == MarketStatus::CloseOnly as u8;
+        let size_lots = if reduce_only {
+            let pos_loader = ctx
+                .accounts
+                .position
+                .as_ref()
+                .ok_or_else(|| error!(FlashBookError::ReduceOnlyNoPosition))?;
+            let pdata = pos_loader.load()?;
+            verify_position_pda(
+                &market.key(),
+                &ctx.accounts.trader_state.key(),
+                pdata.bump,
+                &pos_loader.key(),
+                ctx.program_id,
+            )?;
+            match matcher::reduce_only::check_reduce_only(
+                pdata.side,
+                pdata.size_lots,
+                side,
+                size_lots,
+            ) {
+                matcher::reduce_only::ReduceOnlyOutcome::Admit => size_lots,
+                matcher::reduce_only::ReduceOnlyOutcome::PartialAdmit(cap) => cap,
+                matcher::reduce_only::ReduceOnlyOutcome::Reject => {
+                    return err!(FlashBookError::ReduceOnlyNoPosition)
+                }
+            }
+        } else {
+            size_lots
+        };
 
         // Per-market OI hard cap — mirror the limit path (MATCH-H1). Without
         // this guard a taker (filled portion + resting residual) bypasses the
@@ -1618,8 +1657,10 @@ pub mod flash_book {
         // Intake initial-margin gate — reject an order whose
         // resulting position on this market would be under-margined (the zero/thin-
         // collateral "free option"). Pure reduces are exempt; an omitted position is
-        // treated as a full open (strictest), so it cannot be a bypass.
-        {
+        // treated as a full open (strictest), so it cannot be a bypass. A reduce-only
+        // taker is capped above to its reducible size, so it can only lower exposure
+        // and needs no initial margin.
+        if !reduce_only {
             let (pos_info, backing) = if let Some(pos_loader) = ctx.accounts.position.as_ref() {
                 let pdata = pos_loader.load()?;
                 verify_position_pda(
@@ -1648,6 +1689,13 @@ pub mod flash_book {
                 market.params.initial_margin_ratio_bps,
                 market.params.tick_size,
                 backing,
+                pos_info,
+            )?;
+            // Keep the trader within the cross-margin stress lattice's position
+            // budget: reject opening a NEW market once already at the cap. Reduces
+            // / adds on a market the trader already holds are exempt.
+            assert_open_position_budget(
+                ctx.accounts.trader_state.load()?.open_positions,
                 pos_info,
             )?;
         }
@@ -4694,6 +4742,49 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// Permissionless funding crank: advance `cum_funding_index` by one tick of
+    /// `rate · Δt` from the current (mark, oracle) premium, gated to the market's
+    /// rate cap and a clamped Δt. This is the SOLE writer of the index besides
+    /// its init-to-zero. It moves NO value itself — positions realize funding
+    /// later via `settle_funding` (the Kani-proven `route_funding` path,
+    /// Δcollateral == −Δresidual). A first-ever or same-second call, or a market
+    /// with no oracle anchor, accrues exactly nothing.
+    pub fn crank_funding(ctx: Context<CrankFunding>) -> Result<()> {
+        let market_key = ctx.accounts.market.key();
+        let market = &mut ctx.accounts.market;
+        let now = Clock::get()?.unix_timestamp.max(0) as u64;
+        // A first observation only SEEDS the clock — never accrue the rate over
+        // an uninitialised (0) timestamp, which would be an unbounded Δt.
+        if market.last_funding_crank_unix == 0 {
+            market.last_funding_crank_unix = now;
+            return Ok(());
+        }
+        let dt = now.saturating_sub(market.last_funding_crank_unix);
+        let (delta, rate) = matcher::funding::funding_index_delta(
+            market.mark_price_ticks,
+            market.oracle_price_ticks,
+            dt,
+            market.params.funding_rate_k_bps,
+            market.params.funding_rate_max_bps_per_sec,
+            market.params.funding_period_seconds,
+        )?;
+        if delta != 0 {
+            market.cum_funding_index = market
+                .cum_funding_index
+                .checked_add(delta)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            market.last_funding_rate_bps_per_sec = rate;
+        }
+        market.last_funding_crank_unix = now;
+        emit!(FundingCrankedEvent {
+            market: market_key,
+            cum_funding_index: market.cum_funding_index,
+            rate_bps_per_sec: market.last_funding_rate_bps_per_sec,
+            dt_seconds: dt,
+        });
+        Ok(())
+    }
+
     /// Apply a single fill against the taker's and maker's Position PDAs.
     /// Called by the off-chain sequencer once per `FillEntry` row in a
     /// `FillBatchEvent` emitted from `place_taker_order_v2`, or by an
@@ -6269,7 +6360,7 @@ pub mod flash_book {
     }
 
     pub fn set_market_status(ctx: Context<SetMarketStatus>, new_status: u8) -> Result<()> {
-        require!(new_status <= 4, FlashBookError::OutOfRange);
+        require!(new_status <= 5, FlashBookError::OutOfRange);
         let caller = ctx.accounts.authority.key();
         let market_key = ctx.accounts.market.key();
         let is_authority = ctx.accounts.market.authority == caller;
@@ -13505,29 +13596,33 @@ fn place_limit_v2_core(
     // empirical frequency: malformed inputs rare → fast-path through.
     let now_slot = Clock::get()?.slot;
 
-    // Fast input guards (most-common-pass first).
-    if side > 1
-        || size_lots == 0
-        || limit_ticks == 0
-        || (flags & !0b0111_1111) != 0
-        // H4: reduce_only (bit1) is NOT enforced on the v2 CLOB (there is no
-        // settlement-time reduce-only check; matcher::reduce_only is uncalled).
-        // Reject it LOUDLY so a trader cannot set a "protective close" that
-        // would silently OPEN or FLIP a position. (Full enforcement = separate feature.)
-        || (flags & 0b0000_0010) != 0
-    {
+    // Fast input guards (most-common-pass first). reduce_only (bit1) is honored:
+    // a resting reduce-only order is capped to its reducible size by the
+    // symmetric, inflight-aware maker clamp in the taker walk, so it can never
+    // open or flip a position.
+    if side > 1 || size_lots == 0 || limit_ticks == 0 || (flags & !0b0111_1111) != 0 {
         return err!(FlashBookError::OutOfRange);
     }
     if expires_at_slot != 0 && expires_at_slot <= now_slot {
         return err!(FlashBookError::OutOfRange);
     }
 
-    // Market-state guards.
+    // Market-state guards. A CloseOnly market admits intake but forces every
+    // resting order reduce-only (below), so positions can only be wound down.
     let p = &market.params;
-    if market.status != MarketStatus::Active as u8 && market.status != MarketStatus::PostOnly as u8
+    if market.status != MarketStatus::Active as u8
+        && market.status != MarketStatus::PostOnly as u8
+        && market.status != MarketStatus::CloseOnly as u8
     {
         return err!(FlashBookError::OutOfRange);
     }
+    // In CloseOnly the order is forced reduce-only regardless of the caller's flag,
+    // so the symmetric maker clamp caps it to the position's reducible size.
+    let flags = if market.status == MarketStatus::CloseOnly as u8 {
+        flags | state_v2::FLAG_REDUCE_ONLY
+    } else {
+        flags
+    };
     if size_lots < p.min_base_lots {
         return err!(FlashBookError::SizeBelowMinLot);
     }
@@ -13592,15 +13687,27 @@ fn place_limit_v2_core(
         } else {
             (None, trader_state.load()?.collateral_quote_lots)
         };
-        assert_intake_initial_margin(
-            side,
-            size_lots,
-            limit_ticks,
-            market.params.initial_margin_ratio_bps,
-            market.params.tick_size,
-            backing,
-            pos_info,
-        )?;
+        // A reduce-only order is exempt from BOTH opening gates: the maker clamp
+        // caps it to the position's reducible size, so it can only lower exposure —
+        // it never needs initial margin (requiring it would wrongly reject a
+        // full-close larger than the position, whose excess never fills) and it
+        // never opens a new position slot (so it can't breach the stress-lattice
+        // budget).
+        if flags & state_v2::FLAG_REDUCE_ONLY == 0 {
+            assert_intake_initial_margin(
+                side,
+                size_lots,
+                limit_ticks,
+                market.params.initial_margin_ratio_bps,
+                market.params.tick_size,
+                backing,
+                pos_info,
+            )?;
+            // Keep the trader within the cross-margin stress lattice's position
+            // budget: reject a resting order that would OPEN a new market once
+            // already at the cap. Reduces / adds on a market already held are exempt.
+            assert_open_position_budget(trader_state.load()?.open_positions, pos_info)?;
+        }
     }
 
     // Borrow the market_book account data + load the handle.
@@ -15832,6 +15939,19 @@ pub struct LockOracleSource<'info> {
 #[derive(Accounts)]
 pub struct SettleMark<'info> {
     /// Permissionless caller (anyone can settle).
+    pub caller: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+}
+
+#[derive(Accounts)]
+pub struct CrankFunding<'info> {
+    /// Permissionless caller (anyone can crank the funding index).
     pub caller: Signer<'info>,
 
     #[account(
@@ -18103,6 +18223,17 @@ pub struct FundingSettledEvent {
 }
 
 #[event]
+pub struct FundingCrankedEvent {
+    pub market: Pubkey,
+    /// Q64.64 cumulative funding index after this tick.
+    pub cum_funding_index: i128,
+    /// Clamped funding rate stamped this tick (bps per second, signed).
+    pub rate_bps_per_sec: i64,
+    /// Seconds elapsed since the previous crank (pre-clamp).
+    pub dt_seconds: u64,
+}
+
+#[event]
 pub struct BasketOrderPlacedV2Event {
     pub trader: Pubkey,
     pub market_a: Pubkey,
@@ -18637,6 +18768,11 @@ pub enum MarketStatus {
     PostOnly = 2,
     Paused = 3,
     Closed = 4,
+    // Wind-down: order intake is open but every order is forced reduce-only, so
+    // positions can only be closed, never opened or grown. Authority-only (it is
+    // deliberately outside the guardian's monotonic restrict ladder). Numbered
+    // last to keep the existing on-chain status values stable.
+    CloseOnly = 5,
 }
 
 /// Inject one basket leg into a hypertree-backed market_book PDA.
@@ -20163,6 +20299,73 @@ fn assert_intake_initial_margin(
     Ok(())
 }
 
+/// Intake OPEN-POSITION-COUNT gate. The cross-margin stress lattice is sized for
+/// at most `MAX_POSITIONS_PER_TRADER` positions (that bounds `MAX_STRESS_SCENARIOS`);
+/// past it, `assess_margin` rejects the over-long scenario vector and the trader
+/// lands in a fail-closed corner — it can no longer pass a portfolio margin check
+/// to withdraw or open, only reduce. This gate keeps the common case out of that
+/// corner: at intake, an order that would OPEN a NEW position slot on a market
+/// where the trader is currently flat is rejected once the trader already holds
+/// `MAX_POSITIONS_PER_TRADER` positions.
+///
+/// Sound-by-construction — never rejects a legitimate reduce:
+///   • `pos == Some((_, size > 0))` ⇒ the trader is already open on THIS market
+///     (the position PDA is verified against this market by the caller), so the
+///     order adds to / reduces / flips an EXISTING slot and cannot raise the slot
+///     count ⇒ exempt.
+///   • `pos == None` or `Some((_, 0))` ⇒ the trader is flat here ⇒ the order can
+///     open a new slot ⇒ gated. Omitting the position only makes the check
+///     STRICTER, never a bypass.
+///
+/// Best-effort by design: the counter increments at SETTLEMENT (a fill going
+/// flat→non-flat), which cannot reject, so a burst of new-market opens from below
+/// the cap can still race past it. `assess_margin`'s scenario-length check remains
+/// the hard backstop that prevents any under-margining in that tail.
+fn assert_open_position_budget(open_positions: u8, pos: Option<(u8, u64)>) -> Result<()> {
+    let opens_new_slot = match pos {
+        None => true,
+        Some((_, size)) => size == 0,
+    };
+    if opens_new_slot {
+        require!(
+            (open_positions as usize) < crate::constants::MAX_POSITIONS_PER_TRADER,
+            FlashBookError::TooManyOpenPositions
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod m2_open_position_budget_tests {
+    use super::assert_open_position_budget;
+    use crate::constants::MAX_POSITIONS_PER_TRADER;
+
+    const CAP: u8 = MAX_POSITIONS_PER_TRADER as u8;
+
+    #[test]
+    fn open_below_cap_ok_at_cap_rejected() {
+        // Flat on this market (None) ⇒ opening a new slot.
+        assert!(assert_open_position_budget(CAP - 1, None).is_ok());
+        assert!(assert_open_position_budget(CAP, None).is_err());
+        assert!(assert_open_position_budget(CAP + 1, None).is_err());
+    }
+
+    #[test]
+    fn zero_size_position_counts_as_new_open() {
+        // A position account that exists but is flat (size 0) still opens a slot.
+        assert!(assert_open_position_budget(CAP, Some((0, 0))).is_err());
+        assert!(assert_open_position_budget(CAP - 1, Some((1, 0))).is_ok());
+    }
+
+    #[test]
+    fn already_open_on_market_is_exempt_even_at_cap() {
+        // Live position on THIS market ⇒ add/reduce/flip an existing slot ⇒ exempt,
+        // so a trader at the cap can still manage every position they hold.
+        assert!(assert_open_position_budget(CAP, Some((0, 100))).is_ok());
+        assert!(assert_open_position_budget(CAP + 5, Some((1, 1))).is_ok());
+    }
+}
+
 #[cfg(test)]
 mod m2_intake_margin_tests {
     use super::assert_intake_initial_margin;
@@ -21390,12 +21593,14 @@ pub struct VaultPlaceOrderV3<'info> {
     )]
     pub vault: Account<'info, state_v3::VaultAccountV3>,
 
+    /// Boxed: an un-boxed 1152-byte MarketAccount deserializes onto the stack and
+    /// tips this context's `try_accounts` frame past the 4 KB BPF limit.
     #[account(
         mut,
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
 
     /// CHECK: market_book PDA — disc validated inside handler.
     #[account(

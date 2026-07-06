@@ -72,6 +72,23 @@ jobs:
           path: target/deploy/flash_book.so
           if-no-files-found: error
 
+  v2-bridge:
+    name: V2 bridge SDK tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # The adapter builds instructions from the committed IDL and reconciles PnL
+      # in exact integers; the SDK suite round-trips every instruction/account
+      # through anchor's coders and checks the identity beyond 2^53.
+      - name: Install + test
+        working-directory: v2-bridge
+        run: |
+          npm ci
+          npm test
+
   kani:
     name: Formal verification (Kani)
     runs-on: ubuntu-latest
@@ -90,6 +107,65 @@ jobs:
         with:
           kani-version: 0.67.0
           args: '--package flash-book --features no-entrypoint'
+
+  lint:
+    name: Format + Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned toolchain: a `-D warnings` clippy gate on a floating `@stable`
+      # breaks whenever a new Rust release adds a lint that fires on existing
+      # code. Pin to the version the tree is validated against; bump deliberately.
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+  audit:
+    name: Dependency audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Advisories confined to the host dev/test toolchain are ignored with a
+      # per-ID justification in .cargo/audit.toml (none are normal/build deps of
+      # the program, none are linked into the deployed .so). Any NEW advisory —
+      # or any of those reaching the program's non-dev tree — fails the gate.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit
+
+  idl-drift:
+    name: IDL drift gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to the toolchain the committed IDL was generated with, so
+      # `anchor idl build` is reproducible run-to-run.
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      # anchor-cli links against libudev (via hidapi); the runner needs the dev
+      # package + pkg-config before `cargo install`.
+      - name: Install anchor-cli build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+      - name: Install Solana toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+      - name: Install Anchor CLI
+        run: cargo install anchor-cli --version 0.32.1 --locked
+      # Rebuild the IDL from source and fail if it diverges from the committed
+      # idl/flash_book.json (the documented source of truth). Catches any account
+      # / arg / discriminator / event / error change that was not regenerated.
+      - name: Build IDL from source
+        run: anchor idl build -o /tmp/fresh-idl.json
+      - name: Compare against committed IDL
+        run: node scripts/check-idl-drift.mjs idl/flash_book.json /tmp/fresh-idl.json
 
   lean:
     name: Formal verification (Lean)
