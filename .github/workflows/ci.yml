@@ -91,6 +91,56 @@ jobs:
           kani-version: 0.67.0
           args: '--package flash-book --features no-entrypoint'
 
+  lint:
+    name: Format + Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+  audit:
+    name: Dependency audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Advisories confined to the host dev/test toolchain are ignored with a
+      # per-ID justification in .cargo/audit.toml (none are normal/build deps of
+      # the program, none are linked into the deployed .so). Any NEW advisory —
+      # or any of those reaching the program's non-dev tree — fails the gate.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit
+
+  idl-drift:
+    name: IDL drift gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Solana toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+      - name: Install Anchor CLI
+        run: cargo install anchor-cli --version 0.32.1 --locked
+      # Rebuild the IDL from source and fail if it diverges from the committed
+      # idl/flash_book.json (the documented source of truth). Catches any account
+      # / arg / discriminator / event / error change that was not regenerated.
+      - name: Build IDL from source
+        run: anchor idl build -o /tmp/fresh-idl.json
+      - name: Compare against committed IDL
+        run: node scripts/check-idl-drift.mjs idl/flash_book.json /tmp/fresh-idl.json
+
   lean:
     name: Formal verification (Lean)
     runs-on: ubuntu-latest

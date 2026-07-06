@@ -1,0 +1,34 @@
+# cargo-audit configuration.
+#
+# The advisories ignored below are ALL confined to the host-side developer /
+# test toolchain that `cargo test` pulls in as dev-dependencies
+# (solana-program-test, solana-sdk, solana-client and their target-gated crypto
+# / QUIC transitive crates). None of them is a normal or build dependency of the
+# on-chain program:
+#
+#     cargo tree -p flash-book -i <crate> -e no-dev   # → empty for each
+#     nm target/deploy/flash_book.so | grep -i <crate> # → not linked
+#
+# The deployed `flash_book.so` verifies signatures through Solana runtime
+# syscalls and performs no networking, so the vulnerable code paths (ed25519
+# double-signing oracle, curve25519 scalar-subtraction timing, quinn stream
+# reassembly) are unreachable on-chain. The versions are pinned by the Solana
+# 2.x / anchor toolchain and cannot be bumped without breaking that set.
+#
+# The gate deliberately ignores ONLY these specific IDs, so any NEW advisory —
+# or any of these reaching the program's non-dev tree — fails CI.
+
+[advisories]
+ignore = [
+    # curve25519-dalek 3.2.0 — Scalar sub timing variability. Dev/test tree only
+    # (solana host crypto); not linked into the program. Patched in >=4.1.3,
+    # which the pinned Solana 2.x stack does not yet use.
+    "RUSTSEC-2024-0344",
+    # ed25519-dalek 1.0.1 — double public-key signing oracle. Dev/test tree only;
+    # the program never signs (it verifies via syscalls). Patched in >=2.
+    "RUSTSEC-2022-0093",
+    # quinn-proto 0.11.14 — remote memory exhaustion in QUIC stream reassembly.
+    # Reachable only from the host RPC/client networking stack; the on-chain
+    # program does no networking. Patched in >=0.11.15.
+    "RUSTSEC-2026-0185",
+]

@@ -12484,6 +12484,10 @@
         },
         {
           "name": "market",
+          "docs": [
+            "Boxed: an un-boxed 1152-byte MarketAccount deserializes onto the stack and",
+            "tips this context's `try_accounts` frame past the 4 KB BPF limit."
+          ],
           "pda": {
             "seeds": [
               {
