@@ -16718,11 +16718,13 @@ pub struct SettleFunding<'info> {
     /// not by who signs the tx.
     pub caller: Signer<'info>,
 
+    /// Boxed: an un-boxed 1152-byte MarketAccount deserializes onto the stack and
+    /// tips this context's `try_accounts` frame past the 4 KB BPF limit.
     #[account(
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    pub market: Box<Account<'info, MarketAccount>>,
 
     /// The trader being settled — informational only post-Phase-2d.
     /// Settle is permissionless and the identity binding is now the
