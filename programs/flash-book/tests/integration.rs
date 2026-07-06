@@ -2410,6 +2410,172 @@ async fn d19_reconciler_rebuilds_haircut_reserve_from_release() {
     );
 }
 
+// Read an SPL token account's balance.
+async fn token_amount(ctx: &mut solana_program_test::ProgramTestContext, acc: Pubkey) -> u64 {
+    let raw = ctx.banks_client.get_account(acc).await.unwrap().unwrap();
+    <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(&raw.data)
+        .unwrap()
+        .amount
+}
+
+// Conservation sequence-fuzzer: drive a deterministic (seeded) sequence of
+// deposit / withdraw / funding-crank operations across a pool of traders — on
+// top of an already-open cross position so fees flow to insurance and OI is
+// non-trivial — and assert the two core conservation laws after EVERY step:
+//   (1) solvency:  quote_vault balance ≥ Σ trader collateral + insurance balance
+//   (2) two-sided: oi_long == oi_short
+// A reverted op leaves state unchanged, so the invariants must hold regardless.
+#[tokio::test]
+async fn conservation_sequence_fuzz() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    disarm_fill_commitment(&mut ctx, market_pda).await;
+
+    let traders: Vec<Keypair> = (0..4).map(|_| Keypair::new()).collect();
+    let mut states = Vec::new();
+    let mut atas = Vec::new();
+    for t in &traders {
+        let ts = setup_trader(&mut ctx, &payer, t, 0, &protocol).await;
+        let ata = create_ata(&mut ctx, &payer, t.pubkey(), protocol.quote_mint).await;
+        mint_tokens(&mut ctx, &payer, protocol.quote_mint, ata, 10_000_000).await;
+        states.push(ts);
+        atas.push(ata);
+    }
+
+    // Seed collateral into traders 0 and 1, then open a cross position between
+    // them (taker 0 long, maker 1) so fees hit insurance and OI is non-zero.
+    let deposit_ix = |i: usize, amt: u64| {
+        build_ix(
+            flash_book::instruction::DepositCollateral {
+                amount_quote_lots: amt,
+            },
+            vec![
+                AccountMeta::new_readonly(traders[i].pubkey(), true),
+                AccountMeta::new(states[i], false),
+                AccountMeta::new_readonly(protocol.insurance_fund, false),
+                AccountMeta::new_readonly(protocol.quote_mint, false),
+                AccountMeta::new(atas[i], false),
+                AccountMeta::new(protocol.quote_vault, false),
+                AccountMeta::new_readonly(spl_token_id(), false),
+            ],
+        )
+    };
+    // `deposit_ix` indexes the parallel states/atas arrays, so the index is load-bearing.
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..traders.len() {
+        let ix = deposit_ix(i, 1_000_000);
+        let t = &traders[i];
+        let bh = ctx.get_new_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&t.pubkey()),
+                &[t],
+                bh,
+            ))
+            .await
+            .unwrap();
+    }
+    open_cross_position(
+        &mut ctx,
+        &payer,
+        market_pda,
+        protocol.insurance_fund,
+        states[0],
+        states[1],
+        1,
+    )
+    .await;
+
+    // Deterministic op stream (seeded PCG-style LCG); sweep several seeds so the
+    // op interleavings differ run-to-run while staying reproducible.
+    let seeds: [u64; 4] = [
+        0x9E37_79B9_7F4A_7C15,
+        0x1234_5678_9ABC_DEF0,
+        0xDEAD_BEEF_CAFE_BABE,
+        0x0F0F_0F0F_F0F0_F0F0,
+    ];
+    let mut rng: u64 = seeds[0];
+    let mut next = |seed_reset: Option<u64>| {
+        if let Some(s) = seed_reset {
+            rng = s;
+        }
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        rng >> 33
+    };
+
+    for step in 0..400u32 {
+        let r = if step % 100 == 0 {
+            next(Some(seeds[(step / 100) as usize]))
+        } else {
+            next(None)
+        };
+        let ti = (r % 4) as usize;
+        let op = (r >> 8) % 3;
+        let amt = 1_000 + (r >> 16) % 300_000;
+        let ix = match op {
+            0 => deposit_ix(ti, amt),
+            1 => build_ix(
+                flash_book::instruction::WithdrawCollateral {
+                    amount_quote_lots: amt,
+                },
+                vec![
+                    AccountMeta::new_readonly(traders[ti].pubkey(), true),
+                    AccountMeta::new(states[ti], false),
+                    AccountMeta::new_readonly(protocol.insurance_fund, false),
+                    AccountMeta::new_readonly(protocol.quote_mint, false),
+                    AccountMeta::new(atas[ti], false),
+                    AccountMeta::new(protocol.quote_vault, false),
+                    AccountMeta::new_readonly(spl_token_id(), false),
+                ],
+            ),
+            _ => build_ix(
+                flash_book::instruction::CrankFunding {},
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                ],
+            ),
+        };
+        // A reverted op leaves state unchanged; either way the invariants hold.
+        let bh = ctx.get_new_latest_blockhash().await.unwrap();
+        let signer: &Keypair = if op == 2 { &payer } else { &traders[ti] };
+        let _ = ctx
+            .banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signer.pubkey()),
+                &[signer],
+                bh,
+            ))
+            .await;
+
+        // (1) Solvency: vault covers every withdrawable claim.
+        let vault_bal = token_amount(&mut ctx, protocol.quote_vault).await as u128;
+        let mut sum_coll = 0u128;
+        for ts in &states {
+            let s: TraderStateAccount = fetch(&mut ctx.banks_client, *ts).await;
+            sum_coll += s.collateral_quote_lots as u128;
+        }
+        let ins: InsuranceFundAccount = fetch(&mut ctx.banks_client, protocol.insurance_fund).await;
+        assert!(
+            vault_bal >= sum_coll + ins.balance_quote_lots as u128,
+            "solvency broken at step {step}: vault {vault_bal} < Σcoll {sum_coll} + ins {}",
+            ins.balance_quote_lots
+        );
+        // (2) Two-sided OI.
+        let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+        assert_eq!(
+            m.oi_long_lots, m.oi_short_lots,
+            "OI not two-sided at step {step}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn update_market_params_rejects_immutable_primitive_change() {
     let pt = make_program_test();
