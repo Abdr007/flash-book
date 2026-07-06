@@ -1,0 +1,15 @@
+{
+  "name": "flash-book-v2-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reference adapter mapping Flash V2 requests to flash-book CLOB instructions and flash-book positions back to V2's PositionMetrics shape. Exact-integer math; real transaction construction from the committed IDL.",
+  "scripts": {
+    "demo": "node flash-book-v2-adapter.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.1",
+    "@solana/web3.js": "^1.95.0"
+  }
+}
