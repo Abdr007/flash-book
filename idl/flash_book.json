@@ -18951,6 +18951,11 @@
       "code": 8322,
       "name": "ErMarginNotReady",
       "msg": "Trader has no ER reserved-margin attestation: it must be initialized before trading on a delegated book"
+    },
+    {
+      "code": 8323,
+      "name": "TooManyOpenPositions",
+      "msg": "Trader already holds the maximum number of open positions: close one before opening a new market"
     }
   ],
   "types": [
