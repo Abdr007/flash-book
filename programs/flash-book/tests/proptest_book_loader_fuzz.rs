@@ -100,7 +100,11 @@ proptest! {
     /// tampered commit actually produces — and asserts totality on them too.
     #[test]
     fn loader_is_total_on_mutated_valid_book(
-        inserts in prop::collection::vec((any::<bool>(), 1u64..64, 1u64..500), 0..40),
+        // (is_bid, price). The seq is the loop index below, so every order_id is
+        // unique — as it always is in production, where seq is a monotonic
+        // per-market counter. (Duplicate order_ids never occur on-chain; a
+        // committed book carrying one is caught by the arbitrary-bytes test.)
+        inserts in prop::collection::vec((any::<bool>(), 1u64..64), 0..40),
         mutations in prop::collection::vec((any::<usize>(), any::<u8>()), 0..48),
     ) {
         // A valid book (16-aligned Vec, like the other book tests).
@@ -115,8 +119,9 @@ proptest! {
         .unwrap();
         {
             let mut handle = MarketBookHandle::from_account_data(&mut data).unwrap();
-            for (i, (is_bid, price, seq)) in inserts.iter().enumerate() {
-                let o = order(*price, seq.wrapping_add(i as u64), *is_bid);
+            for (i, (is_bid, price)) in inserts.iter().enumerate() {
+                // seq = i + 1 ⇒ every order_id is unique, matching production.
+                let o = order(*price, (i as u64) + 1, *is_bid);
                 if *is_bid {
                     let _ = handle.insert_bid(o);
                 } else {
