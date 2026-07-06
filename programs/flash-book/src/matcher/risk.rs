@@ -1135,6 +1135,71 @@ mod high1_cross_market_regression {
         }
     }
 
+    /// N-position host sweep over the real cross-margin domain: for every portfolio
+    /// size N = 1..=MAX_POSITIONS_PER_TRADER, with seeded-random sides/sizes/entries
+    /// across several markets, the three cross-margin safety properties hold —
+    ///   (1) the margin REQUIREMENT is independent of collateral,
+    ///   (2) equity is exactly linear in collateral, and
+    ///   (3) health is monotone in collateral (adding collateral never turns a
+    ///       healthy portfolio unhealthy).
+    /// Kani cannot bit-blast N symbolic positions × the 128-bit notional math, so
+    /// this exhausts a wide seeded sample of the domain instead.
+    #[test]
+    fn n_position_margin_is_collateral_monotone_and_frame_stable() {
+        use crate::constants::MAX_POSITIONS_PER_TRADER;
+        let markets: Vec<MarketSnapshot> =
+            (1..=4u8).map(|s| market(s, 100 + s as u64 * 10)).collect();
+        let market_keys: Vec<Pubkey> = markets.iter().map(|m| m.market).collect();
+        let scenarios = default_scenarios(&market_keys);
+        assert!(scenarios.len() <= MAX_STRESS_SCENARIOS);
+
+        let mut rng: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            rng >> 33
+        };
+        let mut checked = 0u64;
+        for n in 1..=MAX_POSITIONS_PER_TRADER {
+            for _ in 0..200 {
+                let positions: Vec<PositionSnapshot> = (0..n)
+                    .map(|_| {
+                        let r = next();
+                        let m = &markets[(r % markets.len() as u64) as usize];
+                        let side = if (r >> 8) & 1 == 0 {
+                            Side::Long
+                        } else {
+                            Side::Short
+                        };
+                        let size = 1 + (r >> 16) % 5_000;
+                        let entry = 50 + (r >> 32) % 100;
+                        pos(m.market, side, size, entry)
+                    })
+                    .collect();
+                let c = next() % 10_000_000;
+                let delta = 1 + next() % 5_000_000;
+                let a = assess_margin(&positions, &markets, &scenarios, c).unwrap();
+                let b = assess_margin(&positions, &markets, &scenarios, c.saturating_add(delta))
+                    .unwrap();
+                // (1) requirement independent of collateral.
+                assert_eq!(a.required_quote_lots, b.required_quote_lots);
+                assert_eq!(a.worst_scenario_idx, b.worst_scenario_idx);
+                // (2) equity linear in collateral.
+                assert_eq!(
+                    b.equity_quote_lots_signed,
+                    a.equity_quote_lots_signed + delta as i128
+                );
+                // (3) health monotone in collateral.
+                if a.is_healthy {
+                    assert!(b.is_healthy);
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 200 * MAX_POSITIONS_PER_TRADER as u64);
+    }
+
     #[test]
     fn opposing_legs_are_not_netted_across_markets() {
         let ma = market(1, 100);
