@@ -1797,6 +1797,10 @@ impl Reconciled {
                     ) {
                         self.positions.insert(e.maker, o.pos);
                     }
+                    // Fee-side collateral deltas now carried by the event: the
+                    // taker's fee debit and the maker's rebate credit.
+                    *self.collateral.entry(e.taker).or_default() -= e.taker_fee_paid as i128;
+                    *self.collateral.entry(e.maker).or_default() += e.maker_rebate_paid as i128;
                 }
             }
         }
@@ -1906,8 +1910,8 @@ async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
 
     let taker = Keypair::new();
     let maker = Keypair::new();
-    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
-    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 0, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 0, &protocol).await;
     let (taker_pos, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market_pda.as_ref(),
@@ -1925,6 +1929,29 @@ async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
         tick_size: 1,
         ..Default::default()
     };
+
+    // Fund both via explicit, captured deposits so collateral is reconstructed
+    // from the event stream (not the internal setup_trader deposit).
+    for (t, ts) in [(&taker, taker_state), (&maker, maker_state)] {
+        let ata = create_ata(&mut ctx, &payer, t.pubkey(), protocol.quote_mint).await;
+        mint_tokens(&mut ctx, &payer, protocol.quote_mint, ata, 100_000).await;
+        let dep = build_ix(
+            flash_book::instruction::DepositCollateral {
+                amount_quote_lots: 100_000,
+            },
+            vec![
+                AccountMeta::new_readonly(t.pubkey(), true),
+                AccountMeta::new(ts, false),
+                AccountMeta::new_readonly(protocol.insurance_fund, false),
+                AccountMeta::new_readonly(protocol.quote_mint, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(protocol.quote_vault, false),
+                AccountMeta::new_readonly(spl_token_id(), false),
+            ],
+        );
+        let logs = send_capture(&mut ctx, dep, &t.pubkey(), &[t]).await;
+        recon.apply_logs(&logs);
+    }
 
     // A real fill: taker buys 1 lot @ 100_000 from maker. apply_fill creates both
     // positions, moves OI, and emits FillApplied — the reconciler rebuilds the
@@ -1997,6 +2024,22 @@ async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
         (market.oi_long_lots, market.oi_short_lots),
         "event-reconstructed OI == on-chain"
     );
+
+    // ── Collateral reconstructed THROUGH the fee'd fill == on-chain: the taker's
+    // deposit minus its fee, the maker's deposit plus its rebate. Closes the
+    // fee-event gap — a fee'd fill is now fully reconstructable. ──
+    for (t, ts) in [(&taker, taker_state), (&maker, maker_state)] {
+        let oc: TraderStateAccount = fetch(&mut ctx.banks_client, ts).await;
+        assert_eq!(
+            *recon
+                .collateral
+                .get(&t.pubkey())
+                .expect("collateral reconstructed"),
+            oc.collateral_quote_lots as i128,
+            "event-reconstructed collateral through a fee'd fill == on-chain ({})",
+            t.pubkey()
+        );
+    }
 }
 
 #[tokio::test]
