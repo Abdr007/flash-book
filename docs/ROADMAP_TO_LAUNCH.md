@@ -44,7 +44,7 @@ Resolved from the source-plan prose (they exist; they were missing only from the
 | 1.3 | money-path proof | eng | SCOPE-PENDING | need source text |
 | 1.4 | real-engine money-path proof | eng | SCOPE-PENDING | need source text |
 | 1.5 | money-path proof | eng | SCOPE-PENDING | need source text |
-| 1.6 | code-explanation-only comment hygiene (no audit tags/provenance) | eng | STARTABLE | grep audit shows 0 provenance comments |
+| 1.6 | code-explanation-only comment hygiene; fix stale "funding inert/never advanced" comments (contradicted by live `crank_funding`) | eng | **DONE** | funding.rs module doc + `settle_funding` docstring corrected: cum-index funding is LIVE via crank_funding→settle_position_funding; only the side-accrual rate term waits |
 | 1.7 | money-path proof | eng | SCOPE-PENDING | need source text |
 | 1.8 | same-day win | eng | SCOPE-PENDING | need source text |
 
@@ -87,7 +87,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | Item | Scope | Owner | Status |
 |---|---|---|---|
 | 5.1 | FLP on-book AMM tuning + quoter spec (Avellaneda-Stoikov) | eng/quant | DONE (engine) → STARTABLE (devnet param sweep + spec) |
-| 5.2 | segregate MM vault from insurance backstop (prove isolation) | eng | STARTABLE (verify + prove) |
+| 5.2 | segregate MM vault from insurance backstop (prove isolation) | eng | **DONE** — Kani `bad_debt_coverage_is_insurance_isolated_and_bounded` (VERIFICATION SUCCESSFUL) proves the waterfall debits insurance by a function of only its own balance + shortfall (no FLP input, no underflow), plus `solvent_iff_vault_covers_buckets` proves insurance/FLP are separate additive buckets |
 | **5.3** | **off-chain copy-trading** (snapshot-diff mirror) | eng | **STARTABLE** |
 | 5.4 | activate a real paying maker-rebate schedule (negative-fee tier) | eng | STARTABLE (code exists, disabled) |
 | **5.5** | **builder codes + sub-accounts + referrals** | eng | **DONE** (docs/SDK exposure → 5.6) |
