@@ -101,7 +101,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | 6.2 | multisig authority migration + fill-commitment-v1 upgrade | owner | STARTABLE (ops) |
 | 6.3 | GPL-vs-MIT license decision (vendored hypertree GPL in MIT repo) | owner/legal | STARTABLE (legal read) |
 | 6.4 | latency benchmark, disclosed methodology (tx sigs + CU + timing) | eng | STARTABLE |
-| 6.5 | pre-commit algorithmic settlement policy (one-pager) | owner | STARTABLE |
+| 6.5 | pre-commit algorithmic settlement policy (one-pager) | owner | **DONE** — `docs/SETTLEMENT_POLICY.md`: robust-oracle-only settlement, no discretionary repricing, each commitment grounded in the deployed code or a CI proof (3.2 + 5.2) |
 | 6.6 | honest launch framing (devnet + freshly-audited) | owner | STARTABLE |
 
 ## Big builds (first-class pre-launch tracks)
