@@ -46,7 +46,7 @@ Resolved from the source-plan prose (they exist; they were missing only from the
 | 1.5 | money-path proof | eng | SCOPE-PENDING | need source text |
 | 1.6 | code-explanation-only comment hygiene; fix stale "funding inert/never advanced" comments (contradicted by live `crank_funding`) | eng | **DONE** | funding.rs module doc + `settle_funding` docstring corrected: cum-index funding is LIVE via crank_funding→settle_position_funding; only the side-accrual rate term waits |
 | 1.7 | money-path proof | eng | SCOPE-PENDING | need source text |
-| 1.8 | same-day win | eng | SCOPE-PENDING | need source text |
+| 1.8 | clean proof suite + fix README undercount | eng | **DONE (count fix)** — README corrected 57→61 Kani, 565→621 tests, Certora qualified as written/integration-in-progress (no unprovable claim). Dead-proof pruning deliberately NOT done: removing proofs conflicts with the rising-count discipline; 61 real proofs > removing 4 for aesthetics |
 
 Baseline already in place: **Kani 59 proofs + Lean (haircut / OiMmr / funding at real
 divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
