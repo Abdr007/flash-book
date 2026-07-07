@@ -39,13 +39,13 @@ Resolved from the source-plan prose (they exist; they were missing only from the
 
 | Item | Scope | Owner | Status | Evidence |
 |---|---|---|---|---|
-| 1.1 | Certora integration (the long pole) | eng | STARTABLE | Certora specs green in CI — *not yet integrated; current FV is Kani (59) + Lean* |
-| 1.2 | real-engine money-path proof | eng | SCOPE-PENDING | need source text |
-| 1.3 | money-path proof | eng | SCOPE-PENDING | need source text |
-| 1.4 | real-engine money-path proof | eng | SCOPE-PENDING | need source text |
-| 1.5 | money-path proof | eng | SCOPE-PENDING | need source text |
+| 1.1 | Certora solvency spec — compile the harness, wire real handler externs, run the prover, add to CI (closes G1) | eng | STARTABLE (long pole; harness is uncompiled scaffold today) | `solvencyPreserved` passes parametrically in CI |
+| 1.2 | prove the REAL `assess_margin` (not an abstract re-impl); Lean if 128-bit is CBMC-intractable (closes G3) | eng | STARTABLE (partial: N-position host sweep already covers key properties) | proof names the real symbol |
+| 1.3 | Lean theorem for realized-PnL on reduce/flip (`sign·closed·Δticks·tick`) + VWAP entry (closes G2) | eng | STARTABLE | Lean theorem at real domain |
+| 1.4 | structural enforcement that handlers reach funding/health math only via the proven helper (closes G5) | eng | STARTABLE | single-call-site lint / CI test |
+| 1.5 | whole-system residual identity — triple-ledger conservation checked before every commit (closes G4) | eng | STARTABLE (big) | Kani/Lean per-instruction invariant |
 | 1.6 | code-explanation-only comment hygiene; fix stale "funding inert/never advanced" comments (contradicted by live `crank_funding`) | eng | **DONE** | funding.rs module doc + `settle_funding` docstring corrected: cum-index funding is LIVE via crank_funding→settle_position_funding; only the side-accrual rate term waits |
-| 1.7 | money-path proof | eng | SCOPE-PENDING | need source text |
+| 1.7 | prove authorization + completeness invariants (margin-walk completeness, liquidation dedupe, auth gates) (closes G7) | eng | STARTABLE | proofs replace runtime `require!`-only |
 | 1.8 | clean proof suite + fix README undercount | eng | **DONE (count fix)** — README corrected 57→61 Kani, 565→621 tests, Certora qualified as written/integration-in-progress (no unprovable claim). Dead-proof pruning deliberately NOT done: removing proofs conflicts with the rising-count discipline; 61 real proofs > removing 4 for aesthetics |
 
 Baseline already in place: **Kani 59 proofs + Lean (haircut / OiMmr / funding at real
@@ -55,30 +55,32 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 
 | Item | Scope | Owner | Status |
 |---|---|---|---|
-| 2.1–2.3 | dormant-path / gap closures | eng | SCOPE-PENDING |
-| 2.4 | gap closure | eng | SCOPE-PENDING |
-| 2.5 | final gate | eng | SCOPE-PENDING |
-| 2.6 | built pre-launch (see big-builds) | eng | SCOPE-PENDING |
-| 2.7 | same-day win | eng | SCOPE-PENDING |
+| 2.1 | side-accrual K/F PnL path (`settle_position_pnl` never called) — wire or delete the scaffold | eng | STARTABLE (program change) |
+| 2.2 | isolated-position ADL redirect (cross has ADL; isolated doesn't) — close asymmetry + prove | eng | STARTABLE (program change) |
+| 2.3 | on-chain payout walk for referrer/builder/creator shares (today emit-only) | eng | STARTABLE (program change) |
+| 2.4 | automated funding keeper binary/script (+ optional crank incentive) | eng | STARTABLE (tooling) |
+| 2.5 | executable trustless force-undelegate | eng | **DISPOSITION**: returns `OwnerForceUndelegateUnavailable` vs the upgraded delegation program → **vendor-gated** on MagicBlock owner-recovery; public censorship-exit claim must stay downgraded until it ships (see `docs/DECENTRALIZED_SEQUENCER.md`) |
+| 2.6 | force-include from L1 (`errors.rs:141` "not yet supported") | owner | **DISPOSITION**: documented **post-launch roadmap** (not ambiguous) — the ER censorship-exit story rests on 2.5's force-undelegate, not L1 force-include |
+| 2.7 | resolve dual `place_limit_order` migration (lib.rs:1393); delete legacy path | eng | STARTABLE (program change) |
 
 ## 3 · Manipulation-proof / percolator (3.x)
 
 | Item | Scope | Owner | Status | Evidence |
 |---|---|---|---|---|
-| 3.1 | per-domain credit + proofs (percolator upgrade) | eng | STARTABLE (big build) | proof of per-domain isolation |
+| 3.1 | per-source-domain realizable credit: cap each profitable leg's usable PnL by `credit_rate = min(1, backing/claims)` of the opposing side of that same market — manipulated/thin/stale market ⇒ credit collapses ⇒ paper profit can't back margin/cure/withdraw (closes the HL-$20M oracle-pump class) | eng | STARTABLE (big build, marquee) | Lean per-domain conservation + adversarial Kani: "manipulated thin market cannot convert paper PnL to withdrawable/margin" |
 | 3.2 | anti-self-liquidation proof (marquee) | eng | **DONE** — Kani `withdraw_cannot_self_liquidate_below_maintenance` (VERIFICATION SUCCESSFUL): no gate-allowed withdrawal can leave the account below maintenance margin (im≥mm ⇒ remainder ≥ mm), so the HL self-liquidation-onto-insurance attack is structurally impossible |
-| 3.3 | final gate | eng | SCOPE-PENDING | — |
+| 3.3 | exclusive per-domain close serialization: immutable `close_id` + `max_close_slot` on the liquidation/bankrupt-close path (deadlock/livelock impossible by construction) | eng | STARTABLE (program change) | — |
 
 ## 4 · Techniques / HL-feature parity / hygiene (4.x)
 
 | Item | Scope | Owner | Status |
 |---|---|---|---|
-| 4.1 | same-day win | eng | SCOPE-PENDING |
-| 4.2 | same-day win | eng | SCOPE-PENDING |
-| 4.3 | technique/feature | eng | SCOPE-PENDING |
-| 4.4 | technique/feature | eng | SCOPE-PENDING |
-| 4.5 | technique/feature | eng | SCOPE-PENDING |
-| 4.6 | same-day win | eng | SCOPE-PENDING |
+| 4.1 | min-notional gate (~$10 value floor, today only lots floored) — kills dust spam | eng | STARTABLE (program change) |
+| 4.2 | 5-significant-figures price rule — prevents book fragmentation | eng | STARTABLE (program change) |
+| 4.3 | scale/ladder USER order type (FLP quoter ladder exists; expose a user version) | eng | STARTABLE (program change) |
+| 4.4 | published margin-tier table (leverage-steps-down-with-notional) + enable coded-but-inactive OI-crowding surcharge | eng | STARTABLE (config/doc + program) |
+| 4.5 | tranched liquidation (positions above a notional threshold liquidate in tranches) | eng | STARTABLE (program change) |
+| 4.6 | user reduce-only flag on the v2 place path (currently rejected at intake) | eng | STARTABLE (program change) |
 | **4.7** | **robust-median mark** (median for funding/display; worse-of for liquidation) | eng | **STARTABLE** |
 | 4.8 | apply intake IM gate to v3 injection paths (TWAP/iceberg/bracket) | eng | STARTABLE |
 
@@ -102,7 +104,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | 6.3 | GPL-vs-MIT license decision (vendored hypertree GPL in MIT repo) | owner/legal | STARTABLE (legal read) |
 | 6.4 | latency benchmark, disclosed methodology (tx sigs + CU + timing) | eng | STARTABLE |
 | 6.5 | pre-commit algorithmic settlement policy (one-pager) | owner | **DONE** — `docs/SETTLEMENT_POLICY.md`: robust-oracle-only settlement, no discretionary repricing, each commitment grounded in the deployed code or a CI proof (3.2 + 5.2) |
-| 6.6 | honest launch framing (devnet + freshly-audited) | owner | STARTABLE |
+| 6.6 | honest launch framing: "devnet + freshly-audited; run it, read it, break it; mainnet after audit closes" | owner | STARTABLE (positioning; the honesty is already the operating norm) |
 
 ## Big builds (first-class pre-launch tracks)
 
@@ -135,10 +137,30 @@ v1.52 clean · IDL-drift 0 · cargo-audit 0 · SDK green · devnet + chaos green
 remaining waits are the two honest vendor dependencies — the audit firm's signature and
 MagicBlock owner-recovery — both code-complete on our side.
 
-## Honest status of this register
+## Closure ledger — closed this pass (with runnable evidence)
 
-The SCOPE-PENDING items (1.2–1.5, 1.7–1.8, 2.1–2.7, 3.3, 4.1–4.6) carry only titles in
-the source plan; their full scope text is required before execution so nothing is
-invented. Certora (1.1), the percolator upgrade (3.1), and the three big builds are
-multi-week efforts. 6.1 and 6.3 are external/vendor gates. This document is the
-authoritative tracker; each item closes only against its evidence artifact.
+- **3.2** anti-self-liquidation — Kani `withdraw_cannot_self_liquidate_below_maintenance` **VERIFICATION SUCCESSFUL**. The marquee: HL self-liquidation attack impossible by construction.
+- **5.2** insurance/FLP isolation — Kani `bad_debt_coverage_is_insurance_isolated_and_bounded` **VERIFICATION SUCCESSFUL**. HL single-vault SPOF structurally absent.
+- **1.6** stale-funding-comment fix (auditor-critical).
+- **1.8** README undercount fixed (61 Kani / 621 tests) + Certora honestly qualified.
+- **6.5** pre-committed algorithmic settlement policy (`docs/SETTLEMENT_POLICY.md`).
+- **5.5** (pre-existing) builder codes / sub-accounts / referrals — verified in code.
+
+Kani proof count: 59 → **61**. All committed on `docs/roadmap-to-launch`.
+
+## Honest status of the remainder
+
+Every item now has real scope (no more title-only). The remainder splits into:
+
+- **Program changes** (need a devnet deploy + live-re-verify cycle each): 2.1–2.3, 2.7,
+  3.3, 4.1–4.6, 4.8.
+- **Hard proofs** (Lean / real-symbol): 1.2, 1.3, 1.5, 1.7.
+- **Multi-week builds**: 1.1 Certora integration, 3.1 percolator per-domain credit, and
+  the three big builds (copy-vaults, HIP-3 permissionless deploy, decentralized-sequencer
+  activation).
+- **Vendor-gated**: 6.1 (audit signature), 6.3 (GPL legal read), 2.5 (MagicBlock
+  owner-recovery).
+- **Positioning/ops docs**: 5.1 spec+devnet sweep, 5.3/5.6 SDK, 6.2/6.4/6.6.
+
+This document is the authoritative tracker; each item closes only against its evidence
+artifact, and no public claim ships ahead of that evidence.
