@@ -171,6 +171,38 @@ mod tests {
         assert!(get_price_no_older_than_full(&b, &FEED, PUB_TIME + 5, 30).is_err());
     }
 
+    /// Mutation/truncation fuzzer: the REAL message must always parse, and NO
+    /// mutated or truncated input may panic — the parser returns Ok/Err, never
+    /// crashes (a malformed oracle account must fail closed, not brick the ix).
+    #[test]
+    fn parser_survives_mutated_and_truncated_input() {
+        // Never break the real message.
+        assert!(get_price_no_older_than_full(&FIXTURE, &FEED, PUB_TIME + 5, 30).is_ok());
+
+        let mut rng: u64 = 0xA5A5_1234_DEAD_0001;
+        let mut next = || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            rng >> 33
+        };
+        // 20k random 1–4 byte mutations at random offsets, random clock.
+        for _ in 0..20_000 {
+            let mut b = FIXTURE;
+            let flips = 1 + next() % 4;
+            for _ in 0..flips {
+                let idx = (next() % b.len() as u64) as usize;
+                b[idx] = (next() & 0xFF) as u8;
+            }
+            let now = PUB_TIME + (next() % 200) as i64 - 50;
+            let _ = get_price_no_older_than_full(&b, &FEED, now, 30);
+        }
+        // Every truncation length (including empty) must fail closed, not panic.
+        for len in 0..=FIXTURE.len() {
+            let _ = get_price_no_older_than_full(&FIXTURE[..len], &FEED, PUB_TIME + 5, 30);
+        }
+    }
+
     #[test]
     fn rejects_short_buffer() {
         assert!(get_price_no_older_than_full(&FIXTURE[..40], &FEED, PUB_TIME + 5, 30).is_err());
