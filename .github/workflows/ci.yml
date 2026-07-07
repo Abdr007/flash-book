@@ -181,3 +181,41 @@ jobs:
         with:
           lake-package-directory: formal_verification/lean
           use-mathlib-cache: true
+
+  certora:
+    # Parametric solvency proof (certora/specs/solvency.spec: solvencyPreserved
+    # over every money-moving handler). Gated on the Certora Solana license key:
+    # without CERTORAKEY the job transparently SKIPS the proof (logging why) so
+    # forks/unlicensed CI stay green — it is NOT a silent pass. It runs the real
+    # Prover and gates the build only when a licensed operator sets the secret.
+    name: Formal verification (Certora, licensed only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gate on Certora license
+        id: gate
+        env:
+          CERTORAKEY: ${{ secrets.CERTORAKEY }}
+        run: |
+          if [ -n "$CERTORAKEY" ]; then
+            echo "licensed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "licensed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CERTORAKEY not set — Certora solvency proof SKIPPED (scaffold not yet licensed). This is not a pass."
+          fi
+      - if: steps.gate.outputs.licensed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - if: steps.gate.outputs.licensed == 'true'
+        name: Install Solana toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - if: steps.gate.outputs.licensed == 'true'
+        name: Run parametric solvency proof
+        env:
+          CERTORAKEY: ${{ secrets.CERTORAKEY }}
+        run: |
+          pip install certora-cli
+          certoraRun certora/solana_solvency.conf

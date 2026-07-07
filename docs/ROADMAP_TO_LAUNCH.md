@@ -39,7 +39,7 @@ Resolved from the source-plan prose (they exist; they were missing only from the
 
 | Item | Scope | Owner | Status | Evidence |
 |---|---|---|---|---|
-| 1.1 | Certora solvency spec — compile the harness, wire real handler externs, run the prover, add to CI (closes G1) | eng | STARTABLE (long pole; harness is uncompiled scaffold today) | `solvencyPreserved` passes parametrically in CI |
+| 1.1 | Certora solvency spec — compile the harness, wire real handler externs, run the prover, add to CI (closes G1) | eng | **WIRED, VENDOR-WAIT** — parametric `solvencyPreserved(method f)` + `surplusNeverInvented` specs written; conf + build.sh + cvt_summaries + cvt_inlining now all present; CI job added (gates when `CERTORAKEY` set, transparently skips otherwise). **BLOCKER: needs the Certora Solana license + `cvlr` SDK + cloud run — cannot produce VERIFICATION SUCCESSFUL without it.** Arithmetic is Kani-proven today; Certora adds all-paths reachability | `solvencyPreserved` VERIFICATION SUCCESSFUL in CI (licensed) |
 | 1.2 | prove the REAL `assess_margin` (not an abstract re-impl); Lean if 128-bit is CBMC-intractable (closes G3) | eng | STARTABLE (partial: N-position host sweep already covers key properties) | proof names the real symbol |
 | 1.3 | Lean theorem for realized-PnL on reduce/flip (`sign·closed·Δticks·tick`) + VWAP entry (closes G2) | eng | STARTABLE | Lean theorem at real domain |
 | 1.4 | structural enforcement that handlers reach funding/health math only via the proven helper (closes G5) | eng | STARTABLE | single-call-site lint / CI test |

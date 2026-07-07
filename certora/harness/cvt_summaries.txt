@@ -1,0 +1,18 @@
+# Certora Solana summaries for the P-SOLV-4 solvency harness.
+#
+# SCAFFOLD (unvalidated without the licensed cvlr toolchain). Each summary maps a
+# ghost view declared in ../specs/solvency.spec to the live on-chain read it
+# stands for, so the Prover reasons over the real account state, not a mock. The
+# operator validates these against the installed cvlr SDK's summary syntax.
+#
+# ghost view            on-chain source (quote-lots, u64)
+# ------------------    ---------------------------------------------------------
+# vaultAmount()      -> spl_token::state::Account.amount of the market quote_vault
+# flpCapital()       -> FlpExposureAccount.total_capital_quote_lots
+# insuranceBalance() -> InsuranceFundAccount.balance_quote_lots
+# totalCollateral()  -> Σ TraderStateAccount.collateral_quote_lots
+#                       + Σ isolated PositionAccount.collateral_quote_lots
+#
+# The arithmetic these feed (`assess_solvency_full`) is already Kani-proven; the
+# Prover's job here is the all-paths reachability obligation, so the summaries
+# must be FAITHFUL (no over-summarization that assumes the post-state solvent).
