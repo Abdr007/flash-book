@@ -272,4 +272,35 @@ mod xmargin_kani_proofs {
         assert!(req >= base);
         assert!(req >= er);
     }
+
+    /// ANTI-SELF-LIQUIDATION (the Hyperliquid self-liquidation attack, blocked by
+    /// construction): NO withdrawal the reserve-margin gate allows can leave the
+    /// account below maintenance margin — so a trader can never withdraw
+    /// themselves into a liquidatable state and dump the resulting loss onto the
+    /// insurance fund. The partial-withdraw gate admits `amount` only if the
+    /// remainder covers `required_collateral_with_er(im, floor, er) =
+    /// max(im,floor)+er`. Because initial margin is never below maintenance margin
+    /// (`im >= mm`, a protocol invariant), the remainder is provably `>= mm`, and
+    /// it still covers the ER reservation. This is the adversarial theorem behind
+    /// the launch claim.
+    #[kani::proof]
+    fn withdraw_cannot_self_liquidate_below_maintenance() {
+        let collateral: u64 = kani::any();
+        let amount: u64 = kani::any();
+        let im: u64 = kani::any();
+        let floor: u64 = kani::any();
+        let mm: u64 = kani::any();
+        let er: u64 = kani::any();
+        // Initial margin dominates maintenance margin — always true on-chain.
+        kani::assume(im >= mm);
+        let required = required_collateral_with_er(im, floor, er);
+        // The gate an adversary must pass to release `amount`.
+        kani::assume(amount <= collateral);
+        kani::assume(collateral - amount >= required);
+        let remaining = collateral - amount;
+        // The account cannot be pushed below maintenance margin...
+        assert!(remaining >= mm);
+        // ...nor below the ER reservation (no cross-domain loss dump).
+        assert!(remaining >= er);
+    }
 }
