@@ -66,7 +66,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | Item | Scope | Owner | Status | Evidence |
 |---|---|---|---|---|
 | 3.1 | per-domain credit + proofs (percolator upgrade) | eng | STARTABLE (big build) | proof of per-domain isolation |
-| 3.2 | anti-self-liquidation proof (marquee) | eng | STARTABLE | proof: oracle manipulation cannot self-liquidate |
+| 3.2 | anti-self-liquidation proof (marquee) | eng | **DONE** — Kani `withdraw_cannot_self_liquidate_below_maintenance` (VERIFICATION SUCCESSFUL): no gate-allowed withdrawal can leave the account below maintenance margin (im≥mm ⇒ remainder ≥ mm), so the HL self-liquidation-onto-insurance attack is structurally impossible |
 | 3.3 | final gate | eng | SCOPE-PENDING | — |
 
 ## 4 · Techniques / HL-feature parity / hygiene (4.x)
