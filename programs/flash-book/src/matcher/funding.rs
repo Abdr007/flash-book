@@ -1,11 +1,11 @@
 //! Cumulative funding index — fixed-point Q64.64.
 //!
 //! A position's funding charge at settlement is
-//! sign·notional·(I_now − I_entry). The index itself is never advanced by
-//! any instruction (no on-chain path moves it off zero), so funding is
-//! economically inert until a rate driver ships; the settlement-side charge
-//! math below is live and covered so that wiring a driver cannot change
-//! settlement semantics.
+//! sign·notional·(I_now − I_entry). The index is advanced by the live,
+//! permissionless `crank_funding` instruction (rate-limited, oracle-gated;
+//! see `funding_index_delta`), and the settlement-side charge math below
+//! applies it. Both sides — the rate driver and the charge — are covered by
+//! the proofs/tests in this module.
 //!
 //! The index is an i128 in Q64.64: ±2^63 in the integer part, which no
 //! realistic rate can overflow.
