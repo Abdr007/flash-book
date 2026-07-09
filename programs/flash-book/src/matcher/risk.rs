@@ -1098,6 +1098,95 @@ mod assess_margin_gate_kani_proofs {
     }
 }
 
+/// G3 — proofs that name the REAL `assess_margin` symbol (not the abstract
+/// `gate` re-implementation above). Kani cannot bit-blast N symbolic positions ×
+/// the 128-bit stress-lattice math, nor the 32-byte `Pubkey` `memcmp`s that the
+/// full `default_scenarios` lattice unwinds (the `n_position_..._frame_stable`
+/// HOST sweep samples that space). So these fix a concrete representative
+/// portfolio + a minimal 2-scenario slice and make the COLLATERAL dimension fully
+/// symbolic — exhaustively proving, on the live function, the three cross-margin
+/// frame invariants over ALL `u64` collateral (the host sweep only samples
+/// `c % 10_000_000`):
+///   (1) the margin REQUIREMENT (and worst-scenario index) is independent of
+///       collateral — collateral never enters the requirement loop, so it cannot
+///       be inflated/deflated by funding the account;
+///   (2) equity is EXACTLY linear in collateral (`equity(c+δ) = equity(c) + δ`);
+///   (3) health is MONOTONE in collateral — adding collateral never turns a
+///       healthy portfolio unhealthy (no self-liquidation by depositing).
+/// The invariants are scenario-agnostic (collateral never enters the per-scenario
+/// requirement math), so the 2-scenario slice loses no generality for what is
+/// proven; the full lattice's per-market decomposition is covered by the host
+/// sweep + `opposing_legs_are_not_netted_across_markets`.
+#[cfg(kani)]
+mod assess_margin_real_symbol_kani_proofs {
+    use super::{assess_margin, MarketSnapshot, PositionSnapshot, Scenario, StressShock};
+    use crate::matcher::lot::Ticks;
+    use crate::matcher::order::Side;
+    use anchor_lang::prelude::Pubkey;
+
+    fn mkt(seed: u8, mark: u64) -> MarketSnapshot {
+        MarketSnapshot {
+            market: Pubkey::new_from_array([seed; 32]),
+            mark_price: Ticks(mark),
+            cum_funding_index: 0,
+            maintenance_margin_bps: 500, // 5%
+            tick_size: 1,
+            concentration_threshold_lots: 0,
+            concentration_extra_mmr_bps: 0,
+            side_oi_lots: 0,
+            oi_mmr_slope_bps_per_million_lots: 0,
+            oi_mmr_max_extra_bps: 0,
+        }
+    }
+
+    /// Minimal 2-scenario slice: flat + a single adverse shock on `m`. Enough to
+    /// drive a non-trivial requirement; the frame invariants below are
+    /// scenario-agnostic so this is fully general for what they assert.
+    fn two_scenarios(m: Pubkey) -> [Scenario; 2] {
+        [
+            Scenario::new(),
+            vec![StressShock {
+                market: m,
+                shock_bps: -2000,
+            }],
+        ]
+    }
+
+    /// Single-market long, REAL `assess_margin`, collateral + δ fully symbolic.
+    #[kani::proof]
+    fn assess_margin_single_market_frame_stable() {
+        let m = mkt(1, 100);
+        let positions = [PositionSnapshot {
+            market: m.market,
+            side: Side::Long,
+            size_lots: 100,
+            entry_price: Ticks(90),
+            cum_funding_index_at_entry: 0,
+            collateral_quote_lots: 0, // cross-margined: evaluated vs the pooled arg
+        }];
+        let markets = [m];
+        let scenarios = two_scenarios(m.market);
+
+        let c: u64 = kani::any();
+        let delta: u64 = kani::any();
+        // c + δ must stay a valid u64 collateral for the second call.
+        kani::assume((c as u128) + (delta as u128) <= u64::MAX as u128);
+
+        let a = assess_margin(&positions, &markets, &scenarios, c).unwrap();
+        let b = assess_margin(&positions, &markets, &scenarios, c + delta).unwrap();
+
+        // (1) requirement + worst scenario are collateral-independent.
+        assert!(a.required_quote_lots == b.required_quote_lots);
+        assert!(a.worst_scenario_idx == b.worst_scenario_idx);
+        // (2) equity is exactly linear in collateral.
+        assert!(b.equity_quote_lots_signed == a.equity_quote_lots_signed + delta as i128);
+        // (3) health is monotone in collateral (no self-liquidation by depositing).
+        if a.is_healthy {
+            assert!(b.is_healthy);
+        }
+    }
+}
+
 #[cfg(test)]
 mod high1_cross_market_regression {
     //! Regression: a cross-margin portfolio that is long
