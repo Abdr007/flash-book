@@ -45,7 +45,7 @@ Resolved from the source-plan prose (they exist; they were missing only from the
 | 1.4 | structural enforcement that handlers reach funding/health math only via the proven helper (closes G5) | eng | STARTABLE | single-call-site lint / CI test |
 | 1.5 | whole-system residual identity — triple-ledger conservation checked before every commit (closes G4) | eng | STARTABLE (big) | Kani/Lean per-instruction invariant |
 | 1.6 | code-explanation-only comment hygiene; fix stale "funding inert/never advanced" comments (contradicted by live `crank_funding`) | eng | **DONE** | funding.rs module doc + `settle_funding` docstring corrected: cum-index funding is LIVE via crank_funding→settle_position_funding; only the side-accrual rate term waits |
-| 1.7 | prove authorization + completeness invariants (margin-walk completeness, liquidation dedupe, auth gates) (closes G7) | eng | STARTABLE | proofs replace runtime `require!`-only |
+| 1.7 | prove authorization + completeness invariants (margin-walk completeness, liquidation dedupe, auth gates) (closes G7) | eng | **DONE** — `formal_verification/lean/AuthCompleteness.lean` (compiles clean, `#print axioms` shows only propext/Classical.choice/Quot.sound, no `sorry`): **margin-walk completeness** (`walk_is_complete`/`no_position_omitted`) — the C-2 gate (`lib.rs:13382`: exact-count + PDA-binding + dedupe + live-only) forces the supplied position set to EQUAL the trader's full open set, so no risky position can be omitted (Finset cardinality: distinct owned subset of size = `open_positions` is the whole set); **no-understatement** (`requirement_monotone`/`complete_walk_requirement_exact`) — the requirement is a monotone sum of non-negative floors, so a complete walk computes the TRUE requirement, never an under-count; **liquidation dedupe** (`exec_always_present`/`reinsert_noop`) — the exec-seeded set can't drop the exec market and re-supplying a counted market is a no-op (no double-count); **auth gate** (`auth_gate_sound`/`unauthorized_rejected`) — the `require_keys_eq!` gate admits exactly the authority. Proven for ALL N, replacing the runtime-`require!`-only guarantee | Lean proofs at unbounded N |
 | 1.8 | clean proof suite + fix README undercount | eng | **DONE (count fix)** — README corrected 57→61 Kani, 565→621 tests, Certora qualified as written/integration-in-progress (no unprovable claim). Dead-proof pruning deliberately NOT done: removing proofs conflicts with the rising-count discipline; 61 real proofs > removing 4 for aesthetics |
 
 Baseline already in place: **Kani 59 proofs + Lean (haircut / OiMmr / funding at real
@@ -139,6 +139,7 @@ MagicBlock owner-recovery — both code-complete on our side.
 
 ## Closure ledger — closed this pass (with runnable evidence)
 
+- **1.7** authorization + completeness invariants — `formal_verification/lean/AuthCompleteness.lean` (sorry-free, Lean 4.24.0 + Mathlib). Closes G7: margin-walk completeness (no position can be omitted from the walk — Finset cardinality over the C-2 gate), requirement no-understatement, liquidation dedupe (exec-seeded, idempotent), and auth-gate soundness — all at unbounded N, replacing the runtime-`require!`-only guarantee.
 - **3.2** anti-self-liquidation — Kani `withdraw_cannot_self_liquidate_below_maintenance` **VERIFICATION SUCCESSFUL**. The marquee: HL self-liquidation attack impossible by construction.
 - **5.2** insurance/FLP isolation — Kani `bad_debt_coverage_is_insurance_isolated_and_bounded` **VERIFICATION SUCCESSFUL**. HL single-vault SPOF structurally absent.
 - **1.6** stale-funding-comment fix (auditor-critical).
@@ -154,7 +155,7 @@ Every item now has real scope (no more title-only). The remainder splits into:
 
 - **Program changes** (need a devnet deploy + live-re-verify cycle each): 2.1–2.3, 2.7,
   3.3, 4.1–4.6, 4.8.
-- **Hard proofs** (Lean / real-symbol): 1.2, 1.3, 1.5, 1.7.
+- **Hard proofs** (Lean / real-symbol): 1.2, 1.3, 1.5. (**1.7 DONE** — `AuthCompleteness.lean`.)
 - **Multi-week builds**: 1.1 Certora integration, 3.1 percolator per-domain credit, and
   the three big builds (copy-vaults, HIP-3 permissionless deploy, decentralized-sequencer
   activation).

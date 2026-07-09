@@ -21,6 +21,17 @@ Lean has no such limitation. `Haircut.lean` proves the same bounds with the real
 Both are `#print axioms`-clean: they depend only on `propext`, `Classical.choice`,
 `Quot.sound` — Lean/Mathlib's three standard axioms. No `sorry`.
 
+## Other proofs in this library (`lakefile.lean` roots)
+
+Same toolchain, same `#print axioms`-clean discipline; each proves at the real
+domain / unbounded width a property the runtime can only `require!`-check per call:
+
+| File | Proves | Complements |
+|---|---|---|
+| `OiMmr.lean` | scaled-OI maintenance-margin bound + monotonicity | `matcher/risk.rs` OI-MMR |
+| `Funding.lean` | funding is zero-sum (long owes exactly what short receives), independent of the `>>64` rounding | `funding.rs funding_owed` |
+| `AuthCompleteness.lean` | margin-walk completeness (no position can be omitted — Finset cardinality over the C-2 gate), requirement no-understatement, liquidation dedupe (exec-seeded/idempotent), auth-gate soundness | `lib.rs:13382` C-2 gate + `liquidate_portfolio_v2` (closes G7) |
+
 ## Reproduce
 
 ```bash
