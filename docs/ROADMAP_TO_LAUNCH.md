@@ -43,7 +43,7 @@ Resolved from the source-plan prose (they exist; they were missing only from the
 | 1.2 | prove the REAL `assess_margin` (not an abstract re-impl); Lean if 128-bit is CBMC-intractable (closes G3) | eng | STARTABLE (partial: N-position host sweep already covers key properties) | proof names the real symbol |
 | 1.3 | Lean theorem for realized-PnL on reduce/flip (`sign·closed·Δticks·tick`) + VWAP entry (closes G2) | eng | STARTABLE | Lean theorem at real domain |
 | 1.4 | structural enforcement that handlers reach funding/health math only via the proven helper (closes G5) | eng | STARTABLE | single-call-site lint / CI test |
-| 1.5 | whole-system residual identity — triple-ledger conservation checked before every commit (closes G4) | eng | STARTABLE (big) | Kani/Lean per-instruction invariant |
+| 1.5 | whole-system residual identity — triple-ledger conservation checked before every commit (closes G4) | eng | **DONE (proof artifact)** — `formal_verification/lean/ResidualConservation.lean` (compiles clean, `#print axioms` shows only propext/Quot.sound, no `sorry`): models the identity `V = C_tot + I + Residual` (`haircut.rs:168`) and proves ALL 12 money-moving instructions from the `haircut.rs:460` delta table satisfy `ΔV = ΔC + ΔI + ΔR` (so each preserves the identity), plus **sequence-closure** (`foldl_conserves` — the identity survives ANY interleaving = the "checked before every commit" guarantee, structurally) and the **solvency corollary** (`Residual ≥ 0 ⟺ V ≥ C_tot + I`, the `haircut.rs:449` baseline). Forces out the one doc-table imprecision: the `convert`/gain row needs its paired `+credit` collateral leg to balance (`convert_gain_conserves`). Runtime companion (already live): on-chain `verify_protocol_solvency` + the #268 conservation sequence-fuzzer reconcile against real SPL balances | Lean per-instruction invariant + sequence closure |
 | 1.6 | code-explanation-only comment hygiene; fix stale "funding inert/never advanced" comments (contradicted by live `crank_funding`) | eng | **DONE** | funding.rs module doc + `settle_funding` docstring corrected: cum-index funding is LIVE via crank_funding→settle_position_funding; only the side-accrual rate term waits |
 | 1.7 | prove authorization + completeness invariants (margin-walk completeness, liquidation dedupe, auth gates) (closes G7) | eng | STARTABLE | proofs replace runtime `require!`-only |
 | 1.8 | clean proof suite + fix README undercount | eng | **DONE (count fix)** — README corrected 57→61 Kani, 565→621 tests, Certora qualified as written/integration-in-progress (no unprovable claim). Dead-proof pruning deliberately NOT done: removing proofs conflicts with the rising-count discipline; 61 real proofs > removing 4 for aesthetics |
@@ -139,6 +139,7 @@ MagicBlock owner-recovery — both code-complete on our side.
 
 ## Closure ledger — closed this pass (with runnable evidence)
 
+- **1.5** whole-system residual identity — `formal_verification/lean/ResidualConservation.lean` (sorry-free, Lean 4.24.0 + Mathlib). Closes G4: every money-moving instruction preserves `V = C_tot + I + Residual` (`ΔV = ΔC + ΔI + ΔR`), the identity survives any interleaving (`foldl_conserves`), and `Residual ≥ 0 ⟺ V ≥ C_tot + I` (solvency baseline). Runtime companion: `verify_protocol_solvency` + #268 fuzzer.
 - **3.2** anti-self-liquidation — Kani `withdraw_cannot_self_liquidate_below_maintenance` **VERIFICATION SUCCESSFUL**. The marquee: HL self-liquidation attack impossible by construction.
 - **5.2** insurance/FLP isolation — Kani `bad_debt_coverage_is_insurance_isolated_and_bounded` **VERIFICATION SUCCESSFUL**. HL single-vault SPOF structurally absent.
 - **1.6** stale-funding-comment fix (auditor-critical).
@@ -154,7 +155,7 @@ Every item now has real scope (no more title-only). The remainder splits into:
 
 - **Program changes** (need a devnet deploy + live-re-verify cycle each): 2.1–2.3, 2.7,
   3.3, 4.1–4.6, 4.8.
-- **Hard proofs** (Lean / real-symbol): 1.2, 1.3, 1.5, 1.7.
+- **Hard proofs** (Lean / real-symbol): 1.2, 1.3, 1.7. (**1.5 DONE** — `ResidualConservation.lean`.)
 - **Multi-week builds**: 1.1 Certora integration, 3.1 percolator per-domain credit, and
   the three big builds (copy-vaults, HIP-3 permissionless deploy, decentralized-sequencer
   activation).
