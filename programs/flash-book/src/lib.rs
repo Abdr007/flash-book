@@ -1389,18 +1389,16 @@ pub mod flash_book {
         )
     }
 
-    /// V2 limit-order placement against the hypertree-backed orderbook.
-    /// Runs ALONGSIDE the legacy `place_limit_order` for now — operators
-    /// pick which book each market uses by calling `init_market_book`
-    /// (v2) vs `initialize_order_buffer` (legacy).
+    /// Limit-order placement against the hypertree-backed orderbook — the sole
+    /// limit-placement path (the legacy order-buffer book was removed; every
+    /// market is initialized with `init_market_book`).
     ///
-    /// Validation mirrors the legacy ix's intake: status-active gate,
-    /// min-base-lots, tick alignment, size cap. Then constructs a
-    /// `RestingOrderV2` carrying the trader pubkey inline and inserts it
-    /// into the bids or asks RBT inside the `MarketBookHandle`.
+    /// Intake: status-active gate, min-base-lots, tick alignment, size cap. Then
+    /// constructs a `RestingOrderV2` carrying the trader pubkey inline and inserts
+    /// it into the bids or asks RBT inside the `MarketBookHandle`.
     ///
-    /// `flags` accepts the same bitfield as v1: bit0 post_only, bit1
-    /// reduce_only, bit2 ioc, bit3 jit, bits 4-5 stp_mode.
+    /// `flags` bitfield: bit0 post_only, bit1 reduce_only, bit2 ioc, bit3 jit,
+    /// bits 4-5 stp_mode.
     pub fn place_limit_order_v2(
         ctx: Context<PlaceLimitOrderV2>,
         side: u8,
@@ -3575,7 +3573,7 @@ pub mod flash_book {
     /// (revert to using market default). Lets risk-
     /// conscious traders limit their effective leverage on a single
     /// position without affecting their other positions or the market's
-    /// global cap. The cap is enforced at place_limit_order intake on
+    /// global cap. The cap is enforced at place_limit_order_v2 intake on
     /// the projected post-fill notional.
     ///
     /// Setting a tighter cap on a position that already exceeds it does
@@ -4796,7 +4794,7 @@ pub mod flash_book {
     /// the fill data is taken at face value (a future version verifies
     /// via per-tx fill buffer or Merkle proof against the emitted event).
     /// `taker_was_jit`: set to true if the matched taker order was
-    /// JIT-tagged (flag bit 3 on place_limit_order). The sequencer reads
+    /// JIT-tagged (flag bit 3 on place_limit_order_v2). The sequencer reads
     /// this from the order's stored flags. When true, the maker earns
     /// `market.params.jit_bonus_rebate_bps` extra rebate on top of the
     /// base maker_rebate_bps. Passing false preserves legacy behaviour.
@@ -5218,7 +5216,7 @@ pub mod flash_book {
         let maker_trader_pk = ctx.accounts.maker_trader_state.load()?.trader;
 
         // Apply fees BEFORE position state is mutated, so reads are clean.
-        // Taker pays fee from collateral (must have it; place_limit_order's
+        // Taker pays fee from collateral (must have it; place_limit_order_v2's
         // margin gate ensured this at intake time, but we double-check).
         // For NEGATIVE-fee tier traders, taker_fee == 0 and we credit the
         // taker the rebate sourced from the protocol contribution.
@@ -18591,7 +18589,7 @@ pub struct InvariantBreachDetectedEvent {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
-/// One leg of a basket order. Mirrors place_limit_order's args minus
+/// One leg of a basket order. Mirrors place_limit_order_v2's args minus
 /// market identity (which is bound by the account context per leg).
 #[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize)]
 pub struct BasketLeg {

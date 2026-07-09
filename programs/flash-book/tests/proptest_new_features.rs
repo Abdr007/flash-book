@@ -189,7 +189,7 @@ proptest! {
 
 // ─── Reduce-only ──────────────────────────────────────────────────────
 //
-// Mirrors place_limit_order's reduce_only gate:
+// Mirrors place_limit_order_v2's reduce_only gate:
 //   accept iff position.size > 0 AND order.side != position.side
 //            AND order.size <= position.size
 
