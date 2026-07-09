@@ -34,6 +34,9 @@ pub mod state_v2;
 pub mod state_v3;
 pub mod xmargin;
 
+#[cfg(test)]
+mod proven_wrapper_enforcement;
+
 pub use errors::FlashBookError;
 
 use constants::{
