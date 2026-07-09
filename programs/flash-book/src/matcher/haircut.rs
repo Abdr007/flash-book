@@ -457,6 +457,10 @@ pub fn validate_market_params(h_min_slots: u64, h_max_slots: u64) -> Result<(), 
 /// pattern is: each ix that changes V, C_tot, or I computes its own
 /// delta to Residual and feeds it through this helper. The mapping:
 ///
+/// Every row satisfies the conservation identity `ΔV = ΔC_tot + ΔI + ΔResidual`
+/// (so `V = C_tot + I + Residual` is preserved — machine-checked in
+/// `formal_verification/lean/ResidualConservation.lean`):
+///
 /// | Ix | ΔV | ΔC_tot | ΔI | ΔResidual |
 /// |---|---|---|---|---|
 /// | deposit_collateral | +amt | +amt | 0 | 0 |
@@ -469,7 +473,8 @@ pub fn validate_market_params(h_min_slots: u64, h_max_slots: u64) -> Result<(), 
 /// | fee accrual to FLP | +fee | 0 | 0 | +fee |
 /// | fee accrual to insurance | +fee | 0 | +fee | 0 |
 /// | liquidation reward to liquidator | -reward | -reward (from position) | 0 | 0 |
-/// | apply_realized_pnl_delta gain | 0 | 0 | 0 | -credit (after convert) |
+/// | apply_realized_pnl_delta gain | 0 | 0 | 0 | 0 (deferred to the warmup reserve; no ledger move) |
+/// | convert_position (extract matured gain) | 0 | +credit | 0 | -credit (credit moves Residual→collateral) |
 /// | apply_realized_pnl_delta loss | 0 | -loss (saturating) | 0 | +loss |
 ///
 /// Identity check: Σ ΔResidual over a market's history must equal the
