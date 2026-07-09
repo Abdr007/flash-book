@@ -21,6 +21,17 @@ Lean has no such limitation. `Haircut.lean` proves the same bounds with the real
 Both are `#print axioms`-clean: they depend only on `propext`, `Classical.choice`,
 `Quot.sound` — Lean/Mathlib's three standard axioms. No `sorry`.
 
+## Other proofs in this library (`lakefile.lean` roots)
+
+Same toolchain, same `#print axioms`-clean discipline; each proves at the real
+domain / unbounded width a property CBMC cannot decide tractably:
+
+| File | Proves | Complements |
+|---|---|---|
+| `OiMmr.lean` | scaled-OI maintenance-margin bound + monotonicity | `matcher/risk.rs` OI-MMR |
+| `Funding.lean` | funding is zero-sum (long owes exactly what short receives), independent of the `>>64` rounding | `funding.rs funding_owed` |
+| `RealizedPnl.lean` | reduce/flip realized-PnL value `sign·closed·Δticks·tick`, exact Flash V2 notional reconciliation, and the VWAP-entry bracket `min ≤ entry' ≤ max` — the two properties `matcher/position_math.rs` can only host-pin at B=256 (128-bit multiply + division-result reasoning) | `position_math.rs apply_fill` (closes G2) |
+
 ## Reproduce
 
 ```bash

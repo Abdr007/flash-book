@@ -41,7 +41,7 @@ Resolved from the source-plan prose (they exist; they were missing only from the
 |---|---|---|---|---|
 | 1.1 | Certora solvency spec — compile the harness, wire real handler externs, run the prover, add to CI (closes G1) | eng | STARTABLE (long pole; harness is uncompiled scaffold today) | `solvencyPreserved` passes parametrically in CI |
 | 1.2 | prove the REAL `assess_margin` (not an abstract re-impl); Lean if 128-bit is CBMC-intractable (closes G3) | eng | STARTABLE (partial: N-position host sweep already covers key properties) | proof names the real symbol |
-| 1.3 | Lean theorem for realized-PnL on reduce/flip (`sign·closed·Δticks·tick`) + VWAP entry (closes G2) | eng | STARTABLE | Lean theorem at real domain |
+| 1.3 | Lean theorem for realized-PnL on reduce/flip (`sign·closed·Δticks·tick`) + VWAP entry (closes G2) | eng | **DONE** — `formal_verification/lean/RealizedPnl.lean` (compiles clean, `#print axioms` shows only propext/Classical.choice/Quot.sound, no `sorry`): mirrors the real `matcher/position_math.rs apply_fill` — sign correctness (`long_pnl_pos_iff`/`short_pnl_pos_iff`: profit iff price crosses entry the right way), breakeven=0, `closedLots = min(fill,size)` (reduce vs flip), the marquee **V2 reconciliation** `pnl·entry = sign·(price−entry)·notional` at unbounded width, and the CBMC-intractable **VWAP bracket** `min(entry,price) ≤ vwapEntry ≤ max(entry,price)` — the two properties `position_math.rs` could only host-pin at B=256 | Lean theorems at unbounded domain |
 | 1.4 | structural enforcement that handlers reach funding/health math only via the proven helper (closes G5) | eng | STARTABLE | single-call-site lint / CI test |
 | 1.5 | whole-system residual identity — triple-ledger conservation checked before every commit (closes G4) | eng | STARTABLE (big) | Kani/Lean per-instruction invariant |
 | 1.6 | code-explanation-only comment hygiene; fix stale "funding inert/never advanced" comments (contradicted by live `crank_funding`) | eng | **DONE** | funding.rs module doc + `settle_funding` docstring corrected: cum-index funding is LIVE via crank_funding→settle_position_funding; only the side-accrual rate term waits |
@@ -139,6 +139,7 @@ MagicBlock owner-recovery — both code-complete on our side.
 
 ## Closure ledger — closed this pass (with runnable evidence)
 
+- **1.3** realized-PnL value + VWAP entry — `formal_verification/lean/RealizedPnl.lean` (sorry-free, Lean 4.24.0 + Mathlib). Closes G2: the reduce/flip PnL value (`sign·closed·Δticks·tick`) and the VWAP-entry bracket — both CBMC-intractable, host-pinned at B=256 in `position_math.rs` — are now machine-proven at unbounded domain, including the exact Flash V2 notional reconciliation.
 - **3.2** anti-self-liquidation — Kani `withdraw_cannot_self_liquidate_below_maintenance` **VERIFICATION SUCCESSFUL**. The marquee: HL self-liquidation attack impossible by construction.
 - **5.2** insurance/FLP isolation — Kani `bad_debt_coverage_is_insurance_isolated_and_bounded` **VERIFICATION SUCCESSFUL**. HL single-vault SPOF structurally absent.
 - **1.6** stale-funding-comment fix (auditor-critical).
@@ -154,7 +155,7 @@ Every item now has real scope (no more title-only). The remainder splits into:
 
 - **Program changes** (need a devnet deploy + live-re-verify cycle each): 2.1–2.3, 2.7,
   3.3, 4.1–4.6, 4.8.
-- **Hard proofs** (Lean / real-symbol): 1.2, 1.3, 1.5, 1.7.
+- **Hard proofs** (Lean / real-symbol): 1.2, 1.5, 1.7. (**1.3 DONE** — `RealizedPnl.lean`.)
 - **Multi-week builds**: 1.1 Certora integration, 3.1 percolator per-domain credit, and
   the three big builds (copy-vaults, HIP-3 permissionless deploy, decentralized-sequencer
   activation).
