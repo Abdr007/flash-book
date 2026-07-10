@@ -185,6 +185,18 @@ pub fn apply_collateral_debit_checked(balance: u64, amount: u64) -> Result<u64> 
         .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))
 }
 
+/// Pure core for a CHECKED debit that reports the exact `ArithmeticUnderflow`
+/// error (Track A2): subtract `amount` from `balance`, erroring on underflow.
+/// Returns `balance - amount` when Ok (proven in `collateral_debit_underflow_exact`).
+/// Used where the on-chain path historically used `checked_sub().ok_or(
+/// ArithmeticUnderflow)` — withdraw / xdomain-withdraw / insurance payout.
+#[inline]
+pub fn apply_collateral_debit_underflow(balance: u64, amount: u64) -> Result<u64> {
+    balance
+        .checked_sub(amount)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))
+}
+
 /// Resolve the ER reserved margin a collateral-releasing path must leave
 /// behind on the source trader_state. Fail-closed in both directions: an
 /// ER-active source (live attested reservation) must supply its own bound
@@ -417,6 +429,19 @@ mod xmargin_kani_proofs {
         let balance: u64 = kani::any();
         let amount: u64 = kani::any();
         if let Ok(after) = apply_collateral_debit_checked(balance, amount) {
+            assert!(after == balance - amount);
+            assert!(amount <= balance);
+        }
+    }
+
+    /// EXACT (Track A2): the underflow-erroring checked debit subtracts exactly
+    /// `amount` when the balance covers it — on the real
+    /// `apply_collateral_debit_underflow` symbol over all `u64`.
+    #[kani::proof]
+    fn collateral_debit_underflow_exact() {
+        let balance: u64 = kani::any();
+        let amount: u64 = kani::any();
+        if let Ok(after) = apply_collateral_debit_underflow(balance, amount) {
             assert!(after == balance - amount);
             assert!(amount <= balance);
         }
