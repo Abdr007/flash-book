@@ -298,6 +298,33 @@ mod health_price_kani_proofs {
         assert!(hp >= oracle);
     }
 
+    /// ANTI-JELLY (the mark-manipulation vector — the $20M Hyperliquid attack).
+    /// That attack pumped a thin-market mark to inflate a position's usable equity.
+    /// The health price that feeds margin / loss-cure / withdrawal is the WORSE of
+    /// the two real sources, so a mark manipulated IN THE ATTACKER'S FAVOUR (pumped
+    /// UP for a long, dumped DOWN for a short) can NEVER move the health price past
+    /// the honest live oracle — the manipulation converts to ZERO extra usable
+    /// equity. Proven on the real `worse_of_health_price` for ALL `u64` prices.
+    /// (When the mark moves AGAINST the attacker it IS used — that only raises their
+    /// risk, never their credit, which is the correct, conservative direction.)
+    #[kani::proof]
+    fn jelly_mark_manipulation_yields_no_usable_equity() {
+        let honest_oracle: u64 = kani::any();
+        kani::assume(honest_oracle > 0); // the attacked market has a live oracle
+        let manipulated_mark: u64 = kani::any();
+        let is_long: bool = kani::any();
+        let (hp, _src) = worse_of_health_price(manipulated_mark, honest_oracle, is_long);
+        if is_long {
+            // A long profits from a HIGHER price; pumping the mark up can never lift
+            // the health price above the honest oracle → no inflated long equity.
+            assert!(hp <= honest_oracle);
+        } else {
+            // A short profits from a LOWER price; dumping the mark down can never
+            // push the health price below the honest oracle → no inflated short equity.
+            assert!(hp >= honest_oracle);
+        }
+    }
+
     /// The health price is ALWAYS one of the two real sources — never a fabricated
     /// value (no third price can enter the liquidation decision).
     #[kani::proof]
