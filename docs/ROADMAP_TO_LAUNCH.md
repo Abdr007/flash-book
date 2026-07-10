@@ -40,7 +40,7 @@ Resolved from the source-plan prose (they exist; they were missing only from the
 | Item | Scope | Owner | Status | Evidence |
 |---|---|---|---|---|
 | 1.1 | Certora solvency spec — compile the harness, wire real handler externs, run the prover, add to CI (closes G1) | eng | STARTABLE (long pole; harness is uncompiled scaffold today) | `solvencyPreserved` passes parametrically in CI |
-| 1.2 | prove the REAL `assess_margin` (not an abstract re-impl); Lean if 128-bit is CBMC-intractable (closes G3) | eng | STARTABLE (partial: N-position host sweep already covers key properties) | proof names the real symbol |
+| 1.2 | prove the REAL `assess_margin` (not an abstract re-impl); Lean if 128-bit is CBMC-intractable (closes G3) | eng | **DONE** — new Kani harness `assess_margin_single_market_frame_stable` (`risk.rs`, VERIFICATION SUCCESSFUL in ~9s) calls the **real `assess_margin` symbol** (not the abstract `gate` re-impl) with collateral + δ **fully symbolic over `u64`**, proving the three cross-margin frame invariants for ALL collateral: (1) requirement + worst-scenario index are collateral-independent, (2) equity is exactly linear in collateral, (3) health is monotone in collateral (no self-liquidation by depositing). Kani can't bit-blast N symbolic positions × the 128-bit lattice × 32-byte Pubkey memcmps, so the harness fixes a concrete portfolio + minimal scenario slice and exhausts the COLLATERAL dimension the host sweep only samples (`c % 1e7`); per-market decomposition stays covered by the host sweep `n_position_..._frame_stable` + `opposing_legs_are_not_netted_across_markets` | proof names the real symbol |
 | 1.3 | Lean theorem for realized-PnL on reduce/flip (`sign·closed·Δticks·tick`) + VWAP entry (closes G2) | eng | STARTABLE | Lean theorem at real domain |
 | 1.4 | structural enforcement that handlers reach funding/health math only via the proven helper (closes G5) | eng | STARTABLE | single-call-site lint / CI test |
 | 1.5 | whole-system residual identity — triple-ledger conservation checked before every commit (closes G4) | eng | STARTABLE (big) | Kani/Lean per-instruction invariant |
@@ -139,6 +139,7 @@ MagicBlock owner-recovery — both code-complete on our side.
 
 ## Closure ledger — closed this pass (with runnable evidence)
 
+- **1.2** real-symbol `assess_margin` — Kani `assess_margin_single_market_frame_stable` (VERIFICATION SUCCESSFUL, ~9s). Closes G3: the three cross-margin frame invariants (collateral-independent requirement, collateral-linear equity, collateral-monotone health) proven on the LIVE `assess_margin`, over all `u64` collateral — replacing the abstract `gate` re-impl proof.
 - **3.2** anti-self-liquidation — Kani `withdraw_cannot_self_liquidate_below_maintenance` **VERIFICATION SUCCESSFUL**. The marquee: HL self-liquidation attack impossible by construction.
 - **5.2** insurance/FLP isolation — Kani `bad_debt_coverage_is_insurance_isolated_and_bounded` **VERIFICATION SUCCESSFUL**. HL single-vault SPOF structurally absent.
 - **1.6** stale-funding-comment fix (auditor-critical).
@@ -154,7 +155,7 @@ Every item now has real scope (no more title-only). The remainder splits into:
 
 - **Program changes** (need a devnet deploy + live-re-verify cycle each): 2.1–2.3, 2.7,
   3.3, 4.1–4.6, 4.8.
-- **Hard proofs** (Lean / real-symbol): 1.2, 1.3, 1.5, 1.7.
+- **Hard proofs** (Lean / real-symbol): 1.3, 1.5, 1.7. (**1.2 DONE** — real-symbol Kani `assess_margin_single_market_frame_stable`.)
 - **Multi-week builds**: 1.1 Certora integration, 3.1 percolator per-domain credit, and
   the three big builds (copy-vaults, HIP-3 permissionless deploy, decentralized-sequencer
   activation).
