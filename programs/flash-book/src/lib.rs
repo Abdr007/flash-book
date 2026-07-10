@@ -5259,15 +5259,18 @@ pub mod flash_book {
                 // they can; the uncollected shortfall is subtracted from `net_fee`
                 // so insurance/FLP are NOT over-credited (no phantom value). The
                 // resulting thin position is handled by the liquidation engine.
+                // Track A2: capped taker-fee debit through the proven core.
                 let paid = if taker_pos_isolated {
                     let mut p = ctx.accounts.taker_position.load_mut()?;
-                    let paid = taker_fee.min(p.collateral_quote_lots);
-                    p.collateral_quote_lots = p.collateral_quote_lots.saturating_sub(paid);
+                    let (after, paid) =
+                        xmargin::apply_capped_debit(p.collateral_quote_lots, taker_fee);
+                    p.collateral_quote_lots = after;
                     paid
                 } else {
                     let mut s = ctx.accounts.taker_trader_state.load_mut()?;
-                    let paid = taker_fee.min(s.collateral_quote_lots);
-                    s.collateral_quote_lots = s.collateral_quote_lots.saturating_sub(paid);
+                    let (after, paid) =
+                        xmargin::apply_capped_debit(s.collateral_quote_lots, taker_fee);
+                    s.collateral_quote_lots = after;
                     paid
                 };
                 net_fee = net_fee.saturating_sub(taker_fee.saturating_sub(paid));
@@ -5281,18 +5284,15 @@ pub mod flash_book {
                 } else {
                     taker_negative_rebate_u128 as u64
                 };
+                // Track A2: negative-rebate credit through the proven core.
                 if taker_pos_isolated {
                     let mut p = ctx.accounts.taker_position.load_mut()?;
                     p.collateral_quote_lots =
-                        p.collateral_quote_lots
-                            .checked_add(neg_rebate_u64)
-                            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                        xmargin::apply_collateral_credit(p.collateral_quote_lots, neg_rebate_u64)?;
                 } else {
                     let mut s = ctx.accounts.taker_trader_state.load_mut()?;
                     s.collateral_quote_lots =
-                        s.collateral_quote_lots
-                            .checked_add(neg_rebate_u64)
-                            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                        xmargin::apply_collateral_credit(s.collateral_quote_lots, neg_rebate_u64)?;
                 }
             }
         }
@@ -5309,34 +5309,32 @@ pub mod flash_book {
         // a fill against an under-collateralized taker.
         let maker_rebate = maker_rebate.min(taker_fee_paid);
         {
+            // Track A2: maker-rebate credit through the proven core.
             if maker_rebate > 0 {
                 if maker_pos_isolated {
                     let mut p = ctx.accounts.maker_position.load_mut()?;
-                    p.collateral_quote_lots = p
-                        .collateral_quote_lots
-                        .checked_add(maker_rebate)
-                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                    p.collateral_quote_lots =
+                        xmargin::apply_collateral_credit(p.collateral_quote_lots, maker_rebate)?;
                 } else {
                     let mut s = ctx.accounts.maker_trader_state.load_mut()?;
-                    s.collateral_quote_lots = s
-                        .collateral_quote_lots
-                        .checked_add(maker_rebate)
-                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                    s.collateral_quote_lots =
+                        xmargin::apply_collateral_credit(s.collateral_quote_lots, maker_rebate)?;
                 }
             }
+            // Track A2: maker-fee debit through the proven core.
             if maker_fee > 0 {
                 if maker_pos_isolated {
                     let mut p = ctx.accounts.maker_position.load_mut()?;
-                    p.collateral_quote_lots = p
-                        .collateral_quote_lots
-                        .checked_sub(maker_fee)
-                        .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+                    p.collateral_quote_lots = xmargin::apply_collateral_debit_checked(
+                        p.collateral_quote_lots,
+                        maker_fee,
+                    )?;
                 } else {
                     let mut s = ctx.accounts.maker_trader_state.load_mut()?;
-                    s.collateral_quote_lots = s
-                        .collateral_quote_lots
-                        .checked_sub(maker_fee)
-                        .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+                    s.collateral_quote_lots = xmargin::apply_collateral_debit_checked(
+                        s.collateral_quote_lots,
+                        maker_fee,
+                    )?;
                 }
             }
         }

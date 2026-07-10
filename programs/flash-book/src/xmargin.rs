@@ -151,6 +151,40 @@ pub fn apply_liquidation_reward(src: u64, caller: u64, reward: u64) -> Result<(u
     Ok((src_after, caller_after, paid))
 }
 
+/// Pure core for a CAPPED collateral debit (Track A2): remove up to `amount`
+/// from `balance`, capped at what's available (a fee that exceeds the balance
+/// takes only the balance). Returns `(balance_after, debited)`. Conserves the
+/// removed value exactly (`balance_after + debited == balance`) and never
+/// over-charges (`debited <= amount`) — proven in `capped_debit_conserves`.
+/// Used for the taker-fee deduction in `apply_fill`.
+#[inline]
+pub fn apply_capped_debit(balance: u64, amount: u64) -> (u64, u64) {
+    let debited = amount.min(balance);
+    (balance - debited, debited) // debited ≤ balance ⇒ no underflow
+}
+
+/// Pure core for a CHECKED collateral credit (Track A2): add `amount` to
+/// `balance`, erroring on overflow with the exact `ArithmeticOverflow`. Returns
+/// the new balance. `balance_after == balance + amount` when Ok (proven in
+/// `collateral_credit_exact`). Used for the rebate credits in `apply_fill`.
+#[inline]
+pub fn apply_collateral_credit(balance: u64, amount: u64) -> Result<u64> {
+    balance
+        .checked_add(amount)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))
+}
+
+/// Pure core for a CHECKED collateral debit (Track A2): subtract `amount` from
+/// `balance`, erroring on underflow with the exact `InsufficientCollateral`.
+/// Returns the new balance. `balance_after == balance - amount` when Ok (proven
+/// in `collateral_debit_exact`). Used for the maker-fee deduction in `apply_fill`.
+#[inline]
+pub fn apply_collateral_debit_checked(balance: u64, amount: u64) -> Result<u64> {
+    balance
+        .checked_sub(amount)
+        .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))
+}
+
 /// Resolve the ER reserved margin a collateral-releasing path must leave
 /// behind on the source trader_state. Fail-closed in both directions: an
 /// ER-active source (live attested reservation) must supply its own bound
@@ -349,6 +383,42 @@ mod xmargin_kani_proofs {
             assert!(src_after as u128 + caller_after as u128 == src as u128 + caller as u128);
             assert!(paid <= reward); // never over-rewards
             assert!(src_after == src - paid); // exact debit, capped at src
+        }
+    }
+
+    /// CONSERVATION (Track A2): the capped fee debit removes exactly the debited
+    /// amount and never more than is available — `balance_after + debited ==
+    /// balance`, `debited <= amount`, on the real `apply_capped_debit` symbol.
+    #[kani::proof]
+    fn capped_debit_conserves() {
+        let balance: u64 = kani::any();
+        let amount: u64 = kani::any();
+        let (after, debited) = apply_capped_debit(balance, amount);
+        assert!(after as u128 + debited as u128 == balance as u128);
+        assert!(debited <= amount);
+        assert!(after <= balance); // never mints collateral
+    }
+
+    /// EXACT (Track A2): the checked credit adds exactly `amount` when it does not
+    /// overflow — on the real `apply_collateral_credit` symbol over all `u64`.
+    #[kani::proof]
+    fn collateral_credit_exact() {
+        let balance: u64 = kani::any();
+        let amount: u64 = kani::any();
+        if let Ok(after) = apply_collateral_credit(balance, amount) {
+            assert!(after as u128 == balance as u128 + amount as u128);
+        }
+    }
+
+    /// EXACT (Track A2): the checked debit subtracts exactly `amount` when the
+    /// balance covers it — on the real `apply_collateral_debit_checked` symbol.
+    #[kani::proof]
+    fn collateral_debit_exact() {
+        let balance: u64 = kani::any();
+        let amount: u64 = kani::any();
+        if let Ok(after) = apply_collateral_debit_checked(balance, amount) {
+            assert!(after == balance - amount);
+            assert!(amount <= balance);
         }
     }
 

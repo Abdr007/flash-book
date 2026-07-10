@@ -15,7 +15,7 @@ devnet; not yet live on flash.trade, not yet externally audited.
 | Place at depth | **13.0–14.1k CU, flat across a 511-level book** (O(log n) insertion) |
 | Taker sweep | **~14.7k CU base + ~1.2k CU per level crossed**, incl. the per-fill keccak settlement commitment; a 96-level sweep clears in one tx (129k CU) in the default 32 KiB heap |
 | Settlement | Two-phase: match on the ER → `apply_fill` on L1 verifies every fill against the keccak commitment ring; a fabricated fill cannot settle |
-| Formal verification | **67 Kani proof harnesses** on the deployed risk/settlement paths + **7 Lean proof modules** (haircut conservation, OI/MMR, funding, per-domain credit, realized-PnL/VWAP, residual conservation, auth completeness) at the real value domain + Certora property specs (written; prover integration in progress) |
+| Formal verification | **70 Kani proof harnesses** on the deployed risk/settlement paths + **7 Lean proof modules** (haircut conservation, OI/MMR, funding, per-domain credit, realized-PnL/VWAP, residual conservation, auth completeness) at the real value domain + Certora property specs (written; prover integration in progress) |
 | Tests | 621 host/integration tests (the integration suite runs the real compiled `.so` in the BPF VM) + a live MagicBlock devnet ER round-trip acceptance suite |
 | Risk engine | Stress-lattice portfolio margin, worse-of(mark, oracle) liquidation pricing, ADL at true bankruptcy, insurance waterfall, junior-claim profit haircut |
 | Surface | 146 instructions · 137 events · 109 error codes ([IDL](idl/flash_book.json)) |
