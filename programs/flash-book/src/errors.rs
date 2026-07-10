@@ -277,6 +277,8 @@ pub enum FlashBookError {
     TooManyOpenPositions = 2323,
     #[msg("Reduce-only order has no opposing position to reduce (absent, foreign, flat, or same-side)")]
     ReduceOnlyNoPosition = 2324,
+    #[msg("Liquidation-close order (order_type 3) cannot be cancelled by its owner — only a fill or keeper/authority retirement clears it")]
+    LiquidationOrderNotCancelable = 2325,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

@@ -19039,6 +19039,11 @@
       "code": 8324,
       "name": "ReduceOnlyNoPosition",
       "msg": "Reduce-only order has no opposing position to reduce (absent, foreign, flat, or same-side)"
+    },
+    {
+      "code": 8325,
+      "name": "LiquidationOrderNotCancelable",
+      "msg": "Liquidation-close order (order_type 3) cannot be cancelled by its owner — only a fill or keeper/authority retirement clears it"
     }
   ],
   "types": [

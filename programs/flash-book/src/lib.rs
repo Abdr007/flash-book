@@ -2455,11 +2455,17 @@ pub mod flash_book {
         let mut ask_idxs: Vec<hypertree::DataIndex> = Vec::with_capacity(8);
         let cap = MAX_CANCELS_PER_IX_V2;
 
+        // H-B (security re-audit 2026-07-10): NEVER bulk-cancel a liquidation-close
+        // order (`order_type == 3`). It is injected by `liquidate_position_v2` on
+        // the liquidatee's behalf and must remain until a taker fills it (or a
+        // keeper/authority retires it) — otherwise the liquidatee spams
+        // `cancel_all_v2` each slot to sweep their own close and dodge liquidation,
+        // leaving bad debt that ADL then has to absorb. Skipped here, not removed.
         handle.for_each_bid_best_first(|idx, bid| {
             if bid_idxs.len() + ask_idxs.len() >= cap {
                 return false;
             }
-            if bid.trader == trader_pk {
+            if bid.trader == trader_pk && bid.order_type != 3 {
                 bid_idxs.push(idx);
             }
             true
@@ -2468,7 +2474,7 @@ pub mod flash_book {
             if bid_idxs.len() + ask_idxs.len() >= cap {
                 return false;
             }
-            if ask.trader == trader_pk {
+            if ask.trader == trader_pk && ask.order_type != 3 {
                 ask_idxs.push(idx);
             }
             true
@@ -13865,6 +13871,14 @@ fn cancel_v2_core(
         if order.trader != trader_pk {
             return err!(FlashBookError::WrongTrader);
         }
+        // H-B (security re-audit 2026-07-10): a liquidation-close order
+        // (`order_type == 3`) may NOT be cancelled by its owner — only a fill, or a
+        // keeper/authority retirement, clears it. Without this the liquidatee
+        // cancels their own injected close every slot to dodge liquidation, leaving
+        // bad debt for ADL to absorb.
+        if order.order_type == 3 {
+            return err!(FlashBookError::LiquidationOrderNotCancelable);
+        }
         order.seq
     };
 
@@ -20408,6 +20422,86 @@ fn assert_open_position_budget(open_positions: u8, pos: Option<(u8, u64)>) -> Re
         );
     }
     Ok(())
+}
+
+/// H-A (item 4.8, security re-audit 2026-07-10): the shared intake gate every
+/// maker-OPEN path must pass before resting an order — factored out so the v3
+/// injection handlers (trigger/twap/iceberg/bracket) and `vault_place_order_v3`
+/// gate IDENTICALLY to `place_limit_v2_core` / `place_taker_order_v2`. Settlement
+/// cannot re-check margin, so a resting order that OPENS exposure must be backed
+/// here, or its later fill opens an under-margined position whose loss socializes
+/// to insurance. Reduce-only orders are EXEMPT (the maker clamp caps them to
+/// reducible size). `pos` = the trader's current (side, size) on this market, or
+/// `None` if flat/unavailable (treated as a full open — strictest, never a bypass).
+///
+/// READY-TO-WIRE: the 6 maker-open call sites (the 5 v3 injection handlers +
+/// `vault_place_order_v3`) are wired to this helper in the SBF/devnet session —
+/// three of them (`execute_trigger_order_v3`, `execute_twap_slice_v3`,
+/// `replenish_iceberg_v3`) first gain a `trader_state`(+position) account (an IDL
+/// change whose executor account-passing must be integration-tested), which is why
+/// the wiring is deferred to the environment that can build-sbf + run devnet
+/// acceptance (see `docs/ACCEPTANCE_CRITICAL_PATH.md`). The gate logic itself is
+/// unit-proven below.
+#[allow(clippy::too_many_arguments, dead_code)]
+fn assert_injection_intake(
+    side: u8,
+    size_lots: u64,
+    limit_ticks: u64,
+    is_reduce_only: bool,
+    im_bps: u32,
+    tick_size: u64,
+    backing_collateral: u64,
+    open_positions: u8,
+    pos: Option<(u8, u64)>,
+) -> Result<()> {
+    if is_reduce_only {
+        return Ok(());
+    }
+    assert_intake_initial_margin(
+        side,
+        size_lots,
+        limit_ticks,
+        im_bps,
+        tick_size,
+        backing_collateral,
+        pos,
+    )?;
+    assert_open_position_budget(open_positions, pos)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod ha_injection_intake_tests {
+    use super::assert_injection_intake;
+    // im_bps=1000 (10%), tick=1: an open of `size` @ `price` needs
+    // ceil(size*price*0.10) collateral.
+    const IM: u32 = 1000;
+    const TS: u64 = 1;
+
+    #[test]
+    fn under_margined_open_is_rejected() {
+        // open 100 @ 10 → notional 1000, IM required = 100. 99 collateral → reject.
+        assert!(assert_injection_intake(0, 100, 10, false, IM, TS, 99, 0, None).is_err());
+    }
+    #[test]
+    fn exactly_at_margin_open_passes() {
+        // exactly 100 collateral → ok (boundary).
+        assert!(assert_injection_intake(0, 100, 10, false, IM, TS, 100, 0, None).is_ok());
+    }
+    #[test]
+    fn reduce_only_is_exempt_even_with_zero_collateral() {
+        // reduce-only bypasses the gate entirely (maker clamp bounds it).
+        assert!(assert_injection_intake(0, 100, 10, true, IM, TS, 0, 0, None).is_ok());
+    }
+    #[test]
+    fn reduce_against_existing_position_passes() {
+        // sell 40 against a long 100 → pure reduce → ok with no collateral.
+        assert!(assert_injection_intake(1, 40, 10, false, IM, TS, 0, 1, Some((0, 100))).is_ok());
+    }
+    #[test]
+    fn zero_im_disables_gate() {
+        assert!(assert_injection_intake(0, u64::MAX, u64::MAX, false, 0, TS, 0, 0, None).is_ok());
+    }
 }
 
 #[cfg(test)]
