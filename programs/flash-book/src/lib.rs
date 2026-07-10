@@ -9190,15 +9190,27 @@ pub mod flash_book {
                     caller_ts.collateral_quote_lots = caller_after;
                 }
             } else {
+                // Track A2: the reward move (cross trader_state → liquidator) goes
+                // through the proven conservation core. Safe: the self-liquidation
+                // guard above (`caller != position.trader`) makes `trader_state` and
+                // `caller_trader_state` distinct accounts (their PDAs derive from
+                // different owners), so they cannot alias — read-then-write is exact.
                 reward_paid =
                     reward_u64.min(ctx.accounts.trader_state.load()?.collateral_quote_lots);
                 if reward_paid > 0 {
-                    ctx.accounts.trader_state.load_mut()?.collateral_quote_lots -= reward_paid;
-                    let mut caller_ts = ctx.accounts.caller_trader_state.load_mut()?;
-                    caller_ts.collateral_quote_lots = caller_ts
-                        .collateral_quote_lots
-                        .checked_add(reward_paid)
-                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                    let ts_col = ctx.accounts.trader_state.load()?.collateral_quote_lots;
+                    let caller_col = ctx
+                        .accounts
+                        .caller_trader_state
+                        .load()?
+                        .collateral_quote_lots;
+                    let (ts_after, caller_after, _paid) =
+                        xmargin::apply_liquidation_reward(ts_col, caller_col, reward_u64)?;
+                    ctx.accounts.trader_state.load_mut()?.collateral_quote_lots = ts_after;
+                    ctx.accounts
+                        .caller_trader_state
+                        .load_mut()?
+                        .collateral_quote_lots = caller_after;
                 }
             }
         }
