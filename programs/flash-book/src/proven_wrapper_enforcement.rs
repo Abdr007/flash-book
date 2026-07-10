@@ -203,6 +203,11 @@ mod tests {
         for (core, handler) in [
             ("split_to_isolated(", "set_position_isolated"),
             ("merge_to_cross(", "set_position_cross"),
+            // Liquidation reward (BOTH isolated + cross branches): the
+            // source→liquidator move routes through the proven capped-transfer
+            // core. The cross branch is aliasing-safe because the SelfLiquidation
+            // guard forces `trader_state` and `caller_trader_state` distinct.
+            ("apply_liquidation_reward(", "liquidate_position_v2"),
         ] {
             let callers = enclosing_fns(LIB_RS, core);
             assert!(

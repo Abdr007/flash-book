@@ -134,6 +134,23 @@ pub fn merge_to_cross(cross: u64, isolated: u64) -> Result<u64> {
         .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))
 }
 
+/// Pure core for a LIQUIDATION-REWARD payment (Track A2): pay the liquidator a
+/// `reward`, capped at the liquidated source's available collateral, moving it
+/// from `src` (the liquidated position or trader_state) to `caller` (the
+/// liquidator's trader_state). Returns `(src_after, caller_after, paid)`.
+/// Preserves the exact `ArithmeticOverflow` error. Conserves total collateral
+/// (`src_after + caller_after == src + caller`) and never over-rewards
+/// (`paid <= reward`), proven in `liquidation_reward_conserves`.
+#[inline]
+pub fn apply_liquidation_reward(src: u64, caller: u64, reward: u64) -> Result<(u64, u64, u64)> {
+    let paid = reward.min(src); // capped at the source's available collateral
+    let src_after = src - paid; // paid ≤ src ⇒ no underflow
+    let caller_after = caller
+        .checked_add(paid)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    Ok((src_after, caller_after, paid))
+}
+
 /// Resolve the ER reserved margin a collateral-releasing path must leave
 /// behind on the source trader_state. Fail-closed in both directions: an
 /// ER-active source (live attested reservation) must supply its own bound
@@ -316,6 +333,22 @@ mod xmargin_kani_proofs {
         let isolated: u64 = kani::any();
         if let Ok(cross_after) = merge_to_cross(cross, isolated) {
             assert!(cross_after as u128 == cross as u128 + isolated as u128);
+        }
+    }
+
+    /// CONSERVATION (Track A2): the liquidation-reward payment moves the capped
+    /// reward from the liquidated source to the liquidator without minting or
+    /// burning — `src_after + caller_after == src + caller`, `paid <= reward`,
+    /// on the real `apply_liquidation_reward` symbol over all `u64`.
+    #[kani::proof]
+    fn liquidation_reward_conserves() {
+        let src: u64 = kani::any();
+        let caller: u64 = kani::any();
+        let reward: u64 = kani::any();
+        if let Ok((src_after, caller_after, paid)) = apply_liquidation_reward(src, caller, reward) {
+            assert!(src_after as u128 + caller_after as u128 == src as u128 + caller as u128);
+            assert!(paid <= reward); // never over-rewards
+            assert!(src_after == src - paid); // exact debit, capped at src
         }
     }
 
