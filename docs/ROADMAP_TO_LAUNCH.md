@@ -82,7 +82,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | 4.5 | tranched liquidation (positions above a notional threshold liquidate in tranches) | eng | STARTABLE (program change) |
 | 4.6 | user reduce-only flag on the v2 place path (currently rejected at intake) | eng | STARTABLE (program change) |
 | **4.7** | **robust-median mark** (median for funding/display; worse-of for liquidation) | eng | **STARTABLE** |
-| 4.8 | apply intake IM gate to v3 injection paths (TWAP/iceberg/bracket) | eng | STARTABLE |
+| 4.8 | apply intake IM gate to v3 injection paths (TWAP/iceberg/bracket) | eng | **CONFIRMED HIGH — LAUNCH-BLOCKER** (adversarial re-audit 2026-07-10, `docs/SECURITY_AUDIT_2026-07-10-wave2.md` H-A): NOT an accepted residual — exploitable. `execute_trigger_order_v3` (entry), `execute_twap_slice_v3`, `place_iceberg_order_v3`, `replenish_iceberg_v3`, `place_bracket_order_v3` (parent) AND `vault_place_order_v3` all skip `assert_intake_initial_margin` (which `place_limit_v2_core`/`place_taker` call precisely because settlement can't re-check margin). Thin-collateral attacker injects a large maker order → crossed → under-margined open → bad debt to insurance. **Fix:** shared `assert_injection_intake` (IM + position-budget + OI-cap + oracle-band) on all 6 opening paths, exempt reduce-only. Fail-safe; **devnet-gated** (6-handler pricing/gating change, not a blind push) |
 
 ## 5 · Product / integration (5.x)
 
@@ -147,6 +147,21 @@ MagicBlock owner-recovery — both code-complete on our side.
 - **5.5** (pre-existing) builder codes / sub-accounts / referrals — verified in code.
 
 Kani proof count: 59 → **61**. All committed on `docs/roadmap-to-launch`.
+
+## Adversarial re-audit 2026-07-10 (9 surfaces, 2 waves) — `docs/SECURITY_AUDIT_2026-07-10*.md`
+
+No CRITICAL on any surface. Access-control, oracle, arithmetic, hypertree,
+settlement-authenticity, and DoS/compute-exhaustion returned **zero exploitable
+findings**. Fixed + shipped: **M-1** — `set_position_isolated` now gates on
+`er_active == 0` (was: could relocate collateral out of ER-order reach → bad debt).
+**Two HIGH launch-blockers** confirmed (both bad-debt-adjacent, fail-safe-fixable,
+devnet-gated; neither direct-theft): **H-A** (4.8 — six maker-open paths skip the
+intake IM gate) and **H-B** (liquidatee can cancel the injected `order_type==3`
+liquidation-close order to dodge liquidation; ADL remains the bankruptcy backstop).
+Plus MEDs (ER attestation-lag, `record_flp_fill_v3` trust, funding snapshot, M-2
+withdraw raw-mark) and LOW/INFO — all in the wave-2 report's fix queue for the next
+devnet-verified cycle. **Launch gate holds these two HIGH + M-2 open** — per the
+mandate's no-defer-lane, they must close before launch.
 
 ## Honest status of the remainder
 
