@@ -236,7 +236,7 @@ programs/flash-book/src/
     └── vpin                  layout-reserved accumulator (retired)
 ```
 
-Formal verification (57 Kani harnesses, 6 Lean theorems, property suites):
+Formal verification (62 Kani harnesses, 7 Lean proof modules, property suites):
 `docs/FORMAL_VERIFICATION.md`. Math specs: `docs/MATH.md`,
 `docs/MARGIN_MATH.md`, `docs/HAIRCUT_MATH.md`. Threat model:
 `docs/SAFETY.md`. Flash V2 integration: `docs/V2_INTEGRATION.md`.

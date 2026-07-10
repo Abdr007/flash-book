@@ -1,14 +1,14 @@
 # Formal Verification
 
-Flash Book carries **57 Kani proof harnesses** (discharged by CBMC), **6 Lean
-theorems** at the real production divisors, a formal property specification
+Flash Book carries **62 Kani proof harnesses** (discharged by CBMC), **7 Lean
+proof modules** at the real production divisors, a formal property specification
 (`certora/PROPERTIES.md`), and eight property-test suites. A Kani harness is
 not a sampled test: `kani::any()` ranges over the *entire* input domain
 symbolically, and the model checker proves the assertion for **every** value
 or returns a concrete counterexample. CI runs the full Kani suite and builds
 the Lean proofs on every PR; any broken invariant fails the build.
 
-## Kani coverage (57 harnesses, by module)
+## Kani coverage (62 harnesses, by module)
 
 | Module | # | Properties proven |
 |---|---|---|
@@ -16,14 +16,15 @@ the Lean proofs on every PR; any broken invariant fails the build.
 | `matcher/fill_commitment` | 7 | Settlement ring: never over-settles, depth-bounded, rejects uncommitted/fabricated fills, no double-settle; settlement nonce strictly monotone (replay/reorder rejected), advance strict + exact, chain monotone. |
 | `state_v2` | 6 | Order-id price-time priority: better price fills first on both sides, FIFO sequence tiebreak, id injectivity (no collisions among live orders), guard-admitted orders never collide, seq guard matches the encoding precondition. |
 | `lib` (settlement frame) | 6 | Realized-PnL routing credits exactly one bucket on gain and is bounded/one-sided on loss; cross-loss shortfall conserves and never over-credits; funding routing conserves value, is bounded and one-signed, zero is a no-op. |
-| `matcher/risk` | 5 | Effective MMR never below the base floor (proven on the live `MarketSnapshot::effective_mmr_bps` path), OI surcharge capped and disabled at zero slope, healthy ⇒ survives stress, health verdict independent of mark PnL (no double-count). |
+| `matcher/risk` | 6 | Effective MMR never below the base floor (proven on the live `MarketSnapshot::effective_mmr_bps` path), OI surcharge capped and disabled at zero slope, healthy ⇒ survives stress, health verdict independent of mark PnL (no double-count), and the real `assess_margin` symbol's three cross-margin frame invariants over all `u64` collateral (`assess_margin_single_market_frame_stable`). |
 | `matcher/liquidation` | 5 | Health price is always one of the two real sources and the worse one for the side (long and short), fresh mark equals worse-of, stale mark falls back to oracle-only. |
-| `matcher/insurance` | 4 | Solvent ⟺ vault covers the protocol buckets; surplus exact when solvent; the full-invariant reference model; the one-sided partial-collateral insolvency detector is sound (never fires on a solvent state). |
+| `matcher/insurance` | 5 | Solvent ⟺ vault covers the protocol buckets; surplus exact when solvent; the full-invariant reference model; the one-sided partial-collateral insolvency detector is sound (never fires on a solvent state); bad-debt coverage is insurance-isolated and bounded (`bad_debt_coverage_is_insurance_isolated_and_bounded` — no single-vault SPOF). |
 | `matcher/position_math` | 3 | Open-from-flat exact, same-side stacking exact, no realized PnL without a reduction. |
 | `matcher/flp_quoter` | 3 | Pool fill-price band accepts the oracle price (no false reject) and rejects gross fabrication; required floor conservative. |
 | `matcher/fill_outbox` | 3 | Write index in bounds, no silent overwrite, drained grow has no remappable pending slot. |
 | `matcher/committee` | 3 | Valid BFT config implies quorum intersection, equivocation ⟺ same height + different digest, jail is effective. |
-| `xmargin` | 3 | ER-reserved margin floor preserved by simple withdrawals, epoch strictly increases. |
+| `xmargin` | 5 | ER-reserved margin floor preserved by simple withdrawals, epoch strictly increases, required floor adds reserved on top of max, attestation binding fails closed, and withdrawal can never self-liquidate below maintenance (`withdraw_cannot_self_liquidate_below_maintenance`). |
+| `matcher/funding` | 1 | Funding is zero-sum: `owed(long) + owed(short) == 0` on the real `funding_owed` path (funding moves value between sides; cannot mint or burn), independent of the `>>64` rounding. |
 | `er` | 2 | The force-undelegate gate only fires when a liveness baseline is genuinely stale; a market with a fresh heartbeat AND recent settlement can never be forced off the ER. |
 
 Every proven pure function is the one the deployed handler routes through
@@ -100,8 +101,9 @@ the gap entirely — the harness bodies need no other change.
 A theorem prover does not share CBMC's bitvector limitations (non-power-of-two
 division; bit-blasting a 128-bit multiply), so the gaps CBMC cannot reach are
 closed directly in Lean 4 (+ Mathlib) over unbounded `Nat`/`Int`, at the
-**actual** divisors. Three proof files cover the haircut, the OI-scaled MMR
-surcharge, and funding:
+**actual** divisors. Seven proof modules cover the haircut, the OI-scaled MMR
+surcharge, funding, per-domain credit, realized-PnL/VWAP, whole-system residual
+conservation, and margin-walk auth/completeness:
 
 **Haircut** (`formal_verification/lean/Haircut.lean`), at the actual `H_DENOM = 1e9`:
 
@@ -124,8 +126,39 @@ surcharge, and funding:
 | `funding_zero_sum` | `owed(long) + owed(short) == 0` (funding moves value between sides; cannot mint/burn) | — (128-bit multiply non-terminating in CBMC) |
 | `funding_zero_when_no_index_move` | `delta == 0 ⇒ owed == 0` (no accrual from a static index) | — |
 
-All six are `#print axioms`-clean — they depend only on `propext`,
-`Classical.choice`, `Quot.sound` (no `sorry`). Build + reproduction steps are
+**Per-domain credit** (`formal_verification/lean/PerDomainCredit.lean`), at the real `1e9` divisor — the realizable-credit haircut bound CBMC cannot decide at a non-power-of-two divisor:
+
+| Lean theorem | Statement |
+|---|---|
+| per-domain credit bound | realizable credit never exceeds collateral and is monotone in realizable value |
+
+**Realized-PnL / VWAP** (`formal_verification/lean/RealizedPnl.lean`), unbounded width — mirrors `matcher/position_math.rs apply_fill` (closes G2):
+
+| Lean theorem | Statement |
+|---|---|
+| `realized_reconciles_v2` | `pnl·entry = sign·(price−entry)·notional` (exact Flash V2 reconciliation) |
+| `long_pnl_pos_iff` | profit iff price crosses entry the right way; breakeven = 0 |
+| `vwap_lower_bound` / `vwap_upper_bound` | `min(entry,price) ≤ vwapEntry ≤ max(entry,price)` |
+
+**Residual conservation** (`formal_verification/lean/ResidualConservation.lean`) — the triple-ledger identity `V = C_tot + I + Residual` (closes G4):
+
+| Lean theorem | Statement |
+|---|---|
+| `applyDelta_conserves` | all 12 money-moving instruction deltas satisfy `ΔV = ΔC + ΔI + ΔR` |
+| `foldl_conserves` | the identity survives any interleaving of instructions (sequence closure) |
+| `solvent_of_conserved_nonneg_residual` | `Residual ≥ 0 ⟺ V ≥ C_tot + I` |
+
+**Auth + completeness** (`formal_verification/lean/AuthCompleteness.lean`) — Finset-cardinality margin-walk (closes G7):
+
+| Lean theorem | Statement |
+|---|---|
+| `walk_is_complete` / `no_position_omitted` | every open position is visited by the margin walk (none skipped) |
+| `complete_walk_requirement_exact` | the walked requirement equals the true total |
+| `exec_always_present` / `reinsert_noop` | liquidation dedupe / re-insert is a no-op |
+
+All are `#print axioms`-clean — they depend only on `propext`,
+`Classical.choice`, `Quot.sound` (no `sorry`). The full 7-root library
+`lake build` completes (7358 jobs). Build + reproduction steps are
 in [`formal_verification/lean/README.md`](../formal_verification/lean/README.md).
 
 So the two solvency-critical haircut bounds now hold **both** ways: Kani proves

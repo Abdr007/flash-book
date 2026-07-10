@@ -46,9 +46,10 @@ Resolved from the source-plan prose (they exist; they were missing only from the
 | 1.5 | whole-system residual identity — triple-ledger conservation checked before every commit (closes G4) | eng | **DONE (proof artifact)** — `formal_verification/lean/ResidualConservation.lean` (compiles clean, `#print axioms` shows only propext/Quot.sound, no `sorry`): models the identity `V = C_tot + I + Residual` (`haircut.rs:168`) and proves ALL 12 money-moving instructions from the `haircut.rs:460` delta table satisfy `ΔV = ΔC + ΔI + ΔR` (so each preserves the identity), plus **sequence-closure** (`foldl_conserves` — the identity survives ANY interleaving = the "checked before every commit" guarantee, structurally) and the **solvency corollary** (`Residual ≥ 0 ⟺ V ≥ C_tot + I`, the `haircut.rs:449` baseline). Forces out the one doc-table imprecision: the `convert`/gain row needs its paired `+credit` collateral leg to balance (`convert_gain_conserves`). Runtime companion (already live): on-chain `verify_protocol_solvency` + the #268 conservation sequence-fuzzer reconcile against real SPL balances | Lean per-instruction invariant + sequence closure |
 | 1.6 | code-explanation-only comment hygiene; fix stale "funding inert/never advanced" comments (contradicted by live `crank_funding`) | eng | **DONE** | funding.rs module doc + `settle_funding` docstring corrected: cum-index funding is LIVE via crank_funding→settle_position_funding; only the side-accrual rate term waits |
 | 1.7 | prove authorization + completeness invariants (margin-walk completeness, liquidation dedupe, auth gates) (closes G7) | eng | **DONE** — `formal_verification/lean/AuthCompleteness.lean` (compiles clean, `#print axioms` shows only propext/Classical.choice/Quot.sound, no `sorry`): **margin-walk completeness** (`walk_is_complete`/`no_position_omitted`) — the C-2 gate (`lib.rs:13382`: exact-count + PDA-binding + dedupe + live-only) forces the supplied position set to EQUAL the trader's full open set, so no risky position can be omitted (Finset cardinality: distinct owned subset of size = `open_positions` is the whole set); **no-understatement** (`requirement_monotone`/`complete_walk_requirement_exact`) — the requirement is a monotone sum of non-negative floors, so a complete walk computes the TRUE requirement, never an under-count; **liquidation dedupe** (`exec_always_present`/`reinsert_noop`) — the exec-seeded set can't drop the exec market and re-supplying a counted market is a no-op (no double-count); **auth gate** (`auth_gate_sound`/`unauthorized_rejected`) — the `require_keys_eq!` gate admits exactly the authority. Proven for ALL N, replacing the runtime-`require!`-only guarantee | Lean proofs at unbounded N |
-| 1.8 | clean proof suite + fix README undercount | eng | **DONE (count fix)** — README corrected 57→61 Kani, 565→621 tests, Certora qualified as written/integration-in-progress (no unprovable claim). Dead-proof pruning deliberately NOT done: removing proofs conflicts with the rising-count discipline; 61 real proofs > removing 4 for aesthetics |
+| 1.8 | clean proof suite + fix README undercount | eng | **DONE (count fix)** — README + ARCHITECTURE + FORMAL_VERIFICATION reconciled to the true **62 Kani / 7 Lean** (grep-verified; the 7-root `lake build` completes and every theorem is `#print axioms`-clean), tests 621, Certora qualified as written/integration-in-progress (no unprovable claim). Dead-proof pruning deliberately NOT done: removing proofs conflicts with the rising-count discipline |
 
-Baseline already in place: **Kani 59 proofs + Lean (haircut / OiMmr / funding at real
+Baseline now in place: **Kani 62 proofs + 7 Lean modules (haircut / OiMmr / funding /
+per-domain credit / realized-PnL / residual conservation / auth completeness, at real
 divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 
 ## 2 · Dormant paths / audit gaps (2.x)
@@ -148,11 +149,11 @@ MagicBlock owner-recovery — both code-complete on our side.
 - **3.2** anti-self-liquidation — Kani `withdraw_cannot_self_liquidate_below_maintenance` **VERIFICATION SUCCESSFUL**. The marquee: HL self-liquidation attack impossible by construction.
 - **5.2** insurance/FLP isolation — Kani `bad_debt_coverage_is_insurance_isolated_and_bounded` **VERIFICATION SUCCESSFUL**. HL single-vault SPOF structurally absent.
 - **1.6** stale-funding-comment fix (auditor-critical).
-- **1.8** README undercount fixed (61 Kani / 621 tests) + Certora honestly qualified.
+- **1.8** doc counts reconciled to true **62 Kani / 7 Lean** (621 tests) + Certora honestly qualified.
 - **6.5** pre-committed algorithmic settlement policy (`docs/SETTLEMENT_POLICY.md`).
 - **5.5** (pre-existing) builder codes / sub-accounts / referrals — verified in code.
 
-Kani proof count: 59 → **61**. All committed on `docs/roadmap-to-launch`.
+Kani proof count: 59 → **62** (grep-verified on `main`). Lean: 3 → **7** modules, full library `lake build` clean + `#print axioms`-clean.
 
 ## Honest status of the remainder
 
