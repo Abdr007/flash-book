@@ -93,7 +93,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | **5.3** | **off-chain copy-trading** (snapshot-diff mirror) | eng | **STARTABLE** |
 | 5.4 | activate a real paying maker-rebate schedule (negative-fee tier) | eng | STARTABLE (code exists, disabled) |
 | **5.5** | **builder codes + sub-accounts + referrals** | eng | **DONE** (docs/SDK exposure → 5.6) |
-| 5.6 | agent-native SDK (typed REST, AGENTS.md, llms.txt, OpenAPI, GOTCHAS.md) | eng | STARTABLE |
+| 5.6 | agent-native SDK (typed REST, AGENTS.md, llms.txt, OpenAPI, GOTCHAS.md) | eng | **DONE (docs core)** — `AGENTS.md` (trading lifecycle + exact IDL-grounded instruction signatures + state model + client bootstrap), `llms.txt` (llmstxt.org-style machine index), `docs/GOTCHAS.md` (PDA seeds, sequencer/armed-market trust model, margin-walk completeness, withdraw-anytime reserve, worse-of health, units/flags, hypertree book decode, error convention). All derived from the committed IDL — no aspirational APIs. Remaining (deferred): typed-REST/OpenAPI surface (needs a gateway service, not on-chain) |
 
 ## 6 · Ship gates (6.x)
 
@@ -104,7 +104,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | 6.3 | GPL-vs-MIT license decision (vendored hypertree GPL in MIT repo) | owner/legal | STARTABLE (legal read) |
 | 6.4 | latency benchmark, disclosed methodology (tx sigs + CU + timing) | eng | STARTABLE |
 | 6.5 | pre-commit algorithmic settlement policy (one-pager) | owner | **DONE** — `docs/SETTLEMENT_POLICY.md`: robust-oracle-only settlement, no discretionary repricing, each commitment grounded in the deployed code or a CI proof (3.2 + 5.2) |
-| 6.6 | honest launch framing: "devnet + freshly-audited; run it, read it, break it; mainnet after audit closes" | owner | STARTABLE (positioning; the honesty is already the operating norm) |
+| 6.6 | honest launch framing: "devnet + freshly-audited; run it, read it, break it; mainnet after audit closes" | owner | **DONE** — `docs/LAUNCH_FRAMING.md`: the one-page truth — what is proven today (solvency conservation, no self-liq, manipulated-market credit collapse, frame-stability, all CI-gated), what is NOT yet (not audited, not mainnet), the two honest vendor waits (audit signature, MagicBlock owner-recovery), the declared post-launch builds, and the permanent robust-oracle-only settlement trust wedge. Owner to approve the wording |
 
 ## Big builds (first-class pre-launch tracks)
 
