@@ -1399,18 +1399,16 @@ pub mod flash_book {
         )
     }
 
-    /// V2 limit-order placement against the hypertree-backed orderbook.
-    /// Runs ALONGSIDE the legacy `place_limit_order` for now — operators
-    /// pick which book each market uses by calling `init_market_book`
-    /// (v2) vs `initialize_order_buffer` (legacy).
+    /// Limit-order placement against the hypertree-backed orderbook — the sole
+    /// limit-placement path (the legacy order-buffer book was removed; every
+    /// market is initialized with `init_market_book`).
     ///
-    /// Validation mirrors the legacy ix's intake: status-active gate,
-    /// min-base-lots, tick alignment, size cap. Then constructs a
-    /// `RestingOrderV2` carrying the trader pubkey inline and inserts it
-    /// into the bids or asks RBT inside the `MarketBookHandle`.
+    /// Intake: status-active gate, min-base-lots, tick alignment, size cap. Then
+    /// constructs a `RestingOrderV2` carrying the trader pubkey inline and inserts
+    /// it into the bids or asks RBT inside the `MarketBookHandle`.
     ///
-    /// `flags` accepts the same bitfield as v1: bit0 post_only, bit1
-    /// reduce_only, bit2 ioc, bit3 jit, bits 4-5 stp_mode.
+    /// `flags` bitfield: bit0 post_only, bit1 reduce_only, bit2 ioc, bit3 jit,
+    /// bits 4-5 stp_mode.
     pub fn place_limit_order_v2(
         ctx: Context<PlaceLimitOrderV2>,
         side: u8,
@@ -3585,7 +3583,7 @@ pub mod flash_book {
     /// (revert to using market default). Lets risk-
     /// conscious traders limit their effective leverage on a single
     /// position without affecting their other positions or the market's
-    /// global cap. The cap is enforced at place_limit_order intake on
+    /// global cap. The cap is enforced at place_limit_order_v2 intake on
     /// the projected post-fill notional.
     ///
     /// Setting a tighter cap on a position that already exceeds it does
@@ -4268,14 +4266,24 @@ pub mod flash_book {
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-        let (trader_pk, ts_open, ts_collateral) = {
+        let (trader_pk, ts_open, ts_collateral, ts_er_active) = {
             let ts = ctx.accounts.trader_state.load()?;
             (
                 ts.trader,
                 ts.open_positions as usize,
                 ts.collateral_quote_lots,
+                ts.er_active,
             )
         };
+        // SECURITY (adversarial re-audit 2026-07-10): an ER-active trader (attested
+        // reserved margin backing resting ER orders) must NOT relocate cross
+        // collateral into an isolated bucket — that drains the cross pool below the
+        // ER reservation while walling the collateral off from the ER order's
+        // settlement, dumping bad debt onto insurance. Mirror the withdraw /
+        // partial-withdraw / sweep gate: force ER resolution (undelegate / cancel
+        // resting orders → `er_active` clears) before isolation. Default 0 ⇒ a
+        // strict no-op for every trader that never touched the ER.
+        require!(ts_er_active == 0, FlashBookError::ErMarginReserved);
         // Snapshot target position scalars (read guard dropped immediately).
         let (
             tp_trader,
@@ -4806,7 +4814,7 @@ pub mod flash_book {
     /// the fill data is taken at face value (a future version verifies
     /// via per-tx fill buffer or Merkle proof against the emitted event).
     /// `taker_was_jit`: set to true if the matched taker order was
-    /// JIT-tagged (flag bit 3 on place_limit_order). The sequencer reads
+    /// JIT-tagged (flag bit 3 on place_limit_order_v2). The sequencer reads
     /// this from the order's stored flags. When true, the maker earns
     /// `market.params.jit_bonus_rebate_bps` extra rebate on top of the
     /// base maker_rebate_bps. Passing false preserves legacy behaviour.
@@ -5228,7 +5236,7 @@ pub mod flash_book {
         let maker_trader_pk = ctx.accounts.maker_trader_state.load()?.trader;
 
         // Apply fees BEFORE position state is mutated, so reads are clean.
-        // Taker pays fee from collateral (must have it; place_limit_order's
+        // Taker pays fee from collateral (must have it; place_limit_order_v2's
         // margin gate ensured this at intake time, but we double-check).
         // For NEGATIVE-fee tier traders, taker_fee == 0 and we credit the
         // taker the rebate sourced from the protocol contribution.
@@ -5908,12 +5916,14 @@ pub mod flash_book {
         // genuinely stalled ER stops fills → this slot ages past
         // MARK_STALENESS_MAX_SLOTS → `liquidate_position_v2` falls back to
         // oracle-only health pricing and `verify_market_invariants` auto-pauses.
-        market.last_mark_update_slot = Clock::get()?.slot;
+        // One Clock syscall for both slot stamps below (identical value within a tx).
+        let fill_now_slot = Clock::get()?.slot;
+        market.last_mark_update_slot = fill_now_slot;
         // Honest settlement-liveness signal for the force-undelegate escape and
         // the S7 auto-pause: unlike the mark slot above, this advances ONLY on a
         // real committed fill (never on the permissionless settle_mark), so a
         // censoring sequencer cannot keep the escape shut by spamming settle_mark.
-        market.last_settlement_slot = Clock::get()?.slot;
+        market.last_settlement_slot = fill_now_slot;
 
         // ── Multi-threshold margin warning ──────────────────────────
         // Single-position equity-vs-MMR view (cheap, no portfolio walk):
@@ -9798,8 +9808,10 @@ pub mod flash_book {
         // mark is replaced by the oracle if its mark is stale (see
         // `effective_health_mark`), so a stalled ER cannot drive a wrongful
         // portfolio liquidation on any leg.
-        let liq_now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
-        let liq_current_slot = Clock::get()?.slot;
+        // One Clock syscall for both reads below (identical value within a tx).
+        let liq_clock = Clock::get()?;
+        let liq_now_unix = liq_clock.unix_timestamp.max(0) as u64;
+        let liq_current_slot = liq_clock.slot;
 
         // Build snapshot vectors with the execution market+position first.
         let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
@@ -18601,7 +18613,7 @@ pub struct InvariantBreachDetectedEvent {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
-/// One leg of a basket order. Mirrors place_limit_order's args minus
+/// One leg of a basket order. Mirrors place_limit_order_v2's args minus
 /// market identity (which is bound by the account context per leg).
 #[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize)]
 pub struct BasketLeg {

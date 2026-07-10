@@ -56,13 +56,13 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 
 | Item | Scope | Owner | Status |
 |---|---|---|---|
-| 2.1 | side-accrual K/F PnL path (`settle_position_pnl` never called) — wire or delete the scaffold | eng | STARTABLE (program change) |
+| 2.1 | side-accrual K/F PnL path (`settle_position_pnl` never called) — wire or delete the scaffold | eng | **DISPOSITION**: safe dormancy, NOT a live gap. The A/K/F/B side indices DO advance live (`advance_indices` from `settle_funding`), but the real economic settlement runs entirely through the already-proven eager path (`cum_funding_index`→`settle_position_funding`→`route_funding`, + `assess_margin`'s unrealized-PnL). `settle_position_pnl`'s input `PositionSnapshot.a_snap` is never populated on a real position, so it returns 0 by its own guard → zero economic effect today. Documented in the `settle_funding` docstring (lib.rs:4655); fields KEPT (deleting the `MarketSideAccrualAccount` layout is an ABI regression on an allocated PDA). Full wiring = adding K/F/A/B snapshots to the live position account + migration + hot-path rewire = a multi-week economic redesign with its own devnet cycle, not a chore. **Reclassified STARTABLE→disposition; do not force a rushed wire/delete** |
 | 2.2 | isolated-position ADL redirect (cross has ADL; isolated doesn't) — close asymmetry + prove | eng | STARTABLE (program change) |
 | 2.3 | on-chain payout walk for referrer/builder/creator shares (today emit-only) | eng | STARTABLE (program change) |
-| 2.4 | automated funding keeper binary/script (+ optional crank incentive) | eng | STARTABLE (tooling) |
+| 2.4 | automated funding keeper binary/script (+ optional crank incentive) | eng | **DONE (keeper)** — `sequencer/funding_keeper.mjs` (+ `npm run funding-keeper`): permissionless service that cranks every configured market's `cum_funding_index` on an interval. Anchor-client on the committed IDL; concurrent per-market with isolated failures; `ONCE` (cron), `DRY_RUN`, and `MIN_DT_SECONDS` (fee optimization — correctness never depends on it, per the on-chain Δt clamp) modes. Never moves value (index-only; positions realize via the proven `settle_funding` path), safe to run multiple instances. Optional crank-incentive = separate program change (deferred) |
 | 2.5 | executable trustless force-undelegate | eng | **DISPOSITION**: returns `OwnerForceUndelegateUnavailable` vs the upgraded delegation program → **vendor-gated** on MagicBlock owner-recovery; public censorship-exit claim must stay downgraded until it ships (see `docs/DECENTRALIZED_SEQUENCER.md`) |
 | 2.6 | force-include from L1 (`errors.rs:141` "not yet supported") | owner | **DISPOSITION**: documented **post-launch roadmap** (not ambiguous) — the ER censorship-exit story rests on 2.5's force-undelegate, not L1 force-include |
-| 2.7 | resolve dual `place_limit_order` migration (lib.rs:1393); delete legacy path | eng | STARTABLE (program change) |
+| 2.7 | resolve dual `place_limit_order` migration (lib.rs:1393); delete legacy path | eng | **DONE (doc-only)** — investigation found the legacy path was ALREADY removed: no `place_limit_order` / `initialize_order_buffer` / order-buffer code exists; `place_limit_order_v2` (+`_session`) is the sole limit-placement ix and `init_market_book` the sole book init. Only stale doc comments remained falsely describing a live dual-book migration ("runs ALONGSIDE the legacy … `initialize_order_buffer`"). Fixed the `place_limit_order_v2` docstring + 6 stale `place_limit_order` mentions (state.rs/lib.rs/proptest) → `place_limit_order_v2`; regenerated `idl/flash_book.json` (doc strings flow into the IDL, gate now green). No code/ABI change |
 
 ## 3 · Manipulation-proof / percolator (3.x)
 
@@ -83,7 +83,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | 4.5 | tranched liquidation (positions above a notional threshold liquidate in tranches) | eng | STARTABLE (program change) |
 | 4.6 | user reduce-only flag on the v2 place path (currently rejected at intake) | eng | STARTABLE (program change) |
 | **4.7** | **robust-median mark** (median for funding/display; worse-of for liquidation) | eng | **STARTABLE** |
-| 4.8 | apply intake IM gate to v3 injection paths (TWAP/iceberg/bracket) | eng | STARTABLE |
+| 4.8 | apply intake IM gate to v3 injection paths (TWAP/iceberg/bracket) | eng | **CONFIRMED HIGH — LAUNCH-BLOCKER** (adversarial re-audit 2026-07-10, `docs/SECURITY_AUDIT_2026-07-10-wave2.md` H-A): NOT an accepted residual — exploitable. `execute_trigger_order_v3` (entry), `execute_twap_slice_v3`, `place_iceberg_order_v3`, `replenish_iceberg_v3`, `place_bracket_order_v3` (parent) AND `vault_place_order_v3` all skip `assert_intake_initial_margin` (which `place_limit_v2_core`/`place_taker` call precisely because settlement can't re-check margin). Thin-collateral attacker injects a large maker order → crossed → under-margined open → bad debt to insurance. **Fix:** shared `assert_injection_intake` (IM + position-budget + OI-cap + oracle-band) on all 6 opening paths, exempt reduce-only. Fail-safe; **devnet-gated** (6-handler pricing/gating change, not a blind push) |
 
 ## 5 · Product / integration (5.x)
 
@@ -94,7 +94,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | **5.3** | **off-chain copy-trading** (snapshot-diff mirror) | eng | **STARTABLE** |
 | 5.4 | activate a real paying maker-rebate schedule (negative-fee tier) | eng | STARTABLE (code exists, disabled) |
 | **5.5** | **builder codes + sub-accounts + referrals** | eng | **DONE** (docs/SDK exposure → 5.6) |
-| 5.6 | agent-native SDK (typed REST, AGENTS.md, llms.txt, OpenAPI, GOTCHAS.md) | eng | STARTABLE |
+| 5.6 | agent-native SDK (typed REST, AGENTS.md, llms.txt, OpenAPI, GOTCHAS.md) | eng | **DONE (docs core)** — `AGENTS.md` (trading lifecycle + exact IDL-grounded instruction signatures + state model + client bootstrap), `llms.txt` (llmstxt.org-style machine index), `docs/GOTCHAS.md` (PDA seeds, sequencer/armed-market trust model, margin-walk completeness, withdraw-anytime reserve, worse-of health, units/flags, hypertree book decode, error convention). All derived from the committed IDL — no aspirational APIs. Remaining (deferred): typed-REST/OpenAPI surface (needs a gateway service, not on-chain) |
 
 ## 6 · Ship gates (6.x)
 
@@ -105,7 +105,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | 6.3 | GPL-vs-MIT license decision (vendored hypertree GPL in MIT repo) | owner/legal | STARTABLE (legal read) |
 | 6.4 | latency benchmark, disclosed methodology (tx sigs + CU + timing) | eng | STARTABLE |
 | 6.5 | pre-commit algorithmic settlement policy (one-pager) | owner | **DONE** — `docs/SETTLEMENT_POLICY.md`: robust-oracle-only settlement, no discretionary repricing, each commitment grounded in the deployed code or a CI proof (3.2 + 5.2) |
-| 6.6 | honest launch framing: "devnet + freshly-audited; run it, read it, break it; mainnet after audit closes" | owner | STARTABLE (positioning; the honesty is already the operating norm) |
+| 6.6 | honest launch framing: "devnet + freshly-audited; run it, read it, break it; mainnet after audit closes" | owner | **DONE** — `docs/LAUNCH_FRAMING.md`: the one-page truth — what is proven today (solvency conservation, no self-liq, manipulated-market credit collapse, frame-stability, all CI-gated), what is NOT yet (not audited, not mainnet), the two honest vendor waits (audit signature, MagicBlock owner-recovery), the declared post-launch builds, and the permanent robust-oracle-only settlement trust wedge. Owner to approve the wording |
 
 ## Big builds (first-class pre-launch tracks)
 
@@ -154,6 +154,21 @@ MagicBlock owner-recovery — both code-complete on our side.
 - **5.5** (pre-existing) builder codes / sub-accounts / referrals — verified in code.
 
 Kani proof count: 59 → **62** (grep-verified on `main`). Lean: 3 → **7** modules, full library `lake build` clean + `#print axioms`-clean.
+
+## Adversarial re-audit 2026-07-10 (9 surfaces, 2 waves) — `docs/SECURITY_AUDIT_2026-07-10*.md`
+
+No CRITICAL on any surface. Access-control, oracle, arithmetic, hypertree,
+settlement-authenticity, and DoS/compute-exhaustion returned **zero exploitable
+findings**. Fixed + shipped: **M-1** — `set_position_isolated` now gates on
+`er_active == 0` (was: could relocate collateral out of ER-order reach → bad debt).
+**Two HIGH launch-blockers** confirmed (both bad-debt-adjacent, fail-safe-fixable,
+devnet-gated; neither direct-theft): **H-A** (4.8 — six maker-open paths skip the
+intake IM gate) and **H-B** (liquidatee can cancel the injected `order_type==3`
+liquidation-close order to dodge liquidation; ADL remains the bankruptcy backstop).
+Plus MEDs (ER attestation-lag, `record_flp_fill_v3` trust, funding snapshot, M-2
+withdraw raw-mark) and LOW/INFO — all in the wave-2 report's fix queue for the next
+devnet-verified cycle. **Launch gate holds these two HIGH + M-2 open** — per the
+mandate's no-defer-lane, they must close before launch.
 
 ## Honest status of the remainder
 
