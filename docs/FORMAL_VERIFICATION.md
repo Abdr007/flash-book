@@ -1,6 +1,6 @@
 # Formal Verification
 
-Flash Book carries **70 Kani proof harnesses** (discharged by CBMC), **7 Lean
+Flash Book carries **72 Kani proof harnesses** (discharged by CBMC), **7 Lean
 proof modules** at the real production divisors, a formal property specification
 (`certora/PROPERTIES.md`), and eight property-test suites. A Kani harness is
 not a sampled test: `kani::any()` ranges over the *entire* input domain
@@ -8,14 +8,14 @@ symbolically, and the model checker proves the assertion for **every** value
 or returns a concrete counterexample. CI runs the full Kani suite and builds
 the Lean proofs on every PR; any broken invariant fails the build.
 
-## Kani coverage (70 harnesses, by module)
+## Kani coverage (72 harnesses, by module)
 
 | Module | # | Properties proven |
 |---|---|---|
 | `matcher/haircut` | 7 | Dust conservation (`credit + dust == matured`, nothing minted or burned), single-convert solvency (credit ≤ residual — the non-printing bound), maturation bounds, residual-delta exactness + round-trip conservation, the CBMC division boundary controls. |
 | `matcher/fill_commitment` | 7 | Settlement ring: never over-settles, depth-bounded, rejects uncommitted/fabricated fills, no double-settle; settlement nonce strictly monotone (replay/reorder rejected), advance strict + exact, chain monotone. |
 | `state_v2` | 6 | Order-id price-time priority: better price fills first on both sides, FIFO sequence tiebreak, id injectivity (no collisions among live orders), guard-admitted orders never collide, seq guard matches the encoding precondition. |
-| `lib` (settlement frame) | 6 | Realized-PnL routing credits exactly one bucket on gain and is bounded/one-sided on loss; cross-loss shortfall conserves and never over-credits; funding routing conserves value, is bounded and one-signed, zero is a no-op. |
+| `lib` (settlement frame) | 8 | Realized-PnL routing credits exactly one bucket on gain and is bounded/one-sided on loss; cross-loss shortfall conserves and never over-credits; funding routing conserves value, is bounded and one-signed, zero is a no-op. |
 | `matcher/risk` | 6 | Effective MMR never below the base floor (proven on the live `MarketSnapshot::effective_mmr_bps` path), OI surcharge capped and disabled at zero slope, healthy ⇒ survives stress, health verdict independent of mark PnL (no double-count), and the real `assess_margin` symbol's three cross-margin frame invariants over all `u64` collateral (`assess_margin_single_market_frame_stable`). |
 | `matcher/liquidation` | 6 | Health price is always one of the two real sources and the worse one for the side (long and short), fresh mark equals worse-of, stale mark falls back to oracle-only, and the **anti-JELLY** property (`jelly_mark_manipulation_yields_no_usable_equity`): a mark manipulated in the attacker's favour can never move the health price past the honest live oracle, so the $20M Hyperliquid-style mark pump converts to ZERO extra usable equity. |
 | `matcher/insurance` | 5 | Solvent ⟺ vault covers the protocol buckets; surplus exact when solvent; the full-invariant reference model; the one-sided partial-collateral insolvency detector is sound (never fires on a solvent state); bad-debt coverage is insurance-isolated and bounded (`bad_debt_coverage_is_insurance_isolated_and_bounded` — no single-vault SPOF). |
