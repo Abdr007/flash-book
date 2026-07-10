@@ -3686,6 +3686,14 @@ pub mod flash_book {
             let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(expected);
             let mut market_snaps: Vec<RiskMarketSnap> = Vec::with_capacity(expected);
             let mut market_keys: Vec<Pubkey> = Vec::with_capacity(expected);
+            // M-2 (security re-audit 2026-07-10): value each leg off the
+            // staleness-gated worse-of(mark, oracle) health price, not the raw EMA
+            // mark — same rationale as partial_withdraw_core (a stale/adverse mark
+            // must not let a losing position be over-valued and over-swept). One
+            // clock read for all legs.
+            let m2_clock = Clock::get()?;
+            let m2_now_unix = m2_clock.unix_timestamp.max(0) as u64;
+            let m2_current_slot = m2_clock.slot;
             for i in 0..expected {
                 let market_ai = &ctx.remaining_accounts[i * 2];
                 let position_ai = &ctx.remaining_accounts[i * 2 + 1];
@@ -3744,7 +3752,13 @@ pub mod flash_book {
                 });
                 market_snaps.push(RiskMarketSnap {
                     market: market_ai.key(),
-                    mark_price: Ticks(market_acct.mark_price_ticks),
+                    // M-2: worse-of(mark, oracle) with the staleness gate, per side.
+                    mark_price: Ticks(effective_health_mark(
+                        &market_acct,
+                        m2_now_unix,
+                        m2_current_slot,
+                        position.side == 0,
+                    )?),
                     cum_funding_index: market_acct.cum_funding_index,
                     // RISK-2: withdraw gate enforces INITIAL margin (IM > MM) so a
                     // trader keeps a buffer above the liquidation line. Liquidation
@@ -13418,6 +13432,17 @@ fn partial_withdraw_core<'info>(
     let mut market_keys: Vec<Pubkey> = Vec::new();
     let mut total_notional_quote: u128 = 0;
 
+    // M-2 (security re-audit 2026-07-10): value each leg for the withdraw margin
+    // check off the staleness-gated worse-of(mark, oracle) health price — the SAME
+    // price liquidation uses (`effective_health_mark`) — never the raw EMA mark. A
+    // frozen/adverse mark on a stalled or illiquid market must not let a losing
+    // position be over-valued so the requirement is understated and the trader
+    // over-withdraws (bad debt socialized to insurance). A stale mark with no fresh
+    // oracle reverts (fail-safe). One clock read for all legs.
+    let m2_clock = Clock::get()?;
+    let m2_now_unix = m2_clock.unix_timestamp.max(0) as u64;
+    let m2_current_slot = m2_clock.slot;
+
     let mut i = 0usize;
     while i + 1 < remaining.len() {
         let m_ai = &remaining[i];
@@ -13467,7 +13492,13 @@ fn partial_withdraw_core<'info>(
         });
         market_snaps.push(RiskMarketSnap {
             market: m_ai.key(),
-            mark_price: Ticks(market.mark_price_ticks),
+            // M-2: worse-of(mark, oracle) with the staleness gate, per leg side.
+            mark_price: Ticks(effective_health_mark(
+                &market,
+                m2_now_unix,
+                m2_current_slot,
+                position.side == 0,
+            )?),
             cum_funding_index: market.cum_funding_index,
             // RISK-2: withdraw gate enforces INITIAL margin (buffer above liquidation).
             maintenance_margin_bps: market.params.initial_margin_ratio_bps,
