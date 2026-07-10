@@ -67,5 +67,10 @@ pub fn solvency_preserved_simple_withdraw() {
     let total_collateral_post = total_collateral - amount;
 
     // Solvent after, per the REAL invariant.
-    cvlr_assert!(solvent(vault_post, total_collateral_post, flp_capital, insurance));
+    cvlr_assert!(solvent(
+        vault_post,
+        total_collateral_post,
+        flp_capital,
+        insurance
+    ));
 }
