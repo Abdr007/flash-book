@@ -238,4 +238,32 @@ mod tests {
             }
         }
     }
+
+    /// MIGRATE (Track A2): the remaining non-arithmetic money-path sites are
+    /// conserved by CONSTRUCTION, not by a proven arithmetic core. The two
+    /// structural guarantees this test pins:
+    ///
+    /// (1) `migrate_position_to_trader_state_key` copies collateral VERBATIM
+    ///     (`new_pos.collateral_quote_lots = legacy.collateral_quote_lots;`) — a
+    ///     whole-position relocation, never a computation, so nothing is minted.
+    /// (2) the LEGACY source position carries an Anchor `close = trader`
+    ///     constraint, so it is destroyed by the runtime — the relocated position
+    ///     cannot be double-counted across two live accounts.
+    ///
+    /// (The other residual writes are `= 0` account teardown / init-at-creation:
+    /// zeroing an emptied bucket or setting a genesis value — trivially conserving,
+    /// with no arithmetic to prove.)
+    #[test]
+    fn migrate_relocation_conserves_by_construction() {
+        assert!(
+            LIB_RS.contains("new_pos.collateral_quote_lots = legacy.collateral_quote_lots;"),
+            "migrate no longer copies collateral verbatim — the relocation changed; re-establish \
+             that it is a copy (not arithmetic) or route it through a proven core (A2)"
+        );
+        assert!(
+            LIB_RS.contains("close = trader"),
+            "the migrate legacy_position must carry `close = trader` so the relocated collateral \
+             cannot be duplicated across two live accounts (A2)"
+        );
+    }
 }
