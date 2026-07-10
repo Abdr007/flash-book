@@ -9174,15 +9174,20 @@ pub mod flash_book {
             // the pooled trader_state.collateral_quote_lots.
             let is_isolated = position.collateral_quote_lots > 0;
             if is_isolated {
+                // Track A2: the reward move (isolated position → liquidator) goes
+                // through the proven conservation core. Safe from aliasing — a
+                // `position` account can never be the `caller_trader_state`.
                 let mut pos = ctx.accounts.position.load_mut()?;
                 reward_paid = reward_u64.min(pos.collateral_quote_lots);
                 if reward_paid > 0 {
-                    pos.collateral_quote_lots -= reward_paid;
                     let mut caller_ts = ctx.accounts.caller_trader_state.load_mut()?;
-                    caller_ts.collateral_quote_lots = caller_ts
-                        .collateral_quote_lots
-                        .checked_add(reward_paid)
-                        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                    let (pos_after, caller_after, _paid) = xmargin::apply_liquidation_reward(
+                        pos.collateral_quote_lots,
+                        caller_ts.collateral_quote_lots,
+                        reward_u64,
+                    )?;
+                    pos.collateral_quote_lots = pos_after;
+                    caller_ts.collateral_quote_lots = caller_after;
                 }
             } else {
                 reward_paid =

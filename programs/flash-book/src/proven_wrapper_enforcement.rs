@@ -203,6 +203,10 @@ mod tests {
         for (core, handler) in [
             ("split_to_isolated(", "set_position_isolated"),
             ("merge_to_cross(", "set_position_cross"),
+            // Liquidation reward (isolated branch): the position→liquidator move
+            // routes through the proven capped-transfer core. (The cross branch
+            // stays inline pending an aliasing-safe extraction — tracked residual.)
+            ("apply_liquidation_reward(", "liquidate_position_v2"),
         ] {
             let callers = enclosing_fns(LIB_RS, core);
             assert!(
