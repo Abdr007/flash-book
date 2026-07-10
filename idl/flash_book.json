@@ -4132,6 +4132,9 @@
           "name": "market"
         },
         {
+          "name": "trader_state"
+        },
+        {
           "name": "market_book",
           "writable": true,
           "pda": {
@@ -4242,6 +4245,13 @@
         {
           "name": "twap_order",
           "writable": true
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": []
@@ -9242,6 +9252,10 @@
           "name": "trader_state"
         },
         {
+          "name": "position",
+          "optional": true
+        },
+        {
           "name": "market"
         },
         {
@@ -9356,6 +9370,10 @@
         },
         {
           "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         },
         {
           "name": "market"
@@ -10900,6 +10918,13 @@
         {
           "name": "iceberg_order",
           "writable": true
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": []
@@ -14621,6 +14646,10 @@
               }
             ]
           }
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": [

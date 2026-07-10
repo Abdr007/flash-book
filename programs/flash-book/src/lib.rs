@@ -10421,6 +10421,30 @@ pub mod flash_book {
             size_lots
         };
 
+        // H-A (item 4.8): bind the caller-supplied TraderState to the trigger's
+        // trader, then gate the injected order (reduce-only exempt via is_reduce_only,
+        // so a reduce-close still fires; an OPENING entry must be backed). Mirrors
+        // place_limit_v2_core; the position is already trigger-bound above.
+        require!(
+            ctx.accounts.trader_state.load()?.trader == trader_pk,
+            FlashBookError::WrongTrader
+        );
+        let ha_ts_key = ctx.accounts.trader_state.key();
+        let ha_mkt_key = ctx.accounts.market.key();
+        gate_injection_open(
+            &ha_mkt_key,
+            ctx.accounts.market.params.initial_margin_ratio_bps,
+            ctx.accounts.market.params.tick_size,
+            &ctx.accounts.trader_state,
+            &ha_ts_key,
+            Some(&ctx.accounts.position),
+            ctx.program_id,
+            side,
+            effective_size,
+            limit_ticks,
+            is_reduce_only,
+        )?;
+
         let side_is_bid = side == 0;
         let order = state_v2::RestingOrderV2 {
             order_id: state_v2::encode_order_id(limit_ticks, seq, side_is_bid),
@@ -10692,6 +10716,27 @@ pub mod flash_book {
         let twap_sub_index = twap.sub_index;
         let market_key = market.key();
 
+        // H-A (item 4.8): bind the caller-supplied TraderState to the twap's trader
+        // and gate the OPENING slice (twap slices always open; None position ⇒ full-open).
+        require!(
+            ctx.accounts.trader_state.load()?.trader == trader_pk,
+            FlashBookError::WrongTrader
+        );
+        let ha_ts_key = ctx.accounts.trader_state.key();
+        gate_injection_open(
+            &market_key,
+            market.params.initial_margin_ratio_bps,
+            market.params.tick_size,
+            &ctx.accounts.trader_state,
+            &ha_ts_key,
+            ctx.accounts.position.as_ref(),
+            ctx.program_id,
+            side,
+            slice_size,
+            limit,
+            false,
+        )?;
+
         // Inline order injection.
         let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
         let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
@@ -10833,6 +10878,24 @@ pub mod flash_book {
         let market_key = market.key();
         let first_chunk = displayed_size_lots.min(total_size_lots);
 
+        // H-A (item 4.8): the visible chunk OPENS exposure and settlement cannot
+        // re-check margin, so gate it now exactly like place_limit_v2_core (reduces
+        // are exempt inside the helper; None position ⇒ full-open, strictest).
+        let ts_key = ctx.accounts.trader_state.key();
+        gate_injection_open(
+            &market_key,
+            market.params.initial_margin_ratio_bps,
+            market.params.tick_size,
+            &ctx.accounts.trader_state,
+            &ts_key,
+            ctx.accounts.position.as_ref(),
+            ctx.program_id,
+            side,
+            first_chunk,
+            limit_ticks,
+            false,
+        )?;
+
         // Inline first-chunk insertion.
         let inserted_seq;
         {
@@ -10926,6 +10989,27 @@ pub mod flash_book {
         let iceberg_sub_index = iceberg.sub_index;
         let iceberg_prev_child_seq = iceberg.child_order_seq;
         let market_key = market.key();
+
+        // H-A (item 4.8): bind caller-supplied TraderState to the iceberg's trader,
+        // gate the OPENING replenish chunk (None position ⇒ full-open).
+        require!(
+            ctx.accounts.trader_state.load()?.trader == trader_pk,
+            FlashBookError::WrongTrader
+        );
+        let ha_ts_key = ctx.accounts.trader_state.key();
+        gate_injection_open(
+            &market_key,
+            market.params.initial_margin_ratio_bps,
+            market.params.tick_size,
+            &ctx.accounts.trader_state,
+            &ha_ts_key,
+            ctx.accounts.position.as_ref(),
+            ctx.program_id,
+            side,
+            chunk,
+            limit,
+            false,
+        )?;
 
         let inserted_seq;
         {
@@ -11113,6 +11197,23 @@ pub mod flash_book {
 
         let trader_pk = ctx.accounts.trader.key();
         let market_key = market.key();
+
+        // H-A (item 4.8): gate the OPENING parent leg exactly like place_limit_v2_core
+        // (the TP/SL legs are reduce-only and exempt). None position ⇒ full-open.
+        let ts_key = ctx.accounts.trader_state.key();
+        gate_injection_open(
+            &market_key,
+            market.params.initial_margin_ratio_bps,
+            market.params.tick_size,
+            &ctx.accounts.trader_state,
+            &ts_key,
+            ctx.accounts.position.as_ref(),
+            ctx.program_id,
+            parent_side,
+            size_lots,
+            parent_limit_ticks,
+            false,
+        )?;
 
         // 1. Parent limit order injected directly.
         {
@@ -11510,6 +11611,25 @@ pub mod flash_book {
             limit_ticks % market.params.tick_size == 0,
             FlashBookError::PriceNotOnTick
         );
+
+        // H-A (item 4.8): gate the vault's OPENING order against its own TraderState
+        // collateral, exactly like place_limit_v2_core (reduce-only already rejected
+        // above). None position ⇒ full-open. Closes the vault under-margined-open leak.
+        let vts_key = ctx.accounts.vault_trader_state.key();
+        let market_key_ha = market.key();
+        gate_injection_open(
+            &market_key_ha,
+            market.params.initial_margin_ratio_bps,
+            market.params.tick_size,
+            &ctx.accounts.vault_trader_state,
+            &vts_key,
+            ctx.accounts.position.as_ref(),
+            ctx.program_id,
+            side,
+            size_lots,
+            limit_ticks,
+            false,
+        )?;
 
         let oi_cap = market.params.max_oi_base_lots;
         if oi_cap > 0 {
@@ -20469,7 +20589,7 @@ fn assert_injection_intake(
 /// `place_limit_v2_core` intake block so every v3 maker-open path gates
 /// identically. `position == None` ⇒ full-open (strictest), matching the
 /// canonical `Option<position>` semantics.
-#[allow(clippy::too_many_arguments, dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn gate_injection_open<'info>(
     market_key: &Pubkey,
     im_bps: u32,
@@ -21198,6 +21318,11 @@ pub struct ExecuteTriggerOrderV3<'info> {
 
     pub market: Account<'info, MarketAccount>,
 
+    // H-A: the trigger.trader's (sub_index) TraderState — the permissionless caller
+    // supplies it; PDA/ownership bound to `trigger_order.trader` in-handler. Needed
+    // for the intake margin gate on an OPENING (non-reduce-only) trigger.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
     /// CHECK: market_book PDA — disc validated inside handler.
     #[account(
         mut,
@@ -21515,6 +21640,11 @@ pub struct ExecuteTwapSliceV3<'info> {
         bump = twap_order.bump,
     )]
     pub twap_order: Account<'info, state_v3::TwapOrderAccountV3>,
+
+    // H-A: the twap.trader's TraderState + OPTIONAL position — the permissionless
+    // caller supplies them; bound to twap_order.trader in-handler. For the intake gate.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+    pub position: Option<AccountLoader<'info, state::PositionAccount>>,
 }
 
 #[derive(Accounts)]
@@ -21544,6 +21674,10 @@ pub struct PlaceIcebergOrderV3<'info> {
 
     // (trader, sub_index) TraderState — see PlaceTriggerOrderV3.
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    // H-A: OPTIONAL (trader_state, market) position for the intake margin gate —
+    // PDA-verified in-handler; None ⇒ full-open (strictest). Mirrors PlaceLimitOrderV2.
+    pub position: Option<AccountLoader<'info, state::PositionAccount>>,
 
     pub market: Account<'info, MarketAccount>,
 
@@ -21597,6 +21731,11 @@ pub struct ReplenishIcebergV3<'info> {
         bump = iceberg_order.bump,
     )]
     pub iceberg_order: Account<'info, state_v3::IcebergOrderAccountV3>,
+
+    // H-A: the iceberg.trader's TraderState + OPTIONAL position — the permissionless
+    // caller supplies them; bound to iceberg_order.trader in-handler. For the intake gate.
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+    pub position: Option<AccountLoader<'info, state::PositionAccount>>,
 }
 
 #[derive(Accounts)]
@@ -21634,6 +21773,10 @@ pub struct PlaceBracketOrderV3<'info> {
 
     // (trader, sub_index) TraderState — see PlaceTriggerOrderV3.
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    // H-A: OPTIONAL position for the intake margin gate on the parent leg —
+    // PDA-verified in-handler; None ⇒ full-open. Mirrors PlaceLimitOrderV2.
+    pub position: Option<AccountLoader<'info, state::PositionAccount>>,
 
     // Boxed: moves the 1152-byte MarketAccount off the try_accounts stack
     // frame — the C-1 trader_state addition otherwise tips this context's frame past
@@ -21879,6 +22022,10 @@ pub struct VaultPlaceOrderV3<'info> {
         bump,
     )]
     pub vault_trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    // H-A: OPTIONAL (vault_trader_state, market) position for the intake margin gate
+    // — PDA-verified in-handler; None ⇒ full-open. Mirrors PlaceLimitOrderV2.
+    pub position: Option<AccountLoader<'info, state::PositionAccount>>,
 }
 
 #[derive(Accounts)]
