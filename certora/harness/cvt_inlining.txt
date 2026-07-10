@@ -1,0 +1,13 @@
+# Certora Solana inlining directives for the P-SOLV-4 solvency harness.
+#
+# SCAFFOLD (unvalidated without the licensed cvlr toolchain). Inline the small
+# proven-pure cores so the Prover discharges them directly instead of
+# over-approximating across a call boundary — keeping the all-paths proof precise
+# without re-deriving arithmetic Kani already proved.
+#
+# inline: matcher::insurance::assess_solvency_full
+# inline: matcher::insurance::partial_collateral_proves_insolvent
+#
+# Do NOT inline the handler bodies themselves — `solvencyPreserved(method f)`
+# must range over each real entrypoint so a counterexample names the offending
+# instruction.
