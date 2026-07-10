@@ -5898,12 +5898,14 @@ pub mod flash_book {
         // genuinely stalled ER stops fills → this slot ages past
         // MARK_STALENESS_MAX_SLOTS → `liquidate_position_v2` falls back to
         // oracle-only health pricing and `verify_market_invariants` auto-pauses.
-        market.last_mark_update_slot = Clock::get()?.slot;
+        // One Clock syscall for both slot stamps below (identical value within a tx).
+        let fill_now_slot = Clock::get()?.slot;
+        market.last_mark_update_slot = fill_now_slot;
         // Honest settlement-liveness signal for the force-undelegate escape and
         // the S7 auto-pause: unlike the mark slot above, this advances ONLY on a
         // real committed fill (never on the permissionless settle_mark), so a
         // censoring sequencer cannot keep the escape shut by spamming settle_mark.
-        market.last_settlement_slot = Clock::get()?.slot;
+        market.last_settlement_slot = fill_now_slot;
 
         // ── Multi-threshold margin warning ──────────────────────────
         // Single-position equity-vs-MMR view (cheap, no portfolio walk):
@@ -9788,8 +9790,10 @@ pub mod flash_book {
         // mark is replaced by the oracle if its mark is stale (see
         // `effective_health_mark`), so a stalled ER cannot drive a wrongful
         // portfolio liquidation on any leg.
-        let liq_now_unix = Clock::get()?.unix_timestamp.max(0) as u64;
-        let liq_current_slot = Clock::get()?.slot;
+        // One Clock syscall for both reads below (identical value within a tx).
+        let liq_clock = Clock::get()?;
+        let liq_now_unix = liq_clock.unix_timestamp.max(0) as u64;
+        let liq_current_slot = liq_clock.slot;
 
         // Build snapshot vectors with the execution market+position first.
         let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
