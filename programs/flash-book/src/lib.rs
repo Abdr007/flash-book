@@ -20432,17 +20432,10 @@ fn assert_open_position_budget(open_positions: u8, pos: Option<(u8, u64)>) -> Re
 /// here, or its later fill opens an under-margined position whose loss socializes
 /// to insurance. Reduce-only orders are EXEMPT (the maker clamp caps them to
 /// reducible size). `pos` = the trader's current (side, size) on this market, or
-/// `None` if flat/unavailable (treated as a full open — strictest, never a bypass).
-///
-/// READY-TO-WIRE: the 6 maker-open call sites (the 5 v3 injection handlers +
-/// `vault_place_order_v3`) are wired to this helper in the SBF/devnet session —
-/// three of them (`execute_trigger_order_v3`, `execute_twap_slice_v3`,
-/// `replenish_iceberg_v3`) first gain a `trader_state`(+position) account (an IDL
-/// change whose executor account-passing must be integration-tested), which is why
-/// the wiring is deferred to the environment that can build-sbf + run devnet
-/// acceptance (see `docs/ACCEPTANCE_CRITICAL_PATH.md`). The gate logic itself is
-/// unit-proven below.
-#[allow(clippy::too_many_arguments, dead_code)]
+/// `None` if flat/unavailable (treated as a full open — strictest, matching the
+/// canonical `place_limit_v2_core` `Option<position>` semantics). Wired into all 6
+/// maker-open paths via `gate_injection_open` (below).
+#[allow(clippy::too_many_arguments)]
 fn assert_injection_intake(
     side: u8,
     size_lots: u64,
@@ -20468,6 +20461,55 @@ fn assert_injection_intake(
     )?;
     assert_open_position_budget(open_positions, pos)?;
     Ok(())
+}
+
+/// H-A wiring helper: extract `(pos_info, backing)` from an optional PDA-verified
+/// position + the trader_state (isolated collateral if the position carries it,
+/// else the cross pool), then run `assert_injection_intake`. Mirrors the
+/// `place_limit_v2_core` intake block so every v3 maker-open path gates
+/// identically. `position == None` ⇒ full-open (strictest), matching the
+/// canonical `Option<position>` semantics.
+#[allow(clippy::too_many_arguments, dead_code)]
+fn gate_injection_open<'info>(
+    market_key: &Pubkey,
+    im_bps: u32,
+    tick_size: u64,
+    trader_state: &AccountLoader<'info, TraderStateAccount>,
+    trader_state_key: &Pubkey,
+    position: Option<&AccountLoader<'info, state::PositionAccount>>,
+    program_id: &Pubkey,
+    side: u8,
+    size_lots: u64,
+    limit_ticks: u64,
+    is_reduce_only: bool,
+) -> Result<()> {
+    let (open_positions, cross_collateral) = {
+        let ts = trader_state.load()?;
+        (ts.open_positions, ts.collateral_quote_lots)
+    };
+    let (pos_info, backing) = if let Some(pl) = position {
+        let pd = pl.load()?;
+        verify_position_pda(market_key, trader_state_key, pd.bump, &pl.key(), program_id)?;
+        let backing = if pd.collateral_quote_lots > 0 {
+            pd.collateral_quote_lots
+        } else {
+            cross_collateral
+        };
+        (Some((pd.side, pd.size_lots)), backing)
+    } else {
+        (None, cross_collateral)
+    };
+    assert_injection_intake(
+        side,
+        size_lots,
+        limit_ticks,
+        is_reduce_only,
+        im_bps,
+        tick_size,
+        backing,
+        open_positions,
+        pos_info,
+    )
 }
 
 #[cfg(test)]
