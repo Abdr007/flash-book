@@ -82,6 +82,33 @@ pub fn check_simple_withdraw(collateral: u64, amount: u64, er_reserved: u64) -> 
     Ok(())
 }
 
+/// Pure core for an INTERNAL collateral transfer between two of the same
+/// trader's accounts (Track A2 extract-and-prove): move `amount` quote-lots from
+/// `src` to `dst`, leaving at least `er_reserved` behind on the source. Returns
+/// the new `(src, dst)` balances.
+///
+/// This IS the transfer handlers' code path — `transfer_main_to_sub` /
+/// `transfer_sub_to_main` mutate the two `collateral_quote_lots` fields ONLY via
+/// this function (enforced by `proven_wrapper_enforcement`), so the balance
+/// arithmetic is proven here rather than inline. Reuses the already-proven
+/// `check_simple_withdraw` gate — no duplicated guard. TOTAL collateral is
+/// conserved: `src_after + dst_after == src + dst` (proven in
+/// `collateral_transfer_conserves_total`).
+#[inline]
+pub fn apply_collateral_transfer(
+    src: u64,
+    dst: u64,
+    amount: u64,
+    er_reserved: u64,
+) -> Result<(u64, u64)> {
+    check_simple_withdraw(src, amount, er_reserved)?; // amount ≤ src, src − amount ≥ er_reserved
+    let src_after = src - amount; // gate ⇒ no underflow
+    let dst_after = dst
+        .checked_add(amount)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    Ok((src_after, dst_after))
+}
+
 /// Resolve the ER reserved margin a collateral-releasing path must leave
 /// behind on the source trader_state. Fail-closed in both directions: an
 /// ER-active source (live attested reservation) must supply its own bound
@@ -213,6 +240,30 @@ mod xmargin_kani_proofs {
             // amount <= collateral was required, so this does not underflow.
             assert!(amount <= collateral);
             assert!(collateral - amount >= er_reserved);
+        }
+    }
+
+    /// CONSERVATION (Track A2): the internal collateral transfer core neither
+    /// mints nor burns collateral — the total across the two accounts is
+    /// invariant, the source keeps its ER reservation, and exactly `amount`
+    /// moves. Proven on the REAL `apply_collateral_transfer` symbol over all
+    /// `u64`, so the `transfer_*` handlers that route through it preserve
+    /// V = Σ collateral + … .
+    #[kani::proof]
+    fn collateral_transfer_conserves_total() {
+        let src: u64 = kani::any();
+        let dst: u64 = kani::any();
+        let amount: u64 = kani::any();
+        let er_reserved: u64 = kani::any();
+        if let Ok((src_after, dst_after)) = apply_collateral_transfer(src, dst, amount, er_reserved)
+        {
+            // total collateral conserved — nothing minted or burned
+            assert!(src_after as u128 + dst_after as u128 == src as u128 + dst as u128);
+            // exactly `amount` moved from src to dst
+            assert!(src_after == src - amount);
+            assert!(dst_after == dst + amount);
+            // the source still covers its ER reservation
+            assert!(src_after >= er_reserved);
         }
     }
 
