@@ -109,6 +109,31 @@ pub fn apply_collateral_transfer(
     Ok((src_after, dst_after))
 }
 
+/// Pure core for the CROSS→ISOLATED margin conversion (Track A2): move `amount`
+/// collateral from the trader's pooled cross balance into a fresh isolated
+/// position (which held 0). Returns `(cross_after, isolated_after)`. Preserves
+/// the exact `ArithmeticUnderflow` error the inline path used. Conserves total:
+/// `cross_after + isolated_after == cross` (proven in `split_to_isolated_conserves`).
+#[inline]
+pub fn split_to_isolated(cross: u64, amount: u64) -> Result<(u64, u64)> {
+    let cross_after = cross
+        .checked_sub(amount)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+    Ok((cross_after, amount)) // fresh isolated position started at 0
+}
+
+/// Pure core for the ISOLATED→CROSS margin conversion (Track A2): return all of
+/// an isolated position's `isolated` collateral to the pooled cross balance.
+/// Returns `cross_after`. Preserves the exact `ArithmeticOverflow` error.
+/// Conserves total: `cross_after == cross + isolated` (proven in
+/// `merge_to_cross_conserves`); the isolated position is then zeroed by the caller.
+#[inline]
+pub fn merge_to_cross(cross: u64, isolated: u64) -> Result<u64> {
+    cross
+        .checked_add(isolated)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))
+}
+
 /// Resolve the ER reserved margin a collateral-releasing path must leave
 /// behind on the source trader_state. Fail-closed in both directions: an
 /// ER-active source (live attested reservation) must supply its own bound
@@ -264,6 +289,33 @@ mod xmargin_kani_proofs {
             assert!(dst_after == dst + amount);
             // the source still covers its ER reservation
             assert!(src_after >= er_reserved);
+        }
+    }
+
+    /// CONSERVATION (Track A2): the cross→isolated margin conversion moves
+    /// `amount` from the cross pool to a fresh isolated position without minting
+    /// or burning — `cross_after + isolated_after == cross`, on the real
+    /// `split_to_isolated` symbol over all `u64`.
+    #[kani::proof]
+    fn split_to_isolated_conserves() {
+        let cross: u64 = kani::any();
+        let amount: u64 = kani::any();
+        if let Ok((cross_after, isolated_after)) = split_to_isolated(cross, amount) {
+            assert!(cross_after as u128 + isolated_after as u128 == cross as u128);
+            assert!(cross_after == cross - amount);
+            assert!(isolated_after == amount);
+        }
+    }
+
+    /// CONSERVATION (Track A2): the isolated→cross margin conversion returns all
+    /// isolated collateral to the cross pool without minting or burning —
+    /// `cross_after == cross + isolated`, on the real `merge_to_cross` symbol.
+    #[kani::proof]
+    fn merge_to_cross_conserves() {
+        let cross: u64 = kani::any();
+        let isolated: u64 = kani::any();
+        if let Ok(cross_after) = merge_to_cross(cross, isolated) {
+            assert!(cross_after as u128 == cross as u128 + isolated as u128);
         }
     }
 

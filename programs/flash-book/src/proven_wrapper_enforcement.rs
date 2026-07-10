@@ -190,4 +190,32 @@ mod tests {
             }
         }
     }
+
+    /// MARGIN CONVERSIONS (Track A2): the isolated↔cross collateral pool moves go
+    /// ONLY through their proven conservation cores. Unlike the transfer handlers,
+    /// these handlers contain other (non-collateral) arithmetic, so the guarantee
+    /// is routing: each core is called only from its sanctioned handler, and each
+    /// conversion handler routes its collateral move through the core — binding the
+    /// `split_to_isolated_conserves` / `merge_to_cross_conserves` Kani proofs to
+    /// the shipped path.
+    #[test]
+    fn margin_conversions_move_collateral_only_via_proven_core() {
+        for (core, handler) in [
+            ("split_to_isolated(", "set_position_isolated"),
+            ("merge_to_cross(", "set_position_cross"),
+        ] {
+            let callers = enclosing_fns(LIB_RS, core);
+            assert!(
+                !callers.is_empty(),
+                "no `{core}` call site in lib.rs — needle stale, update this guard (A2)"
+            );
+            for f in &callers {
+                assert_eq!(
+                    f, handler,
+                    "`{core}` is called from `{f}`, not the sanctioned `{handler}` — the margin \
+                     pool move routes through the proven core only (A2)"
+                );
+            }
+        }
+    }
 }
