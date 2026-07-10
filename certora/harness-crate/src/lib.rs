@@ -176,3 +176,18 @@ pub fn solvency_preserved_withdraw_gate() {
         insurance
     ));
 }
+
+/// MINIMAL reproducer for the Certora Anchor `error!` global-memcpy blocker.
+/// See certora/repro/. Evaluating the real `check_simple_withdraw` (which uses
+/// `require!`/`error!`) makes the Prover analyze Anchor error construction and
+/// return UNKNOWN "illegal dereference of an absolute address", despite the
+/// trivial assertion. Isolates the SOLE cause for the Certora support request.
+#[allow(dead_code)]
+#[rule]
+pub fn repro_anchor_error_memcpy() {
+    let collateral: u64 = nondet();
+    let amount: u64 = nondet();
+    let er_reserved: u64 = nondet();
+    let _ = check_simple_withdraw(collateral, amount, er_reserved).is_ok();
+    cvlr_assert!(true);
+}
