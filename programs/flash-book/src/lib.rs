@@ -4258,14 +4258,24 @@ pub mod flash_book {
         amount_quote_lots: u64,
     ) -> Result<()> {
         require!(amount_quote_lots > 0, FlashBookError::ZeroSize);
-        let (trader_pk, ts_open, ts_collateral) = {
+        let (trader_pk, ts_open, ts_collateral, ts_er_active) = {
             let ts = ctx.accounts.trader_state.load()?;
             (
                 ts.trader,
                 ts.open_positions as usize,
                 ts.collateral_quote_lots,
+                ts.er_active,
             )
         };
+        // SECURITY (adversarial re-audit 2026-07-10): an ER-active trader (attested
+        // reserved margin backing resting ER orders) must NOT relocate cross
+        // collateral into an isolated bucket — that drains the cross pool below the
+        // ER reservation while walling the collateral off from the ER order's
+        // settlement, dumping bad debt onto insurance. Mirror the withdraw /
+        // partial-withdraw / sweep gate: force ER resolution (undelegate / cancel
+        // resting orders → `er_active` clears) before isolation. Default 0 ⇒ a
+        // strict no-op for every trader that never touched the ER.
+        require!(ts_er_active == 0, FlashBookError::ErMarginReserved);
         // Snapshot target position scalars (read guard dropped immediately).
         let (
             tp_trader,
