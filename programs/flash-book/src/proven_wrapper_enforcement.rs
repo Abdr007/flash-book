@@ -155,9 +155,17 @@ mod tests {
     #[test]
     fn internal_transfers_mutate_collateral_only_via_proven_core() {
         const TRANSFER_HANDLERS: [&str; 2] = ["transfer_main_to_sub", "transfer_sub_to_main"];
+        // All sanctioned callers of the conserving-transfer core: the two sub-account
+        // transfers PLUS `sweep_collateral` (also a conserving move between two of a
+        // trader's states, routed through the same proven core).
+        const CONSERVING_CALLERS: [&str; 3] = [
+            "transfer_main_to_sub",
+            "transfer_sub_to_main",
+            "sweep_collateral",
+        ];
 
-        // (1) Every `apply_collateral_transfer` call site in lib.rs is one of the
-        // two sanctioned transfer handlers — nothing else may perform this move.
+        // (1) Every `apply_collateral_transfer` call site in lib.rs is a sanctioned
+        // conserving-move handler — nothing else may perform this move.
         let callers = enclosing_fns(LIB_RS, "apply_collateral_transfer(");
         assert!(
             !callers.is_empty(),
@@ -165,9 +173,9 @@ mod tests {
         );
         for f in &callers {
             assert!(
-                TRANSFER_HANDLERS.contains(&f.as_str()),
-                "apply_collateral_transfer is called from `{f}`, not an allowlisted transfer \
-                 handler — internal collateral moves route through the proven core only (A2)"
+                CONSERVING_CALLERS.contains(&f.as_str()),
+                "apply_collateral_transfer is called from `{f}`, not a sanctioned conserving-move \
+                 handler — such moves route through the proven core only (A2)"
             );
         }
         // (2) BOTH handlers actually route through it.

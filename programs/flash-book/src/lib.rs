@@ -3774,15 +3774,17 @@ pub mod flash_book {
 
         let to_trader = {
             let mut from = ctx.accounts.from_state.load_mut()?;
-            from.collateral_quote_lots = from
-                .collateral_quote_lots
-                .checked_sub(amount)
-                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
             let mut to = ctx.accounts.to_state.load_mut()?;
-            to.collateral_quote_lots = to
-                .collateral_quote_lots
-                .checked_add(amount)
-                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            // Track A2: the sweep move is a conserving transfer through the proven
+            // core (er_reserved = 0; the health/ER gate is enforced separately).
+            let (from_after, to_after) = xmargin::apply_collateral_transfer(
+                from.collateral_quote_lots,
+                to.collateral_quote_lots,
+                amount,
+                0,
+            )?;
+            from.collateral_quote_lots = from_after;
+            to.collateral_quote_lots = to_after;
             to.trader
         };
 
@@ -3887,10 +3889,9 @@ pub mod flash_book {
         // Accounting.
         let (trader, new_balance) = {
             let mut s = ctx.accounts.trader_state.load_mut()?;
-            s.collateral_quote_lots = s
-                .collateral_quote_lots
-                .checked_add(amount_quote_lots)
-                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            // Track A2: deposit credit through the proven checked-credit core.
+            s.collateral_quote_lots =
+                xmargin::apply_collateral_credit(s.collateral_quote_lots, amount_quote_lots)?;
             (s.trader, s.collateral_quote_lots)
         };
         emit!(CollateralDepositedEvent {
@@ -5355,10 +5356,9 @@ pub mod flash_book {
             } else {
                 contribution as u64
             };
-            fund.balance_quote_lots = fund
-                .balance_quote_lots
-                .checked_add(contribution_u64)
-                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            // Track A2: insurance-contribution credit through the proven core.
+            fund.balance_quote_lots =
+                xmargin::apply_collateral_credit(fund.balance_quote_lots, contribution_u64)?;
             fund.total_contributions = fund.total_contributions.saturating_add(contribution_u64);
             insurance_contribution_paid = contribution_u64;
         }
