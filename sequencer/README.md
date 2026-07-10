@@ -74,3 +74,30 @@ L1_RPC=<devnet> ER_RPC=https://devnet-as.magicblock.app node cranker_acceptance.
 - One attestation account per trader_state spans **all** markets, so a
   deployment must run a single cranker instance (or shard by trader, never by
   market) to avoid two writers ping-ponging epochs.
+
+## Funding keeper (`funding_keeper.mjs`)
+
+`crank_funding` advances each market's `cum_funding_index` from the live
+(mark, oracle) premium. It is **permissionless**, rate-capped, oracle-gated, and
+clamps Δt to one funding period — the on-chain proof
+`funding_index_delta_is_gated_and_safe` guarantees no caller-reachable input drives
+the index past those bounds. The keeper only keeps the index current; it **never
+moves value** (positions realize funding later through the Kani-proven
+`settle_funding` / `route_funding` path), so running it or not can neither mint nor
+burn value — a stale index just means funding applies in fewer, larger (still
+per-period-clamped) steps.
+
+Safe to run multiple instances: same-second cranks are on-chain no-ops, and the
+worst race is one wasted zero-delta tx. The keypair only pays fees.
+
+```
+# crank a fixed market set every 15s
+L1_RPC=<devnet> MARKETS=<mkt1,mkt2> npm run funding-keeper
+
+# one pass (cron-style); or dry-run to see what would be cranked
+L1_RPC=<devnet> MARKETS=<mkt1> ONCE=1 npm run funding-keeper
+L1_RPC=<devnet> MARKETS=<mkt1> DRY_RUN=1 npm run funding-keeper
+# skip a market cranked within the last N seconds (fee optimization; correctness
+# never depends on it thanks to the on-chain Δt clamp)
+L1_RPC=<devnet> MARKETS=<mkt1> MIN_DT_SECONDS=5 npm run funding-keeper
+```
