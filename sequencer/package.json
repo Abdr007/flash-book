@@ -6,7 +6,8 @@
   "description": "Sequencer-side ER reserved-margin attestation cranker — keeps every trader's ErMarginAttestation current with the margin their live ER resting orders require.",
   "scripts": {
     "cranker": "node attestation_cranker.mjs",
-    "acceptance": "node cranker_acceptance.mjs"
+    "acceptance": "node cranker_acceptance.mjs",
+    "funding-keeper": "node funding_keeper.mjs"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
