@@ -11296,10 +11296,9 @@ pub mod flash_book {
         // Credit vault's TraderState collateral.
         let post_deposit_collateral = {
             let mut ts = ctx.accounts.vault_trader_state.load_mut()?;
-            ts.collateral_quote_lots = ts
-                .collateral_quote_lots
-                .checked_add(amount_quote_lots)
-                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            // Track A2: vault deposit credit through the proven checked-credit core.
+            ts.collateral_quote_lots =
+                xmargin::apply_collateral_credit(ts.collateral_quote_lots, amount_quote_lots)?;
             ts.collateral_quote_lots
         };
 
@@ -11422,10 +11421,9 @@ pub mod flash_book {
         // Debit core TraderState collateral.
         {
             let mut ts = ctx.accounts.vault_trader_state.load_mut()?;
-            ts.collateral_quote_lots = ts
-                .collateral_quote_lots
-                .checked_sub(amount)
-                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+            // Track A2: vault withdraw debit through the proven checked-debit core.
+            ts.collateral_quote_lots =
+                xmargin::apply_collateral_debit_checked(ts.collateral_quote_lots, amount)?;
         }
 
         // SPL release from quote_vault → depositor's ATA, signed by InsuranceFund PDA.
@@ -12941,18 +12939,19 @@ pub mod flash_book {
 
         // Same bucket-selection rule as `compute_realized_pnl_routing`.
         let isolated = ctx.accounts.position.load()?.collateral_quote_lots > 0;
+        // Track A2: realized-PnL bucket debit through the proven checked-debit core.
         if isolated {
             let mut position = ctx.accounts.position.load_mut()?;
-            position.collateral_quote_lots = position
-                .collateral_quote_lots
-                .checked_sub(gain_quote_lots)
-                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+            position.collateral_quote_lots = xmargin::apply_collateral_debit_checked(
+                position.collateral_quote_lots,
+                gain_quote_lots,
+            )?;
         } else {
             let mut trader_state = ctx.accounts.trader_state.load_mut()?;
-            trader_state.collateral_quote_lots = trader_state
-                .collateral_quote_lots
-                .checked_sub(gain_quote_lots)
-                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+            trader_state.collateral_quote_lots = xmargin::apply_collateral_debit_checked(
+                trader_state.collateral_quote_lots,
+                gain_quote_lots,
+            )?;
         }
 
         let pos_haircut = &mut ctx.accounts.position_haircut;
@@ -13556,10 +13555,9 @@ fn credit_collateral(
 ) -> Result<()> {
     let (trader, new_balance) = {
         let mut s = trader_state.load_mut()?;
-        s.collateral_quote_lots = s
-            .collateral_quote_lots
-            .checked_add(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        // Track A2: collateral-deposit credit through the proven checked-credit core.
+        s.collateral_quote_lots =
+            xmargin::apply_collateral_credit(s.collateral_quote_lots, amount_quote_lots)?;
         (s.trader, s.collateral_quote_lots)
     };
     emit!(CollateralDepositedEvent {
