@@ -56,7 +56,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 
 | Item | Scope | Owner | Status |
 |---|---|---|---|
-| 2.1 | side-accrual K/F PnL path (`settle_position_pnl` never called) — wire or delete the scaffold | eng | STARTABLE (program change) |
+| 2.1 | side-accrual K/F PnL path (`settle_position_pnl` never called) — wire or delete the scaffold | eng | **DISPOSITION**: safe dormancy, NOT a live gap. The A/K/F/B side indices DO advance live (`advance_indices` from `settle_funding`), but the real economic settlement runs entirely through the already-proven eager path (`cum_funding_index`→`settle_position_funding`→`route_funding`, + `assess_margin`'s unrealized-PnL). `settle_position_pnl`'s input `PositionSnapshot.a_snap` is never populated on a real position, so it returns 0 by its own guard → zero economic effect today. Documented in the `settle_funding` docstring (lib.rs:4655); fields KEPT (deleting the `MarketSideAccrualAccount` layout is an ABI regression on an allocated PDA). Full wiring = adding K/F/A/B snapshots to the live position account + migration + hot-path rewire = a multi-week economic redesign with its own devnet cycle, not a chore. **Reclassified STARTABLE→disposition; do not force a rushed wire/delete** |
 | 2.2 | isolated-position ADL redirect (cross has ADL; isolated doesn't) — close asymmetry + prove | eng | STARTABLE (program change) |
 | 2.3 | on-chain payout walk for referrer/builder/creator shares (today emit-only) | eng | STARTABLE (program change) |
 | 2.4 | automated funding keeper binary/script (+ optional crank incentive) | eng | STARTABLE (tooling) |
