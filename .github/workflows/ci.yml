@@ -183,11 +183,15 @@ jobs:
           use-mathlib-cache: true
 
   certora:
-    # Parametric solvency proof (certora/specs/solvency.spec: solvencyPreserved
-    # over every money-moving handler). Gated on the Certora Solana license key:
-    # without CERTORAKEY the job transparently SKIPS the proof (logging why) so
-    # forks/unlicensed CI stay green — it is NOT a silent pass. It runs the real
-    # Prover and gates the build only when a licensed operator sets the secret.
+    # P-SOLV-4 solvency proof on the Certora Solana Prover. Runs the Rust
+    # `#[rule]` harness (certora/harness/solvency_rules.rs) selected in
+    # certora/solana_solvency.conf. CURRENT COVERAGE: the withdraw slice
+    # (`solvency_preserved_simple_withdraw`) — solvency preserved against the
+    # REAL `assess_solvency_full` invariant; verified non-vacuous on the cloud
+    # Prover. NOT yet the full 19-handler parametric set (tracked; see the conf
+    # + certora/harness/README.md). Gated on the Certora Solana license: without
+    # CERTORAKEY the job transparently SKIPS (logging why) so forks/unlicensed
+    # CI stay green — it is NOT a silent pass.
     name: Formal verification (Certora, licensed only)
     runs-on: ubuntu-latest
     steps:
@@ -213,9 +217,19 @@ jobs:
           sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
       - if: steps.gate.outputs.licensed == 'true'
-        name: Run parametric solvency proof
+        name: Install Certora Solana toolchain
+        run: |
+          pip install certora-cli
+          cargo install cargo-certora-sbf --version 0.3.5 --locked
+      - if: steps.gate.outputs.licensed == 'true'
+        name: Run P-SOLV-4 solvency proof (Certora Solana Prover)
+        working-directory: certora/harness-crate
         env:
           CERTORAKEY: ${{ secrets.CERTORAKEY }}
         run: |
-          pip install certora-cli
-          certoraRun certora/solana_solvency.conf
+          # The harness is a SEPARATE crate (flash-book stays IDL-clean).
+          # cargo-certora-sbf pulls Certora's platform-tools (v1.53-certora) and
+          # emits the build manifest; certoraSolanaProver builds it (flash-book
+          # with the certora feature) and runs the rule(s) in the conf on the
+          # cloud Prover, failing CI on any violation or sanity failure.
+          certoraSolanaProver "$GITHUB_WORKSPACE/certora/solana_solvency.conf" --wait_for_results

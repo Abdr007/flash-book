@@ -1742,13 +1742,231 @@ dependencies = [
 ]
 
 [[package]]
+name = "cvlr"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+dependencies = [
+ "cvlr-asserts 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-decimal",
+ "cvlr-derive",
+ "cvlr-early-panic 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-fixed",
+ "cvlr-hook",
+ "cvlr-log 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-macros 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-mathint 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-nondet 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-spec",
+]
+
+[[package]]
+name = "cvlr-asserts"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0096bd5c925bd81ad127b648e980b468b7b0720d2810574a1bb429615d4ba0f8"
+
+[[package]]
+name = "cvlr-asserts"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+
+[[package]]
+name = "cvlr-decimal"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+dependencies = [
+ "cvlr-asserts 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-log 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-mathint 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-nondet 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+]
+
+[[package]]
+name = "cvlr-derive"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "cvlr-early-panic"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e32d46bc14367046ce1746ba864bf175620e337bf4584f026adf613181d73ffc"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "cvlr-early-panic"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "cvlr-fixed"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+dependencies = [
+ "cvlr-asserts 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-log 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-mathint 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-nondet 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+]
+
+[[package]]
+name = "cvlr-hook"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+dependencies = [
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "cvlr-log"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95cb4edf07d36e895f558727f655a4dce7ccdb836fb8e03a1b040baf39db4968"
+dependencies = [
+ "cvlr-mathint 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "cvlr-log"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+dependencies = [
+ "cvlr-mathint 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+]
+
+[[package]]
+name = "cvlr-macros"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95eedd975cc0b7f9bdff15436d8550221c7476a719d33eff1134a6234dfcc284"
+dependencies = [
+ "darling 0.20.11",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "cvlr-macros"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+dependencies = [
+ "darling 0.20.11",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "cvlr-mathint"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95ac331829e886d9f74c684f33f1db09f49e9f497de107d0f2581e2b4a150f9b"
+dependencies = [
+ "cvlr-asserts 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cvlr-nondet 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "cvlr-mathint"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+dependencies = [
+ "cvlr-asserts 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-nondet 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+]
+
+[[package]]
+name = "cvlr-nondet"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02f329573a49e2807e63ef82572c0b5f37a7c3791b8a3ca6af394ac9caeba1f6"
+dependencies = [
+ "cvlr-asserts 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "cvlr-nondet"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+dependencies = [
+ "cvlr-asserts 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+]
+
+[[package]]
+name = "cvlr-solana"
+version = "0.5.0"
+source = "git+https://github.com/Certora/cvlr-solana?tag=cvlr-solana-v0.5.0#7938de72910f8db180167b447bfdf896a43ebc59"
+dependencies = [
+ "arrayref",
+ "cvlr-asserts 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cvlr-early-panic 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cvlr-log 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cvlr-macros 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cvlr-mathint 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cvlr-nondet 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "solana-program 2.3.0",
+]
+
+[[package]]
+name = "cvlr-spec"
+version = "0.6.1"
+source = "git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1#0b33500b3a6220e1af497040eb9cf36bc80534df"
+dependencies = [
+ "cvlr-asserts 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-log 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-macros 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-mathint 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-nondet 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+]
+
+[[package]]
+name = "darling"
+version = "0.20.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee"
+dependencies = [
+ "darling_core 0.20.11",
+ "darling_macro 0.20.11",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
 dependencies = [
- "darling_core",
- "darling_macro",
+ "darling_core 0.23.0",
+ "darling_macro 0.23.0",
+]
+
+[[package]]
+name = "darling_core"
+version = "0.20.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d00b9596d185e565c2207a0b01f8bd1a135483d02d9b7b0a54b11da8d53412e"
+dependencies = [
+ "fnv",
+ "ident_case",
+ "proc-macro2",
+ "quote",
+ "strsim",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1766,11 +1984,22 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
+version = "0.20.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
+dependencies = [
+ "darling_core 0.20.11",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "darling_macro"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
 dependencies = [
- "darling_core",
+ "darling_core 0.23.0",
  "quote",
  "syn 2.0.117",
 ]
@@ -2327,6 +2556,9 @@ dependencies = [
  "anchor-lang",
  "anchor-spl",
  "bytemuck",
+ "cvlr",
+ "cvlr-nondet 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-solana",
  "proptest",
  "serde",
  "serde_json",
@@ -4827,7 +5059,7 @@ version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf2ebbe86054f9b45bc3881e865683ccfaccce97b9b4cb53f3039d67f355a334"
 dependencies = [
- "darling",
+ "darling 0.23.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -10405,7 +10637,7 @@ version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15ab90b719560d0fda79c74550ad1c948d17b118765942838055ebaf34d67071"
 dependencies = [
- "darling",
+ "darling 0.23.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",

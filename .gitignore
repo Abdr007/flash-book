@@ -18,3 +18,8 @@ test-ledger/
 *.rs.cpi
 *.rs.ctx
 *.rs.rz
+
+# Certora Prover local scratch
+.certora_internal/
+certora/harness-crate/target/
+certora/harness-crate/err.log

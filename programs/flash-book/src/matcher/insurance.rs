@@ -111,7 +111,7 @@ impl InsuranceFund {
 /// [`partial_collateral_proves_insolvent`] is machine-proven sound against.
 /// Returns `(solvent, surplus)`; `Err(())` iff the summed liabilities
 /// overflow u64.
-#[cfg(any(kani, test))]
+#[cfg(any(kani, test, feature = "certora"))]
 #[allow(clippy::result_unit_err)]
 #[inline]
 pub fn assess_solvency_full(
