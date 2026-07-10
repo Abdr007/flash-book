@@ -3371,15 +3371,16 @@ pub mod flash_book {
             main.er_active,
             ctx.accounts.er_margin.as_deref(),
         )?;
-        xmargin::check_simple_withdraw(main.collateral_quote_lots, amount, er_reserved)?;
-        main.collateral_quote_lots = main
-            .collateral_quote_lots
-            .checked_sub(amount)
-            .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
-        sub.collateral_quote_lots = sub
-            .collateral_quote_lots
-            .checked_add(amount)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        // Track A2: the balance move goes through the proven, conservation-
+        // checked core (`apply_collateral_transfer`) — no inline arithmetic.
+        let (main_after, sub_after) = xmargin::apply_collateral_transfer(
+            main.collateral_quote_lots,
+            sub.collateral_quote_lots,
+            amount,
+            er_reserved,
+        )?;
+        main.collateral_quote_lots = main_after;
+        sub.collateral_quote_lots = sub_after;
         emit!(SubAccountTransferEvent {
             trader: trader_key,
             sub_index,
@@ -3420,15 +3421,16 @@ pub mod flash_book {
             sub.er_active,
             ctx.accounts.er_margin.as_deref(),
         )?;
-        xmargin::check_simple_withdraw(sub.collateral_quote_lots, amount, er_reserved)?;
-        sub.collateral_quote_lots = sub
-            .collateral_quote_lots
-            .checked_sub(amount)
-            .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
-        main.collateral_quote_lots = main
-            .collateral_quote_lots
-            .checked_add(amount)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        // Track A2: the balance move goes through the proven, conservation-
+        // checked core (`apply_collateral_transfer`) — no inline arithmetic.
+        let (sub_after, main_after) = xmargin::apply_collateral_transfer(
+            sub.collateral_quote_lots,
+            main.collateral_quote_lots,
+            amount,
+            er_reserved,
+        )?;
+        sub.collateral_quote_lots = sub_after;
+        main.collateral_quote_lots = main_after;
         emit!(SubAccountTransferEvent {
             trader: trader_key,
             sub_index,

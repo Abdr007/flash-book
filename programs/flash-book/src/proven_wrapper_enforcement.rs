@@ -145,4 +145,49 @@ mod tests {
             );
         }
     }
+
+    /// INTERNAL TRANSFERS (Track A2): the two sub-account transfer handlers move
+    /// collateral ONLY through the proven, conservation-checked core
+    /// `xmargin::apply_collateral_transfer` — never via inline arithmetic. This is
+    /// what makes the model→real bridge a compiler-enforced guarantee, not a
+    /// transcription: the `collateral_transfer_conserves_total` Kani proof binds to
+    /// the exact code the handlers run.
+    #[test]
+    fn internal_transfers_mutate_collateral_only_via_proven_core() {
+        const TRANSFER_HANDLERS: [&str; 2] = ["transfer_main_to_sub", "transfer_sub_to_main"];
+
+        // (1) Every `apply_collateral_transfer` call site in lib.rs is one of the
+        // two sanctioned transfer handlers — nothing else may perform this move.
+        let callers = enclosing_fns(LIB_RS, "apply_collateral_transfer(");
+        assert!(
+            !callers.is_empty(),
+            "apply_collateral_transfer call sites not found in lib.rs — needle stale, update guard"
+        );
+        for f in &callers {
+            assert!(
+                TRANSFER_HANDLERS.contains(&f.as_str()),
+                "apply_collateral_transfer is called from `{f}`, not an allowlisted transfer \
+                 handler — internal collateral moves route through the proven core only (A2)"
+            );
+        }
+        // (2) BOTH handlers actually route through it.
+        for h in TRANSFER_HANDLERS {
+            assert!(
+                callers.iter().any(|f| f == h),
+                "{h} no longer routes its collateral move through apply_collateral_transfer (A2)"
+            );
+        }
+        // (3) Neither handler re-introduces inline collateral arithmetic — a raw
+        // `.checked_sub(`/`.checked_add(` inside a transfer handler would bypass the
+        // proven conservation core.
+        for needle in [".checked_sub(", ".checked_add("] {
+            for f in enclosing_fns(LIB_RS, needle) {
+                assert!(
+                    !TRANSFER_HANDLERS.contains(&f.as_str()),
+                    "`{f}` contains raw `{needle}` — the internal-transfer balance move must go \
+                     through apply_collateral_transfer, not inline arithmetic (A2)"
+                );
+            }
+        }
+    }
 }
