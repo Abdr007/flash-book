@@ -16,6 +16,9 @@ no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
 idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+# Certora Solana Prover harness — verification-only. Never in the product/CI
+# build path; pulls the proprietary-registry-free public cvlr SDK.
+certora = ["no-entrypoint", "dep:cvlr", "dep:cvlr-solana", "dep:nondet"]
 
 [dependencies]
 anchor-lang = { workspace = true, features = ["init-if-needed"] }
@@ -24,6 +27,18 @@ bytemuck = { workspace = true }
 thiserror = { workspace = true }
 solana-security-txt = "1.1.1"
 solana-keccak-hasher = "2.2.1"
+cvlr = { workspace = true, optional = true }
+cvlr-solana = { workspace = true, optional = true }
+nondet = { workspace = true, optional = true }
+
+# Certora Solana Prover: source manifest for `cargo certora-sbf` (verification
+# build only). Lists the sources the Prover collects for reporting/mutation.
+[package.metadata.certora]
+sources = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "../../certora/harness/*.rs",
+]
 
 [dev-dependencies]
 proptest = "1.6"

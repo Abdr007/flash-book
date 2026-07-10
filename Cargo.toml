@@ -19,6 +19,13 @@ anchor-spl = "1.0.0"
 # dependency creates a derive-macro ambiguity.
 bytemuck = { version = "1.23", features = ["derive"] }
 thiserror = "2.0"
+# Certora Solana Prover SDK — verification-only, pulled ONLY under the
+# `certora` feature (never in the product/CI build path). Public crates.
+cvlr = { git = "https://github.com/Certora/cvlr", tag = "cvlr-v0.6.1" }
+cvlr-solana = { git = "https://github.com/Certora/cvlr-solana", tag = "cvlr-solana-v0.5.0" }
+# aliased as `nondet` — the pre-existing hypertree certora instrumentation
+# (red_black_tree.rs / hypertree.rs) refers to the crate by that bare name.
+nondet = { package = "cvlr-nondet", git = "https://github.com/Certora/cvlr", tag = "cvlr-v0.6.1" }
 
 [profile.release]
 overflow-checks = true

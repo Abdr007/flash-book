@@ -37,6 +37,13 @@ pub mod xmargin;
 #[cfg(test)]
 mod proven_wrapper_enforcement;
 
+// Certora Solana Prover harness (P-SOLV-4 solvency). Verification-only, compiled
+// ONLY under `--features certora`; never in the product/CI build. Lives at
+// certora/harness/ (outside src/) and is pulled in via #[path].
+#[cfg(feature = "certora")]
+#[path = "../../../certora/harness/solvency_rules.rs"]
+pub mod certora_harness;
+
 pub use errors::FlashBookError;
 
 use constants::{
