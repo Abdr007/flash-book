@@ -2497,6 +2497,70 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// H-B (security re-audit 2026-07-10): keeper/authority retirement of a stranded
+    /// liquidation-close order. The OWNER cannot cancel an `order_type == 3` order
+    /// (`cancel_v2_core` / `cancel_all_v2` — that closes the liquidation-dodge), so a
+    /// legitimate path must exist to clear one that never filled (e.g. the position
+    /// recovered or was closed by other means, leaving the synthetic close resting).
+    /// Gated to the market `sequencer` (the settlement keeper that drives liquidation)
+    /// or the market `authority` — NEVER the owner. ONLY `order_type == 3` is retirable
+    /// here: this is not a general keeper-cancel bypass. Reuses the same book-removal
+    /// plumbing as `cancel_v2_core`.
+    pub fn retire_liquidation_order_v2(
+        ctx: Context<RetireLiquidationOrderV2>,
+        side: u8,
+        order_id: u64,
+    ) -> Result<()> {
+        let market = &ctx.accounts.market;
+        require!(
+            ctx.accounts.caller.key() == market.sequencer
+                || ctx.accounts.caller.key() == market.authority,
+            FlashBookError::Unauthorized
+        );
+        require!(side <= 1, FlashBookError::OutOfRange);
+        let market_key = market.key();
+
+        let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
+        let mut handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
+        if handle.header.market_pubkey != market_key {
+            return err!(FlashBookError::WrongMarket);
+        }
+
+        let side_is_bid = side == 0;
+        let idx = if side_is_bid {
+            handle.lookup_bid_by_order_id(order_id)
+        } else {
+            handle.lookup_ask_by_order_id(order_id)
+        };
+        if idx == crate::hypertree::NIL {
+            return err!(FlashBookError::LiquidationStale);
+        }
+
+        let (order_seq, order_trader) = {
+            let order = handle.order_at(idx);
+            // ONLY a liquidation-close order (order_type == 3) is retirable via this
+            // path — never a general cancel bypass for a trader's real orders.
+            require!(order.order_type == 3, FlashBookError::OutOfRange);
+            (order.seq, order.trader)
+        };
+
+        if side_is_bid {
+            handle.remove_bid_node(idx);
+        } else {
+            handle.remove_ask_node(idx);
+        }
+
+        emit!(OrderCancelledV2Event {
+            market: market_key,
+            trader: order_trader,
+            order_seq,
+            side,
+            node_index: idx,
+            total_orders_after: handle.header.total_orders_active,
+        });
+        Ok(())
+    }
+
     /// V2 modify: atomic cancel + place in one ix. Cheaper than two
     /// separate txs (one signature, one set of account-load costs)
     /// and preserves the trader's intent across the cancel window —
@@ -14297,6 +14361,29 @@ pub struct ViewBookDepthV2<'info> {
 #[derive(Accounts)]
 pub struct CancelOrderV2<'info> {
     pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, MarketAccount>,
+
+    /// CHECK: PDA at the market_book seed; disc validated inside handler.
+    /// Mut because we remove a node + update header indices + free-list.
+    #[account(
+        mut,
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: UncheckedAccount<'info>,
+}
+
+/// H-B retirement: keeper/authority clears a stranded `order_type == 3`
+/// liquidation-close order. `caller` must equal the market `sequencer` or
+/// `authority` (checked in-handler) — never the order owner.
+#[derive(Accounts)]
+pub struct RetireLiquidationOrderV2<'info> {
+    pub caller: Signer<'info>,
 
     #[account(
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
