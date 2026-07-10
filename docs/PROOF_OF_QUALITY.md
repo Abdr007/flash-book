@@ -9,6 +9,16 @@ as the code: where a claim is not yet fully earned, it says so.
 > solvency, on a fully on-chain order book with sub-50ms fills, and the
 > Hyperliquid-$20M oracle manipulation is proven impossible.*
 
+## Launch sentence — clause by clause (verified now, no rounding up)
+
+| Clause | Verdict | Evidence |
+|---|---|---|
+| **every money-moving instruction ⇒ solvency** | **EARNED IN-HOUSE (65/65 accounted)** | Track A2 extract-and-prove (PRs #289–#297): **60/65** money-path writes route through pure, Kani-proven `xmargin` cores (or the already-proven `route_funding` / `route_adl` helpers), with a `proven_wrapper_enforcement` lint pinning the routing; **5/65** conserved-by-construction (`migrate` verbatim-copy + Anchor `close = trader`; `=0`/init teardown). No Certora bundle, no assumed bridge, no behavior change. This **disproved** the earlier "needs the external Certora Anchor bundle" conclusion. |
+| **sub-50ms fills** | **NOT VERIFIED — measured ~165–275ms client round-trip** | `er-acceptance/latency_benchmark.mjs` on the live MagicBlock devnet ER: real taker fills at CU 21,492, but client round-trip is network + public-endpoint-rate-limit dominated. The ER *execution* is plausibly sub-50ms (tiny CU, sub-50ms slot cadence) but is **not reproduced with an artifact**. Needs a dedicated (non-429) RPC to complete the distribution. Reported at the measured truth, not the claim. |
+| **$20M JELLY proven impossible** | **EARNED for the mark-manipulation vector** | The actual HL attack (thin-market mark pump): adversarial Kani `jelly_mark_manipulation_yields_no_usable_equity` (VERIFICATION SUCCESSFUL, non-vacuous, real `worse_of_health_price`) — a pumped mark can never move the health price past the honest oracle. The additional per-domain-credit ability-to-pay layer is Lean-model (`PerDomainCredit.lean`) + a **documented engine-wiring remainder**. |
+
+**Net:** the solvency clause is now **earned in-house** (the biggest, previously externally-blocked clause); the JELLY clause is earned for the actual attack; **`sub-50ms` is the one clause still gated on a measurement** (a dedicated RPC), reported honestly at ~165–275ms until then.
+
 ## Headline (honest)
 
 The **permanent** engineering value — proofs, verified internals, adversarial
@@ -44,15 +54,21 @@ for the liquidation-cancel vector.
 - Real-symbol margin proof — Kani `assess_margin_single_market_frame_stable`
   names the live `assess_margin`; proves the requirement is collateral-independent,
   equity linear, health monotone, over **all** `u64` collateral (PR #274, closes G3).
-- Per-domain realizable credit (the anti-JELLY property) — Lean
-  `PerDomainCredit.lean`: a manipulated/thin market's paper PnL cannot back margin
-  or be withdrawn (PR #270, closes the HL-$20M class).
+- Anti-JELLY, mark-manipulation vector (the actual HL attack) — Kani
+  `jelly_mark_manipulation_yields_no_usable_equity` on the real `worse_of_health_price`:
+  a pumped mark can never move the health price past the honest oracle (EARNED).
+- Per-domain realizable credit (the *additional* ability-to-pay layer) — Lean
+  `PerDomainCredit.lean` (core-math verified) **but NOT wired in the engine**
+  (`grep` finds no `credit_rate` in the money path); documented engine-wiring
+  remainder, not counted as live.
 - Worse-of health pricing, margin-walk completeness, ADL bankruptcy gate + value
   conservation — re-verified clean (audit 2026-07-10, margin/liq surface).
 
 ### Safety / proofs
-- **Kani:** 61 machine-checked proofs on `main` + the real-symbol `assess_margin`
-  harness (#274), all CI-gated.
+- **Kani:** **73 machine-checked proofs on `main`** (grep-verified), incl. the
+  real-symbol `assess_margin` harness (#274), the anti-JELLY harness, and the
+  Track A2 money-path conservation cores (transfer / margin / liquidation-reward /
+  fee / capped-debit / credit / debit / ADL / route_funding), all CI-gated.
 - **Lean 4 + Mathlib (unbounded, real divisors):** `Haircut`, `OiMmr`, `Funding`,
   plus this session — `PerDomainCredit` (#270), `RealizedPnl` (#271, G2),
   `ResidualConservation` (#272, G4), `AuthCompleteness` (#273, G7). All
