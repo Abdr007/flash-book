@@ -62,7 +62,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | 2.4 | automated funding keeper binary/script (+ optional crank incentive) | eng | STARTABLE (tooling) |
 | 2.5 | executable trustless force-undelegate | eng | **DISPOSITION**: returns `OwnerForceUndelegateUnavailable` vs the upgraded delegation program → **vendor-gated** on MagicBlock owner-recovery; public censorship-exit claim must stay downgraded until it ships (see `docs/DECENTRALIZED_SEQUENCER.md`) |
 | 2.6 | force-include from L1 (`errors.rs:141` "not yet supported") | owner | **DISPOSITION**: documented **post-launch roadmap** (not ambiguous) — the ER censorship-exit story rests on 2.5's force-undelegate, not L1 force-include |
-| 2.7 | resolve dual `place_limit_order` migration (lib.rs:1393); delete legacy path | eng | STARTABLE (program change) |
+| 2.7 | resolve dual `place_limit_order` migration (lib.rs:1393); delete legacy path | eng | **DONE (doc-only)** — investigation found the legacy path was ALREADY removed: no `place_limit_order` / `initialize_order_buffer` / order-buffer code exists; `place_limit_order_v2` (+`_session`) is the sole limit-placement ix and `init_market_book` the sole book init. Only stale doc comments remained falsely describing a live dual-book migration ("runs ALONGSIDE the legacy … `initialize_order_buffer`"). Fixed the `place_limit_order_v2` docstring + 6 stale `place_limit_order` mentions (state.rs/lib.rs/proptest) → `place_limit_order_v2`; regenerated `idl/flash_book.json` (doc strings flow into the IDL, gate now green). No code/ABI change |
 
 ## 3 · Manipulation-proof / percolator (3.x)
 

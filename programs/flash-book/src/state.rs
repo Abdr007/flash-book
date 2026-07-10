@@ -116,7 +116,7 @@ pub struct MarketParams {
     pub liquidation_auction_duration_slots: u32,
 
     /// Drift-style JIT bonus: extra bps of rebate the maker earns when
-    /// filling a JIT-tagged taker order (flag bit 3 on place_limit_order).
+    /// filling a JIT-tagged taker order (flag bit 3 on place_limit_order_v2).
     /// 0 = JIT inactive. Typical setting: 5-20 bps (0.05-0.2% of notional)
     /// added on top of the base maker_rebate_bps. Encourages MMs to
     /// preferentially quote against tagged flow.
@@ -156,7 +156,7 @@ pub struct MarketParams {
     /// short lots, whichever is larger). 0 = unlimited. Acts as a hard
     /// circuit breaker against runaway exposure on a single market —
     /// new orders that would push OI past the cap are rejected at
-    /// place_limit_order intake. Distinct from `max_position_lots_per_trader`
+    /// place_limit_order_v2 intake. Distinct from `max_position_lots_per_trader`
     /// (per-trader) and `max_position_ratio_bps` (per-trader as % of FLP);
     /// this caps the WHOLE-MARKET aggregate. Typical: scaled with FLP
     /// capital × leverage so worst-case insurance draw stays bounded.
