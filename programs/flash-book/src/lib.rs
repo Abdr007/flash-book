@@ -4428,11 +4428,10 @@ pub mod flash_book {
         });
         market_keys.push(target_market_key);
 
-        // Post-transfer state for the split assessment.
-        let post_cross_collateral = ts_collateral
-            .checked_sub(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
-        let post_isolated_collateral = amount_quote_lots; // currently 0 + amount
+        // Post-transfer state for the split assessment. Track A2: the collateral
+        // move goes through the proven conservation core (cross → fresh isolated).
+        let (post_cross_collateral, post_isolated_collateral) =
+            xmargin::split_to_isolated(ts_collateral, amount_quote_lots)?;
         let isolated_map: [(Pubkey, u64); 1] = [(target_market_key, post_isolated_collateral)];
 
         let scenarios = default_scenarios_fn(&market_keys);
@@ -4624,9 +4623,9 @@ pub mod flash_book {
             market_keys.push(target_market_key);
         }
 
-        let post_cross_collateral = ts_collateral
-            .checked_add(returned)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        // Track A2: return all isolated collateral to the cross pool via the
+        // proven conservation core.
+        let post_cross_collateral = xmargin::merge_to_cross(ts_collateral, returned)?;
 
         // No isolated positions remain — straight assess_margin (cross-only).
         let scenarios = default_scenarios_fn(&market_keys);
