@@ -8419,18 +8419,18 @@ pub mod flash_book {
         // Deduct fee from taker.
         {
             let mut taker_state = ctx.accounts.taker_trader_state.load_mut()?;
-            taker_state.collateral_quote_lots = taker_state
-                .collateral_quote_lots
-                .checked_sub(taker_fee)
-                .ok_or_else(|| error!(FlashBookError::InsufficientCollateral))?;
+            // Track A2: taker-fee debit through the proven checked-debit core.
+            taker_state.collateral_quote_lots = xmargin::apply_collateral_debit_checked(
+                taker_state.collateral_quote_lots,
+                taker_fee,
+            )?;
         }
         // Credit rebate to FLP capital (FLP is the maker here).
         {
             let flp = &mut ctx.accounts.flp_exposure;
+            // Track A2: FLP-capital credit through the proven checked-credit core.
             flp.total_capital_quote_lots =
-                flp.total_capital_quote_lots
-                    .checked_add(maker_rebate)
-                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+                xmargin::apply_collateral_credit(flp.total_capital_quote_lots, maker_rebate)?;
         }
         // Net fee to insurance fund.
         {
@@ -8444,10 +8444,9 @@ pub mod flash_book {
             } else {
                 contribution as u64
             };
-            fund.balance_quote_lots = fund
-                .balance_quote_lots
-                .checked_add(contribution_u64)
-                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            // Track A2: insurance-balance credit through the proven checked-credit core.
+            fund.balance_quote_lots =
+                xmargin::apply_collateral_credit(fund.balance_quote_lots, contribution_u64)?;
             fund.total_contributions = fund.total_contributions.saturating_add(contribution_u64);
         }
         market.total_fees_collected = market
@@ -20550,6 +20549,45 @@ fn route_adl_gain(
             .checked_add(gain_quote_lots)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         Ok((pos_collateral, new_ts))
+    }
+}
+
+/// Track A2: conservation proofs for the ADL collateral-routing helpers that
+/// `auto_deleverage` computes its `new_pos_collat` / `new_ts_collat` through.
+/// The handler's only compute path for those values IS `route_adl_loss` /
+/// `route_adl_gain` (by design — the arithmetic lives here, not inline), so
+/// these proofs bind to the shipped ADL path.
+#[cfg(kani)]
+mod adl_routing_proofs {
+    use super::{route_adl_gain, route_adl_loss};
+
+    /// ADL LOSS never mints collateral: the total across the two buckets after a
+    /// loss is at most the total before (the loss is socialized to the counter's
+    /// gain, never created), and at most `loss` is removed. Real symbol, all u64.
+    #[kani::proof]
+    fn route_adl_loss_never_mints() {
+        let isolated: bool = kani::any();
+        let loss: u64 = kani::any();
+        let pos: u64 = kani::any();
+        let ts: u64 = kani::any();
+        let (new_pos, new_ts) = route_adl_loss(isolated, loss, pos, ts);
+        let before = pos as u128 + ts as u128;
+        let after = new_pos as u128 + new_ts as u128;
+        assert!(after <= before); // no minting
+        assert!(before - after <= loss as u128); // removes at most the loss
+    }
+
+    /// ADL GAIN credits exactly `gain` to one bucket when it does not overflow:
+    /// total after == total before + gain. Real symbol, all u64.
+    #[kani::proof]
+    fn route_adl_gain_credits_exactly() {
+        let isolated: bool = kani::any();
+        let gain: u64 = kani::any();
+        let pos: u64 = kani::any();
+        let ts: u64 = kani::any();
+        if let Ok((new_pos, new_ts)) = route_adl_gain(isolated, gain, pos, ts) {
+            assert!(new_pos as u128 + new_ts as u128 == pos as u128 + ts as u128 + gain as u128);
+        }
     }
 }
 
