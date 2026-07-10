@@ -152,8 +152,9 @@ MagicBlock owner-recovery — both code-complete on our side.
 - **1.8** doc counts reconciled to true **62 Kani / 7 Lean** (621 tests) + Certora honestly qualified.
 - **6.5** pre-committed algorithmic settlement policy (`docs/SETTLEMENT_POLICY.md`).
 - **5.5** (pre-existing) builder codes / sub-accounts / referrals — verified in code.
+- **A2 money-path matrix — CLOSED IN-HOUSE (65/65), no Certora bundle, no assumed bridge.** Extract-and-prove: every inline handler balance-write was moved into a pure, Kani-proven `xmargin` core (`apply_collateral_transfer`, `split_to_isolated`/`merge_to_cross`, `apply_liquidation_reward`, `apply_capped_debit`, `apply_collateral_credit`/`_debit_checked`/`_debit_underflow`) or an already-proven helper (`route_funding`, `route_adl_loss`/`_gain`), and a `proven_wrapper_enforcement` lint pins the routing (it CAUGHT two new callers mid-refactor — proof it's real). **60/65 real-symbol arithmetic-proven + 5 conserved-by-construction** (`migrate` verbatim-copy relocation with an Anchor `close = trader` source-destroy — `migrate_relocation_conserves_by_construction`; plus `= 0` teardown / genesis-init writes). Every increment semantics-preserving (build-sbf v1.52 0-warn + full suite). This disproved the earlier "needs the external Certora bundle" conclusion for these sites.
 
-Kani proof count: 59 → **62** (grep-verified on `main`). Lean: 3 → **7** modules, full library `lake build` clean + `#print axioms`-clean.
+Kani proof count: 59 → **73** (grep-verified). Lean: 3 → **7** modules, full library `lake build` clean + `#print axioms`-clean.
 
 ## Adversarial re-audit 2026-07-10 (9 surfaces, 2 waves) — `docs/SECURITY_AUDIT_2026-07-10*.md`
 
