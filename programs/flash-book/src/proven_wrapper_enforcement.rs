@@ -209,12 +209,13 @@ mod tests {
     #[test]
     fn margin_conversions_move_collateral_only_via_proven_core() {
         for (core, handler) in [
-            // Fill fee/rebate web: the taker-fee capped debit is fill-specific and
-            // routes only through `apply_capped_debit` in the settlement handler.
-            // (The rebate/maker-fee legs use the GENERIC `apply_collateral_credit`
-            // / `apply_collateral_debit_checked` primitives, which are proven and
-            // reusable, so they are not pinned to a single handler here.)
-            ("apply_capped_debit(", "apply_fill"),
+            // NOTE: the capped-debit / checked-credit / checked-debit primitives
+            // (`apply_capped_debit`, `apply_collateral_credit`,
+            // `apply_collateral_debit_checked`, `apply_collateral_debit_underflow`)
+            // are GENERIC proven cores reused across many handlers (fee debit, FLP
+            // principal draw, rebates, payouts, …), so they are intentionally NOT
+            // pinned to a single caller here — only the handler-specific conserving
+            // cores below are.
             ("split_to_isolated(", "set_position_isolated"),
             ("merge_to_cross(", "set_position_cross"),
             // Liquidation reward (BOTH isolated + cross branches): the

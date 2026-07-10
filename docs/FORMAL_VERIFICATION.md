@@ -1,6 +1,6 @@
 # Formal Verification
 
-Flash Book carries **72 Kani proof harnesses** (discharged by CBMC), **7 Lean
+Flash Book carries **73 Kani proof harnesses** (discharged by CBMC), **7 Lean
 proof modules** at the real production divisors, a formal property specification
 (`certora/PROPERTIES.md`), and eight property-test suites. A Kani harness is
 not a sampled test: `kani::any()` ranges over the *entire* input domain
@@ -8,7 +8,7 @@ symbolically, and the model checker proves the assertion for **every** value
 or returns a concrete counterexample. CI runs the full Kani suite and builds
 the Lean proofs on every PR; any broken invariant fails the build.
 
-## Kani coverage (72 harnesses, by module)
+## Kani coverage (73 harnesses, by module)
 
 | Module | # | Properties proven |
 |---|---|---|
@@ -23,7 +23,7 @@ the Lean proofs on every PR; any broken invariant fails the build.
 | `matcher/flp_quoter` | 3 | Pool fill-price band accepts the oracle price (no false reject) and rejects gross fabrication; required floor conservative. |
 | `matcher/fill_outbox` | 3 | Write index in bounds, no silent overwrite, drained grow has no remappable pending slot. |
 | `matcher/committee` | 3 | Valid BFT config implies quorum intersection, equivocation ⟺ same height + different digest, jail is effective. |
-| `xmargin` | 12 | ER-reserved margin floor preserved by simple withdrawals, epoch strictly increases, required floor adds reserved on top of max, attestation binding fails closed, withdrawal can never self-liquidate below maintenance (`withdraw_cannot_self_liquidate_below_maintenance`), and the internal-transfer core conserves total collateral (`collateral_transfer_conserves_total` — Track A2: the `transfer_*` handlers move collateral only through this proven core, lint-enforced). |
+| `xmargin` | 13 | ER-reserved margin floor preserved by simple withdrawals, epoch strictly increases, required floor adds reserved on top of max, attestation binding fails closed, withdrawal can never self-liquidate below maintenance (`withdraw_cannot_self_liquidate_below_maintenance`), and the internal-transfer core conserves total collateral (`collateral_transfer_conserves_total` — Track A2: the `transfer_*` handlers move collateral only through this proven core, lint-enforced). |
 | `matcher/funding` | 1 | Funding is zero-sum: `owed(long) + owed(short) == 0` on the real `funding_owed` path (funding moves value between sides; cannot mint or burn), independent of the `>>64` rounding. |
 | `er` | 2 | The force-undelegate gate only fires when a liveness baseline is genuinely stale; a market with a fresh heartbeat AND recent settlement can never be forced off the ER. |
 

@@ -2864,10 +2864,9 @@ pub mod flash_book {
         };
         require!(shares_to_mint > 0, FlashBookError::ZeroSize);
 
-        flp.total_capital_quote_lots = flp
-            .total_capital_quote_lots
-            .checked_add(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        // Track A2: FLP-capital deposit credit through the proven checked-credit core.
+        flp.total_capital_quote_lots =
+            xmargin::apply_collateral_credit(flp.total_capital_quote_lots, amount_quote_lots)?;
         flp.lp_shares_outstanding = flp
             .lp_shares_outstanding
             .checked_add(shares_to_mint)
@@ -3038,9 +3037,10 @@ pub mod flash_book {
         // beyond conservation. `amount_quote_lots <= nav` holds (shares_to_burn <=
         // shares_outstanding, nav > 0), so pnl_reduction <= realized_pnl and the
         // new realized_pnl stays >= 0 whenever the pool was in profit.
-        let cap_reduction = amount_quote_lots.min(flp_ro.total_capital_quote_lots);
+        // Track A2: capped principal draw through the proven capped-debit core.
+        let (new_total, cap_reduction) =
+            xmargin::apply_capped_debit(flp_ro.total_capital_quote_lots, amount_quote_lots);
         let pnl_reduction = amount_quote_lots - cap_reduction;
-        let new_total = flp_ro.total_capital_quote_lots - cap_reduction;
         let new_realized_pnl: i64 = ((flp_ro.realized_pnl as i128) - (pnl_reduction as i128))
             .try_into()
             .map_err(|_| error!(FlashBookError::ArithmeticUnderflow))?;
@@ -3177,12 +3177,11 @@ pub mod flash_book {
             FlashBookError::Unauthorized
         );
 
-        let new_balance = ctx
-            .accounts
-            .insurance_fund
-            .balance_quote_lots
-            .checked_sub(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+        // Track A2: insurance payout debit through the proven underflow-checked core.
+        let new_balance = xmargin::apply_collateral_debit_underflow(
+            ctx.accounts.insurance_fund.balance_quote_lots,
+            amount_quote_lots,
+        )?;
         // Cannot withdraw below the pause threshold — that's the protocol's
         // solvency floor.
         require!(
@@ -3947,10 +3946,11 @@ pub mod flash_book {
         // Accounting.
         let (trader, new_balance) = {
             let mut s = ctx.accounts.trader_state.load_mut()?;
-            s.collateral_quote_lots = s
-                .collateral_quote_lots
-                .checked_sub(amount_quote_lots)
-                .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+            // Track A2: withdraw debit through the proven underflow-checked core.
+            s.collateral_quote_lots = xmargin::apply_collateral_debit_underflow(
+                s.collateral_quote_lots,
+                amount_quote_lots,
+            )?;
             (s.trader, s.collateral_quote_lots)
         };
         emit!(CollateralWithdrawnEvent {
@@ -4183,10 +4183,11 @@ pub mod flash_book {
 
         let (trader, new_balance) = {
             let mut s = ctx.accounts.trader_state.load_mut()?;
-            s.collateral_quote_lots = s
-                .collateral_quote_lots
-                .checked_sub(amount_quote_lots)
-                .ok_or_else(|| error!(FlashBookError::ArithmeticUnderflow))?;
+            // Track A2: withdraw debit through the proven underflow-checked core.
+            s.collateral_quote_lots = xmargin::apply_collateral_debit_underflow(
+                s.collateral_quote_lots,
+                amount_quote_lots,
+            )?;
             (s.trader, s.collateral_quote_lots)
         };
         emit!(CollateralWithdrawnEvent {
@@ -11325,10 +11326,9 @@ pub mod flash_book {
         };
         require!(shares_to_mint > 0, FlashBookError::ZeroSize);
 
-        vault.total_capital_quote_lots = vault
-            .total_capital_quote_lots
-            .checked_add(amount_quote_lots)
-            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        // Track A2: vault-capital deposit credit through the proven checked-credit core.
+        vault.total_capital_quote_lots =
+            xmargin::apply_collateral_credit(vault.total_capital_quote_lots, amount_quote_lots)?;
         vault.shares_outstanding = vault
             .shares_outstanding
             .checked_add(shares_to_mint)
