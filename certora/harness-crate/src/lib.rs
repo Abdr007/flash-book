@@ -1,30 +1,21 @@
-//! Certora Solana Prover harness for P-SOLV-4 (global solvency preservation).
+//! Certora Solana Prover harness for Flash Book P-SOLV-4 (global solvency).
 //!
-//! Compiled ONLY under `--features certora` (wired in programs/flash-book/
-//! Cargo.toml + pulled into the crate via `#[path]` in lib.rs). It is NOT in
-//! the product build or normal CI.
+//! Separate verification-only crate (see Cargo.toml for why it is not a module
+//! of flash-book). Each `#[rule]` establishes a solvent pre-state via the REAL,
+//! Kani-proven `assess_solvency_full`, executes a balance-mutating effect with
+//! fully symbolic (`nondet`) inputs, then asserts the real invariant still
+//! holds — the all-paths preservation obligation Kani cannot give.
 //!
-//! Model of the invariant (P-SOLV-4):
-//!     vault ≥ Σ trader_collateral + Σ flp_capital + insurance
-//! computed by the REAL, Kani-proven `assess_solvency_full`. Each `#[rule]`
-//! below establishes a solvent pre-state (via that real function), executes a
-//! REAL balance-mutating core with fully symbolic (`nondet`) inputs, then
-//! asserts the real invariant still holds — the all-paths preservation
-//! obligation Kani cannot give.
-//!
-//! COVERAGE (honest): this is the withdraw slice (1 of the 19 balance-mutating
-//! instructions in certora/harness/README.md). It names the REAL symbols
-//! `xmargin::check_simple_withdraw` (the on-chain withdraw gate) and
-//! `matcher::insurance::assess_solvency_full` (the invariant). It is NOT the
-//! full parametric-over-19-handlers proof — that remains staged.
+//! COVERAGE (honest): the withdraw slice (1 of the 19 balance-mutating
+//! instructions in ../harness/README.md). NOT the full parametric-over-19
+//! proof — that remains staged.
 
 use cvlr::prelude::*;
-
-use crate::matcher::insurance::assess_solvency_full;
+use flash_book::matcher::insurance::assess_solvency_full;
 
 /// Solvent per the REAL invariant function `assess_solvency_full`
-/// (matcher/insurance.rs) — NOT an inline re-derivation. This is the exact
-/// P-SOLV-4 predicate the on-chain `verify_collateral_solvency` sweep enforces.
+/// (flash_book::matcher::insurance) — NOT an inline re-derivation. This is the
+/// exact P-SOLV-4 predicate the on-chain `verify_collateral_solvency` enforces.
 fn solvent(vault: u64, total_collateral: u64, flp_capital: u64, insurance: u64) -> bool {
     matches!(
         assess_solvency_full(vault, total_collateral, flp_capital, insurance),
@@ -39,12 +30,10 @@ fn solvent(vault: u64, total_collateral: u64, flp_capital: u64, insurance: u64) 
 ///
 /// The withdraw precondition `amount <= total_collateral` is the numeric core
 /// of the on-chain gate `xmargin::check_simple_withdraw` (`amount <=
-/// collateral`, aggregated). NOTE: calling `check_simple_withdraw` directly is
-/// blocked today by a Prover pointer-analysis limitation — its Anchor `require!`
-/// error path memcpy's a global string the pointer domain cannot classify
-/// (`solana-address` syscalls). Calling the real gate symbol is the tracked
-/// next step (needs a faithful summary of the Anchor error construction); this
-/// rule proves the withdraw arithmetic against the REAL invariant symbol.
+/// collateral`, aggregated). Calling that gate symbol directly is blocked today
+/// by a Prover pointer-analysis limit (its Anchor `require!` error path
+/// memcpy's an unclassified `solana-address` global) — tracked as the next step
+/// toward per-handler coverage.
 #[rule]
 pub fn solvency_preserved_simple_withdraw() {
     // Fully symbolic pre-state over the whole u64 domain.

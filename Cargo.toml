@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["programs/*"]
+# Certora verification harness — standalone (never built by normal workspace CI;
+# path-depends on flash-book with the certora feature). See its Cargo.toml.
+exclude = ["certora/harness-crate"]
 
 [workspace.package]
 version = "0.1.0"

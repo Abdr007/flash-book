@@ -223,12 +223,13 @@ jobs:
           cargo install cargo-certora-sbf --version 0.3.5 --locked
       - if: steps.gate.outputs.licensed == 'true'
         name: Run P-SOLV-4 solvency proof (Certora Solana Prover)
-        working-directory: programs/flash-book
+        working-directory: certora/harness-crate
         env:
           CERTORAKEY: ${{ secrets.CERTORAKEY }}
         run: |
+          # The harness is a SEPARATE crate (flash-book stays IDL-clean).
           # cargo-certora-sbf pulls Certora's platform-tools (v1.53-certora) and
-          # emits the build manifest; certoraSolanaProver builds --features certora
-          # and runs the rule(s) in certora/solana_solvency.conf on the cloud
-          # Prover, failing CI on any violation or sanity failure.
+          # emits the build manifest; certoraSolanaProver builds it (flash-book
+          # with the certora feature) and runs the rule(s) in the conf on the
+          # cloud Prover, failing CI on any violation or sanity failure.
           certoraSolanaProver "$GITHUB_WORKSPACE/certora/solana_solvency.conf" --wait_for_results

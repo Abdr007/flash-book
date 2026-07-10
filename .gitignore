@@ -21,3 +21,5 @@ test-ledger/
 
 # Certora Prover local scratch
 .certora_internal/
+certora/harness-crate/target/
+certora/harness-crate/err.log
