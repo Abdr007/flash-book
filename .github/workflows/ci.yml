@@ -205,7 +205,7 @@ jobs:
             echo "licensed=true" >> "$GITHUB_OUTPUT"
           else
             echo "licensed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::CERTORAKEY not set — Certora solvency proof SKIPPED (scaffold not yet licensed). This is not a pass."
+            echo "::notice::CERTORAKEY not set — Certora solvency proof SKIPPED (the real harness verifies GREEN on the cloud Prover; this CI runner just lacks the license secret). This is not a pass."
           fi
       - if: steps.gate.outputs.licensed == 'true'
         uses: actions/setup-python@v5
