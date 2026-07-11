@@ -279,6 +279,8 @@ pub enum FlashBookError {
     ReduceOnlyNoPosition = 2324,
     #[msg("Liquidation-close order (order_type 3) cannot be cancelled by its owner — only a fill or keeper/authority retirement clears it")]
     LiquidationOrderNotCancelable = 2325,
+    #[msg("Price carries more than 5 significant figures (anti-fragmentation rule); trim the trailing precision")]
+    PriceTooManySignificantFigures = 2326,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

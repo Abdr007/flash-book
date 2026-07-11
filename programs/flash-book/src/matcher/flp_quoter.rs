@@ -280,6 +280,23 @@ pub fn price_within_band(oracle_ticks: u64, price_ticks: u64, max_dev_bps: u32) 
     diff * (BPS_DENOM as u128) <= allowed
 }
 
+/// True iff `price_ticks` carries at most `MAX_PRICE_SIG_FIGS` significant figures — the
+/// anti-fragmentation price rule (roadmap 4.2). Trailing zeros are not significant, so they
+/// are stripped first; the remaining magnitude must be `< 10^N`. `price == 0` is trivially
+/// ok (the ZeroPrice guard rejects it elsewhere). Pure, total, overflow-free: the strip loop
+/// runs at most ~19 times (10^19 < 2^64) and `10^N` for N=5 is 100_000.
+#[inline]
+pub fn price_sig_figs_ok(price_ticks: u64) -> bool {
+    if price_ticks == 0 {
+        return true;
+    }
+    let mut p = price_ticks;
+    while p % 10 == 0 {
+        p /= 10;
+    }
+    p < 10u64.pow(crate::constants::MAX_PRICE_SIG_FIGS)
+}
+
 /// HARD INVENTORY CAP (increment 3): the pool's net-position notional must not
 /// exceed its capital (a conservative ~1× exposure limit). Returns
 /// `(skip_bids, skip_asks)` for `flp_refresh_quotes`: when the pool is at the
@@ -385,6 +402,49 @@ mod inventory_cap_tests {
         assert_eq!(inventory_cap_skip(-1500, 1000), (false, true)); // over short cap
         assert_eq!(inventory_cap_skip(999, 1000), (false, false)); // just under → quote both
         assert_eq!(inventory_cap_skip(5000, 0), (false, false)); // no capital → no cap
+    }
+}
+
+#[cfg(test)]
+mod price_sig_figs_tests {
+    use super::price_sig_figs_ok;
+
+    #[test]
+    fn accepts_at_most_5_sig_figs_rejects_more() {
+        assert!(price_sig_figs_ok(0)); // ZeroPrice guarded elsewhere
+        assert!(price_sig_figs_ok(1));
+        assert!(price_sig_figs_ok(99_999)); // 5 sig figs
+        assert!(price_sig_figs_ok(12_345)); // 5
+        assert!(price_sig_figs_ok(123_450)); // trailing zero not significant → 5
+        assert!(price_sig_figs_ok(100_000)); // 1 sig fig
+        assert!(price_sig_figs_ok(1_000_000_000)); // 1 sig fig
+        assert!(!price_sig_figs_ok(123_456)); // 6 sig figs
+        assert!(!price_sig_figs_ok(100_001)); // 6
+        assert!(!price_sig_figs_ok(999_999)); // 6
+                                              // appending a trailing zero never changes the verdict
+        assert_eq!(price_sig_figs_ok(12_345), price_sig_figs_ok(123_450));
+        assert_eq!(price_sig_figs_ok(123_456), price_sig_figs_ok(1_234_560));
+    }
+}
+
+#[cfg(kani)]
+mod price_sig_figs_proofs {
+    use super::price_sig_figs_ok;
+
+    /// Total (no panic/overflow — the strip loop terminates), any ≤5-digit price passes,
+    /// and appending a trailing zero (×10) never changes the verdict (a trailing zero is
+    /// not a significant figure).
+    #[kani::proof]
+    #[kani::unwind(21)]
+    fn price_sig_figs_ok_is_total_and_trailing_zero_invariant() {
+        let p: u64 = kani::any();
+        let ok = price_sig_figs_ok(p);
+        if p != 0 && p < 100_000 {
+            assert!(ok);
+        }
+        if let Some(p10) = p.checked_mul(10) {
+            assert!(price_sig_figs_ok(p) == price_sig_figs_ok(p10));
+        }
     }
 }
 
