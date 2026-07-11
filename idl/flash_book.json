@@ -23807,6 +23807,22 @@
               "`0` = disabled (no per-order value floor)."
             ],
             "type": "u64"
+          },
+          {
+            "name": "oi_mmr_slope_bps_per_million_lots",
+            "docs": [
+              "OI-crowding maintenance surcharge (4.4): extra maintenance bps a position pays per",
+              "million lots of open interest on ITS side, capped by `oi_mmr_max_extra_bps`. `slope",
+              "= 0` = OFF (existing behaviour). See `matcher::risk::oi_scaled_mmr_extra_bps`."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "oi_mmr_max_extra_bps",
+            "docs": [
+              "Cap (bps) on the OI-crowding surcharge. `0` = uncapped."
+            ],
+            "type": "u32"
           }
         ]
       }

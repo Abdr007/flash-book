@@ -259,6 +259,13 @@ pub struct MarketParams {
     /// splinter the book cheaply; this puts a real value floor on every resting order.
     /// `0` = disabled (no per-order value floor).
     pub min_notional_quote_lots: u64,
+
+    /// OI-crowding maintenance surcharge (4.4): extra maintenance bps a position pays per
+    /// million lots of open interest on ITS side, capped by `oi_mmr_max_extra_bps`. `slope
+    /// = 0` = OFF (existing behaviour). See `matcher::risk::oi_scaled_mmr_extra_bps`.
+    pub oi_mmr_slope_bps_per_million_lots: u32,
+    /// Cap (bps) on the OI-crowding surcharge. `0` = uncapped.
+    pub oi_mmr_max_extra_bps: u32,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).

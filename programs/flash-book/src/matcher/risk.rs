@@ -88,17 +88,15 @@ impl MarketSnapshot {
     ///
     /// All terms are additive; total saturates on u32 overflow.
     ///
-    /// ⚠️ Term (3) is **INACTIVE in production**. Every on-chain
-    /// `RiskMarketSnap` constructs this snapshot with `side_oi_lots = 0` and
-    /// `oi_mmr_slope_bps_per_million_lots = 0`, and there is **no MarketParams
-    /// field** to configure them — so `oi_extra` is always 0 and the
-    /// crowded-trade penalty does nothing. This is documented (not silently
-    /// dead) to avoid false assurance. To activate it: add
-    /// `oi_mmr_slope_bps_per_million_lots` + `oi_mmr_max_extra_bps` to
-    /// `MarketParams` (a state migration) and thread real per-side OI
-    /// (`market.oi_long_lots` / `oi_short_lots`) into the snapshots at the
-    /// call sites. Omitting the penalty is conservative-safe (never
-    /// under-margins), so this is a missing feature, not a solvency bug.
+    /// Term (3) is **wired and configurable** (roadmap 4.4). `MarketParams`
+    /// carries `oi_mmr_slope_bps_per_million_lots` + `oi_mmr_max_extra_bps`,
+    /// and every on-chain `RiskMarketSnap` threads real per-side OI
+    /// (`market.oi_long_lots` / `oi_short_lots`, selected by the position's
+    /// side via `oi_side_lots`) into the snapshot. `slope = 0` is the default
+    /// and keeps `oi_extra = 0`, i.e. byte-identical to pre-4.4 behaviour until
+    /// a market opts in. Because the term is purely additive to maintenance
+    /// bps, enabling it only ever *raises* the margin requirement — it can
+    /// never under-margin an existing position.
     pub fn effective_mmr_bps(&self, size_lots: u64) -> u32 {
         let base_with_conc = if self.concentration_threshold_lots > 0
             && size_lots >= self.concentration_threshold_lots

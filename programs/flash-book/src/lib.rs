@@ -3932,9 +3932,11 @@ pub mod flash_book {
                     tick_size: market_acct.params.tick_size,
                     concentration_threshold_lots: market_acct.params.concentration_threshold_lots,
                     concentration_extra_mmr_bps: market_acct.params.concentration_extra_mmr_bps,
-                    side_oi_lots: 0,
-                    oi_mmr_slope_bps_per_million_lots: 0,
-                    oi_mmr_max_extra_bps: 0,
+                    side_oi_lots: oi_side_lots(&market_acct, position.side == 0),
+                    oi_mmr_slope_bps_per_million_lots: market_acct
+                        .params
+                        .oi_mmr_slope_bps_per_million_lots,
+                    oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
                 });
                 market_keys.push(market_ai.key());
             }
@@ -4568,9 +4570,9 @@ pub mod flash_book {
                 tick_size: market.params.tick_size,
                 concentration_threshold_lots: market.params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
-                side_oi_lots: 0,
-                oi_mmr_slope_bps_per_million_lots: 0,
-                oi_mmr_max_extra_bps: 0,
+                side_oi_lots: oi_side_lots(&market, position.side == 0),
+                oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
+                oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
             });
             market_keys.push(m_ai.key());
             i += 2;
@@ -4603,9 +4605,11 @@ pub mod flash_book {
             tick_size: target_market.params.tick_size,
             concentration_threshold_lots: target_market.params.concentration_threshold_lots,
             concentration_extra_mmr_bps: target_market.params.concentration_extra_mmr_bps,
-            side_oi_lots: 0,
-            oi_mmr_slope_bps_per_million_lots: 0,
-            oi_mmr_max_extra_bps: 0,
+            side_oi_lots: oi_side_lots(target_market, tp_side == 0),
+            oi_mmr_slope_bps_per_million_lots: target_market
+                .params
+                .oi_mmr_slope_bps_per_million_lots,
+            oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
         });
         market_keys.push(target_market_key);
 
@@ -4764,9 +4768,9 @@ pub mod flash_book {
                 tick_size: market.params.tick_size,
                 concentration_threshold_lots: market.params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
-                side_oi_lots: 0,
-                oi_mmr_slope_bps_per_million_lots: 0,
-                oi_mmr_max_extra_bps: 0,
+                side_oi_lots: oi_side_lots(&market, position.side == 0),
+                oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
+                oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
             });
             market_keys.push(m_ai.key());
             i += 2;
@@ -4797,9 +4801,11 @@ pub mod flash_book {
                 tick_size: target_market.params.tick_size,
                 concentration_threshold_lots: target_market.params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: target_market.params.concentration_extra_mmr_bps,
-                side_oi_lots: 0,
-                oi_mmr_slope_bps_per_million_lots: 0,
-                oi_mmr_max_extra_bps: 0,
+                side_oi_lots: oi_side_lots(target_market, tp_side == 0),
+                oi_mmr_slope_bps_per_million_lots: target_market
+                    .params
+                    .oi_mmr_slope_bps_per_million_lots,
+                oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
             });
             market_keys.push(target_market_key);
         }
@@ -7493,6 +7499,7 @@ pub mod flash_book {
             (proj_a, market_a, market_a_key),
             (proj_b, market_b, market_b_key),
         ] {
+            let leg_is_long = matches!(proj.as_ref().map(|s| s.side), Some(Side::Long));
             if let Some(s) = proj {
                 snaps.push(s);
             }
@@ -7505,9 +7512,9 @@ pub mod flash_book {
                 tick_size: market.params.tick_size,
                 concentration_threshold_lots: market.params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
-                side_oi_lots: 0,
-                oi_mmr_slope_bps_per_million_lots: 0,
-                oi_mmr_max_extra_bps: 0,
+                side_oi_lots: oi_side_lots(market, leg_is_long),
+                oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
+                oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
             });
         }
         if !snaps.is_empty() {
@@ -7661,9 +7668,11 @@ pub mod flash_book {
                 tick_size: markets[i].params.tick_size,
                 concentration_threshold_lots: markets[i].params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: markets[i].params.concentration_extra_mmr_bps,
-                side_oi_lots: 0,
-                oi_mmr_slope_bps_per_million_lots: 0,
-                oi_mmr_max_extra_bps: 0,
+                side_oi_lots: oi_side_lots(&markets[i], positions[i].side == 0),
+                oi_mmr_slope_bps_per_million_lots: markets[i]
+                    .params
+                    .oi_mmr_slope_bps_per_million_lots,
+                oi_mmr_max_extra_bps: markets[i].params.oi_mmr_max_extra_bps,
             });
         }
         if !snaps.is_empty() {
@@ -7964,9 +7973,11 @@ pub mod flash_book {
                 tick_size: market_acct.params.tick_size,
                 concentration_threshold_lots: market_acct.params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: market_acct.params.concentration_extra_mmr_bps,
-                side_oi_lots: 0,
-                oi_mmr_slope_bps_per_million_lots: 0,
-                oi_mmr_max_extra_bps: 0,
+                side_oi_lots: oi_side_lots(&market_acct, position.side == 0),
+                oi_mmr_slope_bps_per_million_lots: market_acct
+                    .params
+                    .oi_mmr_slope_bps_per_million_lots,
+                oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
             });
             market_keys.push(market_ai.key());
         }
@@ -9071,9 +9082,9 @@ pub mod flash_book {
             tick_size: market.params.tick_size,
             concentration_threshold_lots: market.params.concentration_threshold_lots,
             concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
-            side_oi_lots: 0,
-            oi_mmr_slope_bps_per_million_lots: 0,
-            oi_mmr_max_extra_bps: 0,
+            side_oi_lots: oi_side_lots(market, matches!(pos_side, Side::Long)),
+            oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
+            oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         // Unified dispatch: if position is isolated (pos_snap.collateral_quote_lots > 0),
@@ -9691,9 +9702,9 @@ pub mod flash_book {
             tick_size: market.params.tick_size,
             concentration_threshold_lots: market.params.concentration_threshold_lots,
             concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
-            side_oi_lots: 0,
-            oi_mmr_slope_bps_per_million_lots: 0,
-            oi_mmr_max_extra_bps: 0,
+            side_oi_lots: oi_side_lots(market, underwater.side == 0),
+            oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
+            oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         let assessment = assess_margin_unified_fn(
@@ -10066,9 +10077,9 @@ pub mod flash_book {
             tick_size: exec_market.params.tick_size,
             concentration_threshold_lots: exec_market.params.concentration_threshold_lots,
             concentration_extra_mmr_bps: exec_market.params.concentration_extra_mmr_bps,
-            side_oi_lots: 0,
-            oi_mmr_slope_bps_per_million_lots: 0,
-            oi_mmr_max_extra_bps: 0,
+            side_oi_lots: oi_side_lots(exec_market, exec_position.side == 0),
+            oi_mmr_slope_bps_per_million_lots: exec_market.params.oi_mmr_slope_bps_per_million_lots,
+            oi_mmr_max_extra_bps: exec_market.params.oi_mmr_max_extra_bps,
         });
         position_snaps.push(RiskPosSnap {
             market: exec_position.market,
@@ -10164,9 +10175,9 @@ pub mod flash_book {
                 tick_size: market.params.tick_size,
                 concentration_threshold_lots: market.params.concentration_threshold_lots,
                 concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
-                side_oi_lots: 0,
-                oi_mmr_slope_bps_per_million_lots: 0,
-                oi_mmr_max_extra_bps: 0,
+                side_oi_lots: oi_side_lots(&market, position.side == 0),
+                oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
+                oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
             });
             position_snaps.push(RiskPosSnap {
                 market: position.market,
@@ -13876,9 +13887,9 @@ fn partial_withdraw_core<'info>(
             tick_size: market.params.tick_size,
             concentration_threshold_lots: market.params.concentration_threshold_lots,
             concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
-            side_oi_lots: 0,
-            oi_mmr_slope_bps_per_million_lots: 0,
-            oi_mmr_max_extra_bps: 0,
+            side_oi_lots: oi_side_lots(&market, position.side == 0),
+            oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
+            oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
         });
         market_keys.push(m_ai.key());
         i += 2;
@@ -19105,6 +19116,18 @@ pub struct BasketLeg {
 /// health (configured + published, and required-fresh below); otherwise it is
 /// passed as 0 so the worse-of prices off the mark alone. `is_long` is the
 /// position's direction in `market`.
+/// 4.4: open interest on a position's SIDE, for the OI-crowding maintenance surcharge on a
+/// `RiskMarketSnap`. With `oi_mmr_slope == 0` (default) the surcharge is 0 regardless, so
+/// every wired site is byte-identical to the pre-4.4 behaviour until a market opts in.
+#[inline]
+fn oi_side_lots(market: &MarketAccount, is_long: bool) -> u64 {
+    if is_long {
+        market.oi_long_lots
+    } else {
+        market.oi_short_lots
+    }
+}
+
 fn effective_health_mark(
     market: &MarketAccount,
     now_unix: u64,
@@ -22871,5 +22894,33 @@ mod m15_undelegate_gate_tests {
                 check_undelegate_binding(&book_pda(&market), &market, seed, &seq, &seq).is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod oi_crowding_wiring_tests {
+    //! 4.4: guards the per-side OI selector that every `RiskMarketSnap` uses to
+    //! feed the OI-crowding maintenance surcharge. The surcharge MATH + its
+    //! application are proven in `matcher::risk` (unit + Kani); these pin the
+    //! side selection that the 13 call sites hand-wire.
+    use super::*;
+
+    fn mkt_with_oi(long: u64, short: u64) -> MarketAccount {
+        let mut m: MarketAccount = unsafe { core::mem::zeroed() };
+        m.oi_long_lots = long;
+        m.oi_short_lots = short;
+        m
+    }
+
+    #[test]
+    fn selects_long_oi_for_a_long_leg() {
+        let m = mkt_with_oi(700, 300);
+        assert_eq!(oi_side_lots(&m, true), 700);
+    }
+
+    #[test]
+    fn selects_short_oi_for_a_short_leg() {
+        let m = mkt_with_oi(700, 300);
+        assert_eq!(oi_side_lots(&m, false), 300);
     }
 }
