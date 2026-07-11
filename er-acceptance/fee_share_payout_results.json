@@ -1,0 +1,23 @@
+{
+  "program": "BRtnEAZ6Tc61gz8m93unL1vzaC4GjtHViLCU8JqKB2gD",
+  "rpc": "https://devnet.helius-rpc.com/",
+  "market": "6WsrVNnvyW64QZVf1cbNtbS7TqahgBhjBpU2H2kvWNP5",
+  "rows": [
+    {
+      "n": "2.3 apply_fill accrues referrer share on-chain (real matched fill)",
+      "ok": true,
+      "d": "accrued=900 quote-lots",
+      "sig": "5T5q3NqWRRtfpS5xWSmyDKWGGQaQUbvxnHa87ACdLD1XXtYc6iZyW9xrERjvW8LjDfY8GAzBNHreEGcoVUFN4XM3",
+      "explorer": "https://explorer.solana.com/tx/5T5q3NqWRRtfpS5xWSmyDKWGGQaQUbvxnHa87ACdLD1XXtYc6iZyW9xrERjvW8LjDfY8GAzBNHreEGcoVUFN4XM3?cluster=devnet"
+    },
+    {
+      "n": "2.3 claim_fee_accrual pays out to referrer ATA + zeroes accrual",
+      "ok": true,
+      "d": "ATA balance=900 accrual now=0",
+      "sig": "3RNef6KEC9CBaHKNg1u7c6FUEE9Hytj3doX6dm6uKUnMcyy1nLwJtyZDakNzbKLpViAiypycPfMPVKXBu6Hysmg",
+      "explorer": "https://explorer.solana.com/tx/3RNef6KEC9CBaHKNg1u7c6FUEE9Hytj3doX6dm6uKUnMcyy1nLwJtyZDakNzbKLpViAiypycPfMPVKXBu6Hysmg?cluster=devnet"
+    }
+  ],
+  "pass": 2,
+  "fail": 0
+}
