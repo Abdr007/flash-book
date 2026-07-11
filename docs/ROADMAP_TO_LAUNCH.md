@@ -196,7 +196,8 @@ sequencer-trust/latent item with a **named fix and the milestone it attaches to*
 Every item now has real scope (no more title-only). The remainder splits into:
 
 - **Program changes**: **ALL BUILT** — the last first-party program-change items
-  are done (each pending only its devnet acceptance cycle): 2.2 #315; 4.1 #316; 3.3 disp.; 4.3 #318; **4.4** OI-crowding surcharge (default-off migration); **2.3** trustless fee-share escrow-accrual (host-tested + Lean-proved); **4.5** tranched liquidation (host-tested). No first-party program change remains open. (**4.8 CLOSED** + devnet-accepted, PR #300; the H-B cancel-lock
+  are done: 2.2 #315; 4.1 #316; 3.3 disp.; 4.3 #318; **4.4** OI-crowding surcharge (default-off migration); **2.3** trustless fee-share escrow-accrual (host-tested + Lean-proved); **4.5** tranched liquidation (host-tested). No first-party program change remains open.
+  **Devnet deploy (2026-07-12):** merged main built + deployed to the throwaway `BRtnEAZ6…` (upgrade sig `5PVsfo9…`); **deployed bytecode sha256 == local artifact** (`cdcfaeaa…`), so devnet runs bit-for-bit main. Live acceptance (`er-acceptance/feature_acceptance_2026_07_12.mjs`, public devnet): **2/2** — `init_fee_accrual` creates the recipient PDA, `claim_fee_accrual` on an empty accrual reverts with ZeroSize (0x1c22) through the full INS/FLP/ATA/vault account path. **Still pending:** the value-moving happy paths (2.3 accrual-through-`apply_fill`→claim payout, 4.4 surcharge effect, 4.5 tranche clamp on a live liquidation) — these need a full fill genesis; covered by host tests (+ 2.3 Lean). (**4.8 CLOSED** + devnet-accepted, PR #300; the H-B cancel-lock
   + M-2 worse-of shipped in the same PR — the audit's two HIGHs are no longer open.
   **4.2 DONE** PR #313; **4.6 DONE** PR #309 (+ vault #311); **4.7 DONE** PR #305 +
   funding-TWAP PR #307. 2.1/2.7 dispositioned/done above.)

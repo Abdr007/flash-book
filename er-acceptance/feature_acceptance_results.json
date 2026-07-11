@@ -1,0 +1,21 @@
+{
+  "program": "BRtnEAZ6Tc61gz8m93unL1vzaC4GjtHViLCU8JqKB2gD",
+  "rpc": "https://api.devnet.solana.com",
+  "rows": [
+    {
+      "name": "2.3 init_fee_accrual creates PDA (recipient bound, accrued=0)",
+      "ok": true,
+      "detail": "recipient=FdrMadjU accrued=0",
+      "sig": "259ZGs162yiXR7qvAA9UpsovaJudQCp21Zy4rDtWGnTH1GoVpVf3jaeaejBMBm3gPCP8vF3egueLgtbtebFxFfUo",
+      "explorer": "https://explorer.solana.com/tx/259ZGs162yiXR7qvAA9UpsovaJudQCp21Zy4rDtWGnTH1GoVpVf3jaeaejBMBm3gPCP8vF3egueLgtbtebFxFfUo?cluster=devnet"
+    },
+    {
+      "name": "2.3 claim_fee_accrual rejects empty (ZeroSize)",
+      "ok": true,
+      "detail": "empty accrual reverts with ZeroSize (0x1c22)",
+      "explorer": null
+    }
+  ],
+  "pass": 2,
+  "fail": 0
+}
