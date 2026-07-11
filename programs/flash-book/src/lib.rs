@@ -9999,14 +9999,22 @@ pub mod flash_book {
                 FlashBookError::OutOfRange
             );
             market_keys.push(market_ai.key());
+            // L-1 (audit 2026-07-10): a SIBLING leg on a dormant/stale market must NOT
+            // abort the whole portfolio walk (that let a genuinely-insolvent trader dodge
+            // liquidation of their other, freshly-priced legs). When the leg is
+            // unpriceable, fall back to ENTRY-NEUTRAL valuation: mark = entry ⇒ zero
+            // unrealized PnL (never credit an unverifiable gain, never fabricate a loss)
+            // while the leg's maintenance margin is STILL charged on its entry notional.
+            // Only a stale sibling is softened; the EXECUTION leg (the first snap, above)
+            // stays strict (`?`) because the injected close is priced off it, and the
+            // injection-price read further down also stays strict. `effective_health_mark` only
+            // errors on staleness / mark-untrust, so any Err here means "cannot price".
+            let sibling_mark =
+                effective_health_mark(&market, liq_now_unix, liq_current_slot, position.side == 0)
+                    .unwrap_or(position.entry_price_ticks);
             market_snaps.push(RiskMarketSnap {
                 market: market_ai.key(),
-                mark_price: Ticks(effective_health_mark(
-                    &market,
-                    liq_now_unix,
-                    liq_current_slot,
-                    position.side == 0,
-                )?),
+                mark_price: Ticks(sibling_mark),
                 cum_funding_index: market.cum_funding_index,
                 maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
                 tick_size: market.params.tick_size,
