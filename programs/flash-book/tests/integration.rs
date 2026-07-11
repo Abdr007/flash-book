@@ -4904,6 +4904,91 @@ async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
     );
 }
 
+/// 4.2 anti-fragmentation: a resting limit price may carry at most 5 significant figures.
+/// A 6-sig-fig in-band price (123_457) is rejected (PriceTooManySignificantFigures, 8326);
+/// a 5-sig-fig in-band price (123_450 — the trailing zero is not significant) is accepted.
+#[tokio::test]
+async fn place_limit_v2_enforces_5_significant_figures() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // oracle 100_000
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let maker = Keypair::new();
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let place = |price: u64| {
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side: 1,
+                size_lots: 1,
+                limit_ticks: price,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(maker_state, false),
+                AccountMeta::new_readonly(program_id(), false),
+            ],
+        )
+    };
+
+    // 6 significant figures (in-band vs oracle 100_000) → rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let six = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(123_457)],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await;
+    assert!(
+        format!("{six:?}").contains("Custom(8326)"),
+        "a 6-sig-fig price must reject PriceTooManySignificantFigures, got: {six:?}"
+    );
+
+    // 5 significant figures (trailing zero not significant) → accepted.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let five = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(123_450)],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await;
+    assert!(
+        five.is_ok(),
+        "a 5-sig-fig in-band price must be accepted, got: {five:?}"
+    );
+}
+
 /// modify_order_v2 must re-apply the anti-stuffing oracle band: an order placed
 /// in-band cannot be re-priced to a far-from-oracle level. Place an ask @ 140_000
 /// (inside the 50% band around the 100_000 oracle), then modify it to 200_000

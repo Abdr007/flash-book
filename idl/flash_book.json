@@ -19206,6 +19206,11 @@
       "code": 8325,
       "name": "LiquidationOrderNotCancelable",
       "msg": "Liquidation-close order (order_type 3) cannot be cancelled by its owner — only a fill or keeper/authority retirement clears it"
+    },
+    {
+      "code": 8326,
+      "name": "PriceTooManySignificantFigures",
+      "msg": "Price carries more than 5 significant figures (anti-fragmentation rule); trim the trailing precision"
     }
   ],
   "types": [

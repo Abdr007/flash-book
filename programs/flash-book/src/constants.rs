@@ -221,6 +221,12 @@ pub const FLP_REFRESH_MIN_SLOTS: u32 = 50;
 /// orders) — that is bounded by the expandable arena + economic future work.
 pub const MAX_RESTING_ORDER_DEVIATION_BPS: u32 = 5000;
 
+/// Anti-fragmentation price rule (roadmap 4.2): an order price may carry at most this
+/// many significant figures. Prices with excess precision splinter the book into many
+/// near-identical levels; capping significant figures keeps price-time priority meaningful
+/// without constraining the market's tick size. 5 is a conventional exchange choice.
+pub const MAX_PRICE_SIG_FIGS: u32 = 5;
+
 /// Max expired orders a single `reap_expired_orders` call may reclaim.
 /// Bounds CU/transaction size; the permissionless cranker batches more across
 /// calls. 64 comfortably fits a transaction's account/data budget.

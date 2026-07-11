@@ -1572,6 +1572,10 @@ pub mod flash_book {
         if limit_ticks % p.tick_size != 0 {
             return err!(FlashBookError::PriceNotOnTick);
         }
+        // 4.2: anti-fragmentation — reject a price carrying more than 5 significant figures.
+        if !matcher::flp_quoter::price_sig_figs_ok(limit_ticks) {
+            return err!(FlashBookError::PriceTooManySignificantFigures);
+        }
 
         // reduce_only (bit1), or a market in CloseOnly wind-down: cap the taker to
         // its own reducible size so it can
@@ -2610,6 +2614,10 @@ pub mod flash_book {
         }
         if new_limit_ticks % p.tick_size != 0 {
             return err!(FlashBookError::PriceNotOnTick);
+        }
+        // 4.2: anti-fragmentation — reject a price carrying more than 5 significant figures.
+        if !matcher::flp_quoter::price_sig_figs_ok(new_limit_ticks) {
+            return err!(FlashBookError::PriceTooManySignificantFigures);
         }
 
         // Anti-stuffing: the re-priced resting order must sit within the band of
@@ -11743,6 +11751,11 @@ pub mod flash_book {
             limit_ticks % market.params.tick_size == 0,
             FlashBookError::PriceNotOnTick
         );
+        // 4.2: anti-fragmentation — reject a price carrying more than 5 significant figures.
+        require!(
+            matcher::flp_quoter::price_sig_figs_ok(limit_ticks),
+            FlashBookError::PriceTooManySignificantFigures
+        );
 
         // H-A (item 4.8): gate the vault's OPENING order against its own TraderState
         // collateral, exactly like place_limit_v2_core. A reduce-only order is exempt
@@ -13954,6 +13967,10 @@ fn place_limit_v2_core(
     }
     if limit_ticks % p.tick_size != 0 {
         return err!(FlashBookError::PriceNotOnTick);
+    }
+    // 4.2: anti-fragmentation — reject a price carrying more than 5 significant figures.
+    if !matcher::flp_quoter::price_sig_figs_ok(limit_ticks) {
+        return err!(FlashBookError::PriceTooManySignificantFigures);
     }
 
     // Anti-stuffing: a RESTING limit must sit within the band of the fresh
