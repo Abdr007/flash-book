@@ -266,6 +266,18 @@ pub struct MarketParams {
     pub oi_mmr_slope_bps_per_million_lots: u32,
     /// Cap (bps) on the OI-crowding surcharge. `0` = uncapped.
     pub oi_mmr_max_extra_bps: u32,
+
+    /// Tranched-liquidation cap (4.5): the maximum base lots a SINGLE
+    /// `liquidate_position_v2` call may close on one position. A position larger
+    /// than this is liquidated over multiple calls, each spaced by
+    /// `liquidation_cooldown_slots`, so a large forced unwind can't dump its
+    /// full size into the book in one shot (market-impact mitigation). The
+    /// requested/derived close size is clamped to this. `0` = disabled
+    /// (unbounded single-shot close — existing behaviour). Deliberately NOT
+    /// applied to `auto_deleverage`: ADL fires only when the insurance fund is
+    /// already below its pause threshold, where throttling the unwind would
+    /// worsen the deficit — that path must stay unbounded.
+    pub max_liq_tranche_lots: u64,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).

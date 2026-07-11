@@ -7748,52 +7748,25 @@ pub mod flash_book {
         let mut markets: Vec<MarketAccount> = Vec::with_capacity(legs.len());
         let mut market_keys: Vec<Pubkey> = Vec::with_capacity(legs.len());
         let mut positions: Vec<state::PositionAccount> = Vec::with_capacity(legs.len());
-        for (i, _leg) in legs.iter().enumerate() {
-            let m_ai = &remaining[i * 3];
-            let book_ai = &remaining[i * 3 + 1];
-            let pos_ai = &remaining[i * 3 + 2];
-
-            require_keys_eq!(*m_ai.owner, *program_id, FlashBookError::Unauthorized);
-            // book_ai owner is also this program (PDA we own). Disc check
-            // happens inside MarketBookHandle::from_account_data on inject.
-            require_keys_eq!(*book_ai.owner, *program_id, FlashBookError::Unauthorized);
-            require_keys_eq!(*pos_ai.owner, *program_id, FlashBookError::Unauthorized);
-
-            let market: MarketAccount =
-                MarketAccount::try_deserialize(&mut &m_ai.try_borrow_data()?[..])?;
-            let position: state::PositionAccount =
-                state::PositionAccount::try_deserialize(&mut &pos_ai.try_borrow_data()?[..])?;
-
-            for prev in &market_keys {
-                require!(*prev != m_ai.key(), FlashBookError::OutOfRange);
-            }
-            market_keys.push(m_ai.key());
-
-            validate_leg_intake(&market, &legs[i])?;
-            check_caps_for_leg(&market, &position, &ctx.accounts.flp_exposure, &legs[i])?;
-
-            // Bind this leg's position to the CANONICAL
-            // PDA for (leg market, signing trader_state). The 2-leg `PlaceBasketOrderV2`
-            // PDA-binds via Anchor seeds; this N-leg path did not. Without it, an
-            // attacker passed a small/empty PositionAccount so the margin lattice saw
-            // ~no exposure (healthy), while the leg injects tagged to the trader_state
-            // and the fill accrues to their REAL large, unassessed position →
-            // undercollateralized. Derivation is in an #[inline(never)] helper so its
-            // stack stays out of this (large) handler's BPF frame.
-            require_canonical_position_pda(
-                &m_ai.key(),
-                &ctx.accounts.trader_state.key(),
-                &pos_ai.key(),
+        let trader_state_key = ctx.accounts.trader_state.key();
+        for (i, leg) in legs.iter().enumerate() {
+            // Per-leg deserialize+validate lives in an #[inline(never)] helper so
+            // the (large) MarketAccount / PositionAccount locals sit in ITS BPF
+            // frame, not this handler's — keeping basket_n under the 4 KB limit as
+            // MarketParams grows.
+            basket_n_load_leg(
+                &remaining[i * 3],
+                &remaining[i * 3 + 1],
+                &remaining[i * 3 + 2],
+                leg,
                 program_id,
+                trader_key,
+                trader_state_key,
+                &ctx.accounts.flp_exposure,
+                &mut markets,
+                &mut positions,
+                &mut market_keys,
             )?;
-
-            if position.size_lots > 0 {
-                require!(position.trader == trader_key, FlashBookError::WrongTrader);
-                require!(position.market == m_ai.key(), FlashBookError::WrongMarket);
-            }
-
-            markets.push(market);
-            positions.push(position);
         }
 
         // Cross-market stress lattice (parity).
@@ -9106,6 +9079,16 @@ pub mod flash_book {
             requested_close_lots
         };
         require!(close_size > 0, FlashBookError::ZeroSize);
+
+        // 4.5: tranched liquidation — cap this call's close to a single tranche so
+        // a position larger than the tranche unwinds over multiple calls, each
+        // spaced by `liquidation_cooldown_slots` (below), bounding the market
+        // impact of one forced unwind. `0` = disabled (unbounded single close).
+        let close_size = if market.params.max_liq_tranche_lots > 0 {
+            close_size.min(market.params.max_liq_tranche_lots)
+        } else {
+            close_size
+        };
 
         let current_slot = Clock::get()?.slot;
         let cooldown = market.params.liquidation_cooldown_slots as u64;
@@ -17796,11 +17779,14 @@ pub struct PlaceBasketOrderNV2<'info> {
     )]
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
+    // Boxed: `FlpExposureAccount` carries a `[FlpMarketExposure; 16]` (~784 B);
+    // deserialized onto the stack it tips this context's 4 KB BPF frame (the
+    // margin becomes tight once `MarketParams` grows). Box moves it to the heap.
     #[account(
         seeds = [FlpExposureAccount::SEED],
         bump = flp_exposure.bump,
     )]
-    pub flp_exposure: Account<'info, FlpExposureAccount>,
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
     // Per-leg accounts arrive in remaining_accounts as triples:
     //   [market_0, market_book_0, position_0,
     //    market_1, market_book_1, position_1, ...]
@@ -19403,6 +19389,61 @@ fn effective_health_mark(
         Some((hp, _)) => Ok(hp),
         None => Err(error!(FlashBookError::MarkTooStale)),
     }
+}
+
+/// 4.5-era stack fix: load + validate ONE basket-N leg. Extracted from the
+/// `place_basket_order_n_v2` loop and marked `#[inline(never)]` so the sizeable
+/// `MarketAccount` / `PositionAccount` deserialized here live in this helper's
+/// BPF frame rather than the (already large) handler's — the handler stays under
+/// the 4 KB limit as `MarketParams` grows. Logic is byte-for-byte the original
+/// loop body: owner checks, deserialize, market-key dedup, leg-intake + cap
+/// gates, canonical-position-PDA binding, trader/market checks, then push.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn basket_n_load_leg(
+    m_ai: &AccountInfo<'_>,
+    book_ai: &AccountInfo<'_>,
+    pos_ai: &AccountInfo<'_>,
+    leg: &BasketLeg,
+    program_id: &Pubkey,
+    trader_key: Pubkey,
+    trader_state_key: Pubkey,
+    flp_exposure: &FlpExposureAccount,
+    markets: &mut Vec<MarketAccount>,
+    positions: &mut Vec<state::PositionAccount>,
+    market_keys: &mut Vec<Pubkey>,
+) -> Result<()> {
+    require_keys_eq!(*m_ai.owner, *program_id, FlashBookError::Unauthorized);
+    // book_ai owner is also this program (PDA we own). Disc check happens inside
+    // MarketBookHandle::from_account_data on inject.
+    require_keys_eq!(*book_ai.owner, *program_id, FlashBookError::Unauthorized);
+    require_keys_eq!(*pos_ai.owner, *program_id, FlashBookError::Unauthorized);
+
+    let market: MarketAccount = MarketAccount::try_deserialize(&mut &m_ai.try_borrow_data()?[..])?;
+    let position: state::PositionAccount =
+        state::PositionAccount::try_deserialize(&mut &pos_ai.try_borrow_data()?[..])?;
+
+    for prev in market_keys.iter() {
+        require!(*prev != m_ai.key(), FlashBookError::OutOfRange);
+    }
+    market_keys.push(m_ai.key());
+
+    validate_leg_intake(&market, leg)?;
+    check_caps_for_leg(&market, &position, flp_exposure, leg)?;
+
+    // Bind this leg's position to the CANONICAL PDA for (leg market, signing
+    // trader_state) — without it an attacker passes a small/empty position so the
+    // margin lattice sees ~no exposure while the fill accrues to their real one.
+    require_canonical_position_pda(&m_ai.key(), &trader_state_key, &pos_ai.key(), program_id)?;
+
+    if position.size_lots > 0 {
+        require!(position.trader == trader_key, FlashBookError::WrongTrader);
+        require!(position.market == m_ai.key(), FlashBookError::WrongMarket);
+    }
+
+    markets.push(market);
+    positions.push(position);
+    Ok(())
 }
 
 /// Validate per-leg intake gates: status, size/price floors, tick alignment.
