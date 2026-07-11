@@ -200,7 +200,7 @@ Every item now has real scope (no more title-only). The remainder splits into:
   + M-2 worse-of shipped in the same PR — the audit's two HIGHs are no longer open.
   **4.2 DONE** PR #313; **4.6 DONE** PR #309 (+ vault #311); **4.7 DONE** PR #305 +
   funding-TWAP PR #307. 2.1/2.7 dispositioned/done above.)
-- **Hard proofs** (Lean / real-symbol): 1.3, 1.5, 1.7. (**1.2 DONE** — real-symbol Kani `assess_margin_single_market_frame_stable`.)
+- **Hard proofs** (Lean / real-symbol): **all DONE.** 1.2 (real-symbol Kani `assess_margin_single_market_frame_stable`), 1.3 (`RealizedPnl.lean`), 1.5 (`ResidualConservation.lean`), 1.7 (`AuthCompleteness.lean`) — each compiles clean with `#print axioms` showing only propext/Classical.choice/Quot.sound, no `sorry`.
 - **Multi-week builds**: 1.1 Certora integration, 3.1 percolator per-domain credit, and
   the three big builds (copy-vaults, HIP-3 permissionless deploy, decentralized-sequencer
   activation).
