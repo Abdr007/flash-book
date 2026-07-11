@@ -9602,6 +9602,139 @@
       ]
     },
     {
+      "name": "place_ladder_order",
+      "docs": [
+        "4.3: place a LADDER of `num_levels` resting limit orders in one instruction —",
+        "`size_per_level` at each of `base_limit_ticks`, `base ± price_step_ticks`, … moving",
+        "AWAY from the mid (bids step DOWN, asks step UP). Each rung is a full",
+        "`place_limit_v2_core`, so every per-order gate (tick / 5-sig-fig / min-notional /",
+        "anti-stuffing band / OI cap / intake margin) applies to each rung independently and a",
+        "rung that fails (e.g. steps out of band) aborts the whole ladder. Opening liquidity",
+        "tool: `reduce_only` is not allowed here (each rung would need its own reducible-size",
+        "clamp — use `place_limit_order_v2` for a reduce-only order). Bounded by",
+        "`MAX_LADDER_LEVELS` so the ladder can never exceed the compute budget."
+      ],
+      "discriminator": [
+        135,
+        158,
+        34,
+        22,
+        201,
+        132,
+        59,
+        185
+      ],
+      "accounts": [
+        {
+          "name": "trader",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "8-byte custom disc inside the handler via `MarketBookHandle::",
+            "from_account_data`. Mut because we write the new resting order",
+            "node + update the header indices."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "base_limit_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "price_step_ticks",
+          "type": "u64"
+        },
+        {
+          "name": "num_levels",
+          "type": "u8"
+        },
+        {
+          "name": "size_per_level",
+          "type": "u64"
+        },
+        {
+          "name": "flags",
+          "type": "u8"
+        },
+        {
+          "name": "expires_at_slot",
+          "type": "u64"
+        },
+        {
+          "name": "sub_index",
+          "type": "u8"
+        }
+      ]
+    },
+    {
       "name": "place_limit_order_v2",
       "docs": [
         "Limit-order placement against the hypertree-backed orderbook — the sole",

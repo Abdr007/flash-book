@@ -1465,6 +1465,76 @@ pub mod flash_book {
         )
     }
 
+    /// 4.3: place a LADDER of `num_levels` resting limit orders in one instruction —
+    /// `size_per_level` at each of `base_limit_ticks`, `base ± price_step_ticks`, … moving
+    /// AWAY from the mid (bids step DOWN, asks step UP). Each rung is a full
+    /// `place_limit_v2_core`, so every per-order gate (tick / 5-sig-fig / min-notional /
+    /// anti-stuffing band / OI cap / intake margin) applies to each rung independently and a
+    /// rung that fails (e.g. steps out of band) aborts the whole ladder. Opening liquidity
+    /// tool: `reduce_only` is not allowed here (each rung would need its own reducible-size
+    /// clamp — use `place_limit_order_v2` for a reduce-only order). Bounded by
+    /// `MAX_LADDER_LEVELS` so the ladder can never exceed the compute budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_ladder_order(
+        ctx: Context<PlaceLimitOrderV2>,
+        side: u8,
+        base_limit_ticks: u64,
+        price_step_ticks: u64,
+        num_levels: u8,
+        size_per_level: u64,
+        flags: u8,
+        expires_at_slot: u64,
+        sub_index: u8,
+    ) -> Result<()> {
+        require!(side <= 1, FlashBookError::OutOfRange);
+        require!(
+            (1..=constants::MAX_LADDER_LEVELS).contains(&num_levels),
+            FlashBookError::OutOfRange
+        );
+        require!(size_per_level > 0, FlashBookError::ZeroSize);
+        require!(base_limit_ticks > 0, FlashBookError::ZeroPrice);
+        // A multi-rung ladder needs a positive step (distinct price levels); a single rung
+        // may use step 0. reduce_only (bit1) is not supported on the ladder path.
+        require!(
+            price_step_ticks > 0 || num_levels == 1,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            flags & state_v2::FLAG_REDUCE_ONLY == 0,
+            FlashBookError::OutOfRange
+        );
+        for i in 0..num_levels as u64 {
+            let offset = price_step_ticks
+                .checked_mul(i)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+            // Bids descend from base, asks ascend — the ladder always moves away from mid.
+            let level_price = if side == 0 {
+                base_limit_ticks
+                    .checked_sub(offset)
+                    .ok_or_else(|| error!(FlashBookError::ZeroPrice))?
+            } else {
+                base_limit_ticks
+                    .checked_add(offset)
+                    .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+            };
+            place_limit_v2_core(
+                &ctx.accounts.market,
+                &ctx.accounts.market_book,
+                ctx.accounts.trader.key(),
+                side,
+                size_per_level,
+                level_price,
+                flags,
+                expires_at_slot,
+                sub_index,
+                &ctx.accounts.trader_state,
+                ctx.program_id,
+                ctx.accounts.position.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Create a SESSION KEY: authorize `session_signer` to trade for the signing
     /// owner until `now + ttl_seconds` (capped at `MAX_SESSION_TTL_SECONDS`). The
     /// session can only place/cancel via the `*_session` variants — never withdraw
