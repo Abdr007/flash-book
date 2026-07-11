@@ -98,16 +98,22 @@ are real engineering that belongs in focused passes, not a rushed tail change:
   inside the already-disclosed sequencer-trust assumption. Proper fix (commit fills
   against an attested book-state root) is the same primitive the decentralized-
   sequencer milestone introduces — attach there.
-- **funding snapshot** — a min-crank-interval **alone is counterproductive** (a
-  larger `dt` weights a momentary band-edge premium *more*), so the real fix is the
-  **premium-TWAP accumulator** (state + accrual change); impact is already bounded by
-  `rate_max`/band. Attach to the funding-mechanism pass (4.7 robust-median mark) so
-  the mark/premium sourcing is hardened once, coherently.
+- **funding snapshot** — ✅ **FIXED (PR #307).** A min-crank-interval alone is
+  counterproductive (a larger `dt` weights a momentary band-edge premium *more*), so
+  the fix is a **dt-weighted premium EMA**: `crank_funding` now blends the instant rate
+  into the prior stamped rate over `funding_premium_twap_window` periods
+  (`funding_index_delta_smoothed`), so a momentary spike at a rapid crank barely moves
+  the rate and only a *sustained* premium converges. No layout change / no migration
+  (reuses the plumbed `funding_premium_twap_window` param + `last_funding_rate_bps_per_sec`
+  as the EMA state); rate-cap preserved (Kani `funding_index_delta_smoothed_is_gated_and_safe`);
+  `window == 0` = legacy. Companion to the 4.7 robust-median mark (PR #305).
 
-**Net:** the MED/LOW audit tail is closed — L-1 and L-2 fixed + merged (devnet-CI
-green); L-3 and these three MEDs are accepted residuals with a **named fix and the
-milestone each attaches to**, none blocking launch (no HIGH, no outside-attacker
-theft). This matches the venue's discipline: name every residual, force nothing risky.
+**Net:** the MED/LOW audit tail is closed — **L-1, L-2, and the funding-snapshot MED
+fixed + merged** (devnet-CI green); L-3 and the remaining two MEDs (ER attestation-lag,
+`record_flp_fill_v3` trust) are accepted residuals inside the disclosed single-sequencer
+trust boundary, with a **named fix and the milestone each attaches to** — none blocking
+launch (no HIGH, no outside-attacker theft). This matches the venue's discipline: name
+every residual, force nothing risky.
 
 ## LOW / INFO (see the fix queue)
 
