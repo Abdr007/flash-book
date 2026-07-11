@@ -11579,6 +11579,16 @@ pub mod flash_book {
             ctx.accounts.vault_trader_state.load()?.open_positions == 0,
             FlashBookError::SweepRequiresFlat
         );
+        // L-2 (audit 2026-07-10): a FLAT vault can still have RESTING ER orders that
+        // reserve margin (er_active) but are not yet positions. Releasing the vault's
+        // collateral against that reserve could strand a live ER order — same failure the
+        // strict trader-withdraw paths gate on. Mirror the M-1 / set_position_isolated
+        // stance: refuse redemption while any ER margin is reserved (fail-safe; er_active
+        // clears when the resting orders cancel/settle).
+        require!(
+            ctx.accounts.vault_trader_state.load()?.er_active == 0,
+            FlashBookError::ErMarginReserved
+        );
 
         let amount_u128 = (shares_to_burn as u128)
             .checked_mul(live_nav)
