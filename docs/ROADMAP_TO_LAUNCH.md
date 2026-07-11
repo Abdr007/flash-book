@@ -77,7 +77,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | Item | Scope | Owner | Status |
 |---|---|---|---|
 | 4.1 | min-notional gate (~$10 value floor, today only lots floored) — kills dust spam | eng | STARTABLE (program change) |
-| 4.2 | 5-significant-figures price rule — prevents book fragmentation | eng | STARTABLE (program change) |
+| 4.2 | 5-significant-figures price rule — prevents book fragmentation | eng | **DONE (PR #313, all CI green).** Hard rule (`MAX_PRICE_SIG_FIGS = 5`) gated on the 4 v2 user book-entry paths (place-limit-core / taker / modify / vault) after the tick check; new error `PriceTooManySignificantFigures`. Rejection-only (never creates an unsafe state). Pure `price_sig_figs_ok` (unit-tested; not Kani-proven — the `/10` strip is non-pow2 division CBMC can't decide, per the Lean/Kani convention). FLP auto-quoter intentionally not gated; v3 order-type prices a follow-up. Const can become a per-market param later (needs a layout migration). |
 | 4.3 | scale/ladder USER order type (FLP quoter ladder exists; expose a user version) | eng | STARTABLE (program change) |
 | 4.4 | published margin-tier table (leverage-steps-down-with-notional) + enable coded-but-inactive OI-crowding surcharge | eng | STARTABLE (config/doc + program) |
 | 4.5 | tranched liquidation (positions above a notional threshold liquidate in tranches) | eng | STARTABLE (program change) |
@@ -195,10 +195,11 @@ sequencer-trust/latent item with a **named fix and the milestone it attaches to*
 
 Every item now has real scope (no more title-only). The remainder splits into:
 
-- **Program changes** (need a devnet deploy + live-re-verify cycle each): 2.1–2.3, 2.7,
-  3.3, 4.1–4.5. (**4.8 CLOSED** + devnet-accepted, PR #300; the H-B cancel-lock + M-2
-  worse-of shipped in the same PR — the audit's two HIGHs are no longer open. **4.6 DONE**
-  PR #309; **4.7 DONE** PR #305 + funding-TWAP PR #307.)
+- **Program changes** (need a devnet deploy + live-re-verify cycle each): 2.2, 2.3,
+  3.3, 4.1, 4.3, 4.4, 4.5. (**4.8 CLOSED** + devnet-accepted, PR #300; the H-B cancel-lock
+  + M-2 worse-of shipped in the same PR — the audit's two HIGHs are no longer open.
+  **4.2 DONE** PR #313; **4.6 DONE** PR #309 (+ vault #311); **4.7 DONE** PR #305 +
+  funding-TWAP PR #307. 2.1/2.7 dispositioned/done above.)
 - **Hard proofs** (Lean / real-symbol): 1.3, 1.5, 1.7. (**1.2 DONE** — real-symbol Kani `assess_margin_single_market_frame_stable`.)
 - **Multi-week builds**: 1.1 Certora integration, 3.1 percolator per-domain credit, and
   the three big builds (copy-vaults, HIP-3 permissionless deploy, decentralized-sequencer
