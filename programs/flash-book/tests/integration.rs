@@ -14995,3 +14995,96 @@ async fn liquidate_position_v2_caps_close_at_one_tranche() {
         pos_before.size_lots
     );
 }
+
+// ── 3.1: paper-profit haircut crank (percolator per-domain credit) ──────────
+
+#[tokio::test]
+async fn set_paper_profit_haircut_cranks_and_gates_auth() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Precondition: default is 0 (no haircut) for a fresh market.
+    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m0.paper_profit_haircut_bps, 0, "default must be no-haircut");
+
+    // Authority (payer) cranks the haircut to 3000 bps.
+    let ix = build_ix(
+        flash_book::instruction::SetPaperProfitHaircut { haircut_bps: 3000 },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let m1: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        m1.paper_profit_haircut_bps, 3000,
+        "crank must persist the haircut"
+    );
+    assert!(
+        m1.paper_haircut_updated_slot > 0,
+        "crank must stamp the slot"
+    );
+
+    // A non-authority / non-sequencer signer is rejected (Unauthorized 7100).
+    let stranger = Keypair::new();
+    let ix2 = build_ix(
+        flash_book::instruction::SetPaperProfitHaircut { haircut_bps: 0 },
+        vec![
+            AccountMeta::new_readonly(stranger.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix2],
+            Some(&payer.pubkey()),
+            &[&payer, &stranger],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7100)"),
+        "non-authority haircut crank must be Unauthorized, got: {err:?}"
+    );
+
+    // Out-of-range (> BPS_DENOM) rejected (OutOfRange 7003).
+    let ix3 = build_ix(
+        flash_book::instruction::SetPaperProfitHaircut {
+            haircut_bps: 10_001,
+        },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix3],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7003)"),
+        "haircut > BPS_DENOM must be OutOfRange, got: {err:?}"
+    );
+}

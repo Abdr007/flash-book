@@ -77,6 +77,32 @@ pub struct MarketSnapshot {
     /// Cap on the OI-scaled extra. Default 0 (no cap) = relies on the
     /// natural saturation of u32 bps. Production should set non-zero.
     pub oi_mmr_max_extra_bps: u32,
+    /// 3.1 percolator per-domain credit: paper-profit haircut in bps for THIS
+    /// market. Usable positive unrealized PnL is scaled by
+    /// `(BPS_DENOM − paper_profit_haircut_bps)/BPS_DENOM` — i.e. `BPS_DENOM −
+    /// credit_rate`. `0` = no haircut (full paper profit usable, default).
+    /// `BPS_DENOM` = paper profit yields ZERO usable equity. Only positive uPnL
+    /// is scaled (losses always count fully), so it can only RAISE the margin
+    /// requirement — conservative-safe.
+    pub paper_profit_haircut_bps: u32,
+}
+
+/// 3.1: apply a market's paper-profit haircut to a signed unrealized-PnL figure.
+/// POSITIVE pnl (paper gains) is scaled by the complement of the haircut so a
+/// manipulated / thin / stale market (haircut → `BPS_DENOM`) yields ~0 usable
+/// credit; NEGATIVE pnl (losses) is returned unchanged (you never get to
+/// discount your own losses). `haircut_bps` is clamped to `BPS_DENOM`, so the
+/// scaled value is in `[0, pnl]` for positive pnl — never above the paper
+/// figure, never a sign flip. Mirrors the Lean `usable`/`creditRate` model.
+#[inline]
+pub fn haircut_positive_pnl(pnl: i128, haircut_bps: u32) -> i128 {
+    if pnl <= 0 || haircut_bps == 0 {
+        return pnl;
+    }
+    let keep = (BPS_DENOM as i128) - (haircut_bps.min(BPS_DENOM) as i128);
+    // pnl > 0, keep ∈ [0, BPS_DENOM] ⇒ result ∈ [0, pnl]. Saturating mul guards
+    // a pathological (governance) pnl near i128::MAX.
+    pnl.saturating_mul(keep) / (BPS_DENOM as i128)
 }
 
 impl MarketSnapshot {
@@ -161,6 +187,60 @@ pub fn oi_scaled_mmr_extra_bps(
 }
 
 #[cfg(test)]
+mod paper_haircut_tests {
+    //! 3.1: the paper-profit haircut. The durable unbounded-width proof lives in
+    //! Lean (`PerDomainCredit.lean`, which CBMC can't do because of the symbolic
+    //! `/BPS_DENOM`); these pin the wired `haircut_positive_pnl` at concrete and
+    //! boundary values.
+    use super::*;
+
+    #[test]
+    fn zero_haircut_is_identity() {
+        assert_eq!(haircut_positive_pnl(1_000, 0), 1_000);
+        assert_eq!(haircut_positive_pnl(-1_000, 0), -1_000);
+        assert_eq!(haircut_positive_pnl(i128::MAX, 0), i128::MAX);
+    }
+
+    #[test]
+    fn full_haircut_zeroes_paper_profit_but_never_a_loss() {
+        // haircut == BPS_DENOM ⇒ positive uPnL → 0 (no usable paper credit).
+        assert_eq!(haircut_positive_pnl(1_000_000, BPS_DENOM), 0);
+        // …but a LOSS is never discounted, at ANY haircut.
+        assert_eq!(haircut_positive_pnl(-1_000_000, BPS_DENOM), -1_000_000);
+        assert_eq!(haircut_positive_pnl(-1_000_000, 5_000), -1_000_000);
+    }
+
+    #[test]
+    fn partial_haircut_scales_positive_pnl() {
+        // 50% haircut ⇒ half the paper profit is usable.
+        assert_eq!(haircut_positive_pnl(1_000, 5_000), 500);
+        // 20% haircut (credit_rate 80%) ⇒ 80% usable.
+        assert_eq!(haircut_positive_pnl(1_000, 2_000), 800);
+    }
+
+    #[test]
+    fn result_is_bounded_in_zero_pnl_for_positive_input() {
+        // The safety envelope: for positive pnl, the scaled value is in [0, pnl]
+        // for every haircut in [0, BPS_DENOM] — never above the paper figure,
+        // never sign-flipped. (The Lean `usable_le_pnl` theorem proves this at
+        // unbounded width; sampled here.)
+        for &pnl in &[1i128, 7, 999, 1_000_000, i64::MAX as i128] {
+            for &h in &[0u32, 1, 2_500, 5_000, 9_999, BPS_DENOM] {
+                let r = haircut_positive_pnl(pnl, h);
+                assert!(r >= 0 && r <= pnl, "pnl={pnl} h={h} r={r}");
+            }
+        }
+    }
+
+    #[test]
+    fn haircut_above_denom_is_clamped_to_full() {
+        // A pathological governance value > BPS_DENOM clamps to full haircut,
+        // never a negative keep-factor / sign flip.
+        assert_eq!(haircut_positive_pnl(1_000, BPS_DENOM + 5_000), 0);
+    }
+}
+
+#[cfg(test)]
 mod oi_mmr_tests {
     use super::*;
 
@@ -209,6 +289,7 @@ mod oi_mmr_tests {
             side_oi_lots: 500_000,
             oi_mmr_slope_bps_per_million_lots: 100,
             oi_mmr_max_extra_bps: 1_000,
+            paper_profit_haircut_bps: 0,
         };
         assert_eq!(snap.effective_mmr_bps(2_000), 200);
         // Below the concentration threshold the extra drops out.
@@ -304,8 +385,13 @@ pub fn assess_margin(
             Some(m) => m,
             None => continue,
         };
+        // 3.1: haircut paper (positive) uPnL by this market's ability-to-pay
+        // before it counts toward reported equity. Losses count in full.
         unrealized_total = unrealized_total
-            .checked_add(unrealized_pnl_quote_lots(pos, m.mark_price, m.tick_size)?)
+            .checked_add(haircut_positive_pnl(
+                unrealized_pnl_quote_lots(pos, m.mark_price, m.tick_size)?,
+                m.paper_profit_haircut_bps,
+            ))
             .or_overflow()?;
         let notional = (pos.size_lots as u128)
             .checked_mul(m.mark_price.0 as u128)
@@ -361,8 +447,14 @@ pub fn assess_margin(
             let stressed = shocked_price(m.mark_price, shock)?;
 
             // Loss contribution = maintenance margin − unrealized PnL, both at
-            // the stressed price (positive = bad for the trader).
-            let pnl = unrealized_pnl_quote_lots(pos, stressed, m.tick_size)?;
+            // the stressed price (positive = bad for the trader). 3.1: paper
+            // (positive) uPnL is haircut by the market's ability-to-pay, so a
+            // manipulated/thin market gives no margin credit for paper profit
+            // (raising `required`); losses count in full.
+            let pnl = haircut_positive_pnl(
+                unrealized_pnl_quote_lots(pos, stressed, m.tick_size)?,
+                m.paper_profit_haircut_bps,
+            );
             let stressed_notional = (pos.size_lots as i128)
                 .checked_mul(stressed.0 as i128)
                 .or_overflow()?
@@ -787,6 +879,7 @@ mod isolated_margin_tests {
             side_oi_lots: 0,
             oi_mmr_slope_bps_per_million_lots: 0,
             oi_mmr_max_extra_bps: 0,
+            paper_profit_haircut_bps: 0,
         };
         (pk, m)
     }
@@ -935,6 +1028,7 @@ mod mmr_kani_proofs {
             side_oi_lots: kani::any(),
             oi_mmr_slope_bps_per_million_lots: kani::any(),
             oi_mmr_max_extra_bps: kani::any(),
+            paper_profit_haircut_bps: 0,
         };
         let size_lots: u64 = kani::any();
         assert!(snap.effective_mmr_bps(size_lots) >= snap.maintenance_margin_bps);
@@ -966,6 +1060,7 @@ mod assess_margin_frame_tests {
                 side_oi_lots: 0,
                 oi_mmr_slope_bps_per_million_lots: 0,
                 oi_mmr_max_extra_bps: 0,
+                paper_profit_haircut_bps: 0,
             },
         )
     }
@@ -986,6 +1081,39 @@ mod assess_margin_frame_tests {
             market,
             shock_bps: -2000,
         }]]
+    }
+
+    /// 3.1 — the paper-profit haircut wired into `assess_margin`. A deeply
+    /// winning long (entry 50, mark 100) stays in profit even under the −20%
+    /// shock (stressed price 80 ⇒ stressed pnl = (80−50)·10 = +300), so at
+    /// `haircut = 0` its paper profit fully offsets the maintenance margin and it
+    /// is healthy on thin collateral. At `haircut = BPS_DENOM` (a manipulated /
+    /// thin / stale market that can't actually pay) the paper profit yields ZERO
+    /// usable credit, the full stressed MM stands, and the SAME position is now
+    /// liquidatable — the surcharge-free proof that ability-to-pay gates equity.
+    #[test]
+    fn paper_profit_haircut_flips_health() {
+        let (m, ms0) = mkt(1, 100);
+        let (_, mut ms1) = mkt(1, 100);
+        ms1.paper_profit_haircut_bps = BPS_DENOM;
+        let pos = vec![long(m, 10, 50)];
+
+        let a0 = assess_margin(&pos, &[ms0], &down_20pct(m), 20).unwrap();
+        assert_eq!(
+            a0.required_quote_lots, 0,
+            "haircut 0: the winner's paper profit offsets the MM → required 0"
+        );
+        assert!(a0.is_healthy, "healthy at haircut 0 on thin collateral");
+
+        let a1 = assess_margin(&pos, &[ms1], &down_20pct(m), 20).unwrap();
+        assert_eq!(
+            a1.required_quote_lots, 40,
+            "full haircut: paper profit is worth 0, so the stressed MM (40) stands"
+        );
+        assert!(
+            !a1.is_healthy,
+            "the SAME position is liquidatable once its paper profit can't back it"
+        );
     }
 
     /// Direction 1 — collateral drain. A winning long (mark 130 > entry 100)
@@ -1134,6 +1262,7 @@ mod assess_margin_real_symbol_kani_proofs {
             side_oi_lots: 0,
             oi_mmr_slope_bps_per_million_lots: 0,
             oi_mmr_max_extra_bps: 0,
+            paper_profit_haircut_bps: 0,
         }
     }
 
@@ -1208,6 +1337,7 @@ mod high1_cross_market_regression {
             side_oi_lots: 0,
             oi_mmr_slope_bps_per_million_lots: 0,
             oi_mmr_max_extra_bps: 0,
+            paper_profit_haircut_bps: 0,
         }
     }
 

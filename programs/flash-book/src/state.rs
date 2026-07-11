@@ -456,6 +456,24 @@ pub struct MarketAccount {
     /// seeds the timestamp (no accrual on the first tick), so it can never apply
     /// a rate over an unbounded Δt from an uninitialised clock.
     pub last_funding_crank_unix: u64,
+    /// 3.1 (percolator per-domain credit): the paper-profit HAIRCUT for this
+    /// market, in bps. Usable positive unrealized PnL on this market is scaled by
+    /// `(BPS_DENOM − paper_profit_haircut_bps)/BPS_DENOM`, i.e. this is
+    /// `BPS_DENOM − credit_rate`, where `credit_rate = min(1, backing/claims)`
+    /// (`docs/PER_DOMAIN_CREDIT.md`). A permissionless crank
+    /// (`set_paper_profit_haircut`) posts it after computing the market's
+    /// ability-to-pay off-chain; a manipulated/thin/stale market has
+    /// `backing ≪ claims` ⇒ `credit_rate → 0` ⇒ `haircut → BPS_DENOM` ⇒ paper
+    /// profit yields ZERO usable equity, so it cannot back margin, cure a loss,
+    /// or be withdrawn. Only POSITIVE uPnL is haircut (losses always count in
+    /// full), so applying it can only ever RAISE the margin requirement —
+    /// conservative-safe. Trailing field: pre-existing accounts read it as `0`
+    /// = NO haircut = exact pre-3.1 behaviour (default off; a market opts in).
+    pub paper_profit_haircut_bps: u32,
+    /// L1 slot the haircut above was last cranked (observability / staleness).
+    /// Trailing field ⇒ pre-existing accounts read 0. A stale haircut is
+    /// over-conservative (safe), so this gates crank cadence, not solvency.
+    pub paper_haircut_updated_slot: u64,
 }
 
 /// Optional emergency guardian for one market, held in a SEPARATE PDA (not a
