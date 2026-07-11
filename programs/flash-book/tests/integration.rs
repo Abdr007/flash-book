@@ -4996,6 +4996,100 @@ async fn modify_order_v2_rejects_far_from_oracle() {
     );
 }
 
+/// 4.6: modify_order_v2 now HONORS the reduce_only flag (bit1), exactly like the place
+/// paths — previously it was rejected loudly at intake (OutOfRange). Place a normal ask,
+/// modify it to reduce-only, and assert the modify is ACCEPTED (the re-inserted resting
+/// order carries the flag; the matcher's maker clamp re-caps it to the position's
+/// reducible size at fill, so it can never open or flip — safety proven by the existing
+/// reduce_only_taker / v1_reduce_only_trigger tests).
+#[tokio::test]
+async fn modify_order_v2_accepts_reduce_only_flag() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let maker = Keypair::new();
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+    let metas = vec![
+        AccountMeta::new(maker.pubkey(), true),
+        AccountMeta::new(market_pda, false),
+        AccountMeta::new(book_pda, false),
+        AccountMeta::new_readonly(maker_state, false),
+        AccountMeta::new_readonly(program_id(), false),
+    ];
+
+    // Place a normal in-band ask @ 140_000 (flags 0, seq 1).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::PlaceLimitOrderV2 {
+                    side: 1,
+                    size_lots: 1,
+                    limit_ticks: 140_000,
+                    flags: 0,
+                    expires_at_slot: 0,
+                    sub_index: 0,
+                },
+                metas.clone(),
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Modify it to reduce-only (new_flags = FLAG_REDUCE_ONLY = bit1) at the same in-band
+    // price — must be ACCEPTED (pre-4.6 this returned OutOfRange).
+    let order_id = flash_book::state_v2::encode_order_id(140_000, 1, false);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::ModifyOrderV2 {
+                    side: 1,
+                    old_order_id: order_id,
+                    new_size_lots: 1,
+                    new_limit_ticks: 140_000,
+                    new_flags: flash_book::state_v2::FLAG_REDUCE_ONLY,
+                    new_expires_at_slot: 0,
+                },
+                metas,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_ok(),
+        "modify to reduce-only must be accepted (4.6), got: {result:?}"
+    );
+}
+
 /// A reduce-only trigger scoped to one sub-account must not be able to read a
 /// DIFFERENT sub-account's position (both carry `trader == wallet`, so the
 /// (market, trader) constraint alone is insufficient). The trigger's `position`

@@ -2585,13 +2585,12 @@ pub mod flash_book {
         let now_slot = Clock::get()?.slot;
 
         // Fast input guards — same as place_limit_order_v2.
-        if side > 1
-            || new_size_lots == 0
-            || new_limit_ticks == 0
-            || (new_flags & !0b0111_1111) != 0
-            // H4: reduce_only (bit1) is unenforced on the v2 CLOB — reject it
-            // loudly (mirrors place_limit_order_v2 / place_taker_order_v2).
-            || (new_flags & 0b0000_0010) != 0
+        // 4.6: reduce_only (bit1) is HONORED on modify, exactly like place_limit_v2_core:
+        // the re-inserted resting order carries the flag and the symmetric, inflight-aware
+        // maker clamp in the taker walk caps it to the position's reducible size AT FILL, so
+        // a modified reduce-only order can never open or flip. (modify is Active/PostOnly-only,
+        // so CloseOnly's force-reduce-only path does not apply here.)
+        if side > 1 || new_size_lots == 0 || new_limit_ticks == 0 || (new_flags & !0b0111_1111) != 0
         {
             return err!(FlashBookError::OutOfRange);
         }
