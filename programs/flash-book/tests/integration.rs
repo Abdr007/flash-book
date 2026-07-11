@@ -11937,6 +11937,133 @@ async fn apply_flp_fill_rejects_stale_oracle() {
     );
 }
 
+/// vault reduce-only follow-up: `vault_place_order_v3` now HONORS the reduce_only flag
+/// (bit1) and EXEMPTS it from the H-A intake-margin gate — a reduce-only order only winds
+/// down (matcher re-clamps at fill against the vault's own position), so it needs no
+/// opening collateral. A 0-collateral vault: an OPENING order is still rejected
+/// (InsufficientCollateral — H-A intact), but a REDUCE-ONLY order is accepted.
+#[tokio::test]
+async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    // Init book.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Create a 0-collateral vault + its TraderState.
+    let vault_id: u8 = 0;
+    let (vault_pda, _) = pda(&[
+        flash_book::state_v3::VaultAccountV3::SEED,
+        payer.pubkey().as_ref(),
+        &[vault_id],
+    ]);
+    let (vault_trader_state, _) = pda(&[TraderStateAccount::SEED, vault_pda.as_ref()]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[
+                build_ix(
+                    flash_book::instruction::CreateVaultV3 {
+                        vault_id,
+                        name: [0u8; 32],
+                        perf_fee_bps: 0,
+                    },
+                    vec![
+                        AccountMeta::new(payer.pubkey(), true),
+                        AccountMeta::new(vault_pda, false),
+                        AccountMeta::new_readonly(system_program::ID, false),
+                    ],
+                ),
+                build_ix(
+                    flash_book::instruction::VaultOpenTraderStateV3 {},
+                    vec![
+                        AccountMeta::new(payer.pubkey(), true),
+                        AccountMeta::new_readonly(vault_pda, false),
+                        AccountMeta::new(vault_trader_state, false),
+                        AccountMeta::new_readonly(system_program::ID, false),
+                    ],
+                ),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let place = |flags: u8| {
+        build_ix(
+            flash_book::instruction::VaultPlaceOrderV3 {
+                side: 1,
+                size_lots: 1,
+                limit_ticks: 140_000, // in-band vs oracle 100_000
+                flags,
+                expires_at_slot: 0,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(vault_pda, false),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new(vault_trader_state, false),
+                AccountMeta::new_readonly(program_id(), false), // optional position = None
+            ],
+        )
+    };
+
+    // An OPENING order from the 0-collateral vault is still rejected (H-A gate intact).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let opening = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(0)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(
+        format!("{opening:?}").contains("Custom(7204)"),
+        "opening vault order from a 0-collateral vault must reject InsufficientCollateral, got: {opening:?}"
+    );
+
+    // A REDUCE-ONLY order is ACCEPTED (exempt from the intake gate; matcher clamps at fill).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let reduce = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(flash_book::state_v2::FLAG_REDUCE_ONLY)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(
+        reduce.is_ok(),
+        "reduce-only vault order must be accepted (exempt from H-A), got: {reduce:?}"
+    );
+}
+
 /// vault_withdraw_v3 must reject while the vault's TraderState carries an
 /// open position — redemptions require the vault FLAT, else a depositor redeems
 /// against unrealized exposure and skips the settlement waterfall. The open
