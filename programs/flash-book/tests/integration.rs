@@ -5101,6 +5101,91 @@ async fn place_limit_v2_enforces_min_notional() {
     );
 }
 
+/// 4.3: place_ladder_order rests `num_levels` orders in one tx (each a full
+/// place_limit_v2_core, so every per-order gate applies), stepping AWAY from mid; and
+/// rejects reduce_only. A 3-rung ask ladder (105_000 / 106_000 / 107_000) rebuilds to 3
+/// resting orders via the event reconciler.
+#[tokio::test]
+async fn place_ladder_order_rests_multiple_levels() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // oracle 100_000
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let maker = Keypair::new();
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 1_000_000, &protocol).await;
+    let metas = vec![
+        AccountMeta::new(maker.pubkey(), true),
+        AccountMeta::new(market_pda, false),
+        AccountMeta::new(book_pda, false),
+        AccountMeta::new_readonly(maker_state, false),
+        AccountMeta::new_readonly(program_id(), false),
+    ];
+
+    // 3-rung ask ladder: 105_000 / 106_000 / 107_000 (all in-band, 5-sig-fig clean).
+    let ladder = |flags: u8| {
+        build_ix(
+            flash_book::instruction::PlaceLadderOrder {
+                side: 1,
+                base_limit_ticks: 105_000,
+                price_step_ticks: 1_000,
+                num_levels: 3,
+                size_per_level: 1,
+                flags,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            metas.clone(),
+        )
+    };
+
+    let mut recon = Reconciled::default();
+    let logs = send_capture(&mut ctx, ladder(0), &maker.pubkey(), &[&maker]).await;
+    recon.apply_logs(&logs);
+    assert_eq!(
+        recon.book.len(),
+        3,
+        "a 3-rung ladder must rest 3 orders, got {}",
+        recon.book.len()
+    );
+
+    // reduce_only ladder is rejected (OutOfRange 7003).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ro = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ladder(flash_book::state_v2::FLAG_REDUCE_ONLY)],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await;
+    assert!(
+        format!("{ro:?}").contains("Custom(7003)"),
+        "a reduce_only ladder must be rejected, got: {ro:?}"
+    );
+}
+
 /// modify_order_v2 must re-apply the anti-stuffing oracle band: an order placed
 /// in-band cannot be re-priced to a far-from-oracle level. Place an ask @ 140_000
 /// (inside the 50% band around the 100_000 oracle), then modify it to 200_000

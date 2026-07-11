@@ -36,6 +36,10 @@ pub const DEFAULT_VOLUME_WINDOW_SLOTS: u64 = 3_024_000;
 /// Maximum positions per trader, used for stress-lattice loops.
 pub const MAX_POSITIONS_PER_TRADER: usize = 16;
 
+/// Max rungs a single `place_ladder_order` may place (4.3). Bounds the per-tx compute
+/// so a ladder can never exceed the CU budget; each rung is a full `place_limit_v2_core`.
+pub const MAX_LADDER_LEVELS: u8 = 20;
+
 /// Maximum stress scenarios `assess_margin` accepts (enforced at entry).
 /// `default_scenarios` emits exactly `5 + 8·N` scenarios for `N` markets
 /// (1 flat + 8 single-market shocks per market + 4 uniform
