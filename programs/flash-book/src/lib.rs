@@ -4851,8 +4851,39 @@ pub mod flash_book {
     /// with no oracle anchor, accrues exactly nothing.
     pub fn crank_funding(ctx: Context<CrankFunding>) -> Result<()> {
         let market_key = ctx.accounts.market.key();
-        let market = &mut ctx.accounts.market;
         let now = Clock::get()?.unix_timestamp.max(0) as u64;
+
+        // 4.7: on-book mid = (best_bid + best_ask) / 2 when the book is two-sided.
+        // Read BEFORE the &mut market borrow. Fail-closed: a book bound to a
+        // different market, or a one-sided/empty book, yields None (→ mark fallback),
+        // never a trusted-but-wrong mid. The median then out-votes a thin/stale mid.
+        let book_mid: Option<u64> = if let Some(book_ai) = &ctx.accounts.market_book {
+            let mut data = book_ai.try_borrow_mut_data()?;
+            let handle = state_v2::MarketBookHandle::from_account_data(&mut data)?;
+            if handle.header.market_pubkey != market_key {
+                None
+            } else {
+                let mut best_bid: u64 = 0;
+                handle.for_each_bid_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    best_bid = o.price_ticks;
+                    false
+                });
+                let mut best_ask: u64 = 0;
+                handle.for_each_ask_best_first(|_i, o: &state_v2::RestingOrderV2| {
+                    best_ask = o.price_ticks;
+                    false
+                });
+                if best_bid > 0 && best_ask > 0 {
+                    Some(((best_bid as u128 + best_ask as u128) / 2) as u64)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let market = &mut ctx.accounts.market;
         // A first observation only SEEDS the clock — never accrue the rate over
         // an uninitialised (0) timestamp, which would be an unbounded Δt.
         if market.last_funding_crank_unix == 0 {
@@ -4860,8 +4891,16 @@ pub mod flash_book {
             return Ok(());
         }
         let dt = now.saturating_sub(market.last_funding_crank_unix);
-        let (delta, rate) = matcher::funding::funding_index_delta(
+        // 4.7: fund off the robust MEDIAN mark (median{mark, oracle, book_mid}). This is
+        // the ONLY consumer of the median; liquidation/health stays on the raw mark's
+        // strict worse-of, so a benign median can never soften a liquidation.
+        let funding_mark = matcher::funding::robust_median_mark(
             market.mark_price_ticks,
+            market.oracle_price_ticks,
+            book_mid,
+        );
+        let (delta, rate) = matcher::funding::funding_index_delta(
+            funding_mark,
             market.oracle_price_ticks,
             dt,
             market.params.funding_rate_k_bps,
@@ -4881,6 +4920,7 @@ pub mod flash_book {
             cum_funding_index: market.cum_funding_index,
             rate_bps_per_sec: market.last_funding_rate_bps_per_sec,
             dt_seconds: dt,
+            funding_mark_ticks: funding_mark,
         });
         Ok(())
     }
@@ -16265,6 +16305,17 @@ pub struct CrankFunding<'info> {
         bump = market.bump,
     )]
     pub market: Account<'info, MarketAccount>,
+
+    /// 4.7: OPTIONAL market book for the on-book mid (the median's third source).
+    /// PDA-pinned to this market. When omitted (or one-sided/empty), funding falls
+    /// back to the mark — behaviour is unchanged, so passing it is purely additive.
+    /// CHECK: read-only; header is bound to `market` in-handler via `from_account_data`
+    /// + a market_pubkey equality check. May be an ER-delegated (last-committed) clone.
+    #[account(
+        seeds = [state_v2::MARKET_BOOK_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_book: Option<UncheckedAccount<'info>>,
 }
 
 /// F2/F3: ER liveness heartbeat. NOT permissionless — the handler requires
@@ -18545,6 +18596,10 @@ pub struct FundingCrankedEvent {
     pub rate_bps_per_sec: i64,
     /// Seconds elapsed since the previous crank (pre-clamp).
     pub dt_seconds: u64,
+    /// 4.7: the robust-median funding/display mark used for THIS tick's premium —
+    /// median{mark (oracle+EMA blend), oracle, on-book mid}, or the mark when no
+    /// two-sided book mid was available. Liquidation is unaffected (strict worse-of).
+    pub funding_mark_ticks: u64,
 }
 
 #[event]
