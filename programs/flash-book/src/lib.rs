@@ -4899,21 +4899,30 @@ pub mod flash_book {
             market.oracle_price_ticks,
             book_mid,
         );
-        let (delta, rate) = matcher::funding::funding_index_delta(
+        // Funding-TWAP hardening (audit MED): the premium is dt-weight-smoothed against the
+        // prior stamped rate (state = `last_funding_rate_bps_per_sec`) over
+        // `funding_premium_twap_window` periods, so a MOMENTARY band-edge premium at a rapid
+        // crank cannot stamp a full-period tick — only a sustained premium converges. window
+        // == 0 ⇒ no smoothing (legacy). The smoothed rate is still capped to `rate_max`.
+        let (delta, smoothed_rate) = matcher::funding::funding_index_delta_smoothed(
             funding_mark,
             market.oracle_price_ticks,
             dt,
             market.params.funding_rate_k_bps,
             market.params.funding_rate_max_bps_per_sec,
             market.params.funding_period_seconds,
+            market.last_funding_rate_bps_per_sec,
+            market.params.funding_premium_twap_window,
         )?;
         if delta != 0 {
             market.cum_funding_index = market
                 .cum_funding_index
                 .checked_add(delta)
                 .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-            market.last_funding_rate_bps_per_sec = rate;
         }
+        // Advance the EMA state every crank (even when the tick rounds to 0) so the smoothing
+        // tracks continuously; this is also the displayed rate.
+        market.last_funding_rate_bps_per_sec = smoothed_rate;
         market.last_funding_crank_unix = now;
         emit!(FundingCrankedEvent {
             market: market_key,

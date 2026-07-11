@@ -1811,6 +1811,91 @@ async fn crank_funding_uses_robust_median_mark_from_the_book() {
     );
 }
 
+/// Funding-TWAP hardening (audit MED): with `funding_premium_twap_window > 0`, a MOMENTARY
+/// full-cap premium at a RAPID crank must NOT stamp the full rate — the dt-weighted EMA
+/// damps it. Patch a huge premium (mark 200_000 vs oracle 100_000 ⇒ instant rate clamps to
+/// rate_max) with an 8-period window and Δt = 1s, crank, and assert the emitted
+/// `rate_bps_per_sec` is heavily damped (≈ 0), not the un-smoothed cap.
+#[tokio::test]
+async fn crank_funding_twap_damps_a_momentary_premium_spike() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let clock: Clock = ctx.banks_client.get_sysvar().await.unwrap();
+    let acc = ctx
+        .banks_client
+        .get_account(market_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut m: flash_book::state::MarketAccount =
+        flash_book::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    // Momentary +100% premium (instant rate clamps to rate_max = 1000).
+    m.mark_price_ticks = 200_000;
+    m.oracle_price_ticks = 100_000;
+    m.oracle_published_at_unix_seconds = clock.unix_timestamp.max(1) as u64;
+    m.params.oracle_staleness_max_seconds = u32::MAX;
+    m.params.funding_rate_k_bps = 10_000;
+    m.params.funding_rate_max_bps_per_sec = 1000;
+    m.params.funding_period_seconds = 3600;
+    m.params.funding_premium_twap_window = 8; // 8-period TWAP window
+    m.last_funding_rate_bps_per_sec = 0; // prior smoothed rate
+                                         // Rapid crank: Δt = 1s (last crank one second ago).
+    m.last_funding_crank_unix = (clock.unix_timestamp.max(0) as u64)
+        .saturating_sub(1)
+        .max(1);
+    let mut nd = Vec::new();
+    m.try_serialize(&mut nd).unwrap();
+    nd.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: acc.lamports,
+            data: nd,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    // Crank (no book ⇒ funding mark = the raw mark 200_000).
+    let crank = build_ix(
+        flash_book::instruction::CrankFunding {},
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new_readonly(program_id(), false), // optional book omitted
+        ],
+    );
+    let logs = send_capture(&mut ctx, crank, &payer.pubkey(), &[&payer]).await;
+
+    let mut rate: Option<i64> = None;
+    for line in &logs {
+        let Some(b64) = line.strip_prefix("Program data: ") else {
+            continue;
+        };
+        let Some(bytes) = recon_b64(b64.trim()) else {
+            continue;
+        };
+        let disc = <flash_book::FundingCrankedEvent as anchor_lang::Discriminator>::DISCRIMINATOR;
+        if bytes.starts_with(disc) {
+            if let Ok(e) = flash_book::FundingCrankedEvent::try_from_slice(&bytes[8..]) {
+                rate = Some(e.rate_bps_per_sec);
+            }
+        }
+    }
+    let r = rate.expect("FundingCrankedEvent emitted");
+    // Un-smoothed this would be the full cap (1000). dt/window = 1/28800 ⇒ ≈ 0.
+    assert!(
+        r.unsigned_abs() < 50,
+        "TWAP must damp a momentary spike (expected ≈0, cap is 1000), got {r}"
+    );
+}
+
 // ── D19: event-replay reconciler ───────────────────────────────────────────
 // Reconstructs value-bearing state from the emitted event stream ALONE — no
 // account reads happen during replay — then asserts it matches the on-chain

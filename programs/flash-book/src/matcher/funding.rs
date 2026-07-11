@@ -65,6 +65,73 @@ pub fn funding_index_delta(
     Ok((delta, rate as i64))
 }
 
+/// One funding crank tick with **dt-weighted premium smoothing** (audit MED: no TWAP →
+/// a momentary band-edge premium stamps a full-period tick). Computes the instantaneous
+/// rate exactly as `funding_index_delta`, then blends it into the PRIOR stamped rate with
+/// a time-weighted EMA so a momentary spike at a rapid crank barely moves the rate — only
+/// a premium SUSTAINED over ~the TWAP window converges it. This is why a bare min-interval
+/// is the wrong fix (a larger Δt would weight a momentary edge premium MORE, not less);
+/// the dt-weighted blend does the opposite.
+///
+///   w = min(1, dt / (twap_window_periods · period))    (w = 1 ⇒ no smoothing)
+///   smoothed = prev + (instant − prev) · w
+///
+/// `twap_window_periods == 0` disables smoothing — byte-identical to `funding_index_delta`.
+/// Returns `(delta_index, smoothed_rate_bps_per_sec)`; the caller stores the smoothed rate
+/// as the new `last_funding_rate_bps_per_sec` (its EMA state, advanced every crank).
+///
+/// The smoothed rate is a convex combination of two `[-rate_max, rate_max]` values and is
+/// additionally clamped, so the market's rate cap is preserved unconditionally.
+#[allow(clippy::too_many_arguments)]
+pub fn funding_index_delta_smoothed(
+    mark_ticks: u64,
+    oracle_ticks: u64,
+    dt_seconds: u64,
+    k_bps: u32,
+    rate_max_bps_per_sec: u32,
+    period_seconds: u32,
+    prev_rate_bps_per_sec: i64,
+    twap_window_periods: u8,
+) -> Result<(i128, i64)> {
+    // No anchor / same-second crank ⇒ accrue nothing; keep the prior smoothed rate.
+    if oracle_ticks == 0 || dt_seconds == 0 {
+        return Ok((0, prev_rate_bps_per_sec));
+    }
+    let dt = dt_seconds.min(period_seconds.max(1) as u64);
+    let premium = (mark_ticks as i128) - (oracle_ticks as i128);
+    let rate_max = rate_max_bps_per_sec as i128;
+    let instant_rate = premium
+        .checked_mul(k_bps as i128)
+        .or_overflow()?
+        .checked_div(oracle_ticks as i128)
+        .or_div_zero()?
+        .clamp(-rate_max, rate_max);
+    // dt-weighted EMA toward the instant rate. window_seconds == 0 (window param 0) or a
+    // Δt ≥ the window ⇒ w = 1 (no smoothing / full catch-up on a long gap).
+    let window_seconds = (twap_window_periods as u64).saturating_mul(period_seconds.max(1) as u64);
+    let smoothed_rate: i128 = if window_seconds == 0 || dt >= window_seconds {
+        instant_rate
+    } else {
+        let prev = prev_rate_bps_per_sec as i128;
+        let diff = instant_rate - prev;
+        prev + diff
+            .checked_mul(dt as i128)
+            .or_overflow()?
+            .checked_div(window_seconds as i128)
+            .or_div_zero()?
+    }
+    // Defensive: hold the rate cap even if `prev` predates a rate_max reduction.
+    .clamp(-rate_max, rate_max);
+    let delta = smoothed_rate
+        .checked_mul(dt as i128)
+        .or_overflow()?
+        .checked_mul(FUNDING_INDEX_ONE)
+        .or_overflow()?
+        .checked_div(BPS_DENOM as i128)
+        .or_div_zero()?;
+    Ok((delta, smoothed_rate as i64))
+}
+
 /// Funding owed by a position since last settlement. Returns signed Q-units
 /// of quote-lots (positive = trader owes).
 ///
@@ -153,6 +220,70 @@ mod tests {
         assert_eq!(robust_median_mark(100, 102, Some(0)), 100);
         assert_eq!(robust_median_mark(100, 0, Some(101)), 100);
         assert_eq!(robust_median_mark(0, 102, Some(101)), 0);
+    }
+
+    #[test]
+    fn twap_window_zero_is_identical_to_the_instant_delta() {
+        // window == 0 disables smoothing ⇒ byte-identical to funding_index_delta.
+        for (mark, oracle, dt) in [(110u64, 100u64, 60u64), (100, 110, 30), (100, 100, 60)] {
+            let instant = funding_index_delta(mark, oracle, dt, BPS_DENOM, 2000, 3600).unwrap();
+            let smoothed = funding_index_delta_smoothed(
+                mark, oracle, dt, BPS_DENOM, 2000, 3600, /*prev*/ 12345, /*window*/ 0,
+            )
+            .unwrap();
+            assert_eq!(instant, smoothed, "window=0 must match the instant delta");
+        }
+    }
+
+    #[test]
+    fn a_momentary_spike_barely_moves_the_smoothed_rate() {
+        // prev rate 0; a full-cap instant premium at a RAPID crank (dt=1s) over an 8-period
+        // (8h) window ⇒ the stamped rate is ~prev, not the spike (the MED fix).
+        let rate_max = 1000u32;
+        let (_delta, smoothed) = funding_index_delta_smoothed(
+            2_000_000, 100, /*dt*/ 1, BPS_DENOM, rate_max, /*period*/ 3600,
+            /*prev*/ 0, /*window*/ 8,
+        )
+        .unwrap();
+        // instant would clamp to +rate_max (1000); after dt/window = 1/28800 weighting it is ~0.
+        assert!(
+            smoothed.unsigned_abs() < 10,
+            "a momentary spike must be heavily damped, got {smoothed}"
+        );
+        // A premium SUSTAINED over many full-period cranks converges toward the cap (each
+        // crank's Δt is clamped to the period, so it adds ~1/window of the gap per crank).
+        let mut prev = 0i64;
+        for _ in 0..40 {
+            let (_d2, r) = funding_index_delta_smoothed(
+                2_000_000, 100, 3600, BPS_DENOM, rate_max, 3600, prev, 8,
+            )
+            .unwrap();
+            prev = r;
+        }
+        assert!(
+            prev > (rate_max as i64) * 9 / 10 && prev <= rate_max as i64,
+            "a sustained premium converges toward the cap, got {prev}"
+        );
+    }
+
+    #[test]
+    fn smoothed_rate_stays_within_the_cap_and_gates_on_no_anchor() {
+        let rate_max = 500u32;
+        // even with an out-of-band prev, the output is clamped into [-rate_max, rate_max].
+        let (_d, r) = funding_index_delta_smoothed(
+            9_999_999, 100, 100, BPS_DENOM, rate_max, 3600, /*prev*/ 30_000, 4,
+        )
+        .unwrap();
+        assert!(r.unsigned_abs() <= rate_max as u64);
+        // no oracle anchor / zero Δt ⇒ accrue nothing, keep the prior rate.
+        assert_eq!(
+            funding_index_delta_smoothed(100, 0, 60, BPS_DENOM, rate_max, 3600, 77, 4).unwrap(),
+            (0, 77)
+        );
+        assert_eq!(
+            funding_index_delta_smoothed(100, 90, 0, BPS_DENOM, rate_max, 3600, 77, 4).unwrap(),
+            (0, 77)
+        );
     }
 
     /// Pins the truncation direction of the Q64.64 -> quote-lot conversion.
@@ -302,5 +433,34 @@ mod proofs {
             assert!(with == mark);
         }
         assert!(robust_median_mark(mark, oracle, None) == mark);
+    }
+
+    /// The dt-weighted smoothed funding tick is as gated as the instant one: the stamped
+    /// rate never exceeds the market's `rate_max` (the smoothing can only ever move the
+    /// rate BETWEEN two capped values, then it is clamped), an absent oracle or zero Δt
+    /// accrues exactly nothing and preserves the prior rate, and every path is
+    /// overflow-checked. So no caller-reachable input — not even an out-of-band prior
+    /// rate — drives funding past the gated bounds.
+    #[kani::proof]
+    fn funding_index_delta_smoothed_is_gated_and_safe() {
+        let mark: u64 = kani::any();
+        let oracle: u64 = kani::any();
+        let dt: u64 = kani::any();
+        let k: u32 = kani::any();
+        let rate_max: u32 = kani::any();
+        let period: u32 = kani::any();
+        let prev: i64 = kani::any();
+        let window: u8 = kani::any();
+        if let Ok((delta, rate)) =
+            funding_index_delta_smoothed(mark, oracle, dt, k, rate_max, period, prev, window)
+        {
+            if oracle == 0 || dt == 0 {
+                // No anchor / same-second: accrue nothing, preserve the prior rate.
+                assert!(delta == 0 && rate == prev);
+            } else {
+                // Every stamped (funding-affecting) rate is capped.
+                assert!(rate.unsigned_abs() <= rate_max as u64);
+            }
+        }
     }
 }
