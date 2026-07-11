@@ -68,4 +68,42 @@ theorem usable_creditRate_le_pnl (pnl backing claims : ℕ) :
     usable pnl (creditRate backing claims) ≤ pnl :=
   usable_le_pnl pnl _ (creditRate_le_BPS backing claims)
 
+/-! ### The WIRED form — `haircut = BPS − credit_rate`
+
+The engine stores a HAIRCUT (`state.rs::MarketAccount.paper_profit_haircut_bps`)
+and computes usable positive PnL as `pnl · (BPS − haircut) / BPS`
+(`risk.rs::haircut_positive_pnl`). This is exactly `usable pnl rate` with
+`rate = BPS − haircut`. These theorems verify the deployed formula. -/
+
+/-- The engine's actual computation: scale by the complement of the haircut. -/
+def usableHaircut (pnl haircut : ℕ) : ℕ := pnl * (BPS - haircut) / BPS
+
+/-- The wired form is exactly `usable` at `rate = BPS − haircut`. -/
+theorem usableHaircut_eq (pnl haircut : ℕ) :
+    usableHaircut pnl haircut = usable pnl (BPS - haircut) := rfl
+
+/-- WIRED SAFETY 1 — usable paper credit never exceeds the paper PnL, for ANY
+haircut. (`BPS − haircut ≤ BPS`, so this reduces to `usable_le_pnl`.) -/
+theorem usableHaircut_le_pnl (pnl haircut : ℕ) : usableHaircut pnl haircut ≤ pnl := by
+  rw [usableHaircut_eq]
+  exact usable_le_pnl pnl (BPS - haircut) (Nat.sub_le BPS haircut)
+
+/-- WIRED SAFETY 2 (the marquee) — a FULL haircut (`haircut = BPS`, a market
+whose backing can't meet its claims) mints ZERO usable credit from any paper
+PnL. This is the `credit_rate → 0 ⇒ usable → 0` collapse in the deployed
+representation. -/
+theorem full_haircut_zero_credit (pnl : ℕ) : usableHaircut pnl BPS = 0 := by
+  unfold usableHaircut
+  rw [Nat.sub_self]
+  simp
+
+/-- WIRED SAFETY 3 — a ZERO haircut (a market that can fully pay) is the
+identity: paper profit is fully usable, i.e. exact pre-3.1 behaviour. -/
+theorem zero_haircut_identity (pnl : ℕ) : usableHaircut pnl 0 = pnl := by
+  unfold usableHaircut
+  rw [Nat.sub_zero]
+  -- pnl * BPS / BPS = pnl
+  rw [Nat.mul_div_cancel]
+  decide
+
 end FlashBook.PerDomainCredit

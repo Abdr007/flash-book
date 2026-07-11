@@ -12425,6 +12425,76 @@
       ]
     },
     {
+      "name": "set_paper_profit_haircut",
+      "docs": [
+        "3.1 (percolator per-domain credit): post this market's paper-profit",
+        "HAIRCUT — `BPS_DENOM − credit_rate`, where `credit_rate = min(1,",
+        "backing/claims)` (`docs/PER_DOMAIN_CREDIT.md`). A keeper computes the",
+        "market's ability-to-pay off-chain (winners' claims vs. what the losing",
+        "side can truly deliver) and posts the resulting haircut here; the margin",
+        "engine then scales every position's usable POSITIVE unrealized PnL by the",
+        "complement, so a manipulated / thin / stale market (`backing ≪ claims` ⇒",
+        "`haircut → BPS_DENOM`) yields ~0 usable paper credit.",
+        "",
+        "Gated to the market's authority OR sequencer: the haircut only ever",
+        "RAISES margin (discounting paper profit, never a loss), so an over-high",
+        "value is at worst over-conservative — but a maliciously LOW value would",
+        "re-open the paper-credit attack, so the setter must be trusted (the same",
+        "trust boundary as the oracle/funding cranks). Bounded to `BPS_DENOM`."
+      ],
+      "discriminator": [
+        247,
+        208,
+        8,
+        221,
+        195,
+        118,
+        220,
+        203
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "haircut_bps",
+          "type": "u32"
+        }
+      ]
+    },
+    {
       "name": "set_position_cross",
       "docs": [
         "Transition a position from isolated-margin back to cross-margin.",
@@ -18454,6 +18524,19 @@
       ]
     },
     {
+      "name": "PaperProfitHaircutSetEvent",
+      "discriminator": [
+        132,
+        80,
+        12,
+        87,
+        239,
+        152,
+        46,
+        223
+      ]
+    },
+    {
       "name": "ParamUpdateCancelledEvent",
       "discriminator": [
         133,
@@ -23117,6 +23200,34 @@
               "a rate over an unbounded Δt from an uninitialised clock."
             ],
             "type": "u64"
+          },
+          {
+            "name": "paper_profit_haircut_bps",
+            "docs": [
+              "3.1 (percolator per-domain credit): the paper-profit HAIRCUT for this",
+              "market, in bps. Usable positive unrealized PnL on this market is scaled by",
+              "`(BPS_DENOM − paper_profit_haircut_bps)/BPS_DENOM`, i.e. this is",
+              "`BPS_DENOM − credit_rate`, where `credit_rate = min(1, backing/claims)`",
+              "(`docs/PER_DOMAIN_CREDIT.md`). A permissionless crank",
+              "(`set_paper_profit_haircut`) posts it after computing the market's",
+              "ability-to-pay off-chain; a manipulated/thin/stale market has",
+              "`backing ≪ claims` ⇒ `credit_rate → 0` ⇒ `haircut → BPS_DENOM` ⇒ paper",
+              "profit yields ZERO usable equity, so it cannot back margin, cure a loss,",
+              "or be withdrawn. Only POSITIVE uPnL is haircut (losses always count in",
+              "full), so applying it can only ever RAISE the margin requirement —",
+              "conservative-safe. Trailing field: pre-existing accounts read it as `0`",
+              "= NO haircut = exact pre-3.1 behaviour (default off; a market opts in)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "paper_haircut_updated_slot",
+            "docs": [
+              "L1 slot the haircut above was last cranked (observability / staleness).",
+              "Trailing field ⇒ pre-existing accounts read 0. A stale haircut is",
+              "over-conservative (safe), so this gates crank cadence, not solvency."
+            ],
+            "type": "u64"
           }
         ]
       }
@@ -24723,6 +24834,29 @@
           {
             "name": "previous_counter",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PaperProfitHaircutSetEvent",
+      "docs": [
+        "3.1: emitted when a market's paper-profit haircut is (re)cranked."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_bps",
+            "type": "u32"
+          },
+          {
+            "name": "new_bps",
+            "type": "u32"
           }
         ]
       }

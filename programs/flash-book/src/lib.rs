@@ -4025,6 +4025,7 @@ pub mod flash_book {
                         .params
                         .oi_mmr_slope_bps_per_million_lots,
                     oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
+                    paper_profit_haircut_bps: market_acct.paper_profit_haircut_bps,
                 });
                 market_keys.push(market_ai.key());
             }
@@ -4661,6 +4662,7 @@ pub mod flash_book {
                 side_oi_lots: oi_side_lots(&market, position.side == 0),
                 oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
+                paper_profit_haircut_bps: market.paper_profit_haircut_bps,
             });
             market_keys.push(m_ai.key());
             i += 2;
@@ -4698,6 +4700,7 @@ pub mod flash_book {
                 .params
                 .oi_mmr_slope_bps_per_million_lots,
             oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
+            paper_profit_haircut_bps: target_market.paper_profit_haircut_bps,
         });
         market_keys.push(target_market_key);
 
@@ -4859,6 +4862,7 @@ pub mod flash_book {
                 side_oi_lots: oi_side_lots(&market, position.side == 0),
                 oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
+                paper_profit_haircut_bps: market.paper_profit_haircut_bps,
             });
             market_keys.push(m_ai.key());
             i += 2;
@@ -4894,6 +4898,7 @@ pub mod flash_book {
                     .params
                     .oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
+                paper_profit_haircut_bps: target_market.paper_profit_haircut_bps,
             });
             market_keys.push(target_market_key);
         }
@@ -7359,6 +7364,45 @@ pub mod flash_book {
         Ok(())
     }
 
+    /// 3.1 (percolator per-domain credit): post this market's paper-profit
+    /// HAIRCUT — `BPS_DENOM − credit_rate`, where `credit_rate = min(1,
+    /// backing/claims)` (`docs/PER_DOMAIN_CREDIT.md`). A keeper computes the
+    /// market's ability-to-pay off-chain (winners' claims vs. what the losing
+    /// side can truly deliver) and posts the resulting haircut here; the margin
+    /// engine then scales every position's usable POSITIVE unrealized PnL by the
+    /// complement, so a manipulated / thin / stale market (`backing ≪ claims` ⇒
+    /// `haircut → BPS_DENOM`) yields ~0 usable paper credit.
+    ///
+    /// Gated to the market's authority OR sequencer: the haircut only ever
+    /// RAISES margin (discounting paper profit, never a loss), so an over-high
+    /// value is at worst over-conservative — but a maliciously LOW value would
+    /// re-open the paper-credit attack, so the setter must be trusted (the same
+    /// trust boundary as the oracle/funding cranks). Bounded to `BPS_DENOM`.
+    pub fn set_paper_profit_haircut(
+        ctx: Context<UpdateMarketAuthority>,
+        haircut_bps: u32,
+    ) -> Result<()> {
+        let signer = ctx.accounts.authority.key();
+        let market = &mut ctx.accounts.market;
+        require!(
+            signer == market.authority || signer == market.sequencer,
+            FlashBookError::Unauthorized
+        );
+        require!(
+            haircut_bps <= constants::BPS_DENOM,
+            FlashBookError::OutOfRange
+        );
+        let prev = market.paper_profit_haircut_bps;
+        market.paper_profit_haircut_bps = haircut_bps;
+        market.paper_haircut_updated_slot = Clock::get()?.slot;
+        emit!(PaperProfitHaircutSetEvent {
+            market: market.key(),
+            previous_bps: prev,
+            new_bps: haircut_bps,
+        });
+        Ok(())
+    }
+
     /// Create/rotate the market's
     /// sequencer committee. Authority-gated. Validates the BFT quorum config
     /// (`3·threshold > 2·N`, `1 ≤ threshold ≤ N ≤ MAX`) + a distinct, non-zero
@@ -7661,6 +7705,7 @@ pub mod flash_book {
                 side_oi_lots: oi_side_lots(market, leg_is_long),
                 oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
+                paper_profit_haircut_bps: market.paper_profit_haircut_bps,
             });
         }
         if !snaps.is_empty() {
@@ -7792,6 +7837,7 @@ pub mod flash_book {
                     .params
                     .oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: markets[i].params.oi_mmr_max_extra_bps,
+                paper_profit_haircut_bps: markets[i].paper_profit_haircut_bps,
             });
         }
         if !snaps.is_empty() {
@@ -8097,6 +8143,7 @@ pub mod flash_book {
                     .params
                     .oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
+                paper_profit_haircut_bps: market_acct.paper_profit_haircut_bps,
             });
             market_keys.push(market_ai.key());
         }
@@ -9214,6 +9261,7 @@ pub mod flash_book {
             side_oi_lots: oi_side_lots(market, matches!(pos_side, Side::Long)),
             oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
             oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
+            paper_profit_haircut_bps: market.paper_profit_haircut_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         // Unified dispatch: if position is isolated (pos_snap.collateral_quote_lots > 0),
@@ -9834,6 +9882,7 @@ pub mod flash_book {
             side_oi_lots: oi_side_lots(market, underwater.side == 0),
             oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
             oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
+            paper_profit_haircut_bps: market.paper_profit_haircut_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         let assessment = assess_margin_unified_fn(
@@ -10209,6 +10258,7 @@ pub mod flash_book {
             side_oi_lots: oi_side_lots(exec_market, exec_position.side == 0),
             oi_mmr_slope_bps_per_million_lots: exec_market.params.oi_mmr_slope_bps_per_million_lots,
             oi_mmr_max_extra_bps: exec_market.params.oi_mmr_max_extra_bps,
+            paper_profit_haircut_bps: exec_market.paper_profit_haircut_bps,
         });
         position_snaps.push(RiskPosSnap {
             market: exec_position.market,
@@ -10307,6 +10357,7 @@ pub mod flash_book {
                 side_oi_lots: oi_side_lots(&market, position.side == 0),
                 oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
+                paper_profit_haircut_bps: market.paper_profit_haircut_bps,
             });
             position_snaps.push(RiskPosSnap {
                 market: position.market,
@@ -14027,6 +14078,7 @@ fn partial_withdraw_core<'info>(
             side_oi_lots: oi_side_lots(&market, position.side == 0),
             oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
             oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
+            paper_profit_haircut_bps: market.paper_profit_haircut_bps,
         });
         market_keys.push(m_ai.key());
         i += 2;
@@ -16783,7 +16835,9 @@ pub struct AcceptAuthorityTransfer<'info> {
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
         bump = market.bump,
     )]
-    pub market: Account<'info, MarketAccount>,
+    // Boxed: MarketAccount deserialized onto the stack tips this context's 4 KB
+    // BPF frame once it grows (3.1 haircut fields). Box moves it to the heap.
+    pub market: Box<Account<'info, MarketAccount>>,
     #[account(
         mut,
         close = new_authority,
@@ -18828,6 +18882,14 @@ pub struct MarketSequencerRotatedEvent {
     pub market: Pubkey,
     pub previous_sequencer: Pubkey,
     pub new_sequencer: Pubkey,
+}
+
+/// 3.1: emitted when a market's paper-profit haircut is (re)cranked.
+#[event]
+pub struct PaperProfitHaircutSetEvent {
+    pub market: Pubkey,
+    pub previous_bps: u32,
+    pub new_bps: u32,
 }
 
 #[event]
