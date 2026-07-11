@@ -11717,11 +11717,13 @@ pub mod flash_book {
         require!(size_lots > 0, FlashBookError::ZeroSize);
         require!(limit_ticks > 0, FlashBookError::ZeroPrice);
         require!(flags & !0b0111_1111 == 0, FlashBookError::OutOfRange);
-        // H4: reduce_only (bit1) is unenforced on the v2 CLOB — reject it loudly
-        // here too. vault_place_order_v3 inserts a RestingOrderV2 into the SAME
-        // MarketBookHandle as place_limit/place_taker/modify_order_v2, so it needs
-        // the identical guard or a vault strategist could store an unenforced flag.
-        require!(flags & 0b0000_0010 == 0, FlashBookError::OutOfRange);
+        // reduce_only (bit1) is HONORED — the vault order rests carrying the flag (stored
+        // below) and the inflight-aware maker clamp in the taker walk re-caps it to the
+        // vault position's reducible size AT FILL. `derive_maker_position_key(market,
+        // vault_pk, 0)` resolves to `["trader_state", vault_pk]` → the vault's own position,
+        // so the clamp is against the correct position and it can never open or flip. A
+        // reduce-only vault order is therefore EXEMPT from the H-A intake gate below.
+        let is_reduce_only = flags & state_v2::FLAG_REDUCE_ONLY != 0;
         let now_slot = Clock::get()?.slot;
         if expires_at_slot > 0 {
             require!(expires_at_slot > now_slot, FlashBookError::OutOfRange);
@@ -11743,8 +11745,10 @@ pub mod flash_book {
         );
 
         // H-A (item 4.8): gate the vault's OPENING order against its own TraderState
-        // collateral, exactly like place_limit_v2_core (reduce-only already rejected
-        // above). None position ⇒ full-open. Closes the vault under-margined-open leak.
+        // collateral, exactly like place_limit_v2_core. A reduce-only order is exempt
+        // (it can only wind down — `is_reduce_only` is passed through so
+        // `assert_injection_intake` returns early). None position ⇒ full-open. Closes the
+        // vault under-margined-open leak.
         let vts_key = ctx.accounts.vault_trader_state.key();
         let market_key_ha = market.key();
         gate_injection_open(
@@ -11758,7 +11762,7 @@ pub mod flash_book {
             side,
             size_lots,
             limit_ticks,
-            false,
+            is_reduce_only,
         )?;
 
         let oi_cap = market.params.max_oi_base_lots;
