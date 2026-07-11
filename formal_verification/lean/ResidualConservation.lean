@@ -175,9 +175,103 @@ theorem insolvent_iff_negative_residual (L : Ledger) (hL : conserved L) :
     L.V < L.C + L.I ↔ L.R < 0 := by
   simp only [conserved] at hL; omega
 
+/-! ### 2.3 — fee-share accrual refines Residual into a claimable liability
+
+The referrer/builder/creator fee-share payout (`apply_fill` accrual +
+`claim_fee_accrual`) carves a NEW bucket `F` (`insurance_fund.total_fee_accrued_lots`)
+out of `Residual`, so `R = F + R'`. This refines the 4-bucket ledger into
+
+    V = C + I + F + R'
+
+`F` is a claimable vault LIABILITY; `R'` is the leftover residual (surplus + FLP +
+junior backing). The two 2.3 money moves:
+
+* **accrue** (`apply_fill`): reserve `a` of surplus as fee liability — `ΔF = +a`,
+  `ΔR' = −a`, and `ΔV = ΔC = ΔI = 0` (the tokens are already in the vault). Only
+  reclassifies within the old `R`, so the original `V = C + I + R` is untouched.
+* **claim** (`claim_fee_accrual`): pay `a` from the vault to the recipient and
+  retire the liability — `ΔV = −a`, `ΔF = −a`, `ΔC = ΔI = ΔR' = 0`.
+
+The surplus-cap in the handler (`accrue = min(share, available_surplus)`) is the
+hypothesis `a ≤ R'` below: it is exactly what keeps `R' ≥ 0` across an accrual, so
+the extended solvency floor `V ≥ C + I + F` (what `verify_protocol_solvency` now
+enforces) never breaks. -/
+
+structure Ledger5 where
+  V : ℤ -- vault total
+  C : ℤ -- Σ committed trader collateral
+  I : ℤ -- insurance fund balance
+  F : ℤ -- accrued fee-share liability (`total_fee_accrued_lots`)
+  R : ℤ -- residual' = V − C − I − F
+
+/-- The refined identity: `V = C + I + F + R'`. -/
+def conserved5 (L : Ledger5) : Prop := L.V = L.C + L.I + L.F + L.R
+
+def applyDelta5 (dV dC dI dF dR : ℤ) (L : Ledger5) : Ledger5 :=
+  ⟨L.V + dV, L.C + dC, L.I + dI, L.F + dF, L.R + dR⟩
+
+def balanced5 (dV dC dI dF dR : ℤ) : Prop := dV = dC + dI + dF + dR
+
+/-- CORE — any balanced 5-tuple step preserves the refined identity. -/
+theorem applyDelta5_conserves (dV dC dI dF dR : ℤ) (hb : balanced5 dV dC dI dF dR)
+    (L : Ledger5) (hL : conserved5 L) : conserved5 (applyDelta5 dV dC dI dF dR L) := by
+  simp only [conserved5, applyDelta5, balanced5] at *
+  omega
+
+/-- Accrue `a` of surplus into the fee-share liability. `ΔV = 0` — the vault
+already holds the tokens; this only moves value from `R'` to `F`. -/
+def feeShareAccrue (a : ℤ) : Ledger5 → Ledger5 := applyDelta5 0 0 0 a (-a)
+
+/-- Claim `a`: vault pays the recipient, liability retires. -/
+def feeShareClaim (a : ℤ) : Ledger5 → Ledger5 := applyDelta5 (-a) 0 0 (-a) 0
+
+theorem fee_share_accrue_conserves (a : ℤ) (L) (h : conserved5 L) :
+    conserved5 (feeShareAccrue a L) := by
+  simp only [conserved5, feeShareAccrue, applyDelta5] at *; omega
+theorem fee_share_claim_conserves (a : ℤ) (L) (h : conserved5 L) :
+    conserved5 (feeShareClaim a L) := by
+  simp only [conserved5, feeShareClaim, applyDelta5] at *; omega
+
+/-- The refinement is faithful: folding `F` back into the residual recovers the
+proven 4-bucket identity `V = C + I + R`. So 2.3 does not weaken G4 — it splits
+one of its buckets. -/
+def project (L : Ledger5) : Ledger := ⟨L.V, L.C, L.I, L.F + L.R⟩
+theorem conserved5_iff_conserved (L : Ledger5) :
+    conserved5 L ↔ conserved (project L) := by
+  simp only [conserved5, conserved, project]; omega
+
+/-- The extended solvency floor `verify_protocol_solvency` now enforces:
+`vault ≥ insurance + flp + fee_accrued` (here `C + I + F ≤ V`) holds iff the
+leftover residual is non-negative. -/
+theorem extended_solvent_of_conserved_nonneg_residual (L : Ledger5)
+    (hL : conserved5 L) (hR : 0 ≤ L.R) : L.C + L.I + L.F ≤ L.V := by
+  simp only [conserved5] at hL; omega
+
+/-- MARQUEE — the surplus-cap is exactly what makes accrual safe. Accruing
+`a ≤ R'` (the handler's `min(share, available_surplus)`) both preserves the
+identity AND keeps the leftover residual non-negative, so the protocol stays
+solvent across every accrual. -/
+theorem fee_share_accrue_preserves_solvency (a : ℤ) (L : Ledger5)
+    (hL : conserved5 L) (hcap : a ≤ L.R) :
+    conserved5 (feeShareAccrue a L) ∧ 0 ≤ (feeShareAccrue a L).R := by
+  simp only [conserved5, feeShareAccrue, applyDelta5] at *
+  omega
+
+/-- Claim is solvency-neutral: `V` and `F` fall by the same `a`, so a solvent
+ledger (`R' ≥ 0`) stays solvent. -/
+theorem fee_share_claim_preserves_solvency (a : ℤ) (L : Ledger5)
+    (hL : conserved5 L) (hR : 0 ≤ L.R) :
+    conserved5 (feeShareClaim a L) ∧ 0 ≤ (feeShareClaim a L).R := by
+  simp only [conserved5, feeShareClaim, applyDelta5] at *
+  omega
+
 #print axioms applyDelta_conserves
 #print axioms convert_gain_conserves
 #print axioms foldl_conserves
 #print axioms solvent_of_conserved_nonneg_residual
+#print axioms applyDelta5_conserves
+#print axioms conserved5_iff_conserved
+#print axioms fee_share_accrue_preserves_solvency
+#print axioms fee_share_claim_preserves_solvency
 
 end FlashBook.ResidualConservation
