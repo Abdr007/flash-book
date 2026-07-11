@@ -12,7 +12,8 @@
 
 use anchor_lang::{prelude::*, InstructionData};
 use flash_book::state::{
-    FlpExposureAccount, InsuranceFundAccount, MarketAccount, MarketParams, TraderStateAccount,
+    FeeAccrualAccount, FlpExposureAccount, InsuranceFundAccount, MarketAccount, MarketParams,
+    TraderStateAccount,
 };
 use solana_program_test::{BanksClient, ProgramTest};
 use solana_sdk::{
@@ -14556,5 +14557,270 @@ async fn auto_deleverage_accepts_side_accrual_when_present() {
     assert!(
         dbg.contains("Custom(8207)"),
         "with side_accrual present the multi-leg cross gate must still reject first, got: {dbg}"
+    );
+}
+
+// ── 2.3: on-chain fee-share accrual + claim ─────────────────────────────────
+
+/// Test-only injection of the global fee-accrual liability counter, mirroring
+/// the insurance-fund seeding pattern used above.
+async fn seed_insurance_fee_accrued(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    insurance_fund: Pubkey,
+    accrued: u64,
+) {
+    use solana_sdk::account::Account as SolAccount;
+    let acc = ctx
+        .banks_client
+        .get_account(insurance_fund)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut st = InsuranceFundAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    st.total_fee_accrued_lots = accrued;
+    let mut data = Vec::new();
+    st.try_serialize(&mut data).unwrap();
+    data.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &insurance_fund,
+        &SolAccount {
+            lamports: acc.lamports,
+            data,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
+}
+
+/// Test-only injection of a recipient's accrued balance.
+async fn seed_fee_accrual_amount(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    fee_accrual: Pubkey,
+    accrued: u64,
+) {
+    use solana_sdk::account::Account as SolAccount;
+    let acc = ctx
+        .banks_client
+        .get_account(fee_accrual)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut st = FeeAccrualAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    st.accrued_quote_lots = accrued;
+    let mut data = Vec::new();
+    st.try_serialize(&mut data).unwrap();
+    data.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &fee_accrual,
+        &SolAccount {
+            lamports: acc.lamports,
+            data,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
+}
+
+fn init_fee_accrual_ix(payer: &Keypair, recipient: Pubkey, fee_accrual_pda: Pubkey) -> Instruction {
+    build_ix(
+        flash_book::instruction::InitFeeAccrual {
+            recipient: to_anchor(recipient),
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(fee_accrual_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    )
+}
+
+fn claim_fee_accrual_ix(
+    recipient: &Keypair,
+    fee_accrual_pda: Pubkey,
+    insurance_fund: Pubkey,
+    quote_mint: Pubkey,
+    recipient_ata: Pubkey,
+    quote_vault: Pubkey,
+) -> Instruction {
+    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    build_ix(
+        flash_book::instruction::ClaimFeeAccrual {},
+        vec![
+            AccountMeta::new_readonly(recipient.pubkey(), true),
+            AccountMeta::new(fee_accrual_pda, false),
+            AccountMeta::new(insurance_fund, false),
+            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(recipient_ata, false),
+            AccountMeta::new(quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn init_fee_accrual_creates_recipient_pda() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let recipient = Pubkey::new_unique();
+    let (fee_accrual_pda, _) = pda(&[FeeAccrualAccount::SEED, recipient.as_ref()]);
+
+    let ix = init_fee_accrual_ix(&payer, recipient, fee_accrual_pda);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let acc: FeeAccrualAccount = fetch(&mut ctx.banks_client, fee_accrual_pda).await;
+    assert_eq!(acc.recipient, to_anchor(recipient));
+    assert_eq!(acc.accrued_quote_lots, 0);
+}
+
+#[tokio::test]
+async fn claim_fee_accrual_pays_out_accrued_shares() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+
+    // Fund the shared vault so the payout transfer can settle.
+    mint_tokens(
+        &mut ctx,
+        &payer,
+        protocol.quote_mint,
+        protocol.quote_vault,
+        100_000,
+    )
+    .await;
+
+    let recipient = Keypair::new();
+    let (fee_accrual_pda, _) = pda(&[FeeAccrualAccount::SEED, recipient.pubkey().as_ref()]);
+    let init_ix = init_fee_accrual_ix(&payer, recipient.pubkey(), fee_accrual_pda);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Seed a 30_000-lot accrual + the matching global liability.
+    seed_fee_accrual_amount(&mut ctx, fee_accrual_pda, 30_000).await;
+    seed_insurance_fee_accrued(&mut ctx, protocol.insurance_fund, 30_000).await;
+
+    let recipient_ata = create_ata(&mut ctx, &payer, recipient.pubkey(), protocol.quote_mint).await;
+
+    let claim_ix = claim_fee_accrual_ix(
+        &recipient,
+        fee_accrual_pda,
+        protocol.insurance_fund,
+        protocol.quote_mint,
+        recipient_ata,
+        protocol.quote_vault,
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[claim_ix],
+            Some(&payer.pubkey()),
+            &[&payer, &recipient],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Recipient ATA received the full accrual.
+    let ata = ctx
+        .banks_client
+        .get_account(recipient_ata)
+        .await
+        .unwrap()
+        .unwrap();
+    let ata_state =
+        <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(
+            &ata.data,
+        )
+        .unwrap();
+    assert_eq!(
+        ata_state.amount, 30_000,
+        "recipient must receive the accrual"
+    );
+
+    // Accrual zeroed + global liability cleared.
+    let acc: FeeAccrualAccount = fetch(&mut ctx.banks_client, fee_accrual_pda).await;
+    assert_eq!(acc.accrued_quote_lots, 0);
+    let fund: InsuranceFundAccount = fetch(&mut ctx.banks_client, protocol.insurance_fund).await;
+    assert_eq!(fund.total_fee_accrued_lots, 0);
+}
+
+#[tokio::test]
+async fn claim_fee_accrual_rejects_empty_accrual() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+    mint_tokens(
+        &mut ctx,
+        &payer,
+        protocol.quote_mint,
+        protocol.quote_vault,
+        100_000,
+    )
+    .await;
+
+    let recipient = Keypair::new();
+    let (fee_accrual_pda, _) = pda(&[FeeAccrualAccount::SEED, recipient.pubkey().as_ref()]);
+    let init_ix = init_fee_accrual_ix(&payer, recipient.pubkey(), fee_accrual_pda);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[init_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let recipient_ata = create_ata(&mut ctx, &payer, recipient.pubkey(), protocol.quote_mint).await;
+    // No accrual seeded ⇒ accrued == 0 ⇒ ZeroSize (Custom(7202)).
+    let claim_ix = claim_fee_accrual_ix(
+        &recipient,
+        fee_accrual_pda,
+        protocol.insurance_fund,
+        protocol.quote_mint,
+        recipient_ata,
+        protocol.quote_vault,
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[claim_ix],
+            Some(&payer.pubkey()),
+            &[&payer, &recipient],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("Custom(7202)"),
+        "empty accrual must reject with ZeroSize, got: {dbg}"
     );
 }
