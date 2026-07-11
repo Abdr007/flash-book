@@ -297,6 +297,25 @@ pub fn price_sig_figs_ok(price_ticks: u64) -> bool {
     p < 10u64.pow(crate::constants::MAX_PRICE_SIG_FIGS)
 }
 
+/// True iff the order's quote-lot notional (`size × price × tick_size`) meets the market's
+/// anti-dust floor (roadmap 4.1). `min_notional_quote_lots == 0` disables it. Overflow-safe
+/// (u128); the notional is computed identically to the intake-margin gate.
+#[inline]
+pub fn order_notional_ok(
+    size_lots: u64,
+    price_ticks: u64,
+    tick_size: u64,
+    min_notional_quote_lots: u64,
+) -> bool {
+    if min_notional_quote_lots == 0 {
+        return true;
+    }
+    let notional = (size_lots as u128)
+        .saturating_mul(price_ticks as u128)
+        .saturating_mul(tick_size as u128);
+    notional >= min_notional_quote_lots as u128
+}
+
 /// HARD INVENTORY CAP (increment 3): the pool's net-position notional must not
 /// exceed its capital (a conservative ~1× exposure limit). Returns
 /// `(skip_bids, skip_asks)` for `flp_refresh_quotes`: when the pool is at the
@@ -424,6 +443,20 @@ mod price_sig_figs_tests {
                                               // appending a trailing zero never changes the verdict
         assert_eq!(price_sig_figs_ok(12_345), price_sig_figs_ok(123_450));
         assert_eq!(price_sig_figs_ok(123_456), price_sig_figs_ok(1_234_560));
+    }
+
+    #[test]
+    fn order_notional_floor() {
+        use super::order_notional_ok;
+        // 0 floor disables the check — any order passes.
+        assert!(order_notional_ok(1, 1, 1, 0));
+        // notional = size × price × tick. 1 × 100 × 1 = 100.
+        assert!(order_notional_ok(1, 100, 1, 100)); // exactly meets
+        assert!(order_notional_ok(2, 100, 1, 100)); // exceeds
+        assert!(!order_notional_ok(1, 99, 1, 100)); // below
+        assert!(!order_notional_ok(1, 1, 1, 1_000_000)); // dust below a real floor
+                                                         // overflow-safe at the extremes (saturating), never panics.
+        assert!(order_notional_ok(u64::MAX, u64::MAX, u64::MAX, 1));
     }
 }
 

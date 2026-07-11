@@ -252,6 +252,13 @@ pub struct MarketParams {
     /// observers can nudge `settle_mark`. 0 = drift alerts disabled.
     /// Typical: 100 bps = 1%.
     pub drift_alert_bps: u32,
+
+    /// Anti-dust minimum order notional in quote-lots (4.1): an order's
+    /// `size_lots × price_ticks × tick_size` must be ≥ this. Tiny orders pass the
+    /// per-lot floor (`min_base_lots`) yet carry negligible value, letting a spammer
+    /// splinter the book cheaply; this puts a real value floor on every resting order.
+    /// `0` = disabled (no per-order value floor).
+    pub min_notional_quote_lots: u64,
 }
 
 /// Top-level market state. One per pool market (e.g. SOL/USD, BTC/USD).

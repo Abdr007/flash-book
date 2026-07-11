@@ -76,7 +76,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 
 | Item | Scope | Owner | Status |
 |---|---|---|---|
-| 4.1 | min-notional gate (~$10 value floor, today only lots floored) — kills dust spam | eng | STARTABLE (program change) |
+| 4.1 | min-notional gate (~$10 value floor, today only lots floored) — kills dust spam | eng | **DONE (PR #316).** New `MarketParams.min_notional_quote_lots` (0 = disabled); gate on all 4 v2 book-entry paths (place-core/taker/modify/vault) — `size × price × tick_size ≥ floor`; error `OrderNotionalTooSmall`. Pure `order_notional_ok` (unit-tested) + integration test. Note: the 8-byte param growth tipped `FlpWithdrawV3::try_accounts` over the SBF 4KB stack — fixed by boxing 2 accounts there. |
 | 4.2 | 5-significant-figures price rule — prevents book fragmentation | eng | **DONE (PR #313, all CI green).** Hard rule (`MAX_PRICE_SIG_FIGS = 5`) gated on the 4 v2 user book-entry paths (place-limit-core / taker / modify / vault) after the tick check; new error `PriceTooManySignificantFigures`. Rejection-only (never creates an unsafe state). Pure `price_sig_figs_ok` (unit-tested; not Kani-proven — the `/10` strip is non-pow2 division CBMC can't decide, per the Lean/Kani convention). FLP auto-quoter intentionally not gated; v3 order-type prices a follow-up. Const can become a per-market param later (needs a layout migration). |
 | 4.3 | scale/ladder USER order type (FLP quoter ladder exists; expose a user version) | eng | STARTABLE (program change) |
 | 4.4 | published margin-tier table (leverage-steps-down-with-notional) + enable coded-but-inactive OI-crowding surcharge | eng | STARTABLE (config/doc + program) |
@@ -196,7 +196,7 @@ sequencer-trust/latent item with a **named fix and the milestone it attaches to*
 Every item now has real scope (no more title-only). The remainder splits into:
 
 - **Program changes** (need a devnet deploy + live-re-verify cycle each): 2.2, 2.3,
-  3.3, 4.1, 4.3, 4.4, 4.5 (2.2 DONE #315). (**4.8 CLOSED** + devnet-accepted, PR #300; the H-B cancel-lock
+  3.3, 4.3, 4.4, 4.5 (2.2 DONE #315; 4.1 DONE #316). (**4.8 CLOSED** + devnet-accepted, PR #300; the H-B cancel-lock
   + M-2 worse-of shipped in the same PR — the audit's two HIGHs are no longer open.
   **4.2 DONE** PR #313; **4.6 DONE** PR #309 (+ vault #311); **4.7 DONE** PR #305 +
   funding-TWAP PR #307. 2.1/2.7 dispositioned/done above.)
