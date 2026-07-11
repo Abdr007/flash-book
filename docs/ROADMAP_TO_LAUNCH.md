@@ -25,7 +25,7 @@ Resolved from the source-plan prose (they exist; they were missing only from the
 
 - **4.7 — Robust-median mark for funding/display.** Mark used for funding + display =
   median of {oracle+EMA blend, on-book mid, external reference}; **liquidation keeps the
-  strict worse-of** (never the median). STARTABLE.
+  strict worse-of** (never the median). **DONE (PR #305).**
 - **5.3 — Copy-trading.** Off-chain snapshot-diff mirroring ported from the Flash V2
   `examples/copy-trade` pattern to Flash Book endpoints; on-chain copy-vaults are the
   separate big-build track. STARTABLE (off-chain).
@@ -82,7 +82,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | 4.4 | published margin-tier table (leverage-steps-down-with-notional) + enable coded-but-inactive OI-crowding surcharge | eng | STARTABLE (config/doc + program) |
 | 4.5 | tranched liquidation (positions above a notional threshold liquidate in tranches) | eng | STARTABLE (program change) |
 | 4.6 | user reduce-only flag on the v2 place path (currently rejected at intake) | eng | STARTABLE (program change) |
-| **4.7** | **robust-median mark** (median for funding/display; worse-of for liquidation) | eng | **STARTABLE** |
+| **4.7** | **robust-median mark** (median for funding/display; worse-of for liquidation) | eng | **DONE (PR #305, `d93f9fa`, all CI green)** — `crank_funding` funds off `median{mark, oracle, on-book mid}` (optional book, fail-closed → mark fallback), emitted as `FundingCrankedEvent.funding_mark_ticks`; liquidation UNTOUCHED (strict worse-of, never the median). Pure `robust_median_mark` is Kani-proven (`robust_median_mark_is_bounded_by_its_sources`) + unit-tested; end-to-end test `crank_funding_uses_robust_median_mark_from_the_book`. The funding-TWAP MED is the natural companion increment here. |
 | 4.8 | apply intake IM gate to v3 injection paths (TWAP/iceberg/bracket) | eng | **CLOSED — CONFIRMED HIGH FIXED (PR #300, `3998b9bd`, all CI green)** and **DEVNET-ACCEPTED**. Shared `assert_injection_intake` (via `gate_injection_open`) now gates all 6 opening-maker paths (`execute_trigger_order_v3`, `execute_twap_slice_v3`, `place_iceberg_order_v3`, `replenish_iceberg_v3`, `place_bracket_order_v3`, `vault_place_order_v3`), exempt reduce-only. Proven live on a fresh throwaway devnet program (`BRtnEAZ6…`, on-chain bytes hash-verified): iceberg/bracket/vault opens from a 0-collateral state reject `InsufficientCollateral` on 3 independent paths + reduce-only exemption accepts (`er-acceptance/critical_path_acceptance.mjs`; `CRITICAL_PATH_FINDINGS.md`). Original finding: `docs/SECURITY_AUDIT_2026-07-10-wave2.md` H-A |
 
 ## 5 · Product / integration (5.x)
