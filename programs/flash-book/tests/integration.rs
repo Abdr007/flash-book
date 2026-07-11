@@ -201,6 +201,7 @@ fn default_params() -> MarketParams {
         min_notional_quote_lots: 0, // 4.1: 0 = anti-dust floor disabled in tests
         oi_mmr_slope_bps_per_million_lots: 0, // 4.4: 0 = OI-crowding surcharge off
         oi_mmr_max_extra_bps: 0,
+        max_liq_tranche_lots: 0, // 4.5: 0 = tranched liquidation disabled
     }
 }
 
@@ -11644,6 +11645,30 @@ async fn open_cross_position(
     maker_state: Pubkey,
     fill_seq: u64,
 ) -> Pubkey {
+    open_cross_position_sized(
+        ctx,
+        payer,
+        market,
+        insurance_fund,
+        taker_state,
+        maker_state,
+        fill_seq,
+        1,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_cross_position_sized(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    market: Pubkey,
+    insurance_fund: Pubkey,
+    taker_state: Pubkey,
+    maker_state: Pubkey,
+    fill_seq: u64,
+    size_lots: u64,
+) -> Pubkey {
     let (taker_pos, _) = pda(&[
         flash_book::state::PositionAccount::SEED,
         market.as_ref(),
@@ -11656,7 +11681,7 @@ async fn open_cross_position(
     ]);
     let ix = build_ix(
         flash_book::instruction::ApplyFill {
-            size_lots: 1,
+            size_lots,
             price_ticks: 100_000,
             taker_side: 0,
             taker_was_jit: false,
@@ -14822,5 +14847,151 @@ async fn claim_fee_accrual_rejects_empty_accrual() {
     assert!(
         dbg.contains("Custom(7202)"),
         "empty accrual must reject with ZeroSize, got: {dbg}"
+    );
+}
+
+// ── 4.5: tranched liquidation ───────────────────────────────────────────────
+
+/// A liquidatable position larger than `max_liq_tranche_lots` closes only ONE
+/// tranche per call (the requested full close is clamped), leaving the rest to
+/// unwind over cooldown-spaced follow-up calls.
+#[tokio::test]
+async fn liquidate_position_v2_caps_close_at_one_tranche() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let liq = Keypair::new();
+    // 3-lot long; collateral scaled 3x the proven single-lot underwater case.
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 7_800, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 300_000, &protocol).await;
+    let liq_state = setup_trader(&mut ctx, &payer, &liq, 100_000, &protocol).await;
+    let taker_pos = open_cross_position_sized(
+        &mut ctx,
+        &payer,
+        market_pda,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+        3,
+    )
+    .await;
+
+    let pos_before: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, taker_pos).await;
+    assert_eq!(pos_before.size_lots, 3, "precondition: 3-lot position");
+
+    let now = ctx
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    {
+        let acc = ctx
+            .banks_client
+            .get_account(market_pda)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut m = MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+        let slot = ctx.banks_client.get_sysvar::<Clock>().await.unwrap().slot;
+        m.oracle_price_ticks = 98_000;
+        m.oracle_published_at_unix_seconds = now as u64;
+        m.mark_price_ticks = 98_000;
+        m.last_mark_update_slot = slot;
+        m.params.liq_penalty_bps = 100;
+        m.params.liquidator_reward_bps = 100;
+        m.params.liquidation_auction_duration_slots = 0;
+        // 4.5: cap each liquidation to a single lot.
+        m.params.max_liq_tranche_lots = 1;
+        let mut data = Vec::new();
+        m.try_serialize(&mut data).unwrap();
+        data.resize(acc.data.len(), 0);
+        ctx.set_account(
+            &market_pda,
+            &SolAccount {
+                lamports: acc.lamports,
+                data,
+                owner: acc.owner,
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            }
+            .into(),
+        );
+    }
+
+    // Request a FULL close; the tranche cap must clamp it to 1 lot.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::LiquidatePositionV2 {
+                    requested_close_lots: 0,
+                },
+                vec![
+                    AccountMeta::new(liq.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new(taker_state, false),
+                    AccountMeta::new(liq_state, false),
+                    AccountMeta::new(taker_pos, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&liq.pubkey()),
+            &[&liq],
+            bh,
+        ))
+        .await
+        .expect("underwater liquidation must succeed");
+
+    // Liquidation INJECTS a resting close order (order_type = Liquidation) of
+    // size `close_size` into the book — it doesn't synchronously shrink the
+    // position. The tranche cap clamps that injected size: on a 3-lot position
+    // with `max_liq_tranche_lots = 1`, the close order is 1 lot, not 3.
+    let book_acc = ctx
+        .banks_client
+        .get_account(book_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let resting: Vec<(u64, u64, u64, u8)> = decode_book_slab(&book_acc.data)
+        .into_iter()
+        .filter(|(_, _, size, _)| *size > 0)
+        .collect();
+    assert_eq!(
+        resting.len(),
+        1,
+        "exactly one resting liquidation close order expected"
+    );
+    assert_eq!(
+        resting[0].2, 1,
+        "tranche cap must inject a 1-lot close, not the full 3 (pos was {})",
+        pos_before.size_lots
     );
 }
