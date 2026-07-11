@@ -11916,6 +11916,152 @@ async fn auto_deleverage_rejects_multi_leg_cross() {
     );
 }
 
+/// 2.2 (isolated ADL — close asymmetry + prove): an ISOLATED underwater position is
+/// ADL-eligible via its own bucket even when the trader has other (cross) legs — the
+/// same 2-leg setup that is REJECTED for a cross underwater leg (Custom 8207) is
+/// ACCEPTED when the underwater leg is isolated, because the single-leg health/bp then
+/// correctly use the isolated bucket, not the cross pool. This is the exact asymmetry
+/// the roadmap called out: it is closed in code and proven here.
+#[tokio::test]
+async fn auto_deleverage_accepts_isolated_underwater_leg() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_a, _, _, _) = setup_market(&mut ctx, &payer).await; // oracle 100_000
+    let (market_b, _, _, _) = setup_additional_market(&mut ctx, &payer, 100_000).await;
+
+    let under = Keypair::new();
+    let counter = Keypair::new();
+    let maker2 = Keypair::new();
+    let under_state = setup_trader(&mut ctx, &payer, &under, 100_000, &protocol).await;
+    let counter_state = setup_trader(&mut ctx, &payer, &counter, 100_000, &protocol).await;
+    let maker2_state = setup_trader(&mut ctx, &payer, &maker2, 100_000, &protocol).await;
+
+    // Market A: `under` LONG, `counter` SHORT. Market B: a 2nd leg ⇒ open_positions == 2
+    // (so the single-cross eligibility branch does NOT apply — only the isolated one can).
+    let under_pos_a = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_a,
+        protocol.insurance_fund,
+        under_state,
+        counter_state,
+        1,
+    )
+    .await;
+    let (counter_pos_a, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_a.as_ref(),
+        counter_state.as_ref(),
+    ]);
+    let _under_pos_b = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_b,
+        protocol.insurance_fund,
+        under_state,
+        maker2_state,
+        1,
+    )
+    .await;
+    assert_eq!(
+        fetch::<TraderStateAccount>(&mut ctx.banks_client, under_state)
+            .await
+            .open_positions,
+        2
+    );
+
+    // Make the market-A leg ISOLATED with a thin bucket (collateral_quote_lots > 0).
+    // PositionAccount is zero-copy (Pod), so patch its bytes in place after the 8-byte
+    // discriminator via bytemuck (the ADL health/bp for an isolated leg read only this
+    // per-position bucket, so the cross-pool bookkeeping is irrelevant to the assertion).
+    let pa = ctx
+        .banks_client
+        .get_account(under_pos_a)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut pos: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, under_pos_a).await;
+    pos.collateral_quote_lots = 500; // isolated bucket
+    let sz = std::mem::size_of::<flash_book::state::PositionAccount>();
+    let mut pd = pa.data.clone();
+    pd[8..8 + sz].copy_from_slice(bytemuck::bytes_of(&pos));
+    ctx.set_account(
+        &under_pos_a,
+        &SolAccount {
+            lamports: pa.lamports,
+            data: pd,
+            owner: pa.owner,
+            executable: pa.executable,
+            rent_epoch: pa.rent_epoch,
+        }
+        .into(),
+    );
+
+    // Drive market A adverse so the LONG isolated leg (500 bucket) is bankrupt: mark/oracle
+    // to 50_000 (−50%), fresh, so worse-of health prices the long deep underwater.
+    let clock: Clock = ctx.banks_client.get_sysvar().await.unwrap();
+    let ma = ctx
+        .banks_client
+        .get_account(market_a)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut m: flash_book::state::MarketAccount =
+        flash_book::state::MarketAccount::try_deserialize(&mut ma.data.as_slice()).unwrap();
+    m.mark_price_ticks = 50_000;
+    m.oracle_price_ticks = 50_000;
+    m.oracle_published_at_unix_seconds = clock.unix_timestamp.max(1) as u64;
+    m.params.oracle_staleness_max_seconds = u32::MAX;
+    m.last_mark_update_slot = clock.slot;
+    let mut md = Vec::new();
+    m.try_serialize(&mut md).unwrap();
+    md.resize(ma.data.len(), 0);
+    ctx.set_account(
+        &market_a,
+        &SolAccount {
+            lamports: ma.lamports,
+            data: md,
+            owner: ma.owner,
+            executable: ma.executable,
+            rent_epoch: ma.rent_epoch,
+        }
+        .into(),
+    );
+
+    // ADL the isolated underwater leg — must be ACCEPTED (insurance balance 0 < threshold
+    // 5_000, so the ADL trigger is admissible).
+    let ix = build_ix(
+        flash_book::instruction::AutoDeleverage { close_size_lots: 1 },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_a, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new(under_state, false),
+            AccountMeta::new(under_pos_a, false),
+            AccountMeta::new(counter_state, false),
+            AccountMeta::new(counter_pos_a, false),
+            AccountMeta::new_readonly(program_id(), false), // side_accrual = None
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(
+        result.is_ok(),
+        "an isolated underwater leg must be ADL-eligible (2.2), got: {result:?}"
+    );
+}
+
 /// apply_flp_fill must reject a STALE oracle. The FLP price band is only
 /// meaningful against a fresh oracle; a compromised sequencer could otherwise
 /// settle FLP fills against a frozen anchor while the market moved. A market
