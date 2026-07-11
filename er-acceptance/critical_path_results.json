@@ -1,0 +1,117 @@
+{
+  "program": "BRtnEAZ6Tc61gz8m93unL1vzaC4GjtHViLCU8JqKB2gD",
+  "rpc": "https://devnet.helius-rpc.com/",
+  "market": "71FKcZmLC31LXwaoC8UCBW8owp9iGZ3tgvHCi3FpigEG",
+  "rows": [
+    {
+      "id": "HA-3",
+      "group": "H-A",
+      "desc": "place_iceberg (open, 0-collateral)",
+      "verdict": "PASS",
+      "detail": "rejected with InsufficientCollateral (7204) ✓",
+      "explorer": null
+    },
+    {
+      "id": "HA-5",
+      "group": "H-A",
+      "desc": "place_bracket (open, 0-collateral)",
+      "verdict": "PASS",
+      "detail": "rejected with InsufficientCollateral (7204) ✓",
+      "explorer": null
+    },
+    {
+      "id": "HA-6",
+      "group": "H-A",
+      "desc": "vault_place_order (open, 0-collateral vault)",
+      "verdict": "PASS",
+      "detail": "rejected with InsufficientCollateral (7204) ✓",
+      "explorer": null
+    },
+    {
+      "id": "HA-1",
+      "group": "H-A",
+      "desc": "execute_trigger (inject) — shared gate",
+      "verdict": "UNDRIVEN",
+      "detail": "same gate_injection_open as HA-3/5/6; needs an existing position (funded path)",
+      "explorer": null
+    },
+    {
+      "id": "HA-2",
+      "group": "H-A",
+      "desc": "execute_twap_slice (inject) — shared gate",
+      "verdict": "UNDRIVEN",
+      "detail": "same gate_injection_open as HA-3/5/6; twap slice-eligibility (OutOfRange) precedes the gate",
+      "explorer": null
+    },
+    {
+      "id": "HA-4",
+      "group": "H-A",
+      "desc": "replenish_iceberg (inject gate)",
+      "verdict": "UNDRIVEN",
+      "detail": "requires placed-then-depleted iceberg (see notes)",
+      "explorer": null
+    },
+    {
+      "id": "HA-RO",
+      "group": "H-A",
+      "desc": "reduce-only inject is EXEMPT (not margin-gated)",
+      "verdict": "PASS",
+      "detail": "accepted ✓",
+      "sig": "2BGXK7fiY1eucfnPfDfenP3h7Qn9ozFpmHEh5DKd81X2Hy9kzKeC5nXU3ybNmisPEgQu6MZzVyHPTCeP6vFv43RE",
+      "explorer": "https://explorer.solana.com/tx/2BGXK7fiY1eucfnPfDfenP3h7Qn9ozFpmHEh5DKd81X2Hy9kzKeC5nXU3ybNmisPEgQu6MZzVyHPTCeP6vFv43RE?cluster=devnet"
+    },
+    {
+      "id": "POS",
+      "group": "SETUP",
+      "desc": "real position formed via apply_fill (taker long 1 @ 100000)",
+      "verdict": "PASS",
+      "detail": "settled on L1",
+      "explorer": null
+    },
+    {
+      "id": "M2-1",
+      "group": "M-2",
+      "desc": "withdraw at benign mark (healthy) accepted",
+      "verdict": "UNDRIVEN",
+      "detail": "already margin-bound at benign (stress-IM≈notional; InsufficientCollateral) — flip test N/A",
+      "explorer": null
+    },
+    {
+      "id": "M2-2",
+      "group": "M-2",
+      "desc": "withdraw rejected once worse-of mark under-margins",
+      "verdict": "UNDRIVEN",
+      "detail": "benign control did not accept on these params (see M2-1)",
+      "explorer": null
+    },
+    {
+      "id": "LIQ",
+      "group": "SETUP",
+      "desc": "liquidate_position_v2 injects the synthetic close (order_type==3)",
+      "verdict": "PASS",
+      "detail": "real liquidation at oracle=82810",
+      "sig": "5u89tRExDcDiaKSf2jVyR7zovguyKRZboVGtuNdLAQfKPm8iKUd9Y74QjKnoJfq2xk4dREXXwGskpZwY6DYQeAWR",
+      "explorer": "https://explorer.solana.com/tx/5u89tRExDcDiaKSf2jVyR7zovguyKRZboVGtuNdLAQfKPm8iKUd9Y74QjKnoJfq2xk4dREXXwGskpZwY6DYQeAWR?cluster=devnet"
+    },
+    {
+      "id": "HB-1",
+      "group": "H-B",
+      "desc": "liquidatee CANNOT cancel their order_type==3 (dodge blocked)",
+      "verdict": "PASS",
+      "detail": "rejected with LiquidationOrderNotCancelable (8325) ✓",
+      "explorer": null
+    },
+    {
+      "id": "HB-2",
+      "group": "H-B",
+      "desc": "authority CAN retire the order_type==3 (retire_liquidation_order_v2)",
+      "verdict": "PASS",
+      "detail": "accepted ✓",
+      "sig": "5UFhxWLsqEHDkjb5fK1eZXxwfJkmdj8LvzDWVcFUvUjze62ruKCPj6TfXp24a5piUjK3KLprWBhgS3Wuo1QvqKZE",
+      "explorer": "https://explorer.solana.com/tx/5UFhxWLsqEHDkjb5fK1eZXxwfJkmdj8LvzDWVcFUvUjze62ruKCPj6TfXp24a5piUjK3KLprWBhgS3Wuo1QvqKZE?cluster=devnet"
+    }
+  ],
+  "pass": 8,
+  "fail": 0,
+  "undriven": 5
+}
