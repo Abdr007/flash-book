@@ -1600,6 +1600,8 @@ async fn crank_funding_seeds_and_gates_on_oracle() {
             vec![
                 AccountMeta::new_readonly(cranker.pubkey(), true),
                 AccountMeta::new(market_pda, false),
+                // optional market_book omitted (program ID = None) => mark fallback
+                AccountMeta::new_readonly(flash_book::ID, false),
             ],
         )
     };
@@ -1663,6 +1665,149 @@ async fn crank_funding_seeds_and_gates_on_oracle() {
     assert_eq!(
         m.cum_funding_index, 0,
         "no oracle anchor -> crank accrues nothing"
+    );
+}
+
+/// 4.7: `crank_funding` funds off the robust MEDIAN mark = median{mark, oracle,
+/// on-book mid}, not the raw mark. Rest a two-sided book, patch the mark to a value
+/// distinct from the oracle and the book mid, crank WITH the book account, and assert
+/// the emitted `funding_mark_ticks` is the median (≠ raw mark) — proving the book mid
+/// is incorporated. Liquidation is untouched (it never calls `robust_median_mark`).
+#[tokio::test]
+async fn crank_funding_uses_robust_median_mark_from_the_book() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // oracle == mark == 100_000
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    // Init the v2 book.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Rest a two-sided book within the anti-stuffing band (mark/oracle == 100_000):
+    // best_bid 93_000, best_ask 98_000 ⇒ mid == 95_500.
+    let maker = Keypair::new();
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 1_000_000, &protocol).await;
+    let place = |side: u8, price: u64| {
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side,
+                size_lots: 1,
+                limit_ticks: price,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(maker_state, false),
+                AccountMeta::new_readonly(program_id(), false),
+            ],
+        )
+    };
+    for (side, price) in [(0u8, 93_000u64), (1u8, 98_000u64)] {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[place(side, price)],
+                Some(&payer.pubkey()),
+                &[&payer, &maker],
+                bh,
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Patch the mark to 90_000 (distinct from oracle 100_000 and mid 95_500) and put the
+    // funding clock in the past so THIS crank accrues (dt > 0) and emits the event. Keep
+    // the oracle fresh so it anchors the median.
+    let clock: Clock = ctx.banks_client.get_sysvar().await.unwrap();
+    let acc = ctx
+        .banks_client
+        .get_account(market_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut m: flash_book::state::MarketAccount =
+        flash_book::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    m.mark_price_ticks = 90_000;
+    m.oracle_price_ticks = 100_000;
+    m.oracle_published_at_unix_seconds = clock.unix_timestamp.max(1) as u64;
+    m.params.oracle_staleness_max_seconds = u32::MAX;
+    m.last_funding_crank_unix = (clock.unix_timestamp.max(0) as u64)
+        .saturating_sub(100)
+        .max(1);
+    let mut nd = Vec::new();
+    m.try_serialize(&mut nd).unwrap();
+    nd.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: acc.lamports,
+            data: nd,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    // Crank WITH the book account present.
+    let crank = build_ix(
+        flash_book::instruction::CrankFunding {},
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new_readonly(book_pda, false),
+        ],
+    );
+    let logs = send_capture(&mut ctx, crank, &payer.pubkey(), &[&payer]).await;
+
+    // Decode FundingCrankedEvent.funding_mark_ticks from the captured "Program data:" logs.
+    let mut funding_mark: Option<u64> = None;
+    for line in &logs {
+        let Some(b64) = line.strip_prefix("Program data: ") else {
+            continue;
+        };
+        let Some(bytes) = recon_b64(b64.trim()) else {
+            continue;
+        };
+        let disc = <flash_book::FundingCrankedEvent as anchor_lang::Discriminator>::DISCRIMINATOR;
+        if bytes.starts_with(disc) {
+            if let Ok(e) = flash_book::FundingCrankedEvent::try_from_slice(&bytes[8..]) {
+                funding_mark = Some(e.funding_mark_ticks);
+            }
+        }
+    }
+    let fm = funding_mark.expect("FundingCrankedEvent emitted with a funding_mark_ticks");
+    // median{mark 90_000, oracle 100_000, book_mid 95_500} == 95_500 (the mid).
+    assert_eq!(
+        fm, 95_500,
+        "funding uses the median{{mark,oracle,book_mid}}"
+    );
+    assert_ne!(
+        fm, 90_000,
+        "median must differ from the raw mark (book mid incorporated)"
     );
 }
 
@@ -1940,6 +2085,8 @@ async fn d19_reconciler_rebuilds_collateral_and_funding_from_events() {
             vec![
                 AccountMeta::new_readonly(cranker.pubkey(), true),
                 AccountMeta::new(market_pda, false),
+                // optional market_book omitted (program ID = None) => mark fallback
+                AccountMeta::new_readonly(flash_book::ID, false),
             ],
         )
     };
@@ -2538,6 +2685,8 @@ async fn conservation_sequence_fuzz() {
                 vec![
                     AccountMeta::new_readonly(payer.pubkey(), true),
                     AccountMeta::new(market_pda, false),
+                    // optional market_book omitted (program ID = None) => mark fallback
+                    AccountMeta::new_readonly(flash_book::ID, false),
                 ],
             ),
         };

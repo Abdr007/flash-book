@@ -93,9 +93,67 @@ pub fn funding_owed(
     Ok(sign * scaled)
 }
 
+/// Median of three `u64` (branch-free, overflow-free): drops the min and max,
+/// leaving the middle value.
+#[inline]
+pub fn median3(a: u64, b: u64, c: u64) -> u64 {
+    a.max(b).min(a.max(c)).min(b.max(c))
+}
+
+/// Robust funding/display mark (roadmap 4.7). The median of three sources —
+/// `mark` (the oracle-band-clamped fill EMA, i.e. the oracle+EMA blend), `oracle`
+/// (the external reference), and the on-book `mid` — so a manipulated or thin-book
+/// mid is out-voted by the two oracle-anchored sources, and a lagging oracle is
+/// out-voted by the mark+mid. Used ONLY for funding and display.
+///
+/// SAFETY: liquidation/health MUST NOT call this — it keeps the strict
+/// `worse_of(mark, oracle)` (never the median), so a benign median can never soften
+/// a liquidation. When a proper three-source median can't be formed (no two-sided
+/// book mid, or an unset oracle/mark), this falls back to `mark` — the pre-4.7
+/// funding input — so behaviour is unchanged rather than pulled toward a zero source.
+#[inline]
+pub fn robust_median_mark(mark_ticks: u64, oracle_ticks: u64, book_mid_ticks: Option<u64>) -> u64 {
+    match book_mid_ticks {
+        Some(mid) if mid > 0 && oracle_ticks > 0 && mark_ticks > 0 => {
+            median3(mark_ticks, oracle_ticks, mid)
+        }
+        _ => mark_ticks,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn median3_returns_the_middle() {
+        assert_eq!(median3(1, 2, 3), 2);
+        assert_eq!(median3(3, 1, 2), 2);
+        assert_eq!(median3(2, 3, 1), 2);
+        assert_eq!(median3(5, 5, 1), 5); // ties
+        assert_eq!(median3(1, 5, 5), 5);
+        assert_eq!(median3(7, 7, 7), 7);
+        assert_eq!(median3(0, u64::MAX, 100), 100); // no overflow across the full range
+    }
+
+    #[test]
+    fn robust_median_mark_uses_median_when_all_three_present() {
+        // book mid is the outlier ⇒ out-voted by mark+oracle (median = the middle).
+        assert_eq!(robust_median_mark(100, 102, Some(500)), 102);
+        assert_eq!(robust_median_mark(100, 102, Some(50)), 100);
+        // book mid between the two oracle-anchored sources ⇒ it IS the median.
+        assert_eq!(robust_median_mark(100, 104, Some(101)), 101);
+    }
+
+    #[test]
+    fn robust_median_mark_falls_back_to_mark_without_a_full_triplet() {
+        // No two-sided book mid ⇒ keep the pre-4.7 funding input (the mark).
+        assert_eq!(robust_median_mark(100, 102, None), 100);
+        // A zero source is never allowed to pull the mark toward 0.
+        assert_eq!(robust_median_mark(100, 102, Some(0)), 100);
+        assert_eq!(robust_median_mark(100, 0, Some(101)), 100);
+        assert_eq!(robust_median_mark(0, 102, Some(101)), 0);
+    }
 
     /// Pins the truncation direction of the Q64.64 -> quote-lot conversion.
     /// The shift floors toward -infinity: a positive charge loses its
@@ -222,5 +280,27 @@ mod proofs {
                 assert!(delta == 0 && rate == 0);
             }
         }
+    }
+
+    /// The robust median mark (4.7) never fabricates a value outside its sources:
+    /// with a full triplet the output equals one of {mark, oracle, mid} and lies in
+    /// [min, max]; otherwise it is exactly the mark. So funding can never be driven by
+    /// a mark outside the real source range — the median only ever picks a middle
+    /// source, never invents one.
+    #[kani::proof]
+    fn robust_median_mark_is_bounded_by_its_sources() {
+        let mark: u64 = kani::any();
+        let oracle: u64 = kani::any();
+        let mid: u64 = kani::any();
+        let with = robust_median_mark(mark, oracle, Some(mid));
+        if mid > 0 && oracle > 0 && mark > 0 {
+            let lo = mark.min(oracle).min(mid);
+            let hi = mark.max(oracle).max(mid);
+            assert!(with >= lo && with <= hi);
+            assert!(with == mark || with == oracle || with == mid);
+        } else {
+            assert!(with == mark);
+        }
+        assert!(robust_median_mark(mark, oracle, None) == mark);
     }
 }

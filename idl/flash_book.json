@@ -2711,6 +2711,40 @@
               }
             ]
           }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "4.7: OPTIONAL market book for the on-book mid (the median's third source).",
+            "PDA-pinned to this market. When omitted (or one-sided/empty), funding falls",
+            "back to the mark — behaviour is unchanged, so passing it is purely additive.",
+            "+ a market_pubkey equality check. May be an ER-delegated (last-committed) clone."
+          ],
+          "optional": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
         }
       ],
       "args": []
@@ -21174,6 +21208,15 @@
             "name": "dt_seconds",
             "docs": [
               "Seconds elapsed since the previous crank (pre-clamp)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "funding_mark_ticks",
+            "docs": [
+              "4.7: the robust-median funding/display mark used for THIS tick's premium —",
+              "median{mark (oracle+EMA blend), oracle, on-book mid}, or the mark when no",
+              "two-sided book mid was available. Liquidation is unaffected (strict worse-of)."
             ],
             "type": "u64"
           }
