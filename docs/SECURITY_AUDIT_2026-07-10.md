@@ -82,15 +82,36 @@ release from the shared vault against a PDA-owned balance without consulting
 `er_active`/`er_reserved`. Only reachable if a strategy PDA rests ER orders
 (unusual). **Fix:** add the same `er_active == 0` assertion for symmetry. Devnet cycle.
 
-### L-3 (LOW) — `fee_tiers` is keeper-selectable, not commitment-bound
-`ApplyFill`/`ApplyFlpFill` contexts (`lib.rs:16959`/`17231`). On an armed
-(permissionless) market a keeper can omit the `Option<fee_tiers>` account, forcing
-the flat `market.params` fee/rebate instead of the traders' volume-tier rates. No
-value is minted or stolen by the keeper — the delta flows to insurance, not the
-attacker — and it only applies if the griefer out-races the honest sequencer. Pure
-fairness/griefing. **Fix:** bind a `fee_tiers_present` bit (or the resolved bps
-pair) into the keccak preimage, or require the singleton `[b"fee_tiers"]` PDA
-whenever `market.params` defines a nonzero tier table. Devnet cycle.
+### L-3 (LOW) — `fee_tiers` is keeper-selectable, not commitment-bound  ✅ ACCEPTED RESIDUAL (documented; fix specified + trigger-gated)
+`ApplyFill`/`ApplyFlpFill` contexts. On an armed (permissionless) market a keeper
+can omit the `Option<fee_tiers>` account, forcing the flat `market.params`
+fee/rebate instead of the traders' volume-tier rates. No value is minted or stolen
+by the keeper — the delta flows to insurance, not the attacker — and it only applies
+if the griefer out-races the honest sequencer. Pure fairness/griefing.
+
+**Disposition (2026-07-11): accepted residual, not fixed now.** The griefing surface
+is **latent** — it exists only once a *nonzero* fee-tier table is activated: the
+tier table is a **global singleton** (`FeeTiersAccount`, PDA `[b"fee_tiers"]`,
+`tier_count` rows), there is **no per-market tier signal** on `MarketAccount`/
+`MarketParams`, and the singleton is **not part of mandatory genesis**. Until
+`init_fee_tiers` is run with `tier_count > 0`, `resolve_fee_tier` falls back to flat
+`market.params` for everyone, so an omission changes nothing. Every actual fix is
+disproportionate to a LOW, latent, no-theft griefing bug: (a) a `MarketAccount`
+layout grow for a `fee_tiers_required` flag breaks deserialization of existing
+fixed-size markets (migration); (b) binding a `fee_tiers_present` bit into the
+settlement **keccak preimage** modifies the formally-reasoned fill-authenticity ring
+(proven-core-adjacent); (c) making the singleton **mandatory** on all armed
+`apply_fill` is a breaking settlement-interface change that reverts every market
+without the singleton initialized.
+
+**Fix to apply WHEN fee tiers are activated pre-launch** (the trigger that makes this
+non-latent): initialize the `[b"fee_tiers"]` singleton as a standing genesis account
+(default `tier_count = 0`), then make `fee_tiers` a **required** account on
+`ApplyFill`/`ApplyFlpFill` and require the caller to pass the canonical PDA. With the
+singleton always present, an honest keeper always supplies it (public account, zero
+cost) and a griefer can no longer strip tiers — with no per-market flag, no migration,
+and no keccak change. Tracked in the roadmap fix queue against the fee-tier-activation
+milestone.
 
 ### INFO notes (not exploitable — recorded for hardening)
 - **I-1** `partial_withdraw_core` withdraw floor sums the *isolated* required-margin

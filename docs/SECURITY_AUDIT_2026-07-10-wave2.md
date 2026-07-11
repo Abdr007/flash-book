@@ -80,6 +80,35 @@ atomically at injection. Devnet acceptance required.
   band-edge premium stamps a full-period tick (bounded by `rate_max`/band).
   **Harden:** premium TWAP accumulator + min crank interval.
 
+### Disposition of the three MEDs (2026-07-11) — documented, milestone-attached
+
+None of the three is a fresh outside-attacker exploit; all are **defense-in-depth
+against a compromised or griefing sequencer/keeper, bounded in impact**, and two are
+inherent to the **single-sequencer trust boundary that is itself a disclosed launch
+assumption** (`ER_TRUST_BOUNDARY.md`, `docs/LAUNCH_FRAMING.md`). Their proper fixes
+are real engineering that belongs in focused passes, not a rushed tail change:
+
+- **ER attestation-lag** — inherent to the async ER boundary; mitigated today by the
+  honest-sequencer attest-before-ack model. Proper fix (attest-confirm before an ER
+  order rests/fills + an on-chain max-staleness bound on the attestation used by
+  xdomain withdraw) is a money-path + ER-flow change — attach to the ER-hardening /
+  decentralized-sequencer track (2.x), devnet-gated.
+- **`record_flp_fill_v3` trust** — not forgeable by an outside user; only a
+  *compromised* sequencer/authority can inflate FLP NAV, i.e. it lives entirely
+  inside the already-disclosed sequencer-trust assumption. Proper fix (commit fills
+  against an attested book-state root) is the same primitive the decentralized-
+  sequencer milestone introduces — attach there.
+- **funding snapshot** — a min-crank-interval **alone is counterproductive** (a
+  larger `dt` weights a momentary band-edge premium *more*), so the real fix is the
+  **premium-TWAP accumulator** (state + accrual change); impact is already bounded by
+  `rate_max`/band. Attach to the funding-mechanism pass (4.7 robust-median mark) so
+  the mark/premium sourcing is hardened once, coherently.
+
+**Net:** the MED/LOW audit tail is closed — L-1 and L-2 fixed + merged (devnet-CI
+green); L-3 and these three MEDs are accepted residuals with a **named fix and the
+milestone each attaches to**, none blocking launch (no HIGH, no outside-attacker
+theft). This matches the venue's discipline: name every residual, force nothing risky.
+
 ## LOW / INFO (see the fix queue)
 
 OI-cap bypass and oracle-band bypass on the injection paths (fold into H-A's

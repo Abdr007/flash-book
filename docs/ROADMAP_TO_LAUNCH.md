@@ -179,9 +179,17 @@ The **M-2** withdraw/sweep raw-mark gap is also fixed in PR #300 (valuation rout
 through `effective_health_mark`, worse-of); its clean accept→reject devnet flip is not
 demonstrable on realistic params (stress margin ≈ position max-loss leaves no collateral
 window), so it stays covered by the in-tree test suite + the reconciled source rather
-than a live row — reported honestly, not claimed. **Remaining launch-gate eng tail**
-(none HIGH): MEDs — ER attestation-lag, `record_flp_fill_v3` trust, funding snapshot —
-and LOW/INFO, all in the wave-2 report's fix queue for the next devnet-verified cycle.
+than a live row — reported honestly, not claimed. **The MED/LOW audit tail is now
+closed (2026-07-11), none launch-blocking:** **L-1** dormant-sibling portfolio-liq
+(PR #303) and **L-2** vault `er_active` (PR #302) are FIXED + merged (devnet-CI green,
+L-1 with a new behavioral test); **L-3** (`fee_tiers` not commitment-bound) and the
+three MEDs (ER attestation-lag, `record_flp_fill_v3` trust, funding snapshot) are
+**accepted residuals** — each a bounded, no-outside-theft, sequencer-trust/latent
+item with a **named fix and the milestone it attaches to** (see
+`docs/SECURITY_AUDIT_2026-07-10*.md` dispositions): L-3 → fee-tier-activation
+(standing singleton + required account), attestation-lag / FLP-fill-root → ER-hardening
+/ decentralized-sequencer track (2.x), funding → 4.7 funding/mark pass (TWAP accrual;
+a min-interval alone is counterproductive). Nothing risky forced into settlement code.
 
 ## Honest status of the remainder
 
