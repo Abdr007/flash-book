@@ -1576,6 +1576,15 @@ pub mod flash_book {
         if !matcher::flp_quoter::price_sig_figs_ok(limit_ticks) {
             return err!(FlashBookError::PriceTooManySignificantFigures);
         }
+        // 4.1: anti-dust — reject an order whose quote-lot notional is below the market floor.
+        if !matcher::flp_quoter::order_notional_ok(
+            size_lots,
+            limit_ticks,
+            p.tick_size,
+            p.min_notional_quote_lots,
+        ) {
+            return err!(FlashBookError::OrderNotionalTooSmall);
+        }
 
         // reduce_only (bit1), or a market in CloseOnly wind-down: cap the taker to
         // its own reducible size so it can
@@ -2618,6 +2627,15 @@ pub mod flash_book {
         // 4.2: anti-fragmentation — reject a price carrying more than 5 significant figures.
         if !matcher::flp_quoter::price_sig_figs_ok(new_limit_ticks) {
             return err!(FlashBookError::PriceTooManySignificantFigures);
+        }
+        // 4.1: anti-dust — reject an order whose quote-lot notional is below the market floor.
+        if !matcher::flp_quoter::order_notional_ok(
+            new_size_lots,
+            new_limit_ticks,
+            p.tick_size,
+            p.min_notional_quote_lots,
+        ) {
+            return err!(FlashBookError::OrderNotionalTooSmall);
         }
 
         // Anti-stuffing: the re-priced resting order must sit within the band of
@@ -11756,6 +11774,16 @@ pub mod flash_book {
             matcher::flp_quoter::price_sig_figs_ok(limit_ticks),
             FlashBookError::PriceTooManySignificantFigures
         );
+        // 4.1: anti-dust — reject an order whose quote-lot notional is below the market floor.
+        require!(
+            matcher::flp_quoter::order_notional_ok(
+                size_lots,
+                limit_ticks,
+                market.params.tick_size,
+                market.params.min_notional_quote_lots
+            ),
+            FlashBookError::OrderNotionalTooSmall
+        );
 
         // H-A (item 4.8): gate the vault's OPENING order against its own TraderState
         // collateral, exactly like place_limit_v2_core. A reduce-only order is exempt
@@ -13971,6 +13999,15 @@ fn place_limit_v2_core(
     // 4.2: anti-fragmentation — reject a price carrying more than 5 significant figures.
     if !matcher::flp_quoter::price_sig_figs_ok(limit_ticks) {
         return err!(FlashBookError::PriceTooManySignificantFigures);
+    }
+    // 4.1: anti-dust — reject an order whose quote-lot notional is below the market floor.
+    if !matcher::flp_quoter::order_notional_ok(
+        size_lots,
+        limit_ticks,
+        p.tick_size,
+        p.min_notional_quote_lots,
+    ) {
+        return err!(FlashBookError::OrderNotionalTooSmall);
     }
 
     // Anti-stuffing: a RESTING limit must sit within the band of the fresh
@@ -22420,7 +22457,7 @@ pub struct FlpWithdrawV3<'info> {
         seeds = [state_v3::FlpExposurePerMarketAccountV3::SEED, exposure.market.as_ref()],
         bump = exposure.bump,
     )]
-    pub exposure: Account<'info, state_v3::FlpExposurePerMarketAccountV3>,
+    pub exposure: Box<Account<'info, state_v3::FlpExposurePerMarketAccountV3>>,
 
     /// The pool's market — supplies the fresh L1 oracle and `tick_size` used to
     /// mark the pool's open inventory into the exit NAV, and the mark used for the
@@ -22446,7 +22483,7 @@ pub struct FlpWithdrawV3<'info> {
         seeds = [InsuranceFundAccount::SEED],
         bump = insurance_fund.bump,
     )]
-    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 
     /// Protocol vault — debited.
     #[account(mut, address = insurance_fund.quote_vault)]

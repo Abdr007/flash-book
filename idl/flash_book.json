@@ -19211,6 +19211,11 @@
       "code": 8326,
       "name": "PriceTooManySignificantFigures",
       "msg": "Price carries more than 5 significant figures (anti-fragmentation rule); trim the trailing precision"
+    },
+    {
+      "code": 8327,
+      "name": "OrderNotionalTooSmall",
+      "msg": "Order notional (size × price × tick_size) is below the market's minimum (anti-dust floor)"
     }
   ],
   "types": [
@@ -23658,6 +23663,17 @@
               "Typical: 100 bps = 1%."
             ],
             "type": "u32"
+          },
+          {
+            "name": "min_notional_quote_lots",
+            "docs": [
+              "Anti-dust minimum order notional in quote-lots (4.1): an order's",
+              "`size_lots × price_ticks × tick_size` must be ≥ this. Tiny orders pass the",
+              "per-lot floor (`min_base_lots`) yet carry negligible value, letting a spammer",
+              "splinter the book cheaply; this puts a real value floor on every resting order.",
+              "`0` = disabled (no per-order value floor)."
+            ],
+            "type": "u64"
           }
         ]
       }

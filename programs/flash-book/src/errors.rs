@@ -281,6 +281,10 @@ pub enum FlashBookError {
     LiquidationOrderNotCancelable = 2325,
     #[msg("Price carries more than 5 significant figures (anti-fragmentation rule); trim the trailing precision")]
     PriceTooManySignificantFigures = 2326,
+    #[msg(
+        "Order notional (size × price × tick_size) is below the market's minimum (anti-dust floor)"
+    )]
+    OrderNotionalTooSmall = 2327,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.

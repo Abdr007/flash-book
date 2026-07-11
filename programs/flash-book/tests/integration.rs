@@ -197,6 +197,7 @@ fn default_params() -> MarketParams {
         mark_max_change_bps: 0,
         mark_settle_min_slots: 0,
         drift_alert_bps: 0,
+        min_notional_quote_lots: 0, // 4.1: 0 = anti-dust floor disabled in tests
     }
 }
 
@@ -4986,6 +4987,117 @@ async fn place_limit_v2_enforces_5_significant_figures() {
     assert!(
         five.is_ok(),
         "a 5-sig-fig in-band price must be accepted, got: {five:?}"
+    );
+}
+
+/// 4.1 anti-dust: with `min_notional_quote_lots` set, an order whose notional
+/// (size × price × tick) is below the floor is rejected (OrderNotionalTooSmall, 8327);
+/// one at/above the floor is accepted.
+#[tokio::test]
+async fn place_limit_v2_enforces_min_notional() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // oracle 100_000, tick 1
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Set an anti-dust floor of 200_000 quote-lots on the market.
+    let ma = ctx
+        .banks_client
+        .get_account(market_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut m: flash_book::state::MarketAccount =
+        flash_book::state::MarketAccount::try_deserialize(&mut ma.data.as_slice()).unwrap();
+    m.params.min_notional_quote_lots = 200_000;
+    let mut md = Vec::new();
+    m.try_serialize(&mut md).unwrap();
+    md.resize(ma.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: ma.lamports,
+            data: md,
+            owner: ma.owner,
+            executable: ma.executable,
+            rent_epoch: ma.rent_epoch,
+        }
+        .into(),
+    );
+
+    let maker = Keypair::new();
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 1_000_000, &protocol).await;
+    let place = |size: u64| {
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side: 1,
+                size_lots: size,
+                limit_ticks: 100_000, // in-band, 1 sig fig, notional = size × 100_000
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(maker.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(maker_state, false),
+                AccountMeta::new_readonly(program_id(), false),
+            ],
+        )
+    };
+
+    // size 1 → notional 100_000 < 200_000 → rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let dust = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(1)],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await;
+    assert!(
+        format!("{dust:?}").contains("Custom(8327)"),
+        "a below-floor order must reject OrderNotionalTooSmall, got: {dust:?}"
+    );
+
+    // size 3 → notional 300_000 ≥ 200_000 → accepted.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ok = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place(3)],
+            Some(&payer.pubkey()),
+            &[&payer, &maker],
+            bh,
+        ))
+        .await;
+    assert!(
+        ok.is_ok(),
+        "an at/above-floor order must be accepted, got: {ok:?}"
     );
 }
 
