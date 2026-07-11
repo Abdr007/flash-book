@@ -83,7 +83,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | 4.5 | tranched liquidation (positions above a notional threshold liquidate in tranches) | eng | STARTABLE (program change) |
 | 4.6 | user reduce-only flag on the v2 place path (currently rejected at intake) | eng | STARTABLE (program change) |
 | **4.7** | **robust-median mark** (median for funding/display; worse-of for liquidation) | eng | **STARTABLE** |
-| 4.8 | apply intake IM gate to v3 injection paths (TWAP/iceberg/bracket) | eng | **CONFIRMED HIGH — LAUNCH-BLOCKER** (adversarial re-audit 2026-07-10, `docs/SECURITY_AUDIT_2026-07-10-wave2.md` H-A): NOT an accepted residual — exploitable. `execute_trigger_order_v3` (entry), `execute_twap_slice_v3`, `place_iceberg_order_v3`, `replenish_iceberg_v3`, `place_bracket_order_v3` (parent) AND `vault_place_order_v3` all skip `assert_intake_initial_margin` (which `place_limit_v2_core`/`place_taker` call precisely because settlement can't re-check margin). Thin-collateral attacker injects a large maker order → crossed → under-margined open → bad debt to insurance. **Fix:** shared `assert_injection_intake` (IM + position-budget + OI-cap + oracle-band) on all 6 opening paths, exempt reduce-only. Fail-safe; **devnet-gated** (6-handler pricing/gating change, not a blind push) |
+| 4.8 | apply intake IM gate to v3 injection paths (TWAP/iceberg/bracket) | eng | **CLOSED — CONFIRMED HIGH FIXED (PR #300, `3998b9bd`, all CI green)** and **DEVNET-ACCEPTED**. Shared `assert_injection_intake` (via `gate_injection_open`) now gates all 6 opening-maker paths (`execute_trigger_order_v3`, `execute_twap_slice_v3`, `place_iceberg_order_v3`, `replenish_iceberg_v3`, `place_bracket_order_v3`, `vault_place_order_v3`), exempt reduce-only. Proven live on a fresh throwaway devnet program (`BRtnEAZ6…`, on-chain bytes hash-verified): iceberg/bracket/vault opens from a 0-collateral state reject `InsufficientCollateral` on 3 independent paths + reduce-only exemption accepts (`er-acceptance/critical_path_acceptance.mjs`; `CRITICAL_PATH_FINDINGS.md`). Original finding: `docs/SECURITY_AUDIT_2026-07-10-wave2.md` H-A |
 
 ## 5 · Product / integration (5.x)
 
@@ -162,21 +162,34 @@ No CRITICAL on any surface. Access-control, oracle, arithmetic, hypertree,
 settlement-authenticity, and DoS/compute-exhaustion returned **zero exploitable
 findings**. Fixed + shipped: **M-1** — `set_position_isolated` now gates on
 `er_active == 0` (was: could relocate collateral out of ER-order reach → bad debt).
-**Two HIGH launch-blockers** confirmed (both bad-debt-adjacent, fail-safe-fixable,
-devnet-gated; neither direct-theft): **H-A** (4.8 — six maker-open paths skip the
-intake IM gate) and **H-B** (liquidatee can cancel the injected `order_type==3`
+**Two HIGH launch-blockers** were confirmed (both bad-debt-adjacent, fail-safe-fixable,
+devnet-gated; neither direct-theft): **H-A** (4.8 — six maker-open paths skipped the
+intake IM gate) and **H-B** (liquidatee could cancel the injected `order_type==3`
 liquidation-close order to dodge liquidation; ADL remains the bankruptcy backstop).
-Plus MEDs (ER attestation-lag, `record_flp_fill_v3` trust, funding snapshot, M-2
-withdraw raw-mark) and LOW/INFO — all in the wave-2 report's fix queue for the next
-devnet-verified cycle. **Launch gate holds these two HIGH + M-2 open** — per the
-mandate's no-defer-lane, they must close before launch.
+**Both HIGHs are now CLOSED + DEVNET-ACCEPTED (PR #300, `3998b9bd`, all CI green).**
+H-A: shared `gate_injection_open` on all 6 opening paths (reduce-only exempt), proven
+live (3 independent paths reject `InsufficientCollateral` + exemption accepts). H-B:
+owner-cancel of `order_type==3` blocked (`LiquidationOrderNotCancelable`) + a
+keeper/authority `retire_liquidation_order_v2` path — proven live end-to-end by a
+**real** liquidation that injected the `order_type==3` order (never hand-crafted), the
+liquidatee's cancel rejected, the authority retirement accepted. Full acceptance:
+`er-acceptance/critical_path_acceptance.mjs` + `CRITICAL_PATH_FINDINGS.md` (8 PASS / 0
+FAIL / 5 honest-UNDRIVEN on `BRtnEAZ6…`, hash-verified vs the built artifact).
+The **M-2** withdraw/sweep raw-mark gap is also fixed in PR #300 (valuation routed
+through `effective_health_mark`, worse-of); its clean accept→reject devnet flip is not
+demonstrable on realistic params (stress margin ≈ position max-loss leaves no collateral
+window), so it stays covered by the in-tree test suite + the reconciled source rather
+than a live row — reported honestly, not claimed. **Remaining launch-gate eng tail**
+(none HIGH): MEDs — ER attestation-lag, `record_flp_fill_v3` trust, funding snapshot —
+and LOW/INFO, all in the wave-2 report's fix queue for the next devnet-verified cycle.
 
 ## Honest status of the remainder
 
 Every item now has real scope (no more title-only). The remainder splits into:
 
 - **Program changes** (need a devnet deploy + live-re-verify cycle each): 2.1–2.3, 2.7,
-  3.3, 4.1–4.6, 4.8.
+  3.3, 4.1–4.6. (**4.8 CLOSED** + devnet-accepted, PR #300; the H-B cancel-lock + M-2
+  worse-of shipped in the same PR — the audit's two HIGHs are no longer open.)
 - **Hard proofs** (Lean / real-symbol): 1.3, 1.5, 1.7. (**1.2 DONE** — real-symbol Kani `assess_margin_single_market_frame_stable`.)
 - **Multi-week builds**: 1.1 Certora integration, 3.1 percolator per-domain credit, and
   the three big builds (copy-vaults, HIP-3 permissionless deploy, decentralized-sequencer
