@@ -1671,6 +1671,226 @@
       "args": []
     },
     {
+      "name": "claim_fee_accrual",
+      "docs": [
+        "2.3: the recipient drains their entire accrued fee-share balance from the",
+        "shared quote vault to their own ATA. Recipient-signed (only the recipient",
+        "can claim their PDA). The accrued value was reserved out of protocol",
+        "surplus at accrual time and tracked as `insurance_fund.total_fee_accrued_lots`",
+        "(a vault liability), so this payout is conservation-neutral: it drops the",
+        "vault and the liability by the same amount. Gated by the same Residual≥0",
+        "protocol-solvency floor as every other value-out path — the post-claim",
+        "vault must still cover insurance + FLP + the remaining fee-accrual",
+        "liability."
+      ],
+      "discriminator": [
+        179,
+        53,
+        147,
+        1,
+        7,
+        27,
+        31,
+        94
+      ],
+      "accounts": [
+        {
+          "name": "recipient",
+          "docs": [
+            "Only the recipient can drain their own accrual PDA."
+          ],
+          "signer": true
+        },
+        {
+          "name": "fee_accrual",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  97,
+                  99,
+                  99,
+                  114,
+                  117,
+                  97,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "recipient"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "docs": [
+            "Read-only: FLP capital is a solvency-floor term."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "recipient_quote_ata",
+          "docs": [
+            "Recipient's USDC ATA — destination for the claimed shares."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "recipient"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "quote_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "quote_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "clear_book_delegation",
       "docs": [
         "Update market status (authority-only).",
@@ -5971,6 +6191,74 @@
       "args": [
         {
           "name": "attestor",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "init_fee_accrual",
+      "docs": [
+        "2.3: create the canonical on-chain accrual account for a fee-share",
+        "recipient (referrer / builder / curated creator). Permissionless — the",
+        "payer funds rent; the account is bound to `recipient` by its PDA seeds,",
+        "so there is exactly one per recipient and it cannot be spoofed. Idempotent",
+        "in effect: Anchor's `init` fails if it already exists, so callers create",
+        "it once. Until this exists (and is passed in `apply_fill`), shares remain",
+        "emit-only — creating it is how a recipient opts into trustless on-chain",
+        "accrual."
+      ],
+      "discriminator": [
+        251,
+        43,
+        164,
+        105,
+        21,
+        41,
+        153,
+        212
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "fee_accrual",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  97,
+                  99,
+                  99,
+                  114,
+                  117,
+                  97,
+                  108
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "recipient"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "recipient",
           "type": "pubkey"
         }
       ]
@@ -16630,6 +16918,19 @@
       ]
     },
     {
+      "name": "FeeAccrualAccount",
+      "discriminator": [
+        44,
+        10,
+        200,
+        131,
+        172,
+        8,
+        220,
+        2
+      ]
+    },
+    {
       "name": "FeeTiersAccount",
       "discriminator": [
         86,
@@ -17292,6 +17593,32 @@
         172,
         84,
         28
+      ]
+    },
+    {
+      "name": "FeeAccrualClaimedEvent",
+      "discriminator": [
+        92,
+        205,
+        126,
+        45,
+        151,
+        192,
+        170,
+        21
+      ]
+    },
+    {
+      "name": "FeeShareAccruedEvent",
+      "discriminator": [
+        182,
+        254,
+        36,
+        252,
+        152,
+        98,
+        82,
+        107
       ]
     },
     {
@@ -20280,6 +20607,93 @@
       }
     },
     {
+      "name": "FeeAccrualAccount",
+      "docs": [
+        "2.3: per-recipient on-chain accrual of referrer / builder / creator fee",
+        "shares. Created once (permissionlessly) by `init_fee_accrual`; credited",
+        "(surplus-capped) on the `apply_fill` hot path when the recipient's canonical",
+        "PDA is supplied in `remaining_accounts`; drained by the recipient via",
+        "`claim_fee_accrual`. Absent from a fill's `remaining_accounts` ⇒ the share is",
+        "only `emit!`-ed (exact pre-2.3 behaviour), so the account is purely opt-in."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "recipient",
+            "docs": [
+              "The referrer / builder / creator this accrual pays out to. Bound by the",
+              "PDA seeds, so a given recipient has exactly one canonical accrual PDA."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "accrued_quote_lots",
+            "docs": [
+              "Unclaimed accrued fee-share value, in quote lots. Backed 1:1 by the",
+              "shared quote vault (reserved out of protocol surplus at accrual time).",
+              "Byte offset 8 (disc) + 32 (recipient) = 40; the hot-path accrual writes",
+              "this field in place."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FeeAccrualClaimedEvent",
+      "docs": [
+        "2.3: emitted when a recipient drains their accrual via `claim_fee_accrual`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "recipient",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FeeShareAccruedEvent",
+      "docs": [
+        "2.3: emitted when `apply_fill` accrues a fee share to an on-chain",
+        "`FeeAccrualAccount` (the recipient opted in by supplying their PDA in",
+        "`remaining_accounts`). Distinct from the `*FeeOwedEvent`s, which fire on the",
+        "emit-only path; this event means the share was reserved on-chain and is",
+        "trustlessly claimable via `claim_fee_accrual`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "recipient",
+            "type": "pubkey"
+          },
+          {
+            "name": "kind",
+            "docs": [
+              "`0` = referrer, `1` = builder, `2` = creator."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "FeeTier",
       "docs": [
         "One rung of the fee-tier table. `min_volume_quote_lots` is the",
@@ -21806,6 +22220,20 @@
               "collateral + FLP capital."
             ],
             "type": "pubkey"
+          },
+          {
+            "name": "total_fee_accrued_lots",
+            "docs": [
+              "2.3: total referrer/builder/creator fee-share value accrued on-chain",
+              "but not yet claimed. A protocol LIABILITY against the shared vault —",
+              "`verify_protocol_solvency` requires `vault >= insurance + flp +",
+              "total_fee_accrued_lots`. Incremented (surplus-capped) when `apply_fill`",
+              "accrues a share to a `FeeAccrualAccount`; decremented when",
+              "`claim_fee_accrual` pays it out. Trailing field within `space()`",
+              "headroom (149 used, 200 allocated): pre-existing funds deserialize it",
+              "as 0 (no accrual yet, no migration)."
+            ],
+            "type": "u64"
           }
         ]
       }

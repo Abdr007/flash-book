@@ -51,7 +51,8 @@ use matcher::risk::{
     PositionSnapshot as RiskPosSnap,
 };
 use state::{
-    FlpExposureAccount, InsuranceFundAccount, MarketAccount, MarketParams, TraderStateAccount,
+    FeeAccrualAccount, FlpExposureAccount, InsuranceFundAccount, MarketAccount, MarketParams,
+    TraderStateAccount,
 };
 
 declare_id!("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
@@ -3319,6 +3320,7 @@ pub mod flash_book {
         f.total_payouts = 0;
         f.quote_mint = ctx.accounts.quote_mint.key();
         f.quote_vault = ctx.accounts.quote_vault.key();
+        f.total_fee_accrued_lots = 0;
         Ok(())
     }
 
@@ -3378,6 +3380,92 @@ pub mod flash_book {
             .total_payouts
             .checked_add(amount_quote_lots)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        Ok(())
+    }
+
+    /// 2.3: create the canonical on-chain accrual account for a fee-share
+    /// recipient (referrer / builder / curated creator). Permissionless — the
+    /// payer funds rent; the account is bound to `recipient` by its PDA seeds,
+    /// so there is exactly one per recipient and it cannot be spoofed. Idempotent
+    /// in effect: Anchor's `init` fails if it already exists, so callers create
+    /// it once. Until this exists (and is passed in `apply_fill`), shares remain
+    /// emit-only — creating it is how a recipient opts into trustless on-chain
+    /// accrual.
+    pub fn init_fee_accrual(ctx: Context<InitFeeAccrual>, recipient: Pubkey) -> Result<()> {
+        require!(recipient != Pubkey::default(), FlashBookError::OutOfRange);
+        let a = &mut ctx.accounts.fee_accrual;
+        a.recipient = recipient;
+        a.accrued_quote_lots = 0;
+        a.bump = ctx.bumps.fee_accrual;
+        Ok(())
+    }
+
+    /// 2.3: the recipient drains their entire accrued fee-share balance from the
+    /// shared quote vault to their own ATA. Recipient-signed (only the recipient
+    /// can claim their PDA). The accrued value was reserved out of protocol
+    /// surplus at accrual time and tracked as `insurance_fund.total_fee_accrued_lots`
+    /// (a vault liability), so this payout is conservation-neutral: it drops the
+    /// vault and the liability by the same amount. Gated by the same Residual≥0
+    /// protocol-solvency floor as every other value-out path — the post-claim
+    /// vault must still cover insurance + FLP + the remaining fee-accrual
+    /// liability.
+    pub fn claim_fee_accrual(ctx: Context<ClaimFeeAccrual>) -> Result<()> {
+        let amount = ctx.accounts.fee_accrual.accrued_quote_lots;
+        require!(amount > 0, FlashBookError::ZeroSize);
+
+        // Vault must physically hold the tokens.
+        require!(
+            ctx.accounts.quote_vault.amount >= amount,
+            FlashBookError::InsufficientCollateral
+        );
+
+        // Post-claim solvency: vault and the fee-accrual liability both drop by
+        // `amount`, so a solvent protocol stays solvent — but assert it against
+        // the proven core rather than assume it (defends against a vault that was
+        // already under-funded for some other reason).
+        let vault_after = ctx
+            .accounts
+            .quote_vault
+            .amount
+            .checked_sub(amount)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let insurance_bal = ctx.accounts.insurance_fund.balance_quote_lots;
+        let flp_capital = ctx.accounts.flp_exposure.total_capital_quote_lots;
+        let fee_accrued_after = ctx
+            .accounts
+            .insurance_fund
+            .total_fee_accrued_lots
+            .checked_sub(amount)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let required_backing = flp_capital
+            .checked_add(fee_accrued_after)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        let (solvent, _surplus) =
+            matcher::insurance::assess_solvency(vault_after, insurance_bal, required_backing)
+                .map_err(|_| error!(FlashBookError::ArithmeticOverflow))?;
+        require!(solvent, FlashBookError::HaircutResidualUnderflow);
+
+        // PDA-signed transfer out of the shared vault to the recipient's ATA.
+        let bump = ctx.accounts.insurance_fund.bump;
+        let signer_seeds: &[&[u8]] = &[InsuranceFundAccount::SEED, &[bump]];
+        let signers = &[signer_seeds];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.quote_vault.to_account_info(),
+            to: ctx.accounts.recipient_quote_ata.to_account_info(),
+            authority: ctx.accounts.insurance_fund.to_account_info(),
+        };
+        let cpi_ctx =
+            CpiContext::new_with_signer(ctx.accounts.token_program.key(), cpi_accounts, signers);
+        token::transfer(cpi_ctx, amount)?;
+
+        // Zero the accrual and reduce the global liability.
+        ctx.accounts.fee_accrual.accrued_quote_lots = 0;
+        ctx.accounts.insurance_fund.total_fee_accrued_lots = fee_accrued_after;
+
+        emit!(FeeAccrualClaimedEvent {
+            recipient: ctx.accounts.fee_accrual.recipient,
+            amount_quote_lots: amount,
+        });
         Ok(())
     }
 
@@ -5602,29 +5690,51 @@ pub mod flash_book {
             .checked_add(net_fee)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
 
-        // ── Referral attribution ─────────────────────────────────────
-        // When the taker has a referrer set, emit ReferralOwedEvent
-        // with the share so off-chain integrators can credit referrer
-        // balances. Pull-based (no on-chain referrer account walk) keeps
-        // ApplyFill's account list bounded; off-chain ledger pays out.
+        // ── 2.3: fee-share payout — on-chain accrual or emit-only ─────
+        // Of `net_fee`, the maker rebate and insurance contribution are
+        // already routed; the remainder is protocol surplus now sitting in the
+        // vault. Referrer/builder/creator shares are reserved out of THAT
+        // surplus (never more — `min(share, available_surplus)`), so total
+        // distributed <= collected and the vault always backs the accrued
+        // liability. If a recipient supplied their canonical `FeeAccrualAccount`
+        // in `remaining_accounts`, the (capped) share is written there and the
+        // global `total_fee_accrued_lots` liability grows; otherwise the share
+        // is only `emit!`-ed (exact pre-2.3 behaviour — account list stays
+        // bounded and the ER hot path is untouched).
+        let mut available_surplus = net_fee
+            .saturating_sub(maker_rebate)
+            .saturating_sub(insurance_contribution_paid);
+        let mut fee_accrued_this_fill: u64 = 0;
+
+        // Referral attribution.
         let taker_referrer = ctx.accounts.taker_trader_state.load()?.referrer;
         if taker_referrer != Pubkey::default() && market.params.referrer_share_bps > 0 {
             let share = ((net_fee as u128).saturating_mul(market.params.referrer_share_bps as u128)
                 / (constants::BPS_DENOM as u128)) as u64;
             if share > 0 {
-                emit!(ReferralOwedEvent {
-                    taker: taker_trader_pk,
-                    referrer: taker_referrer,
-                    amount_quote_lots: share,
-                });
+                let accrue = share.min(available_surplus);
+                match find_fee_accrual(ctx.remaining_accounts, ctx.program_id, &taker_referrer) {
+                    Some(ai) if accrue > 0 => {
+                        accrue_to_fee_account(ai, accrue)?;
+                        available_surplus -= accrue;
+                        fee_accrued_this_fill = fee_accrued_this_fill.saturating_add(accrue);
+                        emit!(FeeShareAccruedEvent {
+                            recipient: taker_referrer,
+                            kind: 0,
+                            amount_quote_lots: accrue,
+                        });
+                    }
+                    _ => emit!(ReferralOwedEvent {
+                        taker: taker_trader_pk,
+                        referrer: taker_referrer,
+                        amount_quote_lots: share,
+                    }),
+                }
             }
         }
 
-        // ── Builder-code attribution ─────────────────────────────────
-        // When the taker has approved a builder, emit BuilderFeeOwedEvent
-        // for off-chain accrual. Rate = min(market builder_share_bps,
-        // trader-approved cap). Pull-based (no on-chain builder account
-        // walk) keeps ApplyFill's account list bounded.
+        // Builder-code attribution. Rate = min(market builder_share_bps,
+        // trader-approved cap).
         let (taker_builder, trader_builder_cap) = {
             let s = ctx.accounts.taker_trader_state.load()?;
             (s.builder, s.builder_max_fee_share_bps)
@@ -5637,32 +5747,68 @@ pub mod flash_book {
             let share = ((net_fee as u128).saturating_mul(effective_bps)
                 / (constants::BPS_DENOM as u128)) as u64;
             if share > 0 {
-                emit!(BuilderFeeOwedEvent {
-                    taker: taker_trader_pk,
-                    builder: taker_builder,
-                    amount_quote_lots: share,
-                });
+                let accrue = share.min(available_surplus);
+                match find_fee_accrual(ctx.remaining_accounts, ctx.program_id, &taker_builder) {
+                    Some(ai) if accrue > 0 => {
+                        accrue_to_fee_account(ai, accrue)?;
+                        available_surplus -= accrue;
+                        fee_accrued_this_fill = fee_accrued_this_fill.saturating_add(accrue);
+                        emit!(FeeShareAccruedEvent {
+                            recipient: taker_builder,
+                            kind: 1,
+                            amount_quote_lots: accrue,
+                        });
+                    }
+                    _ => emit!(BuilderFeeOwedEvent {
+                        taker: taker_trader_pk,
+                        builder: taker_builder,
+                        amount_quote_lots: share,
+                    }),
+                }
             }
         }
 
-        // ── Curated-creator share ────────────────────────────────────
-        // If the market was migrated to a curated creator by the
-        // protocol authority, credit the creator with
-        // `creator_share_bps` of net fee. Pull-based event — no on-chain
-        // creator account walk on the hot path. For authority-deployed
-        // markets `market.creator == Pubkey::default()` and this branch
-        // is a no-op (no permissionless market creation in V3).
+        // Curated-creator share. For authority-deployed markets
+        // `market.creator == Pubkey::default()` and this branch is a no-op.
         let market_creator = market.creator;
         if market_creator != Pubkey::default() && market.params.creator_share_bps > 0 {
             let share = ((net_fee as u128).saturating_mul(market.params.creator_share_bps as u128)
                 / (constants::BPS_DENOM as u128)) as u64;
             if share > 0 {
-                emit!(CreatorFeeOwedEvent {
-                    market: market_key,
-                    creator: market_creator,
-                    amount_quote_lots: share,
-                });
+                let accrue = share.min(available_surplus);
+                match find_fee_accrual(ctx.remaining_accounts, ctx.program_id, &market_creator) {
+                    Some(ai) if accrue > 0 => {
+                        accrue_to_fee_account(ai, accrue)?;
+                        available_surplus -= accrue;
+                        fee_accrued_this_fill = fee_accrued_this_fill.saturating_add(accrue);
+                        emit!(FeeShareAccruedEvent {
+                            recipient: market_creator,
+                            kind: 2,
+                            amount_quote_lots: accrue,
+                        });
+                    }
+                    _ => emit!(CreatorFeeOwedEvent {
+                        market: market_key,
+                        creator: market_creator,
+                        amount_quote_lots: share,
+                    }),
+                }
             }
+        }
+
+        // The creator leg's final `available_surplus` decrement is intentionally
+        // symmetric with the other two legs but isn't read again — pin it.
+        let _ = available_surplus;
+
+        // Record the fill's total on-chain accrual as a vault liability
+        // (`verify_protocol_solvency` requires the vault to cover it). One
+        // mutable borrow after the three blocks.
+        if fee_accrued_this_fill > 0 {
+            let f = &mut ctx.accounts.insurance_fund;
+            f.total_fee_accrued_lots = f
+                .total_fee_accrued_lots
+                .checked_add(fee_accrued_this_fill)
+                .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         }
 
         // ── Trading-rewards / points emit ────────────────────────────
@@ -13608,15 +13754,23 @@ pub mod flash_book {
         let vault_amount = ctx.accounts.quote_vault.amount;
         let insurance_bal = ctx.accounts.insurance_fund.balance_quote_lots;
         let flp_capital = ctx.accounts.flp_exposure.total_capital_quote_lots;
+        // 2.3: unclaimed referrer/builder/creator fee shares are a vault
+        // liability — fold them into the required-backing term so the solvency
+        // floor becomes `vault >= insurance + flp + fee_accrued`.
+        let fee_accrued = ctx.accounts.insurance_fund.total_fee_accrued_lots;
+        let backing_required = flp_capital
+            .checked_add(fee_accrued)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
 
         // P-SOLV-4 (protocol-owned buckets): Kani-proven solvency arithmetic —
-        // `solvent` iff vault covers insurance + FLP capital, and when solvent the
-        // vault accounts exactly to insurance + FLP + surplus (no value invented).
+        // `solvent` iff vault covers insurance + (FLP capital + accrued fee
+        // shares), and when solvent the vault accounts exactly to insurance +
+        // backing + surplus (no value invented).
         let (solvent, surplus) =
-            matcher::insurance::assess_solvency(vault_amount, insurance_bal, flp_capital)
+            matcher::insurance::assess_solvency(vault_amount, insurance_bal, backing_required)
                 .map_err(|_| error!(FlashBookError::ArithmeticOverflow))?;
         let minimum_required = insurance_bal
-            .checked_add(flp_capital)
+            .checked_add(backing_required)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
 
         emit!(ProtocolSolvencyCheckedEvent {
@@ -16089,6 +16243,63 @@ pub struct WithdrawInsuranceFund<'info> {
         associated_token::authority = authority,
     )]
     pub authority_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(mut, address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+#[instruction(recipient: Pubkey)]
+pub struct InitFeeAccrual<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        init,
+        payer = payer,
+        space = FeeAccrualAccount::space(),
+        seeds = [FeeAccrualAccount::SEED, recipient.as_ref()],
+        bump,
+    )]
+    pub fee_accrual: Box<Account<'info, FeeAccrualAccount>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimFeeAccrual<'info> {
+    /// Only the recipient can drain their own accrual PDA.
+    pub recipient: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [FeeAccrualAccount::SEED, recipient.key().as_ref()],
+        bump = fee_accrual.bump,
+        constraint = fee_accrual.recipient == recipient.key() @ FlashBookError::Unauthorized,
+    )]
+    pub fee_accrual: Box<Account<'info, FeeAccrualAccount>>,
+
+    #[account(
+        mut,
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
+
+    /// Read-only: FLP capital is a solvency-floor term.
+    #[account(seeds = [FlpExposureAccount::SEED], bump)]
+    pub flp_exposure: Box<Account<'info, FlpExposureAccount>>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// Recipient's USDC ATA — destination for the claimed shares.
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = recipient,
+    )]
+    pub recipient_quote_ata: Account<'info, TokenAccount>,
 
     #[account(mut, address = insurance_fund.quote_vault)]
     pub quote_vault: Account<'info, TokenAccount>,
@@ -18821,6 +19032,26 @@ pub struct CreatorFeeOwedEvent {
     pub amount_quote_lots: u64,
 }
 
+/// 2.3: emitted when `apply_fill` accrues a fee share to an on-chain
+/// `FeeAccrualAccount` (the recipient opted in by supplying their PDA in
+/// `remaining_accounts`). Distinct from the `*FeeOwedEvent`s, which fire on the
+/// emit-only path; this event means the share was reserved on-chain and is
+/// trustlessly claimable via `claim_fee_accrual`.
+#[event]
+pub struct FeeShareAccruedEvent {
+    pub recipient: Pubkey,
+    /// `0` = referrer, `1` = builder, `2` = creator.
+    pub kind: u8,
+    pub amount_quote_lots: u64,
+}
+
+/// 2.3: emitted when a recipient drains their accrual via `claim_fee_accrual`.
+#[event]
+pub struct FeeAccrualClaimedEvent {
+    pub recipient: Pubkey,
+    pub amount_quote_lots: u64,
+}
+
 /// Per-fill trading-rewards eligibility event. Off-chain accrual
 /// computes per-trader points (notional × multipliers × time-windows).
 /// Points-program pattern — minimal on-chain footprint
@@ -20489,6 +20720,55 @@ fn find_fill_outbox<'a, 'info>(
         }
     }
     None
+}
+
+/// 2.3: PDA-scan `remaining_accounts` for a `recipient`'s canonical
+/// `FeeAccrualAccount`. Mirrors `find_fill_commitment` — matches by
+/// program-ownership + writability + the Anchor discriminator + the embedded
+/// `recipient` bytes, NOT by position, so accrual accounts are purely additive
+/// to the fill's account list (absent ⇒ the caller falls back to emit-only).
+/// The discriminator disambiguates from the (hand-rolled, discriminator-less)
+/// fill-commitment ring / outbox that also live in `remaining_accounts`.
+fn find_fee_accrual<'a, 'info>(
+    remaining: &'a [AccountInfo<'info>],
+    program_id: &Pubkey,
+    recipient: &Pubkey,
+) -> Option<&'a AccountInfo<'info>> {
+    let disc = <state::FeeAccrualAccount as anchor_lang::Discriminator>::DISCRIMINATOR;
+    let want = recipient.to_bytes();
+    for ai in remaining {
+        if ai.owner != program_id || !ai.is_writable {
+            continue;
+        }
+        if let Ok(data) = ai.try_borrow_data() {
+            if data.len() >= state::FeeAccrualAccount::ACCRUED_OFFSET + 8
+                && &data[..8] == disc
+                && data[8..40] == want
+            {
+                return Some(ai);
+            }
+        }
+    }
+    None
+}
+
+/// 2.3: add `add` quote lots to a `FeeAccrualAccount`'s `accrued_quote_lots`,
+/// writing the u64 in place at its fixed byte offset (checked-add, fail-closed on
+/// overflow). Byte-level write mirrors the hot-path ring/permission handling and
+/// avoids re-serializing an account that isn't a declared context account.
+fn accrue_to_fee_account(ai: &AccountInfo<'_>, add: u64) -> Result<()> {
+    let off = state::FeeAccrualAccount::ACCRUED_OFFSET;
+    let mut data = ai.try_borrow_mut_data()?;
+    require!(data.len() >= off + 8, FlashBookError::OutOfRange);
+    let bytes: [u8; 8] = data[off..off + 8]
+        .try_into()
+        .map_err(|_| error!(FlashBookError::OutOfRange))?;
+    let cur = u64::from_le_bytes(bytes);
+    let new = cur
+        .checked_add(add)
+        .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+    data[off..off + 8].copy_from_slice(&new.to_le_bytes());
+    Ok(())
 }
 
 /// Shared market-params validation — the immutability

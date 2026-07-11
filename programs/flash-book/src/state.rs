@@ -715,14 +715,54 @@ pub struct InsuranceFundAccount {
     /// PDA (which signs transfers out via known seeds). Holds all trader
     /// collateral + FLP capital.
     pub quote_vault: Pubkey,
+    /// 2.3: total referrer/builder/creator fee-share value accrued on-chain
+    /// but not yet claimed. A protocol LIABILITY against the shared vault —
+    /// `verify_protocol_solvency` requires `vault >= insurance + flp +
+    /// total_fee_accrued_lots`. Incremented (surplus-capped) when `apply_fill`
+    /// accrues a share to a `FeeAccrualAccount`; decremented when
+    /// `claim_fee_accrual` pays it out. Trailing field within `space()`
+    /// headroom (149 used, 200 allocated): pre-existing funds deserialize it
+    /// as 0 (no accrual yet, no migration).
+    pub total_fee_accrued_lots: u64,
 }
 
 impl InsuranceFundAccount {
     pub const SEED: &'static [u8] = b"insurance_fund";
     pub fn space() -> usize {
-        // 8 (disc) + 32 + 1 + 8 + 4 + 4 + 4 + 8 + 8 + 8 + 32 + 32 = 149.
+        // 8 (disc) + 32 + 1 + 8 + 4 + 4 + 4 + 8 + 8 + 8 + 32 + 32 + 8 = 157.
         // Round up generously.
         8 + 192
+    }
+}
+
+/// 2.3: per-recipient on-chain accrual of referrer / builder / creator fee
+/// shares. Created once (permissionlessly) by `init_fee_accrual`; credited
+/// (surplus-capped) on the `apply_fill` hot path when the recipient's canonical
+/// PDA is supplied in `remaining_accounts`; drained by the recipient via
+/// `claim_fee_accrual`. Absent from a fill's `remaining_accounts` ⇒ the share is
+/// only `emit!`-ed (exact pre-2.3 behaviour), so the account is purely opt-in.
+#[account]
+#[derive(Debug)]
+pub struct FeeAccrualAccount {
+    /// The referrer / builder / creator this accrual pays out to. Bound by the
+    /// PDA seeds, so a given recipient has exactly one canonical accrual PDA.
+    pub recipient: Pubkey,
+    /// Unclaimed accrued fee-share value, in quote lots. Backed 1:1 by the
+    /// shared quote vault (reserved out of protocol surplus at accrual time).
+    /// Byte offset 8 (disc) + 32 (recipient) = 40; the hot-path accrual writes
+    /// this field in place.
+    pub accrued_quote_lots: u64,
+    pub bump: u8,
+}
+
+impl FeeAccrualAccount {
+    pub const SEED: &'static [u8] = b"fee_accrual";
+    /// Byte offset of `accrued_quote_lots` within the account data (after the
+    /// 8-byte Anchor discriminator + 32-byte `recipient`).
+    pub const ACCRUED_OFFSET: usize = 8 + 32;
+    pub fn space() -> usize {
+        // 8 (disc) + 32 (recipient) + 8 (accrued) + 1 (bump) = 49. Round up.
+        8 + 64
     }
 }
 
