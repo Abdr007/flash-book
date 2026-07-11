@@ -11250,6 +11250,173 @@ async fn liquidate_position_v2_rejects_multi_leg_cross() {
     );
 }
 
+/// L-1 (audit 2026-07-10): a dormant/stale SIBLING leg must NOT abort the whole
+/// portfolio-liquidation walk. Pre-fix, a single unpriceable sibling reverted the
+/// instruction (MarkTooStale/OracleTooStale), so a genuinely-insolvent trader dodged
+/// liquidation of their other, freshly-priced legs. Post-fix the stale sibling is
+/// valued entry-neutral (mark = entry ⇒ 0 PnL, MM still charged) and the walk
+/// completes — a HEALTHY trader with one stale sibling now returns NotLiquidatable,
+/// NOT a stale-abort. (The execution leg stays strict; it is patched fresh here.)
+#[tokio::test]
+async fn liquidate_portfolio_v2_stale_sibling_does_not_abort_walk() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_a, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (market_b, _, _, _) = setup_additional_market(&mut ctx, &payer, 100_000).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    // Two cross legs ⇒ open_positions == 2. market_a = fresh execution leg; market_b = sibling.
+    let taker_pos_a = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_a,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+    let taker_pos_b = open_cross_position(
+        &mut ctx,
+        &payer,
+        market_b,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+    )
+    .await;
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    assert_eq!(ts.open_positions, 2, "taker is a multi-leg cross trader");
+
+    use solana_sdk::account::Account as SolAccount;
+    let clock: Clock = ctx.banks_client.get_sysvar().await.unwrap();
+    let patch_market = |ctx: &mut solana_program_test::ProgramTestContext,
+                        key: Pubkey,
+                        last_mark_slot: u64,
+                        published: u64,
+                        acc: SolAccount| {
+        let mut m: flash_book::state::MarketAccount =
+            flash_book::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+        m.last_mark_update_slot = last_mark_slot;
+        m.oracle_published_at_unix_seconds = published;
+        m.params.oracle_staleness_max_seconds = u32::MAX;
+        let mut nmd = Vec::new();
+        m.try_serialize(&mut nmd).unwrap();
+        nmd.resize(acc.data.len(), 0);
+        ctx.set_account(
+            &key,
+            &SolAccount {
+                lamports: acc.lamports,
+                data: nmd,
+                owner: acc.owner,
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            }
+            .into(),
+        );
+    };
+
+    // Execution leg (market_a) FRESH so its strict `?` passes.
+    let ma_acc = ctx
+        .banks_client
+        .get_account(market_a)
+        .await
+        .unwrap()
+        .unwrap();
+    patch_market(
+        &mut ctx,
+        market_a,
+        clock.slot,
+        clock.unix_timestamp.max(1) as u64,
+        SolAccount {
+            lamports: ma_acc.lamports,
+            data: ma_acc.data.clone(),
+            owner: ma_acc.owner,
+            executable: ma_acc.executable,
+            rent_epoch: ma_acc.rent_epoch,
+        },
+    );
+    // Sibling leg (market_b) DORMANT/STALE: mark stale (last_mark_update_slot == 0) with no
+    // fresh oracle (published == 0) ⇒ effective_health_mark(market_b) errors → fallback path.
+    let mb_acc = ctx
+        .banks_client
+        .get_account(market_b)
+        .await
+        .unwrap()
+        .unwrap();
+    patch_market(
+        &mut ctx,
+        market_b,
+        0,
+        0,
+        SolAccount {
+            lamports: mb_acc.lamports,
+            data: mb_acc.data.clone(),
+            owner: mb_acc.owner,
+            executable: mb_acc.executable,
+            rent_epoch: mb_acc.rent_epoch,
+        },
+    );
+
+    let liquidator = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &liquidator.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let (market_book_a, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_a.as_ref()]);
+
+    // Portfolio path: market_a execution + (market_b, taker_pos_b) sole sibling pair.
+    let ix = build_ix(
+        flash_book::instruction::LiquidatePortfolioV2 {},
+        vec![
+            AccountMeta::new(liquidator.pubkey(), true),
+            AccountMeta::new_readonly(market_a, false),
+            AccountMeta::new(market_book_a, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(taker_pos_a, false),
+            AccountMeta::new_readonly(market_b, false),
+            AccountMeta::new_readonly(taker_pos_b, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&liquidator.pubkey()),
+            &[&liquidator],
+            bh,
+        ))
+        .await;
+    let dbg = format!("{result:?}");
+    // The stale sibling must NOT abort the walk (pre-fix: MarkTooStale 7804 / OracleTooStale 7800).
+    assert!(
+        !dbg.contains("Custom(7804)") && !dbg.contains("Custom(7800)"),
+        "stale sibling must not abort the portfolio walk, got: {dbg}"
+    );
+    // The completed walk must find the healthy trader NotLiquidatable (7403).
+    assert!(
+        dbg.contains("Custom(7403)"),
+        "completed walk on a healthy trader must return NotLiquidatable(7403), got: {dbg}"
+    );
+}
+
 /// The same guard on the ADL path: a multi-leg CROSS underwater trader cannot
 /// be auto-deleveraged one leg at a time — the single-leg eligibility check
 /// excludes their other legs and can wrongfully ADL a portfolio-healthy trader.
