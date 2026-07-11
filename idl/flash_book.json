@@ -4132,6 +4132,9 @@
           "name": "market"
         },
         {
+          "name": "trader_state"
+        },
+        {
           "name": "market_book",
           "writable": true,
           "pda": {
@@ -4242,6 +4245,13 @@
         {
           "name": "twap_order",
           "writable": true
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": []
@@ -9242,6 +9252,10 @@
           "name": "trader_state"
         },
         {
+          "name": "position",
+          "optional": true
+        },
+        {
           "name": "market"
         },
         {
@@ -9356,6 +9370,10 @@
         },
         {
           "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         },
         {
           "name": "market"
@@ -10900,6 +10918,13 @@
         {
           "name": "iceberg_order",
           "writable": true
+        },
+        {
+          "name": "trader_state"
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": []
@@ -11090,6 +11115,105 @@
         }
       ],
       "args": []
+    },
+    {
+      "name": "retire_liquidation_order_v2",
+      "docs": [
+        "H-B (security re-audit 2026-07-10): keeper/authority retirement of a stranded",
+        "liquidation-close order. The OWNER cannot cancel an `order_type == 3` order",
+        "(`cancel_v2_core` / `cancel_all_v2` — that closes the liquidation-dodge), so a",
+        "legitimate path must exist to clear one that never filled (e.g. the position",
+        "recovered or was closed by other means, leaving the synthetic close resting).",
+        "Gated to the market `sequencer` (the settlement keeper that drives liquidation)",
+        "or the market `authority` — NEVER the owner. ONLY `order_type == 3` is retirable",
+        "here: this is not a general keeper-cancel bypass. Reuses the same book-removal",
+        "plumbing as `cancel_v2_core`."
+      ],
+      "discriminator": [
+        144,
+        37,
+        178,
+        37,
+        0,
+        138,
+        73,
+        69
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "Mut because we remove a node + update header indices + free-list."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "side",
+          "type": "u8"
+        },
+        {
+          "name": "order_id",
+          "type": "u64"
+        }
+      ]
     },
     {
       "name": "revoke_session_token",
@@ -14621,6 +14745,10 @@
               }
             ]
           }
+        },
+        {
+          "name": "position",
+          "optional": true
         }
       ],
       "args": [
@@ -19039,6 +19167,11 @@
       "code": 8324,
       "name": "ReduceOnlyNoPosition",
       "msg": "Reduce-only order has no opposing position to reduce (absent, foreign, flat, or same-side)"
+    },
+    {
+      "code": 8325,
+      "name": "LiquidationOrderNotCancelable",
+      "msg": "Liquidation-close order (order_type 3) cannot be cancelled by its owner — only a fill or keeper/authority retirement clears it"
     }
   ],
   "types": [

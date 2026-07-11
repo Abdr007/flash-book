@@ -4915,6 +4915,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new_readonly(m_main, false),
                 AccountMeta::new(book_pda, false),
                 AccountMeta::new(trig, false),
                 AccountMeta::new_readonly(m_sub1_pos, false),
@@ -8338,6 +8339,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new_readonly(m_state, false),
                 AccountMeta::new(book_pda, false),
                 AccountMeta::new(trig, false),
                 AccountMeta::new_readonly(m_pos, false),
