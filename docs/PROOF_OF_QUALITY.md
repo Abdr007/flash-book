@@ -22,18 +22,23 @@ as the code: where a claim is not yet fully earned, it says so.
 ## Headline (honest)
 
 The **permanent** engineering value — proofs, verified internals, adversarial
-audit — is real and reproducible today. The **launch gate is not yet open**: a
-2026-07-10 adversarial re-audit (9 surfaces, 2 waves) confirmed **two HIGH**
-bad-debt vectors — (1) the v3 injection + vault maker-open paths skip the intake
-initial-margin gate (roadmap 4.8); (2) a liquidatee can cancel their own injected
-liquidation-close order to dodge liquidation — plus a MED withdraw-pricing gap
-(M-2), all of which **must** close before launch (no defer lane). Both HIGHs are
-bad-debt-adjacent, fail-safe-fixable, and devnet-gated; neither is a direct-theft
-or CRITICAL. So the honest current state is **"9.5-capable, with a named and
-specified fix queue"** — not "9.5 shipped." That distinction *is* the
-architecture-honesty the venue is built on. Note both HIGHs mint bad debt only
-under adverse price paths (not on demand), and ADL remains the bankruptcy backstop
-for the liquidation-cancel vector.
+audit — is real and reproducible today. A 2026-07-10 adversarial re-audit (9
+surfaces, 2 waves) confirmed **two HIGH** bad-debt vectors — (1) the v3 injection +
+vault maker-open paths skipped the intake initial-margin gate (roadmap 4.8); (2) a
+liquidatee could cancel their own injected liquidation-close order to dodge
+liquidation — plus a MED withdraw-pricing gap (M-2). **All three are now fixed and
+merged (PR #300, `3998b9bd`, all CI green), and the two HIGHs are DEVNET-ACCEPTED**
+on a fresh throwaway program whose on-chain bytes were hash-verified against the
+built artifact (`er-acceptance/CRITICAL_PATH_FINDINGS.md`; 8 PASS / 0 FAIL /
+5 honest-UNDRIVEN). So the audit's **launch-gate HIGH queue is closed**; the honest
+current state is **"9.5-capable, HIGH queue closed + devnet-accepted, with a
+MED/LOW tail and three vendor waits remaining"** — still not "9.5 shipped" until the
+Certora whole-program run, the external audit signature, and MagicBlock
+owner-recovery close. M-2's code shipped in the same PR (withdraw/sweep valuation
+routed through the worse-of `effective_health_mark`); its clean accept→reject devnet
+flip is not demonstrable on realistic params (stress margin ≈ position max-loss
+leaves no collateral window), so it stays covered by the in-tree suite + the
+reconciled source rather than a live row — reported honestly, not claimed.
 
 ## Protocol dimensions → evidence
 
@@ -82,18 +87,19 @@ for the liquidation-cancel vector.
   findings**; ER/cross-domain, v3-vaults, order-injection, economic/DoS — findings
   triaged in `docs/SECURITY_AUDIT_2026-07-10.md` (+ wave-2 companion).
 - **Deduction (honest):** this is the axis the scorecard scores 10 as a *target*.
-  It is not 10 **today**: (a) the confirmed HIGH (4.8) is open; (b) the keccak
-  collision assumption, bounded ring models, and Lean-model↔Rust fidelity are
-  honest assumptions, not proofs; (c) Certora's whole-program run is pending. The
-  10 is *earned* when the fix queue + Certora + external audit close.
+  It is not 10 **today**: (a) the two confirmed HIGHs (4.8 intake gate + liq-cancel)
+  are now CLOSED + devnet-accepted (PR #300), but the keccak collision assumption,
+  bounded ring models, and Lean-model↔Rust fidelity remain honest assumptions, not
+  proofs; (b) Certora's whole-program run is pending; (c) a non-HIGH MED/LOW fix tail
+  remains. The 10 is *earned* when that tail + Certora + external audit close.
 
 ### Order types / features
 - Builder codes, 1–255 sub-accounts, anti-griefing referrals (roadmap 5.5, DONE),
   session keys, and the agent-native SDK — `AGENTS.md` / `llms.txt` /
   `docs/GOTCHAS.md` (#278, roadmap 5.6).
 - **Deduction (honest):** the v3 injection + vault maker-open intake-margin gap
-  (4.8, **confirmed HIGH**) must be fixed; no on-chain copy-vaults; curated (not
-  permissionless) listing at launch.
+  (4.8, the **confirmed HIGH**) is now **CLOSED + devnet-accepted** (PR #300); still
+  no on-chain copy-vaults; curated (not permissionless) listing at launch.
 
 ### Architecture honesty
 - ER trust boundary — a fabricated fill **cannot settle** (ring-authenticated),
@@ -108,10 +114,10 @@ for the liquidation-cancel vector.
 
 | Blocker | Evidence to close | Owner |
 |---|---|---|
-| **HIGH — 4.8** intake-margin gate on v3 injection (trigger/TWAP/iceberg/bracket) + `vault_place_order_v3` | shared `assert_injection_intake` on all 6 opening-maker paths (exempt reduce-only) + host proofs + devnet acceptance | eng (devnet cycle) |
-| **HIGH — liq-cancel** liquidatee can cancel their injected `order_type==3` close order (`cancel_v2_core`/`cancel_all_v2`) to dodge liquidation | block owner-cancel/modify of `order_type==3` + a keeper/authority retirement path (or reduce atomically at injection) + devnet acceptance. ADL remains the bankruptcy backstop | eng (devnet cycle) |
-| **MED — M-2** withdraw/sweep raw-mark pricing | route `partial_withdraw_core` + `sweep_collateral` through `effective_health_mark` + devnet stale-market acceptance | eng (devnet cycle) |
-| MED/LOW — ER attestation-lag, v3 vault er-check, fee_tiers binding, dormant-sibling liq | per `docs/SECURITY_AUDIT_2026-07-10.md` fix queue | eng (devnet cycle) |
+| ✅ **CLOSED — HIGH 4.8** intake-margin gate on v3 injection + `vault_place_order_v3` | DONE — shared `gate_injection_open` on all 6 opening-maker paths (reduce-only exempt); **devnet-accepted** (3 independent paths reject `InsufficientCollateral` + exemption accepts). PR #300 `3998b9bd`, all CI green | eng ✓ |
+| ✅ **CLOSED — HIGH liq-cancel** owner-cancel of the injected `order_type==3` close order | DONE — owner-cancel blocked (`LiquidationOrderNotCancelable`) + `retire_liquidation_order_v2` keeper/authority path; **devnet-accepted** by a REAL liquidation (order_type==3 injected → owner cancel rejected → authority retire accepted). PR #300 | eng ✓ |
+| ✅ **CLOSED — MED M-2** withdraw/sweep raw-mark pricing | DONE — routed through the worse-of `effective_health_mark`. PR #300. Clean devnet flip N/A on realistic params (stress-IM ≈ max-loss → no collateral window); covered by in-tree suite + source | eng ✓ |
+| MED/LOW — ER attestation-lag, `record_flp_fill_v3` trust, funding snapshot, dormant-sibling liq | per `docs/SECURITY_AUDIT_2026-07-10*.md` fix queue (next devnet cycle; none HIGH) | eng (devnet cycle) |
 | Certora whole-program run | VERIFICATION SUCCESSFUL in CI (licensed) | vendor |
 | External audit signature | firm's report | vendor |
 | MagicBlock owner-recovery | executable force-undelegate | vendor |
@@ -119,7 +125,11 @@ for the liquidation-cancel vector.
 ## Verdict (blunt, honest)
 
 The engineering artifact is world-class and its core is *proven*, not asserted —
-that is permanent and hard to copy. But it is **not** launch-gate-green today: a
-confirmed HIGH and a MED sit in a named, specified, devnet-gated fix queue, and
-three honest vendor waits remain. Shipping the fix queue on a live-verified cycle
-closes the gate; nothing here is faked to look closed.
+that is permanent and hard to copy. The audit's **two HIGH launch-blockers and the
+MED withdraw-pricing gap are now closed, merged (PR #300), and the HIGHs are
+devnet-accepted** against hash-verified on-chain bytes. What remains before
+"9.5 shipped" is a **non-HIGH MED/LOW fix tail** (ER attestation-lag,
+`record_flp_fill_v3` trust, funding snapshot, dormant-sibling liq) and **three
+honest vendor waits** (Certora whole-program run, external audit signature,
+MagicBlock owner-recovery). The gate is no longer HIGH-blocked; nothing here is
+faked to look closed, and the residuals are named rather than buried.
