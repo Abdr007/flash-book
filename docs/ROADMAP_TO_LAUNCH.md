@@ -89,7 +89,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 
 | Item | Scope | Owner | Status |
 |---|---|---|---|
-| 5.1 | FLP on-book AMM tuning + quoter spec (Avellaneda-Stoikov) | eng/quant | DONE (engine) → STARTABLE (devnet param sweep + spec) |
+| 5.1 | FLP on-book AMM tuning + quoter spec (Avellaneda-Stoikov) | eng/quant | **DONE (engine + spec)** — `docs/FLP_QUOTER_SPEC.md`: the full inventory-skew reservation price (`skew = −clamp(λ·inv/BPS)`, ±100% clamp), the 5-factor per-level spread (base + α·vpin + β·utilization + γ·|oi_imb| + κ·depth + δ·vol, capped 50%), tick-aligned symmetric quotes, the Kani-proven inventory-cap backstop (never wedges both sides), and the authenticity band — all grounded in `flp_quoter.rs`. **Deferred:** the live per-market parameter *sweep* (empirical fill-quality vs. inventory-variance tuning) needs live MagicBlock-ER flow, so it's ER-endpoint-gated, not on-chain code. |
 | 5.2 | segregate MM vault from insurance backstop (prove isolation) | eng | **DONE** — Kani `bad_debt_coverage_is_insurance_isolated_and_bounded` (VERIFICATION SUCCESSFUL) proves the waterfall debits insurance by a function of only its own balance + shortfall (no FLP input, no underflow), plus `solvent_iff_vault_covers_buckets` proves insurance/FLP are separate additive buckets |
 | **5.3** | **off-chain copy-trading** (snapshot-diff mirror) | eng | **STARTABLE** |
 | 5.4 | activate a real paying maker-rebate schedule (negative-fee tier) | eng | STARTABLE (code exists, disabled) |
