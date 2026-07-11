@@ -81,7 +81,7 @@ divisors)**, both CI-gated. See `docs/FORMAL_VERIFICATION.md`.
 | 4.3 | scale/ladder USER order type (FLP quoter ladder exists; expose a user version) | eng | STARTABLE (program change) |
 | 4.4 | published margin-tier table (leverage-steps-down-with-notional) + enable coded-but-inactive OI-crowding surcharge | eng | STARTABLE (config/doc + program) |
 | 4.5 | tranched liquidation (positions above a notional threshold liquidate in tranches) | eng | STARTABLE (program change) |
-| 4.6 | user reduce-only flag on the v2 place path (currently rejected at intake) | eng | STARTABLE (program change) |
+| 4.6 | user reduce-only flag on the v2 place path | eng | **DONE (PR #309, all CI green).** The v2 place paths (`place_limit_v2_core`, `place_taker_order_v2`) already honored `reduce_only` (resting flag + inflight-aware maker clamp re-caps to reducible size at fill ⇒ never opens/flips); PR #309 completes the v2 order lifecycle by honoring it on `modify_order_v2` too (removed the stale H4 reject). Test `modify_order_v2_accepts_reduce_only_flag`; safety covered by `v1_reduce_only_trigger_two_takers_cannot_flip_position`. Residual: sibling reject in `vault_place_order_v3` (v3, separate) stays. |
 | **4.7** | **robust-median mark** (median for funding/display; worse-of for liquidation) | eng | **DONE (PR #305, `d93f9fa`, all CI green)** — `crank_funding` funds off `median{mark, oracle, on-book mid}` (optional book, fail-closed → mark fallback), emitted as `FundingCrankedEvent.funding_mark_ticks`; liquidation UNTOUCHED (strict worse-of, never the median). Pure `robust_median_mark` is Kani-proven (`robust_median_mark_is_bounded_by_its_sources`) + unit-tested; end-to-end test `crank_funding_uses_robust_median_mark_from_the_book`. The funding-TWAP MED is the natural companion increment here. |
 | 4.8 | apply intake IM gate to v3 injection paths (TWAP/iceberg/bracket) | eng | **CLOSED — CONFIRMED HIGH FIXED (PR #300, `3998b9bd`, all CI green)** and **DEVNET-ACCEPTED**. Shared `assert_injection_intake` (via `gate_injection_open`) now gates all 6 opening-maker paths (`execute_trigger_order_v3`, `execute_twap_slice_v3`, `place_iceberg_order_v3`, `replenish_iceberg_v3`, `place_bracket_order_v3`, `vault_place_order_v3`), exempt reduce-only. Proven live on a fresh throwaway devnet program (`BRtnEAZ6…`, on-chain bytes hash-verified): iceberg/bracket/vault opens from a 0-collateral state reject `InsufficientCollateral` on 3 independent paths + reduce-only exemption accepts (`er-acceptance/critical_path_acceptance.mjs`; `CRITICAL_PATH_FINDINGS.md`). Original finding: `docs/SECURITY_AUDIT_2026-07-10-wave2.md` H-A |
 
@@ -196,8 +196,9 @@ sequencer-trust/latent item with a **named fix and the milestone it attaches to*
 Every item now has real scope (no more title-only). The remainder splits into:
 
 - **Program changes** (need a devnet deploy + live-re-verify cycle each): 2.1–2.3, 2.7,
-  3.3, 4.1–4.6. (**4.8 CLOSED** + devnet-accepted, PR #300; the H-B cancel-lock + M-2
-  worse-of shipped in the same PR — the audit's two HIGHs are no longer open.)
+  3.3, 4.1–4.5. (**4.8 CLOSED** + devnet-accepted, PR #300; the H-B cancel-lock + M-2
+  worse-of shipped in the same PR — the audit's two HIGHs are no longer open. **4.6 DONE**
+  PR #309; **4.7 DONE** PR #305 + funding-TWAP PR #307.)
 - **Hard proofs** (Lean / real-symbol): 1.3, 1.5, 1.7. (**1.2 DONE** — real-symbol Kani `assess_margin_single_market_frame_stable`.)
 - **Multi-week builds**: 1.1 Certora integration, 3.1 percolator per-domain credit, and
   the three big builds (copy-vaults, HIP-3 permissionless deploy, decentralized-sequencer
