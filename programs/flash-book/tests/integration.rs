@@ -198,6 +198,8 @@ fn default_params() -> MarketParams {
         mark_settle_min_slots: 0,
         drift_alert_bps: 0,
         min_notional_quote_lots: 0, // 4.1: 0 = anti-dust floor disabled in tests
+        oi_mmr_slope_bps_per_million_lots: 0, // 4.4: 0 = OI-crowding surcharge off
+        oi_mmr_max_extra_bps: 0,
     }
 }
 
