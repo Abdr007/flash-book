@@ -7255,6 +7255,372 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
     assert_eq!(market_after.last_settlement_seq, 2);
 }
 
+/// ── G-1 residual: an UNDELEGATED-L1 resting order's IM is UNRESERVED, yet the
+/// resulting undercollateralized fill's loss is BOUNDED ──────────────────────
+///
+/// This test DOCUMENTS AND PINS a KNOWN, ACCEPTED residual (call it "G-1") — it
+/// is NOT a bug to be fixed. A sound-and-complete on-chain reservation of a
+/// resting L1 order's initial margin is architecturally precluded: the L1
+/// program never observes the sequencer's live book, so the strict
+/// `withdraw_collateral` gate can only reserve margin for (a) FILLED positions
+/// and (b) ER-attested `er_reserved` margin. An order resting purely on the L1
+/// book — i.e. on an UNDELEGATED market (`book_delegated == false`, which is
+/// what `setup_market` produces) — reserves NOTHING. The design accepts this
+/// because the downside is BOUNDED: an undercollateralized fill's loss is drawn
+/// from the insurance fund / socialized via ADL and can never mint unbacked
+/// value. That bound is Kani-proven — see
+/// `matcher/insurance.rs::bad_debt_coverage_is_insurance_isolated_and_bounded`
+/// and the `cross_loss_shortfall_*` proofs in `lib.rs`. This test drives the
+/// real on-chain path end to end so the residual (and its bound) stay pinned:
+/// if a future change either starts reserving the resting IM (closing the gap)
+/// or lets the loss exceed insurance/socialization (breaking the bound), it
+/// must consciously update this test.
+///
+/// Part 1 — THE RESIDUAL (asserted rigorously):
+///   A trader deposits enough to satisfy the intake IM gate, rests an L1 limit
+///   order (which requires IM = size·price·tick·im_bps), then WITHDRAWS every
+///   lot of collateral back out through the strict `withdraw_collateral`. The
+///   withdraw SUCCEEDS and leaves collateral == 0 — proving the resting order's
+///   IM is NOT reserved by the withdraw gate (the gap). `withdraw_collateral`
+///   only blocks on `open_positions != 0` (a resting order is not a position)
+///   and `er_active != 0` (no ER attestation exists on an undelegated market).
+///
+/// Part 2 — THE BOUND (asserted):
+///   The sequencer then settles that resting order into a position via
+///   `apply_fill` (the victim goes long with ZERO backing — the residual made
+///   real), and an adverse second `apply_fill` closes it at a loss that dwarfs
+///   the victim's collateral. We assert the loss is BOUNDED, never an unbacked
+///   mint:
+///     • the loser's collateral floors at 0 (no wrap / underflow),
+///     • the loss is drawn from the insurance fund (insurance decreases, by at
+///       most its prior balance — the cap itself is Kani-proven), and
+///     • total system value (Σ collateral + insurance) does NOT increase — the
+///       winner's credit is backed 1:1 by the insurance draw, no value minted.
+#[tokio::test]
+async fn residual_undelegated_l1_resting_order_unreserved_but_loss_bounded() {
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    // UNDELEGATED market (setup_market leaves `book_delegated == false`), so the
+    // `if market.book_delegated { require er_margin_ready }` placement guard is
+    // skipped and the order rests on the L1 book.
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Zero all fee/rebate params so the money-path assertions isolate PnL +
+    // bad-debt routing (no fee/rebate leaking value into/out of the
+    // collateral+insurance system). These are real per-market fields — a
+    // legitimate test config, same technique as `zero_initial_margin` /
+    // `disarm_fill_commitment`. `initial_margin_ratio_bps` is LEFT nonzero
+    // (250) so the intake IM gate the residual is about stays live.
+    {
+        let acc = ctx
+            .banks_client
+            .get_account(market_pda)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut m =
+            flash_book::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+        m.params.taker_fee_bps = 0;
+        m.params.maker_rebate_bps = 0;
+        m.params.toxicity_tax_max_bps = 0;
+        let mut data = Vec::new();
+        m.try_serialize(&mut data).unwrap();
+        data.resize(acc.data.len(), 0);
+        ctx.set_account(
+            &market_pda,
+            &SolAccount {
+                lamports: acc.lamports,
+                data,
+                owner: acc.owner,
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            }
+            .into(),
+        );
+    }
+
+    // Init the v2 book so an L1 limit order can rest.
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // ── Part 1: THE RESIDUAL ────────────────────────────────────────────────
+    // The victim rests a BUY 10 @ 100_000. Intake IM = 10·100_000·1·(250/10_000)
+    // = 25_000. Deposit 30_000 (clears the intake IM gate), rest the order, then
+    // withdraw all 30_000 back out via the strict path.
+    let victim = Keypair::new();
+    let victim_state = setup_trader(&mut ctx, &payer, &victim, 30_000, &protocol).await;
+
+    let place_ix = build_ix(
+        flash_book::instruction::PlaceLimitOrderV2 {
+            side: 0, // buy / long
+            size_lots: 10,
+            limit_ticks: 100_000,
+            flags: 0,
+            expires_at_slot: 0,
+            sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(victim.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(book_pda, false),
+            AccountMeta::new_readonly(victim_state, false),
+            AccountMeta::new_readonly(program_id(), false), // None position sentinel
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place_ix],
+            Some(&payer.pubkey()),
+            &[&payer, &victim],
+            bh,
+        ))
+        .await
+        .expect("resting the L1 limit order must succeed (deposit clears intake IM)");
+
+    // Withdraw the ENTIRE collateral back out. The resting order needs 25_000 IM,
+    // yet the strict gate reserves nothing for it — so this SUCCEEDS. THIS IS THE
+    // RESIDUAL: a resting L1 order's IM is not reserved by the withdraw gate.
+    let victim_ata = ata_for(&victim.pubkey(), &protocol.quote_mint);
+    let withdraw_ix = build_ix(
+        flash_book::instruction::WithdrawCollateral {
+            amount_quote_lots: 30_000,
+        },
+        vec![
+            AccountMeta::new_readonly(victim.pubkey(), true),
+            AccountMeta::new(victim_state, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.quote_mint, false),
+            AccountMeta::new(victim_ata, false),
+            AccountMeta::new(protocol.quote_vault, false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let withdraw_res = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[withdraw_ix],
+            Some(&victim.pubkey()),
+            &[&victim],
+            bh,
+        ))
+        .await;
+    assert!(
+        withdraw_res.is_ok(),
+        "RESIDUAL: a resting L1 order's IM is NOT reserved — the full withdraw must succeed"
+    );
+    let vs: TraderStateAccount = fetch(&mut ctx.banks_client, victim_state).await;
+    assert_eq!(
+        vs.collateral_quote_lots, 0,
+        "victim withdrew ALL collateral while a live resting order needed 25_000 IM (the gap)"
+    );
+
+    // ── Part 2: THE BOUND ───────────────────────────────────────────────────
+    // A funded counterparty for the settled fill.
+    let cpty = Keypair::new();
+    let cpty_state = setup_trader(&mut ctx, &payer, &cpty, 100_000, &protocol).await;
+
+    let (victim_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        victim_state.as_ref(),
+    ]);
+    let (cpty_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        cpty_state.as_ref(),
+    ]);
+    let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // Seed insurance with MORE than the coming loss so the bad-debt draw is
+    // fully backed (production: this balance accrues from fees). A fully-backed
+    // draw lets us assert EXACT conservation below; the CAP (draw ≤ balance,
+    // never an unbacked insurance mint) is the separately Kani-proven property.
+    {
+        let acc = ctx
+            .banks_client
+            .get_account(insurance_fund_pda)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut f = InsuranceFundAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+        f.balance_quote_lots = 1_000_000;
+        let mut data = Vec::new();
+        f.try_serialize(&mut data).unwrap();
+        data.resize(acc.data.len(), 0);
+        ctx.set_account(
+            &insurance_fund_pda,
+            &SolAccount {
+                lamports: acc.lamports,
+                data,
+                owner: acc.owner,
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            }
+            .into(),
+        );
+    }
+
+    // apply_fill account layout mirrors `apply_fill_opens_both_positions_and_moves_oi`.
+    let apply = |taker_state: Pubkey,
+                 maker_state: Pubkey,
+                 taker_pos: Pubkey,
+                 maker_pos: Pubkey,
+                 taker_side: u8,
+                 price: u64,
+                 seq: u64| {
+        build_ix(
+            flash_book::instruction::ApplyFill {
+                size_lots: 10,
+                price_ticks: price,
+                taker_side,
+                taker_was_jit: false,
+                taker_sub_index: 0,
+                maker_sub_index: 0,
+                fill_seq: seq,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true), // sequencer (market.sequencer == payer)
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(insurance_fund_pda, false),
+                AccountMeta::new(taker_state, false),
+                AccountMeta::new(maker_state, false),
+                AccountMeta::new(taker_pos, false),
+                AccountMeta::new(maker_pos, false),
+                AccountMeta::new_readonly(program_id(), false), // None fee-tiers
+                AccountMeta::new_readonly(program_id(), false), // None market_haircut
+                AccountMeta::new_readonly(program_id(), false), // None taker_position_haircut
+                AccountMeta::new_readonly(program_id(), false), // None maker_position_haircut
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        )
+    };
+
+    // Fill 1 — the sequencer settles the victim's resting BUY: the victim
+    // (maker) goes LONG 10 @ 100_000 with ZERO backing (the unreserved residual
+    // made real), the counterparty (taker, taker_side=1/sell) goes SHORT.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[apply(
+                cpty_state,
+                victim_state,
+                cpty_pos,
+                victim_pos,
+                1,
+                100_000,
+                1,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .expect("settling the resting order into a position must succeed (no backing required)");
+
+    let vp: flash_book::state::PositionAccount = fetch(&mut ctx.banks_client, victim_pos).await;
+    assert_eq!(vp.side, 0, "victim is long from the settled resting order");
+    assert_eq!(vp.size_lots, 10);
+    assert_eq!(vp.entry_price_ticks, 100_000);
+
+    // Snapshot total system value BEFORE the adverse close.
+    let victim_before: TraderStateAccount = fetch(&mut ctx.banks_client, victim_state).await;
+    let cpty_before: TraderStateAccount = fetch(&mut ctx.banks_client, cpty_state).await;
+    let if_before: InsuranceFundAccount = fetch(&mut ctx.banks_client, insurance_fund_pda).await;
+    let total_before = victim_before.collateral_quote_lots as u128
+        + cpty_before.collateral_quote_lots as u128
+        + if_before.balance_quote_lots as u128;
+    assert_eq!(
+        victim_before.collateral_quote_lots, 0,
+        "victim entered the fill with 0 backing"
+    );
+
+    // Fill 2 — adverse close at 50_000: the victim (maker, sells) realizes a
+    // −500_000 loss it cannot fund; the counterparty (taker, taker_side=0/buy)
+    // realizes +500_000. size·Δticks·tick = 10·(100_000−50_000)·1 = 500_000.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let close_res = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[apply(
+                cpty_state,
+                victim_state,
+                cpty_pos,
+                victim_pos,
+                0,
+                50_000,
+                2,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await;
+    assert!(
+        close_res.is_ok(),
+        "settling an underwater position must NOT revert — the loss is absorbed, not wedged"
+    );
+
+    let victim_after: TraderStateAccount = fetch(&mut ctx.banks_client, victim_state).await;
+    let cpty_after: TraderStateAccount = fetch(&mut ctx.banks_client, cpty_state).await;
+    let if_after: InsuranceFundAccount = fetch(&mut ctx.banks_client, insurance_fund_pda).await;
+    let total_after = victim_after.collateral_quote_lots as u128
+        + cpty_after.collateral_quote_lots as u128
+        + if_after.balance_quote_lots as u128;
+
+    // BOUND 1 — the loser floors at 0 (no wrap / underflow into a phantom balance).
+    assert_eq!(
+        victim_after.collateral_quote_lots, 0,
+        "loser collateral floors at 0 (no wrap)"
+    );
+
+    // BOUND 2 — the loss is drawn from insurance (the backstop). Insurance
+    // decreased by exactly the socialized 500_000 loss (≤ its prior balance).
+    assert!(
+        if_after.balance_quote_lots < if_before.balance_quote_lots,
+        "insurance absorbed the undercollateralized loss"
+    );
+    assert_eq!(
+        if_before.balance_quote_lots - if_after.balance_quote_lots,
+        500_000,
+        "insurance decreased by exactly the socialized loss (drawn, capped at balance)"
+    );
+
+    // BOUND 3 — the winner's credit is backed 1:1 by the insurance draw: total
+    // system value did NOT increase. No value minted from nothing.
+    assert_eq!(
+        cpty_after.collateral_quote_lots - cpty_before.collateral_quote_lots,
+        500_000,
+        "winner credited exactly the counterparty's realized gain"
+    );
+    assert_eq!(
+        total_after, total_before,
+        "conservation: Σ collateral + insurance is unchanged (no unbacked mint)"
+    );
+}
+
 /// A signer that is NOT the market's configured `sequencer` cannot settle
 /// a fill — even when fully funded so the `init_if_needed` position rent
 /// is payable. Without the sequencer gate any signer could fabricate fills
