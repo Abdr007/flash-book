@@ -16912,6 +16912,7 @@ async fn init_market_book_for(
 /// Drive a single settled `apply_fill`: taker buys `size_lots` @ `price_ticks`
 /// from maker. Both trader states must already exist & be funded. Returns the
 /// two position PDAs (taker, maker).
+#[allow(clippy::too_many_arguments)]
 async fn apply_one_fill(
     ctx: &mut solana_program_test::ProgramTestContext,
     payer: &Keypair,
