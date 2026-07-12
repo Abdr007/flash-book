@@ -290,7 +290,7 @@ and the sub-account sections of `docs/ARCHITECTURE.md` / `docs/MARGIN_MATH.md` f
 ### Documentation
 
 - `README.md` rewritten to reflect on-chain reality (continuous CLOB,
-  not FBA — the FBA / commit-reveal pieces are in the TypeScript
+  not batch auction — the batch auction / commit-reveal pieces are in the TypeScript
   reference simulator only).
 - `docs/COMPARISON.md` rewritten with file:line-cited claims and a
   dedicated "honest weaknesses" section.
@@ -587,7 +587,7 @@ Solana runtime.
   is impossible (mutually exclusive)
 - `liq_orders_match_position_size` — synthesized order size = held size
 
-### Total fuzz assertions: 72,000 (12K FBA + 14K risk + 34K modules + 12K liquidation).
+### Total fuzz assertions: 72,000 (12K batch auction + 14K risk + 34K modules + 12K liquidation).
 ### Total test count: 254 (161 TS sim+SDK + 31 Rust unit + 36 Rust property × 2K + 26 E2E integration).
 
 ## [0.26.0] — 2026-05-08
@@ -636,7 +636,7 @@ What it does:
 5. Projects the post-fill position state (open / add / reduce / flip
    semantics matching `apply_fill_to_position`).
 6. Runs `previewPortfolioRisk` against the projected portfolio.
-7. Computes `priceImprovementBps` (always ≥ 0; FBA fills at-or-better
+7. Computes `priceImprovementBps` (always ≥ 0; batch auction fills at-or-better
    than limit by construction).
 
 This is the canonical UI feature for any frontend. TradingView-style
@@ -698,7 +698,7 @@ demonstration and order-intake edge cases:
   - Recent clearing prices contains a price ∈ [99,500, 100,500]
   - Mark price within the configured 100-bps oracle band
   This proves the whole matcher pipeline runs end-to-end on real
-  Solana runtime: order intake → FBA Walrasian clearing →
+  Solana runtime: order intake → Walrasian batch-auction clearing →
   TWAP-banded mark update.
 - **`place_limit_order_below_min_lot_rejected`** — zero-size order
   rejected by the `ZeroSize` gate.
@@ -715,7 +715,7 @@ demonstration and order-intake edge cases:
 across the remaining matcher modules. Each runs 2,000 random cases.
 Total fuzz assertions across all proptests now stands at **60,000**:
 
-- **FBA matcher (proptest_fba.rs)** — 6 × 2K = 12K
+- **batch-auction matcher (the batch-auction matcher proptests)** — 6 × 2K = 12K
 - **Risk (proptest_risk.rs)** — 7 × 2K = 14K
 - **Modules (proptest_modules.rs)** — 17 × 2K = 34K
 
@@ -763,7 +763,7 @@ By module:
 `programs/flash-book/tests/proptest_risk.rs` — 7 property tests for
 the stress-lattice maintenance margin engine, each running 2,000
 random cases (= 14,000 fuzz assertions on top of the 12K from the
-FBA matcher):
+batch-auction matcher):
 
 1. **`required_margin_non_negative`** — for any portfolio shape.
 2. **`monotonic_in_collateral`** — more collateral never makes you
@@ -803,7 +803,7 @@ These are not bugs — they're correct behaviors of integer arithmetic
 on a stress lattice. But they're surprising, and the property tests
 now document them for any future engineer reading the code.
 
-### Total fuzz assertions: 26,000 (12K FBA + 14K risk).
+### Total fuzz assertions: 26,000 (12K batch auction + 14K risk).
 ### Total test count: 216 (152 TS sim+SDK + 31 Rust unit + 13 Rust property × 2K cases + 20 E2E integration).
 
 ## [0.21.0] — 2026-05-08
@@ -814,7 +814,7 @@ Audited the Rust program for all `.unwrap()`, `.expect()`, `panic!`,
 `unreachable!`, `unimplemented!`, `todo!` paths in non-test code.
 
 Findings:
-- Two `.unwrap()` calls in `matcher/fba.rs` tie-break code, both
+- Two `.unwrap()` calls in the batch-auction matcher module tie-break code, both
   guarded by a length check earlier in the function. Replaced with
   `.copied().unwrap_or(prior_mark)` for defense in depth — even a
   future refactor that breaks the length invariant cannot introduce
@@ -836,7 +836,7 @@ and the integration tests (20 E2E paths).
 
 ## [0.20.0] — 2026-05-08
 
-### Added — Phase 1 polish (SDK FBA simulator)
+### Added — Phase 1 polish (SDK batch auction simulator)
 
 **`sdk-ts/src/order-simulator.ts`** — pure-TypeScript port of the
 on-chain Walrasian clearing algorithm.
@@ -844,7 +844,7 @@ on-chain Walrasian clearing algorithm.
 - `simulateBatchClearing(orders, priorMarkTicks)` returns
   `{ clearingPriceTicks, clearingVolumeLots, fills[] }` — the same
   output shape as `clear_batch` in
-  `programs/flash-book/src/matcher/fba.rs`.
+  `programs/flash-book/src/the batch-auction matcher module`.
 - `fillForOrder(result, orderId)` — aggregate size + price filled for
   a specific order in the result.
 - Mirrors all on-chain semantics: priority order
@@ -1422,7 +1422,7 @@ clients can now consume the Anchor instruction surface.
   - `submit_reveal` — verifies hash, synthesizes a taker order in the
     next batch's buffer.
   - `run_batch` — the heart: advances funding index, generates FLP
-    virtual quotes, runs FBA Walrasian clearing, updates mark via
+    virtual quotes, runs Walrasian batch-auction clearing, updates mark via
     TWAP-with-oracle-band, updates VPIN per fill, sweeps expired commits,
     clears buffer, emits `BatchClearedEvent`.
 - Anchor events: `MarketInitializedEvent`, `BatchClearedEvent`.
@@ -1466,7 +1466,7 @@ clients can now consume the Anchor instruction surface.
   - `matcher::lot` — type-safe `BaseLots` / `QuoteLots` / `Ticks` / `Bps` newtypes
     with checked arithmetic.
   - `matcher::order` — `Order` / `OrderType` / `Side` with FIFO priority keys.
-  - `matcher::fba` — Walrasian uniform-price clearing in integer space, with
+  - the batch-auction matcher module — Walrasian uniform-price clearing in integer space, with
     self-trade prevention and within-batch MEV-neutrality property test.
   - `matcher::flp_quoter` — virtual FLP quote ladder using bps integer math.
   - `matcher::funding` — Q64.64 cumulative funding index with rate clamping.
@@ -1477,7 +1477,7 @@ clients can now consume the Anchor instruction surface.
 - Anchor program skeleton in `lib.rs` with seven instruction shells:
   `initialize_market`, `place_limit_order`, `submit_commit`, `submit_reveal`,
   `run_batch`, `delegate_market`, `undelegate_market`.
-- 16 Rust unit tests covering FBA, FLP quoter, funding, VPIN.
+- 16 Rust unit tests covering batch auction, FLP quoter, funding, VPIN.
 - All financial arithmetic uses checked u128 / i128 with overflow propagation
   via `OrOverflow` trait — zero integer wraparound paths.
 
@@ -1487,7 +1487,7 @@ clients can now consume the Anchor instruction surface.
 
 ### Added
 - Initial reference design + simulator.
-- FBA matcher with Walrasian uniform-price clearing.
+- batch-auction matcher with Walrasian uniform-price clearing.
 - Virtual FLP quoter — Avellaneda-Stoikov-grade inventory-aware quoting,
   VPIN-driven adverse-selection widening, depth amortization, realized-vol
   spread term.

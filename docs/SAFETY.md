@@ -65,7 +65,7 @@ The FLP pool's exposure is bounded:
 
 | Threat | Mitigation |
 |---|---|
-| Sequencer reorders txs to extract value | FBA: clearing price is invariant to within-batch ordering. |
+| Sequencer reorders txs to extract value | batch auction: clearing price is invariant to within-batch ordering. |
 | Sequencer observes taker intent before submission | Commit-reveal: hash hides side/size/limit until N+1 batch. |
 | Liquidation race by competing keepers | In-loop liquidations: keepers obsoleted; protocol auto-injects. |
 | Mark price manipulation via wash trades | Mark = TWAP of clearing prices, oracle-banded. Manipulator pays for every bp moved. |
@@ -82,7 +82,7 @@ The FLP pool's exposure is bounded:
 | Sequencer censors a specific reveal | Trader posts reveal directly to L1; matcher honors on next sync with original commit timestamp. | Same fill order, with delay. |
 | Network partition | ER pauses; commits resume on reconnect. | Positions held; no liquidation while paused. |
 | ER outage > timeout (1 h) | Auto-settle on L1 at **last-committed mark**, not current oracle. | Fair valuation; no flash-crash liquidation cascade. |
-| L1 reorg of an ER commit | ER state replays from previous commit; affected fills re-clear. | Identical outcome (FBA is deterministic). |
+| L1 reorg of an ER commit | ER state replays from previous commit; affected fills re-clear. | Identical outcome (batch auction is deterministic). |
 
 ## Defenses against known production attack patterns
 
@@ -93,9 +93,9 @@ concrete defenses are wired in:
 |---|---|---|
 | Mark-price manipulation via thin upstream sources | Hyperliquid JELLY (Mar 2025), POPCAT (Nov 2025) — ~$5M each | `oracle_staleness_max_seconds` + `oracle_confidence_max_bps` gates on `update_oracle` |
 | Coordinated multi-wallet position buildup | Hyperliquid POPCAT — $20M concentrated long via 19 wallets | `max_position_lots_per_trader` cap on `place_limit_order` (per-wallet) |
-| Liquidation cascades | October 2025 crash, $5B liquidations overwhelmed funds | In-batch FBA clearing (atomic; no sequential walk); insurance-fund-first waterfall before ADL |
+| Liquidation cascades | October 2025 crash, $5B liquidations overwhelmed funds | In-batch batch auction clearing (atomic; no sequential walk); insurance-fund-first waterfall before ADL |
 | Funding-tick sniping | Every CEX with discrete funding | Continuous per-block funding via cumulative-index integral |
-| Sequencer front-running | Universal CLOB risk | Commit-reveal (hash hides intent); FBA uniform-clearing within batch |
+| Sequencer front-running | Universal CLOB risk | Commit-reveal (hash hides intent); batch auction uniform-clearing within batch |
 | Self-trading wash | Universal | Self-trade prevention in matcher (same-trader pairing skipped) |
 | Oracle gaming via stale prices | DeFi-wide | Pyth-style staleness check; wide-confidence rejection |
 

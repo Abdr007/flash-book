@@ -7676,7 +7676,7 @@ pub mod flash_book {
     }
 
     /// PERMISSIONLESSLY commit a
-    /// committee-attested state transition. **NOT a batch auction (no FBA)** —
+    /// committee-attested state transition. **NOT a batch auction** —
     /// matching stays a continuous price-time CLOB; this only records the state
     /// root the validator set threshold-signed over the fills the continuous book
     /// already produced. Verifies (1) `epoch` matches the active committee, (2)
@@ -17427,7 +17427,7 @@ pub struct SetSequencerCommittee<'info> {
 }
 
 /// Batch header — the state transition the committee threshold-signs.
-/// NOT an auction batch (no FBA); `fills_merkle_root` commits to the fills the
+/// NOT an auction batch; `fills_merkle_root` commits to the fills the
 /// continuous CLOB already matched, and `prev/new_state_root` chain the book +
 /// position state across committed batches.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]

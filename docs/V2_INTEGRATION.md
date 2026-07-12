@@ -68,7 +68,7 @@ turning the pool into an on-book MM.
 
 ## Why this is "the best orderbook" for Flash specifically
 
-- **Continuous price-time CLOB, no FBA** — pro market structure (tight spreads, real limit
+- **Continuous price-time CLOB, no batch auction** — pro market structure (tight spreads, real limit
   orders, time priority) that the pool model can't give.
 - **Pool-backed (HLP)** — deep guaranteed liquidity from V2's existing FLP, plus competitive
   MM improvement. Best of both; solves cold-start.
