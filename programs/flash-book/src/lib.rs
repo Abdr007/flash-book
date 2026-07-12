@@ -1471,6 +1471,7 @@ pub mod flash_book {
             &ctx.accounts.trader_state,
             ctx.program_id,
             ctx.accounts.position.as_ref(),
+            ctx.remaining_accounts,
         )
     }
 
@@ -1508,6 +1509,7 @@ pub mod flash_book {
             &ctx.accounts.trader_state,
             ctx.program_id,
             ctx.accounts.position.as_ref(),
+            ctx.remaining_accounts,
         )
     }
 
@@ -1576,6 +1578,7 @@ pub mod flash_book {
                 &ctx.accounts.trader_state,
                 ctx.program_id,
                 ctx.accounts.position.as_ref(),
+                ctx.remaining_accounts,
             )?;
         }
         Ok(())
@@ -1821,13 +1824,37 @@ pub mod flash_book {
                 backing,
                 pos_info,
             )?;
+            let (open_positions, cross_collateral, trader_pk) = {
+                let ts = ctx.accounts.trader_state.load()?;
+                (ts.open_positions, ts.collateral_quote_lots, ts.trader)
+            };
             // Keep the trader within the cross-margin stress lattice's position
             // budget: reject opening a NEW market once already at the cap. Reduces
             // / adds on a market the trader already holds are exempt.
-            assert_open_position_budget(
-                ctx.accounts.trader_state.load()?.open_positions,
-                pos_info,
-            )?;
+            assert_open_position_budget(open_positions, pos_info)?;
+            // R-1: a NEW cross-market open must satisfy the FULL cross-portfolio
+            // IM (all existing cross legs + this one), not just this market's, or
+            // sequential opens each pass against the same pool. Same-market adds
+            // stay on the per-market gate above. The trader's other [market,
+            // position] pairs ride in remaining_accounts (maker positions there
+            // belong to other traders and are filtered out by the trader match).
+            // Only the stacking case runs the walk: ≥1 existing position AND a new
+            // market. A first open (open_positions == 0) is unchanged.
+            let opens_new_slot = matches!(pos_info, None | Some((_, 0)));
+            if opens_new_slot && open_positions >= 1 {
+                assert_cross_portfolio_intake_im(
+                    ctx.remaining_accounts,
+                    &ctx.accounts.trader_state.key(),
+                    &trader_pk,
+                    ctx.program_id,
+                    open_positions,
+                    market,
+                    &market_key,
+                    if side == 0 { Side::Long } else { Side::Short },
+                    size_lots,
+                    cross_collateral,
+                )?;
+            }
         }
 
         // Pre-scan remaining_accounts for maker
@@ -14387,6 +14414,10 @@ fn place_limit_v2_core(
     // OPTIONAL (trader_state, market) position for the intake
     // initial-margin gate (None ⇒ treated as a full open — strictest).
     position: Option<&AccountLoader<'_, state::PositionAccount>>,
+    // R-1: [market, position] pairs for the trader's OTHER open cross positions,
+    // used by the full-portfolio IM gate when this order opens a NEW market.
+    // Empty for a same-market add / isolated / reduce-only (unused there).
+    remaining: &[AccountInfo<'_>],
 ) -> Result<()> {
     // ER readiness: while the book is delegated to the ER, this order's margin
     // is reserved cross-domain by the sequencer writing the trader's
@@ -14550,10 +14581,36 @@ fn place_limit_v2_core(
                 backing,
                 pos_info,
             )?;
+            let (open_positions, cross_collateral) = {
+                let ts = trader_state.load()?;
+                (ts.open_positions, ts.collateral_quote_lots)
+            };
             // Keep the trader within the cross-margin stress lattice's position
             // budget: reject a resting order that would OPEN a new market once
             // already at the cap. Reduces / adds on a market already held are exempt.
-            assert_open_position_budget(trader_state.load()?.open_positions, pos_info)?;
+            assert_open_position_budget(open_positions, pos_info)?;
+            // R-1: a NEW cross-market open must satisfy the FULL cross-portfolio
+            // IM, not just this market's — otherwise sequential cross opens each
+            // pass against the same pool and defeat the IM buffer. A same-market
+            // add (Some((_, size>0))) stays on the per-market gate above. Only the
+            // stacking case matters: the trader must already hold ≥1 position AND
+            // be opening a new market. A first open (open_positions == 0) has no
+            // portfolio to stack against and keeps the per-market gate exactly.
+            let opens_new_slot = matches!(pos_info, None | Some((_, 0)));
+            if opens_new_slot && open_positions >= 1 {
+                assert_cross_portfolio_intake_im(
+                    remaining,
+                    &trader_state.key(),
+                    &trader_pk,
+                    program_id,
+                    open_positions,
+                    market,
+                    &market_key,
+                    if side == 0 { Side::Long } else { Side::Short },
+                    size_lots,
+                    cross_collateral,
+                )?;
+            }
         }
     }
 
@@ -21679,6 +21736,177 @@ mod route_funding_tests {
             assert_eq!(d_col, -d_res, "funding must conserve value");
         }
     }
+}
+
+/// R-1: CROSS-PORTFOLIO intake initial-margin gate. The per-market
+/// `assert_intake_initial_margin` below checks only THIS market's resulting IM
+/// against the full cross pool, so opening across N markets lets each open see
+/// the whole pool as free backing — the portfolio can be opened straight onto the
+/// maintenance line with no IM buffer (correlated-gap bad debt then socialises to
+/// insurance). This gate closes that: when an order OPENS a NEW cross market, it
+/// evaluates the trader's FULL cross portfolio (every existing open leg + the
+/// prospective new leg) against the same stress lattice liquidation uses, at the
+/// INITIAL-margin ratio.
+///
+/// It reuses the exact proven machinery from `sweep_collateral`/`partial_withdraw`
+/// (`verify_position_pda` + `effective_health_mark` + `assess_margin_unified`) and
+/// inherits their omission guarantee: every own leg is PDA-bound to THIS
+/// `trader_state`, markets are deduped, and the counted legs must equal
+/// `open_positions` — so a caller cannot omit a risky leg to understate the
+/// requirement (a short count fails closed). Legs are collected by CONTENT (a
+/// program-owned `PositionAccount` whose `trader` matches and which PDA-binds),
+/// so the same helper works on the limit path (a clean [market,position] slice)
+/// and the taker path (a bag also holding maker/commitment/outbox accounts —
+/// maker positions belong to other traders and are naturally excluded).
+///
+/// Only invoked when the order opens a NEW market slot (the R-1 vector); same-
+/// market adds and reduce-only stay on the O(1) `assert_intake_initial_margin`
+/// path, so the hot path is unchanged for the common case. Isolated legs carry
+/// their own segregated collateral in the snapshot, exactly as the withdraw walk
+/// does, and `assess_margin_unified` splits them out.
+#[allow(clippy::too_many_arguments)]
+fn assert_cross_portfolio_intake_im(
+    remaining: &[AccountInfo],
+    trader_state_key: &Pubkey,
+    trader_pk: &Pubkey,
+    program_id: &Pubkey,
+    open_positions: u8,
+    target_market: &MarketAccount,
+    target_market_key: &Pubkey,
+    new_side: Side,
+    new_resulting_size_lots: u64,
+    cross_collateral: u64,
+) -> Result<()> {
+    let clock = Clock::get()?;
+    let now_unix = clock.unix_timestamp.max(0) as u64;
+    let current_slot = clock.slot;
+
+    let expected = open_positions as usize;
+    let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(expected + 1);
+    let mut market_snaps: Vec<RiskMarketSnap> = Vec::with_capacity(expected + 1);
+    let mut market_keys: Vec<Pubkey> = Vec::with_capacity(expected + 1);
+
+    // Collect the trader's OWN open legs from remaining_accounts by content.
+    for ai in remaining.iter() {
+        if ai.owner != program_id {
+            continue;
+        }
+        let position: state::PositionAccount = {
+            let data = match ai.try_borrow_data() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            match state::PositionAccount::try_deserialize(&mut &data[..]) {
+                Ok(p) => p,
+                Err(_) => continue, // not a PositionAccount (market/commitment/outbox/…)
+            }
+        };
+        if position.trader != *trader_pk || position.size_lots == 0 {
+            continue; // a maker/other trader's leg, or a flat leg (no IM)
+        }
+        // Bind to THIS trader_state (blocks a different sub-account's position
+        // of the same wallet being substituted to understate risk).
+        if verify_position_pda(
+            &position.market,
+            trader_state_key,
+            position.bump,
+            &ai.key(),
+            program_id,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        // New-market-only: no own leg may sit on the market being opened.
+        require!(
+            position.market != *target_market_key,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            !market_keys.contains(&position.market),
+            FlashBookError::OutOfRange
+        );
+        // The leg's market account must be present (program-owned, key match).
+        let market_ai = remaining
+            .iter()
+            .find(|m| *m.key == position.market && m.owner == program_id)
+            .ok_or_else(|| error!(FlashBookError::OutOfRange))?;
+        let market_acct: MarketAccount =
+            MarketAccount::try_deserialize(&mut &market_ai.try_borrow_data()?[..])?;
+        snaps.push(RiskPosSnap {
+            market: position.market,
+            side: if position.side == 0 {
+                Side::Long
+            } else {
+                Side::Short
+            },
+            size_lots: position.size_lots,
+            entry_price: Ticks(position.entry_price_ticks),
+            cum_funding_index_at_entry: position.cum_funding_index(),
+            collateral_quote_lots: position.collateral_quote_lots,
+        });
+        market_snaps.push(RiskMarketSnap {
+            market: position.market,
+            mark_price: Ticks(effective_health_mark(
+                &market_acct,
+                now_unix,
+                current_slot,
+                position.side == 0,
+            )?),
+            cum_funding_index: market_acct.cum_funding_index,
+            // INITIAL margin (buffer above liquidation) — RISK-2, as the walk gates.
+            maintenance_margin_bps: market_acct.params.initial_margin_ratio_bps,
+            tick_size: market_acct.params.tick_size,
+            concentration_threshold_lots: market_acct.params.concentration_threshold_lots,
+            concentration_extra_mmr_bps: market_acct.params.concentration_extra_mmr_bps,
+            side_oi_lots: oi_side_lots(&market_acct, position.side == 0),
+            oi_mmr_slope_bps_per_million_lots: market_acct.params.oi_mmr_slope_bps_per_million_lots,
+            oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
+            paper_profit_haircut_bps: market_acct.paper_profit_haircut_bps,
+        });
+        market_keys.push(position.market);
+    }
+
+    // Omission guarantee: every open cross leg must be accounted for.
+    require!(market_keys.len() == expected, FlashBookError::OutOfRange);
+
+    // Append the prospective new leg on the target market (cross ⇒ backed by the
+    // shared pool, so collateral_quote_lots = 0 in the snapshot).
+    snaps.push(RiskPosSnap {
+        market: *target_market_key,
+        side: new_side,
+        size_lots: new_resulting_size_lots,
+        entry_price: Ticks(target_market.mark_price_ticks),
+        cum_funding_index_at_entry: target_market.cum_funding_index,
+        collateral_quote_lots: 0,
+    });
+    market_snaps.push(RiskMarketSnap {
+        market: *target_market_key,
+        mark_price: Ticks(effective_health_mark(
+            target_market,
+            now_unix,
+            current_slot,
+            new_side == Side::Long,
+        )?),
+        cum_funding_index: target_market.cum_funding_index,
+        maintenance_margin_bps: target_market.params.initial_margin_ratio_bps,
+        tick_size: target_market.params.tick_size,
+        concentration_threshold_lots: target_market.params.concentration_threshold_lots,
+        concentration_extra_mmr_bps: target_market.params.concentration_extra_mmr_bps,
+        side_oi_lots: oi_side_lots(target_market, new_side == Side::Long),
+        oi_mmr_slope_bps_per_million_lots: target_market.params.oi_mmr_slope_bps_per_million_lots,
+        oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
+        paper_profit_haircut_bps: target_market.paper_profit_haircut_bps,
+    });
+    market_keys.push(*target_market_key);
+
+    let scenarios = default_scenarios_fn(&market_keys);
+    let assessment = assess_margin_unified_fn(&snaps, &market_snaps, &scenarios, cross_collateral)?;
+    require!(
+        assessment.is_healthy,
+        FlashBookError::InsufficientCollateral
+    );
+    Ok(())
 }
 
 /// Intake INITIAL-MARGIN gate. A position opened with no (or

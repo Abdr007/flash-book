@@ -7615,14 +7615,42 @@ async fn timelocked_param_update_enforces_delay_and_hash() {
         "params unchanged before eta"
     );
 
-    // 3) advance the Clock's unix_timestamp past the 48h eta. (warp_to_slot moves the
-    //    slot but not unix_timestamp in solana-program-test, and the timelock is
-    //    time-based — so set the Clock sysvar directly.)
-    let mut clock = ctx.banks_client.get_sysvar::<Clock>().await.unwrap();
-    clock.unix_timestamp += 49 * 60 * 60; // 49h > the 48h PARAM_UPDATE_TIMELOCK_SECONDS
-    ctx.set_sysvar(&clock);
+    // 3) Make the eta lie in the PAST, deterministically. Warping the Clock
+    //    sysvar is unreliable under parallel test load: solana-program-test
+    //    recomputes unix_timestamp from the bank on each new slot (on slot entry,
+    //    before the ix runs), so a set_sysvar bump is clobbered by the next
+    //    transaction. Patching the pending update's eta directly makes
+    //    `now >= eta` hold regardless of the recomputed clock — testing the eta
+    //    gate itself, not the harness's clock bookkeeping.
+    {
+        use solana_sdk::account::Account as SolAccount;
+        let pend_acc = ctx
+            .banks_client
+            .get_account(pending_pda)
+            .await
+            .unwrap()
+            .unwrap();
+        // Patch ONLY the eta_unix bytes in place, leaving params_hash and every
+        // other byte identical. Layout: 8 disc + 32 market + 32 params_hash, so
+        // eta_unix (i64 LE) starts at offset 72. A full deserialize/serialize
+        // round-trip is avoided so the stored params_hash can't drift.
+        let mut data = pend_acc.data.clone();
+        data[72..80].copy_from_slice(&1i64.to_le_bytes()); // eta in the past
+        ctx.set_account(
+            &pending_pda,
+            &SolAccount {
+                lamports: pend_acc.lamports,
+                data,
+                owner: pend_acc.owner,
+                executable: pend_acc.executable,
+                rent_epoch: pend_acc.rent_epoch,
+            }
+            .into(),
+        );
+    }
 
-    // 4) execute with WRONG params (hash mismatch) → rejected.
+    // 4) execute with WRONG params (hash mismatch), now past eta → rejected for
+    //    the hash, not the timelock.
     let mut wrong = new_params;
     wrong.max_leverage = orig_leverage.saturating_add(9);
     assert!(
@@ -7631,14 +7659,6 @@ async fn timelocked_param_update_enforces_delay_and_hash() {
     );
 
     // 5) execute with the CORRECT params after eta → applied, pending closed.
-    // Re-assert the warped Clock: step 4's transaction advanced the bank a slot,
-    // and solana-program-test recomputes unix_timestamp from the bank on a new
-    // slot, which clobbers the manual bump from step 3. Without this the gated
-    // execute intermittently sees a timestamp back below the eta and fails with
-    // TimelockNotElapsed under parallel test load (deterministic in isolation).
-    let mut clock = ctx.banks_client.get_sysvar::<Clock>().await.unwrap();
-    clock.unix_timestamp += 49 * 60 * 60;
-    ctx.set_sysvar(&clock);
     send(&mut ctx, execute(new_params), &[&payer])
         .await
         .expect("execute after delay");
@@ -8956,6 +8976,29 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
             ],
         )
     };
+    // Same as `limit`, but passes the signer's real PositionAccount so the intake
+    // gate recognizes an opposite-side order as a REDUCE (exempt). Required once
+    // the trader holds a position: omitting it while holding ≥1 position makes the
+    // R-1 cross-portfolio gate (correctly) demand a full-portfolio proof.
+    let limit_pos = |side: u8, size: u64, signer: &Keypair, state: &Pubkey, position: Pubkey| {
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side,
+                size_lots: size,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(*state, false),
+                AccountMeta::new_readonly(position, false),
+            ],
+        )
+    };
     // A taker order; `red` = extra remaining_accounts (fc [+ maker position] for a
     // reduce-only cross so the matcher can cap it).
     let taker = |side: u8, size: u64, signer: &Keypair, state: &Pubkey, red: Vec<AccountMeta>| {
@@ -9123,13 +9166,38 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     .expect("fire reduce-only trigger → resting ask 10");
 
     // 3) M SHRINKS long 10 → 5: C rests bid 5, M takes sell 5, settle. Now the
-    //    resting reduce-only ask (10) exceeds M's position (5).
-    send(&mut ctx, limit(0, 5, &c, &c_state), &[&payer, &c])
-        .await
-        .unwrap();
+    //    resting reduce-only ask (10) exceeds M's position (5). C already holds a
+    //    short here, so pass c_pos → the bid 5 is recognized as a reduce.
     send(
         &mut ctx,
-        taker(1, 5, &m, &m_state, vec![AccountMeta::new(fc_pda, false)]),
+        limit_pos(0, 5, &c, &c_state, c_pos),
+        &[&payer, &c],
+    )
+    .await
+    .unwrap();
+    // M holds long 10 and sells 5 (a reduce). Pass m_pos so the intake gate sees
+    // the reduce and exempts it (omitting it while holding a position makes the
+    // R-1 cross-portfolio gate correctly demand a full-portfolio proof).
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceTakerOrderV2 {
+                side: 1,
+                size_lots: 5,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            vec![
+                AccountMeta::new(m.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(m_state, false),
+                AccountMeta::new_readonly(m_pos, false),
+                AccountMeta::new(fc_pda, false),
+            ],
+        ),
         &[&payer, &m],
     )
     .await
@@ -12042,6 +12110,110 @@ async fn liquidate_position_v2_rejects_multi_leg_cross() {
     assert!(
         dbg.contains("Custom(8207)"),
         "single-leg liquidation of a multi-leg cross trader must be rejected, got: {dbg}"
+    );
+}
+
+/// R-1 REGRESSION: a NEW cross-market open is gated by the trader's FULL cross-
+/// portfolio initial margin, not just this market's. A trader already holding one
+/// cross leg cannot open a second market the two legs jointly cannot back (the
+/// stacking exploit), and cannot omit the existing leg to hide it from the gate.
+/// A well-margined first open on the same market is unaffected (control).
+#[tokio::test]
+async fn cross_portfolio_intake_im_blocks_second_market_stacking() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_a, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (market_b, _, _, _) = setup_additional_market(&mut ctx, &payer, 100_000).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    // 1_000_000 backs a single 1M-notional leg comfortably but NOT a 10M leg PLUS
+    // a 1M leg under the ±stress lattice at 2.5% initial margin.
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 1_000_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000_000, &protocol).await;
+
+    // Existing leg on market A: taker LONG 100 (10M notional). open_positions == 1.
+    let taker_pos_a = open_cross_position_sized(
+        &mut ctx,
+        &payer,
+        market_a,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+        100,
+    )
+    .await;
+    let ts: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    assert_eq!(ts.open_positions, 1, "one cross leg open on market A");
+
+    let (book_b, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_b.as_ref()]);
+    let place_b = |remaining: Vec<AccountMeta>| {
+        let mut accts = vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(market_b, false),
+            AccountMeta::new(book_b, false),
+            AccountMeta::new_readonly(taker_state, false),
+            AccountMeta::new_readonly(program_id(), false), // no position on B (new market)
+        ];
+        accts.extend(remaining);
+        build_ix(
+            flash_book::instruction::PlaceLimitOrderV2 {
+                side: 0,
+                // Deliberately TINY (100k notional): on its own it needs ~33k of
+                // margin and would sail through against the 1M pool. The only
+                // reason the open below is rejected is the EXISTING 10M A leg —
+                // proving the gate is portfolio-driven, not this-market-driven.
+                size_lots: 1,
+                limit_ticks: 100_000,
+                flags: 0,
+                expires_at_slot: 0,
+                sub_index: 0,
+            },
+            accts,
+        )
+    };
+
+    // (1) STACKING BLOCKED: open market B (1 lot) with the existing A leg in
+    // remaining_accounts → portfolio A+B exceeds the pool at initial margin, even
+    // though B alone is trivial. (No-over-rejection is separately established by
+    // the whole multi-position suite, which opens legitimate legs and passes.)
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place_b(vec![
+                AccountMeta::new_readonly(market_a, false),
+                AccountMeta::new_readonly(taker_pos_a, false),
+            ])],
+            Some(&taker.pubkey()),
+            &[&taker],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7204)"),
+        "cross-portfolio open must fail InsufficientCollateral, got: {err:?}"
+    );
+
+    // (2) OMISSION GUARANTEE: the same open with the A leg OMITTED must fail the
+    // count check (OutOfRange), never silently pass by hiding the existing leg.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place_b(vec![])],
+            Some(&taker.pubkey()),
+            &[&taker],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7003)"),
+        "omitting an open leg must fail OutOfRange (no-omission), got: {err:?}"
     );
 }
 
