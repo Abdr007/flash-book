@@ -5444,6 +5444,19 @@ pub mod flash_book {
                     && ctx.accounts.maker_position_haircut.is_some()),
             FlashBookError::HaircutNotInitialized
         );
+        // HIP-3 solvency (audit 2026-07-12): a PERMISSIONLESS market's bad debt
+        // is isolated from the shared insurance fund (`cover_bad_debt` skips the
+        // draw), so an uncovered loser shortfall must NOT be able to leave the
+        // winner over-credited against the shared vault. The haircut engine is
+        // exactly the guard: it routes winner gains to a solvency-gated reserve
+        // that only matures while the protocol is solvent. Therefore a
+        // permissionless market may only settle fills once its haircut engine is
+        // enabled — closing the vault-short window that insurance isolation would
+        // otherwise open. (Authority markets keep the insurance backstop.)
+        require!(
+            !ctx.accounts.market.is_permissionless || ctx.accounts.market.haircut_enabled,
+            FlashBookError::HaircutNotInitialized
+        );
         // A ring settlement (below) means place_taker reserved
         // this fill's OI volume at match; release it once settled (decrement below).
         let ring_settled = fc_opt.is_some();
@@ -8871,6 +8884,14 @@ pub mod flash_book {
             !ctx.accounts.market.haircut_enabled
                 || (ctx.accounts.market_haircut.is_some()
                     && ctx.accounts.taker_position_haircut.is_some()),
+            FlashBookError::HaircutNotInitialized
+        );
+        // HIP-3 solvency (audit 2026-07-12): mirrors apply_fill — a permissionless
+        // market (insurance-isolated) may only settle once its haircut engine is
+        // enabled, so winner gains are solvency-gated and can't over-credit the
+        // shared vault against an uncovered shortfall.
+        require!(
+            !ctx.accounts.market.is_permissionless || ctx.accounts.market.haircut_enabled,
             FlashBookError::HaircutNotInitialized
         );
 
