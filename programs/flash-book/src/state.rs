@@ -474,6 +474,16 @@ pub struct MarketAccount {
     /// Trailing field ⇒ pre-existing accounts read 0. A stale haircut is
     /// over-conservative (safe), so this gates crank cadence, not solvency.
     pub paper_haircut_updated_slot: u64,
+    /// HIP-3: `true` if this market was created permissionlessly (any signer)
+    /// via `create_permissionless_market`, rather than by the protocol authority
+    /// via `initialize_market`. A permissionless market's bad debt is NEVER
+    /// socialized to the shared insurance fund (`cover_bad_debt` skips the draw)
+    /// — its participants bear its risk (ADL + the per-domain paper-profit
+    /// haircut), so a hostile creator can never drain the global fund. Its params
+    /// are additionally clamped to a hard safety envelope at creation
+    /// (`validate_hip3_params`). Trailing field ⇒ pre-existing (authority-created)
+    /// markets read `false` = fully insurance-backed, exact prior behaviour.
+    pub is_permissionless: bool,
 }
 
 /// Optional emergency guardian for one market, held in a SEPARATE PDA (not a

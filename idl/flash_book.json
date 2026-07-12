@@ -2970,6 +2970,154 @@
       "args": []
     },
     {
+      "name": "create_permissionless_market",
+      "docs": [
+        "HIP-3: create a market PERMISSIONLESSLY — ANY signer, no protocol-authority",
+        "gate. The signer becomes the market's authority + sequencer + creator and",
+        "pays rent. Safety rests on two guarantees, both proven:",
+        "1. `validate_hip3_params` clamps every param to a hard safety envelope",
+        "(bounded leverage, MM floor, `IM ≥ MM`, non-predatory fees, fresh",
+        "oracle) — so the market is conservative regardless of creator intent",
+        "(`hip3_params_are_safe`, Kani).",
+        "2. The market is flagged `is_permissionless`, so its bad debt is NEVER",
+        "socialized to the shared insurance fund (`cover_bad_debt` skips the",
+        "draw) — a hostile creator can never drain the global backstop; the",
+        "market's own participants bear its risk via ADL + the per-domain",
+        "paper-profit haircut.",
+        "Front-run-safe: the market PDA is keyed by `(base_mint, quote_mint)`, and",
+        "because the params are envelope-clamped, whoever wins the create race",
+        "produces an equally-safe market. Like the authority path it is fail-closed",
+        "(`fill_commitment_required = true`) until the creator arms it with a ring."
+      ],
+      "discriminator": [
+        209,
+        145,
+        111,
+        159,
+        129,
+        68,
+        202,
+        100
+      ],
+      "accounts": [
+        {
+          "name": "creator",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "base_mint"
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "base_vault"
+        },
+        {
+          "name": "quote_vault"
+        },
+        {
+          "name": "oracle_account"
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "base_mint"
+              },
+              {
+                "kind": "account",
+                "path": "quote_mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "flp_exposure",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "MarketParams"
+            }
+          }
+        },
+        {
+          "name": "initial_oracle_ticks",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "create_session_token",
       "docs": [
         "Create a SESSION KEY: authorize `session_signer` to trade for the signing",
@@ -23228,6 +23376,21 @@
               "over-conservative (safe), so this gates crank cadence, not solvency."
             ],
             "type": "u64"
+          },
+          {
+            "name": "is_permissionless",
+            "docs": [
+              "HIP-3: `true` if this market was created permissionlessly (any signer)",
+              "via `create_permissionless_market`, rather than by the protocol authority",
+              "via `initialize_market`. A permissionless market's bad debt is NEVER",
+              "socialized to the shared insurance fund (`cover_bad_debt` skips the draw)",
+              "— its participants bear its risk (ADL + the per-domain paper-profit",
+              "haircut), so a hostile creator can never drain the global fund. Its params",
+              "are additionally clamped to a hard safety envelope at creation",
+              "(`validate_hip3_params`). Trailing field ⇒ pre-existing (authority-created)",
+              "markets read `false` = fully insurance-backed, exact prior behaviour."
+            ],
+            "type": "bool"
           }
         ]
       }

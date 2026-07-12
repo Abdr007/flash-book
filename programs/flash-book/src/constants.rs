@@ -236,6 +236,27 @@ pub const MAX_PRICE_SIG_FIGS: u32 = 5;
 /// calls. 64 comfortably fits a transaction's account/data budget.
 pub const MAX_REAP_PER_CALL: usize = 64;
 
+// ─── HIP-3 permissionless-market safety envelope ────────────────────────────
+// Hard bounds every `create_permissionless_market` param must satisfy, so a
+// market created by ANY signer is provably conservative regardless of intent.
+// (`validate_hip3_params` enforces these; `hip3_params_are_safe` proves it.)
+
+/// Max leverage a permissionless market may offer. Conservative vs. the
+/// authority path — a hostile creator can't lure with 100x then let it blow up.
+pub const HIP3_MAX_LEVERAGE: u32 = 10;
+/// Minimum maintenance-margin ratio (bps). 5% floor bounds the worst-case
+/// gap between a breach and the liquidation fill.
+pub const HIP3_MIN_MAINTENANCE_MARGIN_BPS: u32 = 500;
+/// Max taker fee (bps). 1% cap — no predatory fee extraction.
+pub const HIP3_MAX_TAKER_FEE_BPS: u32 = 100;
+/// Max liquidation penalty + liquidator reward (bps). 10% cap.
+pub const HIP3_MAX_LIQ_BPS: u32 = 1_000;
+/// Max oracle staleness (seconds) — a permissionless market must consume a
+/// FRESH oracle; 120 s bounds mark drift feeding worse-of liquidations.
+pub const HIP3_MAX_ORACLE_STALENESS_SECS: u32 = 120;
+/// Max any single fee-share (referrer/builder/creator), bps.
+pub const HIP3_MAX_SHARE_BPS: u32 = 2_000;
+
 #[cfg(test)]
 mod oracle_band_tests {
     use super::*;
