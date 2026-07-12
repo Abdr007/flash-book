@@ -20,7 +20,7 @@ const FRESH = new PublicKey(process.env.PROGRAM || "BRtnEAZ6Tc61gz8m93unL1vzaC4G
 const OLD = new PublicKey("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
 const EXPLORER = (s) => `https://explorer.solana.com/tx/${s}?cluster=devnet`;
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const sys = SystemProgram.programId;
 const TOKEN = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const ATA_PROG = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
@@ -63,7 +63,7 @@ console.log(`\nProgram : ${FRESH.toBase58()}\nRPC     : ${L1_RPC.split("?")[0]}\
 const INS = pda(["insurance_fund"]);
 const ins = await program.account.insuranceFundAccount.fetch(INS);
 const QUOTE = ins.quoteMint, VAULT = ins.quoteVault;
-const FLP = pda(["flp_exposure"]);
+const LP = pda(["lp_exposure"]);
 const ref = await oldProgram.account.marketAccount.fetch(REF_MARKET);
 const SIZE = 10;
 const DEP = Number(process.env.DEP || 1_500_000); // health = collateral; >> base MM, << surcharged MM
@@ -82,7 +82,7 @@ async function scenario(label, slope) {
   const M = pda(["market", base.publicKey, QUOTE]);
   const BOOK = pda(["market_book", M]), FC = pda(["fill_commit", M]), FO = pda(["fill_outbox", M]);
   const dummy = Keypair.generate().publicKey;
-  await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: dummy, quoteVault: VAULT, oracleAccount: dummy, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [base]);
+  await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: dummy, quoteVault: VAULT, oracleAccount: dummy, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
   await send(await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction());
   await send(await program.methods.initFillCommitment(105).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction());
   await send(await program.methods.initFillOutbox().accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, fillCommitment: FC, systemProgram: sys }).instruction());

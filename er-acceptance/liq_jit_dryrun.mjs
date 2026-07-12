@@ -14,7 +14,7 @@ import { getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction,
 const { Program, AnchorProvider, Wallet, BN } = anchor;
 
 const L1_RPC = process.env.L1_RPC || "https://solana-devnet.api.onfinality.io/public";
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const PID = new PublicKey(IDL.address);
 const signer = Keypair.fromSecretKey(
   new Uint8Array(JSON.parse(fs.readFileSync(`${os.homedir()}/.config/solana/id.json`))),
@@ -33,7 +33,7 @@ const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
 const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
 const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
 const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
-const FLP = pda(["flp_exposure"]);
+const LP = pda(["lp_exposure"]);
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
 
 const sendAs = async (kp, ix, extra = []) => {
@@ -62,15 +62,15 @@ const FC = pda(["fill_commit", M]);
 const ENV = pda(["envelope", M]);
 
 console.log("setup: armed zero-fee market + book + ring + WIDE envelope");
-await sendAs(signer, await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [base]);
+await sendAs(signer, await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
 await sendAs(signer, await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction());
 await sendAs(signer, await program.methods.initFillCommitment(256).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction());
 await sendAs(signer, await program.methods.setEnvelopeConfig(400, new BN(1), new BN(0), 5000, 50, new BN(0), new BN(100)).accountsPartial({ authority: signer.publicKey, market: M, envelopeConfig: ENV, systemProgram: sys }).instruction());
 console.log(`  market ${M.toBase58()}\n`);
 
 // ── Open a LONG for a thin-collateral (near-max-leverage) taker. ────────────
-console.log("1) FLP posts ask 1@100_000; a thin-collateral taker crosses; keeper settles via the ring");
-await sendAs(signer, await program.methods.flpPostMakerOrder(1, new BN(1), new BN(100000), new BN(0)).accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, flpExposure: FLP }).instruction());
+console.log("1) LP posts ask 1@100_000; a thin-collateral taker crosses; keeper settles via the ring");
+await sendAs(signer, await program.methods.lpPostMakerOrder(1, new BN(1), new BN(100000), new BN(0)).accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, lpExposure: LP }).instruction());
 const taker = Keypair.generate();
 await sendAs(signer, SystemProgram.transfer({ fromPubkey: signer.publicKey, toPubkey: taker.publicKey, lamports: 60_000_000 }));
 const TS = pda(["trader_state", taker.publicKey]);
@@ -84,7 +84,7 @@ await sendAs(signer, createMintToInstruction(QUOTE, takerAta, signer.publicKey, 
 await sendAs(taker, await program.methods.depositCollateral(new BN(2600)).accountsPartial({ trader: taker.publicKey, traderState: TS, insuranceFund: INS, quoteMint: QUOTE, traderQuoteAta: takerAta, quoteVault: VAULT, tokenProgram: TOKEN_PROGRAM_ID }).instruction());
 const TPOS = pda(["position", M, TS]);
 await sendAs(taker, await program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
-await sendAs(signer, await program.methods.applyFlpFill(new BN(1), new BN(100000), 0, 0, new BN(1), false).accountsPartial({ sequencer: signer.publicKey, market: M, insuranceFund: INS, takerTraderState: TS, takerPosition: TPOS, flpExposure: FLP, feeTiers: null, marketHaircut: null, takerPositionHaircut: null, systemProgram: sys }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
+await sendAs(signer, await program.methods.applyLpFill(new BN(1), new BN(100000), 0, 0, new BN(1), false).accountsPartial({ sequencer: signer.publicKey, market: M, insuranceFund: INS, takerTraderState: TS, takerPosition: TPOS, lpExposure: LP, feeTiers: null, marketHaircut: null, takerPositionHaircut: null, systemProgram: sys }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
 const pos0 = await program.account.positionAccount.fetch(TPOS);
 ok(Number(pos0.sizeLots) === 1 && pos0.side === 0, `taker holds LONG ${pos0.sizeLots} @ ${pos0.entryPriceTicks} (thin collateral)`);
 

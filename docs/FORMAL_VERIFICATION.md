@@ -1,6 +1,6 @@
 # Formal Verification
 
-Flash Book carries **73 Kani proof harnesses** (discharged by CBMC), **7 Lean
+Clober carries **73 Kani proof harnesses** (discharged by CBMC), **7 Lean
 proof modules** at the real production divisors, a formal property specification
 (`certora/PROPERTIES.md`), and eight property-test suites. A Kani harness is
 not a sampled test: `kani::any()` ranges over the *entire* input domain
@@ -20,7 +20,7 @@ the Lean proofs on every PR; any broken invariant fails the build.
 | `matcher/liquidation` | 6 | Health price is always one of the two real sources and the worse one for the side (long and short), fresh mark equals worse-of, stale mark falls back to oracle-only, and the **anti-JELLY** property (`jelly_mark_manipulation_yields_no_usable_equity`): a mark manipulated in the attacker's favour can never move the health price past the honest live oracle, so the $20M Hyperliquid-style mark pump converts to ZERO extra usable equity. |
 | `matcher/insurance` | 5 | Solvent ⟺ vault covers the protocol buckets; surplus exact when solvent; the full-invariant reference model; the one-sided partial-collateral insolvency detector is sound (never fires on a solvent state); bad-debt coverage is insurance-isolated and bounded (`bad_debt_coverage_is_insurance_isolated_and_bounded` — no single-vault SPOF). |
 | `matcher/position_math` | 3 | Open-from-flat exact, same-side stacking exact, no realized PnL without a reduction. |
-| `matcher/flp_quoter` | 3 | Pool fill-price band accepts the oracle price (no false reject) and rejects gross fabrication; required floor conservative. |
+| `matcher/lp_quoter` | 3 | Pool fill-price band accepts the oracle price (no false reject) and rejects gross fabrication; required floor conservative. |
 | `matcher/fill_outbox` | 3 | Write index in bounds, no silent overwrite, drained grow has no remappable pending slot. |
 | `matcher/committee` | 3 | Valid BFT config implies quorum intersection, equivocation ⟺ same height + different digest, jail is effective. |
 | `xmargin` | 13 | ER-reserved margin floor preserved by simple withdrawals, epoch strictly increases, required floor adds reserved on top of max, attestation binding fails closed, withdrawal can never self-liquidate below maintenance (`withdraw_cannot_self_liquidate_below_maintenance`), and the internal-transfer core conserves total collateral (`collateral_transfer_conserves_total` — Track A2: the `transfer_*` handlers move collateral only through this proven core, lint-enforced). |
@@ -136,7 +136,7 @@ conservation, and margin-walk auth/completeness:
 
 | Lean theorem | Statement |
 |---|---|
-| `realized_reconciles_v2` | `pnl·entry = sign·(price−entry)·notional` (exact Flash V2 reconciliation) |
+| `realized_reconciles_v2` | `pnl·entry = sign·(price−entry)·notional` (exact notional-return reconciliation) |
 | `long_pnl_pos_iff` | profit iff price crosses entry the right way; breakeven = 0 |
 | `vwap_lower_bound` / `vwap_upper_bound` | `min(entry,price) ≤ vwapEntry ≤ max(entry,price)` |
 

@@ -1,13 +1,13 @@
-# Flash Book — Formal Property Specification
+# Clober — Formal Property Specification
 
-This is the **formal property set** for Flash Book: the invariants the protocol
+This is the **formal property set** for Clober: the invariants the protocol
 must satisfy, stated precisely enough to (a) machine-check today with Kani / Lean
 and (b) encode for the **Certora Prover for Solana** (the production bar set by
 Manifest and Kamino).
 
 **Status legend.**
-- `[KANI]` — machine-proven exhaustively today (`cargo kani --package flash-book
-  --features no-entrypoint`), see `programs/flash-book/src/**/*.rs` `#[cfg(kani)]`.
+- `[KANI]` — machine-proven exhaustively today (`cargo kani --package clober
+  --features no-entrypoint`), see `programs/clober/src/**/*.rs` `#[cfg(kani)]`.
 - `[LEAN]` — machine-proven over unbounded `Nat`/`Int` at the real divisor
   (`formal_verification/lean/`), `#print axioms`-clean.
 - `[CERTORA-TARGET]` — stated here; to be discharged by the Certora Prover
@@ -41,22 +41,22 @@ credit satisfies `credit ≤ Residual` and `credit + dust == matured` at the rea
 (+ `[KANI]` at a power-of-two divisor).
 
 **P-SOLV-4 — Global solvency invariant.** At all times
-`vault.amount ≥ Σ trader_collateral + Σ FLP_capital + insurance.balance`
+`vault.amount ≥ Σ trader_collateral + Σ LP_capital + insurance.balance`
 (no instruction may make protocol liabilities exceed protocol assets).
 → **`[KANI]`** (protocol-owned buckets) `assess_solvency` (`matcher::insurance`) —
 `solvent_iff_vault_covers_buckets` + `surplus_exact_when_solvent` (vault accounts
-exactly to insurance + FLP + surplus; no value invented); `verify_protocol_solvency`
+exactly to insurance + LP + surplus; no value invented); `verify_protocol_solvency`
 routes through it.
 → **`[KANI]`** (FULL invariant, incl. trader collateral) `assess_solvency_full` —
 `full_solvent_iff_vault_covers_all_liabilities` proves `solvent ⇔ vault ≥
-Σ collateral + FLP + insurance` with exact surplus. The runtime check is the
+Σ collateral + LP + insurance` with exact surplus. The runtime check is the
 DRIFT-FREE one-sided sweep `partial_collateral_proves_insolvent` (proven sound by
 `partial_insolvency_detector_is_sound`: it fires only on genuine insolvency, for
 any real total ≥ the summed subset); the permissionless `verify_collateral_solvency`
 instruction sums REAL collateral from deduplicated trader-state / isolated-position
 accounts and routes through it — so it cannot desync from the 47 collateral-mutation
 sites the way a stored aggregate would.
-→ **`[CERTORA-TARGET]`** the broader `vault ≥ Σ trader_collateral + FLP + insurance`
+→ **`[CERTORA-TARGET]`** the broader `vault ≥ Σ trader_collateral + LP + insurance`
 *preserved by every instruction* (the Manifest "loss-of-funds" set) — the all-paths
 proof the one-sided runtime sweep cannot give. Scaffolded in `certora/specs/solvency.spec`
 + `certora/solana_solvency.conf`; runnable once a Certora Solana license is wired.
@@ -119,7 +119,7 @@ than `market.last_settlement_seq`, which it then advances atomically; a replayed
 or out-of-order settlement reverts the whole transaction.
 → **`[KANI]`** `advance_settlement_seq` (`matcher::fill_commitment`) —
 `nonce_rejects_non_increasing`, `nonce_advance_is_strict_and_exact`,
-`nonce_chain_strictly_monotone`. Both `apply_fill` and `apply_flp_fill` route
+`nonce_chain_strictly_monotone`. Both `apply_fill` and `apply_lp_fill` route
 through the proven helper.
 
 **P-SETTLE-2 — Bad debt is bounded.** A bankrupt close draws at most `shortfall`
@@ -171,11 +171,11 @@ displace another).
 
 ```bash
 # Kani (today):
-cargo kani --package flash-book --features no-entrypoint
+cargo kani --package clober --features no-entrypoint
 # Lean (today):
 cd formal_verification/lean && lake build
 # Certora (requires a Certora license; encode the [CERTORA-TARGET] rows):
-#   certoraRun ... --verify FlashBook:certora/specs/<spec>.spec
+#   certoraRun ... --verify Clober:certora/specs/<spec>.spec
 ```
 
 *No individual is named in this document. Every `[KANI]`/`[LEAN]` row is

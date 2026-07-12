@@ -1,7 +1,7 @@
 /*
  * P-SOLV-4 — Global solvency preservation (the Manifest "loss-of-funds" set).
  *
- *   vault.amount  >=  Σ trader_collateral  +  Σ flp_capital  +  insurance.balance
+ *   vault.amount  >=  Σ trader_collateral  +  Σ lp_capital  +  insurance.balance
  *
  * must hold AFTER every balance-mutating instruction whenever it held BEFORE.
  * Kani proves the *arithmetic* of this invariant (matcher::insurance::
@@ -22,16 +22,16 @@
 
 methods {
     // Ghost views over the live account set (implemented in the Rust harness as
-    // summaries that read the TokenAccount / InsuranceFund / FlpExposure /
+    // summaries that read the TokenAccount / InsuranceFund / LpExposure /
     // Σ TraderState+Position collateral). envfree: no environment dependence.
     function vaultAmount()        external returns (uint64) envfree;
     function totalCollateral()    external returns (uint64) envfree;
-    function flpCapital()         external returns (uint64) envfree;
+    function lpCapital()         external returns (uint64) envfree;
     function insuranceBalance()   external returns (uint64) envfree;
 }
 
 definition liabilities() returns mathint =
-    totalCollateral() + flpCapital() + insuranceBalance();
+    totalCollateral() + lpCapital() + insuranceBalance();
 
 definition solvent() returns bool =
     to_mathint(vaultAmount()) >= liabilities();
@@ -53,7 +53,7 @@ rule solvencyPreserved(method f) {
     f(e, args);
 
     assert solvent(),
-        "instruction drove vault below Σ collateral + FLP + insurance";
+        "instruction drove vault below Σ collateral + LP + insurance";
 }
 
 /*

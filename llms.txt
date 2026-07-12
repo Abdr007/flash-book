@@ -1,4 +1,4 @@
-# Flash Book
+# Clober
 
 > A fully on-chain central-limit-order-book (CLOB) perpetuals DEX on Solana whose
 > accounting is machine-proven: every money-moving instruction is Kani/Lean-verified
@@ -13,7 +13,7 @@ side 0=long 1=short. sub_index selects a sub-account (0=primary).
 
 - [Agent trading guide](AGENTS.md): the trading lifecycle, instruction signatures, state model, and a minimal client bootstrap.
 - [Gotchas](docs/GOTCHAS.md): the non-obvious footguns — sequencer trust model, armed markets, PDA seeds, funding crank, withdraw-anytime reserve margin, sub-indices.
-- [Anchor IDL](idl/flash_book.json): the machine source of truth — 149 instructions, 28 accounts, 138 events, 114 typed errors.
+- [Anchor IDL](idl/clober.json): the machine source of truth — 149 instructions, 28 accounts, 138 events, 114 typed errors.
 
 ## Core instructions
 

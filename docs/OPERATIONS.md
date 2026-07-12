@@ -108,7 +108,7 @@ compromise is bounded by the commitment ring).
      accept_authority_transfer                  # executed BY the multisig
    (The 2-step flow means a typoed key can never take authority — the
    pending target must prove it can sign.)
-5. Insurance-fund + fee-tier + FLP authorities: same propose/accept or
+5. Insurance-fund + fee-tier + LP authorities: same propose/accept or
    direct-set instructions, executed to the multisig.
 6. Guardian: set_guardian to a fast-response key (guardian powers are
    restrict-only, so a hot guardian key is acceptable).
@@ -128,20 +128,20 @@ confirm a probe transaction signed by the OLD key is rejected with
 
 ---
 
-## 3. FLP accounting: exactly one system per market
+## 3. LP accounting: exactly one system per market
 
-Flash Book carries two FLP (pool-as-counterparty) accounting systems, and both
+Clober carries two LP (pool-as-counterparty) accounting systems, and both
 mint LP shares redeemable against the **same** protocol vault
 (`insurance_fund.quote_vault`):
 
-- **Singleton** — `FlpExposureAccount` (`[b"flp_exposure"]`), holding per-market
+- **Singleton** — `LiquidityPoolAccount` (`[b"lp_exposure"]`), holding per-market
   inventory in `per_market[]`. Its realized PnL is booked automatically at
-  settlement by `apply_flp_fill`; capital enters/exits via
-  `deposit_flp_capital` / `withdraw_flp_capital`.
-- **Per-market v3** — `FlpExposurePerMarketAccountV3`
-  (`[b"flp_per_market", market]`). Its realized PnL is booked by the
-  keeper-driven `record_flp_fill_v3`; capital enters/exits via
-  `flp_deposit_v3` / `flp_withdraw_v3`.
+  settlement by `apply_lp_fill`; capital enters/exits via
+  `lp_deposit` / `lp_withdraw`.
+- **Per-market v3** — `LpExposurePerMarketAccountV3`
+  (`[b"lp_per_market", market]`). Its realized PnL is booked by the
+  keeper-driven `record_lp_fill_v3`; capital enters/exits via
+  `lp_deposit_v3` / `lp_withdraw_v3`.
 
 ### The constraint
 
@@ -150,7 +150,7 @@ on-chain interlock coupling the two (an airtight guard would require a versioned
 `MarketAccount` layout field, which the account has no reserved slack for). If a
 market is operated with LP capital in *both* systems and the same economic fills
 are booked into both, the combined redeemable NAV
-(`NAV_singleton + NAV_v3`) can exceed the vault's true FLP backing, so the last
+(`NAV_singleton + NAV_v3`) can exceed the vault's true LP backing, so the last
 redeemers over-withdraw and the shortfall socializes onto everyone else. This is
 an operational misconfiguration, not an unprivileged exploit: both booking paths
 are privileged (settlement sequencer / insurance-fund authority), and a market
@@ -160,7 +160,7 @@ that only ever uses one system is unaffected.
 
 1. Pick the system at market bring-up. Default to the **singleton** unless a
    per-market share ledger is specifically required.
-2. Never call `deposit_flp_capital` / `record_flp_fill_v3` (v3) against a market
+2. Never call `lp_deposit` / `record_lp_fill_v3` (v3) against a market
    that already carries capital or inventory in the other system.
 3. If migrating a market between systems, fully drain and zero the source
    system (no shares outstanding, no inventory) before seeding the target.
@@ -169,5 +169,5 @@ that only ever uses one system is unaffected.
 
 - **Professional external audit** — see [../SECURITY.md](../SECURITY.md).
 - **Live volume** on the target venue.
-- **FLP one-system-per-market** — §3 above; an operational invariant, not a
+- **LP one-system-per-market** — §3 above; an operational invariant, not a
   code interlock.

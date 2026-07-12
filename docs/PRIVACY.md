@@ -1,6 +1,6 @@
 # Private (dark-pool) books
 
-A Flash Book market can run its order book as a **private book**: the
+A Clober market can run its order book as a **private book**: the
 delegated book PDA executes on a MagicBlock **Private Ephemeral Rollup**
 (TEE-backed), and an *ephemeral permission* account gates who may read the
 ER's state. When a book is private, only allow-listed readers can see depth,
@@ -42,7 +42,7 @@ action }` (`action`: 0 = init, 1 = update, 2 = close).
 ## Wire format (permission-program ABI)
 
 The permission program's ABI is implemented in
-`programs/flash-book/src/er_permission.rs` and every assembled byte is
+`programs/clober/src/er_permission.rs` and every assembled byte is
 host-tested.
 
 **Programs and addresses**

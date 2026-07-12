@@ -8,14 +8,14 @@
 Hi Certora team,
 
 We're using the Solana Certora Prover to prove whole-program solvency for an Anchor
-program (flash-book, a Solana CLOB perps DEX). Four solvency rules already pass
+program (clober, a Solana CLOB perps DEX). Four solvency rules already pass
 non-vacuously on our real invariant symbol, but every rule that executes a real Anchor
 handler returns `UNKNOWN` with **"[3308] illegal dereference of an absolute address"** at
 a `sol_memcpy_` inside Anchor's `error!`/`#[error_code]` construction.
 
 We've reduced it to a minimal, self-contained reproducer and confirmed the root cause is
 the `&'static` global-string copy (message + `file!()` origin) inside
-`Error::from(FlashBookError)` / `FlashBookError::Display::fmt`, which the pointer analysis
+`Error::from(CloberError)` / `CloberError::Display::fmt`, which the pointer analysis
 can't classify — and it appears at many inlined sites, so per-function summaries don't
 converge.
 
@@ -42,7 +42,7 @@ reproducer files, exact output, and root-cause analysis is attached
 
 Thanks very much,
 <your name>
-flash-book — github.com/Abdr007/flash-book
+clober — github.com/Abdr007/clober
 
 ---
 _Attach: `certora/repro/CERTORA_SUPPORT_REQUEST.md` + optionally point them at

@@ -11,12 +11,12 @@ Machine-readable results + Explorer links: `er-acceptance/critical_path_results.
 |---|---|
 | Reconciled branch | `sec/critical-path-v2` (H-A/H-B/M-2 cherry-picked onto current main; A2 cores untouched) |
 | In-tree gates | build-sbf 0-warn · **631 tests / 0 fail** · clippy `-D warnings` clean · fmt clean · Kani 73 |
-| Artifact | `flash_book.so` built fresh with `declare_id!` = the throwaway id |
+| Artifact | `clober.so` built fresh with `declare_id!` = the throwaway id |
 | Deployed program (throwaway) | `BRtnEAZ6Tc61gz8m93unL1vzaC4GjtHViLCU8JqKB2gD` (devnet; not main's `5VqBgu…`) |
 | Deployed-hash verify | on-chain bytes sha256 == artifact sha256 `326896b0fc85fafe0f974383a678a64edee682885d3258296016d17e8904f2b0` ✓ |
 
 Genesis is built from scratch on the fresh program each run: fresh quote mint (singleton-reused
-across runs), insurance fund (+ vault), FLP exposure, an IM>0 market (params cloned from the old
+across runs), insurance fund (+ vault), LP exposure, an IM>0 market (params cloned from the old
 program's reference market), book, and armed fill-commitment ring. Real positions form via the
 full match→settle loop (maker rests · taker crosses · sequencer `apply_fill`) — the sequencer
 defaults to the deployer, so settlement is driven first-party with a keccak-matched ring pop.

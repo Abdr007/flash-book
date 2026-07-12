@@ -44,7 +44,7 @@ if (MARKETS.length === 0) {
   process.exit(1);
 }
 
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const PID = new PublicKey(IDL.address);
 const keypairPath = process.env.KEYPAIR || `${os.homedir()}/.config/solana/id.json`;
 const payer = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(keypairPath))));

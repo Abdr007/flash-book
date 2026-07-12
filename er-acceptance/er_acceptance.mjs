@@ -31,7 +31,7 @@ if (!ER_RPC) {
 const L1_RPC = process.env.L1_RPC || "https://api.devnet.solana.com";
 
 // ── setup ─────────────────────────────────────────────────────────────────────
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const PID = new PublicKey(IDL.address);
 const DELEG = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
 // Pin the ER validator that will own the delegated accounts, so the ER match stage
@@ -87,7 +87,7 @@ const signer = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(`
 const l1 = new Connection(L1_RPC, "confirmed");
 const er = new Connection(ER_RPC, "confirmed");
 const program = new Program(IDL, new AnchorProvider(l1, new Wallet(signer), { commitment: "confirmed" }));
-const FLP = PublicKey.findProgramAddressSync([Buffer.from("flp_exposure")], PID)[0];
+const LP = PublicKey.findProgramAddressSync([Buffer.from("lp_exposure")], PID)[0];
 const pda = (s, p = PID) => PublicKey.findProgramAddressSync(s.map((x) => (Buffer.isBuffer(x) ? x : (typeof x === "string" ? Buffer.from(x) : x.toBuffer()))), p)[0];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -136,7 +136,7 @@ try {
 
   // ── L1: build a fresh cap-105 market (book + ring + FULL outbox, no grow) ──
   await stage(`L1 init_market + book + ring + outbox (cap ${CAP}, ER-capable)`, async () => {
-    await send(l1, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [base]);
+    await send(l1, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
     await send(l1, await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction(), []);
     await send(l1, await program.methods.initFillCommitment(CAP).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction(), []);
     await send(l1, await program.methods.initFillOutbox().accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, fillCommitment: FC, systemProgram: sys }).instruction(), []);

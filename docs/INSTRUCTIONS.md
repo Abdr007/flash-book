@@ -1,8 +1,8 @@
 # Instruction reference
 
-The program exposes 146 Anchor instructions. `idl/flash_book.json` is the
+The program exposes 146 Anchor instructions. `idl/clober.json` is the
 source of truth for accounts and argument layouts; handler doc comments in
-`programs/flash-book/src/lib.rs` are the authoritative behavior contracts.
+`programs/clober/src/lib.rs` are the authoritative behavior contracts.
 This page is the grouped index.
 
 Access legend — **authority**: gated on `market.authority` (or the stated
@@ -51,7 +51,7 @@ noted).
 | Instruction | Access | Purpose |
 |---|---|---|
 | `apply_fill` | sequencer (permissionless keeper on armed markets) | Settle one matched fill against ring authenticity; moves positions, collateral, fees, funding, OI. |
-| `apply_flp_fill` | sequencer (same armed-market rule) | Settle a pool-maker fill under ring + oracle-band bounds. |
+| `apply_lp_fill` | sequencer (same armed-market rule) | Settle a pool-maker fill under ring + oracle-band bounds. |
 | `settle_funding` | permissionless | Settle a position's accrued funding via the side-accrual indices. |
 | `settle_mark` | authority | Hard mark write under the envelope gate. |
 | `update_oracle` / `update_oracle_quorum` | authority (reverts once source-locked) | Direct oracle writes under staleness + envelope gates. |
@@ -85,17 +85,17 @@ noted).
 | `create_session_token` / `revoke_session_token` | trader | Scoped, expiring session keys (optionally market-scoped). |
 | `place_limit_order_v2_session` / `cancel_order_v2_session` / `deposit_collateral_session` | session key | Session-signed variants. |
 
-## FLP (pool)
+## LP (pool)
 
 | Instruction | Access | Purpose |
 |---|---|---|
-| `initialize_flp_exposure` | protocol authority | Create the pool exposure singleton. |
-| `deposit_flp_capital` / `withdraw_flp_capital` | LP | NAV-share capital in/out (minimum-hold gate on exit). |
-| `flp_post_maker_order` | authority | Post a pool maker order. |
-| `flp_refresh_quotes` | permissionless (rate-limited) | Regenerate the deterministic pool quote ladder. |
-| `init_flp_per_market_v3` | protocol authority | Per-market pool exposure account. |
-| `flp_deposit_v3` / `flp_withdraw_v3` | LP | Per-market NAV-based capital (withdraw blocked while the pool has open positions against it). |
-| `record_flp_fill_v3` | sequencer | Record per-market pool exposure deltas. |
+| `initialize_lp_exposure` | protocol authority | Create the pool exposure singleton. |
+| `lp_deposit` / `lp_withdraw` | LP | NAV-share capital in/out (minimum-hold gate on exit). |
+| `lp_post_maker_order` | authority | Post a pool maker order. |
+| `lp_refresh_quotes` | permissionless (rate-limited) | Regenerate the deterministic pool quote ladder. |
+| `init_lp_per_market_v3` | protocol authority | Per-market pool exposure account. |
+| `lp_deposit_v3` / `lp_withdraw_v3` | LP | Per-market NAV-based capital (withdraw blocked while the pool has open positions against it). |
+| `record_lp_fill_v3` | sequencer | Record per-market pool exposure deltas. |
 
 ## Vaults (v3)
 

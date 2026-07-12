@@ -6,7 +6,7 @@
 //
 // Genesis-light: 2.3's init_fee_accrual needs only payer + PDA + system, so it
 // proves the new instruction surface is LIVE on real devnet without a full fill
-// genesis. When the insurance/FLP singletons already exist on the throwaway,
+// genesis. When the insurance/LP singletons already exist on the throwaway,
 // claim_fee_accrual is exercised too (expect ZeroSize on an empty accrual).
 import fs from "fs";
 import os from "os";
@@ -26,7 +26,7 @@ async function sendIx(ix, extra = []) {
 }
 const L1_RPC = process.env.L1_RPC || "https://api.devnet.solana.com";
 const PROGRAM = new PublicKey(process.env.PROGRAM || "BRtnEAZ6Tc61gz8m93unL1vzaC4GjtHViLCU8JqKB2gD");
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const signer = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(`${os.homedir()}/.config/solana/id.json`))));
 const l1 = new Connection(L1_RPC, "confirmed");
 const sys = SystemProgram.programId;
@@ -64,9 +64,9 @@ try {
 }
 
 // ── 2.3-b: claim on an empty accrual must reject (ZeroSize) — proves the claim
-//           ix + its zero-guard are live (needs the insurance/FLP singletons). ──
+//           ix + its zero-guard are live (needs the insurance/LP singletons). ──
 const INS = seed("insurance_fund");
-const FLP = seed("flp_exposure");
+const LP = seed("lp_exposure");
 const insAi = await l1.getAccountInfo(INS);
 if (!insAi) {
   rec("2.3 claim_fee_accrual rejects empty (ZeroSize)", true,
@@ -88,7 +88,7 @@ if (!insAi) {
     }
     const claimIx = await program.methods.claimFeeAccrual()
       .accountsPartial({
-        recipient: signer.publicKey, feeAccrual: fa2, insuranceFund: INS, flpExposure: FLP,
+        recipient: signer.publicKey, feeAccrual: fa2, insuranceFund: INS, lpExposure: LP,
         quoteMint, recipientQuoteAta: recipientAta, quoteVault, tokenProgram: TOKEN_PROGRAM_ID,
       }).instruction();
     try {

@@ -6,10 +6,10 @@
 # / QUIC transitive crates). None of them is a normal or build dependency of the
 # on-chain program:
 #
-#     cargo tree -p flash-book -i <crate> -e no-dev   # → empty for each
-#     nm target/deploy/flash_book.so | grep -i <crate> # → not linked
+#     cargo tree -p clober -i <crate> -e no-dev   # → empty for each
+#     nm target/deploy/clober.so | grep -i <crate> # → not linked
 #
-# The deployed `flash_book.so` verifies signatures through Solana runtime
+# The deployed `clober.so` verifies signatures through Solana runtime
 # syscalls and performs no networking, so the vulnerable code paths (ed25519
 # double-signing oracle, curve25519 scalar-subtraction timing, quinn stream
 # reassembly) are unreachable on-chain. The versions are pinned by the Solana
@@ -34,8 +34,8 @@ ignore = [
     # crossbeam-epoch 0.9.18 — invalid pointer dereference in the `fmt::Pointer`
     # impl for `Atomic`/`Shared`. Dev/test tree only: pulled solely via
     # solana-program-test → solana-client → solana-streamer → governor → dashmap
-    # → rayon (a dev-dependency); `cargo tree -p flash-book -i crossbeam-epoch
-    # -e no-dev` is empty and it is not linked into flash_book.so. The vulnerable
+    # → rayon (a dev-dependency); `cargo tree -p clober -i crossbeam-epoch
+    # -e no-dev` is empty and it is not linked into clober.so. The vulnerable
     # path only triggers when formatting an already-invalid atomic pointer, which
     # the test harness never does. Pinned by the Solana 3.x stack.
     "RUSTSEC-2026-0204",

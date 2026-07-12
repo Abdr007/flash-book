@@ -15,7 +15,7 @@ import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 const { Program, AnchorProvider, Wallet, BN } = anchor;
 
 const L1_RPC = process.env.L1_RPC || "https://api.devnet.solana.com";
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const PID = new PublicKey(IDL.address);
 const signer = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(`${os.homedir()}/.config/solana/id.json`))));
 const l1 = new Connection(L1_RPC, "confirmed");
@@ -29,7 +29,7 @@ const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
 const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
 const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
 const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
-const FLP = pda(["flp_exposure"]);
+const LP = pda(["lp_exposure"]);
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
 
 let pass = 0, fail = 0;
@@ -42,7 +42,7 @@ const base = Keypair.generate();
 const M = pda(["market", base.publicKey, QUOTE]);
 const params = { ...ref.params, oracleStalenessMaxSeconds: new BN(60) };
 console.log("setup: fresh market");
-await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).rpc();
+await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).rpc();
 console.log(`  market ${M.toBase58()}`);
 
 // A NON-authority signer cranks — permissionless.

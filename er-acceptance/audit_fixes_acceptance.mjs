@@ -11,7 +11,7 @@
 //                   .unsettled_fill_volume > 0 (matched-but-unsettled OI reserved).
 //
 // None of these need the signer to hold quote tokens — they assert rejections at the
-// intake gate and a counter read. FLP/M-7/liquidation flows that need collateral are
+// intake gate and a counter read. LP/M-7/liquidation flows that need collateral are
 // scaffolded separately.
 //
 // L1_RPC=<devnet> node audit_fixes_acceptance.mjs
@@ -22,7 +22,7 @@ import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 const { Program, AnchorProvider, Wallet, BN } = anchor;
 
 const L1_RPC = process.env.L1_RPC || "https://solana-devnet.api.onfinality.io/public";
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const PID = new PublicKey(IDL.address);
 const signer = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(`${os.homedir()}/.config/solana/id.json`))));
 const l1 = new Connection(L1_RPC, "confirmed");
@@ -36,7 +36,7 @@ const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
 const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
 const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
 const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
-const FLP = pda(["flp_exposure"]);
+const LP = pda(["lp_exposure"]);
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
 
 // TraderState PDA: sub_index 0 = [b"trader_state", trader]; N>0 = [.., trader, [N]].
@@ -68,7 +68,7 @@ const mkMarket = async (params, tag) => {
   const M = pda(["market", base.publicKey, QUOTE]);
   const BOOK = pda(["market_book", M]);
   const FC = pda(["fill_commit", M]);
-  await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [base]);
+  await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
   await send(await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction());
   await send(await program.methods.initFillCommitment(256).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction());
   console.log(`  ${tag} market ${M.toBase58()}`);
@@ -107,10 +107,10 @@ const c1rej = await sendExpectFail(await placeTaker(im0, 200, TS_GHOST));
 ok(c1rej, "C-1: place_taker with a non-existent (sub 200) TraderState is REJECTED (no wedge)");
 
 // ── C-1 positive + M-6: a real TraderState on the IM=0 market is accepted, and a
-//    cross reserves unsettled OI. First the FLP posts a maker so the taker crosses.
+//    cross reserves unsettled OI. First the LP posts a maker so the taker crosses.
 console.log("\nC-1 positive + M-6: real TraderState accepted; cross reserves OI");
-await send(await program.methods.flpPostMakerOrder(1, new BN(1), new BN(100000), new BN(0)).accountsPartial({ authority: signer.publicKey, market: im0.M, marketBook: im0.BOOK, flpExposure: FLP }).instruction());
-const c1okSig = await send(await placeTaker(im0, 0, TS0)); // crosses the FLP ask
+await send(await program.methods.lpPostMakerOrder(1, new BN(1), new BN(100000), new BN(0)).accountsPartial({ authority: signer.publicKey, market: im0.M, marketBook: im0.BOOK, lpExposure: LP }).instruction());
+const c1okSig = await send(await placeTaker(im0, 0, TS0)); // crosses the LP ask
 ok(!!c1okSig, `C-1: place_taker with a real TraderState is ACCEPTED — ${c1okSig.slice(0, 12)}…`);
 const mAfter = await program.account.marketAccount.fetch(im0.M);
 ok(Number(mAfter.unsettledFillVolume) > 0, `M-6: unsettled_fill_volume reserved after cross (= ${Number(mAfter.unsettledFillVolume)})`);

@@ -12,7 +12,7 @@ These hold at every batch boundary:
 | S1 | All collateral, capital, fund balances are finite | `engine.checkInvariants()` | checked-arithmetic propagation |
 | S2 | Insurance fund balance ≥ 0 | `engine.checkInvariants()` | `InsuranceFund::cover_shortfall` saturates at 0 |
 | S3 | No trader has negative collateral without an open position | `engine.checkInvariants()` | `withdraw_collateral` open_positions gate |
-| S4 | Σ collateral + FLP + insurance ≡ Σ endowments + Σ realized proceeds − Σ realized payouts | property test (12K cases) | property test on matcher core |
+| S4 | Σ collateral + LP + insurance ≡ Σ endowments + Σ realized proceeds − Σ realized payouts | property test (12K cases) | property test on matcher core |
 | S5 | OI_long = OI_short | `recomputeOpenInterest()` | `update_oi()` per fill, recomputed on each batch |
 | S6 | No position has size ≤ 0 (zero-size positions cleared) | `applyFillToTrader` | `apply_fill_to_position` clears on size→0 |
 | S7 | No position has entry price ≤ 0 | order intake guard | `place_limit_order` `ZeroPrice` check |
@@ -20,8 +20,8 @@ These hold at every batch boundary:
 | S9 | Stress-lattice gate prevents unhealthy traders from opening more positions | n/a | `place_limit_order` margin assessment |
 | S10 | Liquidations only fire on actually-unhealthy traders | n/a | `liquidate_position` `assess_margin` check + `NotLiquidatable` reject |
 | S11 | Measurement primitives (tick_size, base_lot_size, quote_lot_size, min_base_lots) are immutable post-market-init | n/a | `update_market_params` enforces equality |
-| S12 | FLP per-batch position growth ≤ pool_capital × max_growth_pct | quoter cap | quoter cap + buffer cap |
-| S13 | User order seq < FLP_SEQ_RESERVED_OFFSET | n/a | `place_limit_order` reject |
+| S12 | LP per-batch position growth ≤ pool_capital × max_growth_pct | quoter cap | quoter cap + buffer cap |
+| S13 | User order seq < LP_SEQ_RESERVED_OFFSET | n/a | `place_limit_order` reject |
 | S14 | Mark price within oracle band (±oracle_band_bps) | `oracleBand()` | `run_batch` clamp |
 
 ## Per-trade guards
@@ -34,14 +34,14 @@ Every order is checked at intake:
   combined post-trade portfolio
 - For new positions: insurance fund is above pause threshold
 
-## FLP pool safety
+## LP pool safety
 
-The FLP pool's exposure is bounded:
+The LP pool's exposure is bounded:
 
 - **Per-batch growth cap:** the pool cannot grow its position by more than
-  `flp_max_growth_per_batch_pct · pool_capital` in any single batch.
+  `lp_max_growth_per_batch_pct · pool_capital` in any single batch.
   Default 0.5%. Mathematical floor on the loss rate per unit time.
-- **Adaptive spread:** when VPIN spikes (toxic flow), the FLP spread widens
+- **Adaptive spread:** when VPIN spikes (toxic flow), the LP spread widens
   automatically; when pool utilization is high, spread widens more; when
   realized vol spikes, spread widens more. The pool is never forced to
   quote tighter than `s₀` (default 5 bps).

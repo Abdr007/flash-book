@@ -1,6 +1,6 @@
 # Incident Response Playbook
 
-What to do when Flash Book misbehaves on mainnet. Each scenario lists
+What to do when Clober misbehaves on mainnet. Each scenario lists
 detection signals, immediate actions, root-cause investigation, and
 post-incident steps.
 
@@ -25,19 +25,19 @@ false`.
 
 **Immediate**:
 1. Authority calls `set_market_status(Paused)` on every market.
-2. Authority calls `set_market_status(Paused)` on FLP via market
-   pause (FLP withdrawals already block on per-position checks).
+2. Authority calls `set_market_status(Paused)` on LP via market
+   pause (LP withdrawals already block on per-position checks).
 3. Notify users via official channels. Halt new deposits.
 
 **Investigate**: pull `FillAppliedEvent`, `CollateralDepositedEvent`,
 `CollateralWithdrawnEvent`, `FundingSettledEvent`,
-`FlpCapitalUpdatedEvent`, `InsuranceContributionEvent`,
+`LpCapitalUpdatedEvent`, `InsuranceContributionEvent`,
 `PositionConvertedEvent` from the past N hours. Reconcile:
 
 ```
 expected_vault = Σ deposits − Σ withdrawals
                 + Σ insurance_contribs − Σ insurance_payouts
-                + Σ flp_deposits − Σ flp_withdrawals
+                + Σ lp_deposits − Σ lp_withdrawals
                 + Σ fees_collected
 ```
 
@@ -148,18 +148,18 @@ first if the situation is acute.
 **Investigate**: OI imbalance. Identify large traders driving the
 skew; expected behavior of the funding mechanism.
 
-### 8. FLP NAV/share dropping unexpectedly
+### 8. LP NAV/share dropping unexpectedly
 
-**Detection**: `FlpCapitalUpdatedEvent.new_total` declining despite no
+**Detection**: `LpCapitalUpdatedEvent.new_total` declining despite no
 withdrawals.
 
-**Immediate**: trace through `apply_flp_fill` events. FLP is the
+**Immediate**: trace through `apply_lp_fill` events. LP is the
 counterparty to large profitable trader closes — declining NAV is
 expected when the pool is on the losing side of flows. Confirm via
 `FillAppliedEvent` aggregation.
 
 **Investigate**: VPIN toxicity score, OI imbalance, whether
-`flp_quoter` is producing stale or off-market quotes.
+`lp_quoter` is producing stale or off-market quotes.
 
 ### 9. ER commit-buffer staleness
 
@@ -204,7 +204,7 @@ For every P0 / P1:
 | `set_market_status(Active)` | Restore | per-market authority |
 | Envelope tightening | Lower `max_price_move_bps_per_slot` | per-market authority |
 | Burn authority | Permanent decentralization (irreversible) | per-market authority |
-| FLP deposit pause | (future) — block new FLP deposits | per-market authority |
+| LP deposit pause | (future) — block new LP deposits | per-market authority |
 
 Once `burn_market_authority` has been called, NONE of the above admin
 kill switches are available. Operators should burn only after a market
@@ -213,7 +213,7 @@ has stabilized for an extended operating period.
 ## Communication channels
 
 - **Internal pager**: PagerDuty (or equivalent)
-- **Status page**: `status.flashbook.example` (placeholder)
+- **Status page**: `status.clober.example` (placeholder)
 - **Public**: Twitter / Discord (links TBD)
 - **Bilateral with audit partners**: Sherlock contact, Trail of Bits
   retainer

@@ -15,7 +15,7 @@ multisig authority migration).
 
 1. **Do not open a public GitHub issue.**
 2. Open a private security advisory:
-   https://github.com/Abdr007/flash-book/security/advisories/new
+   https://github.com/Abdr007/clober/security/advisories/new
 3. Or email the maintainers (address in the `Cargo.toml` author field).
 
 Include a clear description + impact, a minimal reproduction (test or PoC
@@ -27,10 +27,10 @@ acknowledge within 72 hours.
 
 ### In scope
 
-- The Anchor program in `programs/flash-book/`: anything that lets a user
+- The Anchor program in `programs/clober/`: anything that lets a user
   cause incorrect collateral movement, position state, oracle acceptance,
   liquidation-reward routing, or account-control bypass.
-- The risk math in `programs/flash-book/src/matcher/`: anything that
+- The risk math in `programs/clober/src/matcher/`: anything that
   violates the invariants in `docs/MARGIN_MATH.md` / `docs/HAIRCUT_MATH.md` /
   `docs/SAFETY.md`. The conservation and solvency invariants are
   machine-checked — a violation that Kani/Lean should have caught is a

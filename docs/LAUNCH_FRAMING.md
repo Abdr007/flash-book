@@ -1,9 +1,9 @@
 # Launch framing — the honest posture
 
-This is the one-page truth about what Flash Book is today. It is also the
+This is the one-page truth about what Clober is today. It is also the
 operating norm: **no public word ships that we cannot prove on demand.**
 
-## What Flash Book is
+## What Clober is
 
 A fully on-chain central-limit-order-book perpetuals DEX on Solana, with a
 hypertree order book, a stress-lattice risk engine, and sub-50ms fills via a
@@ -25,7 +25,7 @@ proof fails the build.
 - **Deployed on devnet**, program `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq`.
 - **The core accounting is proven**: solvency conservation, no self-liquidation
   onto insurance, manipulated-market credit collapse, margin frame-stability,
-  funding zero-sum, realized-PnL value, haircut junior-claim bounds, insurance/FLP
+  funding zero-sum, realized-PnL value, haircut junior-claim bounds, insurance/LP
   isolation — all machine-checked, all CI-gated.
 - **Reproducible**: the IDL is regenerated and drift-gated in CI; the event-replay
   reconciler rebuilds all 8 state dimensions byte-for-byte from events.

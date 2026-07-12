@@ -1,10 +1,10 @@
 {
   "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq",
   "metadata": {
-    "name": "flash_book",
+    "name": "clober",
     "version": "0.1.0",
     "spec": "0.1.0",
-    "description": "Flash Book — pool-backed CLOB, continuously matched on MagicBlock ER."
+    "description": "Clober — pool-backed CLOB, continuously matched on MagicBlock ER."
   },
   "instructions": [
     {
@@ -432,8 +432,8 @@
     {
       "name": "apply_flp_fill",
       "docs": [
-        "Apply a fill in which the FLP pool is the *maker*. Mutates the",
-        "`FlpExposureAccount.per_market` entry for this market while",
+        "Apply a fill in which the LP pool is the *maker*. Mutates the",
+        "`LpExposureAccount.per_market` entry for this market while",
         "applying the opposite-side update to the taker's `PositionAccount`.",
         "",
         "Trust model: same as `apply_fill` — sequencer-authenticated; the",
@@ -549,7 +549,7 @@
           }
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "writable": true,
           "pda": {
             "seeds": [
@@ -578,8 +578,8 @@
           "docs": [
             "Optional global fee-tier table.",
             "When supplied, the TAKER's `taker_fee_bps` is resolved per",
-            "their rolling-window volume. FLP-side maker rebate stays flat",
-            "(FLP IS the protocol — tier-tier semantics don't apply on the",
+            "their rolling-window volume. LP-side maker rebate stays flat",
+            "(LP IS the protocol — tier-tier semantics don't apply on the",
             "maker side here). When omitted, falls back to flat",
             "`market.params.taker_fee_bps`."
           ],
@@ -588,10 +588,10 @@
         {
           "name": "market_haircut",
           "docs": [
-            "Optional H-haircut routing on the FLP fill path.",
+            "Optional H-haircut routing on the LP fill path.",
             "Same opt-in shape as ApplyFill: provide market_haircut +",
             "taker_position_haircut to route the trader's positive PnL into",
-            "the reserve. FLP itself doesn't accumulate realized PnL on a",
+            "the reserve. LP itself doesn't accumulate realized PnL on a",
             "Position PDA — there's nothing maker-side to route, so no",
             "maker_position_haircut here."
           ],
@@ -1680,7 +1680,7 @@
         "(a vault liability), so this payout is conservation-neutral: it drops the",
         "vault and the liability by the same amount. Gated by the same Residual≥0",
         "protocol-solvency floor as every other value-out path — the post-claim",
-        "vault must still cover insurance + FLP + the remaining fee-accrual",
+        "vault must still cover insurance + LP + the remaining fee-accrual",
         "liability."
       ],
       "discriminator": [
@@ -1757,9 +1757,9 @@
           }
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "docs": [
-            "Read-only: FLP capital is a solvency-floor term."
+            "Read-only: LP capital is a solvency-floor term."
           ],
           "pda": {
             "seeds": [
@@ -3157,7 +3157,7 @@
           }
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "pda": {
             "seeds": [
               {
@@ -4179,7 +4179,7 @@
     {
       "name": "deposit_flp_capital",
       "docs": [
-        "Deposit capital into the FLP pool and mint shares at the current",
+        "Deposit capital into the LP pool and mint shares at the current",
         "NAV/share price. Permissionless — any signer can become an LP.",
         "Their LpPositionAccount is created lazily via init_if_needed.",
         "",
@@ -4203,7 +4203,7 @@
           "signer": true
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "writable": true,
           "pda": {
             "seeds": [
@@ -4259,9 +4259,9 @@
           }
         },
         {
-          "name": "flp_mode",
+          "name": "lp_mode",
           "docs": [
-            "Protocol-wide FLP-system lock. Created on the first LP-share mint of",
+            "Protocol-wide LP-system lock. Created on the first LP-share mint of",
             "either system; the singleton and the per-market v3 pool are then mutually",
             "exclusive on minting shares (they redeem from one vault)."
           ],
@@ -4959,9 +4959,9 @@
       ]
     },
     {
-      "name": "flp_deposit_v3",
+      "name": "lp_deposit_v3",
       "docs": [
-        "Deposit FLP capital with REAL SPL transfer + mint pro-rata shares."
+        "Deposit LP capital with REAL SPL transfer + mint pro-rata shares."
       ],
       "discriminator": [
         29,
@@ -5006,7 +5006,7 @@
               {
                 "kind": "account",
                 "path": "exposure.market",
-                "account": "FlpExposurePerMarketAccountV3"
+                "account": "LpExposurePerMarketAccountV3"
               }
             ]
           }
@@ -5082,9 +5082,9 @@
           }
         },
         {
-          "name": "flp_mode",
+          "name": "lp_mode",
           "docs": [
-            "Protocol-wide FLP-system lock (see `deposit_flp_capital`). Claimed for v3",
+            "Protocol-wide LP-system lock (see `deposit_flp_capital`). Claimed for v3",
             "on the first v3 share mint; rejects if the singleton already holds shares."
           ],
           "writable": true,
@@ -5238,7 +5238,7 @@
           "docs": [
             "Protocol vault — credited. MUST be the canonical insurance-fund",
             "vault: an unbound `#[account(mut)]` here would let an attacker pass a",
-            "self-owned destination and still be minted FLP shares redeemable",
+            "self-owned destination and still be minted LP shares redeemable",
             "against the real vault."
           ],
           "writable": true
@@ -5260,15 +5260,15 @@
       ]
     },
     {
-      "name": "flp_post_maker_order",
+      "name": "lp_post_maker_order",
       "docs": [
-        "HLP (pool-backed CLOB), increment 1b — post a resting FLP maker quote onto",
-        "the book, owned by the pool (`trader = flp_exposure` PDA). A taker crossing",
-        "it becomes a normal ring-committed BOOK fill (maker = the FLP PDA), settled",
-        "by the FLP-maker settlement path — so the pool provides on-book liquidity",
+        "HLP (pool-backed CLOB), increment 1b — post a resting LP maker quote onto",
+        "the book, owned by the pool (`trader = lp_exposure` PDA). A taker crossing",
+        "it becomes a normal ring-committed BOOK fill (maker = the LP PDA), settled",
+        "by the LP-maker settlement path — so the pool provides on-book liquidity",
         "that real MMs can improve on (a pool-backed passive maker, solving CLOB",
         "cold-start). Authority-gated for now (the on-chain quoter drives this in a",
-        "later increment); POST-ONLY by construction — an FLP quote must REST, so it",
+        "later increment); POST-ONLY by construction — an LP quote must REST, so it",
         "is rejected if it would cross the opposite best (that would make the pool a",
         "taker against its own book). Moves no capital: pure book insertion."
       ],
@@ -5345,7 +5345,7 @@
           }
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "pda": {
             "seeds": [
               {
@@ -5389,10 +5389,10 @@
       ]
     },
     {
-      "name": "flp_refresh_quotes",
+      "name": "lp_refresh_quotes",
       "docs": [
         "HLP (increment 2) — refresh the pool's on-book quotes. Reads the oracle +",
-        "FLP inventory and runs the SAME deterministic `flp_quoter::generate_quotes`",
+        "LP inventory and runs the SAME deterministic `lp_quoter::generate_quotes`",
         "the view exposes (Avellaneda-Stoikov inventory skew + spread model), then",
         "CANCELS the pool's stale resting quotes and POSTS the fresh two-sided",
         "ladder — turning the pool into a self-managing on-book market maker. The",
@@ -5475,7 +5475,7 @@
           }
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "pda": {
             "seeds": [
               {
@@ -5502,9 +5502,9 @@
       "args": []
     },
     {
-      "name": "flp_withdraw_v3",
+      "name": "lp_withdraw_v3",
       "docs": [
-        "Withdraw FLP capital by burning shares + SPL release."
+        "Withdraw LP capital by burning shares + SPL release."
       ],
       "discriminator": [
         7,
@@ -5549,7 +5549,7 @@
               {
                 "kind": "account",
                 "path": "exposure.market",
-                "account": "FlpExposurePerMarketAccountV3"
+                "account": "LpExposurePerMarketAccountV3"
               }
             ]
           }
@@ -7080,7 +7080,7 @@
     {
       "name": "init_flp_per_market_v3",
       "docs": [
-        "Initialize a per-market FLP exposure account. Authority-only."
+        "Initialize a per-market LP exposure account. Authority-only."
       ],
       "discriminator": [
         226,
@@ -7659,7 +7659,7 @@
         "",
         "Owner doesn't need to sign — anyone can fund someone else's ATA",
         "creation. The mint is constrained to the protocol's `quote_mint`",
-        "so this can only be used to create ATAs that Flash Book accepts."
+        "so this can only be used to create ATAs that Clober accepts."
       ],
       "discriminator": [
         148,
@@ -7830,7 +7830,7 @@
     {
       "name": "initialize_flp_exposure",
       "docs": [
-        "Initialize the FLP exposure account (one per protocol). Must run",
+        "Initialize the LP exposure account (one per protocol). Must run",
         "before `initialize_market`. Mints `initial_capital_quote_lots` shares",
         "to the authority at 1:1 (treasury endowment); these shares can later",
         "be redeemed via `withdraw_flp_capital`."
@@ -7852,7 +7852,7 @@
           "signer": true
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "writable": true,
           "pda": {
             "seeds": [
@@ -8057,7 +8057,7 @@
         "Initialize an insurance fund (one per protocol). Also creates the",
         "global protocol quote vault — a TokenAccount for `quote_mint` whose",
         "authority is the insurance_fund PDA itself. All trader collateral",
-        "and FLP capital flows through this vault."
+        "and LP capital flows through this vault."
       ],
       "discriminator": [
         2,
@@ -8153,7 +8153,7 @@
       "name": "initialize_market",
       "docs": [
         "Initialize a new market and all associated PDAs. AUTHORITY-GATED:",
-        "only the protocol authority can deploy markets — Flash Book does",
+        "only the protocol authority can deploy markets — Clober does",
         "not support permissionless market creation. The `creator` field",
         "on the market account is zeroed (no creator share / HIP-3-style",
         "fee split is paid out unless the authority later patches in a",
@@ -8244,7 +8244,7 @@
           }
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "pda": {
             "seeds": [
               {
@@ -9742,7 +9742,7 @@
           "writable": true
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "pda": {
             "seeds": [
               {
@@ -9811,7 +9811,7 @@
           "writable": true
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "pda": {
             "seeds": [
               {
@@ -11528,7 +11528,7 @@
     {
       "name": "record_flp_fill_v3",
       "docs": [
-        "Record a fill on this per-market FLP exposure."
+        "Record a fill on this per-market LP exposure."
       ],
       "discriminator": [
         29,
@@ -11605,7 +11605,7 @@
               {
                 "kind": "account",
                 "path": "exposure.market",
-                "account": "FlpExposurePerMarketAccountV3"
+                "account": "LpExposurePerMarketAccountV3"
               }
             ]
           }
@@ -14625,7 +14625,7 @@
         "`oracle_staleness_max_seconds == 0`, set it to a sane value in",
         "`[MIN_HEAL_STALENESS_SECONDS, MAX_HEAL_STALENESS_SECONDS]`. Every OTHER",
         "parameter change — all economic params (fees, margins, funding, oracle",
-        "band, FLP coefficients, …) and any change to an ALREADY-enabled staleness",
+        "band, LP coefficients, …) and any change to an ALREADY-enabled staleness",
         "bound — MUST go through the timelocked `propose_param_update` →",
         "`execute_param_update` path, so LPs and traders get 48h notice. This",
         "removes the immediate-governance rug vector while preserving the one",
@@ -16014,7 +16014,7 @@
         "`vault >= Σ collateral + flp + insurance`: it sums REAL collateral from the",
         "deduplicated trader-state (cross) and isolated-position accounts supplied in",
         "`remaining_accounts` and errors if that PARTIAL sum already exceeds the",
-        "vault's headroom over FLP + insurance — sound regardless of unseen accounts,",
+        "vault's headroom over LP + insurance — sound regardless of unseen accounts,",
         "since the real total is `>=` the partial sum. It reads live balances, so it",
         "CANNOT desync from the 47 collateral-mutation sites the way a stored",
         "aggregate would. `fully_covered` is the caller's off-chain attestation that",
@@ -16068,7 +16068,7 @@
           }
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "pda": {
             "seeds": [
               {
@@ -16249,8 +16249,8 @@
         "cheapest invariant to verify on-chain.)",
         "",
         "Future invariants this hook can absorb:",
-        "S4 — vault balance ≥ Σ trader collateral + FLP capital",
-        "S12 — FLP per-batch growth ≤ pool_capital × max_growth%",
+        "S4 — vault balance ≥ Σ trader collateral + LP capital",
+        "S12 — LP per-batch growth ≤ pool_capital × max_growth%",
         "S14 — mark price within oracle band ±band_bps"
       ],
       "discriminator": [
@@ -16318,7 +16318,7 @@
         "for a single-tx check). Catches the gross failure modes:",
         "• Vault drained below the LP claims (programmatic bug)",
         "• Insurance balance > vault (double-credit accounting bug)",
-        "• FLP capital not reflected in vault (lost-funds bug)"
+        "• LP capital not reflected in vault (lost-funds bug)"
       ],
       "discriminator": [
         251,
@@ -16365,7 +16365,7 @@
           }
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "pda": {
             "seeds": [
               {
@@ -16574,7 +16574,7 @@
           }
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "pda": {
             "seeds": [
               {
@@ -16603,7 +16603,7 @@
     {
       "name": "view_quote_ladder",
       "docs": [
-        "View ix: snapshot the FLP quoter's would-be next quote ladder",
+        "View ix: snapshot the LP quoter's would-be next quote ladder",
         "(no state change). Runs the same `generate_quotes` computation",
         "the matcher consumes but doesn't mutate any state. Emits",
         "`QuoteLadderSnapshotEvent` carrying the top-N levels (each side)",
@@ -16611,7 +16611,7 @@
         "",
         "Levels are interleaved bid/ask in seq order: [bid0, ask0,",
         "bid1, ask1, ...] — same emission order as the matcher would",
-        "see. `levels_emitted` is bounded by `params.flp_quote_levels`."
+        "see. `levels_emitted` is bounded by `params.lp_quote_levels`."
       ],
       "discriminator": [
         146,
@@ -16653,7 +16653,7 @@
           }
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "pda": {
             "seeds": [
               {
@@ -17118,7 +17118,7 @@
     {
       "name": "withdraw_flp_capital",
       "docs": [
-        "LP withdraws capital from the FLP pool. Blocked if it would push",
+        "LP withdraws capital from the LP pool. Blocked if it would push",
         "utilization past 100% (current gross exposure must remain ≤ new",
         "capital).",
         "Burn `shares_to_burn` LP shares and withdraw the proportional NAV",
@@ -17127,11 +17127,11 @@
         "",
         "Amount returned = shares_to_burn × NAV / shares_outstanding.",
         "",
-        "Position-aware solvency guard: when the FLP has open positions",
+        "Position-aware solvency guard: when the LP has open positions",
         "(markets_count > 0), the caller must pass each active market as",
         "`remaining_accounts`. We compute gross_exposure = Σ |size × mark|",
         "across all per_market entries and require post-withdraw NAV ≥",
-        "gross_exposure. This lets LPs withdraw while the FLP carries",
+        "gross_exposure. This lets LPs withdraw while the LP carries",
         "positions, as long as enough NAV remains to absorb a max-shock",
         "loss. The empty-pool case (markets_count == 0) skips the walk."
       ],
@@ -17151,7 +17151,7 @@
           "signer": true
         },
         {
-          "name": "flp_exposure",
+          "name": "lp_exposure",
           "writable": true,
           "pda": {
             "seeds": [
@@ -17700,7 +17700,7 @@
       ]
     },
     {
-      "name": "FlpExposureAccount",
+      "name": "LpExposureAccount",
       "discriminator": [
         156,
         44,
@@ -17713,7 +17713,7 @@
       ]
     },
     {
-      "name": "FlpExposurePerMarketAccountV3",
+      "name": "LpExposurePerMarketAccountV3",
       "discriminator": [
         174,
         206,
@@ -17726,7 +17726,7 @@
       ]
     },
     {
-      "name": "FlpModeAccount",
+      "name": "LpModeAccount",
       "discriminator": [
         61,
         26,
@@ -17739,7 +17739,7 @@
       ]
     },
     {
-      "name": "FlpPositionAccountV3",
+      "name": "LpPositionAccountV3",
       "discriminator": [
         18,
         136,
@@ -18534,7 +18534,7 @@
       ]
     },
     {
-      "name": "FlpCapitalUpdatedEvent",
+      "name": "LpCapitalUpdatedEvent",
       "discriminator": [
         156,
         137,
@@ -18547,7 +18547,7 @@
       ]
     },
     {
-      "name": "FlpDepositedV3Event",
+      "name": "LpDepositedV3Event",
       "discriminator": [
         90,
         65,
@@ -18560,7 +18560,7 @@
       ]
     },
     {
-      "name": "FlpExposureInitializedEvent",
+      "name": "LpExposureInitializedEvent",
       "discriminator": [
         131,
         165,
@@ -18573,7 +18573,7 @@
       ]
     },
     {
-      "name": "FlpFillAppliedEvent",
+      "name": "LpFillAppliedEvent",
       "discriminator": [
         47,
         91,
@@ -18586,7 +18586,7 @@
       ]
     },
     {
-      "name": "FlpFillRecordedV3Event",
+      "name": "LpFillRecordedV3Event",
       "discriminator": [
         52,
         144,
@@ -18599,7 +18599,7 @@
       ]
     },
     {
-      "name": "FlpMakerOrderPostedEvent",
+      "name": "LpMakerOrderPostedEvent",
       "discriminator": [
         152,
         47,
@@ -18612,7 +18612,7 @@
       ]
     },
     {
-      "name": "FlpPerMarketInitV3Event",
+      "name": "LpPerMarketInitV3Event",
       "discriminator": [
         177,
         87,
@@ -18625,7 +18625,7 @@
       ]
     },
     {
-      "name": "FlpQuotesRefreshedEvent",
+      "name": "LpQuotesRefreshedEvent",
       "discriminator": [
         140,
         67,
@@ -18638,7 +18638,7 @@
       ]
     },
     {
-      "name": "FlpWithdrawnV3Event",
+      "name": "LpWithdrawnV3Event",
       "discriminator": [
         162,
         57,
@@ -20017,8 +20017,8 @@
     },
     {
       "code": 7211,
-      "name": "FlpWithdrawUndercollateralized",
-      "msg": "Withdraw would leave FLP NAV below required exposure coverage"
+      "name": "LpWithdrawUndercollateralized",
+      "msg": "Withdraw would leave LP NAV below required exposure coverage"
     },
     {
       "code": 7212,
@@ -20148,7 +20148,7 @@
     {
       "code": 7502,
       "name": "ProtocolInsolvent",
-      "msg": "Protocol insolvent: summed trader collateral exceeds vault headroom over FLP + insurance"
+      "msg": "Protocol insolvent: summed trader collateral exceeds vault headroom over LP + insurance"
     },
     {
       "code": 7700,
@@ -20317,8 +20317,8 @@
     },
     {
       "code": 8205,
-      "name": "FlpPriceOutsideBand",
-      "msg": "FLP fill price deviates from the oracle by more than the safety band — fabricated or mispriced"
+      "name": "LpPriceOutsideBand",
+      "msg": "LP fill price deviates from the oracle by more than the safety band — fabricated or mispriced"
     },
     {
       "code": 8206,
@@ -20397,8 +20397,8 @@
     },
     {
       "code": 8308,
-      "name": "FlpPoolInsolvent",
-      "msg": "FLP pool is insolvent (NAV <= 0 while shares are outstanding) — deposits paused to prevent dilution of the new depositor"
+      "name": "LpPoolInsolvent",
+      "msg": "LP pool is insolvent (NAV <= 0 while shares are outstanding) — deposits paused to prevent dilution of the new depositor"
     },
     {
       "code": 8309,
@@ -20433,7 +20433,7 @@
     {
       "code": 8315,
       "name": "RefreshTooSoon",
-      "msg": "FLP quote refresh rate-limited: the pool's quotes are still fresh"
+      "msg": "LP quote refresh rate-limited: the pool's quotes are still fresh"
     },
     {
       "code": 8316,
@@ -20452,8 +20452,8 @@
     },
     {
       "code": 8321,
-      "name": "FlpSystemModeConflict",
-      "msg": "FLP system conflict: the other FLP accounting system already holds LP shares (singleton and per-market v3 are mutually exclusive)"
+      "name": "LpSystemModeConflict",
+      "msg": "LP system conflict: the other LP accounting system already holds LP shares (singleton and per-market v3 are mutually exclusive)"
     },
     {
       "code": 8322,
@@ -21105,7 +21105,7 @@
         "Result of a drift-free collateral-solvency sweep (`verify_collateral_solvency`).",
         "`collateral_accounts_summed` deduplicated trader/position accounts contributed",
         "`partial_collateral_quote_lots`; if that already exceeds the vault headroom",
-        "over FLP + insurance the protocol is provably insolvent (`insolvent_proven`).",
+        "over LP + insurance the protocol is provably insolvent (`insolvent_proven`).",
         "`fully_covered` is the caller's attestation that EVERY collateral-holding",
         "account was supplied — only then does a non-insolvent result prove solvency."
       ],
@@ -21117,7 +21117,7 @@
             "type": "u64"
           },
           {
-            "name": "flp_capital_quote_lots",
+            "name": "lp_capital_quote_lots",
             "type": "u64"
           },
           {
@@ -22018,7 +22018,7 @@
       "docs": [
         "Per-fill payload inside a `FillBatchEvent`. The redundant `market`",
         "/ `taker` / `taker_side` / `taker_id` fields live once on the parent.",
-        "`maker == Pubkey::default()` signals an FLP virtual-quote fill — the",
+        "`maker == Pubkey::default()` signals an LP virtual-quote fill — the",
         "off-chain sequencer dispatches `apply_flp_fill` for those entries",
         "and `apply_fill` for the rest."
       ],
@@ -22145,7 +22145,7 @@
       }
     },
     {
-      "name": "FlpCapitalUpdatedEvent",
+      "name": "LpCapitalUpdatedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -22161,7 +22161,7 @@
       }
     },
     {
-      "name": "FlpDepositedV3Event",
+      "name": "LpDepositedV3Event",
       "type": {
         "kind": "struct",
         "fields": [
@@ -22193,9 +22193,9 @@
       }
     },
     {
-      "name": "FlpExposureAccount",
+      "name": "LpExposureAccount",
       "docs": [
-        "FLP pool exposure across markets and per-LP share accounting.",
+        "LP pool exposure across markets and per-LP share accounting.",
         "",
         "The pool's NAV (Net Asset Value) is `total_capital_quote_lots +",
         "realized_pnl`. LPs own `shares` of `lp_shares_outstanding`; their",
@@ -22210,7 +22210,7 @@
           {
             "name": "authority",
             "docs": [
-              "Protocol admin — manages FLP-level governance ops (initial endowment,",
+              "Protocol admin — manages LP-level governance ops (initial endowment,",
               "future emergency pause). Distinct from LPs, who own shares."
             ],
             "type": "pubkey"
@@ -22230,7 +22230,7 @@
           {
             "name": "realized_pnl",
             "docs": [
-              "Cumulative realized P&L from FLP fills across all markets. Signed.",
+              "Cumulative realized P&L from LP fills across all markets. Signed.",
               "The other term of NAV."
             ],
             "type": "i64"
@@ -22253,7 +22253,7 @@
               "array": [
                 {
                   "defined": {
-                    "name": "FlpMarketExposure"
+                    "name": "LpMarketExposure"
                   }
                 },
                 16
@@ -22264,7 +22264,7 @@
       }
     },
     {
-      "name": "FlpExposureInitializedEvent",
+      "name": "LpExposureInitializedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -22280,9 +22280,9 @@
       }
     },
     {
-      "name": "FlpExposurePerMarketAccountV3",
+      "name": "LpExposurePerMarketAccountV3",
       "docs": [
-        "Per-market FLP exposure. Replaces the singleton's per_market[] array",
+        "Per-market LP exposure. Replaces the singleton's per_market[] array",
         "for independent ER-delegation per market."
       ],
       "type": {
@@ -22337,7 +22337,7 @@
       }
     },
     {
-      "name": "FlpFillAppliedEvent",
+      "name": "LpFillAppliedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -22366,18 +22366,18 @@
             "type": "u64"
           },
           {
-            "name": "flp_size_after",
+            "name": "lp_size_after",
             "type": "u64"
           },
           {
-            "name": "flp_side_after",
+            "name": "lp_side_after",
             "type": "u8"
           }
         ]
       }
     },
     {
-      "name": "FlpFillRecordedV3Event",
+      "name": "LpFillRecordedV3Event",
       "type": {
         "kind": "struct",
         "fields": [
@@ -22417,7 +22417,7 @@
       }
     },
     {
-      "name": "FlpMakerOrderPostedEvent",
+      "name": "LpMakerOrderPostedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -22445,7 +22445,7 @@
       }
     },
     {
-      "name": "FlpMarketExposure",
+      "name": "LpMarketExposure",
       "type": {
         "kind": "struct",
         "fields": [
@@ -22469,10 +22469,10 @@
       }
     },
     {
-      "name": "FlpModeAccount",
+      "name": "LpModeAccount",
       "docs": [
-        "Protocol-wide FLP-system lock. The singleton `FlpExposureAccount`",
-        "(`apply_flp_fill` books every FLP fill into it) and the per-market v3 FLP",
+        "Protocol-wide LP-system lock. The singleton `LpExposureAccount`",
+        "(`apply_flp_fill` books every LP fill into it) and the per-market v3 LP",
         "redeem from the SAME vault, so LP shares outstanding in both would",
         "double-count the same realized PnL and let the last redeemers over-withdraw.",
         "This singleton records which system minted shares first; the other system's",
@@ -22507,7 +22507,7 @@
       }
     },
     {
-      "name": "FlpPerMarketInitV3Event",
+      "name": "LpPerMarketInitV3Event",
       "type": {
         "kind": "struct",
         "fields": [
@@ -22523,9 +22523,9 @@
       }
     },
     {
-      "name": "FlpPositionAccountV3",
+      "name": "LpPositionAccountV3",
       "docs": [
-        "Per-LP, per-market FLP shares balance."
+        "Per-LP, per-market LP shares balance."
       ],
       "type": {
         "kind": "struct",
@@ -22569,7 +22569,7 @@
       }
     },
     {
-      "name": "FlpQuotesRefreshedEvent",
+      "name": "LpQuotesRefreshedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -22601,7 +22601,7 @@
       }
     },
     {
-      "name": "FlpWithdrawnV3Event",
+      "name": "LpWithdrawnV3Event",
       "type": {
         "kind": "struct",
         "fields": [
@@ -23102,7 +23102,7 @@
             "name": "quote_mint",
             "docs": [
               "SPL mint for the protocol's quote currency (typically USDC). All",
-              "collateral and FLP capital moves through this mint."
+              "collateral and LP capital moves through this mint."
             ],
             "type": "pubkey"
           },
@@ -23111,7 +23111,7 @@
             "docs": [
               "Global protocol vault TokenAccount. Owned by the InsuranceFundAccount",
               "PDA (which signs transfers out via known seeds). Holds all trader",
-              "collateral + FLP capital."
+              "collateral + LP capital."
             ],
             "type": "pubkey"
           },
@@ -23498,7 +23498,7 @@
           {
             "name": "shares",
             "docs": [
-              "Shares of FlpExposureAccount.lp_shares_outstanding owned by this LP."
+              "Shares of LpExposureAccount.lp_shares_outstanding owned by this LP."
             ],
             "type": "u64"
           },
@@ -23522,7 +23522,7 @@
             "docs": [
               "Slot of the most recent deposit. (Re)set on every deposit via",
               "`jit_lp_defense::extend_lock_on_deposit`; `withdraw_flp_capital` is gated",
-              "on `jit_lp_defense::can_withdraw(deposited_at_slot, now, FLP_MIN_HOLD_SLOTS)`",
+              "on `jit_lp_defense::can_withdraw(deposited_at_slot, now, LP_MIN_HOLD_SLOTS)`",
               "to defeat flash / short-window deposit→NAV-windfall→redeem. Trailing",
               "field within the allocation slack: pre-existing LP accounts",
               "deserialize it as 0 ⇒ immediately withdrawable."
@@ -23694,7 +23694,7 @@
             "type": "pubkey"
           },
           {
-            "name": "flp_pool",
+            "name": "lp_pool",
             "type": "pubkey"
           },
           {
@@ -24835,43 +24835,43 @@
             "type": "u32"
           },
           {
-            "name": "flp_spread_base_bps",
+            "name": "lp_spread_base_bps",
             "type": "u32"
           },
           {
-            "name": "flp_spread_alpha_bps",
+            "name": "lp_spread_alpha_bps",
             "type": "u32"
           },
           {
-            "name": "flp_spread_beta_bps",
+            "name": "lp_spread_beta_bps",
             "type": "u32"
           },
           {
-            "name": "flp_spread_gamma_bps",
+            "name": "lp_spread_gamma_bps",
             "type": "u32"
           },
           {
-            "name": "flp_spread_kappa_bps",
+            "name": "lp_spread_kappa_bps",
             "type": "u32"
           },
           {
-            "name": "flp_spread_delta_bps",
+            "name": "lp_spread_delta_bps",
             "type": "u32"
           },
           {
-            "name": "flp_inventory_lambda_bps",
+            "name": "lp_inventory_lambda_bps",
             "type": "u32"
           },
           {
-            "name": "flp_depth_floor_lots",
+            "name": "lp_depth_floor_lots",
             "type": "u64"
           },
           {
-            "name": "flp_max_growth_per_batch_bps",
+            "name": "lp_max_growth_per_batch_bps",
             "type": "u32"
           },
           {
-            "name": "flp_quote_levels",
+            "name": "lp_quote_levels",
             "type": "u8"
           },
           {
@@ -24930,11 +24930,11 @@
           {
             "name": "max_position_ratio_bps",
             "docs": [
-              "Per-trader maximum position notional as bps of FLP capital.",
-              "E.g. 10 = 0.1% of FLP capital. 0 = unlimited (only the absolute",
+              "Per-trader maximum position notional as bps of LP capital.",
+              "E.g. 10 = 0.1% of LP capital. 0 = unlimited (only the absolute",
               "`max_position_lots_per_trader` gate applies). Computed at order",
               "placement against the trader's projected post-fill notional and",
-              "the FLP's `total_capital_quote_lots`. Defends against cap-relative",
+              "the LP's `total_capital_quote_lots`. Defends against cap-relative",
               "concentration risk that the absolute lots cap can't enforce when",
               "the pool grows or shrinks."
             ],
@@ -25041,8 +25041,8 @@
               "circuit breaker against runaway exposure on a single market —",
               "new orders that would push OI past the cap are rejected at",
               "place_limit_order_v2 intake. Distinct from `max_position_lots_per_trader`",
-              "(per-trader) and `max_position_ratio_bps` (per-trader as % of FLP);",
-              "this caps the WHOLE-MARKET aggregate. Typical: scaled with FLP",
+              "(per-trader) and `max_position_ratio_bps` (per-trader as % of LP);",
+              "this caps the WHOLE-MARKET aggregate. Typical: scaled with LP",
               "capital × leverage so worst-case insurance draw stays bounded."
             ],
             "type": "u64"
@@ -25071,7 +25071,7 @@
               "harder to liquidate without market impact. 0 threshold = tier",
               "disabled (single-MMR for the whole market). Smarter than HL's",
               "flat per-market MMR.",
-              "Typical: threshold sized to 1-5% of FLP capital; extra 100-500 bps."
+              "Typical: threshold sized to 1-5% of LP capital; extra 100-500 bps."
             ],
             "type": "u64"
           },
@@ -26414,7 +26414,7 @@
             "type": "u64"
           },
           {
-            "name": "flp_capital_quote_lots",
+            "name": "lp_capital_quote_lots",
             "type": "u64"
           },
           {
@@ -26435,8 +26435,8 @@
     {
       "name": "QuoteLadderSnapshotEvent",
       "docs": [
-        "View ix output: snapshot of the FLP quoter's would-be next-batch",
-        "quote ladder. The ladder is deterministic given (market state, FLP",
+        "View ix output: snapshot of the LP quoter's would-be next-batch",
+        "quote ladder. The ladder is deterministic given (market state, LP",
         "state, oracle) — off-chain consumers can re-run `generate_quotes`",
         "with the same inputs for the full per-level array; this emit only",
         "carries the top-level summary to keep the log compact."

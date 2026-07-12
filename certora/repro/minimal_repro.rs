@@ -1,13 +1,13 @@
 //! MINIMAL Certora Solana Prover reproducer for the Anchor `error!` global-memcpy
-//! pointer-analysis failure. Compiled into the flash-book-certora-harness crate.
+//! pointer-analysis failure. Compiled into the clober-certora-harness crate.
 //! Add `repro_anchor_error_memcpy` to a conf's `rule` set and run certoraSolanaProver.
 //!
 //! Expected: UNKNOWN — "[3308] illegal dereference of an absolute address ... at
 //! call sol_memcpy_" — even though the assertion is trivially true. The ONLY cause
-//! is the pointer analysis of the Anchor `require!`/`error!(FlashBookError::…)`
+//! is the pointer analysis of the Anchor `require!`/`error!(CloberError::…)`
 //! construction (which memcpy's a &'static global), reached via check_simple_withdraw.
 use cvlr::prelude::*;
-use flash_book::xmargin::check_simple_withdraw;
+use clober::xmargin::check_simple_withdraw;
 
 #[rule]
 pub fn repro_anchor_error_memcpy() {

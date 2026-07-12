@@ -1,8 +1,8 @@
-# GOTCHAS.md — non-obvious footguns for Flash Book clients
+# GOTCHAS.md — non-obvious footguns for Clober clients
 
 Read this before writing a client or an agent. Everything here is behavior that
 will surprise you if you assume "it works like a typical CLOB." Grounded in the
-on-chain program; when in doubt the IDL (`idl/flash_book.json`) and the account
+on-chain program; when in doubt the IDL (`idl/clober.json`) and the account
 init constraints are the source of truth.
 
 ## PDA seeds

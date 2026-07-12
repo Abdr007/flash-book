@@ -52,7 +52,7 @@ be withdrawn.** Only the fraction the opposing side can truly pay is ever usable
 This composes with the two already-proven halves of the launch claim:
 - **3.2** (`withdraw_cannot_self_liquidate_below_maintenance`) — can't withdraw
   into liquidation.
-- **5.2** (`bad_debt_coverage_is_insurance_isolated_and_bounded`) — an FLP loss
+- **5.2** (`bad_debt_coverage_is_insurance_isolated_and_bounded`) — an LP loss
   can't drain insurance.
 - **3.1** (this) — a manipulated market can't mint cross-domain credit.
 

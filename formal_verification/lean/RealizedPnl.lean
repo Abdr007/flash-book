@@ -29,7 +29,7 @@ The core money-safety facts proven below:
   1. sign correctness — a long realizes a PROFIT iff it closes above entry, a
      short iff it closes below entry (no side/sign confusion can mint value);
   2. breakeven — closing at the entry price realizes exactly zero;
-  3. cross-system reconciliation — the clober PnL satisfies the Flash V2
+  3. cross-system reconciliation — the clober PnL satisfies the notional-return formula
      notional identity `pnl · entry = sign · (price − entry) · notional`
      (`notional = closed · entry · tick`) EXACTLY, at unbounded width;
   4. the closed-lot count is `min(fill, size)` — `fill` on a pure reduce,
@@ -126,7 +126,7 @@ theorem realized_on_reduce (side entry price tick fill size : ℕ) (h : fill ≤
       = sign side * (fill : ℤ) * ((price : ℤ) - (entry : ℤ)) * (tick : ℤ) := by
   rw [closed_reduce fill size h]; rfl
 
-/-- MARQUEE — cross-system reconciliation with the Flash V2 notional-return
+/-- MARQUEE — cross-system reconciliation with the notional-return
 formula. V2 settles `(mark − entry)/entry · notional` with
 `notional = closed·entry·tick`; multiplying out the division, the clober
 integer PnL satisfies the exact identity

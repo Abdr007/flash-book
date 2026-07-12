@@ -1,9 +1,9 @@
-# AGENTS.md — trading Flash Book from an agent
+# AGENTS.md — trading Clober from an agent
 
-Flash Book is a fully on-chain central-limit-order-book (CLOB) perps DEX on Solana.
+Clober is a fully on-chain central-limit-order-book (CLOB) perps DEX on Solana.
 This file is the canonical, machine-readable guide for an autonomous agent (or any
 LLM-driven client) to trade on it. Everything here is derived from the committed
-IDL (`idl/flash_book.json`) and the on-chain program — no aspirational APIs.
+IDL (`idl/clober.json`) and the on-chain program — no aspirational APIs.
 
 > **Status: devnet, unaudited.** Read [`docs/LAUNCH_FRAMING.md`](docs/LAUNCH_FRAMING.md)
 > before touching real value. The safety guarantees below are *machine-proven*
@@ -11,7 +11,7 @@ IDL (`idl/flash_book.json`) and the on-chain program — no aspirational APIs.
 > pre-audit. Run it, read it, break it.
 
 - **Program ID:** `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq`
-- **Anchor IDL:** [`idl/flash_book.json`](idl/flash_book.json) — 149 instructions,
+- **Anchor IDL:** [`idl/clober.json`](idl/clober.json) — 149 instructions,
   28 account types, 138 events, 114 typed errors. Load it with
   `@coral-xyz/anchor`'s `Program`.
 - **Machine-readable index:** [`llms.txt`](llms.txt)
@@ -91,7 +91,7 @@ from events alone, so an agent can maintain a verified local mirror.
 ```js
 import anchor from "@coral-xyz/anchor";
 import fs from "fs";
-const IDL = JSON.parse(fs.readFileSync("idl/flash_book.json"));
+const IDL = JSON.parse(fs.readFileSync("idl/clober.json"));
 const program = new anchor.Program(IDL, provider); // provider wraps your Connection + Wallet
 // open + fund
 await program.methods.openTraderState().accounts({ /* … */ }).rpc();

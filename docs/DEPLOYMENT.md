@@ -23,17 +23,17 @@ solana airdrop 2
 ## 1. Build (BPF)
 
 ```bash
-cd /path/to/flash-book
-cargo build-sbf --tools-version v1.52 --manifest-path programs/flash-book/Cargo.toml --sbf-out-dir target/deploy
+cd /path/to/clober
+cargo build-sbf --tools-version v1.52 --manifest-path programs/clober/Cargo.toml --sbf-out-dir target/deploy
 # platform-tools v1.52 (rustc 1.89) is required: earlier releases cannot
 # compile edition2024 dependencies.
 ```
 
 This produces:
-- `target/sbf-solana-solana/release/flash_book.so` (or
-  `target/deploy/flash_book.so` via Anchor) — the BPF program binary
-- `target/idl/flash_book.json` — the Anchor IDL (or regenerate
-  via `anchor idl build -p flash_book > idl/flash_book.json`)
+- `target/sbf-solana-solana/release/clober.so` (or
+  `target/deploy/clober.so` via Anchor) — the BPF program binary
+- `target/idl/clober.json` — the Anchor IDL (or regenerate
+  via `anchor idl build -p clober > idl/clober.json`)
 
 The build is clean as of Phase 2j (commit `66bde61`). Earlier
 versions of this runbook noted a `constant_time_eq` edition2024
@@ -42,12 +42,12 @@ dependency conflict — resolved by Solana platform-tools v1.49+.
 ## 2. Deploy
 
 ```bash
-solana program deploy target/sbf-solana-solana/release/flash_book.so \
-  --program-id keys/flash_book-keypair.json
+solana program deploy target/sbf-solana-solana/release/clober.so \
+  --program-id keys/clober-keypair.json
 ```
 
 Capture the printed program ID. The declared ID lives in
-`programs/flash-book/src/lib.rs::declare_id!()` and in `Anchor.toml`;
+`programs/clober/src/lib.rs::declare_id!()` and in `Anchor.toml`;
 both must match the deployed key. Current devnet ID:
 `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq`. If you need to
 override, regenerate with `anchor keys sync` after building and
@@ -58,22 +58,22 @@ at file scope for the runtime DeclaredProgramIdMismatch check).
 
 These two are global and create at the program ID's PDA seeds:
 - `["insurance_fund"]`
-- `["flp_exposure"]`
+- `["lp_exposure"]`
 
 Using the SDK:
 
 ```ts
 import { Connection, Keypair } from '@solana/web3.js';
 import { Wallet } from '@coral-xyz/anchor';
-import { FlashBookClient, defaultInsuranceFundParams } from './client';
+import { CloberClient, defaultInsuranceFundParams } from './client';
 
 const conn = new Connection('https://api.devnet.solana.com');
 const authority = /* load deployer keypair */;
-const client = new FlashBookClient(conn, new Wallet(authority));
+const client = new CloberClient(conn, new Wallet(authority));
 
 const setupTx = await new Transaction()
   .add(await client.initializeInsuranceFundIx(authority.publicKey, defaultInsuranceFundParams()))
-  .add(await client.initializeFlpExposureIx(authority.publicKey, new BN(5_000_000)));
+  .add(await client.initializeLiquidityPoolIx(authority.publicKey, new BN(5_000_000)));
 await sendAndConfirmTransaction(conn, setupTx, [authority]);
 ```
 
@@ -98,13 +98,13 @@ await sendAndConfirmTransaction(conn, initTx, [authority]);
 
 The `defaultMajorMarketParams()` is calibrated for SOL/BTC/ETH-style
 liquid markets. Use a different param set for long-tail markets
-(narrower lot/tick, wider liq penalty, smaller FLP cap per batch).
+(narrower lot/tick, wider liq penalty, smaller LP cap per batch).
 
 ## 5. Onboard the first trader
 
 ```ts
 const trader = /* load trader keypair */;
-const traderClient = new FlashBookClient(conn, new Wallet(trader));
+const traderClient = new CloberClient(conn, new Wallet(trader));
 
 const tx = new Transaction()
   .add(await traderClient.openTraderStateIx(trader.publicKey))
@@ -167,7 +167,7 @@ subscribeToProgramEvents(conn, (event, slot, sig) => {
 ```
 
 For each `FillAppliedEvent` in a batch's logs, the sequencer (or any
-authorized actor) submits an `apply_fill` or `apply_flp_fill` tx to
+authorized actor) submits an `apply_fill` or `apply_lp_fill` tx to
 mutate the affected Position PDAs.
 
 ## 8. Run a liquidation bot
@@ -252,8 +252,8 @@ in `transfer_market_authority_rotates_keys` E2E test.
 Run `examples/live-monitor.ts` as a background service:
 
 ```bash
-FLASH_BOOK_LIVE=1 \
-FLASH_BOOK_RPC=<your_rpc> \
+CLOBER_LIVE=1 \
+CLOBER_RPC=<your_rpc> \
   bun run examples/live-monitor.ts <market_pda> <trader_pubkey>
 ```
 
