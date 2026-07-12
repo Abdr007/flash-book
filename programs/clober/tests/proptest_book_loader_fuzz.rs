@@ -15,9 +15,8 @@
 
 use anchor_lang::prelude::Pubkey;
 use clober::book_state::{
-    encode_order_id, MarketBookHandle, RestingOrder, MARKET_BOOK_DISC,
-    MARKET_BOOK_MAX_TOTAL_BYTES, MARKET_BOOK_PREFIX_BYTES, MARKET_BOOK_TOTAL_BYTES,
-    NODE_TOTAL_BYTES,
+    encode_order_id, MarketBookHandle, RestingOrder, MARKET_BOOK_DISC, MARKET_BOOK_MAX_TOTAL_BYTES,
+    MARKET_BOOK_PREFIX_BYTES, MARKET_BOOK_TOTAL_BYTES, NODE_TOTAL_BYTES,
 };
 use proptest::prelude::*;
 

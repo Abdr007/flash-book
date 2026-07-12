@@ -7,9 +7,9 @@
 
 use anchor_lang::prelude::Pubkey;
 use clober::matcher::{
-    lp_quoter::{generate_quotes, LpQuoterInputs, LpQuoterParams},
     insurance::InsuranceFund,
     lot::Ticks,
+    lp_quoter::{generate_quotes, LpQuoterInputs, LpQuoterParams},
 };
 use proptest::prelude::*;
 

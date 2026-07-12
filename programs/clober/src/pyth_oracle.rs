@@ -100,10 +100,7 @@ pub fn get_price_no_older_than_full(
     // `update_oracle` path, which already future-rejects.
     require!(publish_time <= now_unix, CloberError::OracleTooStale);
     let age = now_unix.saturating_sub(publish_time);
-    require!(
-        age <= max_age_seconds as i64,
-        CloberError::OracleTooStale
-    );
+    require!(age <= max_age_seconds as i64, CloberError::OracleTooStale);
 
     Ok(PythPrice {
         price,

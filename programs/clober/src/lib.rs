@@ -20,18 +20,18 @@ use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer};
 
+pub mod book_state;
 pub mod constants;
 pub mod er;
 pub mod er_permission;
 pub mod errors;
+pub mod extended_state;
 pub mod hypertree;
 pub mod lazer_oracle;
 pub mod matcher;
 pub mod pyth_oracle;
 pub mod session;
 pub mod state;
-pub mod book_state;
-pub mod extended_state;
 pub mod xmargin;
 
 #[cfg(test)]
@@ -51,8 +51,8 @@ use matcher::risk::{
     PositionSnapshot as RiskPosSnap,
 };
 use state::{
-    CopyVaultAccount, CopyVaultShareAccount, FeeAccrualAccount, LiquidityPoolAccount,
-    InsuranceFundAccount, MarketAccount, MarketParams, TraderStateAccount,
+    CopyVaultAccount, CopyVaultShareAccount, FeeAccrualAccount, InsuranceFundAccount,
+    LiquidityPoolAccount, MarketAccount, MarketParams, TraderStateAccount,
 };
 
 declare_id!("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
@@ -516,11 +516,7 @@ pub mod clober {
         // Defence-in-depth: the PDA must still be owned by us. A delegated
         // book is owned by the delegation program — realloc would be illegal
         // and would corrupt the delegation record.
-        require_keys_eq!(
-            *book_ai.owner,
-            *ctx.program_id,
-            CloberError::Unauthorized
-        );
+        require_keys_eq!(*book_ai.owner, *ctx.program_id, CloberError::Unauthorized);
 
         let additional_bytes = (additional_nodes as usize)
             .checked_mul(book_state::NODE_TOTAL_BYTES)
@@ -576,8 +572,8 @@ pub mod clober {
             market_book: book_ai.key(),
             old_bytes: old_len as u32,
             new_bytes: new_len as u32,
-            max_nodes: ((new_len - book_state::MARKET_BOOK_PREFIX_BYTES) / book_state::NODE_TOTAL_BYTES)
-                as u32,
+            max_nodes: ((new_len - book_state::MARKET_BOOK_PREFIX_BYTES)
+                / book_state::NODE_TOTAL_BYTES) as u32,
         });
         Ok(())
     }
@@ -1089,10 +1085,10 @@ pub mod clober {
                 ctx.accounts.authority.key(),
                 CloberError::Unauthorized
             );
-            let bm = Pubkey::try_from(&data[104..136])
-                .map_err(|_| error!(CloberError::OutOfRange))?;
-            let qm = Pubkey::try_from(&data[136..168])
-                .map_err(|_| error!(CloberError::OutOfRange))?;
+            let bm =
+                Pubkey::try_from(&data[104..136]).map_err(|_| error!(CloberError::OutOfRange))?;
+            let qm =
+                Pubkey::try_from(&data[136..168]).map_err(|_| error!(CloberError::OutOfRange))?;
             (bm, qm)
         };
         require_keys_eq!(
@@ -1104,11 +1100,7 @@ pub mod clober {
             &[MarketAccount::SEED, base_mint.as_ref(), quote_mint.as_ref()],
             ctx.program_id,
         );
-        require_keys_eq!(
-            derived,
-            ctx.accounts.market.key(),
-            CloberError::WrongMarket
-        );
+        require_keys_eq!(derived, ctx.accounts.market.key(), CloberError::WrongMarket);
 
         let seeds_for_args: Vec<Vec<u8>> = vec![
             MarketAccount::SEED.to_vec(),
@@ -3391,10 +3383,7 @@ pub mod clober {
         require!(pricing_nav_i128 > 0, CloberError::LpPoolInsolvent);
         let pricing_nav = pricing_nav_i128 as u128;
         let shares_outstanding = lp_ro.lp_shares_outstanding;
-        require!(
-            shares_outstanding > 0,
-            CloberError::InsufficientCollateral
-        );
+        require!(shares_outstanding > 0, CloberError::InsufficientCollateral);
 
         // amount = shares_to_burn × pricing_nav / shares_outstanding
         let prod = (shares_to_burn as u128)
@@ -4314,14 +4303,8 @@ pub mod clober {
             for i in 0..expected {
                 let market_ai = &ctx.remaining_accounts[i * 2];
                 let position_ai = &ctx.remaining_accounts[i * 2 + 1];
-                require!(
-                    market_ai.owner == ctx.program_id,
-                    CloberError::OutOfRange
-                );
-                require!(
-                    position_ai.owner == ctx.program_id,
-                    CloberError::OutOfRange
-                );
+                require!(market_ai.owner == ctx.program_id, CloberError::OutOfRange);
+                require!(position_ai.owner == ctx.program_id, CloberError::OutOfRange);
 
                 let market_data = market_ai.try_borrow_data()?;
                 let market_acct: MarketAccount =
@@ -4330,10 +4313,7 @@ pub mod clober {
                 let position: state::PositionAccount =
                     state::PositionAccount::try_deserialize(&mut &position_data[..])?;
                 require!(position.trader == from_trader, CloberError::WrongTrader);
-                require!(
-                    position.market == market_ai.key(),
-                    CloberError::WrongMarket
-                );
+                require!(position.market == market_ai.key(), CloberError::WrongMarket);
                 // bind each position to THIS trader_state (positions are
                 // PDA-keyed on trader_state.key(), but `.trader` is only the
                 // WALLET — without this a different sub-account's / stale
@@ -4554,10 +4534,7 @@ pub mod clober {
             // which honors that reservation. Default 0 ⇒ no-op for every trader
             // that never touched the ER, so the strict path is unchanged for them.
             require!(s.er_active == 0, CloberError::UseXDomainWithdraw);
-            require!(
-                s.open_positions == 0,
-                CloberError::InsufficientCollateral
-            );
+            require!(s.open_positions == 0, CloberError::InsufficientCollateral);
             require!(
                 amount_quote_lots <= s.collateral_quote_lots,
                 CloberError::InsufficientCollateral,
@@ -4790,10 +4767,7 @@ pub mod clober {
         let er_reserved = ctx.accounts.er_margin.reserved_margin_quote_lots;
         {
             let s = ctx.accounts.trader_state.load()?;
-            require!(
-                s.open_positions == 0,
-                CloberError::InsufficientCollateral
-            );
+            require!(s.open_positions == 0, CloberError::InsufficientCollateral);
             xmargin::check_simple_withdraw(
                 s.collateral_quote_lots,
                 amount_quote_lots,
@@ -4995,21 +4969,12 @@ pub mod clober {
                 program_id,
             )?;
             // Single-isolated guard.
-            require!(
-                position.collateral_quote_lots == 0,
-                CloberError::OutOfRange
-            );
+            require!(position.collateral_quote_lots == 0, CloberError::OutOfRange);
             // live position, no duplicate market, and never the
             // target market (which is accounted separately below).
             require!(position.size_lots > 0, CloberError::ZeroSize);
-            require!(
-                m_ai.key() != target_market_key_pre,
-                CloberError::OutOfRange
-            );
-            require!(
-                !market_keys.contains(&m_ai.key()),
-                CloberError::OutOfRange
-            );
+            require!(m_ai.key() != target_market_key_pre, CloberError::OutOfRange);
+            require!(!market_keys.contains(&m_ai.key()), CloberError::OutOfRange);
             snaps.push(RiskPosSnap {
                 market: position.market,
                 side: if position.side == 0 {
@@ -5099,10 +5064,7 @@ pub mod clober {
             post_cross_collateral,
             &isolated_map,
         )?;
-        require!(
-            assessment.is_healthy,
-            CloberError::InsufficientCollateral
-        );
+        require!(assessment.is_healthy, CloberError::InsufficientCollateral);
 
         // Apply the transfer.
         ctx.accounts.trader_state.load_mut()?.collateral_quote_lots = post_cross_collateral;
@@ -5214,19 +5176,10 @@ pub mod clober {
             )?;
             // Single-isolated guard: only the target can have
             // collateral_quote_lots > 0; siblings must be cross.
-            require!(
-                position.collateral_quote_lots == 0,
-                CloberError::OutOfRange
-            );
+            require!(position.collateral_quote_lots == 0, CloberError::OutOfRange);
             require!(position.size_lots > 0, CloberError::ZeroSize);
-            require!(
-                m_ai.key() != target_market_key_pre,
-                CloberError::OutOfRange
-            );
-            require!(
-                !market_keys.contains(&m_ai.key()),
-                CloberError::OutOfRange
-            );
+            require!(m_ai.key() != target_market_key_pre, CloberError::OutOfRange);
+            require!(!market_keys.contains(&m_ai.key()), CloberError::OutOfRange);
             snaps.push(RiskPosSnap {
                 market: position.market,
                 side: if position.side == 0 {
@@ -5310,10 +5263,7 @@ pub mod clober {
         if !snaps.is_empty() {
             let assessment =
                 assess_margin_fn(&snaps, &market_snaps, &scenarios, post_cross_collateral)?;
-            require!(
-                assessment.is_healthy,
-                CloberError::InsufficientCollateral
-            );
+            require!(assessment.is_healthy, CloberError::InsufficientCollateral);
         }
 
         // Apply the transfer.
@@ -7117,10 +7067,7 @@ pub mod clober {
         );
         let slot = Clock::get()?.slot;
         // Monotonic: never let a stale/replayed heartbeat move the signal backward.
-        require!(
-            slot >= market.last_heartbeat_slot,
-            CloberError::OutOfRange
-        );
+        require!(slot >= market.last_heartbeat_slot, CloberError::OutOfRange);
         market.last_heartbeat_slot = slot;
         emit!(ErHeartbeatEvent {
             market: market.key(),
@@ -7532,10 +7479,7 @@ pub mod clober {
         ctx: Context<UpdateMarketAuthority>,
         new_authority: Pubkey,
     ) -> Result<()> {
-        require!(
-            new_authority != Pubkey::default(),
-            CloberError::OutOfRange
-        );
+        require!(new_authority != Pubkey::default(), CloberError::OutOfRange);
         let market = &mut ctx.accounts.market;
         require_keys_eq!(
             market.authority,
@@ -7561,10 +7505,7 @@ pub mod clober {
         ctx: Context<ProposeAuthorityTransfer>,
         new_authority: Pubkey,
     ) -> Result<()> {
-        require!(
-            new_authority != Pubkey::default(),
-            CloberError::OutOfRange
-        );
+        require!(new_authority != Pubkey::default(), CloberError::OutOfRange);
         let market_key = ctx.accounts.market.key();
         let proposer = ctx.accounts.market.authority;
         let p = &mut ctx.accounts.pending;
@@ -7775,10 +7716,7 @@ pub mod clober {
             market.authority != Pubkey::default(),
             CloberError::Unauthorized
         );
-        require!(
-            new_sequencer != Pubkey::default(),
-            CloberError::OutOfRange
-        );
+        require!(new_sequencer != Pubkey::default(), CloberError::OutOfRange);
         let prev = market.sequencer;
         market.sequencer = new_sequencer;
         emit!(MarketSequencerRotatedEvent {
@@ -7813,10 +7751,7 @@ pub mod clober {
             signer == market.authority || signer == market.sequencer,
             CloberError::Unauthorized
         );
-        require!(
-            haircut_bps <= constants::BPS_DENOM,
-            CloberError::OutOfRange
-        );
+        require!(haircut_bps <= constants::BPS_DENOM, CloberError::OutOfRange);
         let prev = market.paper_profit_haircut_bps;
         market.paper_profit_haircut_bps = haircut_bps;
         market.paper_haircut_updated_slot = Clock::get()?.slot;
@@ -8008,10 +7943,7 @@ pub mod clober {
             CloberError::OutOfRange
         );
         // The fault must be against THIS committee epoch (slots are epoch-scoped).
-        require!(
-            header_a.epoch == committee.epoch,
-            CloberError::OutOfRange
-        );
+        require!(header_a.epoch == committee.epoch, CloberError::OutOfRange);
         require!(
             !matcher::committee::is_jailed(committee.jailed_mask, validator_slot),
             CloberError::OutOfRange // already jailed
@@ -8216,10 +8148,7 @@ pub mod clober {
         require!(!legs.is_empty(), CloberError::ZeroSize);
         require!(legs.len() <= MAX_BASKET_LEGS_N, CloberError::OutOfRange);
         let remaining = ctx.remaining_accounts;
-        require!(
-            remaining.len() == legs.len() * 3,
-            CloberError::OutOfRange
-        );
+        require!(remaining.len() == legs.len() * 3, CloberError::OutOfRange);
 
         let trader_key = ctx.accounts.trader.key();
         let program_id = ctx.program_id;
@@ -8521,14 +8450,8 @@ pub mod clober {
         for i in 0..open {
             let market_ai = &ctx.remaining_accounts[i * 2];
             let position_ai = &ctx.remaining_accounts[i * 2 + 1];
-            require!(
-                market_ai.owner == ctx.program_id,
-                CloberError::OutOfRange
-            );
-            require!(
-                position_ai.owner == ctx.program_id,
-                CloberError::OutOfRange
-            );
+            require!(market_ai.owner == ctx.program_id, CloberError::OutOfRange);
+            require!(position_ai.owner == ctx.program_id, CloberError::OutOfRange);
 
             let market_data = market_ai.try_borrow_data()?;
             let market_acct: MarketAccount = MarketAccount::try_deserialize(&mut &market_data[..])?;
@@ -8539,10 +8462,7 @@ pub mod clober {
                 position.trader == trader_state.trader,
                 CloberError::WrongTrader
             );
-            require!(
-                position.market == market_ai.key(),
-                CloberError::WrongMarket
-            );
+            require!(position.market == market_ai.key(), CloberError::WrongMarket);
 
             // Track largest by notional at mark.
             let notional = (position.size_lots as u128)
@@ -8681,14 +8601,8 @@ pub mod clober {
             CloberError::OutOfRange
         );
         let p = &market.params;
-        require!(
-            size_lots >= p.min_base_lots,
-            CloberError::SizeBelowMinLot
-        );
-        require!(
-            limit_ticks % p.tick_size == 0,
-            CloberError::PriceNotOnTick
-        );
+        require!(size_lots >= p.min_base_lots, CloberError::SizeBelowMinLot);
+        require!(limit_ticks % p.tick_size == 0, CloberError::PriceNotOnTick);
         require!(
             expires_at_slot == 0 || expires_at_slot > now_slot,
             CloberError::OutOfRange
@@ -9261,10 +9175,7 @@ pub mod clober {
         let maker_rebate_pos_bps = market.params.maker_rebate_bps.max(0) as u128;
         let maker_rebate_u128 =
             notional_u128.saturating_mul(maker_rebate_pos_bps) / constants::BPS_DENOM as u128;
-        require!(
-            maker_rebate_u128 <= taker_fee_u128,
-            CloberError::OutOfRange
-        );
+        require!(maker_rebate_u128 <= taker_fee_u128, CloberError::OutOfRange);
         let taker_fee = if taker_fee_u128 > u64::MAX as u128 {
             u64::MAX
         } else {
@@ -10148,10 +10059,7 @@ pub mod clober {
                 .order_seq_counter
                 .checked_add(1)
                 .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
-            require!(
-                next_seq < LP_SEQ_RESERVED_OFFSET,
-                CloberError::OutOfRange
-            );
+            require!(next_seq < LP_SEQ_RESERVED_OFFSET, CloberError::OutOfRange);
             handle.header.order_seq_counter = next_seq;
 
             let side_is_bid = close_side_u8 == 0;
@@ -10296,10 +10204,7 @@ pub mod clober {
         let counter = *ctx.accounts.counter_position.load()?;
 
         // Sanity: positions on this market, opposite sides, both have size.
-        require!(
-            underwater.market == market.key(),
-            CloberError::WrongMarket
-        );
+        require!(underwater.market == market.key(), CloberError::WrongMarket);
         require!(counter.market == market.key(), CloberError::WrongMarket);
         require!(underwater.size_lots > 0, CloberError::LiquidationStale);
         require!(counter.size_lots > 0, CloberError::LiquidationStale);
@@ -10323,10 +10228,7 @@ pub mod clober {
             CloberError::WrongTrader
         );
         // Cannot ADL yourself.
-        require!(
-            underwater.trader != counter.trader,
-            CloberError::OutOfRange
-        );
+        require!(underwater.trader != counter.trader, CloberError::OutOfRange);
         // Same single-leg defect — the underwater
         // eligibility assesses ONLY this leg against the underwater trader's full
         // cross pool, excluding their other cross legs. A cross trader whose
@@ -10730,10 +10632,7 @@ pub mod clober {
         let exec_position = *ctx.accounts.execution_position.load()?;
         let trader_state = ctx.accounts.trader_state.load()?;
 
-        require!(
-            exec_position.size_lots > 0,
-            CloberError::LiquidationStale
-        );
+        require!(exec_position.size_lots > 0, CloberError::LiquidationStale);
         require!(
             exec_position.trader == trader_state.trader,
             CloberError::WrongTrader
@@ -10808,11 +10707,7 @@ pub mod clober {
             let market_ai = &remaining[i];
             let position_ai = &remaining[i + 1];
             require_keys_eq!(*market_ai.owner, *program_id, CloberError::Unauthorized);
-            require_keys_eq!(
-                *position_ai.owner,
-                *program_id,
-                CloberError::Unauthorized
-            );
+            require_keys_eq!(*position_ai.owner, *program_id, CloberError::Unauthorized);
 
             let m_data = market_ai.try_borrow_data()?;
             let market: MarketAccount = MarketAccount::try_deserialize(&mut &m_data[..])?;
@@ -10823,10 +10718,7 @@ pub mod clober {
                 position.trader == trader_state.trader,
                 CloberError::WrongTrader
             );
-            require!(
-                position.market == market_ai.key(),
-                CloberError::WrongMarket
-            );
+            require!(position.market == market_ai.key(), CloberError::WrongMarket);
             // H2: bind each position to THIS trader_state (positions are
             // PDA-keyed on trader_state.key(), but `.trader` is only the WALLET
             // — without this a different sub-account's / stale position of the
@@ -10974,10 +10866,7 @@ pub mod clober {
                 .order_seq_counter
                 .checked_add(1)
                 .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
-            require!(
-                next_seq < LP_SEQ_RESERVED_OFFSET,
-                CloberError::OutOfRange
-            );
+            require!(next_seq < LP_SEQ_RESERVED_OFFSET, CloberError::OutOfRange);
             handle.header.order_seq_counter = next_seq;
 
             let side_is_bid = close_side_u8 == 0;
@@ -11270,7 +11159,8 @@ pub mod clober {
         // bound the order's life: the matcher skips expired resting orders, capping
         // the flip window at REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS. Entry (non-reduce-
         // only) triggers rest until filled (0 = GTC), where a "flip" is the intent.
-        let is_reduce_only = trigger.flags & extended_state::TriggerOrderAccount::FLAG_REDUCE_ONLY != 0;
+        let is_reduce_only =
+            trigger.flags & extended_state::TriggerOrderAccount::FLAG_REDUCE_ONLY != 0;
         let injected_expiry: u64 = if is_reduce_only {
             now.saturating_add(constants::REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS)
         } else {
@@ -11504,10 +11394,7 @@ pub mod clober {
                 CloberError::WrongTrader
             );
         }
-        require!(
-            total_size_lots >= slice_size_lots,
-            CloberError::OutOfRange
-        );
+        require!(total_size_lots >= slice_size_lots, CloberError::OutOfRange);
         require!(limit_price_ticks > 0, CloberError::ZeroPrice);
         require!(slot_interval > 0, CloberError::OutOfRange);
 
@@ -11988,10 +11875,7 @@ pub mod clober {
                 } else {
                     handle.lookup_ask_by_order_id(child_id)
                 };
-                require!(
-                    existing == crate::hypertree::NIL,
-                    CloberError::OutOfRange
-                );
+                require!(existing == crate::hypertree::NIL, CloberError::OutOfRange);
             }
             let seq = handle
                 .header
@@ -12702,10 +12586,7 @@ pub mod clober {
         } else {
             handle.lookup_ask_by_order_id(order_id)
         };
-        require!(
-            idx != crate::hypertree::NIL,
-            CloberError::LiquidationStale
-        );
+        require!(idx != crate::hypertree::NIL, CloberError::LiquidationStale);
 
         let order_seq = {
             let order = handle.order_at(idx);
@@ -13311,10 +13192,7 @@ pub mod clober {
             let data = market_ai.try_borrow_data()?;
             let mut market: MarketAccount = MarketAccount::try_deserialize(&mut &data[..])?;
             drop(data);
-            require!(
-                market.authority == authority_key,
-                CloberError::Unauthorized
-            );
+            require!(market.authority == authority_key, CloberError::Unauthorized);
             if market.params.mark_ema_alpha_bps != 0 {
                 msg!(
                     "migrate_market_layout: account already V3 (size={}, alpha={})",
@@ -13343,20 +13221,14 @@ pub mod clober {
             return Ok(());
         }
 
-        require!(
-            current_size < target_size,
-            CloberError::AlreadyInitialized
-        );
+        require!(current_size < target_size, CloberError::AlreadyInitialized);
 
         // 1. Read OLD bytes — deserialize using try_deserialize_unchecked which
         //    skips the size check (the discriminator must still match).
         let old_bytes = market_ai.try_borrow_data()?.to_vec();
         let mut market: MarketAccount =
             MarketAccount::try_deserialize_unchecked(&mut &old_bytes[..])?;
-        require!(
-            market.authority == authority_key,
-            CloberError::Unauthorized
-        );
+        require!(market.authority == authority_key, CloberError::Unauthorized);
 
         // 2. Realloc to V3 size. Fund the rent diff from the authority.
         let new_minimum_balance = Rent::get()?.minimum_balance(target_size);
@@ -13422,10 +13294,7 @@ pub mod clober {
         // `10^(exponent + tick_decimals)`; a value outside a sane range only ever
         // overflows the checked power later (a confusing runtime revert), so
         // reject it at config time. ±18 covers every real feed exponent.
-        require!(
-            (-18..=18).contains(&tick_decimals),
-            CloberError::OutOfRange
-        );
+        require!((-18..=18).contains(&tick_decimals), CloberError::OutOfRange);
 
         let cfg = &mut ctx.accounts.oracle_config;
         cfg.bump = ctx.bumps.oracle_config;
@@ -13471,10 +13340,7 @@ pub mod clober {
             CloberError::OutOfRange
         );
         // Bound the price-scaling exponent (see init_market_oracle_config).
-        require!(
-            (-18..=18).contains(&tick_decimals),
-            CloberError::OutOfRange
-        );
+        require!((-18..=18).contains(&tick_decimals), CloberError::OutOfRange);
 
         let cfg = &mut ctx.accounts.oracle_config;
         cfg.bump = ctx.bumps.oracle_config;
@@ -13649,10 +13515,7 @@ pub mod clober {
             CloberError::Unauthorized
         );
         require!(feed_id == cfg.lazer_feed_id, CloberError::WrongMarket);
-        require!(
-            tick_decimals == cfg.tick_decimals,
-            CloberError::WrongMarket
-        );
+        require!(tick_decimals == cfg.tick_decimals, CloberError::WrongMarket);
 
         // 2. Parse the signed payload for our (config-bound) feed.
         let px = lazer_oracle::parse_lazer_price(&payload, feed_id)
@@ -14595,10 +14458,7 @@ fn partial_withdraw_core<'info>(
         // every supplied position must be live, and no market may appear
         // twice (else the exact-count check could be padded with a duplicate).
         require!(position.size_lots > 0, CloberError::ZeroSize);
-        require!(
-            !market_keys.contains(&m_ai.key()),
-            CloberError::OutOfRange
-        );
+        require!(!market_keys.contains(&m_ai.key()), CloberError::OutOfRange);
 
         let notional = (position.size_lots as u128)
             .saturating_mul(market.mark_price_ticks as u128)
@@ -18498,7 +18358,8 @@ pub struct ApplyFill<'info> {
         constraint = taker_position_haircut.market == market.key() @ CloberError::HaircutStateMismatch,
         constraint = taker_position_haircut.position == taker_position.key() @ CloberError::HaircutStateMismatch,
     )]
-    pub taker_position_haircut: Option<Box<Account<'info, extended_state::PositionHaircutStateAccount>>>,
+    pub taker_position_haircut:
+        Option<Box<Account<'info, extended_state::PositionHaircutStateAccount>>>,
 
     /// Per-maker-position haircut state. Same shape as taker.
     #[account(
@@ -18512,7 +18373,8 @@ pub struct ApplyFill<'info> {
         constraint = maker_position_haircut.market == market.key() @ CloberError::HaircutStateMismatch,
         constraint = maker_position_haircut.position == maker_position.key() @ CloberError::HaircutStateMismatch,
     )]
-    pub maker_position_haircut: Option<Box<Account<'info, extended_state::PositionHaircutStateAccount>>>,
+    pub maker_position_haircut:
+        Option<Box<Account<'info, extended_state::PositionHaircutStateAccount>>>,
 
     pub system_program: Program<'info, System>,
     // The optional per-market FillCommitmentAccount is passed
@@ -18765,7 +18627,8 @@ pub struct ApplyLpFill<'info> {
         constraint = taker_position_haircut.market == market.key() @ CloberError::HaircutStateMismatch,
         constraint = taker_position_haircut.position == taker_position.key() @ CloberError::HaircutStateMismatch,
     )]
-    pub taker_position_haircut: Option<Box<Account<'info, extended_state::PositionHaircutStateAccount>>>,
+    pub taker_position_haircut:
+        Option<Box<Account<'info, extended_state::PositionHaircutStateAccount>>>,
 
     pub system_program: Program<'info, System>,
 }
@@ -20501,10 +20364,7 @@ fn inject_leg_into_hypertree(
         .order_seq_counter
         .checked_add(1)
         .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
-    require!(
-        next_seq < LP_SEQ_RESERVED_OFFSET,
-        CloberError::OutOfRange
-    );
+    require!(next_seq < LP_SEQ_RESERVED_OFFSET, CloberError::OutOfRange);
     handle.header.order_seq_counter = next_seq;
 
     let side_is_bid = leg.side == 0;
@@ -20550,10 +20410,7 @@ fn inject_leg_into_hypertree_unchecked(
         .order_seq_counter
         .checked_add(1)
         .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
-    require!(
-        next_seq < LP_SEQ_RESERVED_OFFSET,
-        CloberError::OutOfRange
-    );
+    require!(next_seq < LP_SEQ_RESERVED_OFFSET, CloberError::OutOfRange);
     handle.header.order_seq_counter = next_seq;
 
     let side_is_bid = leg.side == 0;
@@ -20590,14 +20447,8 @@ fn inject_leg_into_hypertree_unchecked(
 fn validate_fee_tiers(volume_window_slots: u64, tiers: &[state::FeeTier]) -> Result<()> {
     require!(volume_window_slots > 0, CloberError::OutOfRange);
     require!(!tiers.is_empty(), CloberError::OutOfRange);
-    require!(
-        tiers.len() <= state::MAX_FEE_TIERS,
-        CloberError::OutOfRange
-    );
-    require!(
-        tiers[0].min_volume_quote_lots == 0,
-        CloberError::OutOfRange
-    );
+    require!(tiers.len() <= state::MAX_FEE_TIERS, CloberError::OutOfRange);
+    require!(tiers[0].min_volume_quote_lots == 0, CloberError::OutOfRange);
 
     let mut prev_min: Option<u64> = None;
     let mut prev_taker: Option<u32> = None;
@@ -21955,19 +21806,13 @@ fn validate_hip3_params(p: &MarketParams) -> Result<()> {
     );
     require!(p.oracle_band_bps > 0, CloberError::OutOfRange);
     // Per-trader position must be bounded (no unbounded single-account OI).
-    require!(
-        p.max_position_lots_per_trader > 0,
-        CloberError::OutOfRange
-    );
+    require!(p.max_position_lots_per_trader > 0, CloberError::OutOfRange);
     Ok(())
 }
 
 fn validate_market_params(current: &MarketParams, new: &MarketParams) -> Result<()> {
     // Immutability of the measurement primitives.
-    require!(
-        new.tick_size == current.tick_size,
-        CloberError::OutOfRange
-    );
+    require!(new.tick_size == current.tick_size, CloberError::OutOfRange);
     require!(
         new.base_lot_size == current.base_lot_size,
         CloberError::OutOfRange
@@ -22427,10 +22272,7 @@ fn assert_cross_portfolio_intake_im(
 
     let scenarios = default_scenarios_fn(&market_keys);
     let assessment = assess_margin_unified_fn(&snaps, &market_snaps, &scenarios, cross_collateral)?;
-    require!(
-        assessment.is_healthy,
-        CloberError::InsufficientCollateral
-    );
+    require!(assessment.is_healthy, CloberError::InsufficientCollateral);
     Ok(())
 }
 

@@ -12,17 +12,9 @@ use clober::extended_state::TriggerOrderAccount;
 fn cap_zero_means_no_cap_regardless_of_side_or_oracle() {
     // Triggers with no cap set (acceptable_price_ticks == 0)
     // never breach — full backward compat.
-    assert!(!TriggerOrderAccount::slippage_cap_breached(
-        0, 0, 1_000_000
-    ));
-    assert!(!TriggerOrderAccount::slippage_cap_breached(
-        0, 1, 1_000_000
-    ));
-    assert!(!TriggerOrderAccount::slippage_cap_breached(
-        0,
-        0,
-        u64::MAX
-    ));
+    assert!(!TriggerOrderAccount::slippage_cap_breached(0, 0, 1_000_000));
+    assert!(!TriggerOrderAccount::slippage_cap_breached(0, 1, 1_000_000));
+    assert!(!TriggerOrderAccount::slippage_cap_breached(0, 0, u64::MAX));
     assert!(!TriggerOrderAccount::slippage_cap_breached(0, 1, 1));
 }
 
@@ -45,9 +37,7 @@ fn long_buying_admits_when_oracle_at_or_below_cap() {
     assert!(!TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 0, 999_999
     ));
-    assert!(!TriggerOrderAccount::slippage_cap_breached(
-        1_000_000, 0, 0
-    ));
+    assert!(!TriggerOrderAccount::slippage_cap_breached(1_000_000, 0, 0));
 }
 
 #[test]
@@ -59,9 +49,7 @@ fn short_selling_breaches_when_oracle_below_cap() {
     assert!(TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 1, 500_000
     ));
-    assert!(TriggerOrderAccount::slippage_cap_breached(
-        1_000_000, 1, 0
-    ));
+    assert!(TriggerOrderAccount::slippage_cap_breached(1_000_000, 1, 0));
 }
 
 #[test]

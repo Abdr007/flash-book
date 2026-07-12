@@ -19,9 +19,7 @@
 use anchor_lang::prelude::Pubkey;
 use clober::matcher::lot::Ticks;
 use clober::matcher::order::Side;
-use clober::matcher::risk::{
-    assess_margin, default_scenarios, MarketSnapshot, PositionSnapshot,
-};
+use clober::matcher::risk::{assess_margin, default_scenarios, MarketSnapshot, PositionSnapshot};
 use proptest::prelude::*;
 
 const MARKET_PK_BYTES: [u8; 32] = [42u8; 32];

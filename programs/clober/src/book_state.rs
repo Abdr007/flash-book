@@ -625,10 +625,7 @@ impl<'a> MarketBookHandle<'a> {
             // the enum is UB. `unsafe impl Pod` bypasses bytemuck's variant check, so
             // validate the byte here. Free/unused slots are zeroed (0=Black), so a
             // well-formed book always passes; only a tampered color byte fails closed.
-            require!(
-                slab[base + 12] <= 1,
-                crate::errors::CloberError::OutOfRange
-            );
+            require!(slab[base + 12] <= 1, crate::errors::CloberError::OutOfRange);
         }
 
         // The per-link bounds check above stops an OOB panic but NOT an
@@ -695,10 +692,7 @@ impl<'a> MarketBookHandle<'a> {
             let mut steps = 0usize;
             while let Some(off) = stack.pop() {
                 steps += 1;
-                require!(
-                    steps <= node_count,
-                    crate::errors::CloberError::OutOfRange
-                );
+                require!(steps <= node_count, crate::errors::CloberError::OutOfRange);
                 let ord = off / NODE_TOTAL_BYTES;
                 require!(
                     ord < node_count && !visited[ord],
@@ -744,20 +738,14 @@ impl<'a> MarketBookHandle<'a> {
                 let mut steps = 0usize;
                 loop {
                     steps += 1;
-                    require!(
-                        steps <= node_count,
-                        crate::errors::CloberError::OutOfRange
-                    );
+                    require!(steps <= node_count, crate::errors::CloberError::OutOfRange);
                     let left = read_link(cur, 0);
                     if left == NIL {
                         break;
                     }
                     cur = left as usize;
                 }
-                require!(
-                    best as usize == cur,
-                    crate::errors::CloberError::OutOfRange
-                );
+                require!(best as usize == cur, crate::errors::CloberError::OutOfRange);
             }
         }
 
@@ -775,10 +763,7 @@ impl<'a> MarketBookHandle<'a> {
             let mut steps = 0usize;
             while free != NIL {
                 steps += 1;
-                require!(
-                    steps <= node_count,
-                    crate::errors::CloberError::OutOfRange
-                );
+                require!(steps <= node_count, crate::errors::CloberError::OutOfRange);
                 let off = free as usize;
                 require!(
                     off % NODE_TOTAL_BYTES == 0
@@ -1006,8 +991,7 @@ impl<'a> MarketBookHandle<'a> {
     /// Read-only access to the `RestingOrder` at `idx`. Caller must
     /// guarantee `idx` is a live node.
     pub fn order_at(&self, idx: DataIndex) -> &RestingOrder {
-        let node: &RBNode<RestingOrder> =
-            get_helper::<RBNode<RestingOrder>>(&self.data[..], idx);
+        let node: &RBNode<RestingOrder> = get_helper::<RBNode<RestingOrder>>(&self.data[..], idx);
         node.get_value()
     }
 

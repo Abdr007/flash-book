@@ -1,9 +1,9 @@
 //! Unit tests for the pure matcher core.
 
-use super::lp_quoter::{generate_quotes, LpQuoterInputs, LpQuoterParams};
 use super::insurance::InsuranceFund;
 use super::liquidation::{compute_shortfall, detect_liquidations, generate_liquidation_orders};
 use super::lot::{BaseLots, Ticks};
+use super::lp_quoter::{generate_quotes, LpQuoterInputs, LpQuoterParams};
 use super::order::{Order, OrderType, Side};
 use super::risk::{assess_margin, default_scenarios, MarketSnapshot, PositionSnapshot};
 use anchor_lang::prelude::Pubkey;

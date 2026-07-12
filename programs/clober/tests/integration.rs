@@ -12,7 +12,7 @@
 
 use anchor_lang::{prelude::*, InstructionData};
 use clober::state::{
-    FeeAccrualAccount, LiquidityPoolAccount, InsuranceFundAccount, MarketAccount, MarketParams,
+    FeeAccrualAccount, InsuranceFundAccount, LiquidityPoolAccount, MarketAccount, MarketParams,
     TraderStateAccount,
 };
 use solana_program_test::{BanksClient, ProgramTest};
@@ -515,8 +515,7 @@ async fn setup_market(
 async fn disarm_fill_commitment(ctx: &mut solana_program_test::ProgramTestContext, market: Pubkey) {
     use solana_sdk::account::Account as SolAccount;
     let acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
-    let mut m =
-        clober::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    let mut m = clober::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
     m.fill_commitment_required = false;
     let mut data = Vec::new();
     m.try_serialize(&mut data).unwrap();
@@ -542,8 +541,7 @@ async fn disarm_fill_commitment(ctx: &mut solana_program_test::ProgramTestContex
 async fn zero_initial_margin(ctx: &mut solana_program_test::ProgramTestContext, market: Pubkey) {
     use solana_sdk::account::Account as SolAccount;
     let acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
-    let mut m =
-        clober::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    let mut m = clober::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
     m.params.initial_margin_ratio_bps = 0;
     let mut data = Vec::new();
     m.try_serialize(&mut data).unwrap();
@@ -566,8 +564,7 @@ async fn zero_initial_margin(ctx: &mut solana_program_test::ProgramTestContext, 
 async fn set_book_delegated(ctx: &mut solana_program_test::ProgramTestContext, market: Pubkey) {
     use solana_sdk::account::Account as SolAccount;
     let acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
-    let mut m =
-        clober::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    let mut m = clober::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
     m.book_delegated = true;
     let mut data = Vec::new();
     m.try_serialize(&mut data).unwrap();
@@ -852,8 +849,7 @@ async fn withdraw_insurance_fund_succeeds_above_pause_threshold() {
         .unwrap()
         .unwrap();
     let mut fund_state =
-        clober::state::InsuranceFundAccount::try_deserialize(&mut if_acc.data.as_slice())
-            .unwrap();
+        clober::state::InsuranceFundAccount::try_deserialize(&mut if_acc.data.as_slice()).unwrap();
     fund_state.balance_quote_lots = 100_000;
     let mut new_data = Vec::new();
     fund_state.try_serialize(&mut new_data).unwrap();
@@ -943,8 +939,7 @@ async fn withdraw_insurance_fund_blocked_below_pause_threshold() {
         .unwrap()
         .unwrap();
     let mut fund_state =
-        clober::state::InsuranceFundAccount::try_deserialize(&mut if_acc.data.as_slice())
-            .unwrap();
+        clober::state::InsuranceFundAccount::try_deserialize(&mut if_acc.data.as_slice()).unwrap();
     fund_state.balance_quote_lots = 6_000;
     let mut new_data = Vec::new();
     fund_state.try_serialize(&mut new_data).unwrap();
@@ -2065,8 +2060,8 @@ impl Reconciled {
         use clober::matcher::position_math as pm;
         use clober::{
             CollateralDepositedEvent, CollateralWithdrawnEvent, FillAppliedEvent,
-            LpFillAppliedEvent, FundingCrankedEvent, FundingSettledEvent,
-            GainReleasedToHaircutEvent, OrderCancelledV2Event, OrderPlacedV2Event,
+            FundingCrankedEvent, FundingSettledEvent, GainReleasedToHaircutEvent,
+            LpFillAppliedEvent, OrderCancelledV2Event, OrderPlacedV2Event,
         };
         for line in logs {
             let Some(b64) = line.strip_prefix("Program data: ") else {
@@ -2144,8 +2139,7 @@ impl Reconciled {
                 }
             } else if disc == <LpFillAppliedEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
                 if let Ok(e) = LpFillAppliedEvent::try_from_slice(body) {
-                    self.lp
-                        .insert(e.market, (e.lp_size_after, e.lp_side_after));
+                    self.lp.insert(e.market, (e.lp_size_after, e.lp_side_after));
                 }
             } else if disc
                 == <GainReleasedToHaircutEvent as anchor_lang::Discriminator>::DISCRIMINATOR
@@ -2341,10 +2335,8 @@ async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
 
     // ── Reconstructed positions == on-chain PositionAccounts (byte-for-byte on
     // side/size/entry), rebuilt purely from FillApplied. ──
-    let oc_taker: clober::state::PositionAccount =
-        fetch(&mut ctx.banks_client, taker_pos).await;
-    let oc_maker: clober::state::PositionAccount =
-        fetch(&mut ctx.banks_client, maker_pos).await;
+    let oc_taker: clober::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
+    let oc_maker: clober::state::PositionAccount = fetch(&mut ctx.banks_client, maker_pos).await;
     let rt = recon
         .positions
         .get(&taker.pubkey())
@@ -2968,8 +2960,7 @@ async fn patch_staleness_to_zero(
 ) {
     use solana_sdk::account::Account as SolAccount;
     let acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
-    let mut m =
-        clober::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    let mut m = clober::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
     m.params.oracle_staleness_max_seconds = 0;
     let mut data = Vec::new();
     m.try_serialize(&mut data).unwrap();
@@ -3224,8 +3215,7 @@ async fn deposit_lp_capital_grows_pool() {
     // 1M deposited at NAV/share = 1.0 → 1M new shares minted.
     assert_eq!(after.lp_shares_outstanding, 6_000_000);
 
-    let lp_pos: clober::state::LpPositionAccount =
-        fetch(&mut ctx.banks_client, lp_position).await;
+    let lp_pos: clober::state::LpPositionAccount = fetch(&mut ctx.banks_client, lp_position).await;
     // Authority already had 5M from init; +1M from this deposit = 6M.
     assert_eq!(lp_pos.shares, 6_000_000);
     assert_eq!(lp_pos.total_deposited_quote_lots, 6_000_000);
@@ -3524,10 +3514,7 @@ async fn lp_deposit(
 
     let lp_ata = create_ata(ctx, payer, lp.pubkey(), protocol.quote_mint).await;
     mint_tokens(ctx, payer, protocol.quote_mint, lp_ata, amount).await;
-    let (lp_position, _) = pda(&[
-        clober::state::LpPositionAccount::SEED,
-        lp.pubkey().as_ref(),
-    ]);
+    let (lp_position, _) = pda(&[clober::state::LpPositionAccount::SEED, lp.pubkey().as_ref()]);
     let ix = build_ix(
         clober::instruction::LpDeposit {
             amount_quote_lots: amount,
@@ -3605,8 +3592,7 @@ async fn lp_units_two_lps_split_shares_pro_rata_with_no_pnl() {
     ]);
     let alice_state: clober::state::LpPositionAccount =
         fetch(&mut ctx.banks_client, alice_pos).await;
-    let bob_state: clober::state::LpPositionAccount =
-        fetch(&mut ctx.banks_client, bob_pos).await;
+    let bob_state: clober::state::LpPositionAccount = fetch(&mut ctx.banks_client, bob_pos).await;
     assert_eq!(alice_state.shares, 1_000_000);
     assert_eq!(bob_state.shares, 2_000_000);
     assert_eq!(alice_state.lp, to_anchor(alice.pubkey()));
@@ -3662,8 +3648,7 @@ async fn lp_units_late_depositor_pays_inflated_share_price_after_pnl() {
         clober::state::LpPositionAccount::SEED,
         bob.pubkey().as_ref(),
     ]);
-    let bob_state: clober::state::LpPositionAccount =
-        fetch(&mut ctx.banks_client, bob_pos).await;
+    let bob_state: clober::state::LpPositionAccount = fetch(&mut ctx.banks_client, bob_pos).await;
     assert_eq!(bob_state.shares, 1_100_000);
 }
 
@@ -3765,8 +3750,7 @@ async fn lp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure() 
         .unwrap()
         .unwrap();
     let mut lp_state =
-        clober::state::LiquidityPoolAccount::try_deserialize(&mut lp_acc.data.as_slice())
-            .unwrap();
+        clober::state::LiquidityPoolAccount::try_deserialize(&mut lp_acc.data.as_slice()).unwrap();
     lp_state.markets_count = 1;
     lp_state.per_market[0] = clober::state::LpMarketExposure {
         market: to_anchor(market_pda),
@@ -3884,8 +3868,7 @@ async fn withdraw_lp_capital_charges_unrealized_loss() {
         .unwrap()
         .unwrap();
     let mut lp_state =
-        clober::state::LiquidityPoolAccount::try_deserialize(&mut lp_acc.data.as_slice())
-            .unwrap();
+        clober::state::LiquidityPoolAccount::try_deserialize(&mut lp_acc.data.as_slice()).unwrap();
     lp_state.markets_count = 1;
     lp_state.per_market[0] = clober::state::LpMarketExposure {
         market: to_anchor(market_pda),
@@ -4397,8 +4380,7 @@ async fn apply_lp_fill_creates_taker_position_and_lp_entry() {
         .unwrap();
 
     // Verify trader position: long 1 @ 100k.
-    let position: clober::state::PositionAccount =
-        fetch(&mut ctx.banks_client, taker_pos).await;
+    let position: clober::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
     assert_eq!(position.side, 0);
     assert_eq!(position.size_lots, 1);
     assert_eq!(position.entry_price_ticks, 100_000);
@@ -4497,10 +4479,7 @@ async fn deposit_lp_capital_prices_on_mark_to_market_nav() {
         .unwrap();
     let lp_ata = create_ata(&mut ctx, &payer, lp.pubkey(), protocol.quote_mint).await;
     mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp_ata, 10_000_000).await;
-    let (lp_position, _) = pda(&[
-        clober::state::LpPositionAccount::SEED,
-        lp.pubkey().as_ref(),
-    ]);
+    let (lp_position, _) = pda(&[clober::state::LpPositionAccount::SEED, lp.pubkey().as_ref()]);
     let (lp_mode, _) = pda(&[clober::state::LpModeAccount::SEED]);
     let dep_metas = vec![
         AccountMeta::new(lp.pubkey(), true),
@@ -4740,8 +4719,7 @@ async fn hlp_lp_maker_order_crossed_and_settled_permissionlessly() {
     .expect("ring-authenticated LP fill settles permissionlessly");
 
     // taker long 1 @ 100k; pool took the opposite side (short 1 @ 100k).
-    let position: clober::state::PositionAccount =
-        fetch(&mut ctx.banks_client, taker_pos).await;
+    let position: clober::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
     assert_eq!(position.side, 0, "taker long after HLP fill");
     assert_eq!(position.size_lots, 1);
     assert_eq!(position.entry_price_ticks, 100_000);
@@ -7172,8 +7150,7 @@ async fn migrate_position_to_trader_state_key_moves_state() {
     let legacy_pos_data = {
         let mut buf = vec![0u8; pos_space];
         // 8-byte discriminator for PositionAccount.
-        let disc =
-            <clober::state::PositionAccount as anchor_lang::Discriminator>::DISCRIMINATOR;
+        let disc = <clober::state::PositionAccount as anchor_lang::Discriminator>::DISCRIMINATOR;
         buf[..8].copy_from_slice(disc);
         // PositionAccount is `#[account(zero_copy)]` (Pod), so it does not
         // implement AnchorSerialize. Write the Pod bytes
@@ -8975,8 +8952,7 @@ async fn guardian_can_restrict_but_not_loosen_market_status() {
     )
     .await
     .expect("authority sets guardian");
-    let g: clober::state::MarketGuardianAccount =
-        fetch(&mut ctx.banks_client, guardian_pda).await;
+    let g: clober::state::MarketGuardianAccount = fetch(&mut ctx.banks_client, guardian_pda).await;
     assert_eq!(g.guardian, guardian.pubkey());
 
     // status ix: guardian slot = guardian_pda (guardian call) or program-id sentinel (None).
@@ -9099,8 +9075,7 @@ async fn reconcile_unsettled_fill_volume_resets_only_when_ring_drained() {
             .await
             .unwrap()
             .unwrap();
-        let mut m =
-            clober::state::MarketAccount::try_deserialize(&mut a.data.as_slice()).unwrap();
+        let mut m = clober::state::MarketAccount::try_deserialize(&mut a.data.as_slice()).unwrap();
         m.unsettled_fill_volume = v;
         let mut d = Vec::new();
         m.try_serialize(&mut d).unwrap();
@@ -12802,8 +12777,7 @@ async fn liquidate_position_v2_rejects_self_liquidation() {
         dbg.contains("Custom(8208)"),
         "self-liquidation must be rejected with SelfLiquidationForbidden, got: {dbg}"
     );
-    let pos_after: clober::state::PositionAccount =
-        fetch(&mut ctx.banks_client, taker_pos).await;
+    let pos_after: clober::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
     assert_eq!(
         pos_after.size_lots, 1,
         "position must be untouched after the rejection"
@@ -13131,8 +13105,7 @@ async fn force_reduce_position_oracle_frees_trapped_margin_when_er_dead() {
         .await
         .expect("recovery must succeed once the ER is stalled");
 
-    let pos_after: clober::state::PositionAccount =
-        fetch(&mut ctx.banks_client, taker_pos).await;
+    let pos_after: clober::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
     let ts_after: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
     let coll_after = ts_after.collateral_quote_lots;
     let fund_after = fetch::<InsuranceFundAccount>(&mut ctx.banks_client, fund_pda)
@@ -13195,11 +13168,9 @@ async fn force_reduce_position_oracle_frees_isolated_margin() {
             .await
             .unwrap()
             .unwrap();
-        let mut pos: clober::state::PositionAccount =
-            fetch(&mut ctx.banks_client, taker_pos).await;
+        let mut pos: clober::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
         pos.collateral_quote_lots = 500_000;
-        let disc =
-            <clober::state::PositionAccount as anchor_lang::Discriminator>::DISCRIMINATOR;
+        let disc = <clober::state::PositionAccount as anchor_lang::Discriminator>::DISCRIMINATOR;
         let mut data = vec![0u8; pos_acc.data.len()];
         data[..8].copy_from_slice(disc);
         let ser = bytemuck::bytes_of(&pos);
@@ -13246,10 +13217,9 @@ async fn force_reduce_position_oracle_frees_isolated_margin() {
     let ts_before = fetch::<TraderStateAccount>(&mut ctx.banks_client, taker_state)
         .await
         .collateral_quote_lots;
-    let pos_coll_before =
-        fetch::<clober::state::PositionAccount>(&mut ctx.banks_client, taker_pos)
-            .await
-            .collateral_quote_lots;
+    let pos_coll_before = fetch::<clober::state::PositionAccount>(&mut ctx.banks_client, taker_pos)
+        .await
+        .collateral_quote_lots;
     let fund_before = fetch::<InsuranceFundAccount>(&mut ctx.banks_client, fund_pda)
         .await
         .balance_quote_lots;
@@ -13276,8 +13246,7 @@ async fn force_reduce_position_oracle_frees_isolated_margin() {
         .await
         .expect("isolated recovery must succeed once the ER is stalled");
 
-    let pos_after: clober::state::PositionAccount =
-        fetch(&mut ctx.banks_client, taker_pos).await;
+    let pos_after: clober::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
     let ts_after: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
     let fund_after = fetch::<InsuranceFundAccount>(&mut ctx.banks_client, fund_pda)
         .await
@@ -13626,8 +13595,7 @@ async fn auto_deleverage_accepts_isolated_underwater_leg() {
         .await
         .unwrap()
         .unwrap();
-    let mut pos: clober::state::PositionAccount =
-        fetch(&mut ctx.banks_client, under_pos_a).await;
+    let mut pos: clober::state::PositionAccount = fetch(&mut ctx.banks_client, under_pos_a).await;
     pos.collateral_quote_lots = 500; // isolated bucket
     let sz = std::mem::size_of::<clober::state::PositionAccount>();
     let mut pd = pa.data.clone();
@@ -14910,8 +14878,7 @@ async fn er_margin_xdomain_withdraw_respects_reservation() {
         ))
         .await
         .unwrap();
-    let att: clober::xmargin::ErMarginAttestation =
-        fetch(&mut ctx.banks_client, er_margin).await;
+    let att: clober::xmargin::ErMarginAttestation = fetch(&mut ctx.banks_client, er_margin).await;
     assert_eq!(att.reserved_margin_quote_lots, 60_000);
     assert_eq!(att.epoch, 1);
     let ts: TraderStateAccount = fetch(&mut ctx.banks_client, trader_state).await;
@@ -15129,8 +15096,7 @@ async fn er_margin_authority_reset_recovers_from_dead_attestor() {
         ))
         .await
         .expect("protocol authority resets a stranded attestation");
-    let att: clober::xmargin::ErMarginAttestation =
-        fetch(&mut ctx.banks_client, er_margin).await;
+    let att: clober::xmargin::ErMarginAttestation = fetch(&mut ctx.banks_client, er_margin).await;
     assert_eq!(att.reserved_margin_quote_lots, 0);
     assert_eq!(att.epoch, 2, "epoch advances past the last attestation");
     assert_eq!(
@@ -15259,8 +15225,7 @@ async fn er_margin_attest_epoch_replay_rejected() {
         ))
         .await
         .unwrap();
-    let att: clober::xmargin::ErMarginAttestation =
-        fetch(&mut ctx.banks_client, er_margin).await;
+    let att: clober::xmargin::ErMarginAttestation = fetch(&mut ctx.banks_client, er_margin).await;
     assert_eq!(att.epoch, 6);
     assert_eq!(att.reserved_margin_quote_lots, 12_000);
 }
@@ -16320,8 +16285,7 @@ async fn liquidate_position_v2_caps_close_at_one_tranche() {
     )
     .await;
 
-    let pos_before: clober::state::PositionAccount =
-        fetch(&mut ctx.banks_client, taker_pos).await;
+    let pos_before: clober::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
     assert_eq!(pos_before.size_lots, 3, "precondition: 3-lot position");
 
     let now = ctx

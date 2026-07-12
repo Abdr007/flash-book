@@ -10,10 +10,10 @@
 //! Pure (no Solana runtime), so it runs thousands of operations fast.
 
 use anchor_lang::prelude::Pubkey;
-use clober::hypertree::NIL;
 use clober::book_state::{
     encode_order_id, MarketBookHandle, RestingOrder, MARKET_BOOK_TOTAL_BYTES,
 };
+use clober::hypertree::NIL;
 use proptest::prelude::*;
 
 fn order_sz(price: u64, seq: u64, is_bid: bool, size: u64) -> RestingOrder {
