@@ -86,7 +86,7 @@ pub fn apply_fill(
             .checked_add(fill_size_lots)
             .ok_or(PosMathError::Overflow)?;
         // entry = (entry·old + price·fill) / new_size
-        let weighted = (pos.entry_ticks as u128)
+        let numer = (pos.entry_ticks as u128)
             .checked_mul(pos.size_lots as u128)
             .ok_or(PosMathError::Overflow)?
             .checked_add(
@@ -94,9 +94,20 @@ pub fn apply_fill(
                     .checked_mul(fill_size_lots as u128)
                     .ok_or(PosMathError::Overflow)?,
             )
-            .ok_or(PosMathError::Overflow)?
-            .checked_div(new_size as u128)
-            .ok_or(PosMathError::DivByZero)?;
+            .ok_or(PosMathError::Overflow)?;
+        if new_size == 0 {
+            return Err(PosMathError::DivByZero);
+        }
+        // Round the stacked entry ADVERSE to the trader so a sub-tick remainder can
+        // never under-charge margin: a LONG's unrealized PnL is (mark − entry), so
+        // flooring the entry over-states PnL — round UP instead. A SHORT's PnL is
+        // (entry − mark), so flooring is already the margin-safe direction. Both
+        // stay bracketed by [old_entry, fill_price].
+        let weighted = if pos.side == 0 {
+            numer.div_ceil(new_size as u128)
+        } else {
+            numer / (new_size as u128)
+        };
         return Ok(FillOutcome {
             pos: Pos {
                 side: pos.side,
@@ -493,6 +504,45 @@ mod tests {
     /// entry after adding to a same-side position always lies between the old
     /// entry and the fill price. Covers what the Kani `stack` proof cannot (it
     /// reasons about the internal division result).
+    #[test]
+    fn stack_entry_rounds_adverse_to_the_trader() {
+        // (100·1 + 101·2)/3 = 302/3 = 100.67. A LONG must round the entry UP
+        // (101) so unrealized PnL (mark − entry) is never over-stated and margin
+        // never under-charged; a SHORT rounds DOWN (100), already margin-safe.
+        let long = apply_fill(
+            Pos {
+                side: 0,
+                size_lots: 1,
+                entry_ticks: 100,
+            },
+            0,
+            2,
+            101,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            long.pos.entry_ticks, 101,
+            "long entry rounds up (conservative)"
+        );
+        let short = apply_fill(
+            Pos {
+                side: 1,
+                size_lots: 1,
+                entry_ticks: 100,
+            },
+            1,
+            2,
+            101,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            short.pos.entry_ticks, 100,
+            "short entry floors (conservative)"
+        );
+    }
+
     #[test]
     fn stack_entry_is_vwap_bracketed() {
         for side in 0u8..=1 {

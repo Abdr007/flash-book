@@ -3,7 +3,7 @@ name = "flash-book"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Flash Book — pool-backed CLOB matched by FBA on MagicBlock ER."
+description = "Flash Book — pool-backed CLOB, continuously matched on MagicBlock ER."
 
 [lib]
 crate-type = ["cdylib", "lib"]

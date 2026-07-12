@@ -3,7 +3,7 @@
 Formal specification of the margin model — cross vs isolated buckets,
 healthy-trader invariant, stress lattice, and the liquidation/funding
 routing that depends on those invariants. Companion to `MATH.md` (which
-covers FBA clearing, FLP quoter, funding, etc.).
+covers batch auction clearing, FLP quoter, funding, etc.).
 
 Target audience: auditors and contributors who need to verify that the
 implementation in `programs/flash-book/src/matcher/risk.rs` +

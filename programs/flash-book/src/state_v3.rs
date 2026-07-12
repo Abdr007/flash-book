@@ -530,7 +530,7 @@ impl SequencerCommittee {
 /// advances it when ≥`threshold` distinct validators sign a batch that chains onto
 /// `last_state_root` with a strictly-greater `last_batch_seq`.
 ///
-/// NOTE — this is NOT a batch auction (no FBA). Matching stays a CONTINUOUS
+/// NOTE — this is NOT a batch auction. Matching stays a CONTINUOUS
 /// price-time CLOB; a "batch" here is only the unit of committed fills the
 /// validator set threshold-signs (the consensus attestation over what the
 /// continuous book already produced). Seeds: `[b"batch_attest", market]`.

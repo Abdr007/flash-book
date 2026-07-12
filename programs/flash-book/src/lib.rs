@@ -758,6 +758,112 @@ pub mod flash_book {
         Err(error!(FlashBookError::OwnerForceUndelegateUnavailable))
     }
 
+    /// R-2 EMERGENCY RECOVERY (permissionless). When a market's ER sequencer is
+    /// dead or censoring — the Kani-proven `force_undelegate_allowed` liveness gate
+    /// fires — this closes a trader's TRAPPED cross position on L1 at the oracle
+    /// price, so the collateral that `open_positions > 0` otherwise locks becomes
+    /// withdrawable via the normal (x-domain) withdraw path. Because the market and
+    /// TraderState live on L1 (only the book is delegated), the close needs neither
+    /// the ER book nor the MagicBlock DLP.
+    ///
+    /// The insurance fund is the counterparty of last resort: realized PnL moves
+    /// trader-collateral ↔ insurance equal-and-opposite through the machine-proven
+    /// `force_close_against_insurance` core, so no value is minted (V conserved).
+    /// The position is valued at the staleness-gated worse-of(mark, oracle) health
+    /// price, which is adverse to the closing trader — protecting the fund and
+    /// removing any incentive to prefer this path over a normal close once the ER
+    /// recovers. Anyone may crank it (it can only HELP the trapped trader), and the
+    /// proven gate guarantees it can NEVER fire on a live/heartbeating market.
+    ///
+    /// Accrued funding is forgiven (no balance moves for it ⇒ conservation-neutral),
+    /// which keeps this path independent of the haircut/Residual engine. v1 handles
+    /// CROSS positions; an isolated position's segregated bucket is a follow-up.
+    pub fn force_reduce_position_oracle(ctx: Context<ForceReducePositionOracle>) -> Result<()> {
+        let clock = Clock::get()?;
+        let current_slot = clock.slot;
+        let now_unix = clock.unix_timestamp.max(0) as u64;
+
+        // Liveness gate — only reachable when the ER is stalled/censoring.
+        require!(
+            er::force_undelegate_allowed(
+                current_slot,
+                ctx.accounts.market.last_settlement_slot,
+                ctx.accounts.market.last_heartbeat_slot,
+                ctx.accounts.market.book_delegated_at_slot,
+                constants::FORCE_UNDELEGATE_TIMEOUT_SLOTS,
+                constants::CENSORSHIP_ESCAPE_TIMEOUT_SLOTS,
+            ),
+            FlashBookError::ErStillLive
+        );
+
+        let (pre_side, pre_size, entry, is_long) = {
+            let p = ctx.accounts.position.load()?;
+            require!(p.size_lots > 0, FlashBookError::ZeroSize);
+            // v1: cross only (bucket == the shared pool). Isolated is a follow-up.
+            require!(p.collateral_quote_lots == 0, FlashBookError::OutOfRange);
+            (p.side, p.size_lots, p.entry_price_ticks, p.side == 0)
+        };
+
+        // Staleness-gated worse-of(mark, oracle), adverse to the closer.
+        let close_price =
+            effective_health_mark(&ctx.accounts.market, now_unix, current_slot, is_long)?;
+
+        // Realized PnL at the close price (price move only; accrued funding is
+        // forgiven — conservation-neutral, as no balance moves for it).
+        let price_diff: i128 = if is_long {
+            close_price as i128 - entry as i128
+        } else {
+            entry as i128 - close_price as i128
+        };
+        let pnl: i128 = price_diff
+            .checked_mul(pre_size as i128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+            .checked_mul(ctx.accounts.market.params.tick_size as i128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // Settle trader-collateral ↔ insurance through the proven conserving core.
+        let bucket = ctx.accounts.trader_state.load()?.collateral_quote_lots;
+        let insurance = ctx.accounts.insurance_fund.balance_quote_lots;
+        let (new_bucket, new_insurance) = force_close_against_insurance(pnl, bucket, insurance);
+        let settled_delta = new_bucket as i128 - bucket as i128;
+        ctx.accounts.trader_state.load_mut()?.collateral_quote_lots = new_bucket;
+        ctx.accounts.insurance_fund.balance_quote_lots = new_insurance;
+
+        // Close the position.
+        let market_funding_index = ctx.accounts.market.cum_funding_index;
+        {
+            let mut p = ctx.accounts.position.load_mut()?;
+            p.size_lots = 0;
+            p.entry_price_ticks = 0;
+            let settled_i64 = if settled_delta > i64::MAX as i128 {
+                i64::MAX
+            } else if settled_delta < i64::MIN as i128 {
+                i64::MIN
+            } else {
+                settled_delta as i64
+            };
+            p.realized_pnl_quote_lots = p.realized_pnl_quote_lots.saturating_add(settled_i64);
+            p.set_cum_funding_index(market_funding_index);
+        }
+
+        // OI + open_positions bookkeeping.
+        update_oi(&mut ctx.accounts.market, pre_side, pre_size, pre_side, 0)?;
+        let (new_open, trader) = {
+            let ts = ctx.accounts.trader_state.load()?;
+            (ts.open_positions.saturating_sub(1), ts.trader)
+        };
+        ctx.accounts.trader_state.load_mut()?.open_positions = new_open;
+        emit!(PositionForceReducedEvent {
+            market: ctx.accounts.market.key(),
+            trader,
+            close_price_ticks: close_price,
+            size_lots: pre_size,
+            realized_delta_quote_lots: settled_delta.clamp(i64::MIN as i128, i64::MAX as i128)
+                as i64,
+        });
+        Ok(())
+    }
+
     /// PERMISSIONLESS one-shot: stamp the force-undelegate liveness baseline for a
     /// market whose book was DELEGATED BEFORE the censorship-escape upgrade shipped
     /// (so `book_delegated_at_slot == 0`). Without this, such a
@@ -1471,6 +1577,7 @@ pub mod flash_book {
             &ctx.accounts.trader_state,
             ctx.program_id,
             ctx.accounts.position.as_ref(),
+            ctx.remaining_accounts,
         )
     }
 
@@ -1508,6 +1615,7 @@ pub mod flash_book {
             &ctx.accounts.trader_state,
             ctx.program_id,
             ctx.accounts.position.as_ref(),
+            ctx.remaining_accounts,
         )
     }
 
@@ -1576,6 +1684,7 @@ pub mod flash_book {
                 &ctx.accounts.trader_state,
                 ctx.program_id,
                 ctx.accounts.position.as_ref(),
+                ctx.remaining_accounts,
             )?;
         }
         Ok(())
@@ -1821,13 +1930,37 @@ pub mod flash_book {
                 backing,
                 pos_info,
             )?;
+            let (open_positions, cross_collateral, trader_pk) = {
+                let ts = ctx.accounts.trader_state.load()?;
+                (ts.open_positions, ts.collateral_quote_lots, ts.trader)
+            };
             // Keep the trader within the cross-margin stress lattice's position
             // budget: reject opening a NEW market once already at the cap. Reduces
             // / adds on a market the trader already holds are exempt.
-            assert_open_position_budget(
-                ctx.accounts.trader_state.load()?.open_positions,
-                pos_info,
-            )?;
+            assert_open_position_budget(open_positions, pos_info)?;
+            // R-1: a NEW cross-market open must satisfy the FULL cross-portfolio
+            // IM (all existing cross legs + this one), not just this market's, or
+            // sequential opens each pass against the same pool. Same-market adds
+            // stay on the per-market gate above. The trader's other [market,
+            // position] pairs ride in remaining_accounts (maker positions there
+            // belong to other traders and are filtered out by the trader match).
+            // Only the stacking case runs the walk: ≥1 existing position AND a new
+            // market. A first open (open_positions == 0) is unchanged.
+            let opens_new_slot = matches!(pos_info, None | Some((_, 0)));
+            if opens_new_slot && open_positions >= 1 {
+                assert_cross_portfolio_intake_im(
+                    ctx.remaining_accounts,
+                    &ctx.accounts.trader_state.key(),
+                    &trader_pk,
+                    ctx.program_id,
+                    open_positions,
+                    market,
+                    &market_key,
+                    if side == 0 { Side::Long } else { Side::Short },
+                    size_lots,
+                    cross_collateral,
+                )?;
+            }
         }
 
         // Pre-scan remaining_accounts for maker
@@ -3353,6 +3486,17 @@ pub mod flash_book {
         liq_penalty_contribution_bps: u32,
         pause_threshold_quote_lots: u64,
     ) -> Result<()> {
+        // Each contribution is a split of value that was actually collected on
+        // that fee/tax/penalty leg. A rate above 100% would credit more insurance
+        // liability than entered the vault; the fund authority could then
+        // withdraw that phantom balance from trader/LP collateral in the shared
+        // vault. Bound every independent stream at its conservation ceiling.
+        require!(
+            fee_contribution_bps <= constants::BPS_DENOM
+                && toxicity_tax_contribution_bps <= constants::BPS_DENOM
+                && liq_penalty_contribution_bps <= constants::BPS_DENOM,
+            FlashBookError::OutOfRange
+        );
         let f = &mut ctx.accounts.insurance_fund;
         f.authority = ctx.accounts.authority.key();
         f.bump = ctx.bumps.insurance_fund;
@@ -3891,6 +4035,11 @@ pub mod flash_book {
             new_pos.unhealthy_since_slot = legacy.unhealthy_since_slot;
             new_pos.last_liquidated_at_slot = legacy.last_liquidated_at_slot;
             new_pos.collateral_quote_lots = legacy.collateral_quote_lots;
+            // Preserve the trader's self-imposed per-position leverage cap.
+            // Omitting it would leave the zero-copy-initialized field at 0, the
+            // sentinel for "use the market max", silently removing the trader's
+            // tighter guardrail across the migration.
+            new_pos.leverage_cap = legacy.leverage_cap;
             new_pos.bump = new_bump;
         }
 
@@ -4754,6 +4903,13 @@ pub mod flash_book {
         let mut snaps: Vec<RiskPosSnap> = Vec::new();
         let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
         let mut market_keys: Vec<Pubkey> = Vec::new();
+        // L-2: value every leg at the staleness-gated worse-of(mark, oracle) health
+        // price (matching the withdraw/sweep gates), not the raw EMA mark — a
+        // stale/favorable mark must not let the transition pass on an over-valued
+        // position. effective_health_mark fails closed on a stale mark. One read.
+        let hm_c = Clock::get()?;
+        let hm_now_unix = hm_c.unix_timestamp.max(0) as u64;
+        let hm_slot = hm_c.slot;
 
         let mut i = 0usize;
         while i + 1 < remaining.len() {
@@ -4804,7 +4960,12 @@ pub mod flash_book {
             });
             market_snaps.push(RiskMarketSnap {
                 market: m_ai.key(),
-                mark_price: Ticks(market.mark_price_ticks),
+                mark_price: Ticks(effective_health_mark(
+                    &market,
+                    hm_now_unix,
+                    hm_slot,
+                    position.side == 0,
+                )?),
                 cum_funding_index: market.cum_funding_index,
                 maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
                 tick_size: market.params.tick_size,
@@ -4840,7 +5001,12 @@ pub mod flash_book {
         });
         market_snaps.push(RiskMarketSnap {
             market: target_market_key,
-            mark_price: Ticks(target_market.mark_price_ticks),
+            mark_price: Ticks(effective_health_mark(
+                target_market,
+                hm_now_unix,
+                hm_slot,
+                tp_side == 0,
+            )?),
             cum_funding_index: target_market.cum_funding_index,
             maintenance_margin_bps: target_market.params.maintenance_margin_ratio_bps,
             tick_size: target_market.params.tick_size,
@@ -4955,6 +5121,13 @@ pub mod flash_book {
         let mut snaps: Vec<RiskPosSnap> = Vec::new();
         let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
         let mut market_keys: Vec<Pubkey> = Vec::new();
+        // L-2: value every leg at the staleness-gated worse-of(mark, oracle) health
+        // price (matching the withdraw/sweep gates), not the raw EMA mark — a
+        // stale/favorable mark must not let the transition pass on an over-valued
+        // position. effective_health_mark fails closed on a stale mark. One read.
+        let hm_c = Clock::get()?;
+        let hm_now_unix = hm_c.unix_timestamp.max(0) as u64;
+        let hm_slot = hm_c.slot;
 
         let mut i = 0usize;
         while i + 1 < remaining.len() {
@@ -5004,7 +5177,12 @@ pub mod flash_book {
             });
             market_snaps.push(RiskMarketSnap {
                 market: m_ai.key(),
-                mark_price: Ticks(market.mark_price_ticks),
+                mark_price: Ticks(effective_health_mark(
+                    &market,
+                    hm_now_unix,
+                    hm_slot,
+                    position.side == 0,
+                )?),
                 cum_funding_index: market.cum_funding_index,
                 maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
                 tick_size: market.params.tick_size,
@@ -5038,7 +5216,12 @@ pub mod flash_book {
             });
             market_snaps.push(RiskMarketSnap {
                 market: target_market_key,
-                mark_price: Ticks(target_market.mark_price_ticks),
+                mark_price: Ticks(effective_health_mark(
+                    target_market,
+                    hm_now_unix,
+                    hm_slot,
+                    tp_side == 0,
+                )?),
                 cum_funding_index: target_market.cum_funding_index,
                 maintenance_margin_bps: target_market.params.maintenance_margin_ratio_bps,
                 tick_size: target_market.params.tick_size,
@@ -5102,10 +5285,12 @@ pub mod flash_book {
     /// underwater positions block keepers from settling them.
     ///
     /// SCOPE: this handler drives the SIDE-ACCRUAL (K/F) price index via
-    /// `advance_indices`, using `market.last_funding_rate_bps_per_sec`. That rate
-    /// is still initialized to 0 and stored nowhere, so the side-accrual F-term
-    /// this handler advances accrues 0 for now (`view_predicted_funding` computes
-    /// a rate read-only; no path persists it into this field yet).
+    /// `advance_indices`. `crank_funding` now DOES persist
+    /// `market.last_funding_rate_bps_per_sec`, but that is a per-SECOND rate at
+    /// 1e4 (bps) scale, whereas `advance_indices` expects a per-SLOT rate at 1e9
+    /// scale — a unit mismatch. Until a proper per-slot-1e9 conversion is wired,
+    /// the F-term is fed 0 (accrues nothing, never a wrong-scaled amount); the
+    /// F-index is dormant anyway (no path reads it into collateral).
     ///
     /// This is NOT the protocol's funding charge. Cumulative-index funding is
     /// LIVE: the permissionless `crank_funding` instruction advances
@@ -5120,7 +5305,15 @@ pub mod flash_book {
         let market = &ctx.accounts.market;
         let mkey = market.key();
         let mark_px = market.mark_price_ticks;
-        let funding_rate = market.last_funding_rate_bps_per_sec;
+        // The side-accrual F-term is DORMANT (no path reads its index into
+        // collateral yet). `advance_indices` expects a per-SLOT rate at 1e9 scale
+        // (`funding_rate_e9`), but the only stored rate is
+        // `last_funding_rate_bps_per_sec` — a per-SECOND rate at 1e4 (bps) scale
+        // (persisted by `crank_funding`). Feeding it in directly is a unit
+        // mismatch (~1e5 magnitude + sec-vs-slot), so pass 0: the index accrues
+        // NOTHING rather than a wrong-scaled amount. A real F-term must first
+        // convert to per-slot-1e9 before any consumer is wired.
+        let funding_rate: i64 = 0;
 
         // ── advance the per-side K/F accrual indices ───────────
         // Maintenance-only wiring. The side indices track the market's live
@@ -5814,21 +6007,27 @@ pub mod flash_book {
                         xmargin::apply_collateral_credit(s.collateral_quote_lots, maker_rebate)?;
                 }
             }
-            // Track A2: maker-fee debit through the proven core.
+            // A maker fee must follow the same liveness rule as the taker fee:
+            // settlement cannot revert merely because the maker's collateral was
+            // depleted after matching. On an armed market that would leave this
+            // fill at the FIFO ring head and wedge every later fill. Collect what
+            // is available, then remove the uncollected amount from `net_fee` so
+            // insurance/protocol accounting never credits phantom value.
             if maker_fee > 0 {
-                if maker_pos_isolated {
+                let paid = if maker_pos_isolated {
                     let mut p = ctx.accounts.maker_position.load_mut()?;
-                    p.collateral_quote_lots = xmargin::apply_collateral_debit_checked(
-                        p.collateral_quote_lots,
-                        maker_fee,
-                    )?;
+                    let (after, paid) =
+                        xmargin::apply_capped_debit(p.collateral_quote_lots, maker_fee);
+                    p.collateral_quote_lots = after;
+                    paid
                 } else {
                     let mut s = ctx.accounts.maker_trader_state.load_mut()?;
-                    s.collateral_quote_lots = xmargin::apply_collateral_debit_checked(
-                        s.collateral_quote_lots,
-                        maker_fee,
-                    )?;
-                }
+                    let (after, paid) =
+                        xmargin::apply_capped_debit(s.collateral_quote_lots, maker_fee);
+                    s.collateral_quote_lots = after;
+                    paid
+                };
+                net_fee = net_fee.saturating_sub(maker_fee.saturating_sub(paid));
             }
         }
         // Net fee to insurance fund (per fee_contribution_bps).
@@ -7627,7 +7826,7 @@ pub mod flash_book {
     }
 
     /// PERMISSIONLESSLY commit a
-    /// committee-attested state transition. **NOT a batch auction (no FBA)** —
+    /// committee-attested state transition. **NOT a batch auction** —
     /// matching stays a continuous price-time CLOB; this only records the state
     /// root the validator set threshold-signed over the fills the continuous book
     /// already produced. Verifies (1) `epoch` matches the active committee, (2)
@@ -7851,6 +8050,11 @@ pub mod flash_book {
 
         let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(2);
         let mut markets: Vec<RiskMarketSnap> = Vec::with_capacity(2);
+        // L-2: value each leg at the staleness-gated worse-of(mark, oracle) price
+        // (see set_position_*), not the raw EMA mark. One clock read.
+        let hm_c = Clock::get()?;
+        let hm_now_unix = hm_c.unix_timestamp.max(0) as u64;
+        let hm_slot = hm_c.slot;
         for (proj, market, market_key) in [
             (proj_a, market_a, market_a_key),
             (proj_b, market_b, market_b_key),
@@ -7861,7 +8065,12 @@ pub mod flash_book {
             }
             markets.push(RiskMarketSnap {
                 market: market_key,
-                mark_price: Ticks(market.mark_price_ticks),
+                mark_price: Ticks(effective_health_mark(
+                    market,
+                    hm_now_unix,
+                    hm_slot,
+                    leg_is_long,
+                )?),
                 cum_funding_index: market.cum_funding_index,
                 // RISK-2: open gate enforces INITIAL margin (buffer above liquidation).
                 maintenance_margin_bps: market.params.initial_margin_ratio_bps,
@@ -9666,12 +9875,20 @@ pub mod flash_book {
         // thin book. Reject until the resting liquidation fills or is cancelled.
         // (Scan happens BEFORE the reward block so no reward is paid on a no-op.)
         {
+            // Key the duplicate check on (wallet, sub_index) — the SPECIFIC
+            // sub-account being liquidated — not the wallet alone. The injected
+            // close order carries the liquidatee's sub_index, so matching it lets
+            // a DIFFERENT sub-account of the same wallet with its own liquidatable
+            // position be liquidated even while this one's close order rests
+            // (closes a keeper-liveness gap), while still blocking a duplicate
+            // liquidation (double reward / OI corruption) of THIS sub-account.
+            let liq_sub_index = ctx.accounts.trader_state.load()?.sub_index;
             let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
             let handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
             let mut already_resting = false;
             if (close_side as u8) == 0 {
                 handle.for_each_bid_best_first(|_i, o: &state_v2::RestingOrderV2| {
-                    if o.order_type == 3 && o.trader == trader {
+                    if o.order_type == 3 && o.trader == trader && o.sub_index == liq_sub_index {
                         already_resting = true;
                         false
                     } else {
@@ -9680,7 +9897,7 @@ pub mod flash_book {
                 });
             } else {
                 handle.for_each_ask_best_first(|_i, o: &state_v2::RestingOrderV2| {
-                    if o.order_type == 3 && o.trader == trader {
+                    if o.order_type == 3 && o.trader == trader && o.sub_index == liq_sub_index {
                         already_resting = true;
                         false
                     } else {
@@ -10102,7 +10319,14 @@ pub mod flash_book {
             .checked_mul(tick_size)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         require!(denom > 0, FlashBookError::ZeroPrice);
-        let collateral_per_lot_ticks = collateral / denom;
+        // Round the equity-per-lot UP so the bankruptcy price is pushed AWAY from
+        // entry (long: lower, short: higher). Flooring pulled `bp` toward entry,
+        // which let `adl_bankruptcy_reached` fire while the position still held up
+        // to ~1 tick of true equity — an over-seizure that wiped solvent equity.
+        // `div_ceil` makes the equity at `bp` ≤ 0 by construction, so ADL only ever
+        // fires on a genuinely-bankrupt leg (at worst 1 tick late, which cannot
+        // seize a solvent trader's equity).
+        let collateral_per_lot_ticks = collateral.div_ceil(denom);
         let bp_u128: u128 = if underwater.side == 0 {
             // long: bp = entry - C/(S*tick); clamp to 1 if collateral overshoots
             entry.saturating_sub(collateral_per_lot_ticks).max(1)
@@ -14365,6 +14589,10 @@ fn place_limit_v2_core(
     // OPTIONAL (trader_state, market) position for the intake
     // initial-margin gate (None ⇒ treated as a full open — strictest).
     position: Option<&AccountLoader<'_, state::PositionAccount>>,
+    // R-1: [market, position] pairs for the trader's OTHER open cross positions,
+    // used by the full-portfolio IM gate when this order opens a NEW market.
+    // Empty for a same-market add / isolated / reduce-only (unused there).
+    remaining: &[AccountInfo<'_>],
 ) -> Result<()> {
     // ER readiness: while the book is delegated to the ER, this order's margin
     // is reserved cross-domain by the sequencer writing the trader's
@@ -14528,10 +14756,36 @@ fn place_limit_v2_core(
                 backing,
                 pos_info,
             )?;
+            let (open_positions, cross_collateral) = {
+                let ts = trader_state.load()?;
+                (ts.open_positions, ts.collateral_quote_lots)
+            };
             // Keep the trader within the cross-margin stress lattice's position
             // budget: reject a resting order that would OPEN a new market once
             // already at the cap. Reduces / adds on a market already held are exempt.
-            assert_open_position_budget(trader_state.load()?.open_positions, pos_info)?;
+            assert_open_position_budget(open_positions, pos_info)?;
+            // R-1: a NEW cross-market open must satisfy the FULL cross-portfolio
+            // IM, not just this market's — otherwise sequential cross opens each
+            // pass against the same pool and defeat the IM buffer. A same-market
+            // add (Some((_, size>0))) stays on the per-market gate above. Only the
+            // stacking case matters: the trader must already hold ≥1 position AND
+            // be opening a new market. A first open (open_positions == 0) has no
+            // portfolio to stack against and keeps the per-market gate exactly.
+            let opens_new_slot = matches!(pos_info, None | Some((_, 0)));
+            if opens_new_slot && open_positions >= 1 {
+                assert_cross_portfolio_intake_im(
+                    remaining,
+                    &trader_state.key(),
+                    &trader_pk,
+                    program_id,
+                    open_positions,
+                    market,
+                    &market_key,
+                    if side == 0 { Side::Long } else { Side::Short },
+                    size_lots,
+                    cross_collateral,
+                )?;
+            }
         }
     }
 
@@ -17348,7 +17602,7 @@ pub struct SetSequencerCommittee<'info> {
 }
 
 /// Batch header — the state transition the committee threshold-signs.
-/// NOT an auction batch (no FBA); `fills_merkle_root` commits to the fills the
+/// NOT an auction batch; `fills_merkle_root` commits to the fills the
 /// continuous CLOB already matched, and `prev/new_state_root` chain the book +
 /// position state across committed batches.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
@@ -18501,6 +18755,43 @@ pub struct AutoDeleverage<'info> {
     pub side_accrual: Option<Box<Account<'info, state_v3::MarketSideAccrualAccount>>>,
 }
 
+/// R-2 emergency oracle force-close. Permissionless; the liveness gate in the
+/// handler restricts it to a stalled/censoring ER, and it can only free the
+/// trapped trader's own funds.
+#[derive(Accounts)]
+pub struct ForceReducePositionOracle<'info> {
+    /// Anyone may crank it — it only helps the trapped trader.
+    pub cranker: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    #[account(
+        mut,
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
+
+    #[account(mut)]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::PositionAccount::SEED,
+            market.key().as_ref(),
+            trader_state.key().as_ref(),
+        ],
+        bump = position.load()?.bump,
+    )]
+    pub position: AccountLoader<'info, state::PositionAccount>,
+}
+
 // ─── Events ─────────────────────────────────────────────────────────────
 
 #[event]
@@ -19637,6 +19928,17 @@ pub struct AutoDeleveragedEvent {
     pub executor: Pubkey,
 }
 
+/// Emitted when a trapped position is force-closed on L1 at the oracle price via
+/// `force_reduce_position_oracle` (ER-down emergency recovery).
+#[event]
+pub struct PositionForceReducedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub close_price_ticks: u64,
+    pub size_lots: u64,
+    pub realized_delta_quote_lots: i64,
+}
+
 /// Emitted when authority updates the insurance fund's pause threshold via
 /// `set_insurance_pause_threshold`. Lets indexers/keepers see the gate move
 /// without re-fetching the InsuranceFundAccount.
@@ -20463,7 +20765,6 @@ fn emit_margin_threshold_if_crossed(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FundingRouteErr {
     Overflow,
-    ResidualUnderflow,
 }
 
 /// Pure RISK-1 funding-routing core (Kani-proven, see `funding_routing_proofs`).
@@ -20473,9 +20774,16 @@ enum FundingRouteErr {
 ///
 /// CONSERVATION (the RISK-1 invariant): the change in collateral equals the
 /// NEGATIVE change in the Residual — `Δcollateral == −Δresidual` — so funding can
-/// never mint or burn protocol collateral. A payment is clamped to availability
-/// (the unpaid remainder is absorbed as the anchor advances, exactly as the prior
-/// inline routing did); a receipt credits in full.
+/// never mint or burn protocol collateral. BOTH directions clamp to availability:
+/// a payment is clamped to the bucket's collateral, and a receipt is clamped to
+/// the solvency Residual it is paid out of. The clamped remainder is absorbed as
+/// the funding anchor advances (the payer under-pays / the receiver is haircut),
+/// exactly the socialized treatment the residual/haircut engine already applies
+/// to a shortfall. Clamping — rather than reverting on an exhausted Residual —
+/// is REQUIRED for liveness: `route_funding` runs at the strict-FIFO ring head
+/// inside `apply_fill`, so a revert there would wedge every later settlement on
+/// the market (a settlement-DoS), and every other value-shortfall leg (taker/
+/// maker fee, bad-debt) is already capped, not reverting.
 fn route_funding(
     owed: i64,
     collateral: u64,
@@ -20488,14 +20796,13 @@ fn route_funding(
             .ok_or(FundingRouteErr::Overflow)?;
         Ok((collateral - paid, new_residual)) // paid ≤ collateral ⇒ no underflow
     } else if owed < 0 {
-        let received = owed.unsigned_abs();
+        // Pay the receipt out of the Residual, clamped to what it can back.
+        let received = owed.unsigned_abs() as u128;
+        let applied = received.min(residual);
         let new_collateral = collateral
-            .checked_add(received)
+            .checked_add(applied as u64) // applied ≤ |owed| ≤ i64::MAX ⇒ fits u64
             .ok_or(FundingRouteErr::Overflow)?;
-        let new_residual = residual
-            .checked_sub(received as u128)
-            .ok_or(FundingRouteErr::ResidualUnderflow)?;
-        Ok((new_collateral, new_residual))
+        Ok((new_collateral, residual - applied)) // applied ≤ residual ⇒ no underflow
     } else {
         Ok((collateral, residual))
     }
@@ -20570,7 +20877,6 @@ fn settle_position_funding(
     let (new_bucket, new_residual) = route_funding(owed_i64, bucket, *residual_quote_lots)
         .map_err(|e| match e {
             FundingRouteErr::Overflow => error!(FlashBookError::ArithmeticOverflow),
-            FundingRouteErr::ResidualUnderflow => error!(FlashBookError::HaircutResidualUnderflow),
         })?;
     if is_isolated {
         position.collateral_quote_lots = new_bucket;
@@ -20730,15 +21036,36 @@ mod funding_routing_proofs {
     }
 
     /// `FundingRouteErr` is only ever produced on a genuine checked-arith failure,
-    /// never on the owed==0 no-op path (used to keep the enum non-dead under kani).
+    /// never on the owed==0 no-op path.
     #[kani::proof]
     fn funding_routing_zero_is_noop() {
         let collateral: u64 = kani::any();
         let residual: u128 = kani::any::<u64>() as u128;
         let r = route_funding(0, collateral, residual);
         assert!(r == Ok((collateral, residual)));
-        let _ = FundingRouteErr::Overflow; // reference both variants
-        let _ = FundingRouteErr::ResidualUnderflow;
+        let _ = FundingRouteErr::Overflow; // reference the enum
+    }
+
+    /// A receipt is clamped to the Residual it is paid out of: it never draws the
+    /// Residual below zero (no revert / no underflow) and never credits collateral
+    /// by more than the Residual could back. This is the liveness property that
+    /// keeps the funding leg from wedging the FIFO ring at an exhausted Residual.
+    #[kani::proof]
+    fn funding_receipt_clamped_to_residual() {
+        let owed: i64 = kani::any();
+        kani::assume(owed < 0);
+        let collateral: u64 = kani::any();
+        let residual: u128 = kani::any::<u64>() as u128;
+        if let Ok((new_col, new_res)) = route_funding(owed, collateral, residual) {
+            // Residual only ever shrinks and stays non-negative (u128, no wrap).
+            assert!(new_res <= residual);
+            // Collateral credited by exactly the drop in Residual, itself capped
+            // at both the amount owed and the Residual available.
+            let credited = (new_col - collateral) as u128;
+            assert!(credited == residual - new_res);
+            assert!(credited <= residual);
+            assert!(credited <= owed.unsigned_abs() as u128);
+        }
     }
 }
 
@@ -20826,6 +21153,125 @@ mod h6_h7_solvency_proofs {
         } else {
             assert!(new_cross == cross + mag);
             assert!(new_iso == iso);
+        }
+    }
+}
+
+/// R-2 emergency recovery core (pure, Kani-proven in `force_close_proofs`).
+/// Settles a TRAPPED position's realized PnL (valued at the oracle price) against
+/// the insurance fund as the counterparty of last resort, so a trader whose ER
+/// sequencer is dead/byzantine can close on L1 and free the collateral that
+/// `open_positions > 0` otherwise locks. Returns `(new_bucket, new_insurance)`.
+///
+/// CONSERVATION (V = C_tot + I + Residual): the trader's bucket and the insurance
+/// fund move EXACTLY equal-and-opposite — `Δbucket == −Δinsurance` — so no value
+/// is minted or burned; the Residual is untouched. BOTH directions clamp so
+/// neither balance can under/overflow: a gain the fund cannot back is haircut
+/// (the trader is shorted — an acceptable last-resort outcome), and a loss beyond
+/// the trader's bucket is absorbed (the fund receives only what the trader held).
+/// The `u64::MAX` headroom clamps are unreachable at real balances; they keep the
+/// core total so the conservation proof holds over the whole input domain.
+fn force_close_against_insurance(pnl: i128, bucket: u64, insurance: u64) -> (u64, u64) {
+    if pnl > 0 {
+        let gain = if pnl > u64::MAX as i128 {
+            u64::MAX
+        } else {
+            pnl as u64
+        };
+        // Paid out of the fund, capped at what it holds AND the bucket's headroom.
+        let paid = gain.min(insurance).min(u64::MAX - bucket);
+        (bucket + paid, insurance - paid) // paid ≤ insurance ⇒ no underflow
+    } else if pnl < 0 {
+        let loss = if pnl < -(u64::MAX as i128) {
+            u64::MAX
+        } else {
+            (-pnl) as u64
+        };
+        // Paid to the fund, capped at the trader's bucket AND the fund's headroom.
+        let paid = loss.min(bucket).min(u64::MAX - insurance);
+        (bucket - paid, insurance + paid) // paid ≤ bucket ⇒ no underflow
+    } else {
+        (bucket, insurance)
+    }
+}
+
+#[cfg(test)]
+mod force_close_core_tests {
+    use super::force_close_against_insurance;
+
+    #[test]
+    fn gain_within_fund_credits_trader_debits_fund() {
+        assert_eq!(
+            force_close_against_insurance(1_000, 500, 4_000),
+            (1_500, 3_000)
+        );
+    }
+
+    #[test]
+    fn gain_beyond_fund_is_haircut() {
+        // Fund only holds 300 of the 1000 owed: trader gets 300, fund drains to 0.
+        assert_eq!(force_close_against_insurance(1_000, 500, 300), (800, 0));
+    }
+
+    #[test]
+    fn loss_within_bucket_debits_trader_credits_fund() {
+        assert_eq!(
+            force_close_against_insurance(-1_000, 5_000, 200),
+            (4_000, 1_200)
+        );
+    }
+
+    #[test]
+    fn loss_beyond_bucket_is_absorbed() {
+        // Trader can only pay 500 of the 1000 loss; fund gains only 500.
+        assert_eq!(force_close_against_insurance(-1_000, 500, 200), (0, 700));
+    }
+
+    #[test]
+    fn conserves_value_each_direction() {
+        for &(pnl, b, i) in &[
+            (1_000i128, 500u64, 4_000u64),
+            (1_000, 500, 300),
+            (-1_000, 5_000, 200),
+            (-1_000, 500, 200),
+            (0, 123, 456),
+        ] {
+            let (nb, ni) = force_close_against_insurance(pnl, b, i);
+            assert_eq!(nb as i128 - b as i128, -(ni as i128 - i as i128));
+        }
+    }
+}
+
+#[cfg(kani)]
+mod force_close_proofs {
+    use super::force_close_against_insurance;
+
+    /// CONSERVATION: the trader bucket and the insurance fund always move
+    /// equal-and-opposite, over the WHOLE (pnl, bucket, insurance) domain — so an
+    /// emergency oracle force-close can never mint or burn protocol value.
+    #[kani::proof]
+    fn force_close_conserves_value() {
+        let pnl: i128 = kani::any();
+        let bucket: u64 = kani::any::<u64>();
+        let insurance: u64 = kani::any::<u64>();
+        let (nb, ni) = force_close_against_insurance(pnl, bucket, insurance);
+        assert!(nb as i128 - bucket as i128 == -(ni as i128 - insurance as i128));
+    }
+
+    /// A gain never drains the fund below zero and a loss never drives the trader
+    /// bucket below zero (no underflow / no panic on any input).
+    #[kani::proof]
+    fn force_close_never_underflows() {
+        let pnl: i128 = kani::any();
+        let bucket: u64 = kani::any::<u64>();
+        let insurance: u64 = kani::any::<u64>();
+        let (nb, ni) = force_close_against_insurance(pnl, bucket, insurance);
+        if pnl > 0 {
+            assert!(ni <= insurance && nb >= bucket); // fund pays, trader credited
+        } else if pnl < 0 {
+            assert!(nb <= bucket && ni >= insurance); // trader pays, fund credited
+        } else {
+            assert!(nb == bucket && ni == insurance);
         }
     }
 }
@@ -21587,6 +22033,222 @@ mod flp_mtm_tests {
     fn tick_size_scales() {
         assert_eq!(flp_slot_unrealized_pnl(0, 100, 100, 110, 5), 5000);
     }
+}
+
+#[cfg(test)]
+mod route_funding_tests {
+    use super::route_funding;
+
+    #[test]
+    fn receipt_beyond_residual_is_clamped_not_reverted() {
+        // A receiver owed 1000 against a Residual of only 300 must NOT revert
+        // (that would wedge the strict-FIFO ring at the head of apply_fill).
+        // It is paid what the Residual can back and the Residual is drained.
+        let (col, res) = route_funding(-1000, 500, 300).expect("receipt must not revert");
+        assert_eq!(col, 800, "credited only the 300 the Residual could back");
+        assert_eq!(res, 0, "Residual fully drawn, never underflowed");
+    }
+
+    #[test]
+    fn receipt_within_residual_credits_in_full() {
+        let (col, res) = route_funding(-1000, 500, 4000).unwrap();
+        assert_eq!(col, 1500);
+        assert_eq!(res, 3000);
+    }
+
+    #[test]
+    fn payment_is_clamped_to_collateral() {
+        // Payer owes 1000 but holds 400: pays 400, Residual grows by 400.
+        let (col, res) = route_funding(1000, 400, 100).unwrap();
+        assert_eq!(col, 0);
+        assert_eq!(res, 500);
+    }
+
+    #[test]
+    fn conservation_delta_collateral_equals_negative_delta_residual() {
+        for &(owed, col0, res0) in &[
+            (-1000i64, 500u64, 300u128),
+            (-50, 10, 10_000),
+            (1000, 400, 100),
+            (777, 10_000, 0),
+        ] {
+            let (col1, res1) = route_funding(owed, col0, res0).unwrap();
+            let d_col = col1 as i128 - col0 as i128;
+            let d_res = res1 as i128 - res0 as i128;
+            assert_eq!(d_col, -d_res, "funding must conserve value");
+        }
+    }
+}
+
+/// R-1: CROSS-PORTFOLIO intake initial-margin gate. The per-market
+/// `assert_intake_initial_margin` below checks only THIS market's resulting IM
+/// against the full cross pool, so opening across N markets lets each open see
+/// the whole pool as free backing — the portfolio can be opened straight onto the
+/// maintenance line with no IM buffer (correlated-gap bad debt then socialises to
+/// insurance). This gate closes that: when an order OPENS a NEW cross market, it
+/// evaluates the trader's FULL cross portfolio (every existing open leg + the
+/// prospective new leg) against the same stress lattice liquidation uses, at the
+/// INITIAL-margin ratio.
+///
+/// It reuses the exact proven machinery from `sweep_collateral`/`partial_withdraw`
+/// (`verify_position_pda` + `effective_health_mark` + `assess_margin_unified`) and
+/// inherits their omission guarantee: every own leg is PDA-bound to THIS
+/// `trader_state`, markets are deduped, and the counted legs must equal
+/// `open_positions` — so a caller cannot omit a risky leg to understate the
+/// requirement (a short count fails closed). Legs are collected by CONTENT (a
+/// program-owned `PositionAccount` whose `trader` matches and which PDA-binds),
+/// so the same helper works on the limit path (a clean [market,position] slice)
+/// and the taker path (a bag also holding maker/commitment/outbox accounts —
+/// maker positions belong to other traders and are naturally excluded).
+///
+/// Only invoked when the order opens a NEW market slot (the R-1 vector); same-
+/// market adds and reduce-only stay on the O(1) `assert_intake_initial_margin`
+/// path, so the hot path is unchanged for the common case. Isolated legs carry
+/// their own segregated collateral in the snapshot, exactly as the withdraw walk
+/// does, and `assess_margin_unified` splits them out.
+#[allow(clippy::too_many_arguments)]
+fn assert_cross_portfolio_intake_im(
+    remaining: &[AccountInfo],
+    trader_state_key: &Pubkey,
+    trader_pk: &Pubkey,
+    program_id: &Pubkey,
+    open_positions: u8,
+    target_market: &MarketAccount,
+    target_market_key: &Pubkey,
+    new_side: Side,
+    new_resulting_size_lots: u64,
+    cross_collateral: u64,
+) -> Result<()> {
+    let clock = Clock::get()?;
+    let now_unix = clock.unix_timestamp.max(0) as u64;
+    let current_slot = clock.slot;
+
+    let expected = open_positions as usize;
+    let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(expected + 1);
+    let mut market_snaps: Vec<RiskMarketSnap> = Vec::with_capacity(expected + 1);
+    let mut market_keys: Vec<Pubkey> = Vec::with_capacity(expected + 1);
+
+    // Collect the trader's OWN open legs from remaining_accounts by content.
+    for ai in remaining.iter() {
+        if ai.owner != program_id {
+            continue;
+        }
+        let position: state::PositionAccount = {
+            let data = match ai.try_borrow_data() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            match state::PositionAccount::try_deserialize(&mut &data[..]) {
+                Ok(p) => p,
+                Err(_) => continue, // not a PositionAccount (market/commitment/outbox/…)
+            }
+        };
+        if position.trader != *trader_pk || position.size_lots == 0 {
+            continue; // a maker/other trader's leg, or a flat leg (no IM)
+        }
+        // Bind to THIS trader_state (blocks a different sub-account's position
+        // of the same wallet being substituted to understate risk).
+        if verify_position_pda(
+            &position.market,
+            trader_state_key,
+            position.bump,
+            &ai.key(),
+            program_id,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        // New-market-only: no own leg may sit on the market being opened.
+        require!(
+            position.market != *target_market_key,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            !market_keys.contains(&position.market),
+            FlashBookError::OutOfRange
+        );
+        // The leg's market account must be present (program-owned, key match).
+        let market_ai = remaining
+            .iter()
+            .find(|m| *m.key == position.market && m.owner == program_id)
+            .ok_or_else(|| error!(FlashBookError::OutOfRange))?;
+        let market_acct: MarketAccount =
+            MarketAccount::try_deserialize(&mut &market_ai.try_borrow_data()?[..])?;
+        snaps.push(RiskPosSnap {
+            market: position.market,
+            side: if position.side == 0 {
+                Side::Long
+            } else {
+                Side::Short
+            },
+            size_lots: position.size_lots,
+            entry_price: Ticks(position.entry_price_ticks),
+            cum_funding_index_at_entry: position.cum_funding_index(),
+            collateral_quote_lots: position.collateral_quote_lots,
+        });
+        market_snaps.push(RiskMarketSnap {
+            market: position.market,
+            mark_price: Ticks(effective_health_mark(
+                &market_acct,
+                now_unix,
+                current_slot,
+                position.side == 0,
+            )?),
+            cum_funding_index: market_acct.cum_funding_index,
+            // INITIAL margin (buffer above liquidation) — RISK-2, as the walk gates.
+            maintenance_margin_bps: market_acct.params.initial_margin_ratio_bps,
+            tick_size: market_acct.params.tick_size,
+            concentration_threshold_lots: market_acct.params.concentration_threshold_lots,
+            concentration_extra_mmr_bps: market_acct.params.concentration_extra_mmr_bps,
+            side_oi_lots: oi_side_lots(&market_acct, position.side == 0),
+            oi_mmr_slope_bps_per_million_lots: market_acct.params.oi_mmr_slope_bps_per_million_lots,
+            oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
+            paper_profit_haircut_bps: market_acct.paper_profit_haircut_bps,
+        });
+        market_keys.push(position.market);
+    }
+
+    // Omission guarantee: every open cross leg must be accounted for.
+    require!(market_keys.len() == expected, FlashBookError::OutOfRange);
+
+    // Append the prospective new leg on the target market (cross ⇒ backed by the
+    // shared pool, so collateral_quote_lots = 0 in the snapshot).
+    snaps.push(RiskPosSnap {
+        market: *target_market_key,
+        side: new_side,
+        size_lots: new_resulting_size_lots,
+        entry_price: Ticks(target_market.mark_price_ticks),
+        cum_funding_index_at_entry: target_market.cum_funding_index,
+        collateral_quote_lots: 0,
+    });
+    market_snaps.push(RiskMarketSnap {
+        market: *target_market_key,
+        mark_price: Ticks(effective_health_mark(
+            target_market,
+            now_unix,
+            current_slot,
+            new_side == Side::Long,
+        )?),
+        cum_funding_index: target_market.cum_funding_index,
+        maintenance_margin_bps: target_market.params.initial_margin_ratio_bps,
+        tick_size: target_market.params.tick_size,
+        concentration_threshold_lots: target_market.params.concentration_threshold_lots,
+        concentration_extra_mmr_bps: target_market.params.concentration_extra_mmr_bps,
+        side_oi_lots: oi_side_lots(target_market, new_side == Side::Long),
+        oi_mmr_slope_bps_per_million_lots: target_market.params.oi_mmr_slope_bps_per_million_lots,
+        oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
+        paper_profit_haircut_bps: target_market.paper_profit_haircut_bps,
+    });
+    market_keys.push(*target_market_key);
+
+    let scenarios = default_scenarios_fn(&market_keys);
+    let assessment = assess_margin_unified_fn(&snaps, &market_snaps, &scenarios, cross_collateral)?;
+    require!(
+        assessment.is_healthy,
+        FlashBookError::InsufficientCollateral
+    );
+    Ok(())
 }
 
 /// Intake INITIAL-MARGIN gate. A position opened with no (or
