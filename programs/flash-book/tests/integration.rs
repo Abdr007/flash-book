@@ -16794,3 +16794,451 @@ async fn copy_vault_deposit_mints_shares_and_withdraw_returns_proportional() {
     assert_eq!(v2.total_shares, 0);
     assert_eq!(v2.total_assets_quote_lots, 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// G-3: OI-vs-insurance circuit breaker.
+//
+// A market may OPT IN to an OI-relative circuit breaker via the authority-only
+// `set_oi_insurance_multiple_bps(bps)` instruction (accounts: authority signer +
+// market — the same `UpdateMarketAuthority` layout `update_market_params` uses):
+//
+//   * `bps == 0` (default / legacy) DISABLES the breaker entirely.
+//   * otherwise `bps` must lie in
+//     `[MIN_OI_INSURANCE_MULTIPLE_BPS = 10_000, MAX_OI_INSURANCE_MULTIPLE_BPS =
+//     100_000_000]`; out-of-range bps reject with `OutOfRange` = `Custom(7003)`.
+//   * a non-authority signer rejects with `Unauthorized` = `Custom(7100)`.
+//
+// When enabled, at the END of `apply_fill` / `apply_flp_fill` — AFTER the fill has
+// fully settled (OI + collateral + insurance all committed) — the breaker checks
+// whether gross OI notional `(oi_long_lots + oi_short_lots) · mark_price_ticks ·
+// tick_size` now EXCEEDS the insurance-relative cap `insurance_balance · bps /
+// BPS_DENOM`. If so it sets `market.status = Paused (3)`. This is a plain FLAG
+// WRITE, not a revert: the committed fill still stands (positions/OI/collateral
+// are unchanged), but because order intake (`place_limit_order_v2`) already
+// rejects a non-tradable (Paused) market with `Custom(7003)`, only NEW risk is
+// blocked while the breaker is tripped — the book can be unwound but not grown.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Directly seed the insurance-fund PDA's `balance_quote_lots` to `balance`
+/// (production: this balance accrues from fees). Mirrors the injection the
+/// `withdraw_insurance_fund_*` tests use.
+async fn seed_insurance_balance(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    insurance_fund: Pubkey,
+    balance: u64,
+) {
+    use solana_sdk::account::Account as SolAccount;
+    let acc = ctx
+        .banks_client
+        .get_account(insurance_fund)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut fund =
+        flash_book::state::InsuranceFundAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    fund.balance_quote_lots = balance;
+    let mut data = Vec::new();
+    fund.try_serialize(&mut data).unwrap();
+    data.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &insurance_fund,
+        &SolAccount {
+            lamports: acc.lamports,
+            data,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
+}
+
+/// Call the authority-only `set_oi_insurance_multiple_bps(bps)` (accounts:
+/// authority signer + market). Returns the raw transaction result so callers can
+/// assert success or a specific `Custom(...)` rejection.
+async fn send_set_oi_multiple(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    market_pda: Pubkey,
+    bps: u64,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let ix = build_ix(
+        flash_book::instruction::SetOiInsuranceMultipleBps { bps },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+}
+
+/// Init the v2 hypertree book for a market so intake (`place_limit_order_v2`)
+/// can run against it.
+async fn init_market_book_for(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    market_pda: Pubkey,
+) -> Pubkey {
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::InitMarketBook {},
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market_pda, false),
+                    AccountMeta::new(book_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    book_pda
+}
+
+/// Drive a single settled `apply_fill`: taker buys `size_lots` @ `price_ticks`
+/// from maker. Both trader states must already exist & be funded. Returns the
+/// two position PDAs (taker, maker).
+async fn apply_one_fill(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    market_pda: Pubkey,
+    insurance_fund_pda: Pubkey,
+    taker_state: Pubkey,
+    maker_state: Pubkey,
+    size_lots: u64,
+    price_ticks: u64,
+    fill_seq: u64,
+) -> (Pubkey, Pubkey) {
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots,
+            price_ticks,
+            taker_side: 0, // taker buys
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+            fill_seq,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(insurance_fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+        .expect("apply_fill (breaker never reverts a settled fill)");
+    (taker_pos, maker_pos)
+}
+
+/// G-3 (1): `set_oi_insurance_multiple_bps` bounds. On a normal market, the
+/// authority may set `bps = 0` (disable) or any value in
+/// `[MIN, MAX] = [10_000, 100_000_000]`, and reads back verbatim; `bps` below
+/// MIN or above MAX rejects `OutOfRange` = `Custom(7003)` and leaves the field
+/// untouched.
+#[tokio::test]
+async fn g3_oi_insurance_multiple_setter_bounds() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Default is 0 (disabled) fresh out of initialize_market.
+    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        m0.oi_insurance_multiple_bps, 0,
+        "breaker defaults to 0 (disabled)"
+    );
+
+    // bps = 0 succeeds → reads back 0.
+    send_set_oi_multiple(&mut ctx, &payer, market_pda, 0)
+        .await
+        .expect("bps=0 accepted");
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m.oi_insurance_multiple_bps, 0);
+
+    // bps = 50_000 (in [MIN, MAX]) succeeds → reads back 50_000.
+    send_set_oi_multiple(&mut ctx, &payer, market_pda, 50_000)
+        .await
+        .expect("bps=50_000 accepted");
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m.oi_insurance_multiple_bps, 50_000);
+
+    // bps = 9_999 (< MIN = 10_000) rejects Custom(7003); field unchanged.
+    let below = send_set_oi_multiple(&mut ctx, &payer, market_pda, 9_999).await;
+    assert!(
+        format!("{below:?}").contains("Custom(7003)"),
+        "bps below MIN must reject OutOfRange (Custom(7003)), got: {below:?}"
+    );
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m.oi_insurance_multiple_bps, 50_000, "rejected set is inert");
+
+    // bps = 100_000_001 (> MAX = 100_000_000) rejects Custom(7003); unchanged.
+    let above = send_set_oi_multiple(&mut ctx, &payer, market_pda, 100_000_001).await;
+    assert!(
+        format!("{above:?}").contains("Custom(7003)"),
+        "bps above MAX must reject OutOfRange (Custom(7003)), got: {above:?}"
+    );
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m.oi_insurance_multiple_bps, 50_000, "rejected set is inert");
+}
+
+/// G-3 (2): breaker TRIPS at settlement and then blocks intake. With the multiple
+/// set to MIN (10_000 bps = 1×) and a SMALL seeded insurance balance, a fill that
+/// pushes gross OI notional above `insurance_balance · 1` auto-pauses the market —
+/// WITHOUT reverting the fill — and a subsequent `place_limit_order_v2` on the
+/// now-Paused market rejects `Custom(7003)`.
+#[tokio::test]
+async fn g3_oi_insurance_breaker_trips_and_pauses() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // oracle/mark 100_000, tick 1
+    let insurance_fund_pda = protocol.insurance_fund;
+    let book_pda = init_market_book_for(&mut ctx, &payer, market_pda).await;
+
+    // Enable the breaker at the MIN multiple (1×).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_ix(
+                flash_book::instruction::SetOiInsuranceMultipleBps { bps: 10_000 },
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market_pda, false),
+                ],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .expect("enable breaker @ 1x");
+
+    // Seed a SMALL insurance balance. A size-1 fill @ 100_000 (tick 1) yields
+    // gross OI = (1 + 1) · 100_000 · 1 = 200_000 quote-lots, which dwarfs the
+    // cap = insurance_balance · 1 = 1_000, so the breaker trips with huge margin.
+    let insurance_balance: u64 = 1_000;
+    seed_insurance_balance(&mut ctx, insurance_fund_pda, insurance_balance).await;
+
+    // Funded taker & maker.
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    let (taker_pos, maker_pos) = apply_one_fill(
+        &mut ctx,
+        &payer,
+        market_pda,
+        insurance_fund_pda,
+        taker_state,
+        maker_state,
+        1,       // size_lots
+        100_000, // price_ticks == mark
+        2,       // fill_seq
+    )
+    .await;
+
+    // The fill SETTLED (breaker is a flag write, not a revert): OI moved and both
+    // positions exist.
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        (market.oi_long_lots, market.oi_short_lots),
+        (1, 1),
+        "the committed fill still moved OI (breaker never reverts)"
+    );
+    assert!(
+        ctx.banks_client
+            .get_account(taker_pos)
+            .await
+            .unwrap()
+            .is_some()
+            && ctx
+                .banks_client
+                .get_account(maker_pos)
+                .await
+                .unwrap()
+                .is_some(),
+        "both positions were created by the settled fill"
+    );
+
+    // Confirm the trip condition really held for the observed post-fill mark, then
+    // assert the market auto-paused.
+    let gross = (market.oi_long_lots as u128 + market.oi_short_lots as u128)
+        * market.mark_price_ticks as u128
+        * market.params.tick_size as u128;
+    let cap = insurance_balance as u128 * 10_000u128 / flash_book::constants::BPS_DENOM as u128;
+    assert!(
+        gross > cap,
+        "sanity: gross OI {gross} must exceed cap {cap} (mark={})",
+        market.mark_price_ticks
+    );
+    assert_eq!(
+        market.status,
+        flash_book::MarketStatus::Paused as u8,
+        "breaker auto-paused the market at settlement"
+    );
+
+    // Intake on the now-Paused market is rejected Custom(7003).
+    let placer = Keypair::new();
+    let placer_state = setup_trader(&mut ctx, &payer, &placer, 100_000, &protocol).await;
+    let place = build_ix(
+        flash_book::instruction::PlaceLimitOrderV2 {
+            side: 1, // ask
+            size_lots: 1,
+            limit_ticks: 105_000, // in-band, on-tick, ≤5 sig figs
+            flags: 0,
+            expires_at_slot: 0,
+            sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(placer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(book_pda, false),
+            AccountMeta::new_readonly(placer_state, false),
+            AccountMeta::new_readonly(program_id(), false), // None sentinel (full open)
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let intake = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place],
+            Some(&payer.pubkey()),
+            &[&payer, &placer],
+            bh,
+        ))
+        .await;
+    assert!(
+        format!("{intake:?}").contains("Custom(7003)"),
+        "intake on a Paused market must reject Custom(7003), got: {intake:?}"
+    );
+}
+
+/// G-3 (3): breaker DISABLED (`bps == 0`, the default) is inert. The very same
+/// OI-growing fill that trips a 1× breaker leaves the market Active (1) — no pause
+/// — and intake still works.
+#[tokio::test]
+async fn g3_oi_insurance_breaker_disabled_no_pause() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let insurance_fund_pda = protocol.insurance_fund;
+    let book_pda = init_market_book_for(&mut ctx, &payer, market_pda).await;
+
+    // Do NOT set the multiple: it stays 0 (disabled).
+    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m0.oi_insurance_multiple_bps, 0, "breaker left disabled");
+
+    // Even a tiny insurance balance would trip a 1× breaker on this fill — but the
+    // breaker is off, so it must stay dormant.
+    seed_insurance_balance(&mut ctx, insurance_fund_pda, 1_000).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    apply_one_fill(
+        &mut ctx,
+        &payer,
+        market_pda,
+        insurance_fund_pda,
+        taker_state,
+        maker_state,
+        1,
+        100_000,
+        2,
+    )
+    .await;
+
+    // No pause: the market stays Active despite the large OI-vs-insurance ratio.
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        (market.oi_long_lots, market.oi_short_lots),
+        (1, 1),
+        "fill settled"
+    );
+    assert_eq!(
+        market.status,
+        flash_book::MarketStatus::Active as u8,
+        "disabled breaker never pauses the market"
+    );
+
+    // Intake still works on the still-Active market.
+    let placer = Keypair::new();
+    let placer_state = setup_trader(&mut ctx, &payer, &placer, 100_000, &protocol).await;
+    let place = build_ix(
+        flash_book::instruction::PlaceLimitOrderV2 {
+            side: 1,
+            size_lots: 1,
+            limit_ticks: 105_000,
+            flags: 0,
+            expires_at_slot: 0,
+            sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(placer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(book_pda, false),
+            AccountMeta::new_readonly(placer_state, false),
+            AccountMeta::new_readonly(program_id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let intake = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place],
+            Some(&payer.pubkey()),
+            &[&payer, &placer],
+            bh,
+        ))
+        .await;
+    assert!(
+        intake.is_ok(),
+        "intake on an Active (disabled-breaker) market must succeed, got: {intake:?}"
+    );
+}

@@ -484,6 +484,16 @@ pub struct MarketAccount {
     /// (`validate_hip3_params`). Trailing field ⇒ pre-existing (authority-created)
     /// markets read `false` = fully insurance-backed, exact prior behaviour.
     pub is_permissionless: bool,
+    /// G-3: OI-vs-insurance circuit breaker. Max GROSS open-interest notional the
+    /// market may carry, expressed as a multiple of the insurance fund balance in
+    /// bps: the cap is `insurance_balance · oi_insurance_multiple_bps / BPS_DENOM`.
+    /// When gross OI notional exceeds it at settlement, `apply_fill` /
+    /// `apply_flp_fill` auto-PAUSE the market (a flag write — the committed fill
+    /// still settles; only NEW intake is blocked, which the intake gate already
+    /// rejects on `Paused`). `0 = DISABLED` — the default, so this is opt-in per
+    /// market and legacy accounts (which read this trailing field as 0) are
+    /// byte-for-byte unaffected. Set via `set_oi_insurance_multiple_bps`.
+    pub oi_insurance_multiple_bps: u64,
 }
 
 /// Optional emergency guardian for one market, held in a SEPARATE PDA (not a

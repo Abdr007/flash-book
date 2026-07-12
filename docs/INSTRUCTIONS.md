@@ -149,6 +149,7 @@ noted).
 | Instruction | Access | Purpose |
 |---|---|---|
 | `set_market_status` | authority or guardian | Status changes; the guardian may only restrict (never unpause). |
+| `set_oi_insurance_multiple_bps` | authority | G-3: set/clear the OI-vs-insurance circuit-breaker multiple (0 = disabled). When gross OI notional exceeds `insurance · bps / 10_000`, settlement auto-pauses the market. |
 | `set_guardian` | authority | Set/clear the emergency guardian PDA. |
 | `update_market_params` | authority | RESTRICTED (K-3): immediate path may ONLY enable a disabled oracle-staleness gate; all economic changes go through the timelock. |
 | `propose_param_update` / `execute_param_update` / `cancel_param_update` | authority | 48 h timelocked params path bound to a keccak params-hash. |

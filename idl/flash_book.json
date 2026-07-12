@@ -12905,6 +12905,71 @@
       ]
     },
     {
+      "name": "set_oi_insurance_multiple_bps",
+      "docs": [
+        "G-3: set the OI-vs-insurance circuit-breaker multiple (authority-only).",
+        "`bps == 0` DISABLES the breaker; otherwise it must be in",
+        "`[MIN_OI_INSURANCE_MULTIPLE_BPS, MAX_OI_INSURANCE_MULTIPLE_BPS]`. The cap",
+        "enforced at settlement is `insurance_balance · bps / BPS_DENOM`; when gross",
+        "OI notional exceeds it, `apply_fill`/`apply_flp_fill` auto-pause the market.",
+        "Immediate (not timelocked) because it grants no power the authority lacks —",
+        "the authority can already halt the market via `set_market_status` — and it",
+        "can never move funds; the only effect is when/whether the market",
+        "auto-pauses as OI grows relative to the insurance backstop."
+      ],
+      "discriminator": [
+        0,
+        131,
+        47,
+        179,
+        130,
+        140,
+        194,
+        19
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "set_paper_profit_haircut",
       "docs": [
         "3.1 (percolator per-domain credit): post this market's paper-profit",
@@ -19054,6 +19119,32 @@
       ]
     },
     {
+      "name": "OiInsuranceBreakerTrippedEvent",
+      "discriminator": [
+        22,
+        147,
+        107,
+        235,
+        124,
+        200,
+        10,
+        12
+      ]
+    },
+    {
+      "name": "OiInsuranceMultipleSetEvent",
+      "discriminator": [
+        194,
+        37,
+        234,
+        121,
+        119,
+        14,
+        197,
+        74
+      ]
+    },
+    {
       "name": "OracleSourceLockedEvent",
       "discriminator": [
         49,
@@ -23974,6 +24065,21 @@
               "markets read `false` = fully insurance-backed, exact prior behaviour."
             ],
             "type": "bool"
+          },
+          {
+            "name": "oi_insurance_multiple_bps",
+            "docs": [
+              "G-3: OI-vs-insurance circuit breaker. Max GROSS open-interest notional the",
+              "market may carry, expressed as a multiple of the insurance fund balance in",
+              "bps: the cap is `insurance_balance · oi_insurance_multiple_bps / BPS_DENOM`.",
+              "When gross OI notional exceeds it at settlement, `apply_fill` /",
+              "`apply_flp_fill` auto-PAUSE the market (a flag write — the committed fill",
+              "still settles; only NEW intake is blocked, which the intake gate already",
+              "rejects on `Paused`). `0 = DISABLED` — the default, so this is opt-in per",
+              "market and legacy accounts (which read this trailing field as 0) are",
+              "byte-for-byte unaffected. Set via `set_oi_insurance_multiple_bps`."
+            ],
+            "type": "u64"
           }
         ]
       }
@@ -25346,6 +25452,65 @@
           {
             "name": "new_status",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OiInsuranceBreakerTrippedEvent",
+      "docs": [
+        "G-3: emitted when the OI-vs-insurance breaker TRIPS at settlement — gross OI",
+        "notional exceeded `insurance_balance · multiple_bps / BPS_DENOM`, so the",
+        "market was auto-paused. `apply_fill`/`apply_flp_fill` still settle the",
+        "committed fill; only NEW intake is blocked. Operators observe this and",
+        "recover via `set_market_status` once OI/insurance are back in balance."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "gross_oi_notional",
+            "type": "u128"
+          },
+          {
+            "name": "insurance_balance_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "multiple_bps",
+            "type": "u64"
+          },
+          {
+            "name": "previous_status",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OiInsuranceMultipleSetEvent",
+      "docs": [
+        "G-3: emitted when the OI-vs-insurance circuit-breaker multiple is set/cleared",
+        "via `set_oi_insurance_multiple_bps`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_bps",
+            "type": "u64"
+          },
+          {
+            "name": "new_bps",
+            "type": "u64"
           }
         ]
       }
