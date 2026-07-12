@@ -7268,16 +7268,147 @@ pub mod flash_book {
         Ok(())
     }
 
-    // K-3: the immediate `update_market_params` instruction was REMOVED. It let
-    // the market authority change mutable params (fees, margins, funding, oracle
-    // band, …) with no warning — a governance backdoor that could rug LPs and
-    // traders between blocks. The ONLY param-change path is now the timelocked
-    // trio: `propose_param_update` (records a keccak(new_params) + eta =
-    // now + PARAM_UPDATE_TIMELOCK_SECONDS) → wait → `execute_param_update`
-    // (re-validates against the hash and applies), with `cancel_param_update`
-    // and `guardian_veto_param_update` as brakes. All of them run the same
-    // `validate_market_params` checks the immediate path used, so nothing is
-    // lost but the ability to change params without notice.
+    /// Update mutable market parameters (authority-only).
+    ///
+    /// Immutable fields (set at initialization, NEVER mutable post-init):
+    ///   - tick_size, base_lot_size, quote_lot_size, min_base_lots
+    ///   These define the market's measurement primitives. Changing them
+    ///   would silently invalidate every existing order and position.
+    ///
+    /// Mutable: everything else — fees, margins, FLP coefficients, funding
+    /// rates, oracle band, VPIN, batch interval. Changes are applied to the
+    /// next batch.
+    pub fn update_market_params(
+        ctx: Context<UpdateMarketAuthority>,
+        new_params: MarketParams,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        require_keys_eq!(
+            market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+
+        // Enforce immutability of measurement primitives.
+        require!(
+            new_params.tick_size == market.params.tick_size,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.base_lot_size == market.params.base_lot_size,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.quote_lot_size == market.params.quote_lot_size,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.min_base_lots == market.params.min_base_lots,
+            FlashBookError::OutOfRange
+        );
+
+        // Sanity bounds on the mutable fields.
+        require!(new_params.max_leverage >= 1, FlashBookError::OutOfRange);
+        // Never let the staleness bound be zeroed post-init —
+        // that would silently disable the staleness gate on every price consumer.
+        require!(
+            new_params.oracle_staleness_max_seconds > 0,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.maintenance_margin_ratio_bps <= new_params.initial_margin_ratio_bps,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.flp_max_growth_per_batch_bps <= constants::BPS_DENOM,
+            FlashBookError::OutOfRange
+        );
+        // Reject an absurdly-wide mark band at config time (was
+        // <= BPS_DENOM = 100%). apply_fill additionally caps the EFFECTIVE band to
+        // MAX at runtime, so this is early operator feedback, not the sole guard.
+        require!(
+            new_params.oracle_band_bps <= constants::MAX_ORACLE_BAND_BPS,
+            FlashBookError::OutOfRange
+        );
+
+        // Explicit absolute caps on margin ratios.
+        // Without these, authority could set MMR/IM to >= 100%, which
+        // would instantly mark every existing position liquidatable.
+        // 5000 bps (50%) is a generous ceiling — well above any plausible
+        // market parameter (BTC = 5%, exotic alt = 30% in typical CEX
+        // configs). Tighter than BPS_DENOM to prevent griefing.
+        require!(
+            new_params.maintenance_margin_ratio_bps < 5_000,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.initial_margin_ratio_bps < 5_000,
+            FlashBookError::OutOfRange
+        );
+        // Concentration extra MMR must also be bounded so MMR + extra
+        // doesn't push past 50% combined.
+        require!(
+            new_params
+                .maintenance_margin_ratio_bps
+                .saturating_add(new_params.concentration_extra_mmr_bps)
+                < 5_000,
+            FlashBookError::OutOfRange
+        );
+
+        // Absolute ceilings on the fee / funding / penalty fields: without
+        // them a compromised authority could set a 100% taker fee or an
+        // extreme funding rate and siphon user collateral on the next fill /
+        // funding tick. The bounds are generous — well above any real market
+        // config, tight enough to bound abuse.
+        require!(
+            new_params.taker_fee_bps <= constants::MAX_FEE_TIER_BPS,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.maker_rebate_bps.unsigned_abs() <= constants::MAX_FEE_TIER_BPS,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.toxicity_tax_max_bps <= constants::MAX_FEE_TIER_BPS,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.jit_bonus_rebate_bps <= constants::MAX_FEE_TIER_BPS,
+            FlashBookError::OutOfRange
+        );
+        // Liquidation economics: penalty ≤ 50%, and the liquidator's reward can
+        // never exceed the penalty actually charged (else it mints value).
+        require!(
+            new_params.liq_penalty_bps <= 5_000,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.liquidator_reward_bps <= new_params.liq_penalty_bps,
+            FlashBookError::OutOfRange
+        );
+        // Funding: bound both the per-second rate and the per-period clamp.
+        require!(
+            new_params.funding_rate_max_bps_per_sec <= constants::BPS_DENOM,
+            FlashBookError::OutOfRange
+        );
+        require!(
+            new_params.funding_per_period_max_bps <= 5_000,
+            FlashBookError::OutOfRange
+        );
+        // Fee-share splits can never exceed 100% of the net fee.
+        require!(
+            new_params.referrer_share_bps <= constants::BPS_DENOM
+                && new_params.builder_share_bps <= constants::BPS_DENOM
+                && new_params.creator_share_bps <= constants::BPS_DENOM,
+            FlashBookError::OutOfRange
+        );
+
+        market.params = new_params;
+        emit!(MarketParamsUpdatedEvent {
+            market: market.key(),
+        });
+        Ok(())
+    }
 
     // ─── Multi-tier fee table (volume-based) ───────────────
 
@@ -7495,12 +7626,11 @@ pub mod flash_book {
     }
 
     /// Propose a TIMELOCKED market-params update.
-    /// Validates `new_params` (via `validate_market_params`), then records
+    /// Validates `new_params` (same checks as `update_market_params`), then records
     /// `keccak(new_params)` + `eta = now + PARAM_UPDATE_TIMELOCK_SECONDS`; does NOT
     /// apply. `execute_param_update` applies it only after the delay. Authority-only.
-    /// Re-proposing overwrites the pending update (and restarts the clock). K-3:
-    /// this timelocked path is the ONLY way to change params (the immediate
-    /// `update_market_params` bypass was removed).
+    /// Re-proposing overwrites the pending update (and restarts the clock). The
+    /// immediate `update_market_params` is left in place as the un-timelocked path.
     pub fn propose_param_update(
         ctx: Context<ProposeParamUpdate>,
         new_params: MarketParams,
@@ -7595,7 +7725,7 @@ pub mod flash_book {
     /// Authority burn. Permanently relinquish authority over
     /// this market by setting `market.authority` to `Pubkey::default()`.
     /// This is a one-way operation: once burned, no further
-    /// `propose_param_update`, `set_market_status`, or
+    /// `update_market_params`, `set_market_status`, or
     /// `transfer_market_authority` can succeed on this market.
     ///
     /// The kill-switch (`set_market_status`) is intentionally also
@@ -15384,7 +15514,7 @@ pub struct InitializeHaircutState<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
     /// Authority must match the market's authority — same trust model
-    /// as `propose_param_update`.
+    /// as `update_market_params`.
     // H-2 fix: `mut` so the handler can set `haircut_enabled = true` (enabling the
     // haircut engine makes its accounts mandatory in settlement, sticky).
     #[account(
@@ -21685,11 +21815,11 @@ fn accrue_to_fee_account(ai: &AccountInfo<'_>, add: u64) -> Result<()> {
 }
 
 /// Shared market-params validation — the immutability
-/// of the measurement primitives + the mutable-field bounds. K-3: this is now the
-/// SOLE param-change validator, used by the timelocked `propose_param_update` /
-/// `execute_param_update` (the immediate `update_market_params` path that once
-/// duplicated these checks inline was removed). A proptest/BanksClient test pins a
-/// representative rejection on the timelocked path.
+/// of the measurement primitives + the mutable-field bounds. Used by the timelocked
+/// `propose_param_update` / `execute_param_update` so they enforce EXACTLY the same
+/// invariants as the immediate `update_market_params`. NOTE: this mirrors the inline
+/// checks in `update_market_params`; keep the two in sync (a proptest/BanksClient
+/// test pins a representative rejection on both paths).
 /// Keccak of the borsh-serialized params — the
 /// commitment stored at propose and re-checked at execute so the applied change is
 /// exactly the pre-announced one. (borsh 1.x dropped the inherent `try_to_vec`;
