@@ -3353,6 +3353,17 @@ pub mod flash_book {
         liq_penalty_contribution_bps: u32,
         pause_threshold_quote_lots: u64,
     ) -> Result<()> {
+        // Each contribution is a split of value that was actually collected on
+        // that fee/tax/penalty leg. A rate above 100% would credit more insurance
+        // liability than entered the vault; the fund authority could then
+        // withdraw that phantom balance from trader/LP collateral in the shared
+        // vault. Bound every independent stream at its conservation ceiling.
+        require!(
+            fee_contribution_bps <= constants::BPS_DENOM
+                && toxicity_tax_contribution_bps <= constants::BPS_DENOM
+                && liq_penalty_contribution_bps <= constants::BPS_DENOM,
+            FlashBookError::OutOfRange
+        );
         let f = &mut ctx.accounts.insurance_fund;
         f.authority = ctx.accounts.authority.key();
         f.bump = ctx.bumps.insurance_fund;
@@ -3891,6 +3902,11 @@ pub mod flash_book {
             new_pos.unhealthy_since_slot = legacy.unhealthy_since_slot;
             new_pos.last_liquidated_at_slot = legacy.last_liquidated_at_slot;
             new_pos.collateral_quote_lots = legacy.collateral_quote_lots;
+            // Preserve the trader's self-imposed per-position leverage cap.
+            // Omitting it would leave the zero-copy-initialized field at 0, the
+            // sentinel for "use the market max", silently removing the trader's
+            // tighter guardrail across the migration.
+            new_pos.leverage_cap = legacy.leverage_cap;
             new_pos.bump = new_bump;
         }
 
@@ -5814,21 +5830,27 @@ pub mod flash_book {
                         xmargin::apply_collateral_credit(s.collateral_quote_lots, maker_rebate)?;
                 }
             }
-            // Track A2: maker-fee debit through the proven core.
+            // A maker fee must follow the same liveness rule as the taker fee:
+            // settlement cannot revert merely because the maker's collateral was
+            // depleted after matching. On an armed market that would leave this
+            // fill at the FIFO ring head and wedge every later fill. Collect what
+            // is available, then remove the uncollected amount from `net_fee` so
+            // insurance/protocol accounting never credits phantom value.
             if maker_fee > 0 {
-                if maker_pos_isolated {
+                let paid = if maker_pos_isolated {
                     let mut p = ctx.accounts.maker_position.load_mut()?;
-                    p.collateral_quote_lots = xmargin::apply_collateral_debit_checked(
-                        p.collateral_quote_lots,
-                        maker_fee,
-                    )?;
+                    let (after, paid) =
+                        xmargin::apply_capped_debit(p.collateral_quote_lots, maker_fee);
+                    p.collateral_quote_lots = after;
+                    paid
                 } else {
                     let mut s = ctx.accounts.maker_trader_state.load_mut()?;
-                    s.collateral_quote_lots = xmargin::apply_collateral_debit_checked(
-                        s.collateral_quote_lots,
-                        maker_fee,
-                    )?;
-                }
+                    let (after, paid) =
+                        xmargin::apply_capped_debit(s.collateral_quote_lots, maker_fee);
+                    s.collateral_quote_lots = after;
+                    paid
+                };
+                net_fee = net_fee.saturating_sub(maker_fee.saturating_sub(paid));
             }
         }
         // Net fee to insurance fund (per fee_contribution_bps).
@@ -20463,7 +20485,6 @@ fn emit_margin_threshold_if_crossed(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FundingRouteErr {
     Overflow,
-    ResidualUnderflow,
 }
 
 /// Pure RISK-1 funding-routing core (Kani-proven, see `funding_routing_proofs`).
@@ -20473,9 +20494,16 @@ enum FundingRouteErr {
 ///
 /// CONSERVATION (the RISK-1 invariant): the change in collateral equals the
 /// NEGATIVE change in the Residual — `Δcollateral == −Δresidual` — so funding can
-/// never mint or burn protocol collateral. A payment is clamped to availability
-/// (the unpaid remainder is absorbed as the anchor advances, exactly as the prior
-/// inline routing did); a receipt credits in full.
+/// never mint or burn protocol collateral. BOTH directions clamp to availability:
+/// a payment is clamped to the bucket's collateral, and a receipt is clamped to
+/// the solvency Residual it is paid out of. The clamped remainder is absorbed as
+/// the funding anchor advances (the payer under-pays / the receiver is haircut),
+/// exactly the socialized treatment the residual/haircut engine already applies
+/// to a shortfall. Clamping — rather than reverting on an exhausted Residual —
+/// is REQUIRED for liveness: `route_funding` runs at the strict-FIFO ring head
+/// inside `apply_fill`, so a revert there would wedge every later settlement on
+/// the market (a settlement-DoS), and every other value-shortfall leg (taker/
+/// maker fee, bad-debt) is already capped, not reverting.
 fn route_funding(
     owed: i64,
     collateral: u64,
@@ -20488,14 +20516,13 @@ fn route_funding(
             .ok_or(FundingRouteErr::Overflow)?;
         Ok((collateral - paid, new_residual)) // paid ≤ collateral ⇒ no underflow
     } else if owed < 0 {
-        let received = owed.unsigned_abs();
+        // Pay the receipt out of the Residual, clamped to what it can back.
+        let received = owed.unsigned_abs() as u128;
+        let applied = received.min(residual);
         let new_collateral = collateral
-            .checked_add(received)
+            .checked_add(applied as u64) // applied ≤ |owed| ≤ i64::MAX ⇒ fits u64
             .ok_or(FundingRouteErr::Overflow)?;
-        let new_residual = residual
-            .checked_sub(received as u128)
-            .ok_or(FundingRouteErr::ResidualUnderflow)?;
-        Ok((new_collateral, new_residual))
+        Ok((new_collateral, residual - applied)) // applied ≤ residual ⇒ no underflow
     } else {
         Ok((collateral, residual))
     }
@@ -20570,7 +20597,6 @@ fn settle_position_funding(
     let (new_bucket, new_residual) = route_funding(owed_i64, bucket, *residual_quote_lots)
         .map_err(|e| match e {
             FundingRouteErr::Overflow => error!(FlashBookError::ArithmeticOverflow),
-            FundingRouteErr::ResidualUnderflow => error!(FlashBookError::HaircutResidualUnderflow),
         })?;
     if is_isolated {
         position.collateral_quote_lots = new_bucket;
@@ -20730,15 +20756,36 @@ mod funding_routing_proofs {
     }
 
     /// `FundingRouteErr` is only ever produced on a genuine checked-arith failure,
-    /// never on the owed==0 no-op path (used to keep the enum non-dead under kani).
+    /// never on the owed==0 no-op path.
     #[kani::proof]
     fn funding_routing_zero_is_noop() {
         let collateral: u64 = kani::any();
         let residual: u128 = kani::any::<u64>() as u128;
         let r = route_funding(0, collateral, residual);
         assert!(r == Ok((collateral, residual)));
-        let _ = FundingRouteErr::Overflow; // reference both variants
-        let _ = FundingRouteErr::ResidualUnderflow;
+        let _ = FundingRouteErr::Overflow; // reference the enum
+    }
+
+    /// A receipt is clamped to the Residual it is paid out of: it never draws the
+    /// Residual below zero (no revert / no underflow) and never credits collateral
+    /// by more than the Residual could back. This is the liveness property that
+    /// keeps the funding leg from wedging the FIFO ring at an exhausted Residual.
+    #[kani::proof]
+    fn funding_receipt_clamped_to_residual() {
+        let owed: i64 = kani::any();
+        kani::assume(owed < 0);
+        let collateral: u64 = kani::any();
+        let residual: u128 = kani::any::<u64>() as u128;
+        if let Ok((new_col, new_res)) = route_funding(owed, collateral, residual) {
+            // Residual only ever shrinks and stays non-negative (u128, no wrap).
+            assert!(new_res <= residual);
+            // Collateral credited by exactly the drop in Residual, itself capped
+            // at both the amount owed and the Residual available.
+            let credited = (new_col - collateral) as u128;
+            assert!(credited == residual - new_res);
+            assert!(credited <= residual);
+            assert!(credited <= owed.unsigned_abs() as u128);
+        }
     }
 }
 
@@ -21586,6 +21633,51 @@ mod flp_mtm_tests {
     #[test]
     fn tick_size_scales() {
         assert_eq!(flp_slot_unrealized_pnl(0, 100, 100, 110, 5), 5000);
+    }
+}
+
+#[cfg(test)]
+mod route_funding_tests {
+    use super::route_funding;
+
+    #[test]
+    fn receipt_beyond_residual_is_clamped_not_reverted() {
+        // A receiver owed 1000 against a Residual of only 300 must NOT revert
+        // (that would wedge the strict-FIFO ring at the head of apply_fill).
+        // It is paid what the Residual can back and the Residual is drained.
+        let (col, res) = route_funding(-1000, 500, 300).expect("receipt must not revert");
+        assert_eq!(col, 800, "credited only the 300 the Residual could back");
+        assert_eq!(res, 0, "Residual fully drawn, never underflowed");
+    }
+
+    #[test]
+    fn receipt_within_residual_credits_in_full() {
+        let (col, res) = route_funding(-1000, 500, 4000).unwrap();
+        assert_eq!(col, 1500);
+        assert_eq!(res, 3000);
+    }
+
+    #[test]
+    fn payment_is_clamped_to_collateral() {
+        // Payer owes 1000 but holds 400: pays 400, Residual grows by 400.
+        let (col, res) = route_funding(1000, 400, 100).unwrap();
+        assert_eq!(col, 0);
+        assert_eq!(res, 500);
+    }
+
+    #[test]
+    fn conservation_delta_collateral_equals_negative_delta_residual() {
+        for &(owed, col0, res0) in &[
+            (-1000i64, 500u64, 300u128),
+            (-50, 10, 10_000),
+            (1000, 400, 100),
+            (777, 10_000, 0),
+        ] {
+            let (col1, res1) = route_funding(owed, col0, res0).unwrap();
+            let d_col = col1 as i128 - col0 as i128;
+            let d_res = res1 as i128 - res0 as i128;
+            assert_eq!(d_col, -d_res, "funding must conserve value");
+        }
     }
 }
 

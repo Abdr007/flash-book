@@ -787,6 +787,52 @@ async fn initialize_insurance_fund_writes_state() {
 }
 
 #[tokio::test]
+async fn initialize_insurance_fund_rejects_overfunded_contribution_rates() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
+    let quote_mint = create_mint(&mut ctx, &payer).await;
+    let quote_vault = Keypair::new();
+
+    // A contribution above 100% credits more insurance liability than the fee
+    // leg actually collected. The authority could later withdraw that phantom
+    // balance from the shared vault, consuming trader/LP collateral.
+    let ix = build_ix(
+        flash_book::instruction::InitializeInsuranceFund {
+            fee_contribution_bps: 10_001,
+            toxicity_tax_contribution_bps: 5_000,
+            liq_penalty_contribution_bps: 5_000,
+            pause_threshold_quote_lots: 0,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(insurance_fund, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(quote_vault.pubkey(), true),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::rent::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer, &quote_vault],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7003)"),
+        "over-100% contribution must fail with OutOfRange, got: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn withdraw_insurance_fund_succeeds_above_pause_threshold() {
     // Inject balance synthetically (production: balance accrues from fees).
     // pause_threshold is 5_000 from setup_protocol. Set balance to 100_000;
@@ -6720,7 +6766,10 @@ async fn migrate_position_to_trader_state_key_moves_state() {
             last_settlement_batch: 0,
             unhealthy_since_slot: 0,
             last_liquidated_at_slot: 0,
-            leverage_cap: 0,
+            // Non-zero: the trader set a tighter self-imposed cap. Migration
+            // must preserve it (0 is the "use market max" sentinel, so a drop
+            // silently relaxes the guardrail).
+            leverage_cap: 5,
             _pad: [0u8; 2],
         };
         let serialized = bytemuck::bytes_of(&pos);
@@ -6796,6 +6845,10 @@ async fn migrate_position_to_trader_state_key_moves_state() {
     assert_eq!(new_after.side, 0);
     assert_eq!(new_after.size_lots, 7);
     assert_eq!(new_after.entry_price_ticks, 12_345);
+    // The trader's per-position leverage cap must survive the migration; a
+    // dropped field would land at 0 (the "use market max" sentinel) and
+    // silently remove the guardrail.
+    assert_eq!(new_after.leverage_cap, 5);
 }
 
 // ─── End-to-end ApplyFill integration tests ───────────────────────
@@ -6804,6 +6857,102 @@ async fn migrate_position_to_trader_state_key_moves_state() {
 // verification are unit-tested via mod realized_pnl_routing_tests +
 // mod adl_routing_tests; these three tests prove the full
 // open → close → PnL credit flow end-to-end on-chain.
+
+#[tokio::test]
+async fn apply_fill_caps_uncollectable_maker_fee_instead_of_wedging() {
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Enable a 10% maker fee (negative rebate), a valid configured tier. In a
+    // real ER sequence the maker can be funded when the order rests, then have
+    // no collectible collateral by L1 settlement time. The FIFO fill must still
+    // settle; only the amount actually collected may become protocol fee.
+    let market_acc = ctx
+        .banks_client
+        .get_account(market_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut market = MarketAccount::try_deserialize(&mut market_acc.data.as_slice()).unwrap();
+    market.params.maker_rebate_bps = -1_000;
+    let mut market_data = Vec::new();
+    market.try_serialize(&mut market_data).unwrap();
+    market_data.resize(market_acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: market_acc.lamports,
+            data: market_data,
+            owner: market_acc.owner,
+            executable: market_acc.executable,
+            rent_epoch: market_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 0, &protocol).await;
+    let (taker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        taker_state.as_ref(),
+    ]);
+    let (maker_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        maker_state.as_ref(),
+    ]);
+
+    let ix = build_ix(
+        flash_book::instruction::ApplyFill {
+            size_lots: 1,
+            price_ticks: 100_000,
+            taker_side: 0,
+            taker_was_jit: false,
+            taker_sub_index: 0,
+            maker_sub_index: 0,
+            fill_seq: 1,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(protocol.insurance_fund, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(maker_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new(maker_pos, false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(program_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .expect("an uncollectable maker fee must be capped, not wedge settlement");
+
+    let maker_after: TraderStateAccount = fetch(&mut ctx.banks_client, maker_state).await;
+    assert_eq!(maker_after.collateral_quote_lots, 0);
+    let fund_after: InsuranceFundAccount =
+        fetch(&mut ctx.banks_client, protocol.insurance_fund).await;
+    // Taker fee = 50; maker paid 0; 10% insurance split = 5. No phantom maker
+    // fee may be credited to the insurance ledger.
+    assert_eq!(fund_after.balance_quote_lots, 5);
+}
 
 /// A single apply_fill ix creates BOTH the taker and maker positions
 /// (`init_if_needed` semantics) and updates OI on both sides of the
@@ -7482,6 +7631,14 @@ async fn timelocked_param_update_enforces_delay_and_hash() {
     );
 
     // 5) execute with the CORRECT params after eta → applied, pending closed.
+    // Re-assert the warped Clock: step 4's transaction advanced the bank a slot,
+    // and solana-program-test recomputes unix_timestamp from the bank on a new
+    // slot, which clobbers the manual bump from step 3. Without this the gated
+    // execute intermittently sees a timestamp back below the eta and fails with
+    // TimelockNotElapsed under parallel test load (deterministic in isolation).
+    let mut clock = ctx.banks_client.get_sysvar::<Clock>().await.unwrap();
+    clock.unix_timestamp += 49 * 60 * 60;
+    ctx.set_sysvar(&clock);
     send(&mut ctx, execute(new_params), &[&payer])
         .await
         .expect("execute after delay");
