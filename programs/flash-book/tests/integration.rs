@@ -5592,6 +5592,189 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
     );
 }
 
+/// GAP-1 regression: the advanced-order crank must re-derive and verify the
+/// caller-supplied `trader_state` PDA against the ORDER's stored `sub_index`
+/// (`verify_trader_state_pda(order.sub_index)` in execute_trigger_order_v3), not
+/// merely against the wallet. Here everything is correct EXCEPT the trader_state:
+/// a reduce-only trigger is scoped to sub-0 (main), the MAIN position is passed
+/// (so the position check passes), but the wallet's SUB-1 trader_state is cranked
+/// in meta[2]. Both trader_states carry `trader == wallet`, so the plain
+/// wallet-binding check (`trader_state.trader == trader_pk`) passes; only the
+/// GAP-1 PDA re-derivation against `sub_index == 0` catches the mismatch and
+/// rejects with WrongTrader (`Custom(7104)`). Without GAP-1 a caller could pass a
+/// FUNDED sub-account to satisfy the intake-IM gate while the order opens on a
+/// near-empty one.
+#[tokio::test]
+async fn execute_trigger_order_v3_rejects_foreign_subaccount_trader_state() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    disarm_fill_commitment(&mut ctx, market_pda).await;
+    let (book_pda, _) = pda(&[flash_book::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (insurance, _) = pda(&[InsuranceFundAccount::SEED]);
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        signers: &[&Keypair],
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&signers[0].pubkey()),
+                signers,
+                bh,
+            ))
+            .await
+    }
+
+    // Init the book so the trigger can inject.
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Trader m: main (sub-0) state AND a sub-1 state — both initialized so meta[2]
+    // deserializes as a valid TraderStateAccount and the handler REACHES the
+    // explicit GAP-1 verify (rather than failing on AccountNotInitialized).
+    let m = Keypair::new();
+    let m_main = setup_trader(&mut ctx, &payer, &m, 100_000, &protocol).await;
+    let (m_sub1, _) = pda(&[TraderStateAccount::SEED, m.pubkey().as_ref(), &[1u8]]);
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::OpenTraderSubAccount { sub_index: 1 },
+            vec![
+                AccountMeta::new(m.pubkey(), true),
+                AccountMeta::new(m_sub1, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer, &m],
+    )
+    .await
+    .unwrap();
+
+    // Open a long position ON MAIN (sub-0) so the MAIN position account exists and
+    // is the CORRECT one for the order's (trader, sub_index=0). Counterparty maker.
+    let counter = Keypair::new();
+    let counter_state = setup_trader(&mut ctx, &payer, &counter, 100_000, &protocol).await;
+    let (m_main_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        m_main.as_ref(),
+    ]);
+    let (counter_pos, _) = pda(&[
+        flash_book::state::PositionAccount::SEED,
+        market_pda.as_ref(),
+        counter_state.as_ref(),
+    ]);
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ApplyFill {
+                size_lots: 1,
+                price_ticks: 100_000,
+                taker_side: 0,
+                taker_was_jit: false,
+                taker_sub_index: 0,
+                maker_sub_index: 0,
+                fill_seq: 1,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new(insurance, false),
+                AccountMeta::new(m_main, false),
+                AccountMeta::new(counter_state, false),
+                AccountMeta::new(m_main_pos, false),
+                AccountMeta::new(counter_pos, false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(program_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    // Reduce-only trigger scoped to SUB-0 (main), fires at oracle <= 100_000.
+    let (trig, _) = pda(&[
+        flash_book::state_v3::TriggerOrderAccountV3::SEED,
+        market_pda.as_ref(),
+        m.pubkey().as_ref(),
+        &[1u8],
+    ]);
+    send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::PlaceTriggerOrderV3 {
+                trigger_id: 1,
+                side: 1,
+                kind: 0,
+                size_lots: 1,
+                trigger_price_ticks: 100_000,
+                limit_price_ticks: 100_000,
+                reduce_only: true,
+                expires_at_slot: 0,
+                sub_index: 0,
+                acceptable_price_ticks: 0,
+            },
+            vec![
+                AccountMeta::new(m.pubkey(), true),
+                AccountMeta::new_readonly(m_main, false),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(trig, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        &[&payer, &m],
+    )
+    .await
+    .unwrap();
+
+    // Execute the sub-0 trigger while passing the CORRECT MAIN position but the
+    // WRONG (sub-1) trader_state in meta[2] → the GAP-1 verify_trader_state_pda
+    // re-derivation against sub_index=0 rejects with WrongTrader.
+    let result = send(
+        &mut ctx,
+        build_ix(
+            flash_book::instruction::ExecuteTriggerOrderV3 {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new_readonly(m_sub1, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new(trig, false),
+                AccountMeta::new_readonly(m_main_pos, false),
+                AccountMeta::new_readonly(program_id(), false),
+            ],
+        ),
+        &[&payer],
+    )
+    .await;
+    let dbg = format!("{result:?}");
+    assert!(
+        dbg.contains("Custom(7104)"),
+        "a sub-0 trigger cranked with the wallet's sub-1 trader_state (correct position, only the trader_state is foreign) must be rejected with WrongTrader, got: {dbg}"
+    );
+}
+
 /// The Pyth pull path must reject a replayed (older or equal) publish_time: the
 /// staleness window only bounds how OLD an accepted price is and the envelope
 /// only bounds the per-slot move, so without a monotonicity guard a caller could

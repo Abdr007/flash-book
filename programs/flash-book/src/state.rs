@@ -764,12 +764,18 @@ pub struct InsuranceFundAccount {
     /// headroom (149 used, 200 allocated): pre-existing funds deserialize it
     /// as 0 (no accrual yet, no migration).
     pub total_fee_accrued_lots: u64,
+    /// K-2: L1 slot of the last `set_insurance_pause_threshold` change. Enforces
+    /// a `INSURANCE_THRESHOLD_UPDATE_MIN_SLOTS` cooldown so a compromised/erratic
+    /// authority cannot rapidly toggle the ADL trigger floor. Trailing field
+    /// within `space()` headroom (157 used, 200 allocated); pre-existing funds
+    /// deserialize it as 0 → the first update is always allowed (no migration).
+    pub last_threshold_update_slot: u64,
 }
 
 impl InsuranceFundAccount {
     pub const SEED: &'static [u8] = b"insurance_fund";
     pub fn space() -> usize {
-        // 8 (disc) + 32 + 1 + 8 + 4 + 4 + 4 + 8 + 8 + 8 + 32 + 32 + 8 = 157.
+        // 8 (disc) + 32 + 1 + 8 + 4 + 4 + 4 + 8 + 8 + 8 + 32 + 32 + 8 + 8 = 165.
         // Round up generously.
         8 + 192
     }
