@@ -208,7 +208,7 @@ mod tests {
     /// the shipped path.
     #[test]
     fn margin_conversions_move_collateral_only_via_proven_core() {
-        for (core, handler) in [
+        for (core, allowed) in [
             // NOTE: the capped-debit / checked-credit / checked-debit primitives
             // (`apply_capped_debit`, `apply_collateral_credit`,
             // `apply_collateral_debit_checked`, `apply_collateral_debit_underflow`)
@@ -216,13 +216,20 @@ mod tests {
             // principal draw, rebates, payouts, …), so they are intentionally NOT
             // pinned to a single caller here — only the handler-specific conserving
             // cores below are.
-            ("split_to_isolated(", "set_position_isolated"),
-            ("merge_to_cross(", "set_position_cross"),
+            ("split_to_isolated(", &["set_position_isolated"][..]),
+            // merge_to_cross: set_position_cross (mode transition) AND
+            // force_reduce_position_oracle (R-2 emergency close of an isolated
+            // position returns its settled bucket to the withdrawable pool). Both
+            // route the pool move through the proven, conserving core.
+            (
+                "merge_to_cross(",
+                &["set_position_cross", "force_reduce_position_oracle"][..],
+            ),
             // Liquidation reward (BOTH isolated + cross branches): the
             // source→liquidator move routes through the proven capped-transfer
             // core. The cross branch is aliasing-safe because the SelfLiquidation
             // guard forces `trader_state` and `caller_trader_state` distinct.
-            ("apply_liquidation_reward(", "liquidate_position_v2"),
+            ("apply_liquidation_reward(", &["liquidate_position_v2"][..]),
         ] {
             let callers = enclosing_fns(LIB_RS, core);
             assert!(
@@ -230,10 +237,10 @@ mod tests {
                 "no `{core}` call site in lib.rs — needle stale, update this guard (A2)"
             );
             for f in &callers {
-                assert_eq!(
-                    f, handler,
-                    "`{core}` is called from `{f}`, not the sanctioned `{handler}` — the margin \
-                     pool move routes through the proven core only (A2)"
+                assert!(
+                    allowed.contains(&f.as_str()),
+                    "`{core}` is called from `{f}`, not one of the sanctioned {allowed:?} — the \
+                     margin pool move routes through the proven core only (A2)"
                 );
             }
         }

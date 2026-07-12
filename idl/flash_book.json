@@ -5783,8 +5783,10 @@
         "proven gate guarantees it can NEVER fire on a live/heartbeating market.",
         "",
         "Accrued funding is forgiven (no balance moves for it ⇒ conservation-neutral),",
-        "which keeps this path independent of the haircut/Residual engine. v1 handles",
-        "CROSS positions; an isolated position's segregated bucket is a follow-up."
+        "which keeps this path independent of the haircut/Residual engine. Handles",
+        "BOTH cross and isolated positions: an isolated position settles its PnL",
+        "against its segregated bucket, then the remainder is merged back into the",
+        "withdrawable cross pool via the proven `merge_to_cross`."
       ],
       "discriminator": [
         170,
