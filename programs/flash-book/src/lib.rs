@@ -785,6 +785,18 @@ pub mod flash_book {
         let current_slot = clock.slot;
         let now_unix = clock.unix_timestamp.max(0) as u64;
 
+        // TRAPPED precondition: recovery is ONLY for a position whose book is
+        // genuinely delegated to the ER (so it cannot be closed on L1). If the
+        // book is on L1 the trader can close normally, and force-closing them at
+        // an adverse oracle price against the insurance fund would be pure
+        // griefing (+ fund drain). `book_delegated_at_slot` is never reset on
+        // undelegation, so the liveness baseline alone is insufficient — the
+        // `book_delegated` flag (set on delegate, cleared on undelegate) is the
+        // authoritative "is the book trapped on the ER" signal.
+        require!(
+            ctx.accounts.market.book_delegated,
+            FlashBookError::BookNotDelegated
+        );
         // Liveness gate — only reachable when the ER is stalled/censoring.
         require!(
             er::force_undelegate_allowed(
@@ -7155,6 +7167,10 @@ pub mod flash_book {
             FlashBookError::AlreadyDelegated
         );
         ctx.accounts.market.book_delegated = false;
+        // Reset the delegation liveness baseline so a later quiet period on the
+        // now-L1 book cannot make `force_undelegate_allowed` fire off a stale
+        // baseline (defense-in-depth; the `book_delegated` gate is authoritative).
+        ctx.accounts.market.book_delegated_at_slot = 0;
         Ok(())
     }
 
@@ -8219,6 +8235,13 @@ pub mod flash_book {
         }
 
         // Cross-market stress lattice (parity).
+        // L-2: value each leg at the staleness-gated worse-of(mark, oracle) health
+        // price (like the 2-leg basket + every single-order open), NOT the raw EMA
+        // mark — a stale/favorable mark must not let a multi-leg open pass on an
+        // over-valued position. effective_health_mark fails closed on a stale mark.
+        let hm_c = Clock::get()?;
+        let hm_now_unix = hm_c.unix_timestamp.max(0) as u64;
+        let hm_slot = hm_c.slot;
         let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(legs.len());
         let mut market_snaps: Vec<RiskMarketSnap> = Vec::with_capacity(legs.len());
         for (i, leg) in legs.iter().enumerate() {
@@ -8229,7 +8252,12 @@ pub mod flash_book {
             }
             market_snaps.push(RiskMarketSnap {
                 market: market_keys[i],
-                mark_price: Ticks(markets[i].mark_price_ticks),
+                mark_price: Ticks(effective_health_mark(
+                    &markets[i],
+                    hm_now_unix,
+                    hm_slot,
+                    positions[i].side == 0,
+                )?),
                 cum_funding_index: markets[i].cum_funding_index,
                 // RISK-2: open gate enforces INITIAL margin (buffer above liquidation).
                 maintenance_margin_bps: markets[i].params.initial_margin_ratio_bps,
@@ -9232,17 +9260,22 @@ pub mod flash_book {
         } else {
             maker_rebate_u128 as u64
         };
-        let net_fee = taker_fee.saturating_sub(maker_rebate);
-
-        // Deduct fee from taker.
-        {
+        // Deduct the taker fee — CAPPED, never reverting. This fill was already
+        // verify-and-popped from the shared FIFO commitment ring (buffer_settle),
+        // so a reverting debit on an under-collateralized taker would roll back the
+        // pop and wedge the WHOLE market's settlement at the ring head — the exact
+        // liveness rule apply_fill already follows. Collect what is available, then
+        // cap the FLP rebate + insurance split at what was actually collected so no
+        // phantom value is credited.
+        let paid = {
             let mut taker_state = ctx.accounts.taker_trader_state.load_mut()?;
-            // Track A2: taker-fee debit through the proven checked-debit core.
-            taker_state.collateral_quote_lots = xmargin::apply_collateral_debit_checked(
-                taker_state.collateral_quote_lots,
-                taker_fee,
-            )?;
-        }
+            let (after, paid) =
+                xmargin::apply_capped_debit(taker_state.collateral_quote_lots, taker_fee);
+            taker_state.collateral_quote_lots = after;
+            paid
+        };
+        let maker_rebate = maker_rebate.min(paid);
+        let net_fee = paid.saturating_sub(maker_rebate);
         // Credit rebate to FLP capital (FLP is the maker here).
         {
             let flp = &mut ctx.accounts.flp_exposure;
@@ -10837,6 +10870,11 @@ pub mod flash_book {
         };
 
         let trader = exec_position.trader;
+        // Liquidatee's sub-account (the injected close order carries it) — the
+        // dup-liq guard below keys on (wallet, sub_index) so a DIFFERENT sub-account
+        // of the same wallet with its own liquidatable leg on this market is not
+        // wrongly blocked while this one's close order rests (keeper-liveness).
+        let liq_sub_index = trader_state.sub_index;
         let close_size = exec_position.size_lots;
         let close_side_u8 = close_side as u8;
         let market_key = exec_market.key();
@@ -10861,7 +10899,7 @@ pub mod flash_book {
             let mut already_resting = false;
             if close_side_u8 == 0 {
                 handle.for_each_bid_best_first(|_i, o: &state_v2::RestingOrderV2| {
-                    if o.order_type == 3 && o.trader == trader {
+                    if o.order_type == 3 && o.trader == trader && o.sub_index == liq_sub_index {
                         already_resting = true;
                         false
                     } else {
@@ -10870,7 +10908,7 @@ pub mod flash_book {
                 });
             } else {
                 handle.for_each_ask_best_first(|_i, o: &state_v2::RestingOrderV2| {
-                    if o.order_type == 3 && o.trader == trader {
+                    if o.order_type == 3 && o.trader == trader && o.sub_index == liq_sub_index {
                         already_resting = true;
                         false
                     } else {

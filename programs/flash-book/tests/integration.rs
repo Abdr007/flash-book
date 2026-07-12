@@ -12269,7 +12269,8 @@ async fn force_reduce_position_oracle_frees_trapped_margin_when_er_dead() {
         )
     };
 
-    // (1) ER LIVE ⇒ refused (anti-grief).
+    // (0) BOOK NOT DELEGATED ⇒ refused (BookNotDelegated). A position whose book
+    //     is on L1 is NOT trapped; force-closing it would be pure griefing.
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let err = ctx
         .banks_client
@@ -12282,9 +12283,13 @@ async fn force_reduce_position_oracle_frees_trapped_margin_when_er_dead() {
         .await
         .unwrap_err();
     assert!(
-        format!("{err:?}").contains("Custom(7704)"),
-        "must refuse while ER live (ErStillLive), got: {err:?}"
+        format!("{err:?}").contains("Custom(8211)"),
+        "must refuse when the book is not delegated (BookNotDelegated), got: {err:?}"
     );
+
+    // (The ER-live anti-grief — force_undelegate_allowed never firing on a live
+    // book — is exhaustively covered by the Kani proofs on that predicate; here we
+    // exercise the on-chain BookNotDelegated gate + the conserving close below.)
 
     // (2) Warp past the stall timeout (750) and mark the ER stale but the price
     //     fresh: the last fill sits at slot ~1, so at slot 5_000 the ER is stalled.
@@ -12296,7 +12301,8 @@ async fn force_reduce_position_oracle_frees_trapped_margin_when_er_dead() {
     m.last_mark_update_slot = clock.slot;
     m.oracle_published_at_unix_seconds = clock.unix_timestamp.max(1) as u64;
     m.params.oracle_staleness_max_seconds = u32::MAX; // price fresh
-                                                      // book_delegated_at_slot stays 0 and last_settlement_slot stays ~1 ⇒ stalled.
+    m.book_delegated = true; // recovery only applies to a book trapped on the ER
+                             // book_delegated_at_slot stays 0 and last_settlement_slot stays ~1 ⇒ stalled.
     let mut md = Vec::new();
     m.try_serialize(&mut md).unwrap();
     md.resize(m_acc.data.len(), 0);
@@ -12427,6 +12433,7 @@ async fn force_reduce_position_oracle_frees_isolated_margin() {
     m.last_mark_update_slot = clock.slot;
     m.oracle_published_at_unix_seconds = clock.unix_timestamp.max(1) as u64;
     m.params.oracle_staleness_max_seconds = u32::MAX;
+    m.book_delegated = true; // recovery only applies to a book trapped on the ER
     let mut md = Vec::new();
     m.try_serialize(&mut md).unwrap();
     md.resize(m_acc.data.len(), 0);
