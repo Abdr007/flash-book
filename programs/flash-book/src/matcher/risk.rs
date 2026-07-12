@@ -329,21 +329,34 @@ fn unrealized_pnl_quote_lots(
 /// Apply a bps shock to a price. `+shock_bps` raises price; `-shock_bps`
 /// lowers. Returns 0 if the shock would drive price negative.
 fn shocked_price(price: Ticks, shock_bps: i32) -> Result<Ticks> {
-    let p = price.0 as i128;
-    let delta = p
-        .checked_mul(shock_bps as i128)
-        .or_overflow()?
-        .checked_div(BPS_DENOM as i128)
-        .or_div_zero()?;
-    let r = p.checked_add(delta).or_overflow()?;
-    if r <= 0 {
-        return Ok(Ticks(0));
+    if shock_bps == 0 || price.0 == 0 {
+        return Ok(price);
     }
-    // Reject a stressed price that overflows u64
-    // rather than silently truncating via `as u64`. Only reachable with a
-    // misconfigured (governance) shock, but matches the clamp/reject discipline
-    // used for every other narrowing cast in this module.
-    Ok(Ticks(u64::try_from(r).ok().or_overflow()?))
+
+    // Stress moves must round AWAY from the current mark. Signed integer
+    // division truncates toward zero, which made both directions less adverse:
+    // 101 * 1.20 became 121 (not 122), while 101 * 0.80 became 81 (not 80).
+    // The missing fraction is multiplied by the full position size, so it is not
+    // harmless dust. Compute the positive magnitude in u128 and ceil it before
+    // applying the sign; u64 * |i32| always fits this intermediate.
+    let magnitude = shock_bps.unsigned_abs() as u128;
+    let delta = (price.0 as u128)
+        .checked_mul(magnitude)
+        .or_overflow()?
+        .div_ceil(BPS_DENOM as u128);
+
+    if shock_bps < 0 {
+        if delta >= price.0 as u128 {
+            return Ok(Ticks(0));
+        }
+        let stressed = (price.0 as u128).checked_sub(delta).or_underflow()?;
+        return Ok(Ticks(u64::try_from(stressed).ok().or_overflow()?));
+    }
+
+    // Reject a positive stressed price that overflows u64 rather than silently
+    // truncating. Only reachable with a pathological governance shock.
+    let stressed = (price.0 as u128).checked_add(delta).or_overflow()?;
+    Ok(Ticks(u64::try_from(stressed).ok().or_overflow()?))
 }
 
 fn lookup_market<'a>(markets: &'a [MarketSnapshot], pk: &Pubkey) -> Option<&'a MarketSnapshot> {
@@ -1159,6 +1172,73 @@ mod assess_margin_frame_tests {
 // position the gate calls healthy provably survives the worst stressed scenario.
 // Pure i128 add/sub/max/compare (NO division), so CBMC is complete and fast.
 // ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod conservative_stress_rounding_tests {
+    use super::*;
+
+    fn market(mark: u64) -> MarketSnapshot {
+        MarketSnapshot {
+            market: Pubkey::new_from_array([91; 32]),
+            mark_price: Ticks(mark),
+            cum_funding_index: 0,
+            maintenance_margin_bps: 500,
+            tick_size: 1,
+            concentration_threshold_lots: 0,
+            concentration_extra_mmr_bps: 0,
+            side_oi_lots: 0,
+            oi_mmr_slope_bps_per_million_lots: 0,
+            oi_mmr_max_extra_bps: 0,
+            paper_profit_haircut_bps: 0,
+        }
+    }
+
+    fn position(market: Pubkey, side: Side) -> PositionSnapshot {
+        PositionSnapshot {
+            market,
+            side,
+            size_lots: 1_000_000,
+            entry_price: Ticks(101),
+            cum_funding_index_at_entry: 0,
+            collateral_quote_lots: 0,
+        }
+    }
+
+    #[test]
+    fn fractional_stress_moves_round_away_from_the_mark() {
+        // 101 * 1.20 = 121.2 and 101 * 0.80 = 80.8. A stress engine must
+        // round the move away from the mark (122 / 80), not truncate it toward
+        // the mark (121 / 81), or it systematically understates both a short's
+        // up-shock and a long's down-shock.
+        assert_eq!(shocked_price(Ticks(101), 2_000).unwrap(), Ticks(122));
+        assert_eq!(shocked_price(Ticks(101), -2_000).unwrap(), Ticks(80));
+    }
+
+    #[test]
+    fn real_assess_margin_prices_the_full_fractional_shock() {
+        let m = market(101);
+        let up = vec![vec![StressShock {
+            market: m.market,
+            shock_bps: 2_000,
+        }]];
+        let down = vec![vec![StressShock {
+            market: m.market,
+            shock_bps: -2_000,
+        }]];
+
+        // Long, stressed to 80: pnl = -21,000,000; MM = 4,000,000.
+        let long =
+            assess_margin(&[position(m.market, Side::Long)], &[m], &down, 25_000_000).unwrap();
+        assert_eq!(long.required_quote_lots, 25_000_000);
+        assert!(long.is_healthy);
+
+        // Short, stressed to 122: pnl = -21,000,000; MM = 6,100,000.
+        let short =
+            assess_margin(&[position(m.market, Side::Short)], &[m], &up, 27_100_000).unwrap();
+        assert_eq!(short.required_quote_lots, 27_100_000);
+        assert!(short.is_healthy);
+    }
+}
+
 #[cfg(kani)]
 mod assess_margin_gate_kani_proofs {
     /// Mirror of the live gate (risk.rs::assess_margin): `required` clamps the
