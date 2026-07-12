@@ -49,8 +49,8 @@ pub const MAX_LADDER_LEVELS: u8 = 20;
 /// rejecting a legitimate caller.
 pub const MAX_STRESS_SCENARIOS: usize = 5 + 8 * MAX_POSITIONS_PER_TRADER;
 
-/// Maximum FLP quote levels per side per batch.
-pub const MAX_FLP_QUOTE_LEVELS: usize = 16;
+/// Maximum LP quote levels per side per batch.
+pub const MAX_LP_QUOTE_LEVELS: usize = 16;
 
 /// Maximum orders processed per batch (compute-budget bounded).
 pub const MAX_ORDERS_PER_BATCH: usize = 256;
@@ -66,16 +66,16 @@ pub const FUNDING_INDEX_FRACTIONAL_BITS: u32 = 64;
 pub const VPIN_FRACTIONAL_BITS: u32 = 32;
 pub const VPIN_FIXED_ONE: u64 = 1u64 << VPIN_FRACTIONAL_BITS;
 
-/// Reserved sequence-number range for synthesized FLP virtual orders.
-/// User-submitted orders use [0, FLP_SEQ_RESERVED_OFFSET); FLP virtual
-/// quotes use [FLP_SEQ_RESERVED_OFFSET, ∞). Keeps user FIFO ordering
-/// untouched by FLP injection.
-pub const FLP_SEQ_RESERVED_OFFSET: u64 = 1u64 << 56;
+/// Reserved sequence-number range for synthesized LP virtual orders.
+/// User-submitted orders use [0, LP_SEQ_RESERVED_OFFSET); LP virtual
+/// quotes use [LP_SEQ_RESERVED_OFFSET, ∞). Keeps user FIFO ordering
+/// untouched by LP injection.
+pub const LP_SEQ_RESERVED_OFFSET: u64 = 1u64 << 56;
 
 /// Per-trader per-batch limit on submitted orders. Spam-protection.
 pub const MAX_ORDERS_PER_TRADER_PER_BATCH: u32 = 16;
 
-/// Solana account max size (10 MB). `migrate_market_to_v3` (and any
+/// Solana account max size (10 MB). `migrate_market_layout` (and any
 /// other account-reallocing ix) MUST refuse `target_size` greater than
 /// this — otherwise the realloc panics deep in the runtime and burns
 /// the tx's compute budget without surfacing a useful error.
@@ -88,14 +88,14 @@ pub const SOLANA_MAX_ACCOUNT_SIZE: usize = 10 * 1024 * 1024;
 /// hedge); larger baskets land via repeated calls.
 pub const MAX_BASKET_LEGS_N: usize = 4;
 
-/// Minimum slots an FLP liquidity provider must hold before withdrawing,
-/// enforced by `withdraw_flp_capital` via `matcher::jit_lp_defense::can_withdraw`.
+/// Minimum slots an LP liquidity provider must hold before withdrawing,
+/// enforced by `lp_withdraw` via `matcher::jit_lp_defense::can_withdraw`.
 /// Defeats the flash / short-window attack of depositing right before a fee /
-/// realized-PnL event that lifts FLP NAV and redeeming the windfall without
+/// realized-PnL event that lifts LP NAV and redeeming the windfall without
 /// bearing risk. ~1 min at ~0.4s/slot — negligible for genuine LPs (who hold for days), fatal to the
 /// timed windfall. Security floor; a future governance field can override it once
-/// the FlpExposureAccount layout is versioned (it currently has no reserved space).
-pub const FLP_MIN_HOLD_SLOTS: u64 = 150;
+/// the LiquidityPoolAccount layout is versioned (it currently has no reserved space).
+pub const LP_MIN_HOLD_SLOTS: u64 = 150;
 
 /// TTL (in slots) stamped on the resting order a REDUCE-ONLY trigger
 /// (stop-loss / take-profit / bracket leg) injects when it fires. A fill is
@@ -149,7 +149,7 @@ pub const INSURANCE_THRESHOLD_UPDATE_MIN_SLOTS: u64 = 9_000;
 /// ER-stall safety floor: max L1 slots since the mark price last moved (via the
 /// fill-EMA in `apply_fill` or a hard `settle_mark`) before the mark is treated
 /// as STALE. A stalled MagicBlock ER freezes the fill stream, so the mark stops
-/// updating; past this bound `liquidate_position_v2` drops the (possibly
+/// updating; past this bound `liquidate_position` drops the (possibly
 /// adverse, frozen) mark and falls back to ORACLE-ONLY health pricing, and
 /// `verify_market_invariants` auto-pauses the market so no new orders land while
 /// the ER is down. ~0.4s/slot ⇒ 150 slots ≈ 60s — comfortably above the normal
@@ -219,18 +219,18 @@ pub const CENSORSHIP_ESCAPE_TIMEOUT_SLOTS: u64 = 9_000;
 /// ⇒ ~1065 bytes.
 pub const MAX_PRIVACY_MEMBERS: usize = 32;
 
-/// Protocol-level safety cap on how far an `apply_flp_fill` price may
-/// deviate from the FRESH oracle, in bps (symmetric band). The FLP quoter
+/// Protocol-level safety cap on how far an `apply_lp_fill` price may
+/// deviate from the FRESH oracle, in bps (symmetric band). The LP quoter
 /// always prices within its spread of fair value, so a legitimate fill is
 /// far inside this bound; the cap exists to stop a compromised sequencer
-/// settling an FLP fill far enough from the oracle to drain the pool. 3% is
-/// comfortably above any realistic FLP spread (sub-2% even in stress) while
+/// settling an LP fill far enough from the oracle to drain the pool. 3% is
+/// comfortably above any realistic LP spread (sub-2% even in stress) while
 /// capping per-fill pool value-extraction at 3% of notional. A constant
 /// (not a `MarketParams` field) because `MarketParams` has no reserved
 /// slack; a governance override requires a versioned layout.
-pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 300;
+pub const LP_MAX_FILL_DEVIATION_BPS: u32 = 300;
 
-/// Rate limit for the PERMISSIONLESS `flp_refresh_quotes`: while the pool's quotes
+/// Rate limit for the PERMISSIONLESS `lp_refresh_quotes`: while the pool's quotes
 /// are still resting, a keeper may only re-quote once they are at least this many
 /// slots old, so nobody can churn the book. Consumed/stale quotes (none resting)
 /// can always be re-posted immediately — so this only throttles re-quoting of
@@ -239,7 +239,7 @@ pub const FLP_MAX_FILL_DEVIATION_BPS: u32 = 300;
 /// like 10 slots ≈ 4s is below normal tx-confirmation latency, so it throttles
 /// almost nothing). A future governance field can tune it once MarketParams is
 /// versioned.
-pub const FLP_REFRESH_MIN_SLOTS: u32 = 50;
+pub const LP_REFRESH_MIN_SLOTS: u32 = 50;
 
 /// Anti-book-stuffing: max deviation (bps, symmetric) a RESTING order's
 /// price may sit from the fresh oracle. Far-from-market orders are the classic

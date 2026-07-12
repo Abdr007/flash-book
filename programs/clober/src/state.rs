@@ -6,7 +6,7 @@
 //! the rest use Borsh, which is sufficient under MAX_ORDERS_PER_BATCH.
 
 use crate::constants::{
-    MARK_HISTORY_LEN, MAX_FLP_QUOTE_LEVELS, MAX_ORDERS_PER_BATCH, MAX_POSITIONS_PER_TRADER,
+    MARK_HISTORY_LEN, MAX_LP_QUOTE_LEVELS, MAX_ORDERS_PER_BATCH, MAX_POSITIONS_PER_TRADER,
 };
 use crate::matcher::funding::FundingIndex;
 use crate::matcher::lot::{BaseLots, Bps, Ticks};
@@ -44,16 +44,16 @@ pub struct MarketParams {
 
     pub oracle_band_bps: u32,
 
-    pub flp_spread_base_bps: u32,
-    pub flp_spread_alpha_bps: u32,
-    pub flp_spread_beta_bps: u32,
-    pub flp_spread_gamma_bps: u32,
-    pub flp_spread_kappa_bps: u32,
-    pub flp_spread_delta_bps: u32, // realized-vol coefficient
-    pub flp_inventory_lambda_bps: u32,
-    pub flp_depth_floor_lots: u64,
-    pub flp_max_growth_per_batch_bps: u32,
-    pub flp_quote_levels: u8,
+    pub lp_spread_base_bps: u32,
+    pub lp_spread_alpha_bps: u32,
+    pub lp_spread_beta_bps: u32,
+    pub lp_spread_gamma_bps: u32,
+    pub lp_spread_kappa_bps: u32,
+    pub lp_spread_delta_bps: u32, // realized-vol coefficient
+    pub lp_inventory_lambda_bps: u32,
+    pub lp_depth_floor_lots: u64,
+    pub lp_max_growth_per_batch_bps: u32,
+    pub lp_quote_levels: u8,
 
     pub vpin_bucket_size_lots: u64,
     pub vpin_ema_window: u32,
@@ -82,11 +82,11 @@ pub struct MarketParams {
     /// Used by `update_oracle_quorum`.
     pub oracle_quorum_max_dispersion_bps: u32,
 
-    /// Per-trader maximum position notional as bps of FLP capital.
-    /// E.g. 10 = 0.1% of FLP capital. 0 = unlimited (only the absolute
+    /// Per-trader maximum position notional as bps of LP capital.
+    /// E.g. 10 = 0.1% of LP capital. 0 = unlimited (only the absolute
     /// `max_position_lots_per_trader` gate applies). Computed at order
     /// placement against the trader's projected post-fill notional and
-    /// the FLP's `total_capital_quote_lots`. Defends against cap-relative
+    /// the LP's `total_capital_quote_lots`. Defends against cap-relative
     /// concentration risk that the absolute lots cap can't enforce when
     /// the pool grows or shrinks.
     pub max_position_ratio_bps: u32,
@@ -116,7 +116,7 @@ pub struct MarketParams {
     pub liquidation_auction_duration_slots: u32,
 
     /// Drift-style JIT bonus: extra bps of rebate the maker earns when
-    /// filling a JIT-tagged taker order (flag bit 3 on place_limit_order_v2).
+    /// filling a JIT-tagged taker order (flag bit 3 on place_limit_order).
     /// 0 = JIT inactive. Typical setting: 5-20 bps (0.05-0.2% of notional)
     /// added on top of the base maker_rebate_bps. Encourages MMs to
     /// preferentially quote against tagged flow.
@@ -156,9 +156,9 @@ pub struct MarketParams {
     /// short lots, whichever is larger). 0 = unlimited. Acts as a hard
     /// circuit breaker against runaway exposure on a single market —
     /// new orders that would push OI past the cap are rejected at
-    /// place_limit_order_v2 intake. Distinct from `max_position_lots_per_trader`
-    /// (per-trader) and `max_position_ratio_bps` (per-trader as % of FLP);
-    /// this caps the WHOLE-MARKET aggregate. Typical: scaled with FLP
+    /// place_limit_order intake. Distinct from `max_position_lots_per_trader`
+    /// (per-trader) and `max_position_ratio_bps` (per-trader as % of LP);
+    /// this caps the WHOLE-MARKET aggregate. Typical: scaled with LP
     /// capital × leverage so worst-case insurance draw stays bounded.
     pub max_oi_base_lots: u64,
 
@@ -179,7 +179,7 @@ pub struct MarketParams {
     /// harder to liquidate without market impact. 0 threshold = tier
     /// disabled (single-MMR for the whole market). Smarter than HL's
     /// flat per-market MMR.
-    /// Typical: threshold sized to 1-5% of FLP capital; extra 100-500 bps.
+    /// Typical: threshold sized to 1-5% of LP capital; extra 100-500 bps.
     pub concentration_threshold_lots: u64,
     pub concentration_extra_mmr_bps: u32,
 
@@ -268,7 +268,7 @@ pub struct MarketParams {
     pub oi_mmr_max_extra_bps: u32,
 
     /// Tranched-liquidation cap (4.5): the maximum base lots a SINGLE
-    /// `liquidate_position_v2` call may close on one position. A position larger
+    /// `liquidate_position` call may close on one position. A position larger
     /// than this is liquidated over multiple calls, each spaced by
     /// `liquidation_cooldown_slots`, so a large forced unwind can't dump its
     /// full size into the book in one shot (market-impact mitigation). The
@@ -291,7 +291,7 @@ pub struct MarketAccount {
     /// CreatorFeeOwedEvent crediting the creator with
     /// `params.creator_share_bps` of net fee.
     pub creator: Pubkey,
-    pub flp_pool: Pubkey,
+    pub lp_pool: Pubkey,
     pub base_mint: Pubkey,
     pub quote_mint: Pubkey,
     pub base_vault: Pubkey,
@@ -339,7 +339,7 @@ pub struct MarketAccount {
     /// Used to enforce `params.mark_settle_min_slots` rate-limit.
     pub last_mark_settle_slot: u64,
     pub params: MarketParams,
-    /// Authorized fill-settlement signer for `apply_fill` / `apply_flp_fill`.
+    /// Authorized fill-settlement signer for `apply_fill` / `apply_lp_fill`.
     ///
     /// Deliberately decoupled from `authority`: the authority can be burned
     /// (zeroed) for decentralization, but settlement must keep working — so
@@ -352,7 +352,7 @@ pub struct MarketAccount {
     /// zero pubkey — which is unsignable, so `apply_fill` fails closed
     /// (refuses every fill) until the authority sets a sequencer.
     pub sequencer: Pubkey,
-    /// Monotonic settlement nonce. Every `apply_fill` / `apply_flp_fill`
+    /// Monotonic settlement nonce. Every `apply_fill` / `apply_lp_fill`
     /// must carry a `fill_seq` STRICTLY GREATER than this, after which it is
     /// stored here — so a replayed or out-of-order settlement (a crashed /
     /// restarting sequencer re-emitting an already-applied batch, or a
@@ -368,7 +368,7 @@ pub struct MarketAccount {
     pub fill_commitment_required: bool,
     /// Sticky flag: once `initialize_haircut_state` enables the haircut
     /// junior-claim engine for this market, the (optional) haircut accounts
-    /// are MANDATORY in `apply_fill`/`apply_flp_fill`. Without this a
+    /// are MANDATORY in `apply_fill`/`apply_lp_fill`. Without this a
     /// settlement could omit them and route positive realized PnL straight to
     /// collateral with no Residual/solvency gating (then withdraw it).
     /// Trailing field: pre-existing accounts deserialize it as `false`.
@@ -408,7 +408,7 @@ pub struct MarketAccount {
     /// escape. Trailing field: pre-existing accounts deserialize it as 0.
     pub last_heartbeat_slot: u64,
     /// Per-market matcher batch cap — the max resting levels a taker may
-    /// cross in one `place_taker_order_v2` tx. Trailing field
+    /// cross in one `place_taker_order` tx. Trailing field
     /// (`size_of::<MarketAccount>()` is 896 B with 256 B free under
     /// `space() = 1152`; pre-existing accounts deserialize it as `0`). `0`
     /// means the global `MAX_BATCH_ORDERS_PER_SIDE_V2` (96) — the log-safe
@@ -421,7 +421,7 @@ pub struct MarketAccount {
 
     /// Total base-lot volume of fills that have been MATCHED (pushed to the
     /// fill-commitment ring) but NOT yet settled by apply_fill /
-    /// apply_flp_fill. Settled OI (`oi_long/short_lots`) only advances at
+    /// apply_lp_fill. Settled OI (`oi_long/short_lots`) only advances at
     /// settlement, so without this reserve the per-market OI cap could be
     /// overshot by pipelining takers ahead of settlement; the intake cap
     /// checks `oi[side] + unsettled_fill_volume + new_size`. Incremented per
@@ -440,7 +440,7 @@ pub struct MarketAccount {
     pub book_delegated: bool,
 
     /// Slot of the last REAL settlement (a committed fill applied via
-    /// `apply_fill` / `apply_flp_fill`). Unlike `last_mark_update_slot` — which
+    /// `apply_fill` / `apply_lp_fill`). Unlike `last_mark_update_slot` — which
     /// the permissionless `settle_mark` also bumps — this advances ONLY on
     /// genuine settlement, so it is the honest liveness signal for the
     /// force-undelegate escape and the S7 auto-pause: a censoring sequencer that
@@ -488,7 +488,7 @@ pub struct MarketAccount {
     /// market may carry, expressed as a multiple of the insurance fund balance in
     /// bps: the cap is `insurance_balance · oi_insurance_multiple_bps / BPS_DENOM`.
     /// When gross OI notional exceeds it at settlement, `apply_fill` /
-    /// `apply_flp_fill` auto-PAUSE the market (a flag write — the committed fill
+    /// `apply_lp_fill` auto-PAUSE the market (a flag write — the committed fill
     /// still settles; only NEW intake is blocked, which the intake gate already
     /// rejects on `Paused`). `0 = DISABLED` — the default, so this is opt-in per
     /// market and legacy accounts (which read this trailing field as 0) are
@@ -676,7 +676,7 @@ impl FeeTiersAccount {
 ///      position set into cross and isolated, evaluates each isolated
 ///      position against its own collateral, and only includes cross
 ///      positions in the pooled-collateral assessment.
-///   2. `liquidate_position_v2` draws the penalty + liquidator reward
+///   2. `liquidate_position` draws the penalty + liquidator reward
 ///      from `position.collateral_quote_lots` first for an isolated
 ///      position, with the insurance fund covering any shortfall — the
 ///      trader's main pool is never touched.
@@ -759,15 +759,15 @@ pub struct InsuranceFundAccount {
     pub total_contributions: u64,
     pub total_payouts: u64,
     /// SPL mint for the protocol's quote currency (typically USDC). All
-    /// collateral and FLP capital moves through this mint.
+    /// collateral and LP capital moves through this mint.
     pub quote_mint: Pubkey,
     /// Global protocol vault TokenAccount. Owned by the InsuranceFundAccount
     /// PDA (which signs transfers out via known seeds). Holds all trader
-    /// collateral + FLP capital.
+    /// collateral + LP capital.
     pub quote_vault: Pubkey,
     /// 2.3: total referrer/builder/creator fee-share value accrued on-chain
     /// but not yet claimed. A protocol LIABILITY against the shared vault —
-    /// `verify_protocol_solvency` requires `vault >= insurance + flp +
+    /// `verify_protocol_solvency` requires `vault >= insurance + lp +
     /// total_fee_accrued_lots`. Incremented (surplus-capped) when `apply_fill`
     /// accrues a share to a `FeeAccrualAccount`; decremented when
     /// `claim_fee_accrual` pays it out. Trailing field within `space()`
@@ -874,7 +874,7 @@ impl CopyVaultShareAccount {
     }
 }
 
-/// FLP pool exposure across markets and per-LP share accounting.
+/// LP pool exposure across markets and per-LP share accounting.
 ///
 /// The pool's NAV (Net Asset Value) is `total_capital_quote_lots +
 /// realized_pnl`. LPs own `shares` of `lp_shares_outstanding`; their
@@ -884,34 +884,34 @@ impl CopyVaultShareAccount {
 /// adapted for Solana.
 #[account]
 #[derive(Debug)]
-pub struct FlpExposureAccount {
-    /// Protocol admin — manages FLP-level governance ops (initial endowment,
+pub struct LiquidityPoolAccount {
+    /// Protocol admin — manages LP-level governance ops (initial endowment,
     /// future emergency pause). Distinct from LPs, who own shares.
     pub authority: Pubkey,
     pub bump: u8,
     /// Aggregate quote-lot deposits + maker rebate accrual. Used as one
     /// term of NAV; does NOT represent a single LP's claim.
     pub total_capital_quote_lots: u64,
-    /// Cumulative realized P&L from FLP fills across all markets. Signed.
+    /// Cumulative realized P&L from LP fills across all markets. Signed.
     /// The other term of NAV.
     pub realized_pnl: i64,
     pub markets_count: u8,
     /// Total shares issued across all LpPositionAccounts. NAV/share = NAV
     /// / lp_shares_outstanding when nonzero.
     pub lp_shares_outstanding: u64,
-    pub per_market: [FlpMarketExposure; 16],
+    pub per_market: [LpMarketExposure; 16],
 }
 
 #[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize, Default)]
-pub struct FlpMarketExposure {
+pub struct LpMarketExposure {
     pub market: Pubkey,
     pub side: u8, // 0 = long, 1 = short, 255 = empty
     pub size_lots: u64,
     pub entry_price_ticks: u64,
 }
 
-impl FlpExposureAccount {
-    pub const SEED: &'static [u8] = b"flp_exposure";
+impl LiquidityPoolAccount {
+    pub const SEED: &'static [u8] = b"lp_exposure";
     pub fn space() -> usize {
         // Original: 8 + 32 + 1 + 8 + 8 + 1 + 16*49 = 842.
         // Add 8 for lp_shares_outstanding. Round up generously.
@@ -933,7 +933,7 @@ impl FlpExposureAccount {
 pub struct LpPositionAccount {
     pub lp: Pubkey,
     pub bump: u8,
-    /// Shares of FlpExposureAccount.lp_shares_outstanding owned by this LP.
+    /// Shares of LiquidityPoolAccount.lp_shares_outstanding owned by this LP.
     pub shares: u64,
     /// Cumulative quote-lot deposits over the lifetime of this LP. Cost
     /// basis for off-chain PnL display; does not affect on-chain math.
@@ -941,8 +941,8 @@ pub struct LpPositionAccount {
     /// Cumulative quote-lot withdrawals.
     pub total_withdrawn_quote_lots: u64,
     /// Slot of the most recent deposit. (Re)set on every deposit via
-    /// `jit_lp_defense::extend_lock_on_deposit`; `withdraw_flp_capital` is gated
-    /// on `jit_lp_defense::can_withdraw(deposited_at_slot, now, FLP_MIN_HOLD_SLOTS)`
+    /// `jit_lp_defense::extend_lock_on_deposit`; `lp_withdraw` is gated
+    /// on `jit_lp_defense::can_withdraw(deposited_at_slot, now, LP_MIN_HOLD_SLOTS)`
     /// to defeat flash / short-window deposit→NAV-windfall→redeem. Trailing
     /// field within the allocation slack: pre-existing LP accounts
     /// deserialize it as 0 ⇒ immediately withdrawable.
@@ -958,8 +958,8 @@ impl LpPositionAccount {
     }
 }
 
-/// Protocol-wide FLP-system lock. The singleton `FlpExposureAccount`
-/// (`apply_flp_fill` books every FLP fill into it) and the per-market v3 FLP
+/// Protocol-wide LP-system lock. The singleton `LiquidityPoolAccount`
+/// (`apply_lp_fill` books every LP fill into it) and the per-market v3 LP
 /// redeem from the SAME vault, so LP shares outstanding in both would
 /// double-count the same realized PnL and let the last redeemers over-withdraw.
 /// This singleton records which system minted shares first; the other system's
@@ -968,14 +968,14 @@ impl LpPositionAccount {
 /// existing layout is resized).
 #[account]
 #[derive(Debug)]
-pub struct FlpModeAccount {
+pub struct LpModeAccount {
     pub bump: u8,
     /// 0 = unset, 1 = singleton, 2 = per-market v3.
     pub mode: u8,
     pub _reserved: [u8; 6],
 }
-impl FlpModeAccount {
-    pub const SEED: &'static [u8] = b"flp_mode";
+impl LpModeAccount {
+    pub const SEED: &'static [u8] = b"lp_mode";
     pub const MODE_UNSET: u8 = 0;
     pub const MODE_SINGLETON: u8 = 1;
     pub const MODE_V3: u8 = 2;
@@ -1082,7 +1082,7 @@ const _: Ticks = Ticks(0);
 const _: Bps = Bps(0);
 const _: FundingIndex = 0i128;
 const _: usize = MAX_POSITIONS_PER_TRADER;
-const _: usize = MAX_FLP_QUOTE_LEVELS;
+const _: usize = MAX_LP_QUOTE_LEVELS;
 const _: usize = MAX_ORDERS_PER_BATCH;
 const _: Order = Order {
     id: 0,

@@ -465,17 +465,17 @@ pub fn validate_market_params(h_min_slots: u64, h_max_slots: u64) -> Result<(), 
 /// |---|---|---|---|---|
 /// | deposit_collateral | +amt | +amt | 0 | 0 |
 /// | withdraw_collateral | -amt | -amt | 0 | 0 |
-/// | deposit_flp_capital | +amt | 0 | 0 | +amt |
-/// | withdraw_flp_capital | -amt | 0 | 0 | -amt |
+/// | lp_deposit | +amt | 0 | 0 | +amt |
+/// | lp_withdraw | -amt | 0 | 0 | -amt |
 /// | insurance deposit | +amt | 0 | +amt | 0 |
 /// | insurance withdraw | -amt | 0 | -amt | 0 |
 /// | flush_haircut_dust | 0 | 0 | +dust | -dust (consumed from dust pool) |
-/// | fee accrual to FLP | +fee | 0 | 0 | +fee |
+/// | fee accrual to LP | +fee | 0 | 0 | +fee |
 /// | fee accrual to insurance | +fee | 0 | +fee | 0 |
 /// | liquidation reward to liquidator | -reward | -reward (from position) | 0 | 0 |
-/// | apply_realized_pnl_delta gain | 0 | 0 | 0 | 0 (deferred to the warmup reserve; no ledger move) |
+/// | apply_realized_pnl_direct gain | 0 | 0 | 0 | 0 (deferred to the warmup reserve; no ledger move) |
 /// | convert_position (extract matured gain) | 0 | +credit | 0 | -credit (credit moves Residual→collateral) |
-/// | apply_realized_pnl_delta loss | 0 | -loss (saturating) | 0 | +loss |
+/// | apply_realized_pnl_direct loss | 0 | -loss (saturating) | 0 | +loss |
 ///
 /// Identity check: Σ ΔResidual over a market's history must equal the
 /// current Residual − initial Residual. A periodic sanity-check ix

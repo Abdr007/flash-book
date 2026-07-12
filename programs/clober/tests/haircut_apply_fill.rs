@@ -1,5 +1,5 @@
-//! Verifies the routing behaviour of `apply_realized_pnl_delta_v2` —
-//! the dispatcher that replaces `apply_realized_pnl_delta`'s direct
+//! Verifies the routing behaviour of `apply_realized_pnl_delta` —
+//! the dispatcher that replaces `apply_realized_pnl_direct`'s direct
 //! credit with H-haircut reserve routing whenever the position has
 //! haircut state attached.
 //!
@@ -13,7 +13,7 @@
 //!     collateral directly (loss seniority).
 //!
 //! Mirrors the on-chain dispatcher body as plain Rust over the same
-//! shape that `apply_realized_pnl_delta_v2` consumes. Layered on top
+//! shape that `apply_realized_pnl_delta` consumes. Layered on top
 //! of the proven `matcher::haircut` math.
 
 use clober::matcher::haircut::{apply_release, PositionHaircutSnapshot};
@@ -32,7 +32,7 @@ struct PosHaircut {
     original: u64,
 }
 
-/// Mirror of `apply_realized_pnl_delta_v2`. Signature exactly tracks
+/// Mirror of `apply_realized_pnl_delta`. Signature exactly tracks
 /// the on-chain function — `position_haircut: Option<&mut ...>` toggles
 /// between legacy and haircut routing.
 fn dispatch(

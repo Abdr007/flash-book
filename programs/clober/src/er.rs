@@ -226,7 +226,7 @@ pub fn cpi_delegate(
 /// (`force_undelegate_market_book`). Returns true iff the ER has been silent for
 /// STRICTLY MORE than `timeout_slots`. The liveness baseline is the more recent
 /// of the last REAL settlement (`last_settlement_slot`, advanced only by
-/// `apply_fill` / `apply_flp_fill` — never by the permissionless `settle_mark`)
+/// `apply_fill` / `apply_lp_fill` — never by the permissionless `settle_mark`)
 /// and the delegation slot (`book_delegated_at_slot`); the latter closes the
 /// "delegate then never fill" trap. A 0 baseline (book not delegated via the
 /// upgraded path) is never escapable. Extracted pure so the "never fires while

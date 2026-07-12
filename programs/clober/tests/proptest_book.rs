@@ -11,13 +11,13 @@
 
 use anchor_lang::prelude::Pubkey;
 use clober::hypertree::NIL;
-use clober::state_v2::{
-    encode_order_id, MarketBookHandle, RestingOrderV2, MARKET_BOOK_TOTAL_BYTES,
+use clober::book_state::{
+    encode_order_id, MarketBookHandle, RestingOrder, MARKET_BOOK_TOTAL_BYTES,
 };
 use proptest::prelude::*;
 
-fn order_sz(price: u64, seq: u64, is_bid: bool, size: u64) -> RestingOrderV2 {
-    RestingOrderV2 {
+fn order_sz(price: u64, seq: u64, is_bid: bool, size: u64) -> RestingOrder {
+    RestingOrder {
         order_id: encode_order_id(price, seq, is_bid),
         seq,
         price_ticks: price,
@@ -32,7 +32,7 @@ fn order_sz(price: u64, seq: u64, is_bid: bool, size: u64) -> RestingOrderV2 {
     }
 }
 
-fn order(price: u64, seq: u64, is_bid: bool) -> RestingOrderV2 {
+fn order(price: u64, seq: u64, is_bid: bool) -> RestingOrder {
     order_sz(price, seq, is_bid, 1)
 }
 

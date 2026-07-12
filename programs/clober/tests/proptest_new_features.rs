@@ -19,8 +19,8 @@ const BPS_DENOM: u128 = 10_000;
 
 // ─── LP unit NAV math ─────────────────────────────────────────────────
 //
-// Mirrors programs/clober/src/lib.rs deposit_flp_capital +
-// withdraw_flp_capital. The math:
+// Mirrors programs/clober/src/lib.rs lp_deposit +
+// lp_withdraw. The math:
 //
 //   shares_to_mint = amount × shares_outstanding / NAV    (or 1:1 if NAV<=0)
 //   amount_to_return = shares_to_burn × NAV / shares_outstanding
@@ -189,7 +189,7 @@ proptest! {
 
 // ─── Reduce-only ──────────────────────────────────────────────────────
 //
-// Mirrors place_limit_order_v2's reduce_only gate:
+// Mirrors place_limit_order's reduce_only gate:
 //   accept iff position.size > 0 AND order.side != position.side
 //            AND order.size <= position.size
 

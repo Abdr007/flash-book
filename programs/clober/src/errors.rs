@@ -63,8 +63,8 @@ pub enum CloberError {
     PositionSizeCapExceeded = 1209,
     #[msg("Open interest invariant violated: oi_long != oi_short")]
     OpenInterestImbalance = 1210,
-    #[msg("Withdraw would leave FLP NAV below required exposure coverage")]
-    FlpWithdrawUndercollateralized = 1211,
+    #[msg("Withdraw would leave LP NAV below required exposure coverage")]
+    LpWithdrawUndercollateralized = 1211,
     #[msg("Required market account missing from remaining_accounts")]
     MissingMarketAccount = 1212,
     #[msg("Order would exceed per-position leverage cap set by trader")]
@@ -127,7 +127,7 @@ pub enum CloberError {
     #[msg("Insurance fund cannot cover bankruptcy; ADL needed")]
     InsuranceExhausted = 1501,
     #[msg(
-        "Protocol insolvent: summed trader collateral exceeds vault headroom over FLP + insurance"
+        "Protocol insolvent: summed trader collateral exceeds vault headroom over LP + insurance"
     )]
     ProtocolInsolvent = 1502,
 
@@ -209,11 +209,11 @@ pub enum CloberError {
     FillRingEmpty = 2203,
     #[msg("Fill commitment ring counters corrupt — settled exceeds produced")]
     FillRingCorrupt = 2204,
-    #[msg("FLP fill price deviates from the oracle by more than the safety band — fabricated or mispriced")]
-    FlpPriceOutsideBand = 2205,
+    #[msg("LP fill price deviates from the oracle by more than the safety band — fabricated or mispriced")]
+    LpPriceOutsideBand = 2205,
     #[msg("Market is armed: the fill-commitment account is mandatory for settlement (C-1)")]
     FillCommitmentMissing = 2206,
-    #[msg("Cross-margined trader with multiple positions must be liquidated via liquidate_portfolio_v2 (H-4)")]
+    #[msg("Cross-margined trader with multiple positions must be liquidated via liquidate_portfolio (H-4)")]
     CrossLiquidationNeedsPortfolio = 2207,
     #[msg("Self-liquidation forbidden: the liquidator must not be the liquidatee (M-2)")]
     SelfLiquidationForbidden = 2208,
@@ -247,8 +247,8 @@ pub enum CloberError {
     FillRingNotDrained = 2306,
     #[msg("Market batch cap exceeds the log-safe limit but no fill-outbox account was supplied to carry the fills off-log")]
     FillOutboxRequired = 2307,
-    #[msg("FLP pool is insolvent (NAV <= 0 while shares are outstanding) — deposits paused to prevent dilution of the new depositor")]
-    FlpPoolInsolvent = 2308,
+    #[msg("LP pool is insolvent (NAV <= 0 while shares are outstanding) — deposits paused to prevent dilution of the new depositor")]
+    LpPoolInsolvent = 2308,
     #[msg("Stress-lattice scenario count exceeds the compute-safe maximum")]
     TooManyStressScenarios = 2309,
     #[msg("Order sequence counter exhausted for this market — the book must be reseated")]
@@ -261,7 +261,7 @@ pub enum CloberError {
     HaircutResidualUnbacked = 2313,
     #[msg("Lazer payload timestamp not strictly newer than the last accepted price (replay)")]
     OracleLazerReplay = 2314,
-    #[msg("FLP quote refresh rate-limited: the pool's quotes are still fresh")]
+    #[msg("LP quote refresh rate-limited: the pool's quotes are still fresh")]
     RefreshTooSoon = 2315,
     #[msg("Timelock has not elapsed: the proposed governance action is not yet executable")]
     TimelockNotElapsed = 2316,
@@ -269,8 +269,8 @@ pub enum CloberError {
     OracleSourceLocked = 2317,
     #[msg("Pyth publish_time not strictly newer than the last accepted price (replay)")]
     OraclePythReplay = 2318,
-    #[msg("FLP system conflict: the other FLP accounting system already holds LP shares (singleton and per-market v3 are mutually exclusive)")]
-    FlpSystemModeConflict = 2321,
+    #[msg("LP system conflict: the other LP accounting system already holds LP shares (singleton and per-market v3 are mutually exclusive)")]
+    LpSystemModeConflict = 2321,
     #[msg("Trader has no ER reserved-margin attestation: it must be initialized before trading on a delegated book")]
     ErMarginNotReady = 2322,
     #[msg("Trader already holds the maximum number of open positions: close one before opening a new market")]

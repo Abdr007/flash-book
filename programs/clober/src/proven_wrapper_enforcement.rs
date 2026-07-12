@@ -94,14 +94,14 @@ mod tests {
 
         // `health_price_with_staleness` (the staleness-gated selector) may be
         // reached in the handler layer only from the proven wrapper
-        // `effective_health_mark`, plus `liquidate_position_v2`, which currently
+        // `effective_health_mark`, plus `liquidate_position`, which currently
         // INLINES an equivalent staleness gate.
         //
-        // TRACKED RESIDUAL: collapse `liquidate_position_v2`'s inlined gate into a
+        // TRACKED RESIDUAL: collapse `liquidate_position`'s inlined gate into a
         // call to `effective_health_mark` so this allowlist shrinks to the single
         // proven wrapper. Deferred here because it edits a live liquidation money
         // path and so needs a devnet re-verify cycle, not a same-PR change.
-        let allow = ["effective_health_mark", "liquidate_position_v2"];
+        let allow = ["effective_health_mark", "liquidate_position"];
         let hits = enclosing_fns(LIB_RS, "matcher::liquidation::health_price_with_staleness(");
         assert!(
             !hits.is_empty(),
@@ -212,7 +212,7 @@ mod tests {
             // NOTE: the capped-debit / checked-credit / checked-debit primitives
             // (`apply_capped_debit`, `apply_collateral_credit`,
             // `apply_collateral_debit_checked`, `apply_collateral_debit_underflow`)
-            // are GENERIC proven cores reused across many handlers (fee debit, FLP
+            // are GENERIC proven cores reused across many handlers (fee debit, LP
             // principal draw, rebates, payouts, …), so they are intentionally NOT
             // pinned to a single caller here — only the handler-specific conserving
             // cores below are.
@@ -229,7 +229,7 @@ mod tests {
             // source→liquidator move routes through the proven capped-transfer
             // core. The cross branch is aliasing-safe because the SelfLiquidation
             // guard forces `trader_state` and `caller_trader_state` distinct.
-            ("apply_liquidation_reward(", &["liquidate_position_v2"][..]),
+            ("apply_liquidation_reward(", &["liquidate_position"][..]),
         ] {
             let callers = enclosing_fns(LIB_RS, core);
             assert!(

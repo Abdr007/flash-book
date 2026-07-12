@@ -62,7 +62,7 @@ fn ix_initialize(h_min: u64, h_max: u64, initial_residual: u128) -> MarketHaircu
 }
 
 /// Release-path proxy: positive realized PnL bypasses
-/// `apply_realized_pnl_delta`'s collateral credit and adds to the
+/// `apply_realized_pnl_direct`'s collateral credit and adds to the
 /// position's reserve instead (the algorithm `apply_fill` routes
 /// through on haircut-enabled markets).
 fn ix_release(pos: &mut PositionHaircutState, gain: u64, now_slot: u64) {

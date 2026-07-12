@@ -1,4 +1,4 @@
-//! Virtual FLP quoter — integer-arithmetic port of the TS reference.
+//! Virtual LP quoter — integer-arithmetic port of the TS reference.
 //!
 //! Spread function (per level, cumulative size Q):
 //!   s_bps = s0 + β·u_bps + γ·|oi_imb_bps| + κ·(Q/depth_floor)·BPS + δ·realized_vol
@@ -18,7 +18,7 @@ use crate::errors::{CloberError, OrOverflow};
 use anchor_lang::prelude::*;
 
 #[derive(Debug, Clone, Copy)]
-pub struct FlpQuoterParams {
+pub struct LpQuoterParams {
     pub base_spread_bps: u32,
     pub alpha_bps: u32, // VPIN coefficient
     pub beta_bps: u32,  // utilization coefficient
@@ -33,7 +33,7 @@ pub struct FlpQuoterParams {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct FlpQuoterInputs {
+pub struct LpQuoterInputs {
     pub oracle_ticks: Ticks,
     pub vpin_bps: u32,
     pub realized_vol_bps: u32,
@@ -45,7 +45,7 @@ pub struct FlpQuoterInputs {
 }
 
 #[derive(Debug, Clone)]
-pub struct FlpQuoterOutput {
+pub struct LpQuoterOutput {
     pub bids: Vec<(Ticks, BaseLots)>,
     pub asks: Vec<(Ticks, BaseLots)>,
     pub fair_value: Ticks,
@@ -53,12 +53,12 @@ pub struct FlpQuoterOutput {
 }
 
 pub fn generate_quotes(
-    params: FlpQuoterParams,
-    inputs: FlpQuoterInputs,
-    flp_trader: Pubkey,
+    params: LpQuoterParams,
+    inputs: LpQuoterInputs,
+    lp_trader: Pubkey,
     base_seq: u64,
-) -> Result<(FlpQuoterOutput, Vec<Order>)> {
-    let empty = FlpQuoterOutput {
+) -> Result<(LpQuoterOutput, Vec<Order>)> {
+    let empty = LpQuoterOutput {
         bids: vec![],
         asks: vec![],
         fair_value: inputs.oracle_ticks,
@@ -116,7 +116,7 @@ pub fn generate_quotes(
 
     if per_level_quote == 0 {
         return Ok((
-            FlpQuoterOutput {
+            LpQuoterOutput {
                 fair_value,
                 skew_bps,
                 ..empty
@@ -132,7 +132,7 @@ pub fn generate_quotes(
         .or_overflow()?;
     if notional_per_lot == 0 {
         return Ok((
-            FlpQuoterOutput {
+            LpQuoterOutput {
                 fair_value,
                 skew_bps,
                 ..empty
@@ -143,7 +143,7 @@ pub fn generate_quotes(
     let per_level_lots = (per_level_quote / notional_per_lot) as u64;
     if per_level_lots == 0 {
         return Ok((
-            FlpQuoterOutput {
+            LpQuoterOutput {
                 fair_value,
                 skew_bps,
                 ..empty
@@ -202,9 +202,9 @@ pub fn generate_quotes(
             bids.push((bid, BaseLots(per_level_lots)));
             orders.push(Order {
                 id: base_seq + (i * 2),
-                trader: flp_trader,
+                trader: lp_trader,
                 side: Side::Long,
-                order_type: OrderType::FlpVirtual,
+                order_type: OrderType::LpVirtual,
                 size: BaseLots(per_level_lots),
                 limit_price: bid,
                 seq: base_seq + (i * 2),
@@ -216,9 +216,9 @@ pub fn generate_quotes(
             asks.push((ask, BaseLots(per_level_lots)));
             orders.push(Order {
                 id: base_seq + (i * 2) + 1,
-                trader: flp_trader,
+                trader: lp_trader,
                 side: Side::Short,
-                order_type: OrderType::FlpVirtual,
+                order_type: OrderType::LpVirtual,
                 size: BaseLots(per_level_lots),
                 limit_price: ask,
                 seq: base_seq + (i * 2) + 1,
@@ -229,7 +229,7 @@ pub fn generate_quotes(
     }
 
     Ok((
-        FlpQuoterOutput {
+        LpQuoterOutput {
             bids,
             asks,
             fair_value,
@@ -258,14 +258,14 @@ fn align_tick(price: Ticks, tick_size: u64) -> Ticks {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FLP fill-price authenticity bound.
+// LP fill-price authenticity bound.
 //
-// FLP fills are quotes against pool liquidity, not on-chain resting orders, so
+// LP fills are quotes against pool liquidity, not on-chain resting orders, so
 // they cannot be bound by the matcher's fill-commitment ring (which covers book
-// fills). Their authenticity is recovered differently: the FLP quoter ALWAYS
+// fills). Their authenticity is recovered differently: the LP quoter ALWAYS
 // prices within its spread of fair value, so an authentic fill is within a small
 // deviation of the fresh oracle. This pure, overflow-free predicate is the
-// settlement-time gate — a compromised sequencer cannot settle an FLP fill far
+// settlement-time gate — a compromised sequencer cannot settle an LP fill far
 // enough from the oracle to drain the pool. It is a BOUND, not exact quote
 // re-derivation (which is unsound here: the quoter's inputs — vpin, inventory, OI
 // — drift between quote-time on the ER and settle-time on L1, so re-deriving would
@@ -324,7 +324,7 @@ pub fn order_notional_ok(
 
 /// HARD INVENTORY CAP (increment 3): the pool's net-position notional must not
 /// exceed its capital (a conservative ~1× exposure limit). Returns
-/// `(skip_bids, skip_asks)` for `flp_refresh_quotes`: when the pool is at the
+/// `(skip_bids, skip_asks)` for `lp_refresh_quotes`: when the pool is at the
 /// LONG cap it stops posting BIDs (a filled bid would grow its long — a taker
 /// selling into the pool), keeping only ASKs so takers can unwind it; symmetric
 /// at the SHORT cap. `capital == 0` (uncapitalized pool) → cap disabled. This is
@@ -340,10 +340,10 @@ pub fn inventory_cap_skip(net_signed: i64, capital_quote_lots: u64) -> (bool, bo
     (net >= cap, net <= -cap)
 }
 
-/// FV: machine-checked properties of the FLP fill-price band (Kani). Equality
+/// FV: machine-checked properties of the LP fill-price band (Kani). Equality
 /// comparisons + multiplies over u128 — bounded and terminating. Runs in CI.
 #[cfg(kani)]
-mod flp_band_kani_proofs {
+mod lp_band_kani_proofs {
     use super::price_within_band;
     use crate::constants::BPS_DENOM;
 
@@ -369,10 +369,10 @@ mod flp_band_kani_proofs {
     // multiplies is checked inside them (the `multiply with overflow` checks on
     // `price_within_band` resolve SUCCESS).
 
-    /// FAIR VALUE always passes — an FLP fill exactly at the oracle is never
+    /// FAIR VALUE always passes — an LP fill exactly at the oracle is never
     /// rejected (no false reject of the most honest possible price).
     #[kani::proof]
-    fn flp_band_accepts_oracle_price() {
+    fn lp_band_accepts_oracle_price() {
         let oracle: u64 = kani::any();
         let max_dev: u32 = kani::any();
         kani::assume(oracle <= PRICE_MAX);
@@ -382,9 +382,9 @@ mod flp_band_kani_proofs {
 
     /// CATASTROPHE BOUND: with the protocol cap (< 100%), a price at 2× the oracle
     /// or at 0 is ALWAYS rejected — the gross fabrications that would drain the
-    /// pool (taker sells to FLP at 2× / buys from FLP at ~0) cannot settle.
+    /// pool (taker sells to LP at 2× / buys from LP at ~0) cannot settle.
     #[kani::proof]
-    fn flp_band_rejects_gross_fabrication() {
+    fn lp_band_rejects_gross_fabrication() {
         let oracle: u64 = kani::any();
         let max_dev: u32 = kani::any();
         kani::assume(oracle > 0 && oracle <= PRICE_MAX);
@@ -485,7 +485,7 @@ mod skew_totality_tests {
     /// −BPS_DENOM.
     #[test]
     fn extreme_lambda_does_not_panic_and_skews_against_inventory() {
-        let params = FlpQuoterParams {
+        let params = LpQuoterParams {
             base_spread_bps: 0,
             alpha_bps: 0,
             beta_bps: 0,
@@ -499,7 +499,7 @@ mod skew_totality_tests {
             levels: 1,
             tick_size: 1,
         };
-        let inputs = FlpQuoterInputs {
+        let inputs = LpQuoterInputs {
             oracle_ticks: Ticks(100_000),
             vpin_bps: 0,
             realized_vol_bps: 0,

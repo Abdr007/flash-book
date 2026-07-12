@@ -1,6 +1,6 @@
 //! Unit tests for the pure matcher core.
 
-use super::flp_quoter::{generate_quotes, FlpQuoterInputs, FlpQuoterParams};
+use super::lp_quoter::{generate_quotes, LpQuoterInputs, LpQuoterParams};
 use super::insurance::InsuranceFund;
 use super::liquidation::{compute_shortfall, detect_liquidations, generate_liquidation_orders};
 use super::lot::{BaseLots, Ticks};
@@ -9,8 +9,8 @@ use super::risk::{assess_margin, default_scenarios, MarketSnapshot, PositionSnap
 use anchor_lang::prelude::Pubkey;
 
 #[test]
-fn flp_quoter_emits_balanced_ladder_when_flat() {
-    let params = FlpQuoterParams {
+fn lp_quoter_emits_balanced_ladder_when_flat() {
+    let params = LpQuoterParams {
         base_spread_bps: 5,
         alpha_bps: 5_000,
         beta_bps: 3_000,
@@ -23,7 +23,7 @@ fn flp_quoter_emits_balanced_ladder_when_flat() {
         levels: 5,
         tick_size: 1,
     };
-    let inputs = FlpQuoterInputs {
+    let inputs = LpQuoterInputs {
         oracle_ticks: Ticks(100_000), // arbitrary tick units
         vpin_bps: 0,
         realized_vol_bps: 0,
@@ -45,8 +45,8 @@ fn flp_quoter_emits_balanced_ladder_when_flat() {
 }
 
 #[test]
-fn flp_quoter_inventory_skew_short_pool_lifts_fair_value() {
-    let params = FlpQuoterParams {
+fn lp_quoter_inventory_skew_short_pool_lifts_fair_value() {
+    let params = LpQuoterParams {
         base_spread_bps: 5,
         alpha_bps: 5_000,
         beta_bps: 3_000,
@@ -59,7 +59,7 @@ fn flp_quoter_inventory_skew_short_pool_lifts_fair_value() {
         levels: 5,
         tick_size: 1,
     };
-    let inputs = FlpQuoterInputs {
+    let inputs = LpQuoterInputs {
         oracle_ticks: Ticks(100_000),
         vpin_bps: 0,
         realized_vol_bps: 0,

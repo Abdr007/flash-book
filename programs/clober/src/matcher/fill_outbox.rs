@@ -2,7 +2,7 @@
 //! program-log ceiling). See `docs/SETTLEMENT.md` for the full rationale.
 //!
 //! ## Why this exists
-//! `place_taker_order_v2` ships each crossed fill's economic data to the off-chain
+//! `place_taker_order` ships each crossed fill's economic data to the off-chain
 //! sequencer via the `FillBatchEvent` log. Solana caps *all* program-log output at
 //! `LOG_MESSAGES_BYTES_LIMIT = 10_000` bytes/tx and base64-inflates `sol_log_data`,
 //! so one event overflows ~125 fills and silently truncates the tail — and a
@@ -50,7 +50,7 @@
 //! | slot off | len | field |
 //! |---------:|----:|-------|
 //! |        0 |  32 | `taker` |
-//! |       32 |  32 | `maker` (`Pubkey::default()` ⇒ FLP virtual-quote fill) |
+//! |       32 |  32 | `maker` (`Pubkey::default()` ⇒ LP virtual-quote fill) |
 //! |       64 |   8 | `size_lots` |
 //! |       72 |   8 | `price_ticks` |
 //! |       80 |   8 | `maker_id` (resting order id — sequencer bookkeeping) |
@@ -433,9 +433,9 @@ mod tests {
     }
 
     #[test]
-    fn flp_fill_marker_roundtrips() {
+    fn lp_fill_marker_roundtrips() {
         let mut d = fresh(CAP);
-        let zero = [0u8; 32]; // Pubkey::default() ⇒ FLP virtual-quote fill
+        let zero = [0u8; 32]; // Pubkey::default() ⇒ LP virtual-quote fill
         outbox_write_slot(&mut d, CAP, 0, &[1u8; 32], &zero, 1, 1, 0, 0, 0, 0, 0).unwrap();
         assert_eq!(outbox_read_slot(&d, CAP, 0).unwrap().maker, zero);
     }

@@ -18,7 +18,7 @@
 //! AUTHORITY NOTE: `detect_liquidations` / `generate_liquidation_orders` /
 //! `compute_shortfall` are a pure REFERENCE/SPEC model of the batch flow,
 //! exercised by the model tests in `matcher/tests.rs`. They are NOT the live
-//! path — on-chain liquidation is `liquidate_position_v2` / `liquidate_portfolio_v2`
+//! path — on-chain liquidation is `liquidate_position` / `liquidate_portfolio`
 //! / `auto_deleverage` in lib.rs (per-instruction, keeper-driven). Keep the model
 //! and the live handlers in agreement when either changes.
 
@@ -211,7 +211,7 @@ pub fn compute_shortfall(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Dual-source health price (P-LIQ-1). The WORSE of mark and oracle for the
-// position's direction — the pure core of `liquidate_position_v2`'s health gate.
+// position's direction — the pure core of `liquidate_position`'s health gate.
 // LONG: lower is worse → min(mark, oracle); SHORT: higher is worse → max(mark,
 // oracle). A LONG ignores an UNSET oracle (`oracle == 0`) — otherwise it would
 // read as price 0 (max loss) and wrongfully liquidate. Returns (price, source)

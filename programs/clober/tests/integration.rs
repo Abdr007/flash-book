@@ -12,7 +12,7 @@
 
 use anchor_lang::{prelude::*, InstructionData};
 use clober::state::{
-    FeeAccrualAccount, FlpExposureAccount, InsuranceFundAccount, MarketAccount, MarketParams,
+    FeeAccrualAccount, LiquidityPoolAccount, InsuranceFundAccount, MarketAccount, MarketParams,
     TraderStateAccount,
 };
 use solana_program_test::{BanksClient, ProgramTest};
@@ -151,16 +151,16 @@ fn default_params() -> MarketParams {
         funding_rate_k_bps: 100_000,
         oracle_band_bps: 100,
 
-        flp_spread_base_bps: 5,
-        flp_spread_alpha_bps: 5_000,
-        flp_spread_beta_bps: 3_000,
-        flp_spread_gamma_bps: 2_000,
-        flp_spread_kappa_bps: 500,
-        flp_spread_delta_bps: 20_000,
-        flp_inventory_lambda_bps: 5_000,
-        flp_depth_floor_lots: 1_000,
-        flp_max_growth_per_batch_bps: 50,
-        flp_quote_levels: 5,
+        lp_spread_base_bps: 5,
+        lp_spread_alpha_bps: 5_000,
+        lp_spread_beta_bps: 3_000,
+        lp_spread_gamma_bps: 2_000,
+        lp_spread_kappa_bps: 500,
+        lp_spread_delta_bps: 20_000,
+        lp_inventory_lambda_bps: 5_000,
+        lp_depth_floor_lots: 1_000,
+        lp_max_growth_per_batch_bps: 50,
+        lp_quote_levels: 5,
 
         vpin_bucket_size_lots: 100,
         vpin_ema_window: 50,
@@ -210,7 +210,7 @@ fn default_params() -> MarketParams {
 #[derive(Clone, Copy)]
 struct Protocol {
     insurance_fund: Pubkey,
-    flp_exposure: Pubkey,
+    lp_exposure: Pubkey,
     quote_mint: Pubkey,
     quote_vault: Pubkey,
 }
@@ -369,13 +369,13 @@ async fn mint_tokens(
         .unwrap();
 }
 
-/// Set up insurance fund + FLP exposure + protocol-wide quote mint and vault.
+/// Set up insurance fund + LP exposure + protocol-wide quote mint and vault.
 async fn setup_protocol(
     ctx: &mut solana_program_test::ProgramTestContext,
     payer: &Keypair,
 ) -> Protocol {
     let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
-    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
 
     let quote_mint = create_mint(ctx, payer).await;
     let quote_vault_kp = Keypair::new();
@@ -401,16 +401,16 @@ async fn setup_protocol(
         clober::state::LpPositionAccount::SEED,
         payer.pubkey().as_ref(),
     ]);
-    // FLP init mints no endowment: initial_capital must be 0 and the pool
-    // is seeded via deposit_flp_capital. The singleton init is admin-gated
+    // LP init mints no endowment: initial_capital must be 0 and the pool
+    // is seeded via lp_deposit. The singleton init is admin-gated
     // on `insurance_fund`.
     let ix2 = build_ix(
-        clober::instruction::InitializeFlpExposure {
+        clober::instruction::InitializeLiquidityPool {
             initial_capital_quote_lots: 0,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new(lp_exposure, false),
             AccountMeta::new(authority_lp_position, false),
             AccountMeta::new_readonly(insurance_fund, false),
             AccountMeta::new_readonly(system_program::ID, false),
@@ -430,22 +430,22 @@ async fn setup_protocol(
 
     Protocol {
         insurance_fund,
-        flp_exposure,
+        lp_exposure,
         quote_mint,
         quote_vault: quote_vault_kp.pubkey(),
     }
 }
 
-/// Backward-compat shim — many existing tests destructure `(insurance, flp)`.
+/// Backward-compat shim — many existing tests destructure `(insurance, lp)`.
 async fn setup_protocol_pair(
     ctx: &mut solana_program_test::ProgramTestContext,
     payer: &Keypair,
 ) -> (Pubkey, Pubkey) {
     let p = setup_protocol(ctx, payer).await;
-    (p.insurance_fund, p.flp_exposure)
+    (p.insurance_fund, p.lp_exposure)
 }
 
-/// Set up insurance fund + flp exposure + market.
+/// Set up insurance fund + lp exposure + market.
 /// Returns (market PDA, order_buffer PDA, base_mint, quote_mint).
 async fn setup_market(
     ctx: &mut solana_program_test::ProgramTestContext,
@@ -453,7 +453,7 @@ async fn setup_market(
 ) -> (Protocol, Pubkey, Pubkey, Pubkey, Pubkey) {
     let protocol = setup_protocol(ctx, payer).await;
     let insurance_fund = protocol.insurance_fund;
-    let flp_exposure = protocol.flp_exposure;
+    let lp_exposure = protocol.lp_exposure;
 
     let base_mint = Keypair::new().pubkey();
     let quote_mint = Keypair::new().pubkey();
@@ -463,7 +463,7 @@ async fn setup_market(
 
     let (market, _) = pda(&[MarketAccount::SEED, base_mint.as_ref(), quote_mint.as_ref()]);
     // (v1 order_buffer PDA — not derived; markets use the v2 hypertree
-    // PDA via state_v2::MARKET_BOOK_SEED.)
+    // PDA via book_state::MARKET_BOOK_SEED.)
     let order_buffer = Pubkey::default();
 
     let ix = build_ix(
@@ -480,7 +480,7 @@ async fn setup_market(
             AccountMeta::new_readonly(oracle_account, false),
             AccountMeta::new(market, false),
             AccountMeta::new_readonly(insurance_fund, false),
-            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(lp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -593,7 +593,7 @@ async fn setup_additional_market(
     initial_oracle_ticks: u64,
 ) -> (Pubkey, Pubkey, Pubkey, Pubkey) {
     let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
-    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
 
     let base_mint = Keypair::new().pubkey();
     let quote_mint = Keypair::new().pubkey();
@@ -603,7 +603,7 @@ async fn setup_additional_market(
 
     let (market, _) = pda(&[MarketAccount::SEED, base_mint.as_ref(), quote_mint.as_ref()]);
     // (v1 order_buffer PDA — not derived; markets use the v2 hypertree
-    // PDA via state_v2::MARKET_BOOK_SEED.)
+    // PDA via book_state::MARKET_BOOK_SEED.)
     let order_buffer = Pubkey::default();
 
     let ix = build_ix(
@@ -620,7 +620,7 @@ async fn setup_additional_market(
             AccountMeta::new_readonly(oracle_account, false),
             AccountMeta::new(market, false),
             AccountMeta::new_readonly(insurance_fund, false),
-            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(lp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -734,7 +734,7 @@ async fn setup_envelope(
     market_pda: Pubkey,
 ) -> Pubkey {
     let (envelope_config, _) = pda(&[
-        clober::state_v3::MarketEnvelopeConfigAccount::SEED,
+        clober::extended_state::MarketEnvelopeConfigAccount::SEED,
         market_pda.as_ref(),
     ]);
     let ix = build_ix(
@@ -1059,24 +1059,24 @@ async fn withdraw_insurance_fund_rejects_non_authority() {
 }
 
 #[tokio::test]
-async fn initialize_flp_exposure_writes_state_and_empty_slots() {
+async fn initialize_lp_exposure_writes_state_and_empty_slots() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    // FLP init is admin-gated and mints NO unbacked
+    // LP init is admin-gated and mints NO unbacked
     // endowment — total_capital starts at 0. setup_protocol performs the gated,
-    // zero-capital init; capital is added later via deposit_flp_capital.
+    // zero-capital init; capital is added later via lp_deposit.
     let _protocol = setup_protocol(&mut ctx, &payer).await;
 
-    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
-    let flp: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
-    assert_eq!(flp.total_capital_quote_lots, 0);
-    assert_eq!(flp.lp_shares_outstanding, 0);
-    assert_eq!(flp.realized_pnl, 0);
-    assert_eq!(flp.markets_count, 0);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
+    let lp: LiquidityPoolAccount = fetch(&mut ctx.banks_client, lp_exposure).await;
+    assert_eq!(lp.total_capital_quote_lots, 0);
+    assert_eq!(lp.lp_shares_outstanding, 0);
+    assert_eq!(lp.realized_pnl, 0);
+    assert_eq!(lp.markets_count, 0);
     // All slots should be empty (side = 255).
-    for slot in flp.per_market.iter() {
+    for slot in lp.per_market.iter() {
         assert_eq!(slot.side, 255);
     }
 }
@@ -1622,7 +1622,7 @@ async fn initialize_market_writes_state() {
     // Status defaults to Active (1).
     assert_eq!(market.status, 1);
     assert_eq!(market.params.tick_size, 1);
-    assert_eq!(market.params.flp_quote_levels, 5);
+    assert_eq!(market.params.lp_quote_levels, 5);
     // no v1 order_buffer; v2 markets use the hypertree-backed
     // market_book PDA initialized separately via init_market_book.
 }
@@ -1731,7 +1731,7 @@ async fn crank_funding_uses_robust_median_mark_from_the_book() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // oracle == mark == 100_000
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     // Init the v2 book.
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -1759,7 +1759,7 @@ async fn crank_funding_uses_robust_median_mark_from_the_book() {
     let maker_state = setup_trader(&mut ctx, &payer, &maker, 1_000_000, &protocol).await;
     let place = |side: u8, price: u64| {
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side,
                 size_lots: 1,
                 limit_ticks: price,
@@ -1952,12 +1952,12 @@ async fn crank_funding_twap_damps_a_momentary_premium_spike() {
 // account reads happen during replay — then asserts it matches the on-chain
 // accounts. This is the observability / data-availability guarantee: the events
 // are sufficient to rebuild collateral and the funding index from their deltas.
-// Positions, OI, FLP NAV, insurance, and the book follow the same pattern on
-// their own events (FillApplied, OrderPlaced/Cancelled, FlpFillApplied, …).
+// Positions, OI, LP NAV, insurance, and the book follow the same pattern on
+// their own events (FillApplied, OrderPlaced/Cancelled, LpFillApplied, …).
 
 // Byte-faithful decode of the resting orders in an on-chain market_book slab:
 // walk both RB-trees from their header roots via the RBNode left/right pointers
-// and read each RestingOrderV2 payload. Layout: 8-byte disc + 256-byte header,
+// and read each RestingOrder payload. Layout: 8-byte disc + 256-byte header,
 // then 96-byte nodes (16-byte RBNode header {left,right,parent,color,...} + the
 // 80-byte payload). Header roots: bids_root_index @112, asks_root_index @120.
 // RBNode links AND the header roots are stored as BYTE OFFSETS into the slab
@@ -2035,9 +2035,9 @@ struct Reconciled {
     book: std::collections::HashMap<u64, (u64, u64, u8)>,
     // Insurance-fund balance delta, summed from the per-fill contribution.
     insurance: i128,
-    // FLP per-market inventory keyed by market → (size_lots, side), taken from
-    // the absolute flp_size_after / flp_side_after the FLP fill carries.
-    flp: std::collections::HashMap<Pubkey, (u64, u8)>,
+    // LP per-market inventory keyed by market → (size_lots, side), taken from
+    // the absolute lp_size_after / lp_side_after the LP fill carries.
+    lp: std::collections::HashMap<Pubkey, (u64, u8)>,
     // Per-position haircut reserve keyed by position → reserve_after (absolute).
     haircut_reserve: std::collections::HashMap<Pubkey, u64>,
 }
@@ -2065,7 +2065,7 @@ impl Reconciled {
         use clober::matcher::position_math as pm;
         use clober::{
             CollateralDepositedEvent, CollateralWithdrawnEvent, FillAppliedEvent,
-            FlpFillAppliedEvent, FundingCrankedEvent, FundingSettledEvent,
+            LpFillAppliedEvent, FundingCrankedEvent, FundingSettledEvent,
             GainReleasedToHaircutEvent, OrderCancelledV2Event, OrderPlacedV2Event,
         };
         for line in logs {
@@ -2142,10 +2142,10 @@ impl Reconciled {
                 if let Ok(e) = OrderCancelledV2Event::try_from_slice(body) {
                     self.book.remove(&e.order_seq);
                 }
-            } else if disc == <FlpFillAppliedEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
-                if let Ok(e) = FlpFillAppliedEvent::try_from_slice(body) {
-                    self.flp
-                        .insert(e.market, (e.flp_size_after, e.flp_side_after));
+            } else if disc == <LpFillAppliedEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
+                if let Ok(e) = LpFillAppliedEvent::try_from_slice(body) {
+                    self.lp
+                        .insert(e.market, (e.lp_size_after, e.lp_side_after));
                 }
             } else if disc
                 == <GainReleasedToHaircutEvent as anchor_lang::Discriminator>::DISCRIMINATOR
@@ -2414,7 +2414,7 @@ async fn d19_reconciler_rebuilds_book_from_orders() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     // Init the v2 hypertree book.
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -2444,7 +2444,7 @@ async fn d19_reconciler_rebuilds_book_from_orders() {
     // two bids and one ask, none crossing (no opposing liquidity).
     let place = |side: u8, price: u64| {
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side,
                 size_lots: 1,
                 limit_ticks: price,
@@ -2474,11 +2474,11 @@ async fn d19_reconciler_rebuilds_book_from_orders() {
         .find(|(_, v)| v.0 == 95_000)
         .expect("95k order reconstructed")
         .0;
-    let order_id = clober::state_v2::encode_order_id(95_000, seq_95, true);
+    let order_id = clober::book_state::encode_order_id(95_000, seq_95, true);
     let logs = send_capture(
         &mut ctx,
         build_ix(
-            clober::instruction::CancelOrderV2 { side: 0, order_id },
+            clober::instruction::CancelOrder { side: 0, order_id },
             vec![
                 AccountMeta::new(maker.pubkey(), true),
                 AccountMeta::new(market_pda, false),
@@ -2515,13 +2515,13 @@ async fn d19_reconciler_rebuilds_book_from_orders() {
 }
 
 #[tokio::test]
-async fn d19_reconciler_rebuilds_flp_inventory_from_a_flp_fill() {
+async fn d19_reconciler_rebuilds_lp_inventory_from_a_lp_fill() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     disarm_fill_commitment(&mut ctx, market_pda).await;
-    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
 
     let trader = Keypair::new();
@@ -2531,13 +2531,13 @@ async fn d19_reconciler_rebuilds_flp_inventory_from_a_flp_fill() {
         market_pda.as_ref(),
         trader_state.as_ref(),
     ]);
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     let mut recon = Reconciled::default();
-    // FLP is the maker: trader buys 1 lot @ 100_000 from the FLP, which takes the
-    // opposite (short) side. FlpFillApplied carries the absolute FLP inventory.
+    // LP is the maker: trader buys 1 lot @ 100_000 from the LP, which takes the
+    // opposite (short) side. LpFillApplied carries the absolute LP inventory.
     let ix = build_ix(
-        clober::instruction::ApplyFlpFill {
+        clober::instruction::ApplyLpFill {
             size_lots: 1,
             price_ticks: 100_000,
             taker_side: 0,
@@ -2551,7 +2551,7 @@ async fn d19_reconciler_rebuilds_flp_inventory_from_a_flp_fill() {
             AccountMeta::new(insurance_fund_pda, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
-            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new(lp_exposure, false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
@@ -2561,21 +2561,21 @@ async fn d19_reconciler_rebuilds_flp_inventory_from_a_flp_fill() {
     let logs = send_capture(&mut ctx, ix, &payer.pubkey(), &[&payer]).await;
     recon.apply_logs(&logs);
 
-    // ── Reconstructed FLP inventory == on-chain per-market entry. ──
-    let flp: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
-    let entry = flp
+    // ── Reconstructed LP inventory == on-chain per-market entry. ──
+    let lp: LiquidityPoolAccount = fetch(&mut ctx.banks_client, lp_exposure).await;
+    let entry = lp
         .per_market
         .iter()
         .find(|e| e.side != 255 && e.market == to_anchor(market_pda))
-        .expect("FLP entry on this market");
+        .expect("LP entry on this market");
     let (size, side) = *recon
-        .flp
+        .lp
         .get(&market_pda)
-        .expect("FLP inventory reconstructed");
+        .expect("LP inventory reconstructed");
     assert_eq!(
         (size, side),
         (entry.size_lots, entry.side),
-        "event-reconstructed FLP inventory == on-chain"
+        "event-reconstructed LP inventory == on-chain"
     );
 }
 
@@ -2604,11 +2604,11 @@ async fn d19_reconciler_rebuilds_haircut_reserve_from_release() {
     )
     .await;
     let (haircut_state, _) = pda(&[
-        clober::state_v3::MarketHaircutStateAccount::SEED,
+        clober::extended_state::MarketHaircutStateAccount::SEED,
         market_pda.as_ref(),
     ]);
     let (pos_hc, _) = pda(&[
-        clober::state_v3::PositionHaircutStateAccount::SEED,
+        clober::extended_state::PositionHaircutStateAccount::SEED,
         market_pda.as_ref(),
         pos.as_ref(),
     ]);
@@ -2677,7 +2677,7 @@ async fn d19_reconciler_rebuilds_haircut_reserve_from_release() {
     recon.apply_logs(&logs);
 
     // ── Reconstructed haircut reserve == on-chain PositionHaircutState. ──
-    let oc: clober::state_v3::PositionHaircutStateAccount =
+    let oc: clober::extended_state::PositionHaircutStateAccount =
         fetch(&mut ctx.banks_client, pos_hc).await;
     assert_eq!(
         *recon
@@ -3169,7 +3169,7 @@ async fn update_market_params_k3_heal_rejects_piggybacked_change() {
 }
 
 #[tokio::test]
-async fn deposit_flp_capital_grows_pool() {
+async fn deposit_lp_capital_grows_pool() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -3177,9 +3177,9 @@ async fn deposit_flp_capital_grows_pool() {
     let protocol = setup_protocol(&mut ctx, &payer).await;
     // Seed 5M via the real backed deposit path. The pool starts at 5M
     // capital / 5M shares, vault-backed.
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
-    let initial: FlpExposureAccount = fetch(&mut ctx.banks_client, protocol.flp_exposure).await;
+    let initial: LiquidityPoolAccount = fetch(&mut ctx.banks_client, protocol.lp_exposure).await;
     assert_eq!(initial.total_capital_quote_lots, 5_000_000);
     assert_eq!(initial.lp_shares_outstanding, 5_000_000);
 
@@ -3192,14 +3192,14 @@ async fn deposit_flp_capital_grows_pool() {
     ]);
 
     let ix = build_ix(
-        clober::instruction::DepositFlpCapital {
+        clober::instruction::LpDeposit {
             amount_quote_lots: 1_000_000,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(protocol.lp_exposure, false),
             AccountMeta::new(lp_position, false),
-            AccountMeta::new(pda(&[clober::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new(pda(&[clober::state::LpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
@@ -3219,7 +3219,7 @@ async fn deposit_flp_capital_grows_pool() {
         .await
         .unwrap();
 
-    let after: FlpExposureAccount = fetch(&mut ctx.banks_client, protocol.flp_exposure).await;
+    let after: LiquidityPoolAccount = fetch(&mut ctx.banks_client, protocol.lp_exposure).await;
     assert_eq!(after.total_capital_quote_lots, 6_000_000);
     // 1M deposited at NAV/share = 1.0 → 1M new shares minted.
     assert_eq!(after.lp_shares_outstanding, 6_000_000);
@@ -3244,32 +3244,32 @@ async fn deposit_flp_capital_grows_pool() {
     assert_eq!(vs.amount, 6_000_000);
 }
 
-/// The singleton and per-market v3 FLP pools redeem from one vault, so LP shares
+/// The singleton and per-market v3 LP pools redeem from one vault, so LP shares
 /// in both would double-count the same PnL. Once the singleton mints shares it
-/// claims the protocol-wide `FlpModeAccount`; a v3 deposit then fails closed
-/// with FlpSystemModeConflict.
+/// claims the protocol-wide `LpModeAccount`; a v3 deposit then fails closed
+/// with LpSystemModeConflict.
 #[tokio::test]
-async fn flp_mode_lock_forbids_v3_after_singleton() {
+async fn lp_mode_lock_forbids_v3_after_singleton() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     // Singleton mints shares → claims MODE_SINGLETON.
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     let result = try_v3_deposit(&mut ctx, &payer, &protocol, market_pda).await;
     let dbg = format!("{result:?}");
     assert!(
         dbg.contains("Custom(8321)"),
-        "v3 deposit after singleton must be rejected with FlpSystemModeConflict, got: {dbg}"
+        "v3 deposit after singleton must be rejected with LpSystemModeConflict, got: {dbg}"
     );
 }
 
 /// Reverse direction: once a v3 pool mints shares it claims the mode, and a
-/// singleton `deposit_flp_capital` then fails closed.
+/// singleton `lp_deposit` then fails closed.
 #[tokio::test]
-async fn flp_mode_lock_forbids_singleton_after_v3() {
+async fn lp_mode_lock_forbids_singleton_after() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -3287,14 +3287,14 @@ async fn flp_mode_lock_forbids_singleton_after_v3() {
         payer.pubkey().as_ref(),
     ]);
     let ix = build_ix(
-        clober::instruction::DepositFlpCapital {
+        clober::instruction::LpDeposit {
             amount_quote_lots: 1_000_000,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(protocol.lp_exposure, false),
             AccountMeta::new(lp_position, false),
-            AccountMeta::new(pda(&[clober::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new(pda(&[clober::state::LpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
@@ -3316,7 +3316,7 @@ async fn flp_mode_lock_forbids_singleton_after_v3() {
     let dbg = format!("{result:?}");
     assert!(
         dbg.contains("Custom(8321)"),
-        "singleton deposit after v3 must be rejected with FlpSystemModeConflict, got: {dbg}"
+        "singleton deposit after v3 must be rejected with LpSystemModeConflict, got: {dbg}"
     );
 }
 
@@ -3329,11 +3329,11 @@ async fn try_v3_deposit(
     market_pda: Pubkey,
 ) -> std::result::Result<(), solana_program_test::BanksClientError> {
     let (exposure, _) = pda(&[
-        clober::state_v3::FlpExposurePerMarketAccountV3::SEED,
+        clober::extended_state::LpMarketExposureAccount::SEED,
         market_pda.as_ref(),
     ]);
     let init_ix = build_ix(
-        clober::instruction::InitFlpPerMarketV3 {},
+        clober::instruction::InitLpPerMarket {},
         vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
@@ -3371,12 +3371,12 @@ async fn try_v3_deposit(
     let lp_ata = create_ata(ctx, payer, lp.pubkey(), protocol.quote_mint).await;
     mint_tokens(ctx, payer, protocol.quote_mint, lp_ata, 10_000_000).await;
     let (position, _) = pda(&[
-        clober::state_v3::FlpPositionAccountV3::SEED,
+        clober::extended_state::LpMarketPositionAccount::SEED,
         exposure.as_ref(),
         lp.pubkey().as_ref(),
     ]);
     let dep_ix = build_ix(
-        clober::instruction::FlpDepositV3 {
+        clober::instruction::LpMarketDeposit {
             amount_quote_lots: 1_000_000,
         },
         vec![
@@ -3384,7 +3384,7 @@ async fn try_v3_deposit(
             AccountMeta::new(exposure, false),
             AccountMeta::new_readonly(market_pda, false),
             AccountMeta::new(position, false),
-            AccountMeta::new(pda(&[clober::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new(pda(&[clober::state::LpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
@@ -3405,7 +3405,7 @@ async fn try_v3_deposit(
 }
 
 #[tokio::test]
-async fn withdraw_flp_capital_blocked_with_open_positions() {
+async fn withdraw_lp_capital_blocked_with_open_positions() {
     // Set markets_count > 0 isn't possible without actual fills, so we
     // test the inverse: withdraw on an empty pool should succeed.
     let pt = make_program_test();
@@ -3414,7 +3414,7 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
 
     let protocol = setup_protocol(&mut ctx, &payer).await;
     // Seed the 5M treasury capital via the backed path.
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     // Pre-fund the vault: deposit 1M USDC. Authority owns the LP position
     // PDA (treasury endowment lives there); after this deposit they hold
@@ -3426,14 +3426,14 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
         payer.pubkey().as_ref(),
     ]);
     let dep_ix = build_ix(
-        clober::instruction::DepositFlpCapital {
+        clober::instruction::LpDeposit {
             amount_quote_lots: 1_000_000,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(protocol.lp_exposure, false),
             AccountMeta::new(lp_position, false),
-            AccountMeta::new(pda(&[clober::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new(pda(&[clober::state::LpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
@@ -3453,18 +3453,18 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
         .await
         .unwrap();
 
-    // H8: the FLP minimum hold (FLP_MIN_HOLD_SLOTS) now gates withdrawals.
+    // H8: the LP minimum hold (LP_MIN_HOLD_SLOTS) now gates withdrawals.
     // Advance past it so the legitimate withdraw succeeds.
     ctx.warp_to_slot(1_000).unwrap();
 
     // Burn 1M shares to withdraw 1M USDC (NAV/share = 1.0 since no fills).
     let withdraw_ix = build_ix(
-        clober::instruction::WithdrawFlpCapital {
+        clober::instruction::LpWithdraw {
             shares_to_burn: 1_000_000,
         },
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
-            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(protocol.lp_exposure, false),
             AccountMeta::new(lp_position, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
@@ -3484,7 +3484,7 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
         .await
         .unwrap();
 
-    let after: FlpExposureAccount = fetch(&mut ctx.banks_client, protocol.flp_exposure).await;
+    let after: LiquidityPoolAccount = fetch(&mut ctx.banks_client, protocol.lp_exposure).await;
     // Deposited 1M (5M -> 6M), then withdrew 1M back to LP -> back to 5M.
     assert_eq!(after.total_capital_quote_lots, 5_000_000);
     assert_eq!(after.lp_shares_outstanding, 5_000_000);
@@ -3498,7 +3498,7 @@ async fn withdraw_flp_capital_blocked_with_open_positions() {
     assert_eq!(lp_state.amount, 1_000_000);
 }
 
-/// Helper: build a DepositFlpCapital tx for an arbitrary LP (any signer).
+/// Helper: build a LpDeposit tx for an arbitrary LP (any signer).
 async fn lp_deposit(
     ctx: &mut solana_program_test::ProgramTestContext,
     payer: &Keypair,
@@ -3529,14 +3529,14 @@ async fn lp_deposit(
         lp.pubkey().as_ref(),
     ]);
     let ix = build_ix(
-        clober::instruction::DepositFlpCapital {
+        clober::instruction::LpDeposit {
             amount_quote_lots: amount,
         },
         vec![
             AccountMeta::new(lp.pubkey(), true),
-            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(protocol.lp_exposure, false),
             AccountMeta::new(lp_position, false),
-            AccountMeta::new(pda(&[clober::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new(pda(&[clober::state::LpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
@@ -3559,9 +3559,9 @@ async fn lp_deposit(
 
 /// Seeds treasury capital through the real backed deposit path (payer =
 /// treasury): the pool starts at 5M capital / 5M shares held in the payer's
-/// LP position, fully vault-backed — `initialize_flp_exposure` itself mints
+/// LP position, fully vault-backed — `initialize_liquidity_pool` itself mints
 /// nothing.
-async fn seed_flp_capital(
+async fn seed_lp_capital(
     ctx: &mut solana_program_test::ProgramTestContext,
     payer: &Keypair,
     protocol: &Protocol,
@@ -3578,7 +3578,7 @@ async fn lp_units_two_lps_split_shares_pro_rata_with_no_pnl() {
     let payer = ctx.payer.insecure_clone();
     let protocol = setup_protocol(&mut ctx, &payer).await;
     // Seed 5M treasury capital via the backed path (payer).
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -3588,12 +3588,12 @@ async fn lp_units_two_lps_split_shares_pro_rata_with_no_pnl() {
     // Bob deposits 2M at NAV/share = 1.0 → 2M shares.
     lp_deposit(&mut ctx, &payer, &bob, &protocol, 2_000_000).await;
 
-    let flp: FlpExposureAccount = fetch(&mut ctx.banks_client, protocol.flp_exposure).await;
+    let lp: LiquidityPoolAccount = fetch(&mut ctx.banks_client, protocol.lp_exposure).await;
     assert_eq!(
-        flp.total_capital_quote_lots,
+        lp.total_capital_quote_lots,
         5_000_000 + 1_000_000 + 2_000_000
     );
-    assert_eq!(flp.lp_shares_outstanding, 8_000_000);
+    assert_eq!(lp.lp_shares_outstanding, 8_000_000);
 
     let (alice_pos, _) = pda(&[
         clober::state::LpPositionAccount::SEED,
@@ -3616,7 +3616,7 @@ async fn lp_units_two_lps_split_shares_pro_rata_with_no_pnl() {
 #[tokio::test]
 async fn lp_units_late_depositor_pays_inflated_share_price_after_pnl() {
     // Simulates: Alice deposits at NAV/share = 1.0. Realized PnL accrues
-    // (someone profits from FLP fills, increasing total_capital). Bob then
+    // (someone profits from LP fills, increasing total_capital). Bob then
     // deposits at the new, higher NAV/share — receives proportionally fewer
     // shares for the same dollar, preventing retroactive PnL theft.
     let pt = make_program_test();
@@ -3624,21 +3624,21 @@ async fn lp_units_late_depositor_pays_inflated_share_price_after_pnl() {
     let payer = ctx.payer.insecure_clone();
     let protocol = setup_protocol(&mut ctx, &payer).await;
     // Seed 5M treasury capital via the backed path (payer).
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     let alice = Keypair::new();
     let bob = Keypair::new();
 
     // Alice deposits 1M at NAV/share = 1.0.
     lp_deposit(&mut ctx, &payer, &alice, &protocol, 1_000_000).await;
-    let flp_before: FlpExposureAccount = fetch(&mut ctx.banks_client, protocol.flp_exposure).await;
-    assert_eq!(flp_before.lp_shares_outstanding, 6_000_000);
-    assert_eq!(flp_before.total_capital_quote_lots, 6_000_000);
+    let lp_before: LiquidityPoolAccount = fetch(&mut ctx.banks_client, protocol.lp_exposure).await;
+    assert_eq!(lp_before.lp_shares_outstanding, 6_000_000);
+    assert_eq!(lp_before.total_capital_quote_lots, 6_000_000);
 
-    // Simulate FLP profit: directly inflate total_capital by 600k. NAV
+    // Simulate LP profit: directly inflate total_capital by 600k. NAV
     // becomes 6.6M against 6M shares → NAV/share = 1.10.
-    // (In production this happens via apply_flp_fill maker rebates and
-    // realized_pnl from closing FLP positions; we shortcut here with a
+    // (In production this happens via apply_lp_fill maker rebates and
+    // realized_pnl from closing LP positions; we shortcut here with a
     // direct mint to the vault + accounting bump for testability.)
     mint_tokens(
         &mut ctx,
@@ -3648,14 +3648,14 @@ async fn lp_units_late_depositor_pays_inflated_share_price_after_pnl() {
         600_000,
     )
     .await;
-    // We need to also bump total_capital on the FLP account to reflect
-    // the appreciation; without an apply_flp_fill in this scope we'll
+    // We need to also bump total_capital on the LP account to reflect
+    // the appreciation; without an apply_lp_fill in this scope we'll
     // rely on the math to be correct against current state. Skip the
     // accounting bump and instead test the deposit-math directly.
 
     // Bob deposits 1.10M against the original NAV of 6M and 6M shares.
     // shares_to_mint = 1_100_000 × 6_000_000 / 6_000_000 = 1_100_000.
-    // (Without a real apply_flp_fill we can't drive realized_pnl up on
+    // (Without a real apply_lp_fill we can't drive realized_pnl up on
     //  account; verifying 1:1 here proves the no-PnL branch.)
     lp_deposit(&mut ctx, &payer, &bob, &protocol, 1_100_000).await;
     let (bob_pos, _) = pda(&[
@@ -3677,7 +3677,7 @@ async fn lp_units_withdraw_burns_shares_and_distributes_nav() {
     let payer = ctx.payer.insecure_clone();
     let protocol = setup_protocol(&mut ctx, &payer).await;
     // Seed 5M treasury capital via the backed path (payer).
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     let alice = Keypair::new();
     lp_deposit(&mut ctx, &payer, &alice, &protocol, 2_000_000).await;
@@ -3689,17 +3689,17 @@ async fn lp_units_withdraw_burns_shares_and_distributes_nav() {
         alice.pubkey().as_ref(),
     ]);
 
-    // H8: advance past the FLP minimum hold before withdrawing.
+    // H8: advance past the LP minimum hold before withdrawing.
     ctx.warp_to_slot(1_000).unwrap();
 
     // Alice burns 1M shares. NAV/share = 7M/7M = 1.0 → returns 1M USDC.
     let withdraw_ix = build_ix(
-        clober::instruction::WithdrawFlpCapital {
+        clober::instruction::LpWithdraw {
             shares_to_burn: 1_000_000,
         },
         vec![
             AccountMeta::new_readonly(alice.pubkey(), true),
-            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(protocol.lp_exposure, false),
             AccountMeta::new(alice_pos, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
@@ -3719,9 +3719,9 @@ async fn lp_units_withdraw_burns_shares_and_distributes_nav() {
         .await
         .unwrap();
 
-    let flp: FlpExposureAccount = fetch(&mut ctx.banks_client, protocol.flp_exposure).await;
-    assert_eq!(flp.total_capital_quote_lots, 6_000_000);
-    assert_eq!(flp.lp_shares_outstanding, 6_000_000);
+    let lp: LiquidityPoolAccount = fetch(&mut ctx.banks_client, protocol.lp_exposure).await;
+    assert_eq!(lp.total_capital_quote_lots, 6_000_000);
+    assert_eq!(lp.lp_shares_outstanding, 6_000_000);
     let alice_state: clober::state::LpPositionAccount =
         fetch(&mut ctx.banks_client, alice_pos).await;
     assert_eq!(alice_state.shares, 1_000_000);
@@ -3742,8 +3742,8 @@ async fn lp_units_withdraw_burns_shares_and_distributes_nav() {
 }
 
 #[tokio::test]
-async fn flp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure() {
-    // Inject an FLP position into per_market with 10_000 lots at mark 1_000
+async fn lp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure() {
+    // Inject an LP position into per_market with 10_000 lots at mark 1_000
     // tick_size=1 → gross_exposure = 10_000_000 quote_lots.
     // Total capital is 5_000_000; an LP burns ALL their shares would leave
     // capital ~0, far below exposure. Withdraw must reject.
@@ -3755,36 +3755,36 @@ async fn flp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure()
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     // Seed 5M treasury capital via the backed path so the
     // payer holds 5M shares (as the old endowment did), now vault-backed.
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
-    // Inject one FLP exposure entry into per_market.
-    let flp_acc = ctx
+    // Inject one LP exposure entry into per_market.
+    let lp_acc = ctx
         .banks_client
-        .get_account(protocol.flp_exposure)
+        .get_account(protocol.lp_exposure)
         .await
         .unwrap()
         .unwrap();
-    let mut flp_state =
-        clober::state::FlpExposureAccount::try_deserialize(&mut flp_acc.data.as_slice())
+    let mut lp_state =
+        clober::state::LiquidityPoolAccount::try_deserialize(&mut lp_acc.data.as_slice())
             .unwrap();
-    flp_state.markets_count = 1;
-    flp_state.per_market[0] = clober::state::FlpMarketExposure {
+    lp_state.markets_count = 1;
+    lp_state.per_market[0] = clober::state::LpMarketExposure {
         market: to_anchor(market_pda),
         side: 0, // long
         size_lots: 10_000,
         entry_price_ticks: 1_000,
     };
     let mut nd = Vec::new();
-    flp_state.try_serialize(&mut nd).unwrap();
-    nd.resize(flp_acc.data.len(), 0);
+    lp_state.try_serialize(&mut nd).unwrap();
+    nd.resize(lp_acc.data.len(), 0);
     ctx.set_account(
-        &protocol.flp_exposure,
+        &protocol.lp_exposure,
         &SolAccount {
-            lamports: flp_acc.lamports,
+            lamports: lp_acc.lamports,
             data: nd,
-            owner: flp_acc.owner,
-            executable: flp_acc.executable,
-            rent_epoch: flp_acc.rent_epoch,
+            owner: lp_acc.owner,
+            executable: lp_acc.executable,
+            rent_epoch: lp_acc.rent_epoch,
         }
         .into(),
     );
@@ -3825,7 +3825,7 @@ async fn flp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure()
         program_id: program_id(),
         accounts: vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
-            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(protocol.lp_exposure, false),
             AccountMeta::new(auth_pos, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
@@ -3835,7 +3835,7 @@ async fn flp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure()
             // remaining_accounts: the active market.
             AccountMeta::new_readonly(market_pda, false),
         ],
-        data: clober::instruction::WithdrawFlpCapital {
+        data: clober::instruction::LpWithdraw {
             shares_to_burn: 5_000_000,
         }
         .data(),
@@ -3860,12 +3860,12 @@ async fn flp_withdraw_blocked_when_remaining_capital_insufficient_for_exposure()
 /// inventory LOSS (symmetric with deposit's mark-to-market pricing), so an LP
 /// cannot redeem at the higher realized-only NAV while the pool is underwater
 /// and thereby extract the standing LPs' unrealized drawdown. Inject a
-/// 10_000-quote-lot unrealized loss (FLP long 1 @ 100_000, oracle 90_000,
+/// 10_000-quote-lot unrealized loss (LP long 1 @ 100_000, oracle 90_000,
 /// tick 1) into a 5_000_000-capital / 5_000_000-share pool, then burn
 /// 1_000_000 shares: realized-only pricing would pay 1_000_000, but the
 /// mark-to-market haircut pays 1_000_000 · 4_990_000 / 5_000_000 = 998_000.
 #[tokio::test]
-async fn withdraw_flp_capital_charges_unrealized_loss() {
+async fn withdraw_lp_capital_charges_unrealized_loss() {
     use solana_sdk::account::Account as SolAccount;
 
     let pt = make_program_test();
@@ -3873,37 +3873,37 @@ async fn withdraw_flp_capital_charges_unrealized_loss() {
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     // Payer (treasury) holds 5_000_000 shares against 5_000_000 capital.
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
-    // Inject an underwater FLP long: 1 lot @ entry 100_000, priced at oracle
+    // Inject an underwater LP long: 1 lot @ entry 100_000, priced at oracle
     // 90_000 ⇒ unrealized loss of 10_000 quote lots.
-    let flp_acc = ctx
+    let lp_acc = ctx
         .banks_client
-        .get_account(protocol.flp_exposure)
+        .get_account(protocol.lp_exposure)
         .await
         .unwrap()
         .unwrap();
-    let mut flp_state =
-        clober::state::FlpExposureAccount::try_deserialize(&mut flp_acc.data.as_slice())
+    let mut lp_state =
+        clober::state::LiquidityPoolAccount::try_deserialize(&mut lp_acc.data.as_slice())
             .unwrap();
-    flp_state.markets_count = 1;
-    flp_state.per_market[0] = clober::state::FlpMarketExposure {
+    lp_state.markets_count = 1;
+    lp_state.per_market[0] = clober::state::LpMarketExposure {
         market: to_anchor(market_pda),
         side: 0, // long
         size_lots: 1,
         entry_price_ticks: 100_000,
     };
     let mut nd = Vec::new();
-    flp_state.try_serialize(&mut nd).unwrap();
-    nd.resize(flp_acc.data.len(), 0);
+    lp_state.try_serialize(&mut nd).unwrap();
+    nd.resize(lp_acc.data.len(), 0);
     ctx.set_account(
-        &protocol.flp_exposure,
+        &protocol.lp_exposure,
         &SolAccount {
-            lamports: flp_acc.lamports,
+            lamports: lp_acc.lamports,
             data: nd,
-            owner: flp_acc.owner,
-            executable: flp_acc.executable,
-            rent_epoch: flp_acc.rent_epoch,
+            owner: lp_acc.owner,
+            executable: lp_acc.executable,
+            rent_epoch: lp_acc.rent_epoch,
         }
         .into(),
     );
@@ -3938,7 +3938,7 @@ async fn withdraw_flp_capital_charges_unrealized_loss() {
         .into(),
     );
 
-    // Advance past the FLP minimum hold so the withdraw is not rate-limited.
+    // Advance past the LP minimum hold so the withdraw is not rate-limited.
     ctx.warp_to_slot(1_000).unwrap();
 
     let auth_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
@@ -3950,7 +3950,7 @@ async fn withdraw_flp_capital_charges_unrealized_loss() {
         program_id: program_id(),
         accounts: vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
-            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(protocol.lp_exposure, false),
             AccountMeta::new(auth_pos, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
@@ -3959,7 +3959,7 @@ async fn withdraw_flp_capital_charges_unrealized_loss() {
             AccountMeta::new_readonly(spl_token_id(), false),
             AccountMeta::new_readonly(market_pda, false),
         ],
-        data: clober::instruction::WithdrawFlpCapital {
+        data: clober::instruction::LpWithdraw {
             shares_to_burn: 1_000_000,
         }
         .data(),
@@ -4017,12 +4017,12 @@ async fn lp_units_withdraw_rejects_other_lps_shares() {
 
     // Bob signs but passes Alice's lp_position — must fail.
     let withdraw_ix = build_ix(
-        clober::instruction::WithdrawFlpCapital {
+        clober::instruction::LpWithdraw {
             shares_to_burn: 500_000,
         },
         vec![
             AccountMeta::new_readonly(bob.pubkey(), true),
-            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(protocol.lp_exposure, false),
             AccountMeta::new(alice_pos, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
@@ -4215,7 +4215,7 @@ async fn second_market_initializes_at_different_oracle_price() {
     assert_ne!(market1.quote_mint, market2.quote_mint);
     // Both should share the same authority + global PDAs.
     assert_eq!(market1.authority, market2.authority);
-    assert_eq!(market1.flp_pool, market2.flp_pool);
+    assert_eq!(market1.lp_pool, market2.lp_pool);
     assert_eq!(market1.insurance_fund, market2.insurance_fund);
 }
 
@@ -4332,9 +4332,9 @@ async fn verify_market_invariants_auto_halts_on_oi_drift() {
 }
 
 #[tokio::test]
-async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
-    // Settlement path where FLP is the maker. Apply_flp_fill mutates the
-    // taker's position + the FlpExposureAccount.per_market entry on the
+async fn apply_lp_fill_creates_taker_position_and_lp_entry() {
+    // Settlement path where LP is the maker. Apply_lp_fill mutates the
+    // taker's position + the LiquidityPoolAccount.per_market entry on the
     // opposite side.
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
@@ -4342,7 +4342,7 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
 
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     disarm_fill_commitment(&mut ctx, market_pda).await; // the legacy sequencer path is unarmed-only
-    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
 
     let trader = Keypair::new();
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
@@ -4353,14 +4353,14 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
         trader_state.as_ref(),
     ]);
 
-    // Seed 5M FLP capital via the backed path (FLP must be
+    // Seed 5M LP capital via the backed path (LP must be
     // capitalized to act as maker), replacing the old unbacked endowment.
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
-    // Apply a fill where trader buys 1 lot @ 100,000 from FLP.
-    let (insurance_fund_pda_for_flpfill, _) = pda(&[InsuranceFundAccount::SEED]);
+    // Apply a fill where trader buys 1 lot @ 100,000 from LP.
+    let (insurance_fund_pda_for_lpfill, _) = pda(&[InsuranceFundAccount::SEED]);
     let ix = build_ix(
-        clober::instruction::ApplyFlpFill {
+        clober::instruction::ApplyLpFill {
             size_lots: 1,
             price_ticks: 100_000,
             taker_side: 0,      // long
@@ -4371,15 +4371,15 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer
             AccountMeta::new(market_pda, false),
-            AccountMeta::new(insurance_fund_pda_for_flpfill, false),
+            AccountMeta::new(insurance_fund_pda_for_lpfill, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
-            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new(lp_exposure, false),
             // Optional<FeeTiersAccount>. Anchor's
             // convention for "None" is the program ID itself.
             AccountMeta::new_readonly(program_id(), false),
             // Optional<MarketHaircutStateAccount> + taker
-            // Optional<PositionHaircutStateAccount> on FLP path.
+            // Optional<PositionHaircutStateAccount> on LP path.
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
@@ -4403,41 +4403,41 @@ async fn apply_flp_fill_creates_taker_position_and_flp_entry() {
     assert_eq!(position.size_lots, 1);
     assert_eq!(position.entry_price_ticks, 100_000);
 
-    // Verify FLP took the opposite side: short 1 @ 100k on this market.
-    let flp: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
-    assert_eq!(flp.markets_count, 1);
-    let entry = flp
+    // Verify LP took the opposite side: short 1 @ 100k on this market.
+    let lp: LiquidityPoolAccount = fetch(&mut ctx.banks_client, lp_exposure).await;
+    assert_eq!(lp.markets_count, 1);
+    let entry = lp
         .per_market
         .iter()
         .find(|e| e.side != 255 && e.market == to_anchor(market_pda))
-        .expect("FLP should have an entry on this market");
+        .expect("LP should have an entry on this market");
     assert_eq!(entry.side, 1); // short
     assert_eq!(entry.size_lots, 1);
     assert_eq!(entry.entry_price_ticks, 100_000);
 
-    // Verify market OI: 1 long (trader) + 1 short (FLP).
+    // Verify market OI: 1 long (trader) + 1 short (LP).
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(market.oi_long_lots, 1);
     assert_eq!(market.oi_short_lots, 1);
 }
 
 /// A deposit prices shares on NAV inclusive of open-inventory unrealized PnL.
-/// The FLP takes the short side of a taker buy @ 102_000, so it carries a +2000
+/// The LP takes the short side of a taker buy @ 102_000, so it carries a +2000
 /// unrealized gain at the 100_000 oracle. A 1_000_000 deposit then mints FEWER
 /// than the 1_000_000 shares a realized-only NAV would mint (closing the
 /// JIT-depositor dilution), and omitting the open market fails closed.
 #[tokio::test]
-async fn deposit_flp_capital_prices_on_mark_to_market_nav() {
+async fn deposit_lp_capital_prices_on_mark_to_market_nav() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     disarm_fill_commitment(&mut ctx, market_pda).await;
-    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
 
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
-    // FLP short 1 @ 102_000 via a taker buy — a +2000 gain at the 100_000 oracle.
+    // LP short 1 @ 102_000 via a taker buy — a +2000 gain at the 100_000 oracle.
     let trader = Keypair::new();
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
     let (taker_pos, _) = pda(&[
@@ -4447,7 +4447,7 @@ async fn deposit_flp_capital_prices_on_mark_to_market_nav() {
     ]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
     let fill = build_ix(
-        clober::instruction::ApplyFlpFill {
+        clober::instruction::ApplyLpFill {
             size_lots: 1,
             price_ticks: 102_000,
             taker_side: 0,
@@ -4461,7 +4461,7 @@ async fn deposit_flp_capital_prices_on_mark_to_market_nav() {
             AccountMeta::new(insurance_fund_pda, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
-            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new(lp_exposure, false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
@@ -4501,12 +4501,12 @@ async fn deposit_flp_capital_prices_on_mark_to_market_nav() {
         clober::state::LpPositionAccount::SEED,
         lp.pubkey().as_ref(),
     ]);
-    let (flp_mode, _) = pda(&[clober::state::FlpModeAccount::SEED]);
+    let (lp_mode, _) = pda(&[clober::state::LpModeAccount::SEED]);
     let dep_metas = vec![
         AccountMeta::new(lp.pubkey(), true),
-        AccountMeta::new(protocol.flp_exposure, false),
+        AccountMeta::new(protocol.lp_exposure, false),
         AccountMeta::new(lp_position, false),
-        AccountMeta::new(flp_mode, false),
+        AccountMeta::new(lp_mode, false),
         AccountMeta::new_readonly(protocol.insurance_fund, false),
         AccountMeta::new_readonly(protocol.quote_mint, false),
         AccountMeta::new(lp_ata, false),
@@ -4521,7 +4521,7 @@ async fn deposit_flp_capital_prices_on_mark_to_market_nav() {
         .banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                clober::instruction::DepositFlpCapital {
+                clober::instruction::LpDeposit {
                     amount_quote_lots: 1_000_000,
                 },
                 dep_metas.clone(),
@@ -4543,7 +4543,7 @@ async fn deposit_flp_capital_prices_on_mark_to_market_nav() {
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                clober::instruction::DepositFlpCapital {
+                clober::instruction::LpDeposit {
                     amount_quote_lots: 1_000_000,
                 },
                 with_market,
@@ -4562,27 +4562,27 @@ async fn deposit_flp_capital_prices_on_mark_to_market_nav() {
     );
 }
 
-/// HLP (1b) — the POOL-BACKED CLOB full loop: the FLP pool posts a resting maker
-/// quote on the book (`flp_post_maker_order`, owner = the flp_exposure PDA); a
-/// taker crosses it via `place_taker_order_v2`, which pushes a STANDARD fill
-/// commitment (maker = the FLP PDA); then a ROGUE keeper (NOT market.sequencer)
-/// settles it via the RING-AUTHENTICATED `apply_flp_fill` path. Asserts the fill
+/// HLP (1b) — the POOL-BACKED CLOB full loop: the LP pool posts a resting maker
+/// quote on the book (`lp_post_maker_order`, owner = the lp_exposure PDA); a
+/// taker crosses it via `place_taker_order`, which pushes a STANDARD fill
+/// commitment (maker = the LP PDA); then a ROGUE keeper (NOT market.sequencer)
+/// settles it via the RING-AUTHENTICATED `apply_lp_fill` path. Asserts the fill
 /// is authentic + permissionless, and the pool takes the opposite side — the
 /// Hyperliquid HLP model, on-chain and trust-minimized.
 #[tokio::test]
-async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
+async fn hlp_lp_maker_order_crossed_and_settled_permissionlessly() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[
         clober::matcher::fill_commitment::FILL_COMMIT_SEED,
         market_pda.as_ref(),
     ]);
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
     let taker = Keypair::new();
     let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
@@ -4640,11 +4640,11 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
     .await
     .unwrap();
 
-    // 2) FLP posts a resting ASK (side=1) 1 lot @ 100_000 — owned by the pool.
+    // 2) LP posts a resting ASK (side=1) 1 lot @ 100_000 — owned by the pool.
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::FlpPostMakerOrder {
+            clober::instruction::LpPostMakerOrder {
                 side: 1,
                 size_lots: 1,
                 limit_ticks: 100_000,
@@ -4654,20 +4654,20 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new(market_pda, false),
                 AccountMeta::new(book_pda, false),
-                AccountMeta::new_readonly(flp_exposure, false),
+                AccountMeta::new_readonly(lp_exposure, false),
             ],
         ),
         &[&payer],
     )
     .await
-    .expect("FLP posts a resting maker quote");
+    .expect("LP posts a resting maker quote");
 
-    // 3) taker crosses: bid (side=0) 1 @ 100_000 -> fills against the FLP ask.
-    //    The commitment pushed binds maker = the FLP PDA.
+    // 3) taker crosses: bid (side=0) 1 @ 100_000 -> fills against the LP ask.
+    //    The commitment pushed binds maker = the LP PDA.
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTakerOrderV2 {
+            clober::instruction::PlaceTakerOrder {
                 side: 0,
                 size_lots: 1,
                 limit_ticks: 100_000,
@@ -4687,10 +4687,10 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
         &[&payer, &taker],
     )
     .await
-    .expect("taker crosses the FLP quote");
+    .expect("taker crosses the LP quote");
 
     // 4) a ROGUE keeper (NOT market.sequencer) settles via the ring-authenticated
-    //    FLP-maker path -> permissionless. The fill_commitment rides in
+    //    LP-maker path -> permissionless. The fill_commitment rides in
     //    remaining_accounts; taker_was_jit=false matches the pushed commitment.
     let rogue = Keypair::new();
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -4712,7 +4712,7 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
         build_ix(
             // Pass fill_seq = u64::MAX on the RING path — it must be
             // IGNORED (auto-incremented), NOT wedge last_settlement_seq. Asserted below.
-            clober::instruction::ApplyFlpFill {
+            clober::instruction::ApplyLpFill {
                 size_lots: 1,
                 price_ticks: 100_000,
                 taker_side: 0,
@@ -4726,7 +4726,7 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
                 AccountMeta::new(insurance_fund_pda, false),
                 AccountMeta::new(taker_state, false),
                 AccountMeta::new(taker_pos, false),
-                AccountMeta::new(flp_exposure, false),
+                AccountMeta::new(lp_exposure, false),
                 AccountMeta::new_readonly(program_id(), false), // fee_tiers None
                 AccountMeta::new_readonly(program_id(), false), // market_haircut None
                 AccountMeta::new_readonly(program_id(), false), // taker_position_haircut None
@@ -4737,7 +4737,7 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
         &[&rogue],
     )
     .await
-    .expect("ring-authenticated FLP fill settles permissionlessly");
+    .expect("ring-authenticated LP fill settles permissionlessly");
 
     // taker long 1 @ 100k; pool took the opposite side (short 1 @ 100k).
     let position: clober::state::PositionAccount =
@@ -4745,12 +4745,12 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
     assert_eq!(position.side, 0, "taker long after HLP fill");
     assert_eq!(position.size_lots, 1);
     assert_eq!(position.entry_price_ticks, 100_000);
-    let flp: FlpExposureAccount = fetch(&mut ctx.banks_client, flp_exposure).await;
-    let entry = flp
+    let lp: LiquidityPoolAccount = fetch(&mut ctx.banks_client, lp_exposure).await;
+    let entry = lp
         .per_market
         .iter()
         .find(|e| e.side != 255 && e.market == to_anchor(market_pda))
-        .expect("FLP has an entry");
+        .expect("LP has an entry");
     assert_eq!(entry.side, 1, "pool short after being crossed as maker");
     assert_eq!(entry.size_lots, 1);
     assert_eq!(entry.entry_price_ticks, 100_000);
@@ -4764,25 +4764,25 @@ async fn hlp_flp_maker_order_crossed_and_settled_permissionlessly() {
     );
 }
 
-/// On an ARMED market, `apply_flp_fill` via the SEQUENCER path (no
+/// On an ARMED market, `apply_lp_fill` via the SEQUENCER path (no
 /// fill-commitment supplied) is REJECTED — the ring is mandatory, matching
-/// `apply_fill`. Without this a compromised sequencer could fabricate FLP
-/// fills within the ±FLP_MAX_FILL_DEVIATION_BPS band and drain LP capital.
+/// `apply_fill`. Without this a compromised sequencer could fabricate LP
+/// fills within the ±LP_MAX_FILL_DEVIATION_BPS band and drain LP capital.
 /// Only UNARMED (legacy) markets accept the sequencer + oracle-band path.
 #[tokio::test]
-async fn apply_flp_fill_armed_requires_ring_rejects_sequencer_path() {
+async fn apply_lp_fill_armed_requires_ring_rejects_sequencer_path() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[
         clober::matcher::fill_commitment::FILL_COMMIT_SEED,
         market_pda.as_ref(),
     ]);
-    seed_flp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
     // setup_market DISARMS; re-ARM (init_fill_commitment sets fill_commitment_required=true).
     {
         let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -4829,9 +4829,9 @@ async fn apply_flp_fill_armed_requires_ring_rejects_sequencer_path() {
         market_pda.as_ref(),
         trader_state.as_ref(),
     ]);
-    // The sequencer (payer) tries to settle an FLP fill with NO commitment on an armed market.
+    // The sequencer (payer) tries to settle an LP fill with NO commitment on an armed market.
     let ix = build_ix(
-        clober::instruction::ApplyFlpFill {
+        clober::instruction::ApplyLpFill {
             size_lots: 1,
             price_ticks: 100_000,
             taker_side: 0,
@@ -4845,7 +4845,7 @@ async fn apply_flp_fill_armed_requires_ring_rejects_sequencer_path() {
             AccountMeta::new(insurance_fund_pda, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
-            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new(lp_exposure, false),
             AccountMeta::new_readonly(program_id(), false), // fee_tiers None
             AccountMeta::new_readonly(program_id(), false), // haircut None ×2
             AccountMeta::new_readonly(program_id(), false),
@@ -4865,34 +4865,34 @@ async fn apply_flp_fill_armed_requires_ring_rejects_sequencer_path() {
         .await;
     assert!(
         r.is_err(),
-        "armed market must reject the sequencer FLP path without a ring"
+        "armed market must reject the sequencer LP path without a ring"
     );
     let taker_acct = ctx.banks_client.get_account(taker_pos).await.unwrap();
     assert!(
         taker_acct.is_none(),
-        "no taker position after a rejected fabricated FLP fill"
+        "no taker position after a rejected fabricated LP fill"
     );
 }
 
-/// HLP (increment 2) — the pool AUTO-QUOTES: `flp_refresh_quotes` runs the
+/// HLP (increment 2) — the pool AUTO-QUOTES: `lp_refresh_quotes` runs the
 /// deterministic quoter and posts a two-sided ladder owned by the pool, then a
-/// taker crosses the pool's own ask → a ring-committed FLP-maker fill. Proves the
+/// taker crosses the pool's own ask → a ring-committed LP-maker fill. Proves the
 /// quoter → book → cross pipeline: the pool is now a self-managing on-book MM.
 #[tokio::test]
-async fn hlp_flp_refresh_quotes_posts_crossable_ladder() {
+async fn hlp_lp_refresh_quotes_posts_crossable_ladder() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[
         clober::matcher::fill_commitment::FILL_COMMIT_SEED,
         market_pda.as_ref(),
     ]);
     // Seed enough capital that per-level size is non-zero (per_level_quote =
     // capital · max_growth_bps/1e4 / levels must exceed one lot's notional).
-    seed_flp_capital(&mut ctx, &payer, &protocol, 10_000_000_000).await;
+    seed_lp_capital(&mut ctx, &payer, &protocol, 10_000_000_000).await;
 
     async fn send(
         ctx: &mut solana_program_test::ProgramTestContext,
@@ -4945,12 +4945,12 @@ async fn hlp_flp_refresh_quotes_posts_crossable_ladder() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::FlpRefreshQuotes {},
+            clober::instruction::LpRefreshQuotes {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new(market_pda, false),
                 AccountMeta::new(book_pda, false),
-                AccountMeta::new_readonly(flp_exposure, false),
+                AccountMeta::new_readonly(lp_exposure, false),
             ],
         ),
         &[&payer],
@@ -4965,7 +4965,7 @@ async fn hlp_flp_refresh_quotes_posts_crossable_ladder() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTakerOrderV2 {
+            clober::instruction::PlaceTakerOrder {
                 side: 0,
                 size_lots: 1,
                 limit_ticks: 110_000,
@@ -4985,9 +4985,9 @@ async fn hlp_flp_refresh_quotes_posts_crossable_ladder() {
         &[&payer, &taker],
     )
     .await
-    .expect("taker crosses an auto-quoted FLP ask");
+    .expect("taker crosses an auto-quoted LP ask");
 
-    // 3) the ring recorded the FLP-maker fill → the auto-quoted ladder is live + crossable.
+    // 3) the ring recorded the LP-maker fill → the auto-quoted ladder is live + crossable.
     let fc_data = ctx
         .banks_client
         .get_account(fc_pda)
@@ -4998,7 +4998,7 @@ async fn hlp_flp_refresh_quotes_posts_crossable_ladder() {
     let produced = u64::from_le_bytes(fc_data[8..16].try_into().unwrap());
     assert!(
         produced >= 1,
-        "a taker must have crossed at least one auto-quoted FLP level (produced={produced})"
+        "a taker must have crossed at least one auto-quoted LP level (produced={produced})"
     );
 
     // 4) re-quoting cancels the pool's stale orders and reposts (idempotent refresh).
@@ -5008,12 +5008,12 @@ async fn hlp_flp_refresh_quotes_posts_crossable_ladder() {
         send(
             &mut ctx,
             build_ix(
-                clober::instruction::FlpRefreshQuotes {},
+                clober::instruction::LpRefreshQuotes {},
                 vec![
                     AccountMeta::new(payer.pubkey(), true),
                     AccountMeta::new(market_pda, false),
                     AccountMeta::new(book_pda, false),
-                    AccountMeta::new_readonly(flp_exposure, false)
+                    AccountMeta::new_readonly(lp_exposure, false)
                 ]
             ),
             &[&payer]
@@ -5022,17 +5022,17 @@ async fn hlp_flp_refresh_quotes_posts_crossable_ladder() {
         .is_err(),
         "immediate re-quote must be rate-limited (RefreshTooSoon)"
     );
-    // ...but after FLP_REFRESH_MIN_SLOTS the pool re-quotes (cancel stale + repost).
+    // ...but after LP_REFRESH_MIN_SLOTS the pool re-quotes (cancel stale + repost).
     ctx.warp_to_slot(200).unwrap();
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::FlpRefreshQuotes {},
+            clober::instruction::LpRefreshQuotes {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new(market_pda, false),
                 AccountMeta::new(book_pda, false),
-                AccountMeta::new_readonly(flp_exposure, false),
+                AccountMeta::new_readonly(lp_exposure, false),
             ],
         ),
         &[&payer],
@@ -5041,20 +5041,20 @@ async fn hlp_flp_refresh_quotes_posts_crossable_ladder() {
     .expect("re-quote allowed once quotes are stale");
 }
 
-/// FLP authenticity band: an `apply_flp_fill` priced far from
+/// LP authenticity band: an `apply_lp_fill` priced far from
 /// the FRESH oracle (a compromised sequencer pricing the pool fill to extract
 /// value) is REJECTED. Oracle = 100_000; posting 300_000 (200% deviation, far
 /// beyond the 20% cap) fails and creates no position. Contrast with
-/// `apply_flp_fill_creates_taker_position_and_flp_entry` (the SAME fill AT the
+/// `apply_lp_fill_creates_taker_position_and_lp_entry` (the SAME fill AT the
 /// oracle succeeds) isolates the rejection to the band gate.
 #[tokio::test]
-async fn apply_flp_fill_rejects_price_far_from_oracle() {
+async fn apply_lp_fill_rejects_price_far_from_oracle() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     disarm_fill_commitment(&mut ctx, market_pda).await; // the legacy sequencer path is unarmed-only
-    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
 
     let trader = Keypair::new();
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
@@ -5067,7 +5067,7 @@ async fn apply_flp_fill_rejects_price_far_from_oracle() {
 
     // oracle == 100_000 (setup_market). 300_000 is a 200% deviation >> 20% cap.
     let ix = build_ix(
-        clober::instruction::ApplyFlpFill {
+        clober::instruction::ApplyLpFill {
             size_lots: 1,
             price_ticks: 300_000,
             taker_side: 0,
@@ -5081,7 +5081,7 @@ async fn apply_flp_fill_rejects_price_far_from_oracle() {
             AccountMeta::new(insurance_fund_pda, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
-            AccountMeta::new(flp_exposure, false),
+            AccountMeta::new(lp_exposure, false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
@@ -5100,12 +5100,12 @@ async fn apply_flp_fill_rejects_price_far_from_oracle() {
         .await;
     assert!(
         result.is_err(),
-        "FLP fill far from the oracle must be rejected by the band gate"
+        "LP fill far from the oracle must be rejected by the band gate"
     );
     let taker_acct = ctx.banks_client.get_account(taker_pos).await.unwrap();
     assert!(
         taker_acct.is_none(),
-        "no taker position after a rejected out-of-band FLP fill"
+        "no taker position after a rejected out-of-band LP fill"
     );
 }
 
@@ -5120,7 +5120,7 @@ async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     // init the v2 book.
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -5148,7 +5148,7 @@ async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
     let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
     let place = |price: u64| {
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side: 1, // ask
                 size_lots: 1,
                 limit_ticks: price,
@@ -5209,7 +5209,7 @@ async fn place_limit_v2_enforces_5_significant_figures() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // oracle 100_000
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
@@ -5234,7 +5234,7 @@ async fn place_limit_v2_enforces_5_significant_figures() {
     let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
     let place = |price: u64| {
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side: 1,
                 size_lots: 1,
                 limit_ticks: price,
@@ -5295,7 +5295,7 @@ async fn place_limit_v2_enforces_min_notional() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // oracle 100_000, tick 1
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
@@ -5345,7 +5345,7 @@ async fn place_limit_v2_enforces_min_notional() {
     let maker_state = setup_trader(&mut ctx, &payer, &maker, 1_000_000, &protocol).await;
     let place = |size: u64| {
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side: 1,
                 size_lots: size,
                 limit_ticks: 100_000, // in-band, 1 sig fig, notional = size × 100_000
@@ -5406,7 +5406,7 @@ async fn place_ladder_order_rests_multiple_levels() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // oracle 100_000
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
@@ -5469,7 +5469,7 @@ async fn place_ladder_order_rests_multiple_levels() {
     let ro = ctx
         .banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[ladder(clober::state_v2::FLAG_REDUCE_ONLY)],
+            &[ladder(clober::book_state::FLAG_REDUCE_ONLY)],
             Some(&payer.pubkey()),
             &[&payer, &maker],
             bh,
@@ -5481,7 +5481,7 @@ async fn place_ladder_order_rests_multiple_levels() {
     );
 }
 
-/// modify_order_v2 must re-apply the anti-stuffing oracle band: an order placed
+/// modify_order must re-apply the anti-stuffing oracle band: an order placed
 /// in-band cannot be re-priced to a far-from-oracle level. Place an ask @ 140_000
 /// (inside the 50% band around the 100_000 oracle), then modify it to 200_000
 /// (100% above) and assert RestingOrderTooFarFromOracle.
@@ -5491,7 +5491,7 @@ async fn modify_order_v2_rejects_far_from_oracle() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
@@ -5527,7 +5527,7 @@ async fn modify_order_v2_rejects_far_from_oracle() {
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                clober::instruction::PlaceLimitOrderV2 {
+                clober::instruction::PlaceLimitOrder {
                     side: 1,
                     size_lots: 1,
                     limit_ticks: 140_000,
@@ -5545,13 +5545,13 @@ async fn modify_order_v2_rejects_far_from_oracle() {
         .unwrap();
 
     // Modify that order to 200_000 — out of band — must be rejected.
-    let order_id = clober::state_v2::encode_order_id(140_000, 1, false);
+    let order_id = clober::book_state::encode_order_id(140_000, 1, false);
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let result = ctx
         .banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                clober::instruction::ModifyOrderV2 {
+                clober::instruction::ModifyOrder {
                     side: 1,
                     old_order_id: order_id,
                     new_size_lots: 1,
@@ -5573,7 +5573,7 @@ async fn modify_order_v2_rejects_far_from_oracle() {
     );
 }
 
-/// 4.6: modify_order_v2 now HONORS the reduce_only flag (bit1), exactly like the place
+/// 4.6: modify_order now HONORS the reduce_only flag (bit1), exactly like the place
 /// paths — previously it was rejected loudly at intake (OutOfRange). Place a normal ask,
 /// modify it to reduce-only, and assert the modify is ACCEPTED (the re-inserted resting
 /// order carries the flag; the matcher's maker clamp re-caps it to the position's
@@ -5585,7 +5585,7 @@ async fn modify_order_v2_accepts_reduce_only_flag() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
@@ -5621,7 +5621,7 @@ async fn modify_order_v2_accepts_reduce_only_flag() {
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                clober::instruction::PlaceLimitOrderV2 {
+                clober::instruction::PlaceLimitOrder {
                     side: 1,
                     size_lots: 1,
                     limit_ticks: 140_000,
@@ -5640,18 +5640,18 @@ async fn modify_order_v2_accepts_reduce_only_flag() {
 
     // Modify it to reduce-only (new_flags = FLAG_REDUCE_ONLY = bit1) at the same in-band
     // price — must be ACCEPTED (pre-4.6 this returned OutOfRange).
-    let order_id = clober::state_v2::encode_order_id(140_000, 1, false);
+    let order_id = clober::book_state::encode_order_id(140_000, 1, false);
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let result = ctx
         .banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                clober::instruction::ModifyOrderV2 {
+                clober::instruction::ModifyOrder {
                     side: 1,
                     old_order_id: order_id,
                     new_size_lots: 1,
                     new_limit_ticks: 140_000,
-                    new_flags: clober::state_v2::FLAG_REDUCE_ONLY,
+                    new_flags: clober::book_state::FLAG_REDUCE_ONLY,
                     new_expires_at_slot: 0,
                 },
                 metas,
@@ -5679,7 +5679,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     disarm_fill_commitment(&mut ctx, market_pda).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (insurance, _) = pda(&[InsuranceFundAccount::SEED]);
     async fn send(
         ctx: &mut solana_program_test::ProgramTestContext,
@@ -5779,7 +5779,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
 
     // Reduce-only trigger scoped to SUB-0 (main), fires at oracle <= 100_000.
     let (trig, _) = pda(&[
-        clober::state_v3::TriggerOrderAccountV3::SEED,
+        clober::extended_state::TriggerOrderAccount::SEED,
         market_pda.as_ref(),
         m.pubkey().as_ref(),
         &[1u8],
@@ -5787,7 +5787,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTriggerOrderV3 {
+            clober::instruction::PlaceTriggerOrder {
                 trigger_id: 1,
                 side: 1,
                 kind: 0,
@@ -5816,7 +5816,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
     let result = send(
         &mut ctx,
         build_ix(
-            clober::instruction::ExecuteTriggerOrderV3 {},
+            clober::instruction::ExecuteTriggerOrder {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new_readonly(market_pda, false),
@@ -5839,7 +5839,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
 
 /// GAP-1 regression: the advanced-order crank must re-derive and verify the
 /// caller-supplied `trader_state` PDA against the ORDER's stored `sub_index`
-/// (`verify_trader_state_pda(order.sub_index)` in execute_trigger_order_v3), not
+/// (`verify_trader_state_pda(order.sub_index)` in execute_trigger_order), not
 /// merely against the wallet. Here everything is correct EXCEPT the trader_state:
 /// a reduce-only trigger is scoped to sub-0 (main), the MAIN position is passed
 /// (so the position check passes), but the wallet's SUB-1 trader_state is cranked
@@ -5856,7 +5856,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_trader_state() {
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     disarm_fill_commitment(&mut ctx, market_pda).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (insurance, _) = pda(&[InsuranceFundAccount::SEED]);
     async fn send(
         ctx: &mut solana_program_test::ProgramTestContext,
@@ -5960,7 +5960,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_trader_state() {
 
     // Reduce-only trigger scoped to SUB-0 (main), fires at oracle <= 100_000.
     let (trig, _) = pda(&[
-        clober::state_v3::TriggerOrderAccountV3::SEED,
+        clober::extended_state::TriggerOrderAccount::SEED,
         market_pda.as_ref(),
         m.pubkey().as_ref(),
         &[1u8],
@@ -5968,7 +5968,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_trader_state() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTriggerOrderV3 {
+            clober::instruction::PlaceTriggerOrder {
                 trigger_id: 1,
                 side: 1,
                 kind: 0,
@@ -5999,7 +5999,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_trader_state() {
     let result = send(
         &mut ctx,
         build_ix(
-            clober::instruction::ExecuteTriggerOrderV3 {},
+            clober::instruction::ExecuteTriggerOrder {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new_readonly(market_pda, false),
@@ -6036,7 +6036,7 @@ async fn update_oracle_from_pyth_rejects_replayed_publish_time() {
 
     let feed_id = [7u8; 32];
     let (oracle_config, _) = pda(&[
-        clober::state_v3::MarketOracleConfigAccount::SEED,
+        clober::extended_state::MarketOracleConfigAccount::SEED,
         market_pda.as_ref(),
     ]);
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -6180,7 +6180,7 @@ async fn liquidate_position_v2_jit_auction_selects_in_band_rejects_out_of_band()
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -6256,7 +6256,7 @@ async fn liquidate_position_v2_jit_auction_selects_in_band_rejects_out_of_band()
     let jit_maker = Keypair::new();
     let nonce: u32 = 2;
     let (inband_pda, inband_bump) = pda(&[
-        clober::state_v3::JitLiquidationOfferAccount::SEED,
+        clober::extended_state::JitLiquidationOfferAccount::SEED,
         market_pda.as_ref(),
         jit_maker.pubkey().as_ref(),
         &nonce.to_le_bytes(),
@@ -6307,7 +6307,7 @@ async fn liquidate_position_v2_jit_auction_selects_in_band_rejects_out_of_band()
     // H-1 bound must reject it (an off-book close-limit would wedge the position).
     let oob_nonce: u32 = 3;
     let (oob_pda, _) = pda(&[
-        clober::state_v3::JitLiquidationOfferAccount::SEED,
+        clober::extended_state::JitLiquidationOfferAccount::SEED,
         market_pda.as_ref(),
         jit_maker.pubkey().as_ref(),
         &oob_nonce.to_le_bytes(),
@@ -6343,7 +6343,7 @@ async fn liquidate_position_v2_jit_auction_selects_in_band_rejects_out_of_band()
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                clober::instruction::LiquidatePositionV2 {
+                clober::instruction::LiquidatePosition {
                     requested_close_lots: 0,
                 },
                 vec![
@@ -6364,9 +6364,9 @@ async fn liquidate_position_v2_jit_auction_selects_in_band_rejects_out_of_band()
         ))
         .await
         .expect("underwater liquidation with JIT offers must succeed");
-    let inband_after: clober::state_v3::JitLiquidationOfferAccount =
+    let inband_after: clober::extended_state::JitLiquidationOfferAccount =
         fetch(&mut ctx.banks_client, inband_pda).await;
-    let oob_after: clober::state_v3::JitLiquidationOfferAccount =
+    let oob_after: clober::extended_state::JitLiquidationOfferAccount =
         fetch(&mut ctx.banks_client, oob_pda).await;
     // The in-band offer is selected and consumed (the auction now deserializes
     // offers correctly); the out-of-band offer is rejected on price and untouched.
@@ -6392,7 +6392,7 @@ async fn liquidate_position_v2_reward_capped_at_synthetic_equity() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -6475,7 +6475,7 @@ async fn liquidate_position_v2_reward_capped_at_synthetic_equity() {
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                clober::instruction::LiquidatePositionV2 {
+                clober::instruction::LiquidatePosition {
                     requested_close_lots: 0,
                 },
                 vec![
@@ -6509,7 +6509,7 @@ async fn delegated_book_order_requires_er_margin_ready() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
@@ -6539,7 +6539,7 @@ async fn delegated_book_order_requires_er_margin_ready() {
 
     let place = |price: u64| {
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side: 1,
                 size_lots: 1,
                 limit_ticks: price, // in-band (oracle 100_000)
@@ -6594,7 +6594,7 @@ async fn delegated_book_order_requires_er_margin_ready() {
 
 /// Permissionless expiry-reaper: an EXPIRED GTT order is reclaimed by anyone,
 /// while a GTC order (expires_at_slot == 0) at the same price is NEVER touched.
-/// Verified via cancel_order_v2 as the oracle: after reaping, cancelling the GTT
+/// Verified via cancel_order as the oracle: after reaping, cancelling the GTT
 /// id fails (it's gone) but cancelling the GTC id succeeds (still resting).
 #[tokio::test]
 async fn reap_expired_orders_removes_only_expired() {
@@ -6602,7 +6602,7 @@ async fn reap_expired_orders_removes_only_expired() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     async fn send(
         ctx: &mut solana_program_test::ProgramTestContext,
@@ -6642,7 +6642,7 @@ async fn reap_expired_orders_removes_only_expired() {
     let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
     let place = |expires: u64| {
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side: 1, // ask, at the 100_000 oracle (in-band)
                 size_lots: 1,
                 limit_ticks: 100_000,
@@ -6665,8 +6665,8 @@ async fn reap_expired_orders_removes_only_expired() {
     send(&mut ctx, place(50), &[&payer, &maker]).await.unwrap();
     send(&mut ctx, place(0), &[&payer, &maker]).await.unwrap();
 
-    let gtt_id = clober::state_v2::encode_order_id(100_000, 1, false);
-    let gtc_id = clober::state_v2::encode_order_id(100_000, 2, false);
+    let gtt_id = clober::book_state::encode_order_id(100_000, 1, false);
+    let gtc_id = clober::book_state::encode_order_id(100_000, 2, false);
 
     // Advance past the GTT expiry, then reap (permissionless — payer cranks).
     ctx.warp_to_slot(100).unwrap();
@@ -6690,7 +6690,7 @@ async fn reap_expired_orders_removes_only_expired() {
     // Oracle: cancelling the reaped GTT id must FAIL (it's gone)...
     let cancel = |order_id: u64| {
         build_ix(
-            clober::instruction::CancelOrderV2 { side: 1, order_id },
+            clober::instruction::CancelOrder { side: 1, order_id },
             vec![
                 AccountMeta::new(maker.pubkey(), true),
                 AccountMeta::new(market_pda, false),
@@ -6719,7 +6719,7 @@ async fn update_oracle_rejects_stale_price() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (insurance_fund, flp_exposure) = setup_protocol_pair(&mut ctx, &payer).await;
+    let (insurance_fund, lp_exposure) = setup_protocol_pair(&mut ctx, &payer).await;
 
     let base_mint = Keypair::new().pubkey();
     let quote_mint = Keypair::new().pubkey();
@@ -6743,7 +6743,7 @@ async fn update_oracle_rejects_stale_price() {
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new(market_pda, false),
             AccountMeta::new_readonly(insurance_fund, false),
-            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(lp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -6792,7 +6792,7 @@ async fn update_oracle_rejects_wide_confidence() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (insurance_fund, flp_exposure) = setup_protocol_pair(&mut ctx, &payer).await;
+    let (insurance_fund, lp_exposure) = setup_protocol_pair(&mut ctx, &payer).await;
 
     let base_mint = Keypair::new().pubkey();
     let quote_mint = Keypair::new().pubkey();
@@ -6816,7 +6816,7 @@ async fn update_oracle_rejects_wide_confidence() {
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new(market_pda, false),
             AccountMeta::new_readonly(insurance_fund, false),
-            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(lp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -6926,7 +6926,7 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (insurance_fund, flp_exposure) = setup_protocol_pair(&mut ctx, &payer).await;
+    let (insurance_fund, lp_exposure) = setup_protocol_pair(&mut ctx, &payer).await;
 
     let base_mint = Keypair::new().pubkey();
     let quote_mint = Keypair::new().pubkey();
@@ -6949,7 +6949,7 @@ async fn update_oracle_quorum_rejects_dispersed_sources() {
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new(market_pda, false),
             AccountMeta::new_readonly(insurance_fund, false),
-            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(lp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -7589,7 +7589,7 @@ async fn residual_undelegated_l1_resting_order_unreserved_but_loss_bounded() {
     }
 
     // Init the v2 book so an L1 limit order can rest.
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -7617,7 +7617,7 @@ async fn residual_undelegated_l1_resting_order_unreserved_but_loss_bounded() {
     let victim_state = setup_trader(&mut ctx, &payer, &victim, 30_000, &protocol).await;
 
     let place_ix = build_ix(
-        clober::instruction::PlaceLimitOrderV2 {
+        clober::instruction::PlaceLimitOrder {
             side: 0, // buy / long
             size_lots: 10,
             limit_ticks: 100_000,
@@ -8264,7 +8264,7 @@ async fn oracle_source_lock_disables_direct_update_one_way() {
         .await
         .expect("authority locks");
     assert_eq!(
-        fetch::<clober::state_v3::MarketEnvelopeConfigAccount>(
+        fetch::<clober::extended_state::MarketEnvelopeConfigAccount>(
             &mut ctx.banks_client,
             envelope_config
         )
@@ -8291,7 +8291,7 @@ async fn oracle_source_lock_disables_direct_update_one_way() {
 
     // 5) ONE-WAY: still locked (no unlock instruction exists).
     assert_eq!(
-        fetch::<clober::state_v3::MarketEnvelopeConfigAccount>(
+        fetch::<clober::extended_state::MarketEnvelopeConfigAccount>(
             &mut ctx.banks_client,
             envelope_config
         )
@@ -9228,11 +9228,11 @@ async fn reconcile_unsettled_fill_volume_resets_only_when_ring_drained() {
 
 /// HONEST PATH, end-to-end on the v2 hypertree book:
 /// init book + arm fill_commitment → maker rests an ask → taker crosses it
-/// (`place_taker_order_v2` pushes a keccak commitment for the real fill) →
+/// (`place_taker_order` pushes a keccak commitment for the real fill) →
 /// `apply_fill` recomputes the SAME commitment and consume-and-clears it, opening
 /// the taker's position. Proves the producer (matcher) and consumer (settlement)
 /// preimages AGREE across the two handlers — the one thing the buffer/Kani layers
-/// can't verify. Also the first end-to-end coverage of `place_taker_order_v2`.
+/// can't verify. Also the first end-to-end coverage of `place_taker_order`.
 #[tokio::test]
 async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
     let pt = make_program_test();
@@ -9259,7 +9259,7 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
         maker_state.as_ref(),
     ]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[
         clober::matcher::fill_commitment::FILL_COMMIT_SEED,
         market_pda.as_ref(),
@@ -9318,7 +9318,7 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side: 1,
                 size_lots: 5,
                 limit_ticks: 100_000,
@@ -9345,7 +9345,7 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTakerOrderV2 {
+            clober::instruction::PlaceTakerOrder {
                 side: 0,
                 size_lots: 1,
                 limit_ticks: 100_000,
@@ -9473,7 +9473,7 @@ async fn armed_ring_is_v1_at_init_and_settles_normally() {
         maker_state.as_ref(),
     ]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
 
     async fn send(
@@ -9535,18 +9535,18 @@ async fn armed_ring_is_v1_at_init_and_settles_normally() {
         .data;
     assert_eq!(
         d1.len(),
-        fc::fill_commit_account_len_v1(256),
+        fc::fill_commit_account_len(256),
         "v1 length at init"
     );
     assert_eq!(d1[29], 1, "fresh ring is v1");
 
     // The legacy v0→v1 upgrade handler now rejects an already-v1 ring
-    // (`buffer_upgrade_to_v1` requires version 0); it survives only for markets
+    // (`buffer_upgrade_to` requires version 0); it survives only for markets
     // armed before v1 became the default.
     let upgrade_res = send(
         &mut ctx,
         build_ix(
-            clober::instruction::UpgradeFillCommitmentV1 {},
+            clober::instruction::UpgradeFillCommitment {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new_readonly(market_pda, false),
@@ -9568,7 +9568,7 @@ async fn armed_ring_is_v1_at_init_and_settles_normally() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side: 1,
                 size_lots: 5,
                 limit_ticks: 100_000,
@@ -9591,7 +9591,7 @@ async fn armed_ring_is_v1_at_init_and_settles_normally() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTakerOrderV2 {
+            clober::instruction::PlaceTakerOrder {
                 side: 0,
                 size_lots: 1,
                 limit_ticks: 100_000,
@@ -9674,7 +9674,7 @@ async fn armed_ring_is_v1_at_init_and_settles_normally() {
 /// reduce-in-flight tracking prevents the position FLIP across the match→settle gap.
 ///
 /// Scenario (the exact residual the injection clamp couldn't reach): a maker M holds
-/// a long, arms a REAL reduce-only stop via place/execute_trigger_order_v3, then
+/// a long, arms a REAL reduce-only stop via place/execute_trigger_order, then
 /// SHRINKS the position below that resting order. Two separate takers then try to
 /// over-cross the oversized reduce-only order across the settle gap. Without the
 /// migration, the second taker (reading a stale position snapshot) would fill and
@@ -9708,7 +9708,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     };
     let (m_pos, c_pos, t1_pos) = (pos(&m_state), pos(&c_state), pos(&t1_state));
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
 
     async fn send(
@@ -9753,7 +9753,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     }
     let limit = |side: u8, size: u64, signer: &Keypair, state: &Pubkey| {
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side,
                 size_lots: size,
                 limit_ticks: 100_000,
@@ -9776,7 +9776,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     // R-1 cross-portfolio gate (correctly) demand a full-portfolio proof.
     let limit_pos = |side: u8, size: u64, signer: &Keypair, state: &Pubkey, position: Pubkey| {
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side,
                 size_lots: size,
                 limit_ticks: 100_000,
@@ -9805,7 +9805,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
         ];
         accts.extend(red);
         build_ix(
-            clober::instruction::PlaceTakerOrderV2 {
+            clober::instruction::PlaceTakerOrder {
                 side,
                 size_lots: size,
                 limit_ticks: 100_000,
@@ -9908,7 +9908,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
 
     // 2) M arms a REAL reduce-only stop (sell 10) and fires it → resting ask 10.
     let (trig, _) = pda(&[
-        clober::state_v3::TriggerOrderAccountV3::SEED,
+        clober::extended_state::TriggerOrderAccount::SEED,
         market_pda.as_ref(),
         m.pubkey().as_ref(),
         &[1u8],
@@ -9916,7 +9916,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTriggerOrderV3 {
+            clober::instruction::PlaceTriggerOrder {
                 trigger_id: 1,
                 side: 1,
                 kind: 0,
@@ -9943,7 +9943,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::ExecuteTriggerOrderV3 {},
+            clober::instruction::ExecuteTriggerOrder {},
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new_readonly(market_pda, false),
@@ -9975,7 +9975,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTakerOrderV2 {
+            clober::instruction::PlaceTakerOrder {
                 side: 1,
                 size_lots: 5,
                 limit_ticks: 100_000,
@@ -10116,7 +10116,7 @@ async fn reduce_only_taker_without_position_is_rejected_fail_closed() {
 
     let taker = Keypair::new();
     let taker_state = setup_trader(&mut ctx, &payer, &taker, 1_000_000, &protocol).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
 
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -10124,11 +10124,11 @@ async fn reduce_only_taker_without_position_is_rejected_fail_closed() {
         .banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                clober::instruction::PlaceTakerOrderV2 {
+                clober::instruction::PlaceTakerOrder {
                     side: 0,
                     size_lots: 1,
                     limit_ticks: 100_000,
-                    flags: clober::state_v2::FLAG_REDUCE_ONLY,
+                    flags: clober::book_state::FLAG_REDUCE_ONLY,
                     expires_at_slot: 0,
                     sub_index: 0,
                 },
@@ -10166,7 +10166,7 @@ async fn close_only_market_forces_reduce_only_and_blocks_openers() {
 
     let taker = Keypair::new();
     let taker_state = setup_trader(&mut ctx, &payer, &taker, 1_000_000, &protocol).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
 
     // Authority moves the market to CloseOnly (status 5).
@@ -10195,7 +10195,7 @@ async fn close_only_market_forces_reduce_only_and_blocks_openers() {
         .banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                clober::instruction::PlaceTakerOrderV2 {
+                clober::instruction::PlaceTakerOrder {
                     side: 0,
                     size_lots: 1,
                     limit_ticks: 100_000,
@@ -10254,7 +10254,7 @@ async fn armed_apply_fill_permissionless_keeper_settles_committed_fill() {
         maker_state.as_ref(),
     ]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[
         clober::matcher::fill_commitment::FILL_COMMIT_SEED,
         market_pda.as_ref(),
@@ -10309,7 +10309,7 @@ async fn armed_apply_fill_permissionless_keeper_settles_committed_fill() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side: 1,
                 size_lots: 5,
                 limit_ticks: 100_000,
@@ -10332,7 +10332,7 @@ async fn armed_apply_fill_permissionless_keeper_settles_committed_fill() {
     send(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTakerOrderV2 {
+            clober::instruction::PlaceTakerOrder {
                 side: 0,
                 size_lots: 1,
                 limit_ticks: 100_000,
@@ -10633,7 +10633,7 @@ async fn deep_book_matching_cu_curve() {
     // resting/crossing orders don't need funded collateral.
     zero_initial_margin(&mut ctx, market).await;
     let maker_state = setup_trader(&mut ctx, &payer, &payer, 0, &protocol).await;
-    let (book, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market.as_ref()]);
+    let (book, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market.as_ref()]);
     let (fc, _) = pda(&[
         clober::matcher::fill_commitment::FILL_COMMIT_SEED,
         market.as_ref(),
@@ -10721,7 +10721,7 @@ async fn deep_book_matching_cu_curve() {
         let cu = cu_of(
             &mut ctx,
             build_ix(
-                clober::instruction::PlaceLimitOrderV2 {
+                clober::instruction::PlaceLimitOrder {
                     side: 0,
                     size_lots: 1,
                     limit_ticks: tick,
@@ -10764,7 +10764,7 @@ async fn deep_book_matching_cu_curve() {
         let cu = cu_of(
             &mut ctx,
             build_ix(
-                clober::instruction::PlaceTakerOrderV2 {
+                clober::instruction::PlaceTakerOrder {
                     side: 1,
                     size_lots: n,
                     limit_ticks: 99_000,
@@ -10792,7 +10792,7 @@ async fn deep_book_matching_cu_curve() {
     let mx = *place_cu.iter().max().unwrap();
     println!("\n========== DEEP-BOOK MATCHING CU (real SBF, armed/production) ==========");
     println!("book depth: {DEPTH} resting bids (book expanded to 630 nodes; ring grown to 512)");
-    println!("\nplace_limit_order_v2 — CU vs insertion depth:");
+    println!("\nplace_limit_order — CU vs insertion depth:");
     for &d in &[0usize, 1, 31, 63, 127, 255, 383, 510] {
         println!("  depth {:>3}: {:>6} CU", d, place_cu[d]);
     }
@@ -10800,7 +10800,7 @@ async fn deep_book_matching_cu_curve() {
         "  -> {DEPTH} inserts: min {mn}, max {mx}, spread {} CU  (flat => O(log n) hypertree)",
         mx - mn
     );
-    println!("\nplace_taker_order_v2 — CU vs levels crossed (armed: +1 keccak commitment / fill):");
+    println!("\nplace_taker_order — CU vs levels crossed (armed: +1 keccak commitment / fill):");
     for &(n, c) in &sweep {
         println!(
             "  cross {:>3} levels: {:>7} CU   ({:>3} CU/level)",
@@ -10819,7 +10819,7 @@ async fn deep_book_matching_cu_curve() {
     let trunc = cu_of(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTakerOrderV2 {
+            clober::instruction::PlaceTakerOrder {
                 side: 1,
                 size_lots: cap * 4,
                 limit_ticks: 99_000,
@@ -10889,7 +10889,7 @@ async fn fill_outbox_deep_sweep_256() {
     // resting/crossing orders don't need funded collateral.
     zero_initial_margin(&mut ctx, market).await;
     let maker_state = setup_trader(&mut ctx, &payer, &payer, 0, &protocol).await;
-    let (book, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market.as_ref()]);
+    let (book, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market.as_ref()]);
     let (fc, _) = pda(&[
         clober::matcher::fill_commitment::FILL_COMMIT_SEED,
         market.as_ref(),
@@ -11002,7 +11002,7 @@ async fn fill_outbox_deep_sweep_256() {
         cu_of(
             &mut ctx,
             build_ix(
-                clober::instruction::PlaceLimitOrderV2 {
+                clober::instruction::PlaceLimitOrder {
                     side: 0,
                     size_lots: 1,
                     limit_ticks: tick,
@@ -11032,7 +11032,7 @@ async fn fill_outbox_deep_sweep_256() {
     // (A) ERROR PATH: a cap-256 market MUST reject a taker that omits the outbox —
     // else the >96 fills would truncate in the 10 KB log and wedge settlement.
     let bad = build_ix(
-        clober::instruction::PlaceTakerOrderV2 {
+        clober::instruction::PlaceTakerOrder {
             side: 1,
             size_lots: 5,
             limit_ticks: 99_000,
@@ -11070,7 +11070,7 @@ async fn fill_outbox_deep_sweep_256() {
     let sweep_cu = cu_of(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTakerOrderV2 {
+            clober::instruction::PlaceTakerOrder {
                 side: 1,
                 size_lots: 256,
                 limit_ticks: 99_000,
@@ -11159,7 +11159,7 @@ async fn fill_outbox_versatile_er_cap() {
     // resting/crossing orders don't need funded collateral.
     zero_initial_margin(&mut ctx, market).await;
     let maker_state = setup_trader(&mut ctx, &payer, &payer, 0, &protocol).await;
-    let (book, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market.as_ref()]);
+    let (book, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market.as_ref()]);
     let (fc, _) = pda(&[
         clober::matcher::fill_commitment::FILL_COMMIT_SEED,
         market.as_ref(),
@@ -11249,7 +11249,7 @@ async fn fill_outbox_versatile_er_cap() {
         cu_of(
             &mut ctx,
             build_ix(
-                clober::instruction::PlaceLimitOrderV2 {
+                clober::instruction::PlaceLimitOrder {
                     side: 0,
                     size_lots: 1,
                     limit_ticks: tick,
@@ -11276,7 +11276,7 @@ async fn fill_outbox_versatile_er_cap() {
     cu_of(
         &mut ctx,
         build_ix(
-            clober::instruction::PlaceTakerOrderV2 {
+            clober::instruction::PlaceTakerOrder {
                 side: 1,
                 size_lots: CAP as u64,
                 limit_ticks: 99_000,
@@ -11434,7 +11434,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
 
     // ── Gated hot paths: oracle band + fill commitment ─────────────────
     // Set up the v2 book + arm the commitment ring (one-time; not measured).
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[
         clober::matcher::fill_commitment::FILL_COMMIT_SEED,
         market_pda.as_ref(),
@@ -11471,10 +11471,10 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             .unwrap();
     }
 
-    // (4) place_limit_order_v2 — rests a deep ask; exercises the intake band
+    // (4) place_limit_order — rests a deep ask; exercises the intake band
     //     check. Also leaves liquidity for the taker measurements below.
     let place_limit_ix = build_ix(
-        clober::instruction::PlaceLimitOrderV2 {
+        clober::instruction::PlaceLimitOrder {
             side: 1,
             size_lots: 10,
             limit_ticks: 100_000,
@@ -11492,7 +11492,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
     );
     let cu_place_limit = cu_of(&mut ctx, place_limit_ix, &payer.pubkey(), &[&payer, &maker]).await;
 
-    // (5) place_taker_order_v2 — UNARMED vs ARMED. The delta is the per-fill
+    // (5) place_taker_order — UNARMED vs ARMED. The delta is the per-fill
     //     keccak commitment (the only added hot-path cost when a market is armed).
     let taker_ix = |armed: bool| {
         let mut metas = vec![
@@ -11506,7 +11506,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             metas.push(AccountMeta::new(fc_pda, false)); // remaining_accounts
         }
         build_ix(
-            clober::instruction::PlaceTakerOrderV2 {
+            clober::instruction::PlaceTakerOrder {
                 side: 0,
                 size_lots: 1,
                 limit_ticks: 100_000,
@@ -11527,8 +11527,8 @@ async fn cu_benchmark_settlement_and_risk_paths() {
     println!("apply_fill (open, both positions) : {cu_apply_fill_open:>7} CU");
     println!("apply_fill (close, realize PnL)   : {cu_apply_fill_close:>7} CU");
     println!("partial_withdraw (1 pos, lattice) : {cu_partial_withdraw:>7} CU");
-    println!("place_limit_v2 (band check)       : {cu_place_limit:>7} CU");
-    println!("place_taker_v2 (armed, commit)    : {cu_taker_armed:>7} CU");
+    println!("place_limit (band check)       : {cu_place_limit:>7} CU");
+    println!("place_taker (armed, commit)    : {cu_taker_armed:>7} CU");
     println!("(200k default per-ix budget; 1.4M max/tx)\n");
 
     // Guardrail: these must comfortably fit the default per-ix budget.
@@ -11841,7 +11841,7 @@ async fn chaos_instruction_sequences_keep_book_consistent() {
         let mut ctx = pt.start_with_context().await;
         let payer = ctx.payer.insecure_clone();
         let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-        let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+        let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
         chaos_send(
             &mut ctx,
@@ -11893,7 +11893,7 @@ async fn chaos_instruction_sequences_keep_book_consistent() {
             let res = match kind {
                 0 | 4 => {
                     let ix = build_ix(
-                        clober::instruction::PlaceLimitOrderV2 {
+                        clober::instruction::PlaceLimitOrder {
                             side,
                             size_lots: size,
                             limit_ticks: price,
@@ -11909,7 +11909,7 @@ async fn chaos_instruction_sequences_keep_book_consistent() {
                         resting.push((
                             ti,
                             side,
-                            clober::state_v2::encode_order_id(price, seq, side == 0),
+                            clober::book_state::encode_order_id(price, seq, side == 0),
                         ));
                         seq += 1;
                     }
@@ -11917,7 +11917,7 @@ async fn chaos_instruction_sequences_keep_book_consistent() {
                 }
                 1 => {
                     let ix = build_ix(
-                        clober::instruction::PlaceTakerOrderV2 {
+                        clober::instruction::PlaceTakerOrder {
                             side,
                             size_lots: size,
                             limit_ticks: price,
@@ -11941,7 +11941,7 @@ async fn chaos_instruction_sequences_keep_book_consistent() {
                     let i = (r >> 24) as usize % resting.len();
                     let (oti, oside, oid) = resting[i];
                     let ix = build_ix(
-                        clober::instruction::CancelOrderV2 {
+                        clober::instruction::CancelOrder {
                             side: oside,
                             order_id: oid,
                         },
@@ -11984,7 +11984,7 @@ async fn chaos_instruction_sequences_keep_book_consistent() {
             .unwrap()
             .expect("book account exists");
         let mut data = acct.data;
-        let handle = clober::state_v2::MarketBookHandle::from_account_data(&mut data)
+        let handle = clober::book_state::MarketBookHandle::from_account_data(&mut data)
             .expect("book still parses after chaos");
         let mut bids: Vec<(u64, u64)> = Vec::new();
         handle.for_each_bid_best_first(|_i, o| {
@@ -12028,7 +12028,7 @@ async fn grow_fill_commitment_raises_ring_cap() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[fc::FILL_COMMIT_SEED, market_pda.as_ref()]);
 
     // init book
@@ -12155,31 +12155,31 @@ async fn grow_fill_commitment_raises_ring_cap() {
     );
     assert_eq!(
         d.len(),
-        fc::fill_commit_account_len_v1(cap1 as usize),
+        fc::fill_commit_account_len(cap1 as usize),
         "account resized to match new cap (v1 layout)"
     );
 }
 
-/// `flp_withdraw_v3` enforces the minimum-hold JIT-LP defense (mirroring the
-/// singleton `withdraw_flp_capital`): an LP that deposits and immediately tries
-/// to redeem — well inside `FLP_MIN_HOLD_SLOTS` — is rejected with RateLimited,
-/// so a JIT depositor cannot slip in front of a NAV-lifting `record_flp_fill_v3`
+/// `lp_market_withdraw` enforces the minimum-hold JIT-LP defense (mirroring the
+/// singleton `lp_withdraw`): an LP that deposits and immediately tries
+/// to redeem — well inside `LP_MIN_HOLD_SLOTS` — is rejected with RateLimited,
+/// so a JIT depositor cannot slip in front of a NAV-lifting `record_lp_market_fill`
 /// and capture the windfall without bearing risk.
 #[tokio::test]
-async fn flp_withdraw_v3_enforces_min_hold() {
+async fn lp_withdraw_v3_enforces_min_hold() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     let (exposure, _) = pda(&[
-        clober::state_v3::FlpExposurePerMarketAccountV3::SEED,
+        clober::extended_state::LpMarketExposureAccount::SEED,
         market_pda.as_ref(),
     ]);
 
-    // Init the per-market FLP exposure (authority = payer = insurance-fund authority).
+    // Init the per-market LP exposure (authority = payer = insurance-fund authority).
     let init_ix = build_ix(
-        clober::instruction::InitFlpPerMarketV3 {},
+        clober::instruction::InitLpPerMarket {},
         vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
@@ -12219,14 +12219,14 @@ async fn flp_withdraw_v3_enforces_min_hold() {
     mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp_ata, 10_000_000).await;
 
     let (position, _) = pda(&[
-        clober::state_v3::FlpPositionAccountV3::SEED,
+        clober::extended_state::LpMarketPositionAccount::SEED,
         exposure.as_ref(),
         lp.pubkey().as_ref(),
     ]);
 
     // Deposit — stamps `deposited_at_slot = now`.
     let deposit_ix = build_ix(
-        clober::instruction::FlpDepositV3 {
+        clober::instruction::LpMarketDeposit {
             amount_quote_lots: 1_000_000,
         },
         vec![
@@ -12234,7 +12234,7 @@ async fn flp_withdraw_v3_enforces_min_hold() {
             AccountMeta::new(exposure, false),
             AccountMeta::new_readonly(market_pda, false),
             AccountMeta::new(position, false),
-            AccountMeta::new(pda(&[clober::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new(pda(&[clober::state::LpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp_ata, false),
@@ -12256,7 +12256,7 @@ async fn flp_withdraw_v3_enforces_min_hold() {
 
     // Immediate withdraw — far inside the 150-slot hold ⇒ RateLimited (Custom(7208)).
     let withdraw_ix = build_ix(
-        clober::instruction::FlpWithdrawV3 { shares_to_burn: 1 },
+        clober::instruction::LpMarketWithdraw { shares_to_burn: 1 },
         vec![
             AccountMeta::new(lp.pubkey(), true),
             AccountMeta::new(exposure, false),
@@ -12281,29 +12281,29 @@ async fn flp_withdraw_v3_enforces_min_hold() {
     let dbg = format!("{result:?}");
     assert!(
         dbg.contains("Custom(7208)"),
-        "immediate v3 FLP withdraw must be rejected with RateLimited, got: {dbg}"
+        "immediate v3 LP withdraw must be rejected with RateLimited, got: {dbg}"
     );
 }
 
-/// `record_flp_fill_v3` derives realized PnL on-chain from the reported fill
+/// `record_lp_market_fill` derives realized PnL on-chain from the reported fill
 /// against the pool's stored inventory VWAP — the caller no longer supplies (and
-/// cannot fabricate) a PnL delta. Open the FLP long 10 @ 100, then close 10 @
+/// cannot fabricate) a PnL delta. Open the LP long 10 @ 100, then close 10 @
 /// 110: with tick_size 1 the pool realizes exactly 10*(110-100) = 100 quote-lots
 /// and the inventory returns to empty.
 #[tokio::test]
-async fn record_flp_fill_v3_derives_realized_pnl_on_chain() {
+async fn record_lp_fill_v3_derives_realized_pnl_on_chain() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     let (exposure, _) = pda(&[
-        clober::state_v3::FlpExposurePerMarketAccountV3::SEED,
+        clober::extended_state::LpMarketExposureAccount::SEED,
         market_pda.as_ref(),
     ]);
 
     let init_ix = build_ix(
-        clober::instruction::InitFlpPerMarketV3 {},
+        clober::instruction::InitLpPerMarket {},
         vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
@@ -12331,7 +12331,7 @@ async fn record_flp_fill_v3_derives_realized_pnl_on_chain() {
 
     // Open long 10 @ 100 — no realized PnL.
     let open_ix = build_ix(
-        clober::instruction::RecordFlpFillV3 {
+        clober::instruction::RecordLpMarketFill {
             size_lots: 10,
             price_ticks: 100,
             side: 0,
@@ -12348,14 +12348,14 @@ async fn record_flp_fill_v3_derives_realized_pnl_on_chain() {
         ))
         .await
         .unwrap();
-    let e0: clober::state_v3::FlpExposurePerMarketAccountV3 =
+    let e0: clober::extended_state::LpMarketExposureAccount =
         fetch(&mut ctx.banks_client, exposure).await;
     assert_eq!(e0.realized_pnl, 0, "open realizes no PnL");
     assert_eq!((e0.side, e0.size_lots), (0, 10), "long 10 open");
 
     // Close 10 @ 110 → realized PnL = 10*(110-100)*tick_size(1) = 100.
     let close_ix = build_ix(
-        clober::instruction::RecordFlpFillV3 {
+        clober::instruction::RecordLpMarketFill {
             size_lots: 10,
             price_ticks: 110,
             side: 1,
@@ -12372,14 +12372,14 @@ async fn record_flp_fill_v3_derives_realized_pnl_on_chain() {
         ))
         .await
         .unwrap();
-    let e1: clober::state_v3::FlpExposurePerMarketAccountV3 =
+    let e1: clober::extended_state::LpMarketExposureAccount =
         fetch(&mut ctx.banks_client, exposure).await;
     assert_eq!(e1.realized_pnl, 100, "derived close PnL = 10*(110-100)");
     assert_eq!(e1.size_lots, 0, "inventory closed to flat");
     assert_eq!(e1.side, 255, "empty marker after full close");
 }
 
-/// `flp_deposit_v3` / `flp_withdraw_v3` must price shares on NAV *inclusive of the
+/// `lp_market_deposit` / `lp_market_withdraw` must price shares on NAV *inclusive of the
 /// unrealized mark* of the pool's open inventory — not realized-only. Here the
 /// pool holds a long opened at entry 200_000 while the fresh L1 oracle marks
 /// 100_000 (tick_size 1), so the inventory carries a 10*(100_000-200_000) =
@@ -12387,22 +12387,22 @@ async fn record_flp_fill_v3_derives_realized_pnl_on_chain() {
 /// capital: true NAV is 0. A realized-only deposit would still see NAV =
 /// total_capital = 1_000_000 and happily mint a second LP into an insolvent pool
 /// (socializing the drawdown onto the shared vault). With the mark folded in, the
-/// deposit is rejected `FlpPoolInsolvent` (Custom(8308)).
+/// deposit is rejected `LpPoolInsolvent` (Custom(8308)).
 #[tokio::test]
-async fn flp_deposit_v3_marks_inventory_and_rejects_when_insolvent() {
+async fn lp_deposit_v3_marks_inventory_and_rejects_when_insolvent() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     let (exposure, _) = pda(&[
-        clober::state_v3::FlpExposurePerMarketAccountV3::SEED,
+        clober::extended_state::LpMarketExposureAccount::SEED,
         market_pda.as_ref(),
     ]);
 
-    // Init the per-market FLP exposure (authority = payer).
+    // Init the per-market LP exposure (authority = payer).
     let init_ix = build_ix(
-        clober::instruction::InitFlpPerMarketV3 {},
+        clober::instruction::InitLpPerMarket {},
         vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
@@ -12441,12 +12441,12 @@ async fn flp_deposit_v3_marks_inventory_and_rejects_when_insolvent() {
     let lp1_ata = create_ata(&mut ctx, &payer, lp1.pubkey(), protocol.quote_mint).await;
     mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp1_ata, 10_000_000).await;
     let (pos1, _) = pda(&[
-        clober::state_v3::FlpPositionAccountV3::SEED,
+        clober::extended_state::LpMarketPositionAccount::SEED,
         exposure.as_ref(),
         lp1.pubkey().as_ref(),
     ]);
     let dep1 = build_ix(
-        clober::instruction::FlpDepositV3 {
+        clober::instruction::LpMarketDeposit {
             amount_quote_lots: 1_000_000,
         },
         vec![
@@ -12454,7 +12454,7 @@ async fn flp_deposit_v3_marks_inventory_and_rejects_when_insolvent() {
             AccountMeta::new(exposure, false),
             AccountMeta::new_readonly(market_pda, false),
             AccountMeta::new(pos1, false),
-            AccountMeta::new(pda(&[clober::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new(pda(&[clober::state::LpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp1_ata, false),
@@ -12477,7 +12477,7 @@ async fn flp_deposit_v3_marks_inventory_and_rejects_when_insolvent() {
     // Authority opens an underwater long: entry 200_000 against the 100_000
     // oracle mark ⇒ -1_000_000 unrealized loss (size 10 × 100_000 × tick 1).
     let open_ix = build_ix(
-        clober::instruction::RecordFlpFillV3 {
+        clober::instruction::RecordLpMarketFill {
             size_lots: 10,
             price_ticks: 200_000,
             side: 0,
@@ -12519,12 +12519,12 @@ async fn flp_deposit_v3_marks_inventory_and_rejects_when_insolvent() {
     let lp2_ata = create_ata(&mut ctx, &payer, lp2.pubkey(), protocol.quote_mint).await;
     mint_tokens(&mut ctx, &payer, protocol.quote_mint, lp2_ata, 10_000_000).await;
     let (pos2, _) = pda(&[
-        clober::state_v3::FlpPositionAccountV3::SEED,
+        clober::extended_state::LpMarketPositionAccount::SEED,
         exposure.as_ref(),
         lp2.pubkey().as_ref(),
     ]);
     let dep2 = build_ix(
-        clober::instruction::FlpDepositV3 {
+        clober::instruction::LpMarketDeposit {
             amount_quote_lots: 1_000_000,
         },
         vec![
@@ -12532,7 +12532,7 @@ async fn flp_deposit_v3_marks_inventory_and_rejects_when_insolvent() {
             AccountMeta::new(exposure, false),
             AccountMeta::new_readonly(market_pda, false),
             AccountMeta::new(pos2, false),
-            AccountMeta::new(pda(&[clober::state::FlpModeAccount::SEED]).0, false),
+            AccountMeta::new(pda(&[clober::state::LpModeAccount::SEED]).0, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
             AccountMeta::new_readonly(protocol.quote_mint, false),
             AccountMeta::new(lp2_ata, false),
@@ -12554,7 +12554,7 @@ async fn flp_deposit_v3_marks_inventory_and_rejects_when_insolvent() {
     let dbg = format!("{result:?}");
     assert!(
         dbg.contains("Custom(8308)"),
-        "deposit into an MTM-insolvent v3 pool must be rejected FlpPoolInsolvent, got: {dbg}"
+        "deposit into an MTM-insolvent v3 pool must be rejected LpPoolInsolvent, got: {dbg}"
     );
 }
 
@@ -12641,7 +12641,7 @@ async fn er_delegation_rejects_non_authority() {
 // CrossLiquidationNeedsPortfolio (2207 → Custom(8207)): a CROSS
 // position (zero per-position collateral) belonging to a trader with >1 open
 // leg must NOT be liquidated/deleveraged via the single-leg path — it has to
-// route through liquidate_portfolio_v2, which assesses the whole pool.
+// route through liquidate_portfolio, which assesses the whole pool.
 // SelfLiquidationForbidden (2208 → Custom(8208)): the liquidator must
 // not be the liquidatee.
 //
@@ -12772,9 +12772,9 @@ async fn liquidate_position_v2_rejects_self_liquidation() {
     // caller == liquidatee. caller_trader_state seed == [SEED, taker] == taker_state,
     // so the same account rides at both the trader_state and caller_trader_state
     // slots; the self-liquidation guard fires before either is mutated.
-    let (market_book, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (market_book, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let ix = build_ix(
-        clober::instruction::LiquidatePositionV2 {
+        clober::instruction::LiquidatePosition {
             requested_close_lots: 0,
         },
         vec![
@@ -12814,7 +12814,7 @@ async fn liquidate_position_v2_rejects_self_liquidation() {
 /// collateral) cannot be liquidated one leg at a time via the single-position
 /// path — that would assess one leg against the full pool and wrongfully
 /// liquidate a portfolio-healthy trader. It must route through
-/// liquidate_portfolio_v2.
+/// liquidate_portfolio.
 #[tokio::test]
 async fn liquidate_position_v2_rejects_multi_leg_cross() {
     let pt = make_program_test();
@@ -12874,10 +12874,10 @@ async fn liquidate_position_v2_rejects_multi_leg_cross() {
         .await
         .unwrap();
     let (caller_state, _) = pda(&[TraderStateAccount::SEED, liquidator.pubkey().as_ref()]);
-    let (market_book_a, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_a.as_ref()]);
+    let (market_book_a, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_a.as_ref()]);
 
     let ix = build_ix(
-        clober::instruction::LiquidatePositionV2 {
+        clober::instruction::LiquidatePosition {
             requested_close_lots: 0,
         },
         vec![
@@ -12942,7 +12942,7 @@ async fn cross_portfolio_intake_im_blocks_second_market_stacking() {
     let ts: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
     assert_eq!(ts.open_positions, 1, "one cross leg open on market A");
 
-    let (book_b, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_b.as_ref()]);
+    let (book_b, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_b.as_ref()]);
     let place_b = |remaining: Vec<AccountMeta>| {
         let mut accts = vec![
             AccountMeta::new(taker.pubkey(), true),
@@ -12953,7 +12953,7 @@ async fn cross_portfolio_intake_im_blocks_second_market_stacking() {
         ];
         accts.extend(remaining);
         build_ix(
-            clober::instruction::PlaceLimitOrderV2 {
+            clober::instruction::PlaceLimitOrder {
                 side: 0,
                 // Deliberately TINY (100k notional): on its own it needs ~33k of
                 // margin and would sail through against the 1M pool. The only
@@ -13436,11 +13436,11 @@ async fn liquidate_portfolio_v2_stale_sibling_does_not_abort_walk() {
         ))
         .await
         .unwrap();
-    let (market_book_a, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_a.as_ref()]);
+    let (market_book_a, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_a.as_ref()]);
 
     // Portfolio path: market_a execution + (market_b, taker_pos_b) sole sibling pair.
     let ix = build_ix(
-        clober::instruction::LiquidatePortfolioV2 {},
+        clober::instruction::LiquidatePortfolio {},
         vec![
             AccountMeta::new(liquidator.pubkey(), true),
             AccountMeta::new_readonly(market_a, false),
@@ -13706,14 +13706,14 @@ async fn auto_deleverage_accepts_isolated_underwater_leg() {
     );
 }
 
-/// apply_flp_fill must reject a STALE oracle. The FLP price band is only
+/// apply_lp_fill must reject a STALE oracle. The LP price band is only
 /// meaningful against a fresh oracle; a compromised sequencer could otherwise
-/// settle FLP fills against a frozen anchor while the market moved. A market
+/// settle LP fills against a frozen anchor while the market moved. A market
 /// with oracle_staleness_max_seconds=60 whose oracle was never published
 /// (`oracle_published_at_unix_seconds == 0`, never set by InitializeMarket) is
 /// stale-by-definition → OracleTooStale (1800 → Custom(7800)).
 #[tokio::test]
-async fn apply_flp_fill_rejects_stale_oracle() {
+async fn apply_lp_fill_rejects_stale_oracle() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -13739,7 +13739,7 @@ async fn apply_flp_fill_rejects_stale_oracle() {
             AccountMeta::new_readonly(Keypair::new().pubkey(), false),
             AccountMeta::new(market_pda, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
-            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(protocol.lp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -13769,7 +13769,7 @@ async fn apply_flp_fill_rejects_stale_oracle() {
     ctx.warp_to_slot(432_000).unwrap();
 
     let ix = build_ix(
-        clober::instruction::ApplyFlpFill {
+        clober::instruction::ApplyLpFill {
             size_lots: 1,
             price_ticks: 100_000,
             taker_side: 0,
@@ -13783,7 +13783,7 @@ async fn apply_flp_fill_rejects_stale_oracle() {
             AccountMeta::new(protocol.insurance_fund, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
-            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(protocol.lp_exposure, false),
             AccountMeta::new_readonly(program_id(), false), // fee_tiers None
             AccountMeta::new_readonly(program_id(), false), // haircut None ×2
             AccountMeta::new_readonly(program_id(), false),
@@ -13803,7 +13803,7 @@ async fn apply_flp_fill_rejects_stale_oracle() {
     let dbg = format!("{result:?}");
     assert!(
         dbg.contains("Custom(7800)"),
-        "stale-oracle FLP fill must be rejected with OracleTooStale, got: {dbg}"
+        "stale-oracle LP fill must be rejected with OracleTooStale, got: {dbg}"
     );
     let pos = ctx.banks_client.get_account(taker_pos).await.unwrap();
     assert!(
@@ -13812,7 +13812,7 @@ async fn apply_flp_fill_rejects_stale_oracle() {
     );
 }
 
-/// vault reduce-only follow-up: `vault_place_order_v3` now HONORS the reduce_only flag
+/// vault reduce-only follow-up: `vault_place_order` now HONORS the reduce_only flag
 /// (bit1) and EXEMPTS it from the H-A intake-margin gate — a reduce-only order only winds
 /// down (matcher re-clamps at fill against the vault's own position), so it needs no
 /// opening collateral. A 0-collateral vault: an OPENING order is still rejected
@@ -13823,7 +13823,7 @@ async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
     // Init book.
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -13848,7 +13848,7 @@ async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
     // Create a 0-collateral vault + its TraderState.
     let vault_id: u8 = 0;
     let (vault_pda, _) = pda(&[
-        clober::state_v3::VaultAccountV3::SEED,
+        clober::extended_state::VaultAccount::SEED,
         payer.pubkey().as_ref(),
         &[vault_id],
     ]);
@@ -13858,7 +13858,7 @@ async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
         .process_transaction(Transaction::new_signed_with_payer(
             &[
                 build_ix(
-                    clober::instruction::CreateVaultV3 {
+                    clober::instruction::CreateVault {
                         vault_id,
                         name: [0u8; 32],
                         perf_fee_bps: 0,
@@ -13870,7 +13870,7 @@ async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
                     ],
                 ),
                 build_ix(
-                    clober::instruction::VaultOpenTraderStateV3 {},
+                    clober::instruction::VaultOpenTraderState {},
                     vec![
                         AccountMeta::new(payer.pubkey(), true),
                         AccountMeta::new_readonly(vault_pda, false),
@@ -13888,7 +13888,7 @@ async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
 
     let place = |flags: u8| {
         build_ix(
-            clober::instruction::VaultPlaceOrderV3 {
+            clober::instruction::VaultPlaceOrder {
                 side: 1,
                 size_lots: 1,
                 limit_ticks: 140_000, // in-band vs oracle 100_000
@@ -13927,7 +13927,7 @@ async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
     let reduce = ctx
         .banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[place(clober::state_v2::FLAG_REDUCE_ONLY)],
+            &[place(clober::book_state::FLAG_REDUCE_ONLY)],
             Some(&payer.pubkey()),
             &[&payer],
             bh,
@@ -13939,7 +13939,7 @@ async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
     );
 }
 
-/// vault_withdraw_v3 must reject while the vault's TraderState carries an
+/// vault_withdraw must reject while the vault's TraderState carries an
 /// open position — redemptions require the vault FLAT, else a depositor redeems
 /// against unrealized exposure and skips the settlement waterfall. The open
 /// position is created through the REAL apply_fill path on the vault's own
@@ -13954,14 +13954,14 @@ async fn vault_withdraw_v3_rejects_when_vault_has_open_position() {
     // 1) Create the vault (strategist = payer) + its TraderState.
     let vault_id: u8 = 0;
     let (vault_pda, _) = pda(&[
-        clober::state_v3::VaultAccountV3::SEED,
+        clober::extended_state::VaultAccount::SEED,
         payer.pubkey().as_ref(),
         &[vault_id],
     ]);
     let (vault_trader_state, _) = pda(&[TraderStateAccount::SEED, vault_pda.as_ref()]);
 
     let create_ix = build_ix(
-        clober::instruction::CreateVaultV3 {
+        clober::instruction::CreateVault {
             vault_id,
             name: [0u8; 32],
             perf_fee_bps: 0,
@@ -13973,7 +13973,7 @@ async fn vault_withdraw_v3_rejects_when_vault_has_open_position() {
         ],
     );
     let open_ts_ix = build_ix(
-        clober::instruction::VaultOpenTraderStateV3 {},
+        clober::instruction::VaultOpenTraderState {},
         vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new_readonly(vault_pda, false),
@@ -14019,12 +14019,12 @@ async fn vault_withdraw_v3_rejects_when_vault_has_open_position() {
     )
     .await;
     let (vault_position, _) = pda(&[
-        clober::state_v3::VaultPositionAccountV3::SEED,
+        clober::extended_state::VaultPositionAccount::SEED,
         vault_pda.as_ref(),
         depositor.pubkey().as_ref(),
     ]);
     let deposit_ix = build_ix(
-        clober::instruction::VaultDepositV3 {
+        clober::instruction::VaultDeposit {
             amount_quote_lots: 1_000_000,
         },
         vec![
@@ -14074,7 +14074,7 @@ async fn vault_withdraw_v3_rejects_when_vault_has_open_position() {
 
     // 4) Depositor tries to redeem while the vault is NOT flat.
     let withdraw_ix = build_ix(
-        clober::instruction::VaultWithdrawV3 { shares_to_burn: 1 },
+        clober::instruction::VaultWithdraw { shares_to_burn: 1 },
         vec![
             AccountMeta::new_readonly(depositor.pubkey(), true),
             AccountMeta::new(vault_pda, false),
@@ -14106,8 +14106,8 @@ async fn vault_withdraw_v3_rejects_when_vault_has_open_position() {
 /// Share pricing ignores an open position's unrealized PnL, so a deposit while
 /// the vault is NOT flat would mint shares against an understated NAV and let
 /// the depositor skim the standing LPs' share of that PnL once it realizes.
-/// `vault_deposit_v3` must reject a deposit while the vault carries an open
-/// position, mirroring `vault_withdraw_v3` (SweepRequiresFlat, Custom(7214)).
+/// `vault_deposit` must reject a deposit while the vault carries an open
+/// position, mirroring `vault_withdraw` (SweepRequiresFlat, Custom(7214)).
 #[tokio::test]
 async fn vault_deposit_v3_rejects_when_vault_has_open_position() {
     let pt = make_program_test();
@@ -14117,14 +14117,14 @@ async fn vault_deposit_v3_rejects_when_vault_has_open_position() {
 
     let vault_id: u8 = 0;
     let (vault_pda, _) = pda(&[
-        clober::state_v3::VaultAccountV3::SEED,
+        clober::extended_state::VaultAccount::SEED,
         payer.pubkey().as_ref(),
         &[vault_id],
     ]);
     let (vault_trader_state, _) = pda(&[TraderStateAccount::SEED, vault_pda.as_ref()]);
 
     let create_ix = build_ix(
-        clober::instruction::CreateVaultV3 {
+        clober::instruction::CreateVault {
             vault_id,
             name: [0u8; 32],
             perf_fee_bps: 0,
@@ -14136,7 +14136,7 @@ async fn vault_deposit_v3_rejects_when_vault_has_open_position() {
         ],
     );
     let open_ts_ix = build_ix(
-        clober::instruction::VaultOpenTraderStateV3 {},
+        clober::instruction::VaultOpenTraderState {},
         vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new_readonly(vault_pda, false),
@@ -14180,7 +14180,7 @@ async fn vault_deposit_v3_rejects_when_vault_has_open_position() {
     )
     .await;
     let (vault_position, _) = pda(&[
-        clober::state_v3::VaultPositionAccountV3::SEED,
+        clober::extended_state::VaultPositionAccount::SEED,
         vault_pda.as_ref(),
         depositor.pubkey().as_ref(),
     ]);
@@ -14198,7 +14198,7 @@ async fn vault_deposit_v3_rejects_when_vault_has_open_position() {
     ];
     // First deposit is while the vault is FLAT — it must succeed.
     let deposit_ix = build_ix(
-        clober::instruction::VaultDepositV3 {
+        clober::instruction::VaultDeposit {
             amount_quote_lots: 1_000_000,
         },
         deposit_metas.clone(),
@@ -14232,7 +14232,7 @@ async fn vault_deposit_v3_rejects_when_vault_has_open_position() {
 
     // A second deposit while the vault is NOT flat must be rejected.
     let deposit_ix2 = build_ix(
-        clober::instruction::VaultDepositV3 {
+        clober::instruction::VaultDeposit {
             amount_quote_lots: 1_000_000,
         },
         deposit_metas,
@@ -14254,7 +14254,7 @@ async fn vault_deposit_v3_rejects_when_vault_has_open_position() {
     );
 }
 
-/// place_basket_order_n_v2 must bind each leg's position account to the
+/// place_basket_order_n must bind each leg's position account to the
 /// canonical PDA `[PositionAccount::SEED, market, trader_state]`. A leg that
 /// references ANOTHER trader's real (initialized, program-owned) position —
 /// non-canonical for the basket caller — is rejected with WrongTrader
@@ -14265,7 +14265,7 @@ async fn place_basket_order_n_v2_rejects_noncanonical_position() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     // Initialize the book so the leg's market_book account is program-owned.
     let init_book = build_ix(
         clober::instruction::InitMarketBook {},
@@ -14314,11 +14314,11 @@ async fn place_basket_order_n_v2_rejects_noncanonical_position() {
         post_only: false,
     }];
     let ix = build_ix(
-        clober::instruction::PlaceBasketOrderNV2 { legs },
+        clober::instruction::PlaceBasketOrderN { legs },
         vec![
             AccountMeta::new(attacker.pubkey(), true),
             AccountMeta::new(attacker_state, false),
-            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(protocol.lp_exposure, false),
             // leg 0 triple: [market, market_book, position] — position is the
             // victim's (non-canonical for the attacker's trader_state).
             AccountMeta::new(market_pda, false),
@@ -14411,16 +14411,16 @@ async fn flush_haircut_dust_debits_residual() {
     .await;
 
     let (haircut_state, _) = pda(&[
-        clober::state_v3::MarketHaircutStateAccount::SEED,
+        clober::extended_state::MarketHaircutStateAccount::SEED,
         market_pda.as_ref(),
     ]);
     let (pos_a_hc, _) = pda(&[
-        clober::state_v3::PositionHaircutStateAccount::SEED,
+        clober::extended_state::PositionHaircutStateAccount::SEED,
         market_pda.as_ref(),
         pos_a.as_ref(),
     ]);
     let (pos_b_hc, _) = pda(&[
-        clober::state_v3::PositionHaircutStateAccount::SEED,
+        clober::extended_state::PositionHaircutStateAccount::SEED,
         market_pda.as_ref(),
         pos_b.as_ref(),
     ]);
@@ -14551,7 +14551,7 @@ async fn flush_haircut_dust_debits_residual() {
     .unwrap();
 
     // Snapshot residual + dust AFTER convert, BEFORE flush.
-    let hc_before: clober::state_v3::MarketHaircutStateAccount =
+    let hc_before: clober::extended_state::MarketHaircutStateAccount =
         fetch(&mut ctx.banks_client, haircut_state).await;
     let residual_before = hc_before.residual_quote_lots;
     let dust = hc_before.dust_accrued_quote_lots;
@@ -14579,7 +14579,7 @@ async fn flush_haircut_dust_debits_residual() {
     .await
     .expect("flush must succeed (residual covers the dust debit)");
 
-    let hc_after: clober::state_v3::MarketHaircutStateAccount =
+    let hc_after: clober::extended_state::MarketHaircutStateAccount =
         fetch(&mut ctx.banks_client, haircut_state).await;
     let ins_after: InsuranceFundAccount =
         fetch(&mut ctx.banks_client, protocol.insurance_fund).await;
@@ -14627,7 +14627,7 @@ async fn apply_fill_requires_haircut_accounts_when_enabled() {
 
     // Enable the haircut engine (sets sticky haircut_enabled = true).
     let (haircut_state, _) = pda(&[
-        clober::state_v3::MarketHaircutStateAccount::SEED,
+        clober::extended_state::MarketHaircutStateAccount::SEED,
         market_pda.as_ref(),
     ]);
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -14702,11 +14702,11 @@ async fn apply_fill_requires_haircut_accounts_when_enabled() {
     );
 }
 
-/// The FLP fill band is 300 bps (3%). A fill priced 10% from the fresh
-/// oracle — outside the band — must be rejected with FlpPriceOutsideBand
+/// The LP fill band is 300 bps (3%). A fill priced 10% from the fresh
+/// oracle — outside the band — must be rejected with LpPriceOutsideBand
 /// (2205 → Custom(8205)). Oracle = 100_000; posting 110_000 = +10%.
 #[tokio::test]
-async fn apply_flp_fill_band_rejects_ten_percent() {
+async fn apply_lp_fill_band_rejects_ten_percent() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -14722,7 +14722,7 @@ async fn apply_flp_fill_band_rejects_ten_percent() {
     ]);
 
     let ix = build_ix(
-        clober::instruction::ApplyFlpFill {
+        clober::instruction::ApplyLpFill {
             size_lots: 1,
             price_ticks: 110_000, // +10% vs the 100_000 oracle: inside old 20%, outside new 3%
             taker_side: 0,
@@ -14736,7 +14736,7 @@ async fn apply_flp_fill_band_rejects_ten_percent() {
             AccountMeta::new(protocol.insurance_fund, false),
             AccountMeta::new(trader_state, false),
             AccountMeta::new(taker_pos, false),
-            AccountMeta::new(protocol.flp_exposure, false),
+            AccountMeta::new(protocol.lp_exposure, false),
             AccountMeta::new_readonly(program_id(), false), // fee_tiers None
             AccountMeta::new_readonly(program_id(), false), // market_haircut None
             AccountMeta::new_readonly(program_id(), false), // taker_position_haircut None
@@ -14756,7 +14756,7 @@ async fn apply_flp_fill_band_rejects_ten_percent() {
     let dbg = format!("{result:?}");
     assert!(
         dbg.contains("Custom(8205)"),
-        "a 10% FLP fill must be rejected by the 3% band, got: {dbg}"
+        "a 10% LP fill must be rejected by the 3% band, got: {dbg}"
     );
     let pos = ctx.banks_client.get_account(taker_pos).await.unwrap();
     assert!(
@@ -15814,7 +15814,7 @@ async fn settle_funding_advances_side_accrual_indices() {
 
     // settle_funding requires the market haircut state.
     let (haircut_state, _) = pda(&[
-        clober::state_v3::MarketHaircutStateAccount::SEED,
+        clober::extended_state::MarketHaircutStateAccount::SEED,
         market.as_ref(),
     ]);
     send_one(
@@ -15840,7 +15840,7 @@ async fn settle_funding_advances_side_accrual_indices() {
     // Seed side accrual at slot 1 / price 50_000 — DIFFERENT from the market's
     // 100_000 mark so the first advance produces a non-zero K.
     let (side_accrual, _) = pda(&[
-        clober::state_v3::MarketSideAccrualAccount::SEED,
+        clober::extended_state::MarketSideAccrualAccount::SEED,
         market.as_ref(),
     ]);
     send_one(
@@ -15888,7 +15888,7 @@ async fn settle_funding_advances_side_accrual_indices() {
     .await
     .unwrap();
 
-    let sa: clober::state_v3::MarketSideAccrualAccount =
+    let sa: clober::extended_state::MarketSideAccrualAccount =
         fetch(&mut ctx.banks_client, side_accrual).await;
     assert_eq!(
         sa.long_price_last, mark,
@@ -15952,7 +15952,7 @@ async fn auto_deleverage_accepts_side_accrual_when_present() {
 
     // Initialize the side-accrual account for market A and PASS it (Some).
     let (side_accrual, _) = pda(&[
-        clober::state_v3::MarketSideAccrualAccount::SEED,
+        clober::extended_state::MarketSideAccrualAccount::SEED,
         market_a.as_ref(),
     ]);
     send_one(
@@ -16090,14 +16090,14 @@ fn claim_fee_accrual_ix(
     recipient_ata: Pubkey,
     quote_vault: Pubkey,
 ) -> Instruction {
-    let (flp_exposure, _) = pda(&[FlpExposureAccount::SEED]);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
     build_ix(
         clober::instruction::ClaimFeeAccrual {},
         vec![
             AccountMeta::new_readonly(recipient.pubkey(), true),
             AccountMeta::new(fee_accrual_pda, false),
             AccountMeta::new(insurance_fund, false),
-            AccountMeta::new_readonly(flp_exposure, false),
+            AccountMeta::new_readonly(lp_exposure, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(recipient_ata, false),
             AccountMeta::new(quote_vault, false),
@@ -16281,7 +16281,7 @@ async fn liquidate_position_v2_caps_close_at_one_tranche() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -16369,7 +16369,7 @@ async fn liquidate_position_v2_caps_close_at_one_tranche() {
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[build_ix(
-                clober::instruction::LiquidatePositionV2 {
+                clober::instruction::LiquidatePosition {
                     requested_close_lots: 0,
                 },
                 vec![
@@ -16551,7 +16551,7 @@ async fn create_perm_market_ix(
             AccountMeta::new_readonly(dummy, false),
             AccountMeta::new(market, false),
             AccountMeta::new_readonly(protocol.insurance_fund, false),
-            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(protocol.lp_exposure, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
     );
@@ -16808,13 +16808,13 @@ async fn copy_vault_deposit_mints_shares_and_withdraw_returns_proportional() {
 //     100_000_000]`; out-of-range bps reject with `OutOfRange` = `Custom(7003)`.
 //   * a non-authority signer rejects with `Unauthorized` = `Custom(7100)`.
 //
-// When enabled, at the END of `apply_fill` / `apply_flp_fill` — AFTER the fill has
+// When enabled, at the END of `apply_fill` / `apply_lp_fill` — AFTER the fill has
 // fully settled (OI + collateral + insurance all committed) — the breaker checks
 // whether gross OI notional `(oi_long_lots + oi_short_lots) · mark_price_ticks ·
 // tick_size` now EXCEEDS the insurance-relative cap `insurance_balance · bps /
 // BPS_DENOM`. If so it sets `market.status = Paused (3)`. This is a plain FLAG
 // WRITE, not a revert: the committed fill still stands (positions/OI/collateral
-// are unchanged), but because order intake (`place_limit_order_v2`) already
+// are unchanged), but because order intake (`place_limit_order`) already
 // rejects a non-tradable (Paused) market with `Custom(7003)`, only NEW risk is
 // blocked while the breaker is tripped — the book can be unwound but not grown.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -16880,14 +16880,14 @@ async fn send_set_oi_multiple(
         .await
 }
 
-/// Init the v2 hypertree book for a market so intake (`place_limit_order_v2`)
+/// Init the v2 hypertree book for a market so intake (`place_limit_order`)
 /// can run against it.
 async fn init_market_book_for(
     ctx: &mut solana_program_test::ProgramTestContext,
     payer: &Keypair,
     market_pda: Pubkey,
 ) -> Pubkey {
-    let (book_pda, _) = pda(&[clober::state_v2::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -17027,7 +17027,7 @@ async fn g3_oi_insurance_multiple_setter_bounds() {
 /// G-3 (2): breaker TRIPS at settlement and then blocks intake. With the multiple
 /// set to MIN (10_000 bps = 1×) and a SMALL seeded insurance balance, a fill that
 /// pushes gross OI notional above `insurance_balance · 1` auto-pauses the market —
-/// WITHOUT reverting the fill — and a subsequent `place_limit_order_v2` on the
+/// WITHOUT reverting the fill — and a subsequent `place_limit_order` on the
 /// now-Paused market rejects `Custom(7003)`.
 #[tokio::test]
 async fn g3_oi_insurance_breaker_trips_and_pauses() {
@@ -17125,7 +17125,7 @@ async fn g3_oi_insurance_breaker_trips_and_pauses() {
     let placer = Keypair::new();
     let placer_state = setup_trader(&mut ctx, &payer, &placer, 100_000, &protocol).await;
     let place = build_ix(
-        clober::instruction::PlaceLimitOrderV2 {
+        clober::instruction::PlaceLimitOrder {
             side: 1, // ask
             size_lots: 1,
             limit_ticks: 105_000, // in-band, on-tick, ≤5 sig figs
@@ -17212,7 +17212,7 @@ async fn g3_oi_insurance_breaker_disabled_no_pause() {
     let placer = Keypair::new();
     let placer_state = setup_trader(&mut ctx, &payer, &placer, 100_000, &protocol).await;
     let place = build_ix(
-        clober::instruction::PlaceLimitOrderV2 {
+        clober::instruction::PlaceLimitOrder {
             side: 1,
             size_lots: 1,
             limit_ticks: 105_000,

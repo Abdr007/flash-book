@@ -1,22 +1,22 @@
 //! Property tests for the pure matcher modules:
 //!
-//!   • flp_quoter   — spread monotonicity, ladder ordering, capacity bounds
+//!   • lp_quoter   — spread monotonicity, ladder ordering, capacity bounds
 //!   • insurance    — waterfall conservation, contribution math
 //!
 //! Each property runs against 2,000 random inputs.
 
 use anchor_lang::prelude::Pubkey;
 use clober::matcher::{
-    flp_quoter::{generate_quotes, FlpQuoterInputs, FlpQuoterParams},
+    lp_quoter::{generate_quotes, LpQuoterInputs, LpQuoterParams},
     insurance::InsuranceFund,
     lot::Ticks,
 };
 use proptest::prelude::*;
 
-// ─── flp_quoter ────────────────────────────────────────────────────────
+// ─── lp_quoter ────────────────────────────────────────────────────────
 
-fn flp_params() -> FlpQuoterParams {
-    FlpQuoterParams {
+fn lp_params() -> LpQuoterParams {
+    LpQuoterParams {
         base_spread_bps: 5,
         alpha_bps: 5_000,
         beta_bps: 3_000,
@@ -31,8 +31,8 @@ fn flp_params() -> FlpQuoterParams {
     }
 }
 
-fn flp_inputs(oracle: u64, vpin: u32, capital: u64, net: i64) -> FlpQuoterInputs {
-    FlpQuoterInputs {
+fn lp_inputs(oracle: u64, vpin: u32, capital: u64, net: i64) -> LpQuoterInputs {
+    LpQuoterInputs {
         oracle_ticks: Ticks(oracle),
         vpin_bps: vpin,
         realized_vol_bps: 0,
@@ -47,15 +47,15 @@ fn flp_inputs(oracle: u64, vpin: u32, capital: u64, net: i64) -> FlpQuoterInputs
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2000))]
 
-    /// FLP bids are always at or below fair value; asks always at or above.
+    /// LP bids are always at or below fair value; asks always at or above.
     #[test]
-    fn flp_bid_below_ask_always(
+    fn lp_bid_below_ask_always(
         oracle in 1_000u64..1_000_000u64,
         vpin in 0u32..10_000u32,
         capital in 1_000_000u64..10_000_000_000u64,
     ) {
         let trader = Pubkey::new_from_array([1u8; 32]);
-        let (out, _) = generate_quotes(flp_params(), flp_inputs(oracle, vpin, capital, 0), trader, 0)?;
+        let (out, _) = generate_quotes(lp_params(), lp_inputs(oracle, vpin, capital, 0), trader, 0)?;
         for level in 0..out.bids.len() {
             let bid_price = out.bids[level].0.0;
             let ask_price = out.asks[level].0.0;
@@ -67,15 +67,15 @@ proptest! {
 
     /// Higher VPIN widens the spread (bid further from fair, ask further from fair).
     #[test]
-    fn flp_vpin_widens_spread(
+    fn lp_vpin_widens_spread(
         oracle in 1_000u64..1_000_000u64,
         vpin_low in 0u32..1_000u32,
         capital in 1_000_000u64..10_000_000_000u64,
     ) {
         let vpin_high = vpin_low.saturating_add(5_000);
         let trader = Pubkey::new_from_array([1u8; 32]);
-        let (low, _) = generate_quotes(flp_params(), flp_inputs(oracle, vpin_low, capital, 0), trader, 0)?;
-        let (high, _) = generate_quotes(flp_params(), flp_inputs(oracle, vpin_high, capital, 0), trader, 0)?;
+        let (low, _) = generate_quotes(lp_params(), lp_inputs(oracle, vpin_low, capital, 0), trader, 0)?;
+        let (high, _) = generate_quotes(lp_params(), lp_inputs(oracle, vpin_high, capital, 0), trader, 0)?;
 
         // For every level, the high-VPIN ask must be ≥ the low-VPIN ask
         // (and the high-VPIN bid ≤ low-VPIN bid). Spread is monotonic in VPIN.
@@ -95,12 +95,12 @@ proptest! {
 
     /// Pool with zero capital emits no quotes.
     #[test]
-    fn flp_zero_capital_emits_no_orders(
+    fn lp_zero_capital_emits_no_orders(
         oracle in 1_000u64..1_000_000u64,
         vpin in 0u32..10_000u32,
     ) {
         let trader = Pubkey::new_from_array([1u8; 32]);
-        let (out, orders) = generate_quotes(flp_params(), flp_inputs(oracle, vpin, 0, 0), trader, 0)?;
+        let (out, orders) = generate_quotes(lp_params(), lp_inputs(oracle, vpin, 0, 0), trader, 0)?;
         prop_assert!(out.bids.is_empty());
         prop_assert!(out.asks.is_empty());
         prop_assert!(orders.is_empty());
@@ -110,28 +110,28 @@ proptest! {
     /// (Integer truncation can collapse skew to exactly 0 when
     /// |net_abs / capital| is very small; both behaviors are correct.)
     #[test]
-    fn flp_short_pool_lifts_fair_value(
+    fn lp_short_pool_lifts_fair_value(
         oracle in 1_000u64..1_000_000u64,
         capital in 1_000_000u64..10_000_000_000u64,
         net_abs in 1u64..100_000u64,
     ) {
         let trader = Pubkey::new_from_array([1u8; 32]);
         let net_short = -(net_abs as i64);
-        let (out, _) = generate_quotes(flp_params(), flp_inputs(oracle, 0, capital, net_short), trader, 0)?;
+        let (out, _) = generate_quotes(lp_params(), lp_inputs(oracle, 0, capital, net_short), trader, 0)?;
         prop_assert!(out.skew_bps >= 0, "skew must be ≥ 0 for net-short pool");
         prop_assert!(out.fair_value.0 >= oracle, "fair_value < oracle with net-short pool");
     }
 
     /// Pool long-skew lowers fair value (skew ≤ 0, fair ≤ oracle).
     #[test]
-    fn flp_long_pool_lowers_fair_value(
+    fn lp_long_pool_lowers_fair_value(
         oracle in 1_000u64..1_000_000u64,
         capital in 1_000_000u64..10_000_000_000u64,
         net_abs in 1u64..100_000u64,
     ) {
         let trader = Pubkey::new_from_array([1u8; 32]);
         let net_long = net_abs as i64;
-        let (out, _) = generate_quotes(flp_params(), flp_inputs(oracle, 0, capital, net_long), trader, 0)?;
+        let (out, _) = generate_quotes(lp_params(), lp_inputs(oracle, 0, capital, net_long), trader, 0)?;
         prop_assert!(out.skew_bps <= 0, "skew must be ≤ 0 for net-long pool");
         prop_assert!(out.fair_value.0 <= oracle, "fair_value > oracle with net-long pool");
     }

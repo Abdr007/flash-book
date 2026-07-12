@@ -1,7 +1,7 @@
 //! Sequencer committee — decentralized-sequencer primitive.
 //!
 //! Pure membership + BFT-quorum logic for the on-chain `SequencerCommittee`
-//! (`state_v3`). The committee attests batch state transitions
+//! (`extended_state`). The committee attests batch state transitions
 //! (`commit_batch`); fill settlement authorization (`apply_fill`) remains
 //! bound to the market's single settlement signer. Kept pure so the quorum
 //! math is Kani-proven independent of account plumbing and cannot perturb

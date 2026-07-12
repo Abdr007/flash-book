@@ -377,7 +377,7 @@ fn residual_grows_back_when_seeded_during_warmup() {
     ix_mature(&mut pos, &mut market, 100);
     // h would be 0.5 if we converted now.
 
-    // Seed more residual (simulating fee accrual to FLP).
+    // Seed more residual (simulating fee accrual to LP).
     ix_seed_residual(&mut market, 500).unwrap();
     // h is now 1.0.
 

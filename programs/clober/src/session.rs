@@ -7,7 +7,7 @@
 //! or change collateral. The token is a PDA `[SESSION_SEED, owner, session_signer]`
 //! the owner creates and can revoke at any time, and it auto-expires.
 //!
-//! Design note (safety): this is purely ADDITIVE. The original `*_v2` trade
+//! Design note (safety): this is purely ADDITIVE. The original `*` trade
 //! instructions are unchanged; the session variants share the exact same core
 //! logic via a single extracted function, differing ONLY in how the trader
 //! identity is authenticated (cold-wallet `Signer` vs. a verified session token).

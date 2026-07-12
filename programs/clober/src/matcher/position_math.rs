@@ -8,7 +8,7 @@
 //!
 //! This is the money math for BOTH sides of every trade: a trader's
 //! `PositionAccount` (via `apply_fill_to_position`) AND — for the pool-backed
-//! CLOB — the FLP pool's net inventory when it acts as an on-book maker. Keeping
+//! CLOB — the LP pool's net inventory when it acts as an on-book maker. Keeping
 //! it pure (plain integers, no `Account`, no anchor) means every transition is
 //! Kani-proven independent of account plumbing, and the pool and a trader
 //! provably settle through the *same* verified arithmetic. Callers own the
@@ -55,7 +55,7 @@ pub enum PosMathError {
 }
 
 /// Apply `(fill_side, fill_size_lots, fill_price_ticks)` to `pos` — the
-/// settlement arithmetic `apply_fill` / `apply_flp_fill` route through,
+/// settlement arithmetic `apply_fill` / `apply_lp_fill` route through,
 /// including the `tick_size` scaling of realized PnL. Returns the new
 /// position + realized PnL + funding-reset flag, or a `PosMathError` on any
 /// checked-arithmetic edge.
@@ -593,7 +593,7 @@ mod tests {
 
 /// Property tests for the DEPLOYED settlement math. `apply_fill` here is the pure
 /// port that `apply_fill_to_position` (called by the live `apply_fill` /
-/// `apply_flp_fill` handlers) delegates to — so these generalize the fixed-case
+/// `apply_lp_fill` handlers) delegates to — so these generalize the fixed-case
 /// unit tests over wide random ranges. They pin the reduce/flip transitions, the
 /// exact tick-scaled realized-PnL value (H-1), and the L-3 overflow reject that the
 /// `#[cfg(kani)]` proofs deliberately leave to host tests (the i128 PnL multiply is

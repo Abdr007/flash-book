@@ -31,8 +31,8 @@ pub enum OrderType {
     Limit = 0,
     /// Revealed-from-commit taker order.
     Taker = 1,
-    /// Synthesized FLP virtual quote.
-    FlpVirtual = 2,
+    /// Synthesized LP virtual quote.
+    LpVirtual = 2,
     /// Liquidation order injected by the risk engine. Highest priority.
     Liquidation = 3,
     /// Auto-deleveraging — when insurance fund is exhausted.
@@ -46,7 +46,7 @@ impl OrderType {
             OrderType::Liquidation => 0,
             OrderType::Adl => 1,
             OrderType::Taker => 2,
-            OrderType::FlpVirtual => 3,
+            OrderType::LpVirtual => 3,
             OrderType::Limit => 4,
         }
     }

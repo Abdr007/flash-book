@@ -1,10 +1,10 @@
 //! `acceptable_price` slippage cap on v3 trigger orders.
 //!
-//! Verifies `TriggerOrderAccountV3::slippage_cap_breached` directly
+//! Verifies `TriggerOrderAccount::slippage_cap_breached` directly
 //! (the pure function the on-chain handler delegates to) and walks
 //! the place → fire → execute pipeline algorithmically.
 
-use clober::state_v3::TriggerOrderAccountV3;
+use clober::extended_state::TriggerOrderAccount;
 
 // ─── Pure pattern: cap-breach predicate ─────────────────────────────
 
@@ -12,40 +12,40 @@ use clober::state_v3::TriggerOrderAccountV3;
 fn cap_zero_means_no_cap_regardless_of_side_or_oracle() {
     // Triggers with no cap set (acceptable_price_ticks == 0)
     // never breach — full backward compat.
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         0, 0, 1_000_000
     ));
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         0, 1, 1_000_000
     ));
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         0,
         0,
         u64::MAX
     ));
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(0, 1, 1));
+    assert!(!TriggerOrderAccount::slippage_cap_breached(0, 1, 1));
 }
 
 #[test]
 fn long_buying_breaches_when_oracle_above_cap() {
     // side=0 → buying. Cap = max admissible price. Oracle > cap = breach.
-    assert!(TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 0, 1_000_001
     ));
-    assert!(TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 0, 2_000_000
     ));
 }
 
 #[test]
 fn long_buying_admits_when_oracle_at_or_below_cap() {
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 0, 1_000_000
     ));
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 0, 999_999
     ));
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 0, 0
     ));
 }
@@ -53,26 +53,26 @@ fn long_buying_admits_when_oracle_at_or_below_cap() {
 #[test]
 fn short_selling_breaches_when_oracle_below_cap() {
     // side=1 → selling. Cap = min admissible price. Oracle < cap = breach.
-    assert!(TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 1, 999_999
     ));
-    assert!(TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 1, 500_000
     ));
-    assert!(TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 1, 0
     ));
 }
 
 #[test]
 fn short_selling_admits_when_oracle_at_or_above_cap() {
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 1, 1_000_000
     ));
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 1, 1_000_001
     ));
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         1_000_000,
         1,
         u64::MAX
@@ -84,10 +84,10 @@ fn invalid_side_returns_no_breach_safely() {
     // Defensive: an invalid side value (place_trigger validates ≤ 1
     // at write time, but if a stale account has a corrupt side byte
     // we don't want to spuriously reject).
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 99, 1
     ));
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         1_000_000,
         99,
         u64::MAX
@@ -104,11 +104,11 @@ fn stop_loss_on_long_protected_against_gap_down() {
     let acceptable = 900;
     let side = 1;
     // Normal slow drop to 950: trigger fires, no slippage breach.
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         acceptable, side, 950
     ));
     // Gap-down through to 850: oracle < 900, slippage breached, trigger cancels.
-    assert!(TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(TriggerOrderAccount::slippage_cap_breached(
         acceptable, side, 850
     ));
 }
@@ -126,12 +126,12 @@ fn take_profit_on_long_protected_against_gap_up_misfill() {
     // example: TP on a SHORT (close short at low price, side=0):
     let acceptable_for_short_close = 90; // won't BUY above $90
     let side = 0; // buying to close the short
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         acceptable_for_short_close,
         side,
         85
     ));
-    assert!(TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(TriggerOrderAccount::slippage_cap_breached(
         acceptable_for_short_close,
         side,
         95
@@ -146,11 +146,11 @@ fn entry_order_protected_against_chase_fill() {
     let acceptable = 112;
     let side = 0;
     // Normal break to 111: fine, fire.
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         acceptable, side, 111
     ));
     // Vertical spike to 115: cap breached, don't fire.
-    assert!(TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(TriggerOrderAccount::slippage_cap_breached(
         acceptable, side, 115
     ));
 }
@@ -160,20 +160,20 @@ fn entry_order_protected_against_chase_fill() {
 #[test]
 fn cap_equal_to_oracle_admits_exact_match() {
     // Oracle exactly at the cap admits (cap is the *limit*, not strict).
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 0, 1_000_000
     ));
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(
+    assert!(!TriggerOrderAccount::slippage_cap_breached(
         1_000_000, 1, 1_000_000
     ));
 }
 
 #[test]
 fn cap_breach_off_by_one() {
-    assert!(TriggerOrderAccountV3::slippage_cap_breached(100, 0, 101));
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(100, 0, 100));
-    assert!(TriggerOrderAccountV3::slippage_cap_breached(100, 1, 99));
-    assert!(!TriggerOrderAccountV3::slippage_cap_breached(100, 1, 100));
+    assert!(TriggerOrderAccount::slippage_cap_breached(100, 0, 101));
+    assert!(!TriggerOrderAccount::slippage_cap_breached(100, 0, 100));
+    assert!(TriggerOrderAccount::slippage_cap_breached(100, 1, 99));
+    assert!(!TriggerOrderAccount::slippage_cap_breached(100, 1, 100));
 }
 
 // ─── Place-time validation (mirrors ix logic) ───────────────────────
@@ -210,7 +210,7 @@ fn space_still_accommodates_layout() {
     // Space allocates 8 + 128 = 136 → fits with 10 bytes spare.
     let body_bytes = 32 + 32 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 8 + 8 + 8 + 1 + 8 + 8;
     assert_eq!(body_bytes, 126);
-    assert!(TriggerOrderAccountV3::space() >= 8 + body_bytes);
+    assert!(TriggerOrderAccount::space() >= 8 + body_bytes);
     // Headroom: 136 - 8 (disc) - 126 (body) = 2 bytes spare.
-    assert_eq!(TriggerOrderAccountV3::space() - 8 - body_bytes, 2);
+    assert_eq!(TriggerOrderAccount::space() - 8 - body_bytes, 2);
 }

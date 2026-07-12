@@ -5,7 +5,7 @@ pub mod committee;
 pub mod envelope;
 pub mod fill_commitment;
 pub mod fill_outbox;
-pub mod flp_quoter;
+pub mod lp_quoter;
 pub mod funding;
 pub mod haircut;
 pub mod insurance;

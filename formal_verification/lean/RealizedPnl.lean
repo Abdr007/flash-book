@@ -133,7 +133,7 @@ integer PnL satisfies the exact identity
 `pnl · entry = sign · (price − entry) · notional` at UNBOUNDED width — the two
 systems settle the same value, with no rounding wedge (this is the host
 `matches_v2_notional_return_formula` test lifted to all magnitudes). -/
-theorem realized_reconciles_v2 (side closed entry price tick : ℕ) :
+theorem realized_reconciles (side closed entry price tick : ℕ) :
     realizedPnl side closed entry price tick * (entry : ℤ)
       = sign side * ((price : ℤ) - (entry : ℤ)) * ((closed : ℤ) * (entry : ℤ) * (tick : ℤ)) := by
   unfold realizedPnl; ring
@@ -187,7 +187,7 @@ theorem vwap_same_price (entry posSize fillSize : ℕ) (h : 1 ≤ posSize + fill
   have : entry * posSize + entry * fillSize = entry * (posSize + fillSize) := by ring
   rw [this, Nat.mul_div_cancel _ (show 0 < posSize + fillSize from h)]
 
-#print axioms realized_reconciles_v2
+#print axioms realized_reconciles
 #print axioms long_pnl_pos_iff
 #print axioms vwap_lower_bound
 #print axioms vwap_upper_bound

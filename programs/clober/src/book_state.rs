@@ -86,7 +86,7 @@ pub struct MarketBookHeader {
     pub total_orders_active: u32,
 
     /// Monotonic per-market order sequence counter. Encoded into
-    /// `RestingOrderV2.order_id` along with the side bit.
+    /// `RestingOrder.order_id` along with the side bit.
     pub order_seq_counter: u64,
 
     /// Reserved — 112 bytes for future fields without a layout break.
@@ -100,7 +100,7 @@ pub struct MarketBookHeader {
 
 const _: () = assert!(std::mem::size_of::<MarketBookHeader>() == 256);
 
-// ─── RestingOrderV2 ──────────────────────────────────────────────────
+// ─── RestingOrder ──────────────────────────────────────────────────
 
 /// 80-byte resting-order payload. Carries everything the matcher needs
 /// to clear a fill PLUS the GTT expiry + an `order_id` whose encoding
@@ -109,7 +109,7 @@ const _: () = assert!(std::mem::size_of::<MarketBookHeader>() == 256);
 /// Implements `Ord` by `order_id` (which embeds price + seq + side). The
 /// RBT uses this for sort.
 ///
-/// `RestingOrderV2.flags` bit1 = REDUCE_ONLY. Set ONLY by the program
+/// `RestingOrder.flags` bit1 = REDUCE_ONLY. Set ONLY by the program
 /// when a reduce-only trigger/bracket leg injects its close order (never
 /// settable on a user place path — those reject bit1 at intake). The
 /// matcher caps a crossed reduce-only maker's fill to the maker's
@@ -118,7 +118,7 @@ const _: () = assert!(std::mem::size_of::<MarketBookHeader>() == 256);
 pub const FLAG_REDUCE_ONLY: u8 = 0b0000_0010;
 
 #[zero_copy]
-pub struct RestingOrderV2 {
+pub struct RestingOrder {
     /// Side-encoded sort key: high bits price, low bits seq. For bids
     /// the price field is inverted so natural ascending sort puts the
     /// highest-price bids first (see `encode_order_id`).
@@ -148,7 +148,7 @@ pub struct RestingOrderV2 {
 
     pub side: u8,       // 0 = long/buy/bid, 1 = short/sell/ask
     pub order_type: u8, // 0 = limit, 1 = ioc, 2 = post_only, 3 = jit
-    /// Bitfield (authoritative layout — see lib.rs place_limit_order_v2 docs +
+    /// Bitfield (authoritative layout — see lib.rs place_limit_order docs +
     /// the matcher reads): bit0 post_only, bit1 reduce_only (program-injected
     /// only — rejected on user place paths at intake), bit2 ioc, bit3 jit,
     /// bits 4-5 stp_mode, bit6 fok.
@@ -158,43 +158,43 @@ pub struct RestingOrderV2 {
     /// `1..=255` = sub TraderState `[STATE_SEED, trader.as_ref(), &[sub_index]]`.
     /// Occupies a former `_pad` byte — nodes serialized before the field
     /// existed carry 0 here, which reads as the main-account default.
-    /// ApplyFill / ApplyFlpFill use this to route fills + fees + PnL
+    /// ApplyFill / ApplyLpFill use this to route fills + fees + PnL
     /// to the correct TraderState. Cancel / modify do NOT need to read
     /// it (those ixs verify the signer against `order.trader`, the
     /// wallet, regardless of sub_index).
     pub sub_index: u8,
 }
 
-const _: () = assert!(std::mem::size_of::<RestingOrderV2>() == 80);
+const _: () = assert!(std::mem::size_of::<RestingOrder>() == 80);
 
-// Make RestingOrderV2 usable as an RBT payload (Hypertree's `Payload`
+// Make RestingOrder usable as an RBT payload (Hypertree's `Payload`
 // requires `Ord + Eq + Display`).
-impl PartialEq for RestingOrderV2 {
+impl PartialEq for RestingOrder {
     fn eq(&self, other: &Self) -> bool {
         self.order_id == other.order_id
     }
 }
-impl Eq for RestingOrderV2 {}
-impl PartialOrd for RestingOrderV2 {
+impl Eq for RestingOrder {}
+impl PartialOrd for RestingOrder {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for RestingOrderV2 {
+impl Ord for RestingOrder {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.order_id.cmp(&other.order_id)
     }
 }
-impl std::fmt::Display for RestingOrderV2 {
+impl std::fmt::Display for RestingOrder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "RestingOrderV2 {{ side={} price_ticks={} size_lots={} seq={} }}",
+            "RestingOrder {{ side={} price_ticks={} size_lots={} seq={} }}",
             self.side, self.price_ticks, self.size_lots, self.seq
         )
     }
 }
-impl Get for RestingOrderV2 {}
+impl Get for RestingOrder {}
 
 /// Bit layout of the side-encoded `order_id`: high `ORDER_ID_PRICE_BITS`
 /// bits hold the price (in ticks), low `ORDER_ID_SEQ_BITS` bits hold the
@@ -214,7 +214,7 @@ pub const MAX_SEQ_ENCODABLE: u64 = (1u64 << ORDER_ID_SEQ_BITS) - 1;
 /// would get a SMALLER `order_id` than older orders at the same price
 /// (price-time-priority violation) and could even collide on `order_id`
 /// with a live order (mis-resolving cancel/modify and corrupting the
-/// best-index cache). Every resting order — user, FLP, trigger, TWAP,
+/// best-index cache). Every resting order — user, LP, trigger, TWAP,
 /// iceberg, basket — funnels through `insert_bid`/`insert_ask`, so
 /// enforcing the bound there is the single complete chokepoint. Fail-loud
 /// (reject the order) forces a market reseat before the counter wraps,
@@ -263,11 +263,11 @@ pub fn encode_order_id(price_ticks: u64, seq: u64, side_is_bid: bool) -> u64 {
     (price_key << ORDER_ID_SEQ_BITS) | seq_low
 }
 
-/// Build a probe `RestingOrderV2` whose only meaningful field is `order_id`,
-/// used to look up a node in an RBT by encoded id. `RestingOrderV2::cmp`
+/// Build a probe `RestingOrder` whose only meaningful field is `order_id`,
+/// used to look up a node in an RBT by encoded id. `RestingOrder::cmp`
 /// compares only `order_id`, so the other fields are inert for the lookup.
-pub fn probe_order(order_id: u64) -> RestingOrderV2 {
-    RestingOrderV2 {
+pub fn probe_order(order_id: u64) -> RestingOrder {
+    RestingOrder {
         order_id,
         seq: 0,
         price_ticks: 0,
@@ -382,14 +382,14 @@ mod order_id_priority_kani_proofs {
     }
 }
 
-// ─── ClaimedSeatV2 ───────────────────────────────────────────────────
+// ─── ClaimedSeat ───────────────────────────────────────────────────
 
 /// 80-byte per-(market, trader) seat. Holds the trader pubkey + open
 /// order count + free-funds balances. On first trade in a market the
 /// trader claims a seat (one-time rent ≈ $0.0005). Subsequent trades
 /// settle into `quote_free_lots` — no SPL token CPI on every fill.
 #[zero_copy]
-pub struct ClaimedSeatV2 {
+pub struct ClaimedSeat {
     pub trader: Pubkey,
 
     /// Quote lots available for trade (settled from prior fills, not
@@ -411,25 +411,25 @@ pub struct ClaimedSeatV2 {
     pub _reserved_b: [u8; 8],
 }
 
-const _: () = assert!(std::mem::size_of::<ClaimedSeatV2>() == 80);
+const _: () = assert!(std::mem::size_of::<ClaimedSeat>() == 80);
 
-impl PartialEq for ClaimedSeatV2 {
+impl PartialEq for ClaimedSeat {
     fn eq(&self, other: &Self) -> bool {
         self.trader == other.trader
     }
 }
-impl Eq for ClaimedSeatV2 {}
-impl PartialOrd for ClaimedSeatV2 {
+impl Eq for ClaimedSeat {}
+impl PartialOrd for ClaimedSeat {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for ClaimedSeatV2 {
+impl Ord for ClaimedSeat {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.trader.to_bytes().cmp(&other.trader.to_bytes())
     }
 }
-impl std::fmt::Display for ClaimedSeatV2 {
+impl std::fmt::Display for ClaimedSeat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -438,7 +438,7 @@ impl std::fmt::Display for ClaimedSeatV2 {
         )
     }
 }
-impl Get for ClaimedSeatV2 {}
+impl Get for ClaimedSeat {}
 
 // ─── MarketBookAccount ───────────────────────────────────────────────
 //
@@ -454,11 +454,11 @@ impl Get for ClaimedSeatV2 {}
 // `bytemuck::from_bytes` and exposes the rest as the dynamic byte
 // array for the hypertree's `FreeList`/`RedBlackTree` ops.
 
-// Compile-time sanity: RBNode<RestingOrderV2> and RBNode<ClaimedSeatV2>
+// Compile-time sanity: RBNode<RestingOrder> and RBNode<ClaimedSeat>
 // are exactly NODE_TOTAL_BYTES (96), so they fit the same FreeList
 // allocator. RBNode = 16-byte RBT header + 80-byte payload = 96.
-const _: () = assert!(std::mem::size_of::<RBNode<RestingOrderV2>>() == NODE_TOTAL_BYTES);
-const _: () = assert!(std::mem::size_of::<RBNode<ClaimedSeatV2>>() == NODE_TOTAL_BYTES);
+const _: () = assert!(std::mem::size_of::<RBNode<RestingOrder>>() == NODE_TOTAL_BYTES);
+const _: () = assert!(std::mem::size_of::<RBNode<ClaimedSeat>>() == NODE_TOTAL_BYTES);
 
 // ─── MarketBookHandle ────────────────────────────────────────────────
 //
@@ -591,9 +591,9 @@ impl<'a> MarketBookHandle<'a> {
     /// `NODE_TOTAL_BYTES` slot regardless of the payload `V`. Pinned by compile-time
     /// asserts so a field reorder fails the build, not silently validates wrong bytes.
     pub fn validate_node_links(account_data: &[u8]) -> Result<()> {
-        const _: () = assert!(core::mem::offset_of!(RBNode<RestingOrderV2>, left) == 0);
-        const _: () = assert!(core::mem::offset_of!(RBNode<RestingOrderV2>, right) == 4);
-        const _: () = assert!(core::mem::offset_of!(RBNode<RestingOrderV2>, parent) == 8);
+        const _: () = assert!(core::mem::offset_of!(RBNode<RestingOrder>, left) == 0);
+        const _: () = assert!(core::mem::offset_of!(RBNode<RestingOrder>, right) == 4);
+        const _: () = assert!(core::mem::offset_of!(RBNode<RestingOrder>, parent) == 8);
         require!(
             account_data.len() >= MARKET_BOOK_PREFIX_BYTES,
             crate::errors::CloberError::OutOfRange
@@ -899,11 +899,11 @@ impl<'a> MarketBookHandle<'a> {
         self.header.free_list_head_index = fl.get_head();
     }
 
-    /// Insert a `RestingOrderV2` into the bids RBT. Allocates a node
+    /// Insert a `RestingOrder` into the bids RBT. Allocates a node
     /// first, writes the payload, then inserts into the tree. Updates
     /// the bid root + best (= MIN-of-tree, which is the highest-priced
     /// bid given our inverted encoding) indices on the header.
-    pub fn insert_bid(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
+    pub fn insert_bid(&mut self, order: RestingOrder) -> Result<DataIndex> {
         require_seq_encodable(order.seq)?;
         let idx = self.alloc_node()?;
         // O(1) cache update: capture order_id now, compare against cached
@@ -912,7 +912,7 @@ impl<'a> MarketBookHandle<'a> {
         let new_root;
         {
             let mut tree =
-                RedBlackTree::<RestingOrderV2>::new(self.data, self.header.bids_root_index, NIL);
+                RedBlackTree::<RestingOrder>::new(self.data, self.header.bids_root_index, NIL);
             tree.insert(idx, order);
             new_root = tree.get_root_index();
         }
@@ -927,17 +927,17 @@ impl<'a> MarketBookHandle<'a> {
         Ok(idx)
     }
 
-    /// Insert a `RestingOrderV2` into the asks RBT. Mirror of `insert_bid`.
+    /// Insert a `RestingOrder` into the asks RBT. Mirror of `insert_bid`.
     /// "Best" = MIN of tree = lowest-priced ask (asks are NOT inverted, so
     /// natural ascending order — smallest order_id is the best ask).
-    pub fn insert_ask(&mut self, order: RestingOrderV2) -> Result<DataIndex> {
+    pub fn insert_ask(&mut self, order: RestingOrder) -> Result<DataIndex> {
         require_seq_encodable(order.seq)?;
         let idx = self.alloc_node()?;
         let new_order_id = order.order_id;
         let new_root;
         {
             let mut tree =
-                RedBlackTree::<RestingOrderV2>::new(self.data, self.header.asks_root_index, NIL);
+                RedBlackTree::<RestingOrder>::new(self.data, self.header.asks_root_index, NIL);
             tree.insert(idx, order);
             new_root = tree.get_root_index();
         }
@@ -958,9 +958,9 @@ impl<'a> MarketBookHandle<'a> {
     /// liquidity in price-time priority.
     pub fn for_each_bid_best_first<F>(&self, mut f: F)
     where
-        F: FnMut(DataIndex, &RestingOrderV2) -> bool,
+        F: FnMut(DataIndex, &RestingOrder) -> bool,
     {
-        for_each_best_first::<RestingOrderV2, F>(
+        for_each_best_first::<RestingOrder, F>(
             &self.data[..],
             self.header.bids_root_index,
             self.header.bids_best_index,
@@ -972,9 +972,9 @@ impl<'a> MarketBookHandle<'a> {
     /// of `for_each_bid_best_first`.
     pub fn for_each_ask_best_first<F>(&self, mut f: F)
     where
-        F: FnMut(DataIndex, &RestingOrderV2) -> bool,
+        F: FnMut(DataIndex, &RestingOrder) -> bool,
     {
-        for_each_best_first::<RestingOrderV2, F>(
+        for_each_best_first::<RestingOrder, F>(
             &self.data[..],
             self.header.asks_root_index,
             self.header.asks_best_index,
@@ -982,7 +982,7 @@ impl<'a> MarketBookHandle<'a> {
         );
     }
 
-    /// Decrement the `size_lots` of the `RestingOrderV2` at `idx` by `delta`.
+    /// Decrement the `size_lots` of the `RestingOrder` at `idx` by `delta`.
     /// Caller must guarantee `idx` is a live node in either the bids or asks
     /// RBT. Returns the new size_lots. Used by the matcher to apply partial
     /// fills without removing the order from the book.
@@ -992,8 +992,8 @@ impl<'a> MarketBookHandle<'a> {
     /// rejected instead of being silently saturated to zero, which masked the
     /// bug while the taker still recorded the full fill. Returns the new size.
     pub fn decrement_size_at(&mut self, idx: DataIndex, delta: u64) -> Result<u64> {
-        let node: &mut RBNode<RestingOrderV2> =
-            get_mut_helper::<RBNode<RestingOrderV2>>(self.data, idx);
+        let node: &mut RBNode<RestingOrder> =
+            get_mut_helper::<RBNode<RestingOrder>>(self.data, idx);
         let new_size = node
             .get_value()
             .size_lots
@@ -1003,11 +1003,11 @@ impl<'a> MarketBookHandle<'a> {
         Ok(new_size)
     }
 
-    /// Read-only access to the `RestingOrderV2` at `idx`. Caller must
+    /// Read-only access to the `RestingOrder` at `idx`. Caller must
     /// guarantee `idx` is a live node.
-    pub fn order_at(&self, idx: DataIndex) -> &RestingOrderV2 {
-        let node: &RBNode<RestingOrderV2> =
-            get_helper::<RBNode<RestingOrderV2>>(&self.data[..], idx);
+    pub fn order_at(&self, idx: DataIndex) -> &RestingOrder {
+        let node: &RBNode<RestingOrder> =
+            get_helper::<RBNode<RestingOrder>>(&self.data[..], idx);
         node.get_value()
     }
 
@@ -1026,12 +1026,12 @@ impl<'a> MarketBookHandle<'a> {
         // removing the best, the cached pointer is unchanged.
         let was_best = self.header.bids_best_index == idx;
         let new_best = if was_best {
-            let tree = RedBlackTreeReadOnly::<RestingOrderV2>::new(
+            let tree = RedBlackTreeReadOnly::<RestingOrder>::new(
                 &self.data[..],
                 self.header.bids_root_index,
                 NIL,
             );
-            successor_index::<RestingOrderV2>(&tree, idx)
+            successor_index::<RestingOrder>(&tree, idx)
         } else {
             self.header.bids_best_index
         };
@@ -1039,7 +1039,7 @@ impl<'a> MarketBookHandle<'a> {
         let new_root;
         {
             let mut tree =
-                RedBlackTree::<RestingOrderV2>::new(self.data, self.header.bids_root_index, NIL);
+                RedBlackTree::<RestingOrder>::new(self.data, self.header.bids_root_index, NIL);
             tree.remove_by_index(idx);
             new_root = tree.get_root_index();
         }
@@ -1053,12 +1053,12 @@ impl<'a> MarketBookHandle<'a> {
     pub fn remove_ask_node(&mut self, idx: DataIndex) {
         let was_best = self.header.asks_best_index == idx;
         let new_best = if was_best {
-            let tree = RedBlackTreeReadOnly::<RestingOrderV2>::new(
+            let tree = RedBlackTreeReadOnly::<RestingOrder>::new(
                 &self.data[..],
                 self.header.asks_root_index,
                 NIL,
             );
-            successor_index::<RestingOrderV2>(&tree, idx)
+            successor_index::<RestingOrder>(&tree, idx)
         } else {
             self.header.asks_best_index
         };
@@ -1066,7 +1066,7 @@ impl<'a> MarketBookHandle<'a> {
         let new_root;
         {
             let mut tree =
-                RedBlackTree::<RestingOrderV2>::new(self.data, self.header.asks_root_index, NIL);
+                RedBlackTree::<RestingOrder>::new(self.data, self.header.asks_root_index, NIL);
             tree.remove_by_index(idx);
             new_root = tree.get_root_index();
         }
@@ -1077,19 +1077,19 @@ impl<'a> MarketBookHandle<'a> {
     }
 
     /// Find the node in the bids RBT whose `order_id` matches `order_id`.
-    /// O(log n). Returns `NIL` if not found. Used by `cancel_order_v2` to
+    /// O(log n). Returns `NIL` if not found. Used by `cancel_order` to
     /// translate (trader, side, seq) → DataIndex.
     pub fn lookup_bid_by_order_id(&self, order_id: u64) -> DataIndex {
         if self.header.bids_root_index == NIL {
             return NIL;
         }
         let probe = probe_order(order_id);
-        let tree = RedBlackTreeReadOnly::<RestingOrderV2>::new(
+        let tree = RedBlackTreeReadOnly::<RestingOrder>::new(
             &self.data[..],
             self.header.bids_root_index,
             NIL,
         );
-        tree.lookup_index::<RestingOrderV2>(&probe)
+        tree.lookup_index::<RestingOrder>(&probe)
     }
 
     /// Mirror of `lookup_bid_by_order_id` for the asks RBT.
@@ -1098,12 +1098,12 @@ impl<'a> MarketBookHandle<'a> {
             return NIL;
         }
         let probe = probe_order(order_id);
-        let tree = RedBlackTreeReadOnly::<RestingOrderV2>::new(
+        let tree = RedBlackTreeReadOnly::<RestingOrder>::new(
             &self.data[..],
             self.header.asks_root_index,
             NIL,
         );
-        tree.lookup_index::<RestingOrderV2>(&probe)
+        tree.lookup_index::<RestingOrder>(&probe)
     }
 }
 
@@ -1223,12 +1223,12 @@ mod tests {
         data
     }
 
-    fn make_order(price: u64, seq: u64, side_is_bid: bool) -> RestingOrderV2 {
+    fn make_order(price: u64, seq: u64, side_is_bid: bool) -> RestingOrder {
         make_order_for(price, seq, side_is_bid, Pubkey::default())
     }
 
-    fn make_order_for(price: u64, seq: u64, side_is_bid: bool, trader: Pubkey) -> RestingOrderV2 {
-        RestingOrderV2 {
+    fn make_order_for(price: u64, seq: u64, side_is_bid: bool, trader: Pubkey) -> RestingOrder {
+        RestingOrder {
             order_id: encode_order_id(price, seq, side_is_bid),
             seq,
             price_ticks: price,
@@ -1274,7 +1274,7 @@ mod tests {
     }
 
     // Validates the cumulative reduce-only capacity scan + clamp used by
-    // `execute_trigger_order_v3` — the exact `for_each_ask_best_first`
+    // `execute_trigger_order` — the exact `for_each_ask_best_first`
     // predicate (reduce-only flag + same trader + same sub_index) and the
     // `min(req, position − Σexisting)` math — on a REAL MarketBookHandle.
     // Proves the scan sums only THIS position's resting reduce-only orders
@@ -1299,7 +1299,7 @@ mod tests {
 
     fn scan_ro(handle: &MarketBookHandle, trader: Pubkey, sub: u8) -> u64 {
         let mut existing = 0u64;
-        handle.for_each_ask_best_first(|_i, o: &RestingOrderV2| {
+        handle.for_each_ask_best_first(|_i, o: &RestingOrder| {
             if o.flags & FLAG_REDUCE_ONLY != 0 && o.trader == trader && o.sub_index == sub {
                 existing = existing.saturating_add(o.size_lots);
             }

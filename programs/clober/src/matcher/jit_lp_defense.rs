@@ -1,6 +1,6 @@
 //! JIT LP defense.
 //!
-//! Prevent flash JIT liquidity attacks against the FLP: a depositor
+//! Prevent flash JIT liquidity attacks against the LP: a depositor
 //! who tries to sneak in front of a big trader-loss event, capture the
 //! windfall, and exit immediately gets blocked by a minimum hold time.
 //!

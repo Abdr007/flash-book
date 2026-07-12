@@ -1,19 +1,19 @@
 //! Clober V3 account types — trigger/TWAP/iceberg orders, vaults,
-//! FLP per-market state, oracle configs, and the risk/haircut siblings.
+//! LP per-market state, oracle configs, and the risk/haircut siblings.
 //! All types live under the `clober` program ID; PDAs use distinct
-//! seed prefixes (`trigger_v3`, `vault_v3`, etc.) so they coexist
+//! seed prefixes (`trigger`, `vault`, etc.) so they coexist
 //! alongside the v1/v2 types without seed collision.
 
 use anchor_lang::prelude::*;
 
 // ─── Trigger orders v3 ──────────────────────────────────────────────
 
-/// V3 trigger order. Seeds: `[b"trigger_v3", market, trader, trigger_id]`.
+/// V3 trigger order. Seeds: `[b"trigger", market, trader, trigger_id]`.
 /// Distinct from the v1 `[b"trigger", ...]` prefix so both PDA families
 /// can coexist without collision.
 #[account]
 #[derive(Debug)]
-pub struct TriggerOrderAccountV3 {
+pub struct TriggerOrderAccount {
     pub trader: Pubkey,
     pub market: Pubkey,
     pub bump: u8,
@@ -28,8 +28,8 @@ pub struct TriggerOrderAccountV3 {
     pub expires_at_slot: u64,
     /// TraderState sub-account index this trigger fires against.
     /// Accounts serialized before this field existed read it as 0 (main)
-    /// from the trailing zeros of their allocation. ExecuteTriggerOrderV3
-    /// copies this into the synthetic RestingOrderV2.sub_index so the
+    /// from the trailing zeros of their allocation. ExecuteTriggerOrder
+    /// copies this into the synthetic RestingOrder.sub_index so the
     /// resulting fill is routed to the right TraderState.
     pub sub_index: u8,
     /// Slippage cap on trigger execution (acceptable-price pattern).
@@ -53,7 +53,7 @@ pub struct TriggerOrderAccountV3 {
     pub acceptable_price_ticks: u64,
     /// OCO link. For a bracket leg, this holds the sibling leg's
     /// `trigger_id`; when this leg FIRES, the executor must pass the
-    /// sibling `TriggerOrderAccountV3` and it is deactivated, so both legs
+    /// sibling `TriggerOrderAccount` and it is deactivated, so both legs
     /// of a bracket can never both fire (a whipsaw double-fill would flip
     /// the position). Set iff `flags & FLAG_HAS_SIBLING`. Trailing field:
     /// pre-existing accounts read 0 (no sibling) with `FLAG_HAS_SIBLING`
@@ -64,8 +64,8 @@ pub struct TriggerOrderAccountV3 {
     pub _reserved: [u8; 7],
 }
 
-impl TriggerOrderAccountV3 {
-    pub const SEED: &'static [u8] = b"trigger_v3";
+impl TriggerOrderAccount {
+    pub const SEED: &'static [u8] = b"trigger";
     pub const FLAG_REDUCE_ONLY: u8 = 1 << 0;
     pub const FLAG_ACTIVE: u8 = 1 << 1;
     /// Set on both legs of a bracket. Marks that `sibling_trigger_id` is
@@ -85,7 +85,7 @@ impl TriggerOrderAccountV3 {
     /// (`other.sibling_trigger_id == self.trigger_id`). The mutual back-link is
     /// what prevents a malicious executor from passing an unrelated trigger they
     /// own just to deactivate it. Pure function for unit-testability.
-    pub fn is_oco_sibling(&self, other: &TriggerOrderAccountV3) -> bool {
+    pub fn is_oco_sibling(&self, other: &TriggerOrderAccount) -> bool {
         self.trader == other.trader
             && self.market == other.market
             && other.trigger_id == self.sibling_trigger_id
@@ -108,10 +108,10 @@ impl TriggerOrderAccountV3 {
     }
 }
 
-/// V3 TWAP order. Seeds: `[b"twap_v3", market, trader, twap_id]`.
+/// V3 TWAP order. Seeds: `[b"twap", market, trader, twap_id]`.
 #[account]
 #[derive(Debug)]
-pub struct TwapOrderAccountV3 {
+pub struct TwapOrderAccount {
     pub trader: Pubkey,
     pub market: Pubkey,
     pub bump: u8,
@@ -126,11 +126,11 @@ pub struct TwapOrderAccountV3 {
     pub slot_interval: u64,
     pub end_slot: u64,
     pub last_slice_at_slot: u64,
-    /// Same semantics as TriggerOrderAccountV3.sub_index.
+    /// Same semantics as TriggerOrderAccount.sub_index.
     /// Every child slice the TWAP emits carries this sub_index in its
-    /// RestingOrderV2.
+    /// RestingOrder.
     pub sub_index: u8,
-    /// Same shape as `TriggerOrderAccountV3.acceptable_price_ticks`.
+    /// Same shape as `TriggerOrderAccount.acceptable_price_ticks`.
     /// Each TWAP slice is checked against this cap before injection.
     /// A slice that would fire while oracle is beyond the cap is
     /// **skipped** (not the TWAP deactivated) — the TWAP itself stays
@@ -140,8 +140,8 @@ pub struct TwapOrderAccountV3 {
     /// Reserved; reads as zero from the trailing allocation.
     pub _reserved: [u8; 7],
 }
-impl TwapOrderAccountV3 {
-    pub const SEED: &'static [u8] = b"twap_v3";
+impl TwapOrderAccount {
+    pub const SEED: &'static [u8] = b"twap";
     pub const FLAG_ACTIVE: u8 = 1 << 0;
     pub fn space() -> usize {
         // body = 32+32 + 4×u8 + 8×u64 + 1 sub + 8 acceptable + 7 reserved
@@ -152,10 +152,10 @@ impl TwapOrderAccountV3 {
     }
 }
 
-/// V3 iceberg order. Seeds: `[b"iceberg_v3", market, trader, iceberg_id]`.
+/// V3 iceberg order. Seeds: `[b"iceberg", market, trader, iceberg_id]`.
 #[account]
 #[derive(Debug)]
-pub struct IcebergOrderAccountV3 {
+pub struct IcebergOrderAccount {
     pub trader: Pubkey,
     pub market: Pubkey,
     pub bump: u8,
@@ -175,8 +175,8 @@ pub struct IcebergOrderAccountV3 {
     pub created_at_slot: u64,
     pub expires_at_slot: u64,
 }
-impl IcebergOrderAccountV3 {
-    pub const SEED: &'static [u8] = b"iceberg_v3";
+impl IcebergOrderAccount {
+    pub const SEED: &'static [u8] = b"iceberg";
     pub const FLAG_ACTIVE: u8 = 1 << 0;
     pub fn space() -> usize {
         8 + 128
@@ -185,10 +185,10 @@ impl IcebergOrderAccountV3 {
 
 // ─── Vaults v3 ──────────────────────────────────────────────────────
 
-/// V3 vault account. Seeds: `[b"vault_v3", strategist, vault_id]`.
+/// V3 vault account. Seeds: `[b"vault", strategist, vault_id]`.
 #[account]
 #[derive(Debug)]
-pub struct VaultAccountV3 {
+pub struct VaultAccount {
     pub strategist: Pubkey,
     pub bump: u8,
     pub vault_id: u8,
@@ -204,17 +204,17 @@ pub struct VaultAccountV3 {
     pub last_perf_settlement_unix: u64,
     pub total_perf_shares_minted: u64,
 }
-impl VaultAccountV3 {
-    pub const SEED: &'static [u8] = b"vault_v3";
+impl VaultAccount {
+    pub const SEED: &'static [u8] = b"vault";
     pub fn space() -> usize {
         8 + 144
     }
 }
 
-/// V3 vault depositor position. Seeds: `[b"vault_position_v3", vault, depositor]`.
+/// V3 vault depositor position. Seeds: `[b"vault_position", vault, depositor]`.
 #[account]
 #[derive(Debug, Default)]
-pub struct VaultPositionAccountV3 {
+pub struct VaultPositionAccount {
     pub vault: Pubkey,
     pub depositor: Pubkey,
     pub bump: u8,
@@ -222,20 +222,20 @@ pub struct VaultPositionAccountV3 {
     pub total_deposited_quote_lots: u64,
     pub total_withdrawn_quote_lots: u64,
 }
-impl VaultPositionAccountV3 {
-    pub const SEED: &'static [u8] = b"vault_position_v3";
+impl VaultPositionAccount {
+    pub const SEED: &'static [u8] = b"vault_position";
     pub fn space() -> usize {
         8 + 112
     }
 }
 
-// ─── Per-market FLP v3 ──────────────────────────────────────────────
+// ─── Per-market LP v3 ──────────────────────────────────────────────
 
-/// Per-market FLP exposure. Replaces the singleton's per_market[] array
+/// Per-market LP exposure. Replaces the singleton's per_market[] array
 /// for independent ER-delegation per market.
 #[account]
 #[derive(Debug)]
-pub struct FlpExposurePerMarketAccountV3 {
+pub struct LpMarketExposureAccount {
     pub market: Pubkey,
     pub authority: Pubkey,
     pub bump: u8,
@@ -247,17 +247,17 @@ pub struct FlpExposurePerMarketAccountV3 {
     pub realized_pnl: i64,
     pub lp_shares_outstanding: u64,
 }
-impl FlpExposurePerMarketAccountV3 {
-    pub const SEED: &'static [u8] = b"flp_per_market";
+impl LpMarketExposureAccount {
+    pub const SEED: &'static [u8] = b"lp_per_market";
     pub fn space() -> usize {
         8 + 128
     }
 }
 
-/// Per-LP, per-market FLP shares balance.
+/// Per-LP, per-market LP shares balance.
 #[account]
 #[derive(Debug)]
-pub struct FlpPositionAccountV3 {
+pub struct LpMarketPositionAccount {
     pub market: Pubkey,
     pub lp: Pubkey,
     pub bump: u8,
@@ -269,8 +269,8 @@ pub struct FlpPositionAccountV3 {
     /// retroactively locked (`can_withdraw` returns true at slot 0).
     pub deposited_at_slot: u64,
 }
-impl FlpPositionAccountV3 {
-    pub const SEED: &'static [u8] = b"flp_position_v3";
+impl LpMarketPositionAccount {
+    pub const SEED: &'static [u8] = b"lp_position";
     pub fn space() -> usize {
         8 + 96
     }
@@ -278,15 +278,15 @@ impl FlpPositionAccountV3 {
 // The struct must fit the reserved account data (`space() = 8 + 96`); the new
 // `deposited_at_slot` field consumes reserved tail, not new allocation.
 const _: () = assert!(
-    core::mem::size_of::<FlpPositionAccountV3>() <= 96,
-    "FlpPositionAccountV3 exceeds its reserved account data"
+    core::mem::size_of::<LpMarketPositionAccount>() <= 96,
+    "LpMarketPositionAccount exceeds its reserved account data"
 );
 
 // ─── JIT liquidation offers v3 ──────────────────────────────────────
 //
 // A *maker* can pre-commit a "tighter than synthetic" close price to be
 // used WHEN any underwater trader is liquidated on this market. When
-// `liquidate_position_v2` fires, the matcher walks JIT offers first,
+// `liquidate_position` fires, the matcher walks JIT offers first,
 // picks the best price beating the synthetic `oracle ± liq_penalty`,
 // and uses it as the close-order's limit price. The trader loses LESS
 // collateral; the insurance fund draws LESS; the maker gets a
@@ -897,8 +897,8 @@ mod tests {
     // Host coverage for the OCO sibling validation —
     // the security-critical check that stops a malicious executor from passing
     // an unrelated trigger just to deactivate it.
-    fn mk_trig(trader: Pubkey, market: Pubkey, id: u8, sibling: u8) -> TriggerOrderAccountV3 {
-        TriggerOrderAccountV3 {
+    fn mk_trig(trader: Pubkey, market: Pubkey, id: u8, sibling: u8) -> TriggerOrderAccount {
+        TriggerOrderAccount {
             trader,
             market,
             bump: 0,
@@ -965,15 +965,15 @@ mod tests {
     #[test]
     fn jit_offer_pda_seed_distinct_from_v3_others() {
         // Confirm the JIT seed prefix doesn't collide with any sibling V3 seed
-        // (regression: someone reusing `trigger_v3` etc).
+        // (regression: someone reusing `trigger` etc).
         let jit = JitLiquidationOfferAccount::SEED;
-        assert_ne!(jit, TriggerOrderAccountV3::SEED);
-        assert_ne!(jit, TwapOrderAccountV3::SEED);
-        assert_ne!(jit, IcebergOrderAccountV3::SEED);
-        assert_ne!(jit, VaultAccountV3::SEED);
-        assert_ne!(jit, VaultPositionAccountV3::SEED);
-        assert_ne!(jit, FlpExposurePerMarketAccountV3::SEED);
-        assert_ne!(jit, FlpPositionAccountV3::SEED);
+        assert_ne!(jit, TriggerOrderAccount::SEED);
+        assert_ne!(jit, TwapOrderAccount::SEED);
+        assert_ne!(jit, IcebergOrderAccount::SEED);
+        assert_ne!(jit, VaultAccount::SEED);
+        assert_ne!(jit, VaultPositionAccount::SEED);
+        assert_ne!(jit, LpMarketExposureAccount::SEED);
+        assert_ne!(jit, LpMarketPositionAccount::SEED);
         assert_ne!(jit, MarketHaircutStateAccount::SEED);
         assert_ne!(jit, PositionHaircutStateAccount::SEED);
     }
@@ -987,13 +987,13 @@ mod tests {
     #[test]
     fn twap_v3_space_matches_borsh_serialized_len() {
         use anchor_lang::AnchorSerialize;
-        let acc = TwapOrderAccountV3 {
+        let acc = TwapOrderAccount {
             trader: Pubkey::new_unique(),
             market: Pubkey::new_unique(),
             bump: 255,
             twap_id: 7,
             side: 1,
-            flags: TwapOrderAccountV3::FLAG_ACTIVE,
+            flags: TwapOrderAccount::FLAG_ACTIVE,
             slice_size_lots: u64::MAX,
             total_size_lots: u64::MAX,
             size_executed_lots: 123,
@@ -1012,7 +1012,7 @@ mod tests {
         acc.serialize(&mut body).expect("borsh serialize");
         assert_eq!(body.len(), 148, "serialized TWAP body must be 148 bytes");
         assert_eq!(
-            TwapOrderAccountV3::space(),
+            TwapOrderAccount::space(),
             8 + body.len(),
             "space() must equal 8-byte disc + exact serialized body"
         );

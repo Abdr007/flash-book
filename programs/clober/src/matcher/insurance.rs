@@ -105,15 +105,15 @@ impl InsuranceFund {
 // ─────────────────────────────────────────────────────────────────────
 // Protocol solvency check (P-SOLV-4, protocol-owned buckets). Pure core of
 // `verify_protocol_solvency`: the quote vault must cover the insurance fund +
-// FLP capital. Returns (solvent, surplus); surplus is exact when solvent, so the
-// vault accounts EXACTLY to insurance + FLP + surplus (no value invented).
-// Overflow-safe — `insurance + flp` via checked_add. This is the
-// protocol-owned subset; the broader `vault ≥ Σ trader_collateral + FLP +
+// LP capital. Returns (solvent, surplus); surplus is exact when solvent, so the
+// vault accounts EXACTLY to insurance + LP + surplus (no value invented).
+// Overflow-safe — `insurance + lp` via checked_add. This is the
+// protocol-owned subset; the broader `vault ≥ Σ trader_collateral + LP +
 // insurance` whole-program invariant is specified in certora/PROPERTIES.md.
 // ─────────────────────────────────────────────────────────────────────
 
 /// Reference model for the full solvency invariant: the vault must cover ALL
-/// liabilities — `vault >= total_collateral + flp_capital + insurance`.
+/// liabilities — `vault >= total_collateral + lp_capital + insurance`.
 /// Stronger than [`assess_solvency`], which omits trader collateral and so
 /// only covers the protocol-owned subset. The full sum is unbounded on-chain
 /// (it requires every trader's collateral), so no instruction evaluates this
@@ -127,11 +127,11 @@ impl InsuranceFund {
 pub fn assess_solvency_full(
     vault: u64,
     total_collateral: u64,
-    flp_capital: u64,
+    lp_capital: u64,
     insurance: u64,
 ) -> core::result::Result<(bool, u64), ()> {
     let required = total_collateral
-        .checked_add(flp_capital)
+        .checked_add(lp_capital)
         .ok_or(())?
         .checked_add(insurance)
         .ok_or(())?;
@@ -143,7 +143,7 @@ pub fn assess_solvency_full(
 /// One-sided insolvency detector over a PARTIAL (deduplicated) collateral sum.
 ///
 /// The full invariant needs `Σ collateral` over ALL traders, which is unbounded
-/// on-chain. But solvency only requires `Σ collateral <= vault - (flp +
+/// on-chain. But solvency only requires `Σ collateral <= vault - (lp +
 /// insurance)`, so if any DEDUPLICATED SUBSET of trader collateral already
 /// exceeds that headroom, the protocol is provably insolvent regardless of the
 /// unseen remainder (the real total is `>=` the partial sum). This is sound in
@@ -154,11 +154,11 @@ pub fn assess_solvency_full(
 #[inline]
 pub fn partial_collateral_proves_insolvent(
     partial_collateral: u64,
-    flp_capital: u64,
+    lp_capital: u64,
     insurance: u64,
     vault: u64,
 ) -> core::result::Result<bool, ()> {
-    let buckets = flp_capital.checked_add(insurance).ok_or(())?;
+    let buckets = lp_capital.checked_add(insurance).ok_or(())?;
     // headroom = vault - buckets, saturating at 0: if the protocol-owned buckets
     // alone already exceed the vault, ANY positive collateral proves insolvency.
     let headroom = vault.saturating_sub(buckets);
@@ -169,8 +169,8 @@ pub fn partial_collateral_proves_insolvent(
 ///
 /// `residual` is the sole backing for junior-profit extraction (convert_position
 /// credits `min(residual, matured)/matured` of matured PnL). It must be covered
-/// by the vault SURPLUS (`vault − collateral − flp − insurance`). Since
-/// `partial_collateral <= total_collateral`, if `partial + flp + insurance +
+/// by the vault SURPLUS (`vault − collateral − lp − insurance`). Since
+/// `partial_collateral <= total_collateral`, if `partial + lp + insurance +
 /// residual` already exceeds the vault, the residual is PROVABLY over-stated /
 /// unbacked, regardless of the unseen collateral remainder. Sound in one
 /// direction: `true` ⇒ the residual is definitely unbacked — it never fires on a
@@ -178,29 +178,29 @@ pub fn partial_collateral_proves_insolvent(
 #[inline]
 pub fn residual_exceeds_backed_surplus(
     partial_collateral: u64,
-    flp_capital: u64,
+    lp_capital: u64,
     insurance: u64,
     residual: u128,
     vault: u64,
 ) -> bool {
     let committed = (partial_collateral as u128)
-        .saturating_add(flp_capital as u128)
+        .saturating_add(lp_capital as u128)
         .saturating_add(insurance as u128)
         .saturating_add(residual);
     committed > vault as u128
 }
 
-/// Assess protocol solvency over the vault / insurance / FLP-capital buckets.
-/// `Err(())` iff `insurance + flp_capital` overflows u64 (unreachable for real
+/// Assess protocol solvency over the vault / insurance / LP-capital buckets.
+/// `Err(())` iff `insurance + lp_capital` overflows u64 (unreachable for real
 /// balances — the caller maps it to ArithmeticOverflow).
 #[allow(clippy::result_unit_err)] // the caller maps the erased error to a program error
 #[inline]
 pub fn assess_solvency(
     vault: u64,
     insurance: u64,
-    flp_capital: u64,
+    lp_capital: u64,
 ) -> core::result::Result<(bool, u64), ()> {
-    let minimum_required = insurance.checked_add(flp_capital).ok_or(())?;
+    let minimum_required = insurance.checked_add(lp_capital).ok_or(())?;
     let solvent = vault >= minimum_required;
     let surplus = if solvent { vault - minimum_required } else { 0 };
     Ok((solvent, surplus))
@@ -212,16 +212,16 @@ mod solvency_kani_proofs {
     use super::{assess_solvency, assess_solvency_full, partial_collateral_proves_insolvent};
 
     /// P-SOLV-4 CORRECTNESS: full-invariant `solvent` is exactly
-    /// `vault >= total_collateral + flp + insurance`.
+    /// `vault >= total_collateral + lp + insurance`.
     #[kani::proof]
     fn full_solvent_iff_vault_covers_all_liabilities() {
         let vault: u64 = kani::any();
         let collateral: u64 = kani::any();
-        let flp: u64 = kani::any();
+        let lp: u64 = kani::any();
         let insurance: u64 = kani::any();
-        if let Ok((solvent, surplus)) = assess_solvency_full(vault, collateral, flp, insurance) {
-            // no-overflow path: collateral + flp + insurance fits u64
-            let req = collateral + flp + insurance;
+        if let Ok((solvent, surplus)) = assess_solvency_full(vault, collateral, lp, insurance) {
+            // no-overflow path: collateral + lp + insurance fits u64
+            let req = collateral + lp + insurance;
             assert!(solvent == (vault >= req));
             if solvent {
                 assert!(req + surplus == vault); // surplus exact, no value invented
@@ -239,42 +239,42 @@ mod solvency_kani_proofs {
     #[kani::proof]
     fn partial_insolvency_detector_is_sound() {
         let partial: u64 = kani::any();
-        let flp: u64 = kani::any();
+        let lp: u64 = kani::any();
         let insurance: u64 = kani::any();
         let vault: u64 = kani::any();
         let total: u64 = kani::any();
         kani::assume(total >= partial);
-        if let Ok(true) = partial_collateral_proves_insolvent(partial, flp, insurance, vault) {
-            if let Ok((solvent, _)) = assess_solvency_full(vault, total, flp, insurance) {
+        if let Ok(true) = partial_collateral_proves_insolvent(partial, lp, insurance, vault) {
+            if let Ok((solvent, _)) = assess_solvency_full(vault, total, lp, insurance) {
                 assert!(!solvent);
             }
         }
     }
 
-    /// CORRECTNESS: `solvent` is exactly `vault ≥ insurance + flp_capital`.
+    /// CORRECTNESS: `solvent` is exactly `vault ≥ insurance + lp_capital`.
     #[kani::proof]
     fn solvent_iff_vault_covers_buckets() {
         let vault: u64 = kani::any();
         let insurance: u64 = kani::any();
-        let flp: u64 = kani::any();
-        if let Ok((solvent, _)) = assess_solvency(vault, insurance, flp) {
-            // no overflow path: insurance + flp fits u64
-            let req = insurance + flp;
+        let lp: u64 = kani::any();
+        if let Ok((solvent, _)) = assess_solvency(vault, insurance, lp) {
+            // no overflow path: insurance + lp fits u64
+            let req = insurance + lp;
             assert!(solvent == (vault >= req));
         }
     }
 
     /// CONSERVATION: when solvent, the vault accounts EXACTLY to
-    /// `insurance + flp + surplus` — surplus is never inflated, no value invented.
+    /// `insurance + lp + surplus` — surplus is never inflated, no value invented.
     #[kani::proof]
     fn surplus_exact_when_solvent() {
         let vault: u64 = kani::any();
         let insurance: u64 = kani::any();
-        let flp: u64 = kani::any();
-        if let Ok((solvent, surplus)) = assess_solvency(vault, insurance, flp) {
+        let lp: u64 = kani::any();
+        if let Ok((solvent, surplus)) = assess_solvency(vault, insurance, lp) {
             if solvent {
-                // insurance + flp + surplus == vault, with no overflow
-                let req = insurance + flp;
+                // insurance + lp + surplus == vault, with no overflow
+                let req = insurance + lp;
                 assert!(req + surplus == vault);
             } else {
                 assert!(surplus == 0);
@@ -284,7 +284,7 @@ mod solvency_kani_proofs {
 
     /// ISOLATION (anti-single-vault-SPOF): the bad-debt waterfall debits the
     /// insurance fund by a function of ONLY its own balance and the shortfall —
-    /// FLP capital is not an input and cannot be drained by it. Mirrors the exact
+    /// LP capital is not an input and cannot be drained by it. Mirrors the exact
     /// arithmetic of `cover_bad_debt` (lib.rs). Bounds: coverage never exceeds the
     /// fund balance (no underflow), never exceeds the shortfall (no over-payout),
     /// and the balance only falls.
@@ -308,7 +308,7 @@ mod m6_residual_backing_tests {
 
     #[test]
     fn backed_residual_passes() {
-        // vault 1000; collateral 400 + flp 200 + insurance 100 = 700 committed;
+        // vault 1000; collateral 400 + lp 200 + insurance 100 = 700 committed;
         // residual 200 → 900 <= 1000 → backed (no flag).
         assert!(!residual_exceeds_backed_surplus(400, 200, 100, 200, 1000));
         // exactly at the surplus (900 committed, residual 100 → 1000) is OK.
@@ -349,7 +349,7 @@ mod solvency_full_tests {
 
     #[test]
     fn full_invariant_counts_collateral() {
-        // vault exactly covers collateral + flp + insurance ⇒ solvent, zero surplus.
+        // vault exactly covers collateral + lp + insurance ⇒ solvent, zero surplus.
         assert_eq!(assess_solvency_full(100, 60, 30, 10), Ok((true, 0)));
         // one extra lot of headroom ⇒ surplus 1.
         assert_eq!(assess_solvency_full(101, 60, 30, 10), Ok((true, 1)));
@@ -359,7 +359,7 @@ mod solvency_full_tests {
 
     #[test]
     fn partial_detector_fires_only_on_real_insolvency() {
-        // vault 100, buckets flp30+ins10=40 ⇒ headroom 60.
+        // vault 100, buckets lp30+ins10=40 ⇒ headroom 60.
         // A partial collateral sum of 61 (subset!) already exceeds headroom ⇒ insolvent.
         assert_eq!(
             partial_collateral_proves_insolvent(61, 30, 10, 100),
@@ -381,11 +381,11 @@ mod solvency_full_tests {
     fn partial_detector_is_one_sided_sound_vs_full() {
         // Whenever the partial detector fires, the full check on the SAME-or-larger
         // total must agree it's insolvent.
-        for &(partial, flp, ins, vault) in &[(61u64, 30u64, 10u64, 100u64), (1, 80, 30, 100)] {
-            if partial_collateral_proves_insolvent(partial, flp, ins, vault) == Ok(true) {
+        for &(partial, lp, ins, vault) in &[(61u64, 30u64, 10u64, 100u64), (1, 80, 30, 100)] {
+            if partial_collateral_proves_insolvent(partial, lp, ins, vault) == Ok(true) {
                 for extra in 0..5u64 {
                     let total = partial + extra;
-                    let (solvent, _) = assess_solvency_full(vault, total, flp, ins).unwrap();
+                    let (solvent, _) = assess_solvency_full(vault, total, lp, ins).unwrap();
                     assert!(!solvent, "detector fired but full check called it solvent");
                 }
             }

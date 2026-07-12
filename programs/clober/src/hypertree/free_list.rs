@@ -28,7 +28,7 @@ pub struct FreeListNode<T> {
 // `node_inner` sits flush after `next_index` and the struct size is exactly
 // `4 + size_of::<T>()`. The SOLE instantiation is `FreeListNode<FreeListPadding>`
 // (payload align 1), which is compile-time size-pinned to `NODE_TOTAL_BYTES` at
-// `state_v2.rs` (const-assert). Any future instantiation with an over-aligned
+// `book_state.rs` (const-assert). Any future instantiation with an over-aligned
 // payload would introduce uninit padding and MUST be gated by an equivalent
 // `assert!(size_of::<FreeListNode<NewT>>() == 4 + size_of::<NewT>())` or it is
 // unsound. Do not add such an instantiation without that assert.

@@ -14,8 +14,8 @@
 //! cast at offset 8, which requires 8-alignment).
 
 use anchor_lang::prelude::Pubkey;
-use clober::state_v2::{
-    encode_order_id, MarketBookHandle, RestingOrderV2, MARKET_BOOK_DISC,
+use clober::book_state::{
+    encode_order_id, MarketBookHandle, RestingOrder, MARKET_BOOK_DISC,
     MARKET_BOOK_MAX_TOTAL_BYTES, MARKET_BOOK_PREFIX_BYTES, MARKET_BOOK_TOTAL_BYTES,
     NODE_TOTAL_BYTES,
 };
@@ -53,8 +53,8 @@ fn choose_len(i: usize) -> usize {
     }
 }
 
-fn order(price: u64, seq: u64, is_bid: bool) -> RestingOrderV2 {
-    RestingOrderV2 {
+fn order(price: u64, seq: u64, is_bid: bool) -> RestingOrder {
+    RestingOrder {
         order_id: encode_order_id(price, seq, is_bid),
         seq,
         price_ticks: price,
