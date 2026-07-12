@@ -10257,7 +10257,14 @@ pub mod flash_book {
             .checked_mul(tick_size)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
         require!(denom > 0, FlashBookError::ZeroPrice);
-        let collateral_per_lot_ticks = collateral / denom;
+        // Round the equity-per-lot UP so the bankruptcy price is pushed AWAY from
+        // entry (long: lower, short: higher). Flooring pulled `bp` toward entry,
+        // which let `adl_bankruptcy_reached` fire while the position still held up
+        // to ~1 tick of true equity — an over-seizure that wiped solvent equity.
+        // `div_ceil` makes the equity at `bp` ≤ 0 by construction, so ADL only ever
+        // fires on a genuinely-bankrupt leg (at worst 1 tick late, which cannot
+        // seize a solvent trader's equity).
+        let collateral_per_lot_ticks = collateral.div_ceil(denom);
         let bp_u128: u128 = if underwater.side == 0 {
             // long: bp = entry - C/(S*tick); clamp to 1 if collateral overshoots
             entry.saturating_sub(collateral_per_lot_ticks).max(1)
