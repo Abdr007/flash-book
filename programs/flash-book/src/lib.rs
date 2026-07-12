@@ -3436,6 +3436,9 @@ pub mod flash_book {
         // above it.
         if flp_ro.markets_count > 0 {
             let remaining = ctx.remaining_accounts;
+            let hm_clock = Clock::get()?;
+            let hm_now_unix = hm_clock.unix_timestamp.max(0) as u64;
+            let hm_slot = hm_clock.slot;
             let mut gross_exposure: u128 = 0;
             let mut matched: u8 = 0;
             for slot in flp_ro.per_market.iter() {
@@ -3449,8 +3452,15 @@ pub mod flash_book {
                     .ok_or_else(|| error!(FlashBookError::MissingMarketAccount))?;
                 let m_data = market_ai.try_borrow_data()?;
                 let m_state = MarketAccount::try_deserialize(&mut &m_data[..])?;
+                // C/J-2: value the pool's inventory at the staleness-aware
+                // worse-of(mark, oracle) HEALTH price for the inventory side, not
+                // the raw ER mark — so an LP cannot withdraw against an
+                // over-optimistic mark while the oracle disagrees. Fails closed
+                // (reverts) if neither mark nor oracle is usable.
+                let health_px =
+                    effective_health_mark(&m_state, hm_now_unix, hm_slot, slot.side == 0)?;
                 let notional = (slot.size_lots as u128)
-                    .saturating_mul(m_state.mark_price_ticks as u128)
+                    .saturating_mul(health_px as u128)
                     .saturating_mul(m_state.params.tick_size as u128);
                 gross_exposure = gross_exposure.saturating_add(notional);
                 matched += 1;
@@ -3824,9 +3834,22 @@ pub mod flash_book {
             ctx.accounts.authority.key(),
             FlashBookError::Unauthorized
         );
+        // K-2: rate-limit threshold changes. The pause threshold is the
+        // ADL/insurance-pause trigger floor; a cooldown stops a compromised or
+        // erratic authority from rapidly toggling it to game when ADL fires. The
+        // first update on a fresh fund (stamp == 0) is always allowed.
+        let current_slot = Clock::get()?.slot;
         let f = &mut ctx.accounts.insurance_fund;
+        if f.last_threshold_update_slot > 0 {
+            let elapsed = current_slot.saturating_sub(f.last_threshold_update_slot);
+            require!(
+                elapsed >= constants::INSURANCE_THRESHOLD_UPDATE_MIN_SLOTS,
+                FlashBookError::RateLimited
+            );
+        }
         let previous = f.pause_threshold_quote_lots;
         f.pause_threshold_quote_lots = new_threshold_quote_lots;
+        f.last_threshold_update_slot = current_slot;
         emit!(InsurancePauseThresholdUpdatedEvent {
             authority: ctx.accounts.authority.key(),
             previous_threshold_quote_lots: previous,
@@ -13066,11 +13089,20 @@ pub mod flash_book {
 
         // Position-aware solvency floor (mirrors the singleton). While the pool
         // holds open inventory, post-withdraw NAV must still cover its gross
-        // exposure at the current mark, so a withdrawal cannot leave the remaining
-        // LPs backing a position larger than the capital left behind.
+        // exposure, so a withdrawal cannot leave the remaining LPs backing a
+        // position larger than the capital left behind. C/J-2: valued at the
+        // staleness-aware worse-of(mark, oracle) HEALTH price for the inventory
+        // side (not the raw mark), and fails closed if neither is usable.
         if side != 255 && size_lots > 0 {
+            let hm_clock = Clock::get()?;
+            let health_px = effective_health_mark(
+                &ctx.accounts.market,
+                hm_clock.unix_timestamp.max(0) as u64,
+                hm_clock.slot,
+                side == 0,
+            )?;
             let gross_exposure = (size_lots as u128)
-                .saturating_mul(ctx.accounts.market.mark_price_ticks as u128)
+                .saturating_mul(health_px as u128)
                 .saturating_mul(ctx.accounts.market.params.tick_size as u128);
             let post_nav: i128 = (new_total as i128) + (new_realized_pnl as i128);
             require!(

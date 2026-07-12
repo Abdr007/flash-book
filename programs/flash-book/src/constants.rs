@@ -117,6 +117,14 @@ pub const REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS: u64 = 750;
 /// path also exists; the timelocked path is the production-safe alternative.
 pub const PARAM_UPDATE_TIMELOCK_SECONDS: i64 = 48 * 60 * 60;
 
+/// K-2: minimum L1 slots between two `set_insurance_pause_threshold` changes.
+/// The pause threshold is the ADL/insurance-pause trigger floor; without a
+/// cooldown a compromised or erratic insurance authority could rapidly toggle
+/// it to game exactly when ADL fires. ~1h at ~0.4s/slot — long enough to defeat
+/// rapid toggling, short enough not to impede genuine governance. The first
+/// update on a fresh fund (stamp == 0) is always allowed.
+pub const INSURANCE_THRESHOLD_UPDATE_MIN_SLOTS: u64 = 9_000;
+
 /// ER-stall safety floor: max L1 slots since the mark price last moved (via the
 /// fill-EMA in `apply_fill` or a hard `settle_mark`) before the mark is treated
 /// as STALE. A stalled MagicBlock ER freezes the fill stream, so the mark stops
