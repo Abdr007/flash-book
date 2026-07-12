@@ -113,8 +113,8 @@ pub const REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS: u64 = 750;
 /// Delay (unix seconds) a proposed market-params change must wait before it
 /// can be executed. 48h gives LPs and traders a window to see the
 /// pre-announced change (the `ParamUpdateProposedEvent` carries the eta)
-/// and exit or react before it lands. The immediate `update_market_params`
-/// path also exists; the timelocked path is the production-safe alternative.
+/// and exit or react before it lands. K-3: the immediate `update_market_params`
+/// bypass was removed, so this timelocked path is the ONLY way to change params.
 pub const PARAM_UPDATE_TIMELOCK_SECONDS: i64 = 48 * 60 * 60;
 
 /// K-2: minimum L1 slots between two `set_insurance_pause_threshold` changes.
