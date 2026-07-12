@@ -1,0 +1,24 @@
+Flash Book — third-party components & modification notices
+==========================================================
+
+This product includes software developed by third parties. First-party Flash
+Book code is licensed MIT (see LICENSE). The compiled on-chain program links the
+GPL-3.0-only component below and is therefore distributed under GPL-3.0-only as a
+combined work; see docs/LICENSE_ANALYSIS.md.
+
+------------------------------------------------------------------------------
+programs/flash-book/src/hypertree/
+------------------------------------------------------------------------------
+Vendored from Manifest (https://github.com/Bonasa-Tech/manifest),
+licensed GPL-3.0-only (see LICENSE-HYPERTREE).
+
+This is a MODIFIED copy (GPL-3.0 §5a notice). Local changes from upstream
+include, without limitation:
+  - `#[cfg(feature = "certora")]` / `#[cfg(kani)]` gates and a bounded `NIL`
+    sentinel added for formal verification;
+  - integration glue (imports, `DataIndex` typing) to embed the structure in the
+    flash-book program;
+  - removal/adaptation of upstream-specific modules not used here.
+
+The corresponding source for the entire combined work is available in this
+public repository, satisfying GPL-3.0 §6.
