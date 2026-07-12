@@ -1,7 +1,8 @@
 //! Virtual FLP quoter — integer-arithmetic port of the TS reference.
 //!
 //! Spread function (per level, cumulative size Q):
-//!   s_bps = s0 + α·VPIN_bps + β·u_bps + γ·|oi_imb_bps| + κ·(Q/depth_floor)·BPS
+//!   s_bps = s0 + β·u_bps + γ·|oi_imb_bps| + κ·(Q/depth_floor)·BPS + δ·realized_vol
+//!   (the α·VPIN toxicity term is RETIRED / inert — see the s_bps comment below)
 //!
 //! Inventory skew (Avellaneda-Stoikov-inspired):
 //!   skew_bps = -λ_bps · (pool_net_q / pool_capital_q)
@@ -159,7 +160,14 @@ pub fn generate_quotes(
         let cum_size = per_level_lots
             .checked_mul(i)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
-        // s_bps = base + α·vpin + β·u + γ·|oi_imb| + κ·(Q/depth_floor)·BPS
+        // s_bps = base + β·u + γ·|oi_imb| + κ·(Q/depth_floor)·BPS + δ·realized_vol.
+        // NOTE: the α·VPIN order-flow-toxicity term is RETIRED — the VPIN
+        // accumulator is no longer advanced (every feed passes vpin_bps = 0), so it
+        // was inert. It is removed here rather than left as an always-zero add so
+        // the formula and the defense posture agree: adverse-selection defense
+        // rests on δ·realized_vol + γ·OI-imbalance + β·utilization + the inventory
+        // skew/cap + the per-fill oracle price band, NOT on a live toxicity signal.
+        // (`params.alpha_bps` / `inputs.vpin_bps` are retained for layout only.)
         let oi_term =
             (params.gamma_bps as u64 * (oi_imb_bps.unsigned_abs() as u64)) / BPS_DENOM as u64;
         let depth_term = if params.depth_floor_lots > 0 {
@@ -171,8 +179,6 @@ pub fn generate_quotes(
         let vol_term =
             (params.delta_bps as u64 * inputs.realized_vol_bps as u64) / BPS_DENOM as u64;
         let s_bps = (params.base_spread_bps as u64)
-            .checked_add((params.alpha_bps as u64 * inputs.vpin_bps as u64) / BPS_DENOM as u64)
-            .or_overflow()?
             .checked_add(
                 (params.beta_bps as u64 * inputs.pool_gross_utilization_bps as u64)
                     / BPS_DENOM as u64,

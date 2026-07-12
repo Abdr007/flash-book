@@ -11303,6 +11303,18 @@ pub mod flash_book {
             FlashBookError::WrongTrader
         );
         let ha_ts_key = ctx.accounts.trader_state.key();
+        // GAP-1: bind the gated TraderState to the ORDER's routing sub_index, not
+        // just the wallet. The injected order carries `trigger.sub_index` and
+        // settles against that sub-account; without this a caller could pass a
+        // FUNDED sub-account for the intake-IM gate while the order opens on a
+        // near-empty one (unbounded leverage → socialized bad debt).
+        verify_trader_state_pda(
+            trigger_sub_index,
+            trader_pk,
+            ha_ts_key,
+            ctx.accounts.trader_state.load()?.bump,
+            ctx.program_id,
+        )?;
         let ha_mkt_key = ctx.accounts.market.key();
         gate_injection_open(
             &ha_mkt_key,
@@ -11596,6 +11608,15 @@ pub mod flash_book {
             FlashBookError::WrongTrader
         );
         let ha_ts_key = ctx.accounts.trader_state.key();
+        // GAP-1: bind the gated TraderState to the twap's routing sub_index (not
+        // just the wallet) — see execute_trigger_order_v3.
+        verify_trader_state_pda(
+            twap_sub_index,
+            trader_pk,
+            ha_ts_key,
+            ctx.accounts.trader_state.load()?.bump,
+            ctx.program_id,
+        )?;
         gate_injection_open(
             &market_key,
             market.params.initial_margin_ratio_bps,
@@ -11870,6 +11891,15 @@ pub mod flash_book {
             FlashBookError::WrongTrader
         );
         let ha_ts_key = ctx.accounts.trader_state.key();
+        // GAP-1: bind the gated TraderState to the iceberg's routing sub_index
+        // (not just the wallet) — see execute_trigger_order_v3.
+        verify_trader_state_pda(
+            iceberg_sub_index,
+            trader_pk,
+            ha_ts_key,
+            ctx.accounts.trader_state.load()?.bump,
+            ctx.program_id,
+        )?;
         gate_injection_open(
             &market_key,
             market.params.initial_margin_ratio_bps,
