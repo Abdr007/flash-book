@@ -41,7 +41,7 @@ Theorems are `#print axioms`-clean (no `sorry`).
 -/
 import Mathlib
 
-namespace FlashBook.AuthCompleteness
+namespace Clober.AuthCompleteness
 
 variable {α : Type*}
 
@@ -138,4 +138,4 @@ theorem unauthorized_rejected (signer authority : α) (h : signer ≠ authority)
 #print axioms exec_always_present
 #print axioms reinsert_noop
 
-end FlashBook.AuthCompleteness
+end Clober.AuthCompleteness

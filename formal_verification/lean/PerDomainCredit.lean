@@ -19,7 +19,7 @@ Theorems are intended `#print axioms`-clean (no `sorry`).
 -/
 import Mathlib.Tactic
 
-namespace FlashBook.PerDomainCredit
+namespace Clober.PerDomainCredit
 
 /-- Basis-points denominator (10_000). -/
 def BPS : ℕ := 10000
@@ -106,4 +106,4 @@ theorem zero_haircut_identity (pnl : ℕ) : usableHaircut pnl 0 = pnl := by
   rw [Nat.mul_div_cancel]
   decide
 
-end FlashBook.PerDomainCredit
+end Clober.PerDomainCredit

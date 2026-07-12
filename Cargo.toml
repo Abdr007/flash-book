@@ -2,20 +2,20 @@
 resolver = "2"
 members = ["programs/*"]
 # Certora verification harness — standalone (never built by normal workspace CI;
-# path-depends on flash-book with the certora feature). See its Cargo.toml.
+# path-depends on clober with the certora feature). See its Cargo.toml.
 exclude = ["certora/harness-crate"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/Abdr007/flash-book"
+repository = "https://github.com/Abdr007/clober"
 
 [workspace.dependencies]
 anchor-lang = "1.0.0"
 anchor-spl = "1.0.0"
 # MagicBlock ER delegation CPIs are issued directly via invoke_signed
-# (programs/flash-book/src/er.rs) against the delegation program's stable
+# (programs/clober/src/er.rs) against the delegation program's stable
 # instruction ABI; the SDK crates require solana-instruction/solana-pubkey
 # ^3.0, which conflicts with the spl-token v6 / solana 2.1 dependency set.
 # borsh is consumed through anchor_lang::prelude; adding it as a direct

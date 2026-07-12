@@ -8,19 +8,19 @@ skip-lint = false
 # run tests with SBF_OUT_DIR=<repo>/target/deploy.
 
 [programs.localnet]
-flash_book = "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
+clober = "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
 
 [programs.devnet]
-flash_book = "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
+clober = "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
 
 [provider]
 cluster = "devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "cargo test -p flash-book"
+test = "cargo test -p clober"
 
 [workspace]
 members = [
-    "programs/flash-book",
+    "programs/clober",
 ]

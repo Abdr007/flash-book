@@ -1,10 +1,10 @@
 import Lake
 open Lake DSL
 
-package «flash-book-fv»
+package «clober-fv»
 
 require "leanprover-community" / "mathlib" @ git "v4.24.0"
 
 @[default_target]
-lean_lib FlashBookFV where
+lean_lib CloberFV where
   roots := #[`Haircut, `OiMmr, `Funding, `PerDomainCredit, `RealizedPnl, `ResidualConservation, `AuthCompleteness, `VaultShares]

@@ -1,8 +1,8 @@
-//! Certora Solana Prover harness for Flash Book P-SOLV-4 (global solvency).
+//! Certora Solana Prover harness for Clober P-SOLV-4 (global solvency).
 //!
 //! Separate verification-only crate (see Cargo.toml for why it is not a module
-//! of flash-book). Every rule establishes its pre-state via the REAL,
-//! Kani-proven solvency cores in `flash_book::matcher::insurance`, executes a
+//! of clober). Every rule establishes its pre-state via the REAL,
+//! Kani-proven solvency cores in `clober::matcher::insurance`, executes a
 //! balance-mutating effect with fully symbolic (`nondet`) inputs, and asserts
 //! the real invariant still holds — the all-paths obligation Kani cannot give.
 //!
@@ -18,8 +18,8 @@
 //! not counted here.
 
 use cvlr::prelude::*;
-use flash_book::matcher::insurance::{assess_solvency_full, partial_collateral_proves_insolvent};
-use flash_book::xmargin::check_simple_withdraw;
+use clober::matcher::insurance::{assess_solvency_full, partial_collateral_proves_insolvent};
+use clober::xmargin::check_simple_withdraw;
 
 /// Solvent per the REAL invariant function `assess_solvency_full` — NOT an
 /// inline re-derivation. This is the exact P-SOLV-4 predicate the on-chain
@@ -137,7 +137,7 @@ pub fn insolvency_detector_is_sound() {
 /// STATUS: **BLOCKED — not in the conf's rule set (never run in CI).** The
 /// Prover returns UNKNOWN with "illegal dereference of an absolute address":
 /// Anchor's `#[error_code]` construction copies the `#[msg("...")]` `&'static`
-/// global strings (`error!` → `Error::from(FlashBookError)` → `to_string()` →
+/// global strings (`error!` → `Error::from(CloberError)` → `to_string()` →
 /// `Display::fmt` → `write_str`), scattered across many inlined sites, which the
 /// pointer analysis cannot classify. Summarizing individual boundaries only
 /// moves the failing global (0x532a → 0x51f0 → 0x5880 …); it does not converge,

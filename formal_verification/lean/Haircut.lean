@@ -4,7 +4,7 @@ invariants over the REAL denominator `H_DENOM = 1_000_000_000`.
 
 Why this exists: the bounded model checker (CBMC, via `cargo kani`) cannot decide
 128-bit division by a non-power-of-two, so the Kani proofs in
-`programs/flash-book/src/matcher/haircut.rs` verify these same invariants with a
+`programs/clober/src/matcher/haircut.rs` verify these same invariants with a
 *representative* power-of-two divisor (`D = 1 << 30`). Lean closes that gap: it
 proves the bounds with the actual `1e9` divisor, over unbounded `Nat`.
 
@@ -17,7 +17,7 @@ the bounds do not depend on it. See README.md for reproduction.
 -/
 import Mathlib.Tactic
 
-namespace FlashBook.Haircut
+namespace Clober.Haircut
 
 def haircut_credit (matured : Nat) (h : Nat) : Nat := (matured * h) / 1000000000
 
@@ -70,4 +70,4 @@ theorem solvency_single_convert (residual matured h : Nat)
 #print axioms convert_ensures_0
 #print axioms solvency_single_convert
 
-end FlashBook.Haircut
+end Clober.Haircut

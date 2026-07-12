@@ -4,7 +4,7 @@ maintenance-margin surcharge over the REAL denominator `1_000_000`.
 
 Why this exists: the bounded model checker (CBMC, via `cargo kani`) cannot decide
 128-bit division by a non-power-of-two, so the Kani proofs in
-`programs/flash-book/src/matcher/risk.rs` (`mod mmr_kani_proofs`) verify the
+`programs/clober/src/matcher/risk.rs` (`mod mmr_kani_proofs`) verify the
 *bound* and *disable* properties — which hold for any division result — but NOT
 the value-dependent MONOTONICITY (more open interest ⇒ a surcharge that never
 decreases). Lean closes that gap: it proves monotonicity (and the cap) with the
@@ -19,7 +19,7 @@ axioms only; no `sorry`). See README.md for reproduction (`lake build`).
 -/
 import Mathlib.Tactic
 
-namespace FlashBook.OiMmr
+namespace Clober.OiMmr
 
 /-- The OI-scaled MMR surcharge over the real `1e6` divisor (see `risk.rs`). -/
 def oiScaled (oi slope cap : Nat) : Nat := min ((oi * slope) / 1000000) cap
@@ -44,4 +44,4 @@ theorem oiScaled_mono (oi₁ oi₂ slope cap : Nat) (h : oi₁ ≤ oi₂) :
 #print axioms oiScaled_le_cap
 #print axioms oiScaled_mono
 
-end FlashBook.OiMmr
+end Clober.OiMmr

@@ -18,7 +18,7 @@ Theorems are `#print axioms`-clean (no `sorry`).
 -/
 import Mathlib.Tactic
 
-namespace FlashBook.Funding
+namespace Clober.Funding
 
 /-- Q64.64 → linear scaling step (the `>> 64`). The conservation result below is
 independent of this definition; it is fixed here only to mirror the Rust. -/
@@ -43,4 +43,4 @@ theorem funding_zero_when_no_index_move (isLong : Bool) (notional : Int) :
 #print axioms funding_zero_sum
 #print axioms funding_zero_when_no_index_move
 
-end FlashBook.Funding
+end Clober.Funding

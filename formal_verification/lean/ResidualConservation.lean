@@ -13,7 +13,7 @@ where
     I        = insurance fund balance
     Residual = V − C_tot − I  (folds FLP capital + junior-profit backing + surplus)
 
-flash-book does not recompute this each block — it DELTA-TRACKS `Residual` (every
+clober does not recompute this each block — it DELTA-TRACKS `Residual` (every
 money-moving ix feeds a signed delta through `haircut::apply_residual_delta`). The
 per-instruction delta table is documented at `matcher/haircut.rs:460`
 (`| Ix | ΔV | ΔC_tot | ΔI | ΔResidual |`). Conservation is preserved iff EVERY
@@ -40,7 +40,7 @@ Theorems are `#print axioms`-clean (no `sorry`).
 -/
 import Mathlib.Tactic
 
-namespace FlashBook.ResidualConservation
+namespace Clober.ResidualConservation
 
 /-- The four protocol-wide value buckets, signed so deltas compose freely. -/
 structure Ledger where
@@ -274,4 +274,4 @@ theorem fee_share_claim_preserves_solvency (a : ℤ) (L : Ledger5)
 #print axioms fee_share_accrue_preserves_solvency
 #print axioms fee_share_claim_preserves_solvency
 
-end FlashBook.ResidualConservation
+end Clober.ResidualConservation
