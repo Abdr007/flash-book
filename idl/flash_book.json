@@ -23030,6 +23030,17 @@
               "as 0 (no accrual yet, no migration)."
             ],
             "type": "u64"
+          },
+          {
+            "name": "last_threshold_update_slot",
+            "docs": [
+              "K-2: L1 slot of the last `set_insurance_pause_threshold` change. Enforces",
+              "a `INSURANCE_THRESHOLD_UPDATE_MIN_SLOTS` cooldown so a compromised/erratic",
+              "authority cannot rapidly toggle the ADL trigger floor. Trailing field",
+              "within `space()` headroom (157 used, 200 allocated); pre-existing funds",
+              "deserialize it as 0 → the first update is always allowed (no migration)."
+            ],
+            "type": "u64"
           }
         ]
       }
