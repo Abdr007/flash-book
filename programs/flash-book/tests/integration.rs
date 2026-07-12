@@ -12358,6 +12358,154 @@ async fn force_reduce_position_oracle_frees_trapped_margin_when_er_dead() {
     );
 }
 
+/// R-2 ISOLATED: the emergency oracle force-close also frees an ISOLATED
+/// position's segregated collateral — it settles the PnL against the isolated
+/// bucket, then merges the remainder back into the withdrawable cross pool
+/// (open_positions → 0), conserving value against the insurance fund.
+#[tokio::test]
+async fn force_reduce_position_oracle_frees_isolated_margin() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 1_000_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000_000, &protocol).await;
+    let taker_pos = open_cross_position_sized(
+        &mut ctx,
+        &payer,
+        market,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+        10,
+    )
+    .await;
+
+    // Make the position ISOLATED: put 500_000 of segregated collateral on the
+    // position account (collateral_quote_lots > 0).
+    {
+        let pos_acc = ctx
+            .banks_client
+            .get_account(taker_pos)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut pos: flash_book::state::PositionAccount =
+            fetch(&mut ctx.banks_client, taker_pos).await;
+        pos.collateral_quote_lots = 500_000;
+        let disc =
+            <flash_book::state::PositionAccount as anchor_lang::Discriminator>::DISCRIMINATOR;
+        let mut data = vec![0u8; pos_acc.data.len()];
+        data[..8].copy_from_slice(disc);
+        let ser = bytemuck::bytes_of(&pos);
+        data[8..8 + ser.len()].copy_from_slice(ser);
+        ctx.set_account(
+            &taker_pos,
+            &SolAccount {
+                lamports: pos_acc.lamports,
+                data,
+                owner: pos_acc.owner,
+                executable: pos_acc.executable,
+                rent_epoch: pos_acc.rent_epoch,
+            }
+            .into(),
+        );
+    }
+
+    let (fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    // Warp past the stall timeout; patch the mark fresh (down 10%), ER stale.
+    ctx.warp_to_slot(5_000).unwrap();
+    let clock: Clock = ctx.banks_client.get_sysvar().await.unwrap();
+    let m_acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
+    let mut m: MarketAccount = MarketAccount::try_deserialize(&mut m_acc.data.as_slice()).unwrap();
+    m.mark_price_ticks = 90_000;
+    m.last_mark_update_slot = clock.slot;
+    m.oracle_published_at_unix_seconds = clock.unix_timestamp.max(1) as u64;
+    m.params.oracle_staleness_max_seconds = u32::MAX;
+    let mut md = Vec::new();
+    m.try_serialize(&mut md).unwrap();
+    md.resize(m_acc.data.len(), 0);
+    ctx.set_account(
+        &market,
+        &SolAccount {
+            lamports: m_acc.lamports,
+            data: md,
+            owner: m_acc.owner,
+            executable: m_acc.executable,
+            rent_epoch: m_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    let ts_before = fetch::<TraderStateAccount>(&mut ctx.banks_client, taker_state)
+        .await
+        .collateral_quote_lots;
+    let pos_coll_before =
+        fetch::<flash_book::state::PositionAccount>(&mut ctx.banks_client, taker_pos)
+            .await
+            .collateral_quote_lots;
+    let fund_before = fetch::<InsuranceFundAccount>(&mut ctx.banks_client, fund_pda)
+        .await
+        .balance_quote_lots;
+    assert_eq!(pos_coll_before, 500_000, "position is isolated");
+
+    let ix = build_ix(
+        flash_book::instruction::ForceReducePositionOracle {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(fund_pda, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(taker_pos, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .expect("isolated recovery must succeed once the ER is stalled");
+
+    let pos_after: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, taker_pos).await;
+    let ts_after: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    let fund_after = fetch::<InsuranceFundAccount>(&mut ctx.banks_client, fund_pda)
+        .await
+        .balance_quote_lots;
+
+    assert_eq!(pos_after.size_lots, 0, "position closed");
+    assert_eq!(
+        pos_after.collateral_quote_lots, 0,
+        "isolated bucket drained"
+    );
+    assert_eq!(
+        ts_after.open_positions, 0,
+        "open_positions freed ⇒ withdrawable"
+    );
+    // Loss 100_000 settled against the isolated bucket ⇒ 400_000 merged into pool.
+    assert_eq!(
+        ts_after.collateral_quote_lots,
+        ts_before + 400_000,
+        "isolated remainder merged into the cross pool"
+    );
+    assert_eq!(fund_after - fund_before, 100_000, "loss went to insurance");
+    // Conservation across BOTH buckets + insurance.
+    assert_eq!(
+        (pos_coll_before as i128 + ts_before as i128) - ts_after.collateral_quote_lots as i128,
+        fund_after as i128 - fund_before as i128,
+        "Δ(position + pool collateral) == −Δinsurance"
+    );
+}
+
 /// L-1 (audit 2026-07-10): a dormant/stale SIBLING leg must NOT abort the whole
 /// portfolio-liquidation walk. Pre-fix, a single unpriceable sibling reverted the
 /// instruction (MarkTooStale/OracleTooStale), so a genuinely-insolvent trader dodged

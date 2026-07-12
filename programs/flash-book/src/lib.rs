@@ -776,8 +776,10 @@ pub mod flash_book {
     /// proven gate guarantees it can NEVER fire on a live/heartbeating market.
     ///
     /// Accrued funding is forgiven (no balance moves for it ⇒ conservation-neutral),
-    /// which keeps this path independent of the haircut/Residual engine. v1 handles
-    /// CROSS positions; an isolated position's segregated bucket is a follow-up.
+    /// which keeps this path independent of the haircut/Residual engine. Handles
+    /// BOTH cross and isolated positions: an isolated position settles its PnL
+    /// against its segregated bucket, then the remainder is merged back into the
+    /// withdrawable cross pool via the proven `merge_to_cross`.
     pub fn force_reduce_position_oracle(ctx: Context<ForceReducePositionOracle>) -> Result<()> {
         let clock = Clock::get()?;
         let current_slot = clock.slot;
@@ -796,13 +798,23 @@ pub mod flash_book {
             FlashBookError::ErStillLive
         );
 
-        let (pre_side, pre_size, entry, is_long) = {
+        let (pre_side, pre_size, entry, is_long, iso_collateral) = {
             let p = ctx.accounts.position.load()?;
             require!(p.size_lots > 0, FlashBookError::ZeroSize);
-            // v1: cross only (bucket == the shared pool). Isolated is a follow-up.
-            require!(p.collateral_quote_lots == 0, FlashBookError::OutOfRange);
-            (p.side, p.size_lots, p.entry_price_ticks, p.side == 0)
+            (
+                p.side,
+                p.size_lots,
+                p.entry_price_ticks,
+                p.side == 0,
+                p.collateral_quote_lots,
+            )
         };
+        // An ISOLATED position (collateral > 0, segregated on the position
+        // account) settles its PnL against that bucket, then the remainder is
+        // merged back into the withdrawable cross pool; a CROSS position settles
+        // directly against the pool. Both make the freed collateral withdrawable
+        // once open_positions hits 0.
+        let is_isolated = iso_collateral > 0;
 
         // Staleness-gated worse-of(mark, oracle), adverse to the closer.
         let close_price =
@@ -821,13 +833,28 @@ pub mod flash_book {
             .checked_mul(ctx.accounts.market.params.tick_size as i128)
             .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
 
-        // Settle trader-collateral ↔ insurance through the proven conserving core.
-        let bucket = ctx.accounts.trader_state.load()?.collateral_quote_lots;
+        // Settle the position's bucket ↔ insurance through the proven conserving
+        // core (isolated ⇒ the position's segregated bucket; cross ⇒ the pool).
+        let bucket = if is_isolated {
+            iso_collateral
+        } else {
+            ctx.accounts.trader_state.load()?.collateral_quote_lots
+        };
         let insurance = ctx.accounts.insurance_fund.balance_quote_lots;
         let (new_bucket, new_insurance) = force_close_against_insurance(pnl, bucket, insurance);
         let settled_delta = new_bucket as i128 - bucket as i128;
-        ctx.accounts.trader_state.load_mut()?.collateral_quote_lots = new_bucket;
         ctx.accounts.insurance_fund.balance_quote_lots = new_insurance;
+        if is_isolated {
+            // Return the post-settlement isolated collateral to the withdrawable
+            // cross pool via the proven merge_to_cross (cross+iso, no mint/burn);
+            // the position bucket is zeroed in the close block below. Conservation
+            // holds: Δ(pool + position bucket) == settled_delta == −Δinsurance.
+            let cross = ctx.accounts.trader_state.load()?.collateral_quote_lots;
+            let merged = xmargin::merge_to_cross(cross, new_bucket)?;
+            ctx.accounts.trader_state.load_mut()?.collateral_quote_lots = merged;
+        } else {
+            ctx.accounts.trader_state.load_mut()?.collateral_quote_lots = new_bucket;
+        }
 
         // Close the position.
         let market_funding_index = ctx.accounts.market.cum_funding_index;
@@ -835,6 +862,8 @@ pub mod flash_book {
             let mut p = ctx.accounts.position.load_mut()?;
             p.size_lots = 0;
             p.entry_price_ticks = 0;
+            // Isolated bucket (if any) was merged into the cross pool above.
+            p.collateral_quote_lots = 0;
             let settled_i64 = if settled_delta > i64::MAX as i128 {
                 i64::MAX
             } else if settled_delta < i64::MIN as i128 {
