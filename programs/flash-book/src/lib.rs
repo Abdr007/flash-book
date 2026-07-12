@@ -4903,6 +4903,13 @@ pub mod flash_book {
         let mut snaps: Vec<RiskPosSnap> = Vec::new();
         let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
         let mut market_keys: Vec<Pubkey> = Vec::new();
+        // L-2: value every leg at the staleness-gated worse-of(mark, oracle) health
+        // price (matching the withdraw/sweep gates), not the raw EMA mark — a
+        // stale/favorable mark must not let the transition pass on an over-valued
+        // position. effective_health_mark fails closed on a stale mark. One read.
+        let hm_c = Clock::get()?;
+        let hm_now_unix = hm_c.unix_timestamp.max(0) as u64;
+        let hm_slot = hm_c.slot;
 
         let mut i = 0usize;
         while i + 1 < remaining.len() {
@@ -4953,7 +4960,12 @@ pub mod flash_book {
             });
             market_snaps.push(RiskMarketSnap {
                 market: m_ai.key(),
-                mark_price: Ticks(market.mark_price_ticks),
+                mark_price: Ticks(effective_health_mark(
+                    &market,
+                    hm_now_unix,
+                    hm_slot,
+                    position.side == 0,
+                )?),
                 cum_funding_index: market.cum_funding_index,
                 maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
                 tick_size: market.params.tick_size,
@@ -4989,7 +5001,12 @@ pub mod flash_book {
         });
         market_snaps.push(RiskMarketSnap {
             market: target_market_key,
-            mark_price: Ticks(target_market.mark_price_ticks),
+            mark_price: Ticks(effective_health_mark(
+                target_market,
+                hm_now_unix,
+                hm_slot,
+                tp_side == 0,
+            )?),
             cum_funding_index: target_market.cum_funding_index,
             maintenance_margin_bps: target_market.params.maintenance_margin_ratio_bps,
             tick_size: target_market.params.tick_size,
@@ -5104,6 +5121,13 @@ pub mod flash_book {
         let mut snaps: Vec<RiskPosSnap> = Vec::new();
         let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
         let mut market_keys: Vec<Pubkey> = Vec::new();
+        // L-2: value every leg at the staleness-gated worse-of(mark, oracle) health
+        // price (matching the withdraw/sweep gates), not the raw EMA mark — a
+        // stale/favorable mark must not let the transition pass on an over-valued
+        // position. effective_health_mark fails closed on a stale mark. One read.
+        let hm_c = Clock::get()?;
+        let hm_now_unix = hm_c.unix_timestamp.max(0) as u64;
+        let hm_slot = hm_c.slot;
 
         let mut i = 0usize;
         while i + 1 < remaining.len() {
@@ -5153,7 +5177,12 @@ pub mod flash_book {
             });
             market_snaps.push(RiskMarketSnap {
                 market: m_ai.key(),
-                mark_price: Ticks(market.mark_price_ticks),
+                mark_price: Ticks(effective_health_mark(
+                    &market,
+                    hm_now_unix,
+                    hm_slot,
+                    position.side == 0,
+                )?),
                 cum_funding_index: market.cum_funding_index,
                 maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
                 tick_size: market.params.tick_size,
@@ -5187,7 +5216,12 @@ pub mod flash_book {
             });
             market_snaps.push(RiskMarketSnap {
                 market: target_market_key,
-                mark_price: Ticks(target_market.mark_price_ticks),
+                mark_price: Ticks(effective_health_mark(
+                    target_market,
+                    hm_now_unix,
+                    hm_slot,
+                    tp_side == 0,
+                )?),
                 cum_funding_index: target_market.cum_funding_index,
                 maintenance_margin_bps: target_market.params.maintenance_margin_ratio_bps,
                 tick_size: target_market.params.tick_size,
@@ -8016,6 +8050,11 @@ pub mod flash_book {
 
         let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(2);
         let mut markets: Vec<RiskMarketSnap> = Vec::with_capacity(2);
+        // L-2: value each leg at the staleness-gated worse-of(mark, oracle) price
+        // (see set_position_*), not the raw EMA mark. One clock read.
+        let hm_c = Clock::get()?;
+        let hm_now_unix = hm_c.unix_timestamp.max(0) as u64;
+        let hm_slot = hm_c.slot;
         for (proj, market, market_key) in [
             (proj_a, market_a, market_a_key),
             (proj_b, market_b, market_b_key),
@@ -8026,7 +8065,12 @@ pub mod flash_book {
             }
             markets.push(RiskMarketSnap {
                 market: market_key,
-                mark_price: Ticks(market.mark_price_ticks),
+                mark_price: Ticks(effective_health_mark(
+                    market,
+                    hm_now_unix,
+                    hm_slot,
+                    leg_is_long,
+                )?),
                 cum_funding_index: market.cum_funding_index,
                 // RISK-2: open gate enforces INITIAL margin (buffer above liquidation).
                 maintenance_margin_bps: market.params.initial_margin_ratio_bps,
@@ -9831,12 +9875,20 @@ pub mod flash_book {
         // thin book. Reject until the resting liquidation fills or is cancelled.
         // (Scan happens BEFORE the reward block so no reward is paid on a no-op.)
         {
+            // Key the duplicate check on (wallet, sub_index) — the SPECIFIC
+            // sub-account being liquidated — not the wallet alone. The injected
+            // close order carries the liquidatee's sub_index, so matching it lets
+            // a DIFFERENT sub-account of the same wallet with its own liquidatable
+            // position be liquidated even while this one's close order rests
+            // (closes a keeper-liveness gap), while still blocking a duplicate
+            // liquidation (double reward / OI corruption) of THIS sub-account.
+            let liq_sub_index = ctx.accounts.trader_state.load()?.sub_index;
             let mut book_data = ctx.accounts.market_book.try_borrow_mut_data()?;
             let handle = state_v2::MarketBookHandle::from_account_data(&mut book_data)?;
             let mut already_resting = false;
             if (close_side as u8) == 0 {
                 handle.for_each_bid_best_first(|_i, o: &state_v2::RestingOrderV2| {
-                    if o.order_type == 3 && o.trader == trader {
+                    if o.order_type == 3 && o.trader == trader && o.sub_index == liq_sub_index {
                         already_resting = true;
                         false
                     } else {
@@ -9845,7 +9897,7 @@ pub mod flash_book {
                 });
             } else {
                 handle.for_each_ask_best_first(|_i, o: &state_v2::RestingOrderV2| {
-                    if o.order_type == 3 && o.trader == trader {
+                    if o.order_type == 3 && o.trader == trader && o.sub_index == liq_sub_index {
                         already_resting = true;
                         false
                     } else {
