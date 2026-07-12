@@ -246,7 +246,7 @@ pub mod clober {
             .map_err(|_| error!(CloberError::FillRingCorrupt))?;
         drop(data);
 
-        // C-1 fix: ARM the market — settlement now REQUIRES the ring (sticky).
+        // ARM the market — settlement now REQUIRES the ring (sticky).
         ctx.accounts.market.fill_commitment_required = true;
 
         emit!(FillCommitmentInitializedEvent {
@@ -258,7 +258,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// §3.2 P3 — grow an existing fill-commitment ring in place by
+    /// — grow an existing fill-commitment ring in place by
     /// `additional_slots`. In the ER deployment the matcher PUSHES commitments on
     /// the rollup but settlement only DRAINS them on L1 after
     /// `commit_and_undelegate_fill_commitment`, so the ring grows for a whole
@@ -446,7 +446,7 @@ pub mod clober {
     }
 
     /// Reconcile `MarketAccount.unsettled_fill_volume` (the
-    /// M-6 matched-but-unsettled OI reserve) back to 0 when the fill-commitment
+    /// matched-but-unsettled OI reserve) back to 0 when the fill-commitment
     /// ring is fully DRAINED.
     ///
     /// The counter lives on `market` and the ring lives on `fill_commitment` — two
@@ -758,7 +758,7 @@ pub mod clober {
         Err(error!(CloberError::OwnerForceUndelegateUnavailable))
     }
 
-    /// R-2 EMERGENCY RECOVERY (permissionless). When a market's ER sequencer is
+    /// EMERGENCY RECOVERY (permissionless). When a market's ER sequencer is
     /// dead or censoring — the Kani-proven `force_undelegate_allowed` liveness gate
     /// fires — this closes a trader's TRAPPED cross position on L1 at the oracle
     /// price, so the collateral that `open_positions > 0` otherwise locks becomes
@@ -1858,7 +1858,7 @@ pub mod clober {
         // foreign / flat / same-side position (nothing to reduce ⇒ reject). The
         // cap uses the taker's freshest committed position; a reduce racing an
         // unsettled fill is bounded by the drain-window residual (SETTLEMENT.md
-        // §3), never a silent open. Shadowing `size_lots` here makes the OI cap,
+        // ), never a silent open. Shadowing `size_lots` here makes the OI cap,
         // margin gate, and match walk below all use the capped size.
         let reduce_only = flags & book_state::FLAG_REDUCE_ONLY != 0
             || market.status == MarketStatus::CloseOnly as u8;
@@ -1979,7 +1979,7 @@ pub mod clober {
             // budget: reject opening a NEW market once already at the cap. Reduces
             // / adds on a market the trader already holds are exempt.
             assert_open_position_budget(open_positions, pos_info)?;
-            // R-1: a NEW cross-market open must satisfy the FULL cross-portfolio
+            // a NEW cross-market open must satisfy the FULL cross-portfolio
             // IM (all existing cross legs + this one), not just this market's, or
             // sequential opens each pass against the same pool. Same-market adds
             // stay on the per-market gate above. The trader's other [market,
@@ -2367,7 +2367,7 @@ pub mod clober {
             );
             // A cap above the log-safe 96 means the fills CANNOT fit the 10 KB
             // program log, so the outbox account MUST be present to carry them — else
-            // the tail truncates in the log and wedges settlement (same H-2 class).
+            // the tail truncates in the log and wedges settlement.
             // `init_fill_outbox` is the only path that raises the cap and it arms the
             // outbox, so an honest sequencer always passes it; this fails closed.
             require!(
@@ -2381,7 +2381,7 @@ pub mod clober {
                 CloberError::FillCommitmentMissing
             );
 
-            // §3.2: commit the taker's actual JIT flag (bit3) so the sequencer
+            // commit the taker's actual JIT flag (bit3) so the sequencer
             // cannot flip `taker_was_jit` at settlement to skim/deny the rebate.
             let taker_was_jit = flags & (1 << 3) != 0;
             let taker_bytes = trader_pk.to_bytes();
@@ -2758,7 +2758,7 @@ pub mod clober {
         let mut ask_idxs: Vec<hypertree::DataIndex> = Vec::with_capacity(8);
         let cap = MAX_CANCELS_PER_IX_V2;
 
-        // H-B (security re-audit 2026-07-10): NEVER bulk-cancel a liquidation-close
+        // NEVER bulk-cancel a liquidation-close
         // order (`order_type == 3`). It is injected by `liquidate_position` on
         // the liquidatee's behalf and must remain until a taker fills it (or a
         // keeper/authority retires it) — otherwise the liquidatee spams
@@ -2800,7 +2800,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// H-B (security re-audit 2026-07-10): keeper/authority retirement of a stranded
+    /// keeper/authority retirement of a stranded
     /// liquidation-close order. The OWNER cannot cancel an `order_type == 3` order
     /// (`cancel_v2_core` / `cancel_all` — that closes the liquidation-dodge), so a
     /// legitimate path must exist to clear one that never filled (e.g. the position
@@ -3249,7 +3249,7 @@ pub mod clober {
         };
         require!(shares_to_mint > 0, CloberError::ZeroSize);
 
-        // Track A2: LP-capital deposit credit through the proven checked-credit core.
+        // LP-capital deposit credit through the proven checked-credit core.
         lp.total_capital_quote_lots =
             xmargin::apply_collateral_credit(lp.total_capital_quote_lots, amount_quote_lots)?;
         lp.lp_shares_outstanding = lp
@@ -3422,7 +3422,7 @@ pub mod clober {
         // beyond conservation. `amount_quote_lots <= nav` holds (shares_to_burn <=
         // shares_outstanding, nav > 0), so pnl_reduction <= realized_pnl and the
         // new realized_pnl stays >= 0 whenever the pool was in profit.
-        // Track A2: capped principal draw through the proven capped-debit core.
+        // capped principal draw through the proven capped-debit core.
         let (new_total, cap_reduction) =
             xmargin::apply_capped_debit(lp_ro.total_capital_quote_lots, amount_quote_lots);
         let pnl_reduction = amount_quote_lots - cap_reduction;
@@ -3452,7 +3452,7 @@ pub mod clober {
                     .ok_or_else(|| error!(CloberError::MissingMarketAccount))?;
                 let m_data = market_ai.try_borrow_data()?;
                 let m_state = MarketAccount::try_deserialize(&mut &m_data[..])?;
-                // C/J-2: value the pool's inventory at the staleness-aware
+                // value the pool's inventory at the staleness-aware
                 // worse-of(mark, oracle) HEALTH price for the inventory side, not
                 // the raw ER mark — so an LP cannot withdraw against an
                 // over-optimistic mark while the oracle disagrees. Fails closed
@@ -3584,7 +3584,7 @@ pub mod clober {
             CloberError::Unauthorized
         );
 
-        // Track A2: insurance payout debit through the proven underflow-checked core.
+        // insurance payout debit through the proven underflow-checked core.
         let new_balance = xmargin::apply_collateral_debit_underflow(
             ctx.accounts.insurance_fund.balance_quote_lots,
             amount_quote_lots,
@@ -3834,7 +3834,7 @@ pub mod clober {
             ctx.accounts.authority.key(),
             CloberError::Unauthorized
         );
-        // K-2: rate-limit threshold changes. The pause threshold is the
+        // rate-limit threshold changes. The pause threshold is the
         // ADL/insurance-pause trigger floor; a cooldown stops a compromised or
         // erratic authority from rapidly toggling it to game when ADL fires. The
         // first update on a fresh fund (stamp == 0) is always allowed.
@@ -3982,7 +3982,7 @@ pub mod clober {
             main.er_active,
             ctx.accounts.er_margin.as_deref(),
         )?;
-        // Track A2: the balance move goes through the proven, conservation-
+        // the balance move goes through the proven, conservation-
         // checked core (`apply_collateral_transfer`) — no inline arithmetic.
         let (main_after, sub_after) = xmargin::apply_collateral_transfer(
             main.collateral_quote_lots,
@@ -4032,7 +4032,7 @@ pub mod clober {
             sub.er_active,
             ctx.accounts.er_margin.as_deref(),
         )?;
-        // Track A2: the balance move goes through the proven, conservation-
+        // the balance move goes through the proven, conservation-
         // checked core (`apply_collateral_transfer`) — no inline arithmetic.
         let (sub_after, main_after) = xmargin::apply_collateral_transfer(
             sub.collateral_quote_lots,
@@ -4303,7 +4303,7 @@ pub mod clober {
             let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(expected);
             let mut market_snaps: Vec<RiskMarketSnap> = Vec::with_capacity(expected);
             let mut market_keys: Vec<Pubkey> = Vec::with_capacity(expected);
-            // M-2 (security re-audit 2026-07-10): value each leg off the
+            // value each leg off the
             // staleness-gated worse-of(mark, oracle) health price, not the raw EMA
             // mark — same rationale as partial_withdraw_core (a stale/adverse mark
             // must not let a losing position be over-valued and over-swept). One
@@ -4334,7 +4334,7 @@ pub mod clober {
                     position.market == market_ai.key(),
                     CloberError::WrongMarket
                 );
-                // C-2: bind each position to THIS trader_state (positions are
+                // bind each position to THIS trader_state (positions are
                 // PDA-keyed on trader_state.key(), but `.trader` is only the
                 // WALLET — without this a different sub-account's / stale
                 // position of the same wallet could be substituted to
@@ -4369,7 +4369,7 @@ pub mod clober {
                 });
                 market_snaps.push(RiskMarketSnap {
                     market: market_ai.key(),
-                    // M-2: worse-of(mark, oracle) with the staleness gate, per side.
+                    // worse-of(mark, oracle) with the staleness gate, per side.
                     mark_price: Ticks(effective_health_mark(
                         &market_acct,
                         m2_now_unix,
@@ -4377,7 +4377,7 @@ pub mod clober {
                         position.side == 0,
                     )?),
                     cum_funding_index: market_acct.cum_funding_index,
-                    // RISK-2: withdraw gate enforces INITIAL margin (IM > MM) so a
+                    // withdraw gate enforces INITIAL margin (IM > MM) so a
                     // trader keeps a buffer above the liquidation line. Liquidation
                     // paths intentionally keep maintenance_margin_ratio_bps.
                     maintenance_margin_bps: market_acct.params.initial_margin_ratio_bps,
@@ -4408,7 +4408,7 @@ pub mod clober {
         let to_trader = {
             let mut from = ctx.accounts.from_state.load_mut()?;
             let mut to = ctx.accounts.to_state.load_mut()?;
-            // Track A2: the sweep move is a conserving transfer through the proven
+            // the sweep move is a conserving transfer through the proven
             // core (er_reserved = 0; the health/ER gate is enforced separately).
             let (from_after, to_after) = xmargin::apply_collateral_transfer(
                 from.collateral_quote_lots,
@@ -4522,7 +4522,7 @@ pub mod clober {
         // Accounting.
         let (trader, new_balance) = {
             let mut s = ctx.accounts.trader_state.load_mut()?;
-            // Track A2: deposit credit through the proven checked-credit core.
+            // deposit credit through the proven checked-credit core.
             s.collateral_quote_lots =
                 xmargin::apply_collateral_credit(s.collateral_quote_lots, amount_quote_lots)?;
             (s.trader, s.collateral_quote_lots)
@@ -4580,7 +4580,7 @@ pub mod clober {
         // Accounting.
         let (trader, new_balance) = {
             let mut s = ctx.accounts.trader_state.load_mut()?;
-            // Track A2: withdraw debit through the proven underflow-checked core.
+            // withdraw debit through the proven underflow-checked core.
             s.collateral_quote_lots = xmargin::apply_collateral_debit_underflow(
                 s.collateral_quote_lots,
                 amount_quote_lots,
@@ -4647,7 +4647,7 @@ pub mod clober {
     /// sequencer-attested ER reserved margin for resting orders — the safety
     /// floor becomes `max(IM_filled, notional_floor) + er_reserved`. This is
     /// the variant ER-active traders MUST use; the strict path fails closed for
-    /// them. Shares the exact C-2 position-walk + margin core via
+    /// them. Shares the exact position-walk + margin core via
     /// `partial_withdraw_core`.
     pub fn partial_withdraw_collateral_xdomain<'info>(
         ctx: Context<'info, PartialWithdrawCollateralXdomain<'info>>,
@@ -4817,7 +4817,7 @@ pub mod clober {
 
         let (trader, new_balance) = {
             let mut s = ctx.accounts.trader_state.load_mut()?;
-            // Track A2: withdraw debit through the proven underflow-checked core.
+            // withdraw debit through the proven underflow-checked core.
             s.collateral_quote_lots = xmargin::apply_collateral_debit_underflow(
                 s.collateral_quote_lots,
                 amount_quote_lots,
@@ -4906,7 +4906,7 @@ pub mod clober {
                 ts.er_active,
             )
         };
-        // SECURITY (adversarial re-audit 2026-07-10): an ER-active trader (attested
+        // SECURITY: an ER-active trader (attested
         // reserved margin backing resting ER orders) must NOT relocate cross
         // collateral into an isolated bucket — that drains the cross pool below the
         // ER reservation while walling the collateral off from the ER order's
@@ -4954,7 +4954,7 @@ pub mod clober {
         let open = ts_open;
         let target_market_key_pre = ctx.accounts.target_market.key();
         let remaining = ctx.remaining_accounts;
-        // H-1: the target position is passed as a named account, so the
+        // the target position is passed as a named account, so the
         // walk must cover every OTHER open position — exactly
         // `(open_positions - 1)` pairs. Exact-count + size>0 + dedupe
         // (incl. the target market) + PDA-binding stop a caller from
@@ -4967,7 +4967,7 @@ pub mod clober {
         let mut snaps: Vec<RiskPosSnap> = Vec::new();
         let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
         let mut market_keys: Vec<Pubkey> = Vec::new();
-        // L-2: value every leg at the staleness-gated worse-of(mark, oracle) health
+        // value every leg at the staleness-gated worse-of(mark, oracle) health
         // price (matching the withdraw/sweep gates), not the raw EMA mark — a
         // stale/favorable mark must not let the transition pass on an over-valued
         // position. effective_health_mark fails closed on a stale mark. One read.
@@ -4999,7 +4999,7 @@ pub mod clober {
                 position.collateral_quote_lots == 0,
                 CloberError::OutOfRange
             );
-            // H-1: live position, no duplicate market, and never the
+            // live position, no duplicate market, and never the
             // target market (which is accounted separately below).
             require!(position.size_lots > 0, CloberError::ZeroSize);
             require!(
@@ -5085,7 +5085,7 @@ pub mod clober {
         });
         market_keys.push(target_market_key);
 
-        // Post-transfer state for the split assessment. Track A2: the collateral
+        // Post-transfer state for the split assessment. The collateral
         // move goes through the proven conservation core (cross → fresh isolated).
         let (post_cross_collateral, post_isolated_collateral) =
             xmargin::split_to_isolated(ts_collateral, amount_quote_lots)?;
@@ -5175,7 +5175,7 @@ pub mod clober {
         let open = ts_open;
         let target_market_key_pre = ctx.accounts.target_market.key();
         let remaining = ctx.remaining_accounts;
-        // H-1: same coverage invariant as set_position_isolated — the
+        // same coverage invariant as set_position_isolated — the
         // target is named, so every OTHER open position must be supplied.
         require!(
             remaining.len() == open.saturating_sub(1) * 2,
@@ -5185,7 +5185,7 @@ pub mod clober {
         let mut snaps: Vec<RiskPosSnap> = Vec::new();
         let mut market_snaps: Vec<RiskMarketSnap> = Vec::new();
         let mut market_keys: Vec<Pubkey> = Vec::new();
-        // L-2: value every leg at the staleness-gated worse-of(mark, oracle) health
+        // value every leg at the staleness-gated worse-of(mark, oracle) health
         // price (matching the withdraw/sweep gates), not the raw EMA mark — a
         // stale/favorable mark must not let the transition pass on an over-valued
         // position. effective_health_mark fails closed on a stale mark. One read.
@@ -5301,7 +5301,7 @@ pub mod clober {
             market_keys.push(target_market_key);
         }
 
-        // Track A2: return all isolated collateral to the cross pool via the
+        // return all isolated collateral to the cross pool via the
         // proven conservation core.
         let post_cross_collateral = xmargin::merge_to_cross(ts_collateral, returned)?;
 
@@ -5418,8 +5418,8 @@ pub mod clober {
             return Ok(());
         }
 
-        // §3.2 P4: the per-position funding settlement (mark-priced notional,
-        // isolated/cross collateral routing, RISK-1 Residual move, anchor advance)
+        // the per-position funding settlement (mark-priced notional,
+        // isolated/cross collateral routing, Residual move, anchor advance)
         // is shared with `apply_fill` via `settle_position_funding` so the two can
         // never diverge. Behavior here is byte-identical to the prior inline body.
         let mkt_cfi = market.cum_funding_index;
@@ -5501,7 +5501,7 @@ pub mod clober {
             market.oracle_price_ticks,
             book_mid,
         );
-        // Funding-TWAP hardening (audit MED): the premium is dt-weight-smoothed against the
+        // Funding-TWAP hardening: the premium is dt-weight-smoothed against the
         // prior stamped rate (state = `last_funding_rate_bps_per_sec`) over
         // `funding_premium_twap_window` periods, so a MOMENTARY band-edge premium at a rapid
         // crank cannot stamp a full-period tick — only a sustained premium converges. window
@@ -5564,7 +5564,7 @@ pub mod clober {
         require!(price_ticks > 0, CloberError::ZeroPrice);
         require!(taker_side <= 1, CloberError::OutOfRange);
 
-        // ── C-1 settlement authorization ────────────────────────────
+        // ── Settlement authorization ────────────────────────────
         // `apply_fill` takes fill data at face value, so the signer MUST
         // be the market's authorized sequencer. Without this gate ANY
         // signer could fabricate fills against arbitrary positions and
@@ -5701,7 +5701,7 @@ pub mod clober {
                     && ctx.accounts.maker_position_haircut.is_some()),
             CloberError::HaircutNotInitialized
         );
-        // HIP-3 solvency (audit 2026-07-12): a PERMISSIONLESS market's bad debt
+        // HIP-3 solvency: a PERMISSIONLESS market's bad debt
         // is isolated from the shared insurance fund (`cover_bad_debt` skips the
         // draw), so an uncovered loser shortfall must NOT be able to leave the
         // winner over-credited against the shared vault. The haircut engine is
@@ -5735,7 +5735,7 @@ pub mod clober {
                 taker_sub_index,
                 maker_sub_index,
                 idx,
-                // §3.2: the sequencer's `taker_was_jit` is now bound to the
+                // the sequencer's `taker_was_jit` is now bound to the
                 // matcher's committed value — a flip yields FillNotCommitted.
                 taker_was_jit,
             );
@@ -6009,7 +6009,7 @@ pub mod clober {
                 // they can; the uncollected shortfall is subtracted from `net_fee`
                 // so insurance/LP are NOT over-credited (no phantom value). The
                 // resulting thin position is handled by the liquidation engine.
-                // Track A2: capped taker-fee debit through the proven core.
+                // capped taker-fee debit through the proven core.
                 let paid = if taker_pos_isolated {
                     let mut p = ctx.accounts.taker_position.load_mut()?;
                     let (after, paid) =
@@ -6034,7 +6034,7 @@ pub mod clober {
                 } else {
                     taker_negative_rebate_u128 as u64
                 };
-                // Track A2: negative-rebate credit through the proven core.
+                // negative-rebate credit through the proven core.
                 if taker_pos_isolated {
                     let mut p = ctx.accounts.taker_position.load_mut()?;
                     p.collateral_quote_lots =
@@ -6059,7 +6059,7 @@ pub mod clober {
         // a fill against an under-collateralized taker.
         let maker_rebate = maker_rebate.min(taker_fee_paid);
         {
-            // Track A2: maker-rebate credit through the proven core.
+            // maker-rebate credit through the proven core.
             if maker_rebate > 0 {
                 if maker_pos_isolated {
                     let mut p = ctx.accounts.maker_position.load_mut()?;
@@ -6111,7 +6111,7 @@ pub mod clober {
             } else {
                 contribution as u64
             };
-            // Track A2: insurance-contribution credit through the proven core.
+            // insurance-contribution credit through the proven core.
             fund.balance_quote_lots =
                 xmargin::apply_collateral_credit(fund.balance_quote_lots, contribution_u64)?;
             fund.total_contributions = fund.total_contributions.saturating_add(contribution_u64);
@@ -6348,14 +6348,14 @@ pub mod clober {
                 maker_pos.last_settlement_batch = current_batch;
             }
 
-            // §3.2 P4 (M-3): settle each leg's accrued funding against the CURRENT
+            // Settle each leg's accrued funding against the CURRENT
             // mark BEFORE the fill is applied. Otherwise a closing/flipping fill
             // advances the position's funding anchor and the closed portion's
             // accrued funding is silently dropped (a small vault leak + a divergence
             // between funding *shown* by the health check and funding *charged*).
             // Uses the SAME `settle_position_funding` as `settle_funding`, so it is
             // idempotent vs the sequencer's crank (delta 0 if already settled) and
-            // the routing/Residual accounting can never diverge. RISK-1's Residual
+            // the routing/Residual accounting can never diverge. Residual
             // move needs the haircut state, so this runs only when the haircut engine
             // is present (mandatory when `haircut_enabled`); haircut-disabled markets
             // keep relying on the `settle_funding` crank exactly as before.
@@ -6780,7 +6780,7 @@ pub mod clober {
             }
         }
 
-        // G-3: OI-vs-insurance circuit breaker. The fill is fully settled above
+        // OI-vs-insurance circuit breaker. The fill is fully settled above
         // (OI + collateral + insurance). If gross OI notional now exceeds the
         // insurance-relative cap, auto-PAUSE the market — a plain flag write, NOT
         // a revert (the committed fill must stand; intake already rejects Paused,
@@ -7108,7 +7108,7 @@ pub mod clober {
     /// down ER stops signing, so the heartbeat goes stale and the escape opens.
     pub fn er_heartbeat(ctx: Context<ErHeartbeat>) -> Result<()> {
         let market = &mut ctx.accounts.market;
-        // C-1 trust model: only the configured settlement signer can attest
+        // Trust model: only the configured settlement signer can attest
         // liveness. A zero/unset sequencer (pre-field market) fails closed.
         require_keys_eq!(
             ctx.accounts.sequencer.key(),
@@ -7285,7 +7285,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// G-3: set the OI-vs-insurance circuit-breaker multiple (authority-only).
+    /// set the OI-vs-insurance circuit-breaker multiple (authority-only).
     /// `bps == 0` DISABLES the breaker; otherwise it must be in
     /// `[MIN_OI_INSURANCE_MULTIPLE_BPS, MAX_OI_INSURANCE_MULTIPLE_BPS]`. The cap
     /// enforced at settlement is `insurance_balance · bps / BPS_DENOM`; when gross
@@ -7342,7 +7342,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// Immediate market-params update — RESTRICTED (K-3).
+    /// Immediate market-params update — RESTRICTED.
     ///
     /// This path may perform exactly ONE change: ENABLING a disabled (legacy,
     /// pre-bound-era) oracle-staleness gate — when the market's current
@@ -7620,8 +7620,8 @@ pub mod clober {
     /// Validates `new_params` (via `validate_market_params`), then records
     /// `keccak(new_params)` + `eta = now + PARAM_UPDATE_TIMELOCK_SECONDS`; does NOT
     /// apply. `execute_param_update` applies it only after the delay. Authority-only.
-    /// Re-proposing overwrites the pending update (and restarts the clock). K-3:
-    /// this is the ONLY path for economic param changes — the immediate
+    /// Re-proposing overwrites the pending update (and restarts the clock).
+    /// This is the ONLY path for economic param changes — the immediate
     /// `update_market_params` is restricted to enabling a disabled staleness gate.
     pub fn propose_param_update(
         ctx: Context<ProposeParamUpdate>,
@@ -7687,7 +7687,7 @@ pub mod clober {
     }
 
     /// Emergency guardian VETO of a pending
-    /// timelocked params update. The guardian (Phase-1 restrict-only key) may cancel a
+    /// timelocked params update. The guardian (restrict-only key) may cancel a
     /// pending change during its delay window — the fail-safe brake for a compromised
     /// authority that proposed a dangerous loosening. Closes the pending account (rent
     /// → guardian). Pure addition: does not touch the authority `cancel_param_update`
@@ -7703,7 +7703,7 @@ pub mod clober {
     /// locked, the direct-authority `update_oracle` / `update_oracle_quorum` paths
     /// revert (`OracleSourceLocked`) — only the Pyth (account-owner + Full) and Lazer
     /// (Ed25519 precompile + replay nonce) paths remain, removing the compromised-
-    /// authority "walk the mark within the H-6 per-slot cap" vector on production
+    /// authority "walk the mark within the per-slot cap" vector on production
     /// markets. Authority-only; there is deliberately NO unlock instruction. The flag
     /// lives in the market's envelope config (already REQUIRED by those paths), so an
     /// initialized envelope is a precondition.
@@ -7751,7 +7751,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// C-1 — Rotate the fill-settlement signer (`market.sequencer`) that
+    /// Rotate the fill-settlement signer (`market.sequencer`) that
     /// gates `apply_fill` / `apply_lp_fill`. Authority-gated, so it must
     /// be done BEFORE `burn_market_authority` (once authority is burned,
     /// the sequencer is frozen at its last value — which keeps settlement
@@ -8110,7 +8110,7 @@ pub mod clober {
 
         let mut snaps: Vec<RiskPosSnap> = Vec::with_capacity(2);
         let mut markets: Vec<RiskMarketSnap> = Vec::with_capacity(2);
-        // L-2: value each leg at the staleness-gated worse-of(mark, oracle) price
+        // value each leg at the staleness-gated worse-of(mark, oracle) price
         // (see set_position_*), not the raw EMA mark. One clock read.
         let hm_c = Clock::get()?;
         let hm_now_unix = hm_c.unix_timestamp.max(0) as u64;
@@ -8132,7 +8132,7 @@ pub mod clober {
                     leg_is_long,
                 )?),
                 cum_funding_index: market.cum_funding_index,
-                // RISK-2: open gate enforces INITIAL margin (buffer above liquidation).
+                // open gate enforces INITIAL margin (buffer above liquidation).
                 maintenance_margin_bps: market.params.initial_margin_ratio_bps,
                 tick_size: market.params.tick_size,
                 concentration_threshold_lots: market.params.concentration_threshold_lots,
@@ -8250,7 +8250,7 @@ pub mod clober {
         }
 
         // Cross-market stress lattice (parity).
-        // L-2: value each leg at the staleness-gated worse-of(mark, oracle) health
+        // value each leg at the staleness-gated worse-of(mark, oracle) health
         // price (like the 2-leg basket + every single-order open), NOT the raw EMA
         // mark — a stale/favorable mark must not let a multi-leg open pass on an
         // over-valued position. effective_health_mark fails closed on a stale mark.
@@ -8274,7 +8274,7 @@ pub mod clober {
                     positions[i].side == 0,
                 )?),
                 cum_funding_index: markets[i].cum_funding_index,
-                // RISK-2: open gate enforces INITIAL margin (buffer above liquidation).
+                // open gate enforces INITIAL margin (buffer above liquidation).
                 maintenance_margin_bps: markets[i].params.initial_margin_ratio_bps,
                 tick_size: markets[i].params.tick_size,
                 concentration_threshold_lots: markets[i].params.concentration_threshold_lots,
@@ -9122,7 +9122,7 @@ pub mod clober {
         // frozen anchor (passing the band) while the real market had moved, draining
         // the pool. When a staleness bound is configured, require the oracle fresh
         // (and treat `published_at == 0` as stale → reject). `max_age == 0` is the
-        // operator's explicit "no staleness gate" (tracked separately as L-5).
+        // operator's explicit "no staleness gate".
         // The oracle-band + staleness gate is the
         // authenticity bound for LEGACY sequencer-decided LP fills. On the RING-
         // AUTHENTICATED path the fill is already matcher-produced and its price is
@@ -9167,7 +9167,7 @@ pub mod clober {
                     && ctx.accounts.taker_position_haircut.is_some()),
             CloberError::HaircutNotInitialized
         );
-        // HIP-3 solvency (audit 2026-07-12): mirrors apply_fill — a permissionless
+        // HIP-3 solvency: mirrors apply_fill — a permissionless
         // market (insurance-isolated) may only settle once its haircut engine is
         // enabled, so winner gains are solvency-gated and can't over-credit the
         // shared vault against an uncovered shortfall.
@@ -9294,7 +9294,7 @@ pub mod clober {
         // Credit rebate to LP capital (LP is the maker here).
         {
             let lp = &mut ctx.accounts.lp_exposure;
-            // Track A2: LP-capital credit through the proven checked-credit core.
+            // LP-capital credit through the proven checked-credit core.
             lp.total_capital_quote_lots =
                 xmargin::apply_collateral_credit(lp.total_capital_quote_lots, maker_rebate)?;
         }
@@ -9310,7 +9310,7 @@ pub mod clober {
             } else {
                 contribution as u64
             };
-            // Track A2: insurance-balance credit through the proven checked-credit core.
+            // insurance-balance credit through the proven checked-credit core.
             fund.balance_quote_lots =
                 xmargin::apply_collateral_credit(fund.balance_quote_lots, contribution_u64)?;
             fund.total_contributions = fund.total_contributions.saturating_add(contribution_u64);
@@ -9513,7 +9513,7 @@ pub mod clober {
             }
         }
 
-        // G-3: OI-vs-insurance circuit breaker (same as apply_fill). The LP fill
+        // OI-vs-insurance circuit breaker (same as apply_fill). The LP fill
         // is fully settled above; if gross OI notional now exceeds the
         // insurance-relative cap, auto-PAUSE (flag write, never a revert — intake
         // already rejects Paused). No-op when opted out / already Paused / Closed.
@@ -10094,7 +10094,7 @@ pub mod clober {
             // the pooled trader_state.collateral_quote_lots.
             let is_isolated = position.collateral_quote_lots > 0;
             if is_isolated {
-                // Track A2: the reward move (isolated position → liquidator) goes
+                // the reward move (isolated position → liquidator) goes
                 // through the proven conservation core. Safe from aliasing — a
                 // `position` account can never be the `caller_trader_state`.
                 let mut pos = ctx.accounts.position.load_mut()?;
@@ -10110,7 +10110,7 @@ pub mod clober {
                     caller_ts.collateral_quote_lots = caller_after;
                 }
             } else {
-                // Track A2: the reward move (cross trader_state → liquidator) goes
+                // the reward move (cross trader_state → liquidator) goes
                 // through the proven conservation core. Safe: the self-liquidation
                 // guard above (`caller != position.trader`) makes `trader_state` and
                 // `caller_trader_state` distinct accounts (their PDAs derive from
@@ -10327,7 +10327,7 @@ pub mod clober {
             underwater.trader != counter.trader,
             CloberError::OutOfRange
         );
-        // Same single-leg defect as H-4 — the underwater
+        // Same single-leg defect — the underwater
         // eligibility assesses ONLY this leg against the underwater trader's full
         // cross pool, excluding their other cross legs. A cross trader whose
         // portfolio is healthy (winning leg, excluded) can be wrongfully ADL'd. The
@@ -10846,7 +10846,7 @@ pub mod clober {
                 CloberError::OutOfRange
             );
             market_keys.push(market_ai.key());
-            // L-1 (audit 2026-07-10): a SIBLING leg on a dormant/stale market must NOT
+            // a SIBLING leg on a dormant/stale market must NOT
             // abort the whole portfolio walk (that let a genuinely-insolvent trader dodge
             // liquidation of their other, freshly-priced legs). When the leg is
             // unpriceable, fall back to ENTRY-NEUTRAL valuation: mark = entry ⇒ zero
@@ -11299,7 +11299,7 @@ pub mod clober {
         // unrelated stop — can otherwise be crossed by SEPARATE takers in the
         // match→settle gap (the matcher reads a stale per-call position snapshot and
         // caps each to the full size), collectively over-reducing and FLIPPING the
-        // position into an under-margined maker-side open that M-2 (intake-only) never
+        // position into an under-margined maker-side open that the intake-only gate never
         // gates. Fix: before injecting, sum this position's EXISTING reduce-only
         // resting orders (same trader+sub_index, same close side) and clamp the new
         // order so total resting reduce-only never exceeds the position. This closes
@@ -11346,7 +11346,7 @@ pub mod clober {
             size_lots
         };
 
-        // H-A (item 4.8): bind the caller-supplied TraderState to the trigger's
+        // bind the caller-supplied TraderState to the trigger's
         // trader, then gate the injected order (reduce-only exempt via is_reduce_only,
         // so a reduce-close still fires; an OPENING entry must be backed). Mirrors
         // place_limit_v2_core; the position is already trigger-bound above.
@@ -11355,7 +11355,7 @@ pub mod clober {
             CloberError::WrongTrader
         );
         let ha_ts_key = ctx.accounts.trader_state.key();
-        // GAP-1: bind the gated TraderState to the ORDER's routing sub_index, not
+        // bind the gated TraderState to the ORDER's routing sub_index, not
         // just the wallet. The injected order carries `trigger.sub_index` and
         // settles against that sub-account; without this a caller could pass a
         // FUNDED sub-account for the intake-IM gate while the order opens on a
@@ -11653,14 +11653,14 @@ pub mod clober {
         let twap_sub_index = twap.sub_index;
         let market_key = market.key();
 
-        // H-A (item 4.8): bind the caller-supplied TraderState to the twap's trader
+        // bind the caller-supplied TraderState to the twap's trader
         // and gate the OPENING slice (twap slices always open; None position ⇒ full-open).
         require!(
             ctx.accounts.trader_state.load()?.trader == trader_pk,
             CloberError::WrongTrader
         );
         let ha_ts_key = ctx.accounts.trader_state.key();
-        // GAP-1: bind the gated TraderState to the twap's routing sub_index (not
+        // bind the gated TraderState to the twap's routing sub_index (not
         // just the wallet) — see execute_trigger_order.
         verify_trader_state_pda(
             twap_sub_index,
@@ -11824,7 +11824,7 @@ pub mod clober {
         let market_key = market.key();
         let first_chunk = displayed_size_lots.min(total_size_lots);
 
-        // H-A (item 4.8): the visible chunk OPENS exposure and settlement cannot
+        // the visible chunk OPENS exposure and settlement cannot
         // re-check margin, so gate it now exactly like place_limit_v2_core (reduces
         // are exempt inside the helper; None position ⇒ full-open, strictest).
         let ts_key = ctx.accounts.trader_state.key();
@@ -11936,14 +11936,14 @@ pub mod clober {
         let iceberg_prev_child_seq = iceberg.child_order_seq;
         let market_key = market.key();
 
-        // H-A (item 4.8): bind caller-supplied TraderState to the iceberg's trader,
+        // bind caller-supplied TraderState to the iceberg's trader,
         // gate the OPENING replenish chunk (None position ⇒ full-open).
         require!(
             ctx.accounts.trader_state.load()?.trader == trader_pk,
             CloberError::WrongTrader
         );
         let ha_ts_key = ctx.accounts.trader_state.key();
-        // GAP-1: bind the gated TraderState to the iceberg's routing sub_index
+        // bind the gated TraderState to the iceberg's routing sub_index
         // (not just the wallet) — see execute_trigger_order.
         verify_trader_state_pda(
             iceberg_sub_index,
@@ -12153,7 +12153,7 @@ pub mod clober {
         let trader_pk = ctx.accounts.trader.key();
         let market_key = market.key();
 
-        // H-A (item 4.8): gate the OPENING parent leg exactly like place_limit_v2_core
+        // gate the OPENING parent leg exactly like place_limit_v2_core
         // (the TP/SL legs are reduce-only and exempt). None position ⇒ full-open.
         let ts_key = ctx.accounts.trader_state.key();
         gate_injection_open(
@@ -12373,7 +12373,7 @@ pub mod clober {
         // Credit vault's TraderState collateral.
         let post_deposit_collateral = {
             let mut ts = ctx.accounts.vault_trader_state.load_mut()?;
-            // Track A2: vault deposit credit through the proven checked-credit core.
+            // vault deposit credit through the proven checked-credit core.
             ts.collateral_quote_lots =
                 xmargin::apply_collateral_credit(ts.collateral_quote_lots, amount_quote_lots)?;
             ts.collateral_quote_lots
@@ -12402,7 +12402,7 @@ pub mod clober {
         };
         require!(shares_to_mint > 0, CloberError::ZeroSize);
 
-        // Track A2: vault-capital deposit credit through the proven checked-credit core.
+        // vault-capital deposit credit through the proven checked-credit core.
         vault.total_capital_quote_lots =
             xmargin::apply_collateral_credit(vault.total_capital_quote_lots, amount_quote_lots)?;
         vault.shares_outstanding = vault
@@ -12470,10 +12470,10 @@ pub mod clober {
             ctx.accounts.vault_trader_state.load()?.open_positions == 0,
             CloberError::SweepRequiresFlat
         );
-        // L-2 (audit 2026-07-10): a FLAT vault can still have RESTING ER orders that
+        // a FLAT vault can still have RESTING ER orders that
         // reserve margin (er_active) but are not yet positions. Releasing the vault's
         // collateral against that reserve could strand a live ER order — same failure the
-        // strict trader-withdraw paths gate on. Mirror the M-1 / set_position_isolated
+        // strict trader-withdraw paths gate on. Mirror the set_position_isolated
         // stance: refuse redemption while any ER margin is reserved (fail-safe; er_active
         // clears when the resting orders cancel/settle).
         require!(
@@ -12507,7 +12507,7 @@ pub mod clober {
         // Debit core TraderState collateral.
         {
             let mut ts = ctx.accounts.vault_trader_state.load_mut()?;
-            // Track A2: vault withdraw debit through the proven checked-debit core.
+            // vault withdraw debit through the proven checked-debit core.
             ts.collateral_quote_lots =
                 xmargin::apply_collateral_debit_checked(ts.collateral_quote_lots, amount)?;
         }
@@ -12557,7 +12557,7 @@ pub mod clober {
         // vault position's reducible size AT FILL. `derive_maker_position_key(market,
         // vault_pk, 0)` resolves to `["trader_state", vault_pk]` → the vault's own position,
         // so the clamp is against the correct position and it can never open or flip. A
-        // reduce-only vault order is therefore EXEMPT from the H-A intake gate below.
+        // reduce-only vault order is therefore EXEMPT from the intake gate below.
         let is_reduce_only = flags & book_state::FLAG_REDUCE_ONLY != 0;
         let now_slot = Clock::get()?.slot;
         if expires_at_slot > 0 {
@@ -12594,7 +12594,7 @@ pub mod clober {
             CloberError::OrderNotionalTooSmall
         );
 
-        // H-A (item 4.8): gate the vault's OPENING order against its own TraderState
+        // gate the vault's OPENING order against its own TraderState
         // collateral, exactly like place_limit_v2_core. A reduce-only order is exempt
         // (it can only wind down — `is_reduce_only` is passed through so
         // `assert_injection_intake` returns early). None position ⇒ full-open. Closes the
@@ -12750,7 +12750,7 @@ pub mod clober {
         // vault carries an open position with unrealized LOSS, its collateral is
         // not yet reduced, so crystallizing the perf fee now over-charges it and
         // dilutes depositors when the loss later realizes. Require the vault FLAT,
-        // exactly like `vault_withdraw` (H-6).
+        // exactly like `vault_withdraw`.
         require!(
             ctx.accounts.vault_trader_state.load()?.open_positions == 0,
             CloberError::SweepRequiresFlat
@@ -12880,7 +12880,7 @@ pub mod clober {
 
         // Derive the realized PnL from this fill against the pool's stored
         // inventory VWAP through the SAME Kani-proven core trader fills use
-        // (`position_math`) — open / stack-VWAP / reduce-flip with H-1 PnL. The
+        // (`position_math`) — open / stack-VWAP / reduce-flip with PnL. The
         // caller no longer supplies (and so cannot fabricate) an unbacked PnL
         // delta that would inflate LP NAV over the shared vault; the recorded PnL
         // is now a pure function of the reported (side, size, price) and the
@@ -12978,7 +12978,7 @@ pub mod clober {
         // total_capital basis, draining the SHARED vault. Bootstrap 1:1 only when
         // there are genuinely no shares; if shares exist but NAV <= 0 the pool is
         // insolvent → reject rather than dilute the depositor (mirrors the singleton
-        // M-3 guard).
+        // guard).
         let nav_i: i128 =
             (acct.total_capital_quote_lots as i128) + (acct.realized_pnl as i128) + mtm;
         require!(
@@ -13119,7 +13119,7 @@ pub mod clober {
         // Position-aware solvency floor (mirrors the singleton). While the pool
         // holds open inventory, post-withdraw NAV must still cover its gross
         // exposure, so a withdrawal cannot leave the remaining LPs backing a
-        // position larger than the capital left behind. C/J-2: valued at the
+        // position larger than the capital left behind. Valued at the
         // staleness-aware worse-of(mark, oracle) HEALTH price for the inventory
         // side (not the raw mark), and fails closed if neither is usable.
         if side != 255 && size_lots > 0 {
@@ -13776,7 +13776,7 @@ pub mod clober {
         matcher::haircut::validate_market_params(h_min_slots, h_max_slots)
             .map_err(map_haircut_error)?;
 
-        // H-2 fix: ENABLE the haircut engine on the market — settlement now REQUIRES
+        // ENABLE the haircut engine on the market — settlement now REQUIRES
         // the haircut accounts (sticky), closing the omit-the-accounts bypass.
         ctx.accounts.market.haircut_enabled = true;
 
@@ -14072,7 +14072,7 @@ pub mod clober {
 
         // Same bucket-selection rule as `compute_realized_pnl_routing`.
         let isolated = ctx.accounts.position.load()?.collateral_quote_lots > 0;
-        // Track A2: realized-PnL bucket debit through the proven checked-debit core.
+        // realized-PnL bucket debit through the proven checked-debit core.
         if isolated {
             let mut position = ctx.accounts.position.load_mut()?;
             position.collateral_quote_lots = xmargin::apply_collateral_debit_checked(
@@ -14170,7 +14170,7 @@ pub mod clober {
             cfg.bump = ctx.bumps.envelope_config;
             cfg._pad0 = [0; 7];
             cfg._pad1 = [0; 4];
-            cfg.source_locked = 0; // Phase-3: markets start with the direct path OPEN
+            cfg.source_locked = 0; // markets start with the direct path OPEN
             cfg._reserved = [0; 31];
             cfg.version = 0;
             // Gate-state defaults (zero = no prior observation).
@@ -14520,7 +14520,7 @@ pub mod clober {
 /// Shared core for the strict + cross-domain (#8) partial-withdraw
 /// instructions. NOT an instruction (no `pub`). Walks the (market, position)
 /// remaining-accounts pairs to build the joint stress-lattice margin snapshot
-/// (the C-2 exact-count + PDA-binding checks), enforces the safety floor
+/// (the exact-count + PDA-binding checks), enforces the safety floor
 /// `max(IM_required, 10%-notional) + er_reserved`, then transfers from the
 /// vault and debits. `er_reserved` is 0 on the strict path and the
 /// sequencer-attested ER reservation on the xdomain path — the ONLY behavioral
@@ -14549,7 +14549,7 @@ fn partial_withdraw_core<'info>(
         );
         (s.trader, s.open_positions as usize, s.collateral_quote_lots)
     };
-    // C-2: the caller MUST supply EVERY open position. Exact-count + size>0 +
+    // the caller MUST supply EVERY open position. Exact-count + size>0 +
     // market-dedupe + PDA-binding together make it impossible to omit a risky
     // position to understate the margin requirement and over-withdraw.
     require!(remaining.len() == open * 2, CloberError::OutOfRange);
@@ -14559,7 +14559,7 @@ fn partial_withdraw_core<'info>(
     let mut market_keys: Vec<Pubkey> = Vec::new();
     let mut total_notional_quote: u128 = 0;
 
-    // M-2 (security re-audit 2026-07-10): value each leg for the withdraw margin
+    // value each leg for the withdraw margin
     // check off the staleness-gated worse-of(mark, oracle) health price — the SAME
     // price liquidation uses (`effective_health_mark`) — never the raw EMA mark. A
     // frozen/adverse mark on a stalled or illiquid market must not let a losing
@@ -14583,7 +14583,7 @@ fn partial_withdraw_core<'info>(
             state::PositionAccount::try_deserialize(&mut &p_ai.try_borrow_data()?[..])?;
         require!(position.trader == trader_pk, CloberError::WrongTrader);
         require!(position.market == m_ai.key(), CloberError::WrongMarket);
-        // C-2: bind this position to THIS trader_state (blocks substituting
+        // bind this position to THIS trader_state (blocks substituting
         // another sub-account's / a stale position).
         verify_position_pda(
             &m_ai.key(),
@@ -14592,7 +14592,7 @@ fn partial_withdraw_core<'info>(
             &p_ai.key(),
             program_id,
         )?;
-        // C-2: every supplied position must be live, and no market may appear
+        // every supplied position must be live, and no market may appear
         // twice (else the exact-count check could be padded with a duplicate).
         require!(position.size_lots > 0, CloberError::ZeroSize);
         require!(
@@ -14619,7 +14619,7 @@ fn partial_withdraw_core<'info>(
         });
         market_snaps.push(RiskMarketSnap {
             market: m_ai.key(),
-            // M-2: worse-of(mark, oracle) with the staleness gate, per leg side.
+            // worse-of(mark, oracle) with the staleness gate, per leg side.
             mark_price: Ticks(effective_health_mark(
                 &market,
                 m2_now_unix,
@@ -14627,7 +14627,7 @@ fn partial_withdraw_core<'info>(
                 position.side == 0,
             )?),
             cum_funding_index: market.cum_funding_index,
-            // RISK-2: withdraw gate enforces INITIAL margin (buffer above liquidation).
+            // withdraw gate enforces INITIAL margin (buffer above liquidation).
             maintenance_margin_bps: market.params.initial_margin_ratio_bps,
             tick_size: market.params.tick_size,
             concentration_threshold_lots: market.params.concentration_threshold_lots,
@@ -14714,7 +14714,7 @@ fn credit_collateral(
 ) -> Result<()> {
     let (trader, new_balance) = {
         let mut s = trader_state.load_mut()?;
-        // Track A2: collateral-deposit credit through the proven checked-credit core.
+        // collateral-deposit credit through the proven checked-credit core.
         s.collateral_quote_lots =
             xmargin::apply_collateral_credit(s.collateral_quote_lots, amount_quote_lots)?;
         (s.trader, s.collateral_quote_lots)
@@ -14747,7 +14747,7 @@ fn place_limit_v2_core(
     // OPTIONAL (trader_state, market) position for the intake
     // initial-margin gate (None ⇒ treated as a full open — strictest).
     position: Option<&AccountLoader<'_, state::PositionAccount>>,
-    // R-1: [market, position] pairs for the trader's OTHER open cross positions,
+    // [market, position] pairs for the trader's OTHER open cross positions,
     // used by the full-portfolio IM gate when this order opens a NEW market.
     // Empty for a same-market add / isolated / reduce-only (unused there).
     remaining: &[AccountInfo<'_>],
@@ -14922,7 +14922,7 @@ fn place_limit_v2_core(
             // budget: reject a resting order that would OPEN a new market once
             // already at the cap. Reduces / adds on a market already held are exempt.
             assert_open_position_budget(open_positions, pos_info)?;
-            // R-1: a NEW cross-market open must satisfy the FULL cross-portfolio
+            // a NEW cross-market open must satisfy the FULL cross-portfolio
             // IM, not just this market's — otherwise sequential cross opens each
             // pass against the same pool and defeat the IM buffer. A same-market
             // add (Some((_, size>0))) stays on the per-market gate above. Only the
@@ -15036,7 +15036,7 @@ fn cancel_v2_core(
         if order.trader != trader_pk {
             return err!(CloberError::WrongTrader);
         }
-        // H-B (security re-audit 2026-07-10): a liquidation-close order
+        // a liquidation-close order
         // (`order_type == 3`) may NOT be cancelled by its owner — only a fill, or a
         // keeper/authority retirement, clears it. Without this the liquidatee
         // cancels their own injected close every slot to dodge liquidation, leaving
@@ -15183,11 +15183,11 @@ fn write_market_genesis(
     // 0 ⇒ book never delegated; set by delegate_market_book.
     market.book_delegated_at_slot = 0;
     market.params = params;
-    // C-1: settlement signer defaults to the deployer/authority. Rotate
+    // settlement signer defaults to the deployer/authority. Rotate
     // via `set_market_sequencer` before burning authority so fills keep
     // settling after decentralization.
     market.sequencer = authority;
-    // §3.2 P2: fill-commitment authenticity is MANDATORY by default. A new market
+    // fill-commitment authenticity is MANDATORY by default. A new market
     // is fail-closed — `apply_fill` / `place_taker_order` reject any settlement
     // until the market is armed with a ring (`init_fill_commitment`), so a
     // compromised sequencer can never fabricate fills on an "un-armed" market. The
@@ -15463,7 +15463,7 @@ pub struct CancelOrder<'info> {
     pub market_book: UncheckedAccount<'info>,
 }
 
-/// H-B retirement: keeper/authority clears a stranded `order_type == 3`
+/// Retirement: keeper/authority clears a stranded `order_type == 3`
 /// liquidation-close order. `caller` must equal the market `sequencer` or
 /// `authority` (checked in-handler) — never the order owner.
 #[derive(Accounts)]
@@ -15544,7 +15544,7 @@ pub struct InitializeHaircutState<'info> {
     pub authority: Signer<'info>,
     /// Authority must match the market's authority — same trust model
     /// as `update_market_params`.
-    // H-2 fix: `mut` so the handler can set `haircut_enabled = true` (enabling the
+    // `mut` so the handler can set `haircut_enabled = true` (enabling the
     // haircut engine makes its accounts mandatory in settlement, sticky).
     #[account(
         mut,
@@ -15623,7 +15623,7 @@ pub struct ConvertPosition<'info> {
     /// Position is isolated, else the cross pool).
     /// declared BEFORE `position` and relaxed (no seed) so the position PDA can
     /// be keyed by `trader_state.key()` — the old wallet-keyed seed never matched
-    /// a Phase-2c position. The position seeds + identity constraint below bind
+    /// a trader_state-keyed position. The position seeds + identity constraint below bind
     /// this trader_state canonically (a wrong one → ConstraintSeeds on `position`).
     #[account(mut)]
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
@@ -15743,7 +15743,7 @@ pub struct ReleaseGainToHaircut<'info> {
 
     /// Declared BEFORE `position` and relaxed (no
     /// seed) so the position PDA can be keyed by `trader_state.key()` — the old
-    /// wallet-keyed seed never matched a Phase-2c position. The cross bucket this
+    /// wallet-keyed seed never matched a trader_state-keyed position. The cross bucket this
     /// handler debits lives on this account; the position seeds + identity
     /// constraint bind it canonically.
     #[account(mut)]
@@ -16290,7 +16290,7 @@ pub struct InitFillCommitment<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
-    // C-1 fix: `mut` so the handler can set `fill_commitment_required = true`
+    // `mut` so the handler can set `fill_commitment_required = true`
     // (arming the market makes the ring mandatory in apply_fill, sticky).
     #[account(
         mut,
@@ -16313,7 +16313,7 @@ pub struct InitFillCommitment<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// §3.2 P3 — grow an existing fill-commitment ring. Same authority gate +
+/// — grow an existing fill-commitment ring. Same authority gate +
 /// raw-PDA realloc pattern as `ExpandMarketBook`; the handler re-asserts program
 /// ownership + drained-ring before resizing.
 #[derive(Accounts)]
@@ -16469,7 +16469,7 @@ fn check_undelegate_binding(
     Ok(())
 }
 
-/// M-15: undelegate context — the plain `commit_*` stays permissionless (an
+/// undelegate context — the plain `commit_*` stays permissionless (an
 /// honest snapshot is harmless), but `commit_and_undelegate_*` adds `market` and
 /// is sequencer-gated. Separate from `CommitMarketBook` so plain commit is
 /// unchanged.
@@ -16479,12 +16479,12 @@ pub struct CommitUndelegateMarketBook<'info> {
     pub payer: Signer<'info>,
     /// CHECK: the delegated market_book PDA being committed + undelegated. On the
     /// ER its owner is the delegation program; `cpi_commit` fails loudly if it is
-    /// not actually delegated. Bound to `market` by the M-15 gate.
+    /// not actually delegated. Bound to `market` by the sequencer gate.
     #[account(mut)]
     pub market_book: UncheckedAccount<'info>,
     /// CHECK: the market this book belongs to. Passed writable because on the ER
     /// only delegated accounts may be non-readonly, and the market IS delegated
-    /// alongside the book; the M-15 gate only READS it (payer == market.sequencer).
+    /// alongside the book; the sequencer gate only READS it (payer == market.sequencer).
     #[account(mut)]
     pub market: UncheckedAccount<'info>,
     /// CHECK: MagicBlock magic context (writable). Address-pinned to MAGIC_CONTEXT_ID.
@@ -16495,12 +16495,12 @@ pub struct CommitUndelegateMarketBook<'info> {
     pub magic_program: UncheckedAccount<'info>,
 }
 
-/// M-15: sequencer-gated undelegate context for the fill-commitment ring.
+/// sequencer-gated undelegate context for the fill-commitment ring.
 #[derive(Accounts)]
 pub struct CommitUndelegateFillCommitment<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
-    /// CHECK: the delegated fill_commitment PDA. Bound to `market` by the M-15 gate.
+    /// CHECK: the delegated fill_commitment PDA. Bound to `market` by the sequencer gate.
     #[account(mut)]
     pub fill_commitment: UncheckedAccount<'info>,
     /// CHECK: the market this ring belongs to. Writable: on the ER only delegated
@@ -16515,12 +16515,12 @@ pub struct CommitUndelegateFillCommitment<'info> {
     pub magic_program: UncheckedAccount<'info>,
 }
 
-/// M-15: sequencer-gated undelegate context for the fill outbox.
+/// sequencer-gated undelegate context for the fill outbox.
 #[derive(Accounts)]
 pub struct CommitUndelegateFillOutbox<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
-    /// CHECK: the delegated fill_outbox PDA. Bound to `market` by the M-15 gate.
+    /// CHECK: the delegated fill_outbox PDA. Bound to `market` by the sequencer gate.
     #[account(mut)]
     pub fill_outbox: UncheckedAccount<'info>,
     /// CHECK: the market this outbox belongs to. Writable: on the ER only delegated
@@ -18364,7 +18364,7 @@ pub struct SettleFunding<'info> {
     )]
     pub market: Box<Account<'info, MarketAccount>>,
 
-    /// The trader being settled — informational only post-Phase-2d.
+    /// The trader being settled — informational only.
     /// Settle is permissionless and the identity binding is now the
     /// (trader_state, position) PDA pair, not the `trader` field on
     /// this struct. Kept on the Accounts struct for backwards-compat
@@ -18388,7 +18388,7 @@ pub struct SettleFunding<'info> {
     )]
     pub position: AccountLoader<'info, state::PositionAccount>,
 
-    /// RISK-1: funding is a money-moving ix and MUST delta-track the
+    /// funding is a money-moving ix and MUST delta-track the
     /// solvency residual (`V − C_tot − I`), exactly like deposit/withdraw/
     /// fee/liquidation. Without it, lazy/entry-priced funding silently
     /// mints or burns protocol collateral and the haircut/kill-switch
@@ -18913,7 +18913,7 @@ pub struct AutoDeleverage<'info> {
     pub side_accrual: Option<Box<Account<'info, extended_state::MarketSideAccrualAccount>>>,
 }
 
-/// R-2 emergency oracle force-close. Permissionless; the liveness gate in the
+/// Emergency oracle force-close. Permissionless; the liveness gate in the
 /// handler restricts it to a stalled/censoring ER, and it can only free the
 /// trapped trader's own funds.
 #[derive(Accounts)]
@@ -19011,7 +19011,7 @@ pub struct FillCommitmentUpgradedV1Event {
 }
 
 /// Emitted when `reconcile_unsettled_fill_volume` resets a
-/// drifted M-6 counter to 0 on a drained ring. `previous_unsettled` records the
+/// drifted counter to 0 on a drained ring. `previous_unsettled` records the
 /// drift that was cleared (0 if it was already correct).
 #[event]
 pub struct UnsettledFillVolumeReconciledEvent {
@@ -19247,7 +19247,7 @@ pub const BOOK_DEPTH_LEVELS: usize = 4;
 ///    truncates the tail. A truncated fill is still crossed on-chain (book
 ///    mutated + commitment pushed to the ring) but the sequencer never sees its
 ///    data → `apply_fill` can't be called → the ring slot never pops →
-///    settlement wedges (the H-2 griefing class). So the cap MUST stay
+///    settlement wedges (the griefing class). So the cap MUST stay
 ///    log-safe. At 96: ~7.7 KB logged, ~2.3 KB headroom. Chunked emission does
 ///    NOT help — it repeats the 86-byte header per chunk, using MORE log bytes.
 ///    Reaching 256+ requires moving fill data off logs into an on-chain
@@ -19260,7 +19260,7 @@ pub const BOOK_DEPTH_LEVELS: usize = 4;
 ///
 /// Deeper crossings truncate GRACEFULLY at the cap (the `walk_limit` path drops
 /// the residual) instead of OOM-panicking. The fill-commitment ring cap (256)
-/// stays ≥ this, as M-2 requires.
+/// stays ≥ this, as the intake margin gate requires.
 pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 96;
 
 /// Withdrawal floor. When a trader pulls collateral from
@@ -19573,7 +19573,7 @@ pub struct MarketStatusChangedEvent {
     pub new_status: u8,
 }
 
-/// G-3: emitted when the OI-vs-insurance circuit-breaker multiple is set/cleared
+/// emitted when the OI-vs-insurance circuit-breaker multiple is set/cleared
 /// via `set_oi_insurance_multiple_bps`.
 #[event]
 pub struct OiInsuranceMultipleSetEvent {
@@ -19582,7 +19582,7 @@ pub struct OiInsuranceMultipleSetEvent {
     pub new_bps: u64,
 }
 
-/// G-3: emitted when the OI-vs-insurance breaker TRIPS at settlement — gross OI
+/// emitted when the OI-vs-insurance breaker TRIPS at settlement — gross OI
 /// notional exceeded `insurance_balance · multiple_bps / BPS_DENOM`, so the
 /// market was auto-paused. `apply_fill`/`apply_lp_fill` still settle the
 /// committed fill; only NEW intake is blocked. Operators observe this and
@@ -20791,7 +20791,7 @@ fn apply_fill_to_lp_market(
 
     // Existing pool position: settle through the SAME Kani-proven core as trader
     // fills (`matcher::position_math`) — the pool and a trader provably use
-    // byte-identical open/stack-VWAP/reduce-flip + H-1 PnL math. This handler
+    // byte-identical open/stack-VWAP/reduce-flip + PnL math. This handler
     // adds only the LP-specific plumbing: aggregate realized PnL (saturating, as
     // before — LP carries it on `lp.realized_pnl`, not per-market) and the slot
     // lifecycle (free the slot + decrement `markets_count` on a full close). The
@@ -20932,7 +20932,7 @@ fn emit_margin_threshold_if_crossed(
     }
 }
 
-/// §3.2 P4 / RISK-M2 + RISK-1: settle ONE position's accrued funding against the
+/// + : settle ONE position's accrued funding against the
 /// current mark, routing collateral (isolated→position bucket, cross→trader pool)
 /// and the solvency Residual exactly as `settle_funding` does, then advance the
 /// position's funding anchor. Returns the signed amount owed (+ pays / − receives)
@@ -20948,12 +20948,12 @@ enum FundingRouteErr {
     Overflow,
 }
 
-/// Pure RISK-1 funding-routing core (Kani-proven, see `funding_routing_proofs`).
+/// Pure funding-routing core (Kani-proven, see `funding_routing_proofs`).
 /// Given the signed funding `owed` (+ pays / − receives), the chosen collateral
 /// bucket, and the current solvency Residual, returns the updated
 /// `(collateral, residual)`.
 ///
-/// CONSERVATION (the RISK-1 invariant): the change in collateral equals the
+/// CONSERVATION (the invariant): the change in collateral equals the
 /// NEGATIVE change in the Residual — `Δcollateral == −Δresidual` — so funding can
 /// never mint or burn protocol collateral. BOTH directions clamp to availability:
 /// a payment is clamped to the bucket's collateral, and a receipt is clamped to
@@ -21018,7 +21018,7 @@ fn settle_position_funding(
         return Ok(0);
     }
     // notional = size × mark_price × tick_size (quote lots); mark-priced to match
-    // assess_margin's funding term (RISK-M2).
+    // assess_margin's funding term ().
     let notional_u128 = (position.size_lots as u128)
         .checked_mul(mark_price_ticks as u128)
         .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?
@@ -21047,7 +21047,7 @@ fn settle_position_funding(
 
     // Isolated → per-position bucket; cross → pooled trader collateral. The
     // Kani-proven `route_funding` core moves the chosen bucket and the solvency
-    // Residual equal-and-opposite (RISK-1 conservation), clamping a payment to
+    // Residual equal-and-opposite (conservation), clamping a payment to
     // availability (the unpaid remainder is absorbed as the anchor advances).
     let is_isolated = position.collateral_quote_lots > 0;
     let bucket = if is_isolated {
@@ -21083,7 +21083,7 @@ fn apply_fill_to_position(
     tick_size: u64,
 ) -> Result<()> {
     // Fund-critical arithmetic lives in the pure, Kani-proven `position_math`
-    // core (open / stack-VWAP / reduce-flip + H-1 tick_size PnL scaling). This
+    // core (open / stack-VWAP / reduce-flip + tick_size PnL scaling). This
     // handler is now just the account-plumbing shell: it maps the verified
     // outcome onto the `PositionAccount`, accumulates realized PnL, and applies
     // the funding-index reset at the points the core flags. The LP pool's
@@ -21176,7 +21176,7 @@ fn cross_loss_shortfall(debit: u64, cross_collateral: u64) -> (u64, u64) {
 /// checking). Together the bad-debt waterfall (H6) and the haircut-Residual
 /// credit (H7) depend on these properties; they prove value can be neither
 /// minted nor destroyed on a loss settlement. Runs in the CI Kani job
-/// §3.2 P4: the RISK-1 funding-routing conservation invariant, machine-proved over
+/// the funding-routing conservation invariant, machine-proved over
 /// the whole symbolic input domain. `route_funding` (used by both `settle_funding`
 /// and `apply_fill`) can NEVER mint or burn protocol collateral: whatever leaves
 /// the collateral bucket lands in the solvency Residual, and vice-versa.
@@ -21338,7 +21338,7 @@ mod h6_h7_solvency_proofs {
     }
 }
 
-/// R-2 emergency recovery core (pure, Kani-proven in `force_close_proofs`).
+/// Emergency recovery core (pure, Kani-proven in `force_close_proofs`).
 /// Settles a TRAPPED position's realized PnL (valued at the oracle price) against
 /// the insurance fund as the counterparty of last resort, so a trader whose ER
 /// sequencer is dead/byzantine can close on L1 and free the collateral that
@@ -21867,7 +21867,7 @@ fn accrue_to_fee_account(ai: &AccountInfo<'_>, add: u64) -> Result<()> {
 }
 
 /// Shared market-params validation — the immutability
-/// of the measurement primitives + the mutable-field bounds. K-3: this is the SOLE
+/// of the measurement primitives + the mutable-field bounds. This is the SOLE
 /// economic-param validator, used by the timelocked `propose_param_update` /
 /// `execute_param_update`. The immediate `update_market_params` no longer changes
 /// economic params (it only enables a disabled staleness gate and requires every
@@ -22078,7 +22078,7 @@ fn verify_trader_state_pda(
     Ok(())
 }
 
-/// C-2 — re-derive a Position PDA from `(market, trader_state)` and assert
+/// Re-derive a Position PDA from `(market, trader_state)` and assert
 /// it matches `actual`. This binds a `remaining_accounts` position to THIS
 /// trader_state, so a margin walk cannot be fed a different sub-account's
 /// position, a stale/closed position, or any other program-owned account
@@ -22263,7 +22263,7 @@ mod route_funding_tests {
     }
 }
 
-/// R-1: CROSS-PORTFOLIO intake initial-margin gate. The per-market
+/// CROSS-PORTFOLIO intake initial-margin gate. The per-market
 /// `assert_intake_initial_margin` below checks only THIS market's resulting IM
 /// against the full cross pool, so opening across N markets lets each open see
 /// the whole pool as free backing — the portfolio can be opened straight onto the
@@ -22284,7 +22284,7 @@ mod route_funding_tests {
 /// and the taker path (a bag also holding maker/commitment/outbox accounts —
 /// maker positions belong to other traders and are naturally excluded).
 ///
-/// Only invoked when the order opens a NEW market slot (the R-1 vector); same-
+/// Only invoked when the order opens a NEW market slot (the cross-portfolio vector); same-
 /// market adds and reduce-only stay on the O(1) `assert_intake_initial_margin`
 /// path, so the hot path is unchanged for the common case. Isolated legs carry
 /// their own segregated collateral in the snapshot, exactly as the withdraw walk
@@ -22379,7 +22379,7 @@ fn assert_cross_portfolio_intake_im(
                 position.side == 0,
             )?),
             cum_funding_index: market_acct.cum_funding_index,
-            // INITIAL margin (buffer above liquidation) — RISK-2, as the walk gates.
+            // INITIAL margin (buffer above liquidation) — as the walk gates.
             maintenance_margin_bps: market_acct.params.initial_margin_ratio_bps,
             tick_size: market_acct.params.tick_size,
             concentration_threshold_lots: market_acct.params.concentration_threshold_lots,
@@ -22533,7 +22533,7 @@ fn assert_open_position_budget(open_positions: u8, pos: Option<(u8, u64)>) -> Re
     Ok(())
 }
 
-/// H-A (item 4.8, security re-audit 2026-07-10): the shared intake gate every
+/// the shared intake gate every
 /// maker-OPEN path must pass before resting an order — factored out so the v3
 /// injection handlers (trigger/twap/iceberg/bracket) and `vault_place_order`
 /// gate IDENTICALLY to `place_limit_v2_core` / `place_taker_order`. Settlement
@@ -22572,7 +22572,7 @@ fn assert_injection_intake(
     Ok(())
 }
 
-/// H-A wiring helper: extract `(pos_info, backing)` from an optional PDA-verified
+/// Wiring helper: extract `(pos_info, backing)` from an optional PDA-verified
 /// position + the trader_state (isolated collateral if the position carries it,
 /// else the cross pool), then run `assert_injection_intake`. Mirrors the
 /// `place_limit_v2_core` intake block so every v3 maker-open path gates
@@ -22826,7 +22826,7 @@ fn route_adl_gain(
     }
 }
 
-/// Track A2: conservation proofs for the ADL collateral-routing helpers that
+/// conservation proofs for the ADL collateral-routing helpers that
 /// `auto_deleverage` computes its `new_pos_collat` / `new_ts_collat` through.
 /// The handler's only compute path for those values IS `route_adl_loss` /
 /// `route_adl_gain` (by design — the arithmetic lives here, not inline), so
@@ -22991,9 +22991,9 @@ mod adl_routing_tests {
 mod realized_pnl_routing_tests {
     use super::*;
 
-    // §3.2 P4 (M-3): settle_position_funding — the shared per-position funding
+    // settle_position_funding — the shared per-position funding
     // settlement used by both settle_funding and apply_fill. Verifies (1) the
-    // funding anchor advances to the market index, (2) RISK-1 conservation
+    // funding anchor advances to the market index, (2) conservation
     // (Δcollateral == −Δresidual: whatever leaves collateral lands in the Residual
     // and vice-versa), and (3) IDEMPOTENCY — a second call once the anchor matches
     // charges nothing (so charging funding in apply_fill never double-charges a
@@ -23022,7 +23022,7 @@ mod realized_pnl_routing_tests {
             "anchor advances to market index"
         );
         assert_ne!(owed, 0, "funding accrued, so a non-zero amount was settled");
-        // RISK-1 conservation: collateral and the Residual move by equal/opposite.
+        // conservation: collateral and the Residual move by equal/opposite.
         let dcol = ts.collateral_quote_lots as i128 - col0;
         let dres = residual as i128 - res0;
         assert_eq!(dcol, -dres, "Δcollateral == −Δresidual (no mint/burn)");
@@ -23307,7 +23307,7 @@ pub struct ExecuteTriggerOrder<'info> {
 
     pub market: Account<'info, MarketAccount>,
 
-    // H-A: the trigger.trader's (sub_index) TraderState — the permissionless caller
+    // the trigger.trader's (sub_index) TraderState — the permissionless caller
     // supplies it; PDA/ownership bound to `trigger_order.trader` in-handler. Needed
     // for the intake margin gate on an OPENING (non-reduce-only) trigger.
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
@@ -23630,7 +23630,7 @@ pub struct ExecuteTwapSlice<'info> {
     )]
     pub twap_order: Account<'info, extended_state::TwapOrderAccount>,
 
-    // H-A: the twap.trader's TraderState + OPTIONAL position — the permissionless
+    // the twap.trader's TraderState + OPTIONAL position — the permissionless
     // caller supplies them; bound to twap_order.trader in-handler. For the intake gate.
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
     pub position: Option<AccountLoader<'info, state::PositionAccount>>,
@@ -23664,7 +23664,7 @@ pub struct PlaceIcebergOrder<'info> {
     // (trader, sub_index) TraderState — see PlaceTriggerOrder.
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
-    // H-A: OPTIONAL (trader_state, market) position for the intake margin gate —
+    // OPTIONAL (trader_state, market) position for the intake margin gate —
     // PDA-verified in-handler; None ⇒ full-open (strictest). Mirrors PlaceLimitOrder.
     pub position: Option<AccountLoader<'info, state::PositionAccount>>,
 
@@ -23721,7 +23721,7 @@ pub struct ReplenishIceberg<'info> {
     )]
     pub iceberg_order: Account<'info, extended_state::IcebergOrderAccount>,
 
-    // H-A: the iceberg.trader's TraderState + OPTIONAL position — the permissionless
+    // the iceberg.trader's TraderState + OPTIONAL position — the permissionless
     // caller supplies them; bound to iceberg_order.trader in-handler. For the intake gate.
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
     pub position: Option<AccountLoader<'info, state::PositionAccount>>,
@@ -23763,12 +23763,12 @@ pub struct PlaceBracketOrder<'info> {
     // (trader, sub_index) TraderState — see PlaceTriggerOrder.
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
-    // H-A: OPTIONAL position for the intake margin gate on the parent leg —
+    // OPTIONAL position for the intake margin gate on the parent leg —
     // PDA-verified in-handler; None ⇒ full-open. Mirrors PlaceLimitOrder.
     pub position: Option<AccountLoader<'info, state::PositionAccount>>,
 
     // Boxed: moves the 1152-byte MarketAccount off the try_accounts stack
-    // frame — the C-1 trader_state addition otherwise tips this context's frame past
+    // frame — the trader_state addition otherwise tips this context's frame past
     // the 4 KB BPF limit. Box<Account<..>> derefs transparently for handler access.
     pub market: Box<Account<'info, MarketAccount>>,
 
@@ -23998,7 +23998,7 @@ pub struct VaultPlaceOrder<'info> {
     /// and `apply_fill` HARD-loads this TraderState (`verify_trader_state_pda`) to
     /// settle. If it did not exist, the committed fill could never settle, the FIFO
     /// cursor could never advance, and the market's settlement pipeline would wedge
-    /// PERMANENTLY (the C-1 class the other place paths already gate — this one was
+    /// PERMANENTLY (the same class the other place paths already gate — this one was
     /// missed). Requiring the canonical, program-owned PDA here (sub_index 0 ⇒ the
     /// single-seed derivation, matching `vault_open_trader_state`) makes a vault
     /// order structurally unable to rest against a non-existent TraderState. Existence
@@ -24012,7 +24012,7 @@ pub struct VaultPlaceOrder<'info> {
     )]
     pub vault_trader_state: AccountLoader<'info, TraderStateAccount>,
 
-    // H-A: OPTIONAL (vault_trader_state, market) position for the intake margin gate
+    // OPTIONAL (vault_trader_state, market) position for the intake margin gate
     // — PDA-verified in-handler; None ⇒ full-open. Mirrors PlaceLimitOrder.
     pub position: Option<AccountLoader<'info, state::PositionAccount>>,
 }

@@ -83,7 +83,7 @@ pub fn check_simple_withdraw(collateral: u64, amount: u64, er_reserved: u64) -> 
 }
 
 /// Pure core for an INTERNAL collateral transfer between two of the same
-/// trader's accounts (Track A2 extract-and-prove): move `amount` quote-lots from
+/// trader's accounts: move `amount` quote-lots from
 /// `src` to `dst`, leaving at least `er_reserved` behind on the source. Returns
 /// the new `(src, dst)` balances.
 ///
@@ -109,7 +109,7 @@ pub fn apply_collateral_transfer(
     Ok((src_after, dst_after))
 }
 
-/// Pure core for the CROSS→ISOLATED margin conversion (Track A2): move `amount`
+/// Pure core for the CROSS→ISOLATED margin conversion: move `amount`
 /// collateral from the trader's pooled cross balance into a fresh isolated
 /// position (which held 0). Returns `(cross_after, isolated_after)`. Preserves
 /// the exact `ArithmeticUnderflow` error the inline path used. Conserves total:
@@ -122,7 +122,7 @@ pub fn split_to_isolated(cross: u64, amount: u64) -> Result<(u64, u64)> {
     Ok((cross_after, amount)) // fresh isolated position started at 0
 }
 
-/// Pure core for the ISOLATED→CROSS margin conversion (Track A2): return all of
+/// Pure core for the ISOLATED→CROSS margin conversion: return all of
 /// an isolated position's `isolated` collateral to the pooled cross balance.
 /// Returns `cross_after`. Preserves the exact `ArithmeticOverflow` error.
 /// Conserves total: `cross_after == cross + isolated` (proven in
@@ -134,7 +134,7 @@ pub fn merge_to_cross(cross: u64, isolated: u64) -> Result<u64> {
         .ok_or_else(|| error!(CloberError::ArithmeticOverflow))
 }
 
-/// Pure core for a LIQUIDATION-REWARD payment (Track A2): pay the liquidator a
+/// Pure core for a LIQUIDATION-REWARD payment: pay the liquidator a
 /// `reward`, capped at the liquidated source's available collateral, moving it
 /// from `src` (the liquidated position or trader_state) to `caller` (the
 /// liquidator's trader_state). Returns `(src_after, caller_after, paid)`.
@@ -151,7 +151,7 @@ pub fn apply_liquidation_reward(src: u64, caller: u64, reward: u64) -> Result<(u
     Ok((src_after, caller_after, paid))
 }
 
-/// Pure core for a CAPPED collateral debit (Track A2): remove up to `amount`
+/// Pure core for a CAPPED collateral debit: remove up to `amount`
 /// from `balance`, capped at what's available (a fee that exceeds the balance
 /// takes only the balance). Returns `(balance_after, debited)`. Conserves the
 /// removed value exactly (`balance_after + debited == balance`) and never
@@ -164,7 +164,7 @@ pub fn apply_capped_debit(balance: u64, amount: u64) -> (u64, u64) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// G-1 COMMITTED-MARGIN RESERVATION — pure arithmetic core (DORMANT).
+// COMMITTED-MARGIN RESERVATION — pure arithmetic core (DORMANT).
 //
 // The intake initial-margin gate reserves nothing at placement, so on an
 // UNDELEGATED market a trader can rest an L1 order, withdraw the backing
@@ -234,7 +234,7 @@ pub fn reserve_release(reserved: u64, sub: u64) -> u64 {
     reserved.saturating_sub(sub)
 }
 
-/// Pure core for a CHECKED collateral credit (Track A2): add `amount` to
+/// Pure core for a CHECKED collateral credit: add `amount` to
 /// `balance`, erroring on overflow with the exact `ArithmeticOverflow`. Returns
 /// the new balance. `balance_after == balance + amount` when Ok (proven in
 /// `collateral_credit_exact`). Used for the rebate credits in `apply_fill`.
@@ -245,7 +245,7 @@ pub fn apply_collateral_credit(balance: u64, amount: u64) -> Result<u64> {
         .ok_or_else(|| error!(CloberError::ArithmeticOverflow))
 }
 
-/// Pure core for a CHECKED collateral debit (Track A2): subtract `amount` from
+/// Pure core for a CHECKED collateral debit: subtract `amount` from
 /// `balance`, erroring on underflow with the exact `InsufficientCollateral`.
 /// Returns the new balance. `balance_after == balance - amount` when Ok (proven
 /// in `collateral_debit_exact`). Used for the maker-fee deduction in `apply_fill`.
@@ -257,7 +257,7 @@ pub fn apply_collateral_debit_checked(balance: u64, amount: u64) -> Result<u64> 
 }
 
 /// Pure core for a CHECKED debit that reports the exact `ArithmeticUnderflow`
-/// error (Track A2): subtract `amount` from `balance`, erroring on underflow.
+/// error: subtract `amount` from `balance`, erroring on underflow.
 /// Returns `balance - amount` when Ok (proven in `collateral_debit_underflow_exact`).
 /// Used where the on-chain path historically used `checked_sub().ok_or(
 /// ArithmeticUnderflow)` — withdraw / xdomain-withdraw / insurance payout.
@@ -313,7 +313,7 @@ pub fn required_collateral_with_er(im_required: u64, notional_floor: u64, er_res
     base.saturating_add(er_reserved)
 }
 
-/// G-3: OI-vs-insurance circuit-breaker predicate. TRUE iff the market's GROSS
+/// OI-vs-insurance circuit-breaker predicate. TRUE iff the market's GROSS
 /// open-interest notional exceeds the insurance-relative cap
 /// `insurance_balance · multiple_bps / BPS_DENOM`. `multiple_bps == 0` DISABLES
 /// the breaker (returns false), so legacy markets that never opted in are
@@ -361,7 +361,7 @@ mod tests {
         );
     }
 
-    /// G-1 IM NEVER UNDERSTATES (exhaustive grid): over a dense grid of realistic
+    /// IM NEVER UNDERSTATES (exhaustive grid): over a dense grid of realistic
     /// inputs, `incremental_im` equals the exact ceiling `ceil(notional·im_bps /
     /// BPS_DENOM)` (saturated to u64) — so the reservation is never LESS than the
     /// true requirement (no under-charge) and never more than one unit over (matches
@@ -529,7 +529,7 @@ mod xmargin_kani_proofs {
         }
     }
 
-    /// CONSERVATION (Track A2): the internal collateral transfer core neither
+    /// CONSERVATION: the internal collateral transfer core neither
     /// mints nor burns collateral — the total across the two accounts is
     /// invariant, the source keeps its ER reservation, and exactly `amount`
     /// moves. Proven on the REAL `apply_collateral_transfer` symbol over all
@@ -553,7 +553,7 @@ mod xmargin_kani_proofs {
         }
     }
 
-    /// CONSERVATION (Track A2): the cross→isolated margin conversion moves
+    /// CONSERVATION: the cross→isolated margin conversion moves
     /// `amount` from the cross pool to a fresh isolated position without minting
     /// or burning — `cross_after + isolated_after == cross`, on the real
     /// `split_to_isolated` symbol over all `u64`.
@@ -568,7 +568,7 @@ mod xmargin_kani_proofs {
         }
     }
 
-    /// CONSERVATION (Track A2): the isolated→cross margin conversion returns all
+    /// CONSERVATION: the isolated→cross margin conversion returns all
     /// isolated collateral to the cross pool without minting or burning —
     /// `cross_after == cross + isolated`, on the real `merge_to_cross` symbol.
     #[kani::proof]
@@ -580,7 +580,7 @@ mod xmargin_kani_proofs {
         }
     }
 
-    /// CONSERVATION (Track A2): the liquidation-reward payment moves the capped
+    /// CONSERVATION: the liquidation-reward payment moves the capped
     /// reward from the liquidated source to the liquidator without minting or
     /// burning — `src_after + caller_after == src + caller`, `paid <= reward`,
     /// on the real `apply_liquidation_reward` symbol over all `u64`.
@@ -596,7 +596,7 @@ mod xmargin_kani_proofs {
         }
     }
 
-    /// CONSERVATION (Track A2): the capped fee debit removes exactly the debited
+    /// CONSERVATION: the capped fee debit removes exactly the debited
     /// amount and never more than is available — `balance_after + debited ==
     /// balance`, `debited <= amount`, on the real `apply_capped_debit` symbol.
     #[kani::proof]
@@ -609,7 +609,7 @@ mod xmargin_kani_proofs {
         assert!(after <= balance); // never mints collateral
     }
 
-    /// G-1 RESERVATION CONSERVATION: reserving an order's IM then releasing the
+    /// RESERVATION CONSERVATION: reserving an order's IM then releasing the
     /// SAME amount returns `reserved` to its original value exactly (when the add
     /// did not overflow) — so a place→cancel/fill round-trip nets to zero and can
     /// never leak reserved margin (which would lock a trader out of their own
@@ -625,7 +625,7 @@ mod xmargin_kani_proofs {
         }
     }
 
-    /// G-1 RELEASE NEVER UNDERFLOWS: releasing any amount saturates at 0 — a
+    /// RELEASE NEVER UNDERFLOWS: releasing any amount saturates at 0 — a
     /// legacy order (placed before reservations existed, so unreserved) whose
     /// release exceeds `reserved` is a safe no-op, never a panic or wrap. Release
     /// only ever moves `reserved` toward 0 (frees the trader's own collateral),
@@ -638,7 +638,7 @@ mod xmargin_kani_proofs {
         assert!(after <= reserved); // only ever decreases (or holds), never wraps up
     }
 
-    /// G-3: the breaker is DISABLED when `multiple_bps == 0` — it never trips, so
+    /// the breaker is DISABLED when `multiple_bps == 0` — it never trips, so
     /// a legacy market that never opted in is byte-for-byte unaffected. Over the
     /// whole input domain (no assumptions).
     #[kani::proof]
@@ -653,7 +653,7 @@ mod xmargin_kani_proofs {
         ));
     }
 
-    /// G-3: the predicate is TOTAL — it never panics/overflows for ANY u64 inputs
+    /// the predicate is TOTAL — it never panics/overflows for ANY u64 inputs
     /// (all arithmetic is 128-bit saturating). Reaching the assertion at all proves
     /// no arithmetic trap on the way. Whole domain, no assumptions.
     #[kani::proof]
@@ -677,7 +677,7 @@ mod xmargin_kani_proofs {
     // two conservation properties below/above (round-trip exactness, release
     // saturation) contain no such division and remain fully machine-proved.
 
-    /// EXACT (Track A2): the checked credit adds exactly `amount` when it does not
+    /// EXACT: the checked credit adds exactly `amount` when it does not
     /// overflow — on the real `apply_collateral_credit` symbol over all `u64`.
     #[kani::proof]
     fn collateral_credit_exact() {
@@ -688,7 +688,7 @@ mod xmargin_kani_proofs {
         }
     }
 
-    /// EXACT (Track A2): the checked debit subtracts exactly `amount` when the
+    /// EXACT: the checked debit subtracts exactly `amount` when the
     /// balance covers it — on the real `apply_collateral_debit_checked` symbol.
     #[kani::proof]
     fn collateral_debit_exact() {
@@ -700,7 +700,7 @@ mod xmargin_kani_proofs {
         }
     }
 
-    /// EXACT (Track A2): the underflow-erroring checked debit subtracts exactly
+    /// EXACT: the underflow-erroring checked debit subtracts exactly
     /// `amount` when the balance covers it — on the real
     /// `apply_collateral_debit_underflow` symbol over all `u64`.
     #[kani::proof]

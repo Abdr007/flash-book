@@ -646,7 +646,7 @@ pub fn assess_margin_split(
 /// snapshots with the POST-transition value before calling.
 ///
 /// When NO snapshot has `collateral_quote_lots > 0` this delegates to
-/// `assess_margin`, byte-identical to the pre-Phase-2 path. When ANY
+/// `assess_margin`, byte-identical to the pre-cross-margin path. When ANY
 /// snapshot is isolated, all isolated snapshots are filtered into their
 /// own singleton buckets and the remainder is evaluated as the cross
 /// set against `cross_collateral_quote_lots`.

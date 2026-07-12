@@ -12,7 +12,7 @@ use anchor_lang::prelude::Pubkey;
 /// A BFT quorum requires `threshold > 2N/3` (equivalently `3·threshold > 2·N`):
 /// any two quorums then intersect in ≥1 validator (safety), and `N ≥ 3f+1`
 /// tolerates `f` Byzantine. Returns true iff `(validator_count, threshold)` is a
-/// valid BFT committee configuration. `N = 1, threshold = 1` (the Phase-1
+/// valid BFT committee configuration. `N = 1, threshold = 1` (the
 /// backward-compatible single-sequencer case) satisfies it (`3 > 2`).
 #[inline]
 pub fn is_valid_bft_config(validator_count: u8, threshold: u8) -> bool {

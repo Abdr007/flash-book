@@ -1,4 +1,4 @@
-//! G5 (roadmap item 1.4) — structural enforcement that handlers reach the
+//! �� structural enforcement that handlers reach the
 //! funding / health math ONLY through their proven wrappers.
 //!
 //! The proven suite verifies `assess_margin`, `settle_position_funding` /
@@ -146,7 +146,7 @@ mod tests {
         }
     }
 
-    /// INTERNAL TRANSFERS (Track A2): the two sub-account transfer handlers move
+    /// INTERNAL TRANSFERS: the two sub-account transfer handlers move
     /// collateral ONLY through the proven, conservation-checked core
     /// `xmargin::apply_collateral_transfer` — never via inline arithmetic. This is
     /// what makes the model→real bridge a compiler-enforced guarantee, not a
@@ -199,7 +199,7 @@ mod tests {
         }
     }
 
-    /// MARGIN CONVERSIONS (Track A2): the isolated↔cross collateral pool moves go
+    /// MARGIN CONVERSIONS: the isolated↔cross collateral pool moves go
     /// ONLY through their proven conservation cores. Unlike the transfer handlers,
     /// these handlers contain other (non-collateral) arithmetic, so the guarantee
     /// is routing: each core is called only from its sanctioned handler, and each
@@ -218,7 +218,7 @@ mod tests {
             // cores below are.
             ("split_to_isolated(", &["set_position_isolated"][..]),
             // merge_to_cross: set_position_cross (mode transition) AND
-            // force_reduce_position_oracle (R-2 emergency close of an isolated
+            // force_reduce_position_oracle (emergency close of an isolated
             // position returns its settled bucket to the withdrawable pool). Both
             // route the pool move through the proven, conserving core.
             (
@@ -246,7 +246,7 @@ mod tests {
         }
     }
 
-    /// MIGRATE (Track A2): the remaining non-arithmetic money-path sites are
+    /// MIGRATE: the remaining non-arithmetic money-path sites are
     /// conserved by CONSTRUCTION, not by a proven arithmetic core. The two
     /// structural guarantees this test pins:
     ///

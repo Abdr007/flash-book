@@ -500,7 +500,7 @@ async fn setup_market(
     (protocol, market, order_buffer, base_mint, quote_mint)
 }
 
-/// §3.2 P2: production markets are fill-commitment-MANDATORY by default
+/// production markets are fill-commitment-MANDATORY by default
 /// (`initialize_market_inner` sets `fill_commitment_required = true`), so a
 /// compromised sequencer can never settle a fabricated fill on an un-armed
 /// market. The authenticity path has dedicated coverage
@@ -1862,7 +1862,7 @@ async fn crank_funding_uses_robust_median_mark_from_the_book() {
     );
 }
 
-/// Funding-TWAP hardening (audit MED): with `funding_premium_twap_window > 0`, a MOMENTARY
+/// Funding-TWAP hardening: with `funding_premium_twap_window > 0`, a MOMENTARY
 /// full-cap premium at a RAPID crank must NOT stamp the full rate — the dt-weighted EMA
 /// damps it. Patch a huge premium (mark 200_000 vs oracle 100_000 ⇒ instant rate clamps to
 /// rate_max) with an 8-period window and Δt = 1s, crank, and assert the emitted
@@ -1947,7 +1947,7 @@ async fn crank_funding_twap_damps_a_momentary_premium_spike() {
     );
 }
 
-// ── D19: event-replay reconciler ───────────────────────────────────────────
+// ── Event-replay reconciler ────────────────────────────────────────────────
 // Reconstructs value-bearing state from the emitted event stream ALONE — no
 // account reads happen during replay — then asserts it matches the on-chain
 // accounts. This is the observability / data-availability guarantee: the events
@@ -2895,7 +2895,7 @@ async fn update_market_params_rejects_immutable_primitive_change() {
         "update_market_params should reject tick_size change"
     );
 
-    // K-3: the immediate path is now restricted to enabling a DISABLED staleness
+    // the immediate path is now restricted to enabling a DISABLED staleness
     // gate. A normally-initialized market has `oracle_staleness_max_seconds > 0`,
     // so the path rejects at the `staleness == 0` gate BEFORE it can touch any
     // field — even a formerly-"mutable" economic one like `taker_fee_bps`. What
@@ -2935,7 +2935,7 @@ async fn update_market_params_rejects_immutable_primitive_change() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// K-3: `update_market_params` is restricted to ONE operation.
+// `update_market_params` is restricted to ONE operation.
 //
 // The immediate (un-timelocked) path may ONLY heal a legacy market whose
 // oracle-staleness gate was never enabled — i.e. `oracle_staleness_max_seconds
@@ -2987,7 +2987,7 @@ async fn patch_staleness_to_zero(
     );
 }
 
-/// K-3 (1/4): on a normally-initialized (staleness > 0) market, an economic-only
+/// (1/4): on a normally-initialized (staleness > 0) market, an economic-only
 /// change is REJECTED. The immediate path can't touch a live market at all — it
 /// rejects at the `staleness == 0` gate before comparing any field.
 #[tokio::test]
@@ -3030,7 +3030,7 @@ async fn update_market_params_k3_economic_change_rejected_on_live_market() {
     assert_eq!(market.params.taker_fee_bps, default_params().taker_fee_bps);
 }
 
-/// K-3 (2/4): heal SUCCESS. A legacy market (staleness == 0) is healed by
+/// (2/4): heal SUCCESS. A legacy market (staleness == 0) is healed by
 /// enabling the gate to a sane value; every other field is byte-identical.
 #[tokio::test]
 async fn update_market_params_k3_heal_success() {
@@ -3077,7 +3077,7 @@ async fn update_market_params_k3_heal_success() {
     );
 }
 
-/// K-3 (3/4): heal REJECTS an out-of-range staleness. A legacy market, but the
+/// (3/4): heal REJECTS an out-of-range staleness. A legacy market, but the
 /// requested value (10s) is below MIN_HEAL_STALENESS_SECONDS (60).
 #[tokio::test]
 async fn update_market_params_k3_heal_rejects_out_of_range() {
@@ -3121,7 +3121,7 @@ async fn update_market_params_k3_heal_rejects_out_of_range() {
     assert_eq!(after.params.oracle_staleness_max_seconds, 0);
 }
 
-/// K-3 (4/4): heal REJECTS a piggybacked other-field change. A legacy market,
+/// (4/4): heal REJECTS a piggybacked other-field change. A legacy market,
 /// requested staleness is in range (3600) BUT an economic field also differs —
 /// the masked-hash equality must catch the smuggled change.
 #[tokio::test]
@@ -5837,7 +5837,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
     );
 }
 
-/// GAP-1 regression: the advanced-order crank must re-derive and verify the
+/// regression: the advanced-order crank must re-derive and verify the
 /// caller-supplied `trader_state` PDA against the ORDER's stored `sub_index`
 /// (`verify_trader_state_pda(order.sub_index)` in execute_trigger_order), not
 /// merely against the wallet. Here everything is correct EXCEPT the trader_state:
@@ -5845,8 +5845,8 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
 /// (so the position check passes), but the wallet's SUB-1 trader_state is cranked
 /// in meta[2]. Both trader_states carry `trader == wallet`, so the plain
 /// wallet-binding check (`trader_state.trader == trader_pk`) passes; only the
-/// GAP-1 PDA re-derivation against `sub_index == 0` catches the mismatch and
-/// rejects with WrongTrader (`Custom(7104)`). Without GAP-1 a caller could pass a
+/// PDA re-derivation against `sub_index == 0` catches the mismatch and
+/// rejects with WrongTrader (`Custom(7104)`). Without a caller could pass a
 /// FUNDED sub-account to satisfy the intake-IM gate while the order opens on a
 /// near-empty one.
 #[tokio::test]
@@ -5893,7 +5893,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_trader_state() {
 
     // Trader m: main (sub-0) state AND a sub-1 state — both initialized so meta[2]
     // deserializes as a valid TraderStateAccount and the handler REACHES the
-    // explicit GAP-1 verify (rather than failing on AccountNotInitialized).
+    // explicit verify (rather than failing on AccountNotInitialized).
     let m = Keypair::new();
     let m_main = setup_trader(&mut ctx, &payer, &m, 100_000, &protocol).await;
     let (m_sub1, _) = pda(&[TraderStateAccount::SEED, m.pubkey().as_ref(), &[1u8]]);
@@ -5994,7 +5994,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_trader_state() {
     .unwrap();
 
     // Execute the sub-0 trigger while passing the CORRECT MAIN position but the
-    // WRONG (sub-1) trader_state in meta[2] → the GAP-1 verify_trader_state_pda
+    // WRONG (sub-1) trader_state in meta[2] → the verify_trader_state_pda
     // re-derivation against sub_index=0 rejects with WrongTrader.
     let result = send(
         &mut ctx,
@@ -6304,7 +6304,7 @@ async fn liquidate_position_v2_jit_auction_selects_in_band_rejects_out_of_band()
         .expect("place in-band JIT offer");
 
     // Out-of-band offer at 99_000 — ABOVE the fair health price (98_000), so the
-    // H-1 bound must reject it (an off-book close-limit would wedge the position).
+    // close-limit bound must reject it (an off-book close-limit would wedge the position).
     let oob_nonce: u32 = 3;
     let (oob_pda, _) = pda(&[
         clober::extended_state::JitLiquidationOfferAccount::SEED,
@@ -6380,7 +6380,7 @@ async fn liquidate_position_v2_jit_auction_selects_in_band_rejects_out_of_band()
     );
 }
 
-/// H-2: the liquidator reward is capped at the position's residual equity valued
+/// the liquidator reward is capped at the position's residual equity valued
 /// at the SYNTHETIC close price, not the pre-penalty health price. A position
 /// with positive equity at health but negative equity at synthetic (the gap is
 /// the liquidation penalty) must yield ZERO reward — otherwise the reward would
@@ -7161,7 +7161,7 @@ async fn migrate_position_to_trader_state_key_moves_state() {
 
     // Pre-seed a "legacy" Position at [POS_SEED, market, wallet] by
     // directly setting it in the test ledger — simulates a position
-    // created pre-Phase-2c. (We cannot create one through the normal
+    // created before the trader_state-keyed layout. (We cannot create one through the normal
     // ix path anymore because the handlers all use the new PDA.)
     let (legacy_pos, legacy_bump) = pda(&[
         clober::state::PositionAccount::SEED,
@@ -7500,10 +7500,10 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
     assert_eq!(market_after.last_settlement_seq, 2);
 }
 
-/// ── G-1 residual: an UNDELEGATED-L1 resting order's IM is UNRESERVED, yet the
+/// ── Residual: an UNDELEGATED-L1 resting order's IM is UNRESERVED, yet the
 /// resulting undercollateralized fill's loss is BOUNDED ──────────────────────
 ///
-/// This test DOCUMENTS AND PINS a KNOWN, ACCEPTED residual (call it "G-1") — it
+/// This test DOCUMENTS AND PINS a KNOWN, ACCEPTED residual — it
 /// is NOT a bug to be fixed. A sound-and-complete on-chain reservation of a
 /// resting L1 order's initial margin is architecturally precluded: the L1
 /// program never observes the sequencer's live book, so the strict
@@ -9773,7 +9773,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     // Same as `limit`, but passes the signer's real PositionAccount so the intake
     // gate recognizes an opposite-side order as a REDUCE (exempt). Required once
     // the trader holds a position: omitting it while holding ≥1 position makes the
-    // R-1 cross-portfolio gate (correctly) demand a full-portfolio proof.
+    // cross-portfolio gate (correctly) demand a full-portfolio proof.
     let limit_pos = |side: u8, size: u64, signer: &Keypair, state: &Pubkey, position: Pubkey| {
         build_ix(
             clober::instruction::PlaceLimitOrder {
@@ -9971,7 +9971,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     .unwrap();
     // M holds long 10 and sells 5 (a reduce). Pass m_pos so the intake gate sees
     // the reduce and exempts it (omitting it while holding a position makes the
-    // R-1 cross-portfolio gate correctly demand a full-portfolio proof).
+    // cross-portfolio gate correctly demand a full-portfolio proof).
     send(
         &mut ctx,
         build_ix(
@@ -12018,7 +12018,7 @@ async fn chaos_instruction_sequences_keep_book_consistent() {
     }
 }
 
-/// §3.2 P3: `grow_fill_commitment` raises a drained ring's capacity in place
+/// `grow_fill_commitment` raises a drained ring's capacity in place
 /// (the ER-session fill ceiling). Verifies the cap + account size grow and the
 /// header re-validates; and that a non-authority is rejected.
 #[tokio::test]
@@ -12907,7 +12907,7 @@ async fn liquidate_position_v2_rejects_multi_leg_cross() {
     );
 }
 
-/// R-1 REGRESSION: a NEW cross-market open is gated by the trader's FULL cross-
+/// REGRESSION: a NEW cross-market open is gated by the trader's FULL cross-
 /// portfolio initial margin, not just this market's. A trader already holding one
 /// cross leg cannot open a second market the two legs jointly cannot back (the
 /// stacking exploit), and cannot omit the existing leg to hide it from the gate.
@@ -13011,7 +13011,7 @@ async fn cross_portfolio_intake_im_blocks_second_market_stacking() {
     );
 }
 
-/// R-2 REGRESSION: emergency oracle force-close frees a trader's margin trapped
+/// REGRESSION: emergency oracle force-close frees a trader's margin trapped
 /// behind a dead/censoring ER sequencer. While the ER is LIVE the recovery is
 /// refused (ErStillLive, anti-grief); once settlement has stalled past the
 /// timeout it closes the position on L1 at the oracle price against the insurance
@@ -13158,7 +13158,7 @@ async fn force_reduce_position_oracle_frees_trapped_margin_when_er_dead() {
     );
 }
 
-/// R-2 ISOLATED: the emergency oracle force-close also frees an ISOLATED
+/// ISOLATED: the emergency oracle force-close also frees an ISOLATED
 /// position's segregated collateral — it settles the PnL against the isolated
 /// bucket, then merges the remainder back into the withdrawable cross pool
 /// (open_positions → 0), conserving value against the insurance fund.
@@ -13307,7 +13307,7 @@ async fn force_reduce_position_oracle_frees_isolated_margin() {
     );
 }
 
-/// L-1 (audit 2026-07-10): a dormant/stale SIBLING leg must NOT abort the whole
+/// a dormant/stale SIBLING leg must NOT abort the whole
 /// portfolio-liquidation walk. Pre-fix, a single unpriceable sibling reverted the
 /// instruction (MarkTooStale/OracleTooStale), so a genuinely-insolvent trader dodged
 /// liquidation of their other, freshly-priced legs. Post-fix the stale sibling is
@@ -13813,10 +13813,10 @@ async fn apply_lp_fill_rejects_stale_oracle() {
 }
 
 /// vault reduce-only follow-up: `vault_place_order` now HONORS the reduce_only flag
-/// (bit1) and EXEMPTS it from the H-A intake-margin gate — a reduce-only order only winds
+/// (bit1) and EXEMPTS it from the intake-margin gate — a reduce-only order only winds
 /// down (matcher re-clamps at fill against the vault's own position), so it needs no
 /// opening collateral. A 0-collateral vault: an OPENING order is still rejected
-/// (InsufficientCollateral — H-A intact), but a REDUCE-ONLY order is accepted.
+/// (InsufficientCollateral — intake gate intact), but a REDUCE-ONLY order is accepted.
 #[tokio::test]
 async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
     let pt = make_program_test();
@@ -13906,7 +13906,7 @@ async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
         )
     };
 
-    // An OPENING order from the 0-collateral vault is still rejected (H-A gate intact).
+    // An OPENING order from the 0-collateral vault is still rejected (intake gate intact).
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let opening = ctx
         .banks_client
@@ -14346,7 +14346,7 @@ async fn place_basket_order_n_v2_rejects_noncanonical_position() {
 /// flush_haircut_dust must DEBIT residual by the flushed dust (ΔResidual =
 /// −dust), preserving `Residual = V − C_tot − I` when the dust moves to insurance.
 /// Driven through the REAL haircut pipeline (no byte injection), reachable after
-/// the audit-2026-06 Phase-2c re-key of the haircut contexts (position PDA now
+/// the re-key of the haircut contexts (position PDA now
 /// keyed by `trader_state.key()`, not the wallet):
 ///   open 2 cross positions → enable haircut (residual=1000) → release 1000 into
 ///   each reserve → mature both (matured_total=2000) → convert ONE (h=0.5 ⇒
@@ -16796,7 +16796,7 @@ async fn copy_vault_deposit_mints_shares_and_withdraw_returns_proportional() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// G-3: OI-vs-insurance circuit breaker.
+// OI-vs-insurance circuit breaker.
 //
 // A market may OPT IN to an OI-relative circuit breaker via the authority-only
 // `set_oi_insurance_multiple_bps(bps)` instruction (accounts: authority signer +
@@ -16972,7 +16972,7 @@ async fn apply_one_fill(
     (taker_pos, maker_pos)
 }
 
-/// G-3 (1): `set_oi_insurance_multiple_bps` bounds. On a normal market, the
+/// (1): `set_oi_insurance_multiple_bps` bounds. On a normal market, the
 /// authority may set `bps = 0` (disable) or any value in
 /// `[MIN, MAX] = [10_000, 100_000_000]`, and reads back verbatim; `bps` below
 /// MIN or above MAX rejects `OutOfRange` = `Custom(7003)` and leaves the field
@@ -17024,7 +17024,7 @@ async fn g3_oi_insurance_multiple_setter_bounds() {
     assert_eq!(m.oi_insurance_multiple_bps, 50_000, "rejected set is inert");
 }
 
-/// G-3 (2): breaker TRIPS at settlement and then blocks intake. With the multiple
+/// (2): breaker TRIPS at settlement and then blocks intake. With the multiple
 /// set to MIN (10_000 bps = 1×) and a SMALL seeded insurance balance, a fill that
 /// pushes gross OI notional above `insurance_balance · 1` auto-pauses the market —
 /// WITHOUT reverting the fill — and a subsequent `place_limit_order` on the
@@ -17157,7 +17157,7 @@ async fn g3_oi_insurance_breaker_trips_and_pauses() {
     );
 }
 
-/// G-3 (3): breaker DISABLED (`bps == 0`, the default) is inert. The very same
+/// (3): breaker DISABLED (`bps == 0`, the default) is inert. The very same
 /// OI-growing fill that trips a 1× breaker leaves the market Active (1) — no pause
 /// — and intake still works.
 #[tokio::test]

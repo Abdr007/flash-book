@@ -113,13 +113,13 @@ pub const REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS: u64 = 750;
 /// Delay (unix seconds) a proposed market-params change must wait before it
 /// can be executed. 48h gives LPs and traders a window to see the
 /// pre-announced change (the `ParamUpdateProposedEvent` carries the eta)
-/// and exit or react before it lands. K-3: this timelocked path is the ONLY
+/// and exit or react before it lands. this timelocked path is the ONLY
 /// way to change economic params — the immediate `update_market_params` is now
 /// restricted to a single safety operation (enabling a disabled oracle-staleness
 /// gate), so it can no longer change fees/margins/funding without notice.
 pub const PARAM_UPDATE_TIMELOCK_SECONDS: i64 = 48 * 60 * 60;
 
-/// K-3: sane bounds for the ONE change the immediate `update_market_params` path
+/// sane bounds for the ONE change the immediate `update_market_params` path
 /// still permits — ENABLING a disabled (legacy, pre-bound-era) oracle-staleness
 /// gate (`oracle_staleness_max_seconds == 0`). The new bound must land in
 /// `[MIN, MAX]`: the floor prevents an always-stale foot-gun (too-tight → every
@@ -128,7 +128,7 @@ pub const PARAM_UPDATE_TIMELOCK_SECONDS: i64 = 48 * 60 * 60;
 pub const MIN_HEAL_STALENESS_SECONDS: u32 = 60;
 pub const MAX_HEAL_STALENESS_SECONDS: u32 = 86_400;
 
-/// G-3: sane bounds for a market's `oi_insurance_multiple_bps` when opting INTO
+/// sane bounds for a market's `oi_insurance_multiple_bps` when opting INTO
 /// the OI-vs-insurance circuit breaker (0 = disabled is always allowed). The cap
 /// is `insurance_balance · multiple_bps / BPS_DENOM`, so `multiple_bps` is how
 /// many times the insurance balance the GROSS OI notional may reach. Floor 1×
@@ -138,7 +138,7 @@ pub const MAX_HEAL_STALENESS_SECONDS: u32 = 86_400;
 pub const MIN_OI_INSURANCE_MULTIPLE_BPS: u64 = 10_000;
 pub const MAX_OI_INSURANCE_MULTIPLE_BPS: u64 = 100_000_000;
 
-/// K-2: minimum L1 slots between two `set_insurance_pause_threshold` changes.
+/// minimum L1 slots between two `set_insurance_pause_threshold` changes.
 /// The pause threshold is the ADL/insurance-pause trigger floor; without a
 /// cooldown a compromised or erratic insurance authority could rapidly toggle
 /// it to game exactly when ADL fires. ~1h at ~0.4s/slot — long enough to defeat

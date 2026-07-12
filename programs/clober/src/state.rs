@@ -484,7 +484,7 @@ pub struct MarketAccount {
     /// (`validate_hip3_params`). Trailing field ⇒ pre-existing (authority-created)
     /// markets read `false` = fully insurance-backed, exact prior behaviour.
     pub is_permissionless: bool,
-    /// G-3: OI-vs-insurance circuit breaker. Max GROSS open-interest notional the
+    /// OI-vs-insurance circuit breaker. Max GROSS open-interest notional the
     /// market may carry, expressed as a multiple of the insurance fund balance in
     /// bps: the cap is `insurance_balance · oi_insurance_multiple_bps / BPS_DENOM`.
     /// When gross OI notional exceeds it at settlement, `apply_fill` /
@@ -774,7 +774,7 @@ pub struct InsuranceFundAccount {
     /// headroom (149 used, 200 allocated): pre-existing funds deserialize it
     /// as 0 (no accrual yet, no migration).
     pub total_fee_accrued_lots: u64,
-    /// K-2: L1 slot of the last `set_insurance_pause_threshold` change. Enforces
+    /// L1 slot of the last `set_insurance_pause_threshold` change. Enforces
     /// a `INSURANCE_THRESHOLD_UPDATE_MIN_SLOTS` cooldown so a compromised/erratic
     /// authority cannot rapidly toggle the ADL trigger floor. Trailing field
     /// within `space()` headroom (157 used, 200 allocated); pre-existing funds

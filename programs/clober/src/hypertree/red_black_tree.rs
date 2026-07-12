@@ -172,7 +172,7 @@ where
             return Color::Black;
         }
         let node: &RBNode<V> = get_helper::<RBNode<V>>(self.data(), index);
-        // E/L-2: decode the raw color BYTE with validation. `set_color` only ever
+        // Decode the raw color BYTE with validation. `set_color` only ever
         // stores 0 (Black) or 1 (Red), so any other value means the slab bytes were
         // corrupted; map it to Black (the neutral default) instead of producing an
         // invalid `Color` discriminant — reading a `repr(u8)` enum with a value
@@ -294,7 +294,7 @@ where
             return;
         }
         let node: &mut RBNode<V> = get_mut_helper::<RBNode<V>>(self.data(), index);
-        node.color = color as u8; // E/L-2: store the discriminant byte (0/1)
+        node.color = color as u8; // store the discriminant byte (0/1)
     }
     fn set_parent_index<V: Payload>(&mut self, index: DataIndex, parent_index: DataIndex) {
         if index == NIL {
@@ -906,7 +906,7 @@ pub struct RBNode<V> {
     pub left: DataIndex,
     pub right: DataIndex,
     pub parent: DataIndex,
-    /// E/L-2: color DISCRIMINANT byte (0 = Black, 1 = Red), NOT the `Color` enum —
+    /// Color DISCRIMINANT byte (0 = Black, 1 = Red), NOT the `Color` enum —
     /// a `repr(u8)` enum in a `Pod` struct is unsound. Accessed only via
     /// `get_color`/`set_color`, which validate the byte.
     pub color: u8,
@@ -927,7 +927,7 @@ pub struct RBNode<V> {
     pub(crate) left: DataIndex,
     pub(crate) right: DataIndex,
     pub(crate) parent: DataIndex,
-    /// E/L-2: color DISCRIMINANT byte (0 = Black, 1 = Red), NOT the `Color` enum.
+    /// Color DISCRIMINANT byte (0 = Black, 1 = Red), NOT the `Color` enum.
     pub(crate) color: u8,
 
     // Optional enum controlled by the application to identify the type of node.
@@ -1422,7 +1422,7 @@ pub(crate) mod test {
         assert_eq!(Color::zeroed(), Color::Black);
     }
 
-    /// E/L-2: a CORRUPT color byte (≥ 2 — only reachable via slab corruption,
+    /// A CORRUPT color byte (≥ 2 — only reachable via slab corruption,
     /// since `set_color` writes only 0/1) decodes to `Black` via `get_color`. It
     /// must never produce an invalid `Color` discriminant, which for a `repr(u8)`
     /// enum is undefined behavior. `color` being a plain `u8` field is what lets us

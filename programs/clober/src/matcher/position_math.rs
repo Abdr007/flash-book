@@ -123,7 +123,7 @@ pub fn apply_fill(
     let close_size = fill_size_lots.min(pos.size_lots);
     let sign: i128 = if pos.side == SIDE_LONG { 1 } else { -1 };
     let pnl_per_lot: i128 = (fill_price_ticks as i128) - (pos.entry_ticks as i128);
-    // quote-lots = sign · closed · Δticks · tick_size (H-1: the tick_size factor
+    // quote-lots = sign · closed · Δticks · tick_size (the tick_size factor
     // keeps realized PnL on the same scale as unrealized PnL / funding / fees).
     let pnl: i128 = sign
         .checked_mul(close_size as i128)
@@ -238,7 +238,7 @@ mod proofs {
     }
 
     // NOTE ON PnL-VALUE COVERAGE: the exact realized-PnL VALUE on the reduce/flip
-    // paths (`sign·closed·Δticks·tick`) and the Flash V2 cross-system
+    // paths (`sign·closed·Δticks·tick`) and the cross-system
     // reconciliation are verified by the host tests below, NOT by Kani. Those
     // properties are deep nested 128-bit MULTIPLICATIONS, which CBMC's bit-blaster
     // cannot verify tractably (a full-range harness does not terminate in CI). The
@@ -428,7 +428,7 @@ mod tests {
     /// Concrete EXHAUSTIVE sweep over a small grid (host execution — no CBMC
     /// blowup) covering what the removed multiplication-heavy Kani proofs did:
     /// reduce/flip size+side transitions, exact realized PnL = sign·closed·Δ·tick,
-    /// and the Flash V2 reconciliation `fb·entry == (mark−entry)·notional`. Both
+    /// and the notional-return reconciliation `fb·entry == (mark−entry)·notional`. Both
     /// sides, profit and loss (fp ≷ e0), and several tick sizes. 1,700+ cases.
     #[test]
     fn reduce_flip_pnl_and_v2_reconciliation_exhaustive_small() {
@@ -595,7 +595,7 @@ mod tests {
 /// port that `apply_fill_to_position` (called by the live `apply_fill` /
 /// `apply_lp_fill` handlers) delegates to — so these generalize the fixed-case
 /// unit tests over wide random ranges. They pin the reduce/flip transitions, the
-/// exact tick-scaled realized-PnL value (H-1), and the L-3 overflow reject that the
+/// exact tick-scaled realized-PnL value, and the overflow reject that the
 /// `#[cfg(kani)]` proofs deliberately leave to host tests (the i128 PnL multiply is
 /// intractable for CBMC). Every outcome is checked against an INDEPENDENT reference
 /// re-derivation of the spec, so a silent drift in the live math fails the test.
@@ -664,7 +664,7 @@ mod proptests {
                         }
                     }
                     Err(_) => {
-                        // L-3: a PnL beyond i64 is a CLEAN reject, never a panic or a
+                        // A PnL beyond i64 is a CLEAN reject, never a panic or a
                         // clamped/distorted value.
                         prop_assert!(matches!(got, Err(PosMathError::Overflow)));
                     }

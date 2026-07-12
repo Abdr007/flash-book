@@ -159,7 +159,7 @@ pub fn outbox_init(
 
 /// Validate a raw account buffer: disc, market binding, and that the length is
 /// exactly header + cap*slot for the stored cap. Returns the cap. Fails CLOSED on
-/// any inconsistency (inherits the ER L-2 hardening posture).
+/// any inconsistency (inherits the ER hardening posture).
 pub fn outbox_check(data: &[u8], expected_market: &[u8; 32]) -> Result<u32, FillOutboxError> {
     if data.len() < FILL_OUTBOX_HEADER_LEN || data[0..8] != FILL_OUTBOX_DISC {
         return Err(FillOutboxError::Corrupt);
