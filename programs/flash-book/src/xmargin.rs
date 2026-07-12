@@ -313,6 +313,35 @@ pub fn required_collateral_with_er(im_required: u64, notional_floor: u64, er_res
     base.saturating_add(er_reserved)
 }
 
+/// G-3: OI-vs-insurance circuit-breaker predicate. TRUE iff the market's GROSS
+/// open-interest notional exceeds the insurance-relative cap
+/// `insurance_balance · multiple_bps / BPS_DENOM`. `multiple_bps == 0` DISABLES
+/// the breaker (returns false), so legacy markets that never opted in are
+/// unaffected. All arithmetic is 128-bit SATURATING: it can never overflow or
+/// panic, and an overflowed notional saturates to the max and trips the breaker
+/// — fail-safe (pause rather than silently permit unbounded OI). Pure, so the
+/// settlement path gains only a status-flag write, never new fallible math.
+/// Proven in `oi_breaker_disabled_is_false` / `oi_breaker_no_overflow`.
+pub fn oi_exceeds_insurance_cap(
+    oi_long_lots: u64,
+    oi_short_lots: u64,
+    mark_ticks: u64,
+    tick_size: u64,
+    insurance_balance: u64,
+    multiple_bps: u64,
+) -> bool {
+    if multiple_bps == 0 {
+        return false;
+    }
+    let gross_notional = (oi_long_lots as u128)
+        .saturating_add(oi_short_lots as u128)
+        .saturating_mul(mark_ticks as u128)
+        .saturating_mul(tick_size as u128);
+    let cap = (insurance_balance as u128).saturating_mul(multiple_bps as u128)
+        / crate::constants::BPS_DENOM as u128;
+    gross_notional > cap
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +395,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn oi_insurance_breaker_predicate() {
+        let bps = crate::constants::BPS_DENOM as u64; // 10_000
+                                                      // Disabled (multiple 0) never trips, whatever the OI.
+        assert!(!oi_exceeds_insurance_cap(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            0,
+            0
+        ));
+        // multiple = 10_000 bps = 1×: cap == insurance balance (in quote lots).
+        // gross_notional = (long+short)·mark·tick. long=short=5, mark=100, tick=1
+        // ⇒ 10·100·1 = 1_000. insurance 1_000, 1× cap = 1_000 ⇒ NOT exceeded (>).
+        assert!(!oi_exceeds_insurance_cap(5, 5, 100, 1, 1_000, bps));
+        // insurance 999 ⇒ cap 999 < 1_000 ⇒ tripped.
+        assert!(oi_exceeds_insurance_cap(5, 5, 100, 1, 999, bps));
+        // 10× multiple (100_000 bps): cap = insurance·10. notional 1_000 vs
+        // insurance 100 → cap 1_000 ⇒ not exceeded; insurance 99 → cap 990 ⇒ tripped.
+        assert!(!oi_exceeds_insurance_cap(5, 5, 100, 1, 100, 10 * bps));
+        assert!(oi_exceeds_insurance_cap(5, 5, 100, 1, 99, 10 * bps));
+        // Saturation is fail-safe: an overflowing notional trips (never panics).
+        assert!(oi_exceeds_insurance_cap(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            1,
+            bps
+        ));
     }
 
     #[test]
@@ -574,6 +636,36 @@ mod xmargin_kani_proofs {
         let sub: u64 = kani::any();
         let after = reserve_release(reserved, sub);
         assert!(after <= reserved); // only ever decreases (or holds), never wraps up
+    }
+
+    /// G-3: the breaker is DISABLED when `multiple_bps == 0` — it never trips, so
+    /// a legacy market that never opted in is byte-for-byte unaffected. Over the
+    /// whole input domain (no assumptions).
+    #[kani::proof]
+    fn oi_breaker_disabled_is_false() {
+        let oi_long: u64 = kani::any();
+        let oi_short: u64 = kani::any();
+        let mark: u64 = kani::any();
+        let tick: u64 = kani::any();
+        let insurance: u64 = kani::any();
+        assert!(!oi_exceeds_insurance_cap(
+            oi_long, oi_short, mark, tick, insurance, 0
+        ));
+    }
+
+    /// G-3: the predicate is TOTAL — it never panics/overflows for ANY u64 inputs
+    /// (all arithmetic is 128-bit saturating). Reaching the assertion at all proves
+    /// no arithmetic trap on the way. Whole domain, no assumptions.
+    #[kani::proof]
+    fn oi_breaker_no_overflow() {
+        let oi_long: u64 = kani::any();
+        let oi_short: u64 = kani::any();
+        let mark: u64 = kani::any();
+        let tick: u64 = kani::any();
+        let insurance: u64 = kani::any();
+        let multiple: u64 = kani::any();
+        let _ = oi_exceeds_insurance_cap(oi_long, oi_short, mark, tick, insurance, multiple);
+        assert!(true); // reached ⇒ no panic/overflow for any inputs
     }
 
     // NOTE: `incremental_im`'s "never understates" property is verified exhaustively

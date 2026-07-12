@@ -6780,6 +6780,44 @@ pub mod flash_book {
             }
         }
 
+        // G-3: OI-vs-insurance circuit breaker. The fill is fully settled above
+        // (OI + collateral + insurance). If gross OI notional now exceeds the
+        // insurance-relative cap, auto-PAUSE the market — a plain flag write, NOT
+        // a revert (the committed fill must stand; intake already rejects Paused,
+        // so only NEW risk is blocked). Opt-in: `oi_insurance_multiple_bps == 0`
+        // (default / legacy) makes `oi_exceeds_insurance_cap` return false.
+        {
+            let market_key = ctx.accounts.market.key();
+            let insurance_balance = ctx.accounts.insurance_fund.balance_quote_lots;
+            let market = &mut ctx.accounts.market;
+            if market.status != MarketStatus::Paused as u8
+                && market.status != MarketStatus::Closed as u8
+                && xmargin::oi_exceeds_insurance_cap(
+                    market.oi_long_lots,
+                    market.oi_short_lots,
+                    market.mark_price_ticks,
+                    market.params.tick_size,
+                    insurance_balance,
+                    market.oi_insurance_multiple_bps,
+                )
+            {
+                let previous_status = market.status;
+                let gross_oi_notional = (market.oi_long_lots as u128)
+                    .saturating_add(market.oi_short_lots as u128)
+                    .saturating_mul(market.mark_price_ticks as u128)
+                    .saturating_mul(market.params.tick_size as u128);
+                let multiple_bps = market.oi_insurance_multiple_bps;
+                market.status = MarketStatus::Paused as u8;
+                emit!(OiInsuranceBreakerTrippedEvent {
+                    market: market_key,
+                    gross_oi_notional,
+                    insurance_balance_quote_lots: insurance_balance,
+                    multiple_bps,
+                    previous_status,
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -7243,6 +7281,42 @@ pub mod flash_book {
             market: market.key(),
             previous_status: prev,
             new_status,
+        });
+        Ok(())
+    }
+
+    /// G-3: set the OI-vs-insurance circuit-breaker multiple (authority-only).
+    /// `bps == 0` DISABLES the breaker; otherwise it must be in
+    /// `[MIN_OI_INSURANCE_MULTIPLE_BPS, MAX_OI_INSURANCE_MULTIPLE_BPS]`. The cap
+    /// enforced at settlement is `insurance_balance · bps / BPS_DENOM`; when gross
+    /// OI notional exceeds it, `apply_fill`/`apply_flp_fill` auto-pause the market.
+    /// Immediate (not timelocked) because it grants no power the authority lacks —
+    /// the authority can already halt the market via `set_market_status` — and it
+    /// can never move funds; the only effect is when/whether the market
+    /// auto-pauses as OI grows relative to the insurance backstop.
+    pub fn set_oi_insurance_multiple_bps(
+        ctx: Context<UpdateMarketAuthority>,
+        bps: u64,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        require_keys_eq!(
+            market.authority,
+            ctx.accounts.authority.key(),
+            FlashBookError::Unauthorized
+        );
+        require!(
+            bps == 0
+                || (constants::MIN_OI_INSURANCE_MULTIPLE_BPS
+                    ..=constants::MAX_OI_INSURANCE_MULTIPLE_BPS)
+                    .contains(&bps),
+            FlashBookError::OutOfRange
+        );
+        let previous = market.oi_insurance_multiple_bps;
+        market.oi_insurance_multiple_bps = bps;
+        emit!(OiInsuranceMultipleSetEvent {
+            market: market.key(),
+            previous_bps: previous,
+            new_bps: bps,
         });
         Ok(())
     }
@@ -9438,6 +9512,43 @@ pub mod flash_book {
                 }
             }
         }
+
+        // G-3: OI-vs-insurance circuit breaker (same as apply_fill). The FLP fill
+        // is fully settled above; if gross OI notional now exceeds the
+        // insurance-relative cap, auto-PAUSE (flag write, never a revert — intake
+        // already rejects Paused). No-op when opted out / already Paused / Closed.
+        {
+            let market_key = ctx.accounts.market.key();
+            let insurance_balance = ctx.accounts.insurance_fund.balance_quote_lots;
+            let market = &mut ctx.accounts.market;
+            if market.status != MarketStatus::Paused as u8
+                && market.status != MarketStatus::Closed as u8
+                && xmargin::oi_exceeds_insurance_cap(
+                    market.oi_long_lots,
+                    market.oi_short_lots,
+                    market.mark_price_ticks,
+                    market.params.tick_size,
+                    insurance_balance,
+                    market.oi_insurance_multiple_bps,
+                )
+            {
+                let previous_status = market.status;
+                let gross_oi_notional = (market.oi_long_lots as u128)
+                    .saturating_add(market.oi_short_lots as u128)
+                    .saturating_mul(market.mark_price_ticks as u128)
+                    .saturating_mul(market.params.tick_size as u128);
+                let multiple_bps = market.oi_insurance_multiple_bps;
+                market.status = MarketStatus::Paused as u8;
+                emit!(OiInsuranceBreakerTrippedEvent {
+                    market: market_key,
+                    gross_oi_notional,
+                    insurance_balance_quote_lots: insurance_balance,
+                    multiple_bps,
+                    previous_status,
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -19460,6 +19571,29 @@ pub struct MarketStatusChangedEvent {
     pub market: Pubkey,
     pub previous_status: u8,
     pub new_status: u8,
+}
+
+/// G-3: emitted when the OI-vs-insurance circuit-breaker multiple is set/cleared
+/// via `set_oi_insurance_multiple_bps`.
+#[event]
+pub struct OiInsuranceMultipleSetEvent {
+    pub market: Pubkey,
+    pub previous_bps: u64,
+    pub new_bps: u64,
+}
+
+/// G-3: emitted when the OI-vs-insurance breaker TRIPS at settlement — gross OI
+/// notional exceeded `insurance_balance · multiple_bps / BPS_DENOM`, so the
+/// market was auto-paused. `apply_fill`/`apply_flp_fill` still settle the
+/// committed fill; only NEW intake is blocked. Operators observe this and
+/// recover via `set_market_status` once OI/insurance are back in balance.
+#[event]
+pub struct OiInsuranceBreakerTrippedEvent {
+    pub market: Pubkey,
+    pub gross_oi_notional: u128,
+    pub insurance_balance_quote_lots: u64,
+    pub multiple_bps: u64,
+    pub previous_status: u8,
 }
 
 /// Emitted when the market's emergency guardian is

@@ -128,6 +128,16 @@ pub const PARAM_UPDATE_TIMELOCK_SECONDS: i64 = 48 * 60 * 60;
 pub const MIN_HEAL_STALENESS_SECONDS: u32 = 60;
 pub const MAX_HEAL_STALENESS_SECONDS: u32 = 86_400;
 
+/// G-3: sane bounds for a market's `oi_insurance_multiple_bps` when opting INTO
+/// the OI-vs-insurance circuit breaker (0 = disabled is always allowed). The cap
+/// is `insurance_balance · multiple_bps / BPS_DENOM`, so `multiple_bps` is how
+/// many times the insurance balance the GROSS OI notional may reach. Floor 1×
+/// (`10_000` bps) stops an operator self-DoS (a sub-1× cap would pause the market
+/// on almost any OI); ceiling 10_000× bounds the loosest meaningful opt-in
+/// (looser than that, just disable with 0).
+pub const MIN_OI_INSURANCE_MULTIPLE_BPS: u64 = 10_000;
+pub const MAX_OI_INSURANCE_MULTIPLE_BPS: u64 = 100_000_000;
+
 /// K-2: minimum L1 slots between two `set_insurance_pause_threshold` changes.
 /// The pause threshold is the ADL/insurance-pause trigger floor; without a
 /// cooldown a compromised or erratic insurance authority could rapidly toggle
