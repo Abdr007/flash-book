@@ -10,11 +10,21 @@
 //!
 //! Pause-new-positions threshold: gating logic for opening orders
 //! when fund balance falls below a configured floor.
+//!
+//! AUTHORITY NOTE: `InsuranceFund` below is a pure REFERENCE/SPEC model of the
+//! contribution + waterfall accounting, exercised by the model tests in
+//! `matcher/tests.rs`. It is NOT the live path — on-chain, the insurance
+//! contribution is computed inline in `apply_fill` (lib.rs) against
+//! `InsuranceFundAccount`, and the live solvency checks are the free functions in
+//! this module (`assess_solvency*`, `partial_collateral_proves_insolvent`,
+//! `residual_exceeds_backed_surplus`), which ARE called from the program. Keep
+//! the model and the live path in agreement when either changes.
 
 use crate::constants::BPS_DENOM;
 use crate::errors::OrOverflow;
 use anchor_lang::prelude::*;
 
+/// REFERENCE/SPEC model (see the module AUTHORITY NOTE) — not the live path.
 #[derive(Debug, Clone, Copy, AnchorSerialize, AnchorDeserialize, Default)]
 pub struct InsuranceFund {
     pub balance_quote_lots: u64,

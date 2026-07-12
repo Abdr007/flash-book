@@ -14,6 +14,13 @@
 //!   - Deterministic: same inputs → same liquidation price (no keeper race).
 //!   - Cascade-resilient: all liqs in a batch clear at the same uniform price.
 //!   - No MEV: no external party captures liquidation fees.
+//!
+//! AUTHORITY NOTE: `detect_liquidations` / `generate_liquidation_orders` /
+//! `compute_shortfall` are a pure REFERENCE/SPEC model of the batch flow,
+//! exercised by the model tests in `matcher/tests.rs`. They are NOT the live
+//! path — on-chain liquidation is `liquidate_position_v2` / `liquidate_portfolio_v2`
+//! / `auto_deleverage` in lib.rs (per-instruction, keeper-driven). Keep the model
+//! and the live handlers in agreement when either changes.
 
 use super::lot::{BaseLots, Ticks};
 use super::order::{Order, OrderType, Side};
