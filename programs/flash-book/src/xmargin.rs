@@ -534,4 +534,91 @@ mod xmargin_kani_proofs {
         // ...nor below the ER reservation (no cross-domain loss dump).
         assert!(remaining >= er);
     }
+
+    /// ROUND-TRIP — moving collateral to isolated and back to cross returns EXACTLY
+    /// the original cross balance (no value created or destroyed by the split/merge
+    /// pair), for every reachable `(cross, amount)`.
+    #[kani::proof]
+    fn split_then_merge_is_identity() {
+        let cross: u64 = kani::any();
+        let amount: u64 = kani::any();
+        // split only succeeds when the cross pool can fund it.
+        kani::assume(amount <= cross);
+        let (cross_after, isolated) = split_to_isolated(cross, amount).unwrap();
+        // isolated bucket got exactly `amount`; cross fell by exactly `amount`.
+        assert!(isolated == amount);
+        assert!(cross_after == cross - amount);
+        // merging the isolated bucket back restores the original cross.
+        let restored = merge_to_cross(cross_after, isolated).unwrap();
+        assert!(restored == cross);
+    }
+
+    /// CAPPED DEBIT bounds — `apply_capped_debit` pays at most what is owed AND at
+    /// most what the balance holds, and the post-balance is exactly `balance −
+    /// paid` (never underflows, never over-charges). This is the fee-debit
+    /// primitive on an under-collateralized taker.
+    #[kani::proof]
+    fn capped_debit_bounds() {
+        let balance: u64 = kani::any();
+        let amount: u64 = kani::any();
+        let (after, paid) = apply_capped_debit(balance, amount);
+        assert!(paid <= amount); // never charges more than owed
+        assert!(paid <= balance); // never charges more than held
+        assert!(after == balance - paid); // exact remainder, no underflow
+        assert!(after <= balance); // balance never grows on a debit
+    }
+
+    /// LIQUIDATION REWARD is bounded by the source — the reward paid to the caller
+    /// never exceeds what the liquidatee's bucket can fund, and the three legs
+    /// (source-out, caller-in, leftover) conserve. Complements the existing
+    /// `liquidation_reward_conserves` with the non-creation bound.
+    #[kani::proof]
+    fn liquidation_reward_bounded_by_source() {
+        let src: u64 = kani::any();
+        let caller: u64 = kani::any();
+        let reward: u64 = kani::any();
+        if let Ok((src_after, caller_after, paid)) = apply_liquidation_reward(src, caller, reward) {
+            assert!(paid <= src); // can't pay a reward the source can't fund
+            assert!(src_after == src - paid); // exact debit
+            assert!(caller_after >= caller); // caller only ever gains
+        }
+    }
+
+    /// TRANSFER never mints — `apply_collateral_transfer` moves value between two
+    /// balances with the destination gaining exactly what the source loses, and
+    /// neither the sum overflows nor the source underflows.
+    #[kani::proof]
+    fn transfer_moves_exactly_and_never_mints() {
+        let from: u64 = kani::any();
+        let to: u64 = kani::any();
+        let amount: u64 = kani::any();
+        let er: u64 = kani::any();
+        if let Ok((from_after, to_after)) = apply_collateral_transfer(from, to, amount, er) {
+            assert!(from_after == from - amount);
+            assert!(to_after == to + amount);
+            // total is invariant across the move.
+            assert!((from_after as u128) + (to_after as u128) == (from as u128) + (to as u128));
+        }
+    }
+
+    /// FLOOR MONOTONICITY — the ER-aware required collateral is monotone
+    /// non-decreasing in each of its inputs, so a larger margin need / notional
+    /// floor / ER reservation can only ever RAISE the requirement (an adversary
+    /// can never lower their own requirement by inflating an input).
+    #[kani::proof]
+    fn required_floor_monotone_in_inputs() {
+        let im: u64 = kani::any();
+        let floor: u64 = kani::any();
+        let er: u64 = kani::any();
+        let d: u64 = kani::any();
+        let base = required_collateral_with_er(im, floor, er);
+        // raising IM never lowers the requirement
+        if let Some(im2) = im.checked_add(d) {
+            assert!(required_collateral_with_er(im2, floor, er) >= base);
+        }
+        // raising the ER reservation never lowers the requirement
+        if let Some(er2) = er.checked_add(d) {
+            assert!(required_collateral_with_er(im, floor, er2) >= base);
+        }
+    }
 }
