@@ -15088,3 +15088,154 @@ async fn set_paper_profit_haircut_cranks_and_gates_auth() {
         "haircut > BPS_DENOM must be OutOfRange, got: {err:?}"
     );
 }
+
+// ── HIP-3: permissionless market creation ───────────────────────────────────
+
+fn hip3_valid_params() -> MarketParams {
+    MarketParams {
+        max_leverage: 10,
+        maintenance_margin_ratio_bps: 500,
+        initial_margin_ratio_bps: 1000,
+        taker_fee_bps: 50,
+        liq_penalty_bps: 100,
+        liquidator_reward_bps: 100,
+        oracle_staleness_max_seconds: 60,
+        oracle_band_bps: 500,
+        max_position_lots_per_trader: 1_000_000,
+        referrer_share_bps: 0,
+        builder_share_bps: 0,
+        creator_share_bps: 0,
+        ..default_params()
+    }
+}
+
+async fn create_perm_market_ix(
+    creator: &Keypair,
+    protocol: &Protocol,
+    params: MarketParams,
+) -> (Pubkey, Instruction) {
+    let base_mint = Keypair::new().pubkey();
+    let quote_mint = Keypair::new().pubkey();
+    let (market, _) = pda(&[MarketAccount::SEED, base_mint.as_ref(), quote_mint.as_ref()]);
+    let dummy = Keypair::new().pubkey();
+    let ix = build_ix(
+        flash_book::instruction::CreatePermissionlessMarket {
+            params,
+            initial_oracle_ticks: 100_000,
+        },
+        vec![
+            AccountMeta::new(creator.pubkey(), true),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(dummy, false),
+            AccountMeta::new_readonly(dummy, false),
+            AccountMeta::new_readonly(dummy, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(protocol.insurance_fund, false),
+            AccountMeta::new_readonly(protocol.flp_exposure, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    (market, ix)
+}
+
+#[tokio::test]
+async fn create_permissionless_market_by_non_authority_succeeds_and_isolates() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+
+    // A NON-authority creator (never the insurance-fund authority) funds itself.
+    let creator = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &creator.pubkey(),
+                200_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    let (market, ix) = create_perm_market_ix(&creator, &protocol, hip3_valid_params()).await;
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&creator.pubkey()),
+            &[&creator],
+            bh,
+        ))
+        .await
+        .expect("a non-authority must be able to create a permissionless market");
+
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market).await;
+    assert!(
+        m.is_permissionless,
+        "created market must be flagged permissionless"
+    );
+    assert_eq!(
+        m.authority,
+        creator.pubkey(),
+        "creator becomes the market authority"
+    );
+    assert_eq!(
+        m.creator,
+        creator.pubkey(),
+        "creator earns the creator share"
+    );
+    assert!(
+        m.fill_commitment_required,
+        "permissionless market is armed (fail-closed) by default"
+    );
+}
+
+#[tokio::test]
+async fn create_permissionless_market_rejects_out_of_envelope_params() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let protocol = setup_protocol(&mut ctx, &payer).await;
+
+    let creator = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &creator.pubkey(),
+                200_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // 50x leverage is outside the HIP-3 envelope (max 10x) → OutOfRange (7003).
+    let mut bad = hip3_valid_params();
+    bad.max_leverage = 50;
+    let (_market, ix) = create_perm_market_ix(&creator, &protocol, bad).await;
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&creator.pubkey()),
+            &[&creator],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7003)"),
+        "predatory (50x) params must be rejected by the HIP-3 envelope, got: {err:?}"
+    );
+}
