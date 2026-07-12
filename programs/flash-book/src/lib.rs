@@ -758,6 +758,112 @@ pub mod flash_book {
         Err(error!(FlashBookError::OwnerForceUndelegateUnavailable))
     }
 
+    /// R-2 EMERGENCY RECOVERY (permissionless). When a market's ER sequencer is
+    /// dead or censoring — the Kani-proven `force_undelegate_allowed` liveness gate
+    /// fires — this closes a trader's TRAPPED cross position on L1 at the oracle
+    /// price, so the collateral that `open_positions > 0` otherwise locks becomes
+    /// withdrawable via the normal (x-domain) withdraw path. Because the market and
+    /// TraderState live on L1 (only the book is delegated), the close needs neither
+    /// the ER book nor the MagicBlock DLP.
+    ///
+    /// The insurance fund is the counterparty of last resort: realized PnL moves
+    /// trader-collateral ↔ insurance equal-and-opposite through the machine-proven
+    /// `force_close_against_insurance` core, so no value is minted (V conserved).
+    /// The position is valued at the staleness-gated worse-of(mark, oracle) health
+    /// price, which is adverse to the closing trader — protecting the fund and
+    /// removing any incentive to prefer this path over a normal close once the ER
+    /// recovers. Anyone may crank it (it can only HELP the trapped trader), and the
+    /// proven gate guarantees it can NEVER fire on a live/heartbeating market.
+    ///
+    /// Accrued funding is forgiven (no balance moves for it ⇒ conservation-neutral),
+    /// which keeps this path independent of the haircut/Residual engine. v1 handles
+    /// CROSS positions; an isolated position's segregated bucket is a follow-up.
+    pub fn force_reduce_position_oracle(ctx: Context<ForceReducePositionOracle>) -> Result<()> {
+        let clock = Clock::get()?;
+        let current_slot = clock.slot;
+        let now_unix = clock.unix_timestamp.max(0) as u64;
+
+        // Liveness gate — only reachable when the ER is stalled/censoring.
+        require!(
+            er::force_undelegate_allowed(
+                current_slot,
+                ctx.accounts.market.last_settlement_slot,
+                ctx.accounts.market.last_heartbeat_slot,
+                ctx.accounts.market.book_delegated_at_slot,
+                constants::FORCE_UNDELEGATE_TIMEOUT_SLOTS,
+                constants::CENSORSHIP_ESCAPE_TIMEOUT_SLOTS,
+            ),
+            FlashBookError::ErStillLive
+        );
+
+        let (pre_side, pre_size, entry, is_long) = {
+            let p = ctx.accounts.position.load()?;
+            require!(p.size_lots > 0, FlashBookError::ZeroSize);
+            // v1: cross only (bucket == the shared pool). Isolated is a follow-up.
+            require!(p.collateral_quote_lots == 0, FlashBookError::OutOfRange);
+            (p.side, p.size_lots, p.entry_price_ticks, p.side == 0)
+        };
+
+        // Staleness-gated worse-of(mark, oracle), adverse to the closer.
+        let close_price =
+            effective_health_mark(&ctx.accounts.market, now_unix, current_slot, is_long)?;
+
+        // Realized PnL at the close price (price move only; accrued funding is
+        // forgiven — conservation-neutral, as no balance moves for it).
+        let price_diff: i128 = if is_long {
+            close_price as i128 - entry as i128
+        } else {
+            entry as i128 - close_price as i128
+        };
+        let pnl: i128 = price_diff
+            .checked_mul(pre_size as i128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?
+            .checked_mul(ctx.accounts.market.params.tick_size as i128)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        // Settle trader-collateral ↔ insurance through the proven conserving core.
+        let bucket = ctx.accounts.trader_state.load()?.collateral_quote_lots;
+        let insurance = ctx.accounts.insurance_fund.balance_quote_lots;
+        let (new_bucket, new_insurance) = force_close_against_insurance(pnl, bucket, insurance);
+        let settled_delta = new_bucket as i128 - bucket as i128;
+        ctx.accounts.trader_state.load_mut()?.collateral_quote_lots = new_bucket;
+        ctx.accounts.insurance_fund.balance_quote_lots = new_insurance;
+
+        // Close the position.
+        let market_funding_index = ctx.accounts.market.cum_funding_index;
+        {
+            let mut p = ctx.accounts.position.load_mut()?;
+            p.size_lots = 0;
+            p.entry_price_ticks = 0;
+            let settled_i64 = if settled_delta > i64::MAX as i128 {
+                i64::MAX
+            } else if settled_delta < i64::MIN as i128 {
+                i64::MIN
+            } else {
+                settled_delta as i64
+            };
+            p.realized_pnl_quote_lots = p.realized_pnl_quote_lots.saturating_add(settled_i64);
+            p.set_cum_funding_index(market_funding_index);
+        }
+
+        // OI + open_positions bookkeeping.
+        update_oi(&mut ctx.accounts.market, pre_side, pre_size, pre_side, 0)?;
+        let (new_open, trader) = {
+            let ts = ctx.accounts.trader_state.load()?;
+            (ts.open_positions.saturating_sub(1), ts.trader)
+        };
+        ctx.accounts.trader_state.load_mut()?.open_positions = new_open;
+        emit!(PositionForceReducedEvent {
+            market: ctx.accounts.market.key(),
+            trader,
+            close_price_ticks: close_price,
+            size_lots: pre_size,
+            realized_delta_quote_lots: settled_delta.clamp(i64::MIN as i128, i64::MAX as i128)
+                as i64,
+        });
+        Ok(())
+    }
+
     /// PERMISSIONLESS one-shot: stamp the force-undelegate liveness baseline for a
     /// market whose book was DELEGATED BEFORE the censorship-escape upgrade shipped
     /// (so `book_delegated_at_slot == 0`). Without this, such a
@@ -18580,6 +18686,43 @@ pub struct AutoDeleverage<'info> {
     pub side_accrual: Option<Box<Account<'info, state_v3::MarketSideAccrualAccount>>>,
 }
 
+/// R-2 emergency oracle force-close. Permissionless; the liveness gate in the
+/// handler restricts it to a stalled/censoring ER, and it can only free the
+/// trapped trader's own funds.
+#[derive(Accounts)]
+pub struct ForceReducePositionOracle<'info> {
+    /// Anyone may crank it — it only helps the trapped trader.
+    pub cranker: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+
+    #[account(
+        mut,
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
+
+    #[account(mut)]
+    pub trader_state: AccountLoader<'info, TraderStateAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            state::PositionAccount::SEED,
+            market.key().as_ref(),
+            trader_state.key().as_ref(),
+        ],
+        bump = position.load()?.bump,
+    )]
+    pub position: AccountLoader<'info, state::PositionAccount>,
+}
+
 // ─── Events ─────────────────────────────────────────────────────────────
 
 #[event]
@@ -19714,6 +19857,17 @@ pub struct AutoDeleveragedEvent {
     pub bankruptcy_price_ticks: u64,
     pub counter_gain_quote_lots: u64,
     pub executor: Pubkey,
+}
+
+/// Emitted when a trapped position is force-closed on L1 at the oracle price via
+/// `force_reduce_position_oracle` (ER-down emergency recovery).
+#[event]
+pub struct PositionForceReducedEvent {
+    pub market: Pubkey,
+    pub trader: Pubkey,
+    pub close_price_ticks: u64,
+    pub size_lots: u64,
+    pub realized_delta_quote_lots: i64,
 }
 
 /// Emitted when authority updates the insurance fund's pause threshold via
@@ -20930,6 +21084,125 @@ mod h6_h7_solvency_proofs {
         } else {
             assert!(new_cross == cross + mag);
             assert!(new_iso == iso);
+        }
+    }
+}
+
+/// R-2 emergency recovery core (pure, Kani-proven in `force_close_proofs`).
+/// Settles a TRAPPED position's realized PnL (valued at the oracle price) against
+/// the insurance fund as the counterparty of last resort, so a trader whose ER
+/// sequencer is dead/byzantine can close on L1 and free the collateral that
+/// `open_positions > 0` otherwise locks. Returns `(new_bucket, new_insurance)`.
+///
+/// CONSERVATION (V = C_tot + I + Residual): the trader's bucket and the insurance
+/// fund move EXACTLY equal-and-opposite — `Δbucket == −Δinsurance` — so no value
+/// is minted or burned; the Residual is untouched. BOTH directions clamp so
+/// neither balance can under/overflow: a gain the fund cannot back is haircut
+/// (the trader is shorted — an acceptable last-resort outcome), and a loss beyond
+/// the trader's bucket is absorbed (the fund receives only what the trader held).
+/// The `u64::MAX` headroom clamps are unreachable at real balances; they keep the
+/// core total so the conservation proof holds over the whole input domain.
+fn force_close_against_insurance(pnl: i128, bucket: u64, insurance: u64) -> (u64, u64) {
+    if pnl > 0 {
+        let gain = if pnl > u64::MAX as i128 {
+            u64::MAX
+        } else {
+            pnl as u64
+        };
+        // Paid out of the fund, capped at what it holds AND the bucket's headroom.
+        let paid = gain.min(insurance).min(u64::MAX - bucket);
+        (bucket + paid, insurance - paid) // paid ≤ insurance ⇒ no underflow
+    } else if pnl < 0 {
+        let loss = if pnl < -(u64::MAX as i128) {
+            u64::MAX
+        } else {
+            (-pnl) as u64
+        };
+        // Paid to the fund, capped at the trader's bucket AND the fund's headroom.
+        let paid = loss.min(bucket).min(u64::MAX - insurance);
+        (bucket - paid, insurance + paid) // paid ≤ bucket ⇒ no underflow
+    } else {
+        (bucket, insurance)
+    }
+}
+
+#[cfg(test)]
+mod force_close_core_tests {
+    use super::force_close_against_insurance;
+
+    #[test]
+    fn gain_within_fund_credits_trader_debits_fund() {
+        assert_eq!(
+            force_close_against_insurance(1_000, 500, 4_000),
+            (1_500, 3_000)
+        );
+    }
+
+    #[test]
+    fn gain_beyond_fund_is_haircut() {
+        // Fund only holds 300 of the 1000 owed: trader gets 300, fund drains to 0.
+        assert_eq!(force_close_against_insurance(1_000, 500, 300), (800, 0));
+    }
+
+    #[test]
+    fn loss_within_bucket_debits_trader_credits_fund() {
+        assert_eq!(
+            force_close_against_insurance(-1_000, 5_000, 200),
+            (4_000, 1_200)
+        );
+    }
+
+    #[test]
+    fn loss_beyond_bucket_is_absorbed() {
+        // Trader can only pay 500 of the 1000 loss; fund gains only 500.
+        assert_eq!(force_close_against_insurance(-1_000, 500, 200), (0, 700));
+    }
+
+    #[test]
+    fn conserves_value_each_direction() {
+        for &(pnl, b, i) in &[
+            (1_000i128, 500u64, 4_000u64),
+            (1_000, 500, 300),
+            (-1_000, 5_000, 200),
+            (-1_000, 500, 200),
+            (0, 123, 456),
+        ] {
+            let (nb, ni) = force_close_against_insurance(pnl, b, i);
+            assert_eq!(nb as i128 - b as i128, -(ni as i128 - i as i128));
+        }
+    }
+}
+
+#[cfg(kani)]
+mod force_close_proofs {
+    use super::force_close_against_insurance;
+
+    /// CONSERVATION: the trader bucket and the insurance fund always move
+    /// equal-and-opposite, over the WHOLE (pnl, bucket, insurance) domain — so an
+    /// emergency oracle force-close can never mint or burn protocol value.
+    #[kani::proof]
+    fn force_close_conserves_value() {
+        let pnl: i128 = kani::any();
+        let bucket: u64 = kani::any::<u64>();
+        let insurance: u64 = kani::any::<u64>();
+        let (nb, ni) = force_close_against_insurance(pnl, bucket, insurance);
+        assert!(nb as i128 - bucket as i128 == -(ni as i128 - insurance as i128));
+    }
+
+    /// A gain never drains the fund below zero and a loss never drives the trader
+    /// bucket below zero (no underflow / no panic on any input).
+    #[kani::proof]
+    fn force_close_never_underflows() {
+        let pnl: i128 = kani::any();
+        let bucket: u64 = kani::any::<u64>();
+        let insurance: u64 = kani::any::<u64>();
+        let (nb, ni) = force_close_against_insurance(pnl, bucket, insurance);
+        if pnl > 0 {
+            assert!(ni <= insurance && nb >= bucket); // fund pays, trader credited
+        } else if pnl < 0 {
+            assert!(nb <= bucket && ni >= insurance); // trader pays, fund credited
+        } else {
+            assert!(nb == bucket && ni == insurance);
         }
     }
 }

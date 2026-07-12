@@ -12217,6 +12217,147 @@ async fn cross_portfolio_intake_im_blocks_second_market_stacking() {
     );
 }
 
+/// R-2 REGRESSION: emergency oracle force-close frees a trader's margin trapped
+/// behind a dead/censoring ER sequencer. While the ER is LIVE the recovery is
+/// refused (ErStillLive, anti-grief); once settlement has stalled past the
+/// timeout it closes the position on L1 at the oracle price against the insurance
+/// fund, conserving value (Δcollateral == −Δinsurance) and dropping open_positions
+/// to 0 so the collateral becomes withdrawable.
+#[tokio::test]
+async fn force_reduce_position_oracle_frees_trapped_margin_when_er_dead() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 1_000_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000_000, &protocol).await;
+
+    // Trapped cross position: taker LONG 10 @ 100_000. open_positions == 1.
+    let taker_pos = open_cross_position_sized(
+        &mut ctx,
+        &payer,
+        market,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+        10,
+    )
+    .await;
+    assert_eq!(
+        fetch::<TraderStateAccount>(&mut ctx.banks_client, taker_state)
+            .await
+            .open_positions,
+        1
+    );
+
+    let (fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let force_close = || {
+        build_ix(
+            flash_book::instruction::ForceReducePositionOracle {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true), // permissionless cranker
+                AccountMeta::new(market, false),
+                AccountMeta::new(fund_pda, false),
+                AccountMeta::new(taker_state, false),
+                AccountMeta::new(taker_pos, false),
+            ],
+        )
+    };
+
+    // (1) ER LIVE ⇒ refused (anti-grief).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[force_close()],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7704)"),
+        "must refuse while ER live (ErStillLive), got: {err:?}"
+    );
+
+    // (2) Warp past the stall timeout (750) and mark the ER stale but the price
+    //     fresh: the last fill sits at slot ~1, so at slot 5_000 the ER is stalled.
+    ctx.warp_to_slot(5_000).unwrap();
+    let clock: Clock = ctx.banks_client.get_sysvar().await.unwrap();
+    let m_acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
+    let mut m: MarketAccount = MarketAccount::try_deserialize(&mut m_acc.data.as_slice()).unwrap();
+    m.mark_price_ticks = 90_000; // 10% down ⇒ the long realizes a −100_000 loss
+    m.last_mark_update_slot = clock.slot;
+    m.oracle_published_at_unix_seconds = clock.unix_timestamp.max(1) as u64;
+    m.params.oracle_staleness_max_seconds = u32::MAX; // price fresh
+                                                      // book_delegated_at_slot stays 0 and last_settlement_slot stays ~1 ⇒ stalled.
+    let mut md = Vec::new();
+    m.try_serialize(&mut md).unwrap();
+    md.resize(m_acc.data.len(), 0);
+    ctx.set_account(
+        &market,
+        &SolAccount {
+            lamports: m_acc.lamports,
+            data: md,
+            owner: m_acc.owner,
+            executable: m_acc.executable,
+            rent_epoch: m_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    let coll_before = fetch::<TraderStateAccount>(&mut ctx.banks_client, taker_state)
+        .await
+        .collateral_quote_lots;
+    let fund_before = fetch::<InsuranceFundAccount>(&mut ctx.banks_client, fund_pda)
+        .await
+        .balance_quote_lots;
+
+    // (3) ER stalled ⇒ recovery succeeds.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[force_close()],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .expect("recovery must succeed once the ER is stalled");
+
+    let pos_after: flash_book::state::PositionAccount =
+        fetch(&mut ctx.banks_client, taker_pos).await;
+    let ts_after: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    let coll_after = ts_after.collateral_quote_lots;
+    let fund_after = fetch::<InsuranceFundAccount>(&mut ctx.banks_client, fund_pda)
+        .await
+        .balance_quote_lots;
+
+    assert_eq!(pos_after.size_lots, 0, "position closed");
+    assert_eq!(
+        ts_after.open_positions, 0,
+        "open_positions freed ⇒ withdrawable"
+    );
+    // Conservation: whatever left the trader entered the fund, exactly.
+    assert_eq!(
+        coll_before as i128 - coll_after as i128,
+        fund_after as i128 - fund_before as i128,
+        "Δcollateral == −Δinsurance (value conserved)"
+    );
+    // The 10% adverse close realizes a 100_000 loss (10 lots × 10_000 ticks × 1).
+    assert_eq!(
+        coll_before - coll_after,
+        100_000,
+        "loss settled at the oracle price"
+    );
+}
+
 /// L-1 (audit 2026-07-10): a dormant/stale SIBLING leg must NOT abort the whole
 /// portfolio-liquidation walk. Pre-fix, a single unpriceable sibling reverted the
 /// instruction (MarkTooStale/OracleTooStale), so a genuinely-insolvent trader dodged
