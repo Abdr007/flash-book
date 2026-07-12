@@ -5251,10 +5251,12 @@ pub mod flash_book {
     /// underwater positions block keepers from settling them.
     ///
     /// SCOPE: this handler drives the SIDE-ACCRUAL (K/F) price index via
-    /// `advance_indices`, using `market.last_funding_rate_bps_per_sec`. That rate
-    /// is still initialized to 0 and stored nowhere, so the side-accrual F-term
-    /// this handler advances accrues 0 for now (`view_predicted_funding` computes
-    /// a rate read-only; no path persists it into this field yet).
+    /// `advance_indices`. `crank_funding` now DOES persist
+    /// `market.last_funding_rate_bps_per_sec`, but that is a per-SECOND rate at
+    /// 1e4 (bps) scale, whereas `advance_indices` expects a per-SLOT rate at 1e9
+    /// scale — a unit mismatch. Until a proper per-slot-1e9 conversion is wired,
+    /// the F-term is fed 0 (accrues nothing, never a wrong-scaled amount); the
+    /// F-index is dormant anyway (no path reads it into collateral).
     ///
     /// This is NOT the protocol's funding charge. Cumulative-index funding is
     /// LIVE: the permissionless `crank_funding` instruction advances
@@ -5269,7 +5271,15 @@ pub mod flash_book {
         let market = &ctx.accounts.market;
         let mkey = market.key();
         let mark_px = market.mark_price_ticks;
-        let funding_rate = market.last_funding_rate_bps_per_sec;
+        // The side-accrual F-term is DORMANT (no path reads its index into
+        // collateral yet). `advance_indices` expects a per-SLOT rate at 1e9 scale
+        // (`funding_rate_e9`), but the only stored rate is
+        // `last_funding_rate_bps_per_sec` — a per-SECOND rate at 1e4 (bps) scale
+        // (persisted by `crank_funding`). Feeding it in directly is a unit
+        // mismatch (~1e5 magnitude + sec-vs-slot), so pass 0: the index accrues
+        // NOTHING rather than a wrong-scaled amount. A real F-term must first
+        // convert to per-slot-1e9 before any consumer is wired.
+        let funding_rate: i64 = 0;
 
         // ── advance the per-side K/F accrual indices ───────────
         // Maintenance-only wiring. The side indices track the market's live
