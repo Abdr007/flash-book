@@ -164,15 +164,26 @@ pub fn apply_capped_debit(balance: u64, amount: u64) -> (u64, u64) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// G-1 COMMITTED-MARGIN RESERVATION — pure arithmetic core.
+// G-1 COMMITTED-MARGIN RESERVATION — pure arithmetic core (DORMANT).
 //
-// The intake initial-margin gate reserves nothing at placement, so two orders
-// placed before either settles both see the full free pool as backing (the
-// flat-start race). The fix is a `reserved_im` accumulator per trader that costs
-// the incremental IM of every LIVE resting order the instant it is placed and
-// releases it on cancel / expiry / fill. These are the pure ops every lifecycle
-// site routes through, so the reserve↔release accounting is proven here once and
-// cannot drift at the call sites. Proven in `reservation_proofs`.
+// The intake initial-margin gate reserves nothing at placement, so on an
+// UNDELEGATED market a trader can rest an L1 order, withdraw the backing
+// collateral, and have it fill undercollateralized (the flat-start race). These
+// pure ops were built as the reserve↔release core for a per-trader `reserved_im`
+// accumulator to close that — proven here once so the accounting cannot drift at
+// call sites.
+//
+// They are DELIBERATELY UNWIRED. A sound + complete on-chain reservation is
+// architecturally precluded (see `docs/REVIEWED_FINDINGS.md`, "G-1"): there is no
+// per-trader live-order anchor to prove completeness, and the removal sites that
+// fire without the owner — bulk `reap_expired_orders` and the maker side of a
+// taker walk — cannot carry the owner's `TraderState`, so any accumulator drifts
+// and would permanently over-lock collateral. The residual loss is instead BOUNDED
+// (insurance/ADL, Kani-proven in `matcher::insurance`); the ER-delegated path is
+// already closed by the sequencer-attested `ErMarginAttestation`. `incremental_im`
+// is retained (it also defines the intake gate's rounding); `reserve_add` /
+// `reserve_release` are kept as proven building blocks should a future
+// off-chain-attested design for the undelegated path ever want them.
 // ─────────────────────────────────────────────────────────────────────
 
 /// Incremental INITIAL margin an order commits, computed EXACTLY as the intake
