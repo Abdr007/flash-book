@@ -202,9 +202,16 @@ Every item now has real scope (no more title-only). The remainder splits into:
   **4.2 DONE** PR #313; **4.6 DONE** PR #309 (+ vault #311); **4.7 DONE** PR #305 +
   funding-TWAP PR #307. 2.1/2.7 dispositioned/done above.)
 - **Hard proofs** (Lean / real-symbol): **all DONE.** 1.2 (real-symbol Kani `assess_margin_single_market_frame_stable`), 1.3 (`RealizedPnl.lean`), 1.5 (`ResidualConservation.lean`), 1.7 (`AuthCompleteness.lean`) — each compiles clean with `#print axioms` showing only propext/Classical.choice/Quot.sound, no `sorry`.
-- **Multi-week builds**: 1.1 Certora integration, 3.1 percolator per-domain credit, and
-  the three big builds (copy-vaults, HIP-3 permissionless deploy, decentralized-sequencer
-  activation).
+- **Multi-week builds**: **3.1 percolator WIRED** (#330); **HIP-3 DONE (core)** (#333);
+  **copy-vaults DONE (share-vault core)** — `matcher::vault_math` (ERC-4626-style
+  `shares_on_deposit` / `assets_on_withdraw`, rounds in the vault's favour, Lean-proven
+  `VaultShares.lean`: no over-withdraw, all-shares-return-all, monotone payout, 1:1 seed)
+  + `CopyVaultAccount` (ISOLATED own token vault — no shared-vault/solvency
+  entanglement) + `create_copy_vault` / `deposit_to_copy_vault` /
+  `withdraw_from_copy_vault`; deposit/withdraw round-trip integration-tested.
+  **Remaining (copy-vaults):** the manager-signed trade path (copy execution) + a
+  devnet cycle. Not-doing (per owner): 1.1 Certora whole-program, decentralized-sequencer
+  activation.
 - **Vendor-gated**: 6.1 (audit signature), 6.3 (GPL legal read), 2.5 (MagicBlock
   owner-recovery).
 - **Positioning/ops docs**: 5.1 spec+devnet sweep, 5.3/5.6 SDK, 6.2/6.4/6.6.

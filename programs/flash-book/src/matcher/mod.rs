@@ -17,6 +17,7 @@ pub mod position_math;
 pub mod reduce_only;
 pub mod risk;
 pub mod side_accrual;
+pub mod vault_math;
 pub mod vpin;
 
 #[cfg(test)]

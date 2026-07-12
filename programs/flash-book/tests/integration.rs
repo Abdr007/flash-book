@@ -15239,3 +15239,139 @@ async fn create_permissionless_market_rejects_out_of_envelope_params() {
         "predatory (50x) params must be rejected by the HIP-3 envelope, got: {err:?}"
     );
 }
+
+// ── copy-vaults: share-accounting vault ─────────────────────────────────────
+
+#[tokio::test]
+async fn copy_vault_deposit_mints_shares_and_withdraw_returns_proportional() {
+    use flash_book::state::{CopyVaultAccount, CopyVaultShareAccount};
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let mint = create_mint(&mut ctx, &payer).await;
+    let manager = Pubkey::new_unique();
+    let (vault, _) = pda(&[CopyVaultAccount::SEED, manager.as_ref()]);
+    let token_vault = Keypair::new();
+
+    // create the vault (its own isolated token vault).
+    let create_ix = build_ix(
+        flash_book::instruction::CreateCopyVault {
+            manager: to_anchor(manager),
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(token_vault.pubkey(), true),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::rent::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[create_ix],
+            Some(&payer.pubkey()),
+            &[&payer, &token_vault],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // depositor with 1_000 tokens.
+    let depositor = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &depositor.pubkey(),
+                100_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let dep_ata = create_ata(&mut ctx, &payer, depositor.pubkey(), mint).await;
+    mint_tokens(&mut ctx, &payer, mint, dep_ata, 1_000).await;
+
+    let (share_acct, _) = pda(&[
+        CopyVaultShareAccount::SEED,
+        vault.as_ref(),
+        depositor.pubkey().as_ref(),
+    ]);
+    let deposit_ix = build_ix(
+        flash_book::instruction::DepositToCopyVault { amount: 1_000 },
+        vec![
+            AccountMeta::new(depositor.pubkey(), true),
+            AccountMeta::new(vault, false),
+            AccountMeta::new(share_acct, false),
+            AccountMeta::new(dep_ata, false),
+            AccountMeta::new(token_vault.pubkey(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[deposit_ix],
+            Some(&depositor.pubkey()),
+            &[&depositor],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // first deposit seeds 1:1 → 1_000 shares, 1_000 assets.
+    let v: CopyVaultAccount = fetch(&mut ctx.banks_client, vault).await;
+    assert_eq!(v.total_shares, 1_000);
+    assert_eq!(v.total_assets_quote_lots, 1_000);
+    let s: CopyVaultShareAccount = fetch(&mut ctx.banks_client, share_acct).await;
+    assert_eq!(s.shares, 1_000);
+
+    // withdraw all shares → 1_000 tokens back, vault emptied.
+    let withdraw_ix = build_ix(
+        flash_book::instruction::WithdrawFromCopyVault { shares: 1_000 },
+        vec![
+            AccountMeta::new_readonly(depositor.pubkey(), true),
+            AccountMeta::new(vault, false),
+            AccountMeta::new(share_acct, false),
+            AccountMeta::new(dep_ata, false),
+            AccountMeta::new(token_vault.pubkey(), false),
+            AccountMeta::new_readonly(spl_token_id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[withdraw_ix],
+            Some(&depositor.pubkey()),
+            &[&depositor],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let ata = ctx
+        .banks_client
+        .get_account(dep_ata)
+        .await
+        .unwrap()
+        .unwrap();
+    let ata_state =
+        <spl_token::state::Account as spl_token::solana_program::program_pack::Pack>::unpack(
+            &ata.data,
+        )
+        .unwrap();
+    assert_eq!(
+        ata_state.amount, 1_000,
+        "withdraw must return the full deposit"
+    );
+    let v2: CopyVaultAccount = fetch(&mut ctx.banks_client, vault).await;
+    assert_eq!(v2.total_shares, 0);
+    assert_eq!(v2.total_assets_quote_lots, 0);
+}

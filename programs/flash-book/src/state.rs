@@ -806,6 +806,58 @@ impl FeeAccrualAccount {
     }
 }
 
+/// Copy-vault (managed/copy-trading vault). Depositors pool quote collateral and
+/// receive SHARES; the vault's `manager` (typically a leader trader or a copy
+/// keeper) directs the vault's trading. Each depositor's claim is
+/// `shares / total_shares` of `total_assets_quote_lots` (`matcher::vault_math`,
+/// Lean-proven `VaultShares.lean`). ISOLATED: the vault holds its own SPL token
+/// vault (`token_vault`, owned by this PDA), NOT the shared protocol vault, so it
+/// adds no term to global solvency and its funds can never be commingled with or
+/// drawn by other markets.
+#[account]
+#[derive(Debug)]
+pub struct CopyVaultAccount {
+    /// Directs the vault's trading (copy leader / keeper). Recorded now; the
+    /// manager-signed trade path is a tracked follow-up.
+    pub manager: Pubkey,
+    /// Quote mint the vault accepts (its `token_vault`'s mint).
+    pub quote_mint: Pubkey,
+    /// The vault's own SPL token account (this PDA is its authority).
+    pub token_vault: Pubkey,
+    /// Total shares outstanding across all `CopyVaultShareAccount`s.
+    pub total_shares: u64,
+    /// Accounted assets in quote lots (deposits − withdrawals + settled PnL).
+    /// Equals `token_vault.amount` while the vault holds no open positions.
+    pub total_assets_quote_lots: u64,
+    pub bump: u8,
+}
+
+impl CopyVaultAccount {
+    pub const SEED: &'static [u8] = b"copy_vault";
+    pub fn space() -> usize {
+        // 8 disc + 32*3 + 8 + 8 + 1 = 121. Round up.
+        8 + 160
+    }
+}
+
+/// A depositor's share balance in a specific copy-vault.
+#[account]
+#[derive(Debug)]
+pub struct CopyVaultShareAccount {
+    pub vault: Pubkey,
+    pub owner: Pubkey,
+    pub shares: u64,
+    pub bump: u8,
+}
+
+impl CopyVaultShareAccount {
+    pub const SEED: &'static [u8] = b"copy_vault_share";
+    pub fn space() -> usize {
+        // 8 disc + 32 + 32 + 8 + 1 = 81. Round up.
+        8 + 96
+    }
+}
+
 /// FLP pool exposure across markets and per-LP share accounting.
 ///
 /// The pool's NAV (Net Asset Value) is `total_capital_quote_lots +
