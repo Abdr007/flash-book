@@ -5763,6 +5763,140 @@
       "args": []
     },
     {
+      "name": "force_reduce_position_oracle",
+      "docs": [
+        "R-2 EMERGENCY RECOVERY (permissionless). When a market's ER sequencer is",
+        "dead or censoring — the Kani-proven `force_undelegate_allowed` liveness gate",
+        "fires — this closes a trader's TRAPPED cross position on L1 at the oracle",
+        "price, so the collateral that `open_positions > 0` otherwise locks becomes",
+        "withdrawable via the normal (x-domain) withdraw path. Because the market and",
+        "TraderState live on L1 (only the book is delegated), the close needs neither",
+        "the ER book nor the MagicBlock DLP.",
+        "",
+        "The insurance fund is the counterparty of last resort: realized PnL moves",
+        "trader-collateral ↔ insurance equal-and-opposite through the machine-proven",
+        "`force_close_against_insurance` core, so no value is minted (V conserved).",
+        "The position is valued at the staleness-gated worse-of(mark, oracle) health",
+        "price, which is adverse to the closing trader — protecting the fund and",
+        "removing any incentive to prefer this path over a normal close once the ER",
+        "recovers. Anyone may crank it (it can only HELP the trapped trader), and the",
+        "proven gate guarantees it can NEVER fire on a live/heartbeating market.",
+        "",
+        "Accrued funding is forgiven (no balance moves for it ⇒ conservation-neutral),",
+        "which keeps this path independent of the haircut/Residual engine. v1 handles",
+        "CROSS positions; an isolated position's segregated bucket is a follow-up."
+      ],
+      "discriminator": [
+        170,
+        114,
+        233,
+        199,
+        157,
+        92,
+        253,
+        248
+      ],
+      "accounts": [
+        {
+          "name": "cranker",
+          "docs": [
+            "Anyone may crank it — it only helps the trapped trader."
+          ],
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "trader_state",
+          "writable": true
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "trader_state"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "force_undelegate_market_book",
       "docs": [
         "PERMISSIONLESS censorship / ER-stall escape (force-include, #1703).",
@@ -13500,10 +13634,12 @@
         "underwater positions block keepers from settling them.",
         "",
         "SCOPE: this handler drives the SIDE-ACCRUAL (K/F) price index via",
-        "`advance_indices`, using `market.last_funding_rate_bps_per_sec`. That rate",
-        "is still initialized to 0 and stored nowhere, so the side-accrual F-term",
-        "this handler advances accrues 0 for now (`view_predicted_funding` computes",
-        "a rate read-only; no path persists it into this field yet).",
+        "`advance_indices`. `crank_funding` now DOES persist",
+        "`market.last_funding_rate_bps_per_sec`, but that is a per-SECOND rate at",
+        "1e4 (bps) scale, whereas `advance_indices` expects a per-SLOT rate at 1e9",
+        "scale — a unit mismatch. Until a proper per-slot-1e9 conversion is wired,",
+        "the F-term is fed 0 (accrues nothing, never a wrong-scaled amount); the",
+        "F-index is dormant anyway (no path reads it into collateral).",
         "",
         "This is NOT the protocol's funding charge. Cumulative-index funding is",
         "LIVE: the permissionless `crank_funding` instruction advances",
@@ -19088,6 +19224,19 @@
         99,
         69,
         69
+      ]
+    },
+    {
+      "name": "PositionForceReducedEvent",
+      "discriminator": [
+        94,
+        77,
+        46,
+        199,
+        9,
+        220,
+        65,
+        31
       ]
     },
     {
@@ -25782,6 +25931,38 @@
           {
             "name": "h_scaled",
             "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PositionForceReducedEvent",
+      "docs": [
+        "Emitted when a trapped position is force-closed on L1 at the oracle price via",
+        "`force_reduce_position_oracle` (ER-down emergency recovery)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "close_price_ticks",
+            "type": "u64"
+          },
+          {
+            "name": "size_lots",
+            "type": "u64"
+          },
+          {
+            "name": "realized_delta_quote_lots",
+            "type": "i64"
           }
         ]
       }
