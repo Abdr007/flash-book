@@ -148,8 +148,11 @@ below this, auto-deleverage becomes eligible.
 1. **Initialize** market with the recommended params for its asset class.
 2. **Observe** for 1 week: volatility, OI growth, liquidation count,
    funding rate range, FLP NAV.
-3. **Adjust** parameters via `update_market_params`. Each update is
-   logged via `MarketParamsUpdatedEvent`.
+3. **Adjust** parameters via the timelocked path
+   `propose_param_update` → (48h) → `execute_param_update`. Each executed
+   update is logged via `MarketParamsUpdatedEvent`. (K-3: the immediate
+   `update_market_params` no longer changes economic params — it only enables a
+   disabled oracle-staleness gate — so all tuning goes through the timelock.)
 4. **Re-prove envelope** with `set_envelope_config` if scenarios change.
 5. **Burn authority** (`burn_market_authority`) only after multiple
    months of stable operation. One-way; no further tuning possible.

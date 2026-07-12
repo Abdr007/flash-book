@@ -2895,14 +2895,165 @@ async fn update_market_params_rejects_immutable_primitive_change() {
         "update_market_params should reject tick_size change"
     );
 
-    // Mutable change should succeed (taker_fee_bps).
-    let mut mutable_change = default_params();
-    mutable_change.taker_fee_bps = 7;
+    // K-3: the immediate path is now restricted to enabling a DISABLED staleness
+    // gate. A normally-initialized market has `oracle_staleness_max_seconds > 0`,
+    // so the path rejects at the `staleness == 0` gate BEFORE it can touch any
+    // field — even a formerly-"mutable" economic one like `taker_fee_bps`. What
+    // used to succeed here now correctly fails with OutOfRange (Custom(7003)):
+    // all economic changes must go through the timelock.
+    let mut economic_change = default_params();
+    economic_change.taker_fee_bps = 7;
 
     let ix2 = build_ix(
         flash_book::instruction::UpdateMarketParams {
-            new_params: mutable_change,
+            new_params: economic_change,
         },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err2 = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix2],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err2:?}").contains("Custom(7003)"),
+        "K-3: economic change on a live market must be rejected with OutOfRange, got: {err2:?}"
+    );
+
+    // Params are untouched — the rejected economic change did not apply.
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.params.taker_fee_bps, default_params().taker_fee_bps);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// K-3: `update_market_params` is restricted to ONE operation.
+//
+// The immediate (un-timelocked) path may ONLY heal a legacy market whose
+// oracle-staleness gate was never enabled — i.e. `oracle_staleness_max_seconds
+// == 0` — by setting it to a sane value in [MIN_HEAL_STALENESS_SECONDS=60,
+// MAX_HEAL_STALENESS_SECONDS=86_400]. Every OTHER change (all economic params,
+// and any change to an ALREADY-enabled staleness bound) MUST go through the
+// timelocked `propose_param_update` → `execute_param_update` path so LPs and
+// traders get advance notice. "Nothing else changed" is enforced robustly by
+// masking the staleness field to the market's current value and requiring the
+// remainder of `new_params` byte-identical to the live params (via hash_params).
+//
+// All rejections surface as `FlashBookError::OutOfRange`, which Anchor encodes as
+// `Custom(7003)` (discriminant 1003 + the 6000 error offset) in BanksClient
+// output.
+//
+// Setup wrinkle: `initialize_market` requires `oracle_staleness_max_seconds > 0`,
+// so a freshly-created market NEVER has 0. To exercise the heal SUCCESS path we
+// simulate a legacy market by deserializing the market account, setting the field
+// to 0, re-serializing, and writing it back with `set_account` (mirroring the
+// `disarm_fill_commitment` / `zero_initial_margin` patch helpers above).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Patch a market's `oracle_staleness_max_seconds` to 0 in place, simulating a
+/// legacy market created before the staleness bound existed. Uses the same
+/// deserialize → mutate → re-serialize → `set_account` technique as
+/// `disarm_fill_commitment` / `zero_initial_margin`.
+async fn patch_staleness_to_zero(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    market: Pubkey,
+) {
+    use solana_sdk::account::Account as SolAccount;
+    let acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
+    let mut m =
+        flash_book::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    m.params.oracle_staleness_max_seconds = 0;
+    let mut data = Vec::new();
+    m.try_serialize(&mut data).unwrap();
+    data.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &market,
+        &SolAccount {
+            lamports: acc.lamports,
+            data,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
+}
+
+/// K-3 (1/4): on a normally-initialized (staleness > 0) market, an economic-only
+/// change is REJECTED. The immediate path can't touch a live market at all — it
+/// rejects at the `staleness == 0` gate before comparing any field.
+#[tokio::test]
+async fn update_market_params_k3_economic_change_rejected_on_live_market() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Current params with only an economic field bumped.
+    let mut new_params = default_params();
+    new_params.taker_fee_bps = default_params().taker_fee_bps + 1;
+
+    let ix = build_ix(
+        flash_book::instruction::UpdateMarketParams { new_params },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7003)"),
+        "K-3: economic change on a live (staleness > 0) market must be rejected with OutOfRange, got: {err:?}"
+    );
+
+    // State unchanged.
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(market.params.taker_fee_bps, default_params().taker_fee_bps);
+}
+
+/// K-3 (2/4): heal SUCCESS. A legacy market (staleness == 0) is healed by
+/// enabling the gate to a sane value; every other field is byte-identical.
+#[tokio::test]
+async fn update_market_params_k3_heal_success() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Simulate a legacy market with a disabled staleness gate.
+    patch_staleness_to_zero(&mut ctx, market_pda).await;
+    let before: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        before.params.oracle_staleness_max_seconds, 0,
+        "precondition: patched market must have a disabled gate"
+    );
+
+    // new_params = the (patched) live params, with ONLY the staleness enabled.
+    let mut new_params = before.params;
+    new_params.oracle_staleness_max_seconds = 3_600;
+
+    let ix = build_ix(
+        flash_book::instruction::UpdateMarketParams { new_params },
         vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new(market_pda, false),
@@ -2911,16 +3062,110 @@ async fn update_market_params_rejects_immutable_primitive_change() {
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            &[ix2],
+            &[ix],
             Some(&payer.pubkey()),
             &[&payer],
             bh,
         ))
         .await
-        .unwrap();
+        .expect("K-3: healing a disabled staleness gate must succeed");
 
-    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    assert_eq!(market.params.taker_fee_bps, 7);
+    let after: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        after.params.oracle_staleness_max_seconds, 3_600,
+        "K-3: staleness gate must be enabled to the healed value"
+    );
+}
+
+/// K-3 (3/4): heal REJECTS an out-of-range staleness. A legacy market, but the
+/// requested value (10s) is below MIN_HEAL_STALENESS_SECONDS (60).
+#[tokio::test]
+async fn update_market_params_k3_heal_rejects_out_of_range() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    patch_staleness_to_zero(&mut ctx, market_pda).await;
+    let before: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+
+    // Below MIN_HEAL_STALENESS_SECONDS (60) — must be rejected.
+    let mut new_params = before.params;
+    new_params.oracle_staleness_max_seconds = 10;
+
+    let ix = build_ix(
+        flash_book::instruction::UpdateMarketParams { new_params },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7003)"),
+        "K-3: healing below MIN_HEAL_STALENESS_SECONDS must be rejected with OutOfRange, got: {err:?}"
+    );
+
+    // Gate remains disabled — the rejected heal did not apply.
+    let after: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(after.params.oracle_staleness_max_seconds, 0);
+}
+
+/// K-3 (4/4): heal REJECTS a piggybacked other-field change. A legacy market,
+/// requested staleness is in range (3600) BUT an economic field also differs —
+/// the masked-hash equality must catch the smuggled change.
+#[tokio::test]
+async fn update_market_params_k3_heal_rejects_piggybacked_change() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    patch_staleness_to_zero(&mut ctx, market_pda).await;
+    let before: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+
+    // Valid staleness AND a piggybacked economic change — must be rejected.
+    let mut new_params = before.params;
+    new_params.oracle_staleness_max_seconds = 3_600;
+    new_params.taker_fee_bps = before.params.taker_fee_bps + 1;
+
+    let ix = build_ix(
+        flash_book::instruction::UpdateMarketParams { new_params },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7003)"),
+        "K-3: a heal carrying a piggybacked economic change must be rejected with OutOfRange, got: {err:?}"
+    );
+
+    // Neither field changed — the whole update was rejected atomically.
+    let after: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(after.params.oracle_staleness_max_seconds, 0);
+    assert_eq!(after.params.taker_fee_bps, before.params.taker_fee_bps);
 }
 
 #[tokio::test]

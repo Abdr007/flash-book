@@ -113,9 +113,20 @@ pub const REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS: u64 = 750;
 /// Delay (unix seconds) a proposed market-params change must wait before it
 /// can be executed. 48h gives LPs and traders a window to see the
 /// pre-announced change (the `ParamUpdateProposedEvent` carries the eta)
-/// and exit or react before it lands. The immediate `update_market_params`
-/// path also exists; the timelocked path is the production-safe alternative.
+/// and exit or react before it lands. K-3: this timelocked path is the ONLY
+/// way to change economic params — the immediate `update_market_params` is now
+/// restricted to a single safety operation (enabling a disabled oracle-staleness
+/// gate), so it can no longer change fees/margins/funding without notice.
 pub const PARAM_UPDATE_TIMELOCK_SECONDS: i64 = 48 * 60 * 60;
+
+/// K-3: sane bounds for the ONE change the immediate `update_market_params` path
+/// still permits — ENABLING a disabled (legacy, pre-bound-era) oracle-staleness
+/// gate (`oracle_staleness_max_seconds == 0`). The new bound must land in
+/// `[MIN, MAX]`: the floor prevents an always-stale foot-gun (too-tight → every
+/// price reads stale), the ceiling prevents "enabling" the gate to a uselessly
+/// loose value. Any change to an ALREADY-enabled bound goes through the timelock.
+pub const MIN_HEAL_STALENESS_SECONDS: u32 = 60;
+pub const MAX_HEAL_STALENESS_SECONDS: u32 = 86_400;
 
 /// K-2: minimum L1 slots between two `set_insurance_pause_threshold` changes.
 /// The pause threshold is the ADL/insurance-pause trigger floor; without a

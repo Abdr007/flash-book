@@ -139,8 +139,11 @@ the EMA clamp? Check `FillBatchEvent` history.
 sign-flips slot-to-slot.
 
 **Immediate**: nothing if funding-velocity smoothing is
-wired in. Pre-wire-in, authority can call `update_market_params` to
-tighten `funding_per_period_max_bps`.
+wired in. Pre-wire-in, the immediate emergency lever is a market PAUSE via
+`set_market_status` (authority or guardian, takes effect at once); tightening
+`funding_per_period_max_bps` is an economic change and, since K-3, goes through
+the 48h timelock (`propose_param_update` → `execute_param_update`), so pause
+first if the situation is acute.
 
 **Investigate**: OI imbalance. Identify large traders driving the
 skew; expected behavior of the funding mechanism.
