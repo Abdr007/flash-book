@@ -20783,7 +20783,7 @@ fn emit_margin_threshold_if_crossed(
     }
 }
 
-/// + : settle ONE position's accrued funding against the
+/// Settle ONE position's accrued funding against the
 /// current mark, routing collateral (isolated→position bucket, cross→trader pool)
 /// and the solvency Residual exactly as `settle_funding` does, then advance the
 /// position's funding anchor. Returns the signed amount owed (+ pays / − receives)
