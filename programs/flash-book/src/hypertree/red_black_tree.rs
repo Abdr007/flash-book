@@ -172,7 +172,17 @@ where
             return Color::Black;
         }
         let node: &RBNode<V> = get_helper::<RBNode<V>>(self.data(), index);
-        node.color
+        // E/L-2: decode the raw color BYTE with validation. `set_color` only ever
+        // stores 0 (Black) or 1 (Red), so any other value means the slab bytes were
+        // corrupted; map it to Black (the neutral default) instead of producing an
+        // invalid `Color` discriminant — reading a `repr(u8)` enum with a value
+        // ≥ 2 is undefined behavior. Storing `color` as a `u8` (rather than the
+        // `Color` enum) is also what makes the hand-written `unsafe impl Pod for
+        // RBNode` sound: a `u8` has no invalid bit patterns, a `repr(u8)` enum does.
+        match node.color {
+            1 => Color::Red,
+            _ => Color::Black,
+        }
     }
     fn get_right_index<V: Payload>(&self, index: DataIndex) -> DataIndex {
         if index == NIL {
@@ -284,7 +294,7 @@ where
             return;
         }
         let node: &mut RBNode<V> = get_mut_helper::<RBNode<V>>(self.data(), index);
-        node.color = color;
+        node.color = color as u8; // E/L-2: store the discriminant byte (0/1)
     }
     fn set_parent_index<V: Payload>(&mut self, index: DataIndex, parent_index: DataIndex) {
         if index == NIL {
@@ -695,7 +705,7 @@ where
                     if self.depth::<V>(index) == y && self.x::<V>(index) == x {
                         found = true;
                         let str = &format!("{:<5}", node);
-                        if node.color == Color::Red {
+                        if node.color == Color::Red as u8 {
                             // Cannot use with sbf. Enable when debugging
                             // locally without sbf.
                             #[cfg(colored)]
@@ -749,9 +759,13 @@ where
                 "┌ "
             };
 
-            let color: char = if node.color == Color::Black { 'B' } else { 'R' };
+            let color: char = if node.color == Color::Black as u8 {
+                'B'
+            } else {
+                'R'
+            };
             let str: &String = &format!("{color}:{index}:{node}");
-            if node.color == Color::Red {
+            if node.color == Color::Red as u8 {
                 // Cannot use with sbf. Enable when debugging
                 // locally without sbf.
                 #[cfg(colored)]
@@ -778,7 +792,7 @@ where
 
         for (index, node) in self.node_iter::<V>() {
             // Verify that all red nodes only have black children
-            if node.color == Color::Red {
+            if node.color == Color::Red as u8 {
                 assert_eq!(
                     self.get_color::<V>(self.get_left_index::<V>(index)),
                     Color::Black
@@ -892,7 +906,10 @@ pub struct RBNode<V> {
     pub left: DataIndex,
     pub right: DataIndex,
     pub parent: DataIndex,
-    pub color: Color,
+    /// E/L-2: color DISCRIMINANT byte (0 = Black, 1 = Red), NOT the `Color` enum —
+    /// a `repr(u8)` enum in a `Pod` struct is unsound. Accessed only via
+    /// `get_color`/`set_color`, which validate the byte.
+    pub color: u8,
 
     // Optional enum controlled by the application to identify the type of node.
     // Defaults to zero.
@@ -910,7 +927,8 @@ pub struct RBNode<V> {
     pub(crate) left: DataIndex,
     pub(crate) right: DataIndex,
     pub(crate) parent: DataIndex,
-    pub(crate) color: Color,
+    /// E/L-2: color DISCRIMINANT byte (0 = Black, 1 = Red), NOT the `Color` enum.
+    pub(crate) color: u8,
 
     // Optional enum controlled by the application to identify the type of node.
     // Defaults to zero.
@@ -983,7 +1001,7 @@ impl<'a, V: Payload> HyperTreeWriteOperations<'a, V> for RedBlackTree<'a, V> {
                 left: NIL,
                 right: NIL,
                 parent: NIL,
-                color: Color::Black,
+                color: Color::Black as u8,
                 value,
                 payload_type: 0,
                 _unused_padding: 0,
@@ -997,7 +1015,7 @@ impl<'a, V: Payload> HyperTreeWriteOperations<'a, V> for RedBlackTree<'a, V> {
             left: NIL,
             right: NIL,
             parent: NIL,
-            color: Color::Red,
+            color: Color::Red as u8,
             value,
             payload_type: 0,
             _unused_padding: 0,
@@ -1402,6 +1420,47 @@ pub(crate) mod test {
     fn test_color_default() {
         assert_eq!(Color::default(), Color::Black);
         assert_eq!(Color::zeroed(), Color::Black);
+    }
+
+    /// E/L-2: a CORRUPT color byte (≥ 2 — only reachable via slab corruption,
+    /// since `set_color` writes only 0/1) decodes to `Black` via `get_color`. It
+    /// must never produce an invalid `Color` discriminant, which for a `repr(u8)`
+    /// enum is undefined behavior. `color` being a plain `u8` field is what lets us
+    /// read the raw byte and canonicalize it — and is what makes the hand-written
+    /// `unsafe impl Pod for RBNode` sound (a `u8` has no invalid bit patterns).
+    #[test]
+    fn test_get_color_canonicalizes_corrupt_byte() {
+        let mut data: [u8; 100000] = [0; 100000];
+        let idx: DataIndex = TEST_BLOCK_WIDTH;
+        {
+            let mut tree: RedBlackTree<TestOrderBid> = RedBlackTree::new(&mut data, NIL, NIL);
+            tree.insert(idx, TestOrderBid::new(1234));
+            // A freshly inserted lone root is Black.
+            assert_eq!(tree.get_color::<TestOrderBid>(idx), Color::Black);
+        }
+        // `color` sits at byte offset 12 within the node (three 4-byte DataIndex).
+        let color_offset = idx as usize + 12;
+        // Every invalid byte must canonicalize to Black — no UB, no panic.
+        for corrupt in [2u8, 3, 7, 100, 255] {
+            data[color_offset] = corrupt;
+            let tree: RedBlackTree<TestOrderBid> = RedBlackTree::new(&mut data, idx, NIL);
+            assert_eq!(
+                tree.get_color::<TestOrderBid>(idx),
+                Color::Black,
+                "corrupt color byte {corrupt} must decode to Black"
+            );
+        }
+        // Valid bytes still decode faithfully.
+        data[color_offset] = 0;
+        assert_eq!(
+            RedBlackTree::<TestOrderBid>::new(&mut data, idx, NIL).get_color::<TestOrderBid>(idx),
+            Color::Black
+        );
+        data[color_offset] = 1;
+        assert_eq!(
+            RedBlackTree::<TestOrderBid>::new(&mut data, idx, NIL).get_color::<TestOrderBid>(idx),
+            Color::Red
+        );
     }
 
     #[derive(Copy, Clone, Pod, Zeroable, Debug)]
@@ -1869,7 +1928,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(1),
@@ -1878,7 +1937,7 @@ pub(crate) mod test {
             left: TEST_BLOCK_WIDTH,
             right: 4 * TEST_BLOCK_WIDTH,
             parent: 5 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(2),
@@ -1887,7 +1946,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 4 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(3),
@@ -1896,7 +1955,7 @@ pub(crate) mod test {
             left: 3 * TEST_BLOCK_WIDTH,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(4),
@@ -1905,7 +1964,7 @@ pub(crate) mod test {
             left: 2 * TEST_BLOCK_WIDTH,
             right: 7 * TEST_BLOCK_WIDTH,
             parent: NIL,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(5),
@@ -1914,7 +1973,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 7 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(6),
@@ -1923,7 +1982,7 @@ pub(crate) mod test {
             left: 6 * TEST_BLOCK_WIDTH,
             right: 8 * TEST_BLOCK_WIDTH,
             parent: 5 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(7),
@@ -1932,7 +1991,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 7 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(8),
@@ -1970,7 +2029,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(1),
@@ -1979,7 +2038,7 @@ pub(crate) mod test {
             left: TEST_BLOCK_WIDTH,
             right: 4 * TEST_BLOCK_WIDTH,
             parent: 6 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(2),
@@ -1988,7 +2047,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 4 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(3),
@@ -1997,7 +2056,7 @@ pub(crate) mod test {
             left: 3 * TEST_BLOCK_WIDTH,
             right: 5 * TEST_BLOCK_WIDTH,
             parent: 2 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(4),
@@ -2006,7 +2065,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 4 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(5),
@@ -2015,7 +2074,7 @@ pub(crate) mod test {
             left: 2 * TEST_BLOCK_WIDTH,
             right: 8 * TEST_BLOCK_WIDTH,
             parent: NIL,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(6),
@@ -2024,7 +2083,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 8 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(7),
@@ -2033,7 +2092,7 @@ pub(crate) mod test {
             left: 7 * TEST_BLOCK_WIDTH,
             right: NIL,
             parent: 6 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(8),
@@ -2075,7 +2134,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(1),
@@ -2084,7 +2143,7 @@ pub(crate) mod test {
             left: TEST_BLOCK_WIDTH,
             right: 4 * TEST_BLOCK_WIDTH,
             parent: 5 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(2),
@@ -2093,7 +2152,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 4 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(3),
@@ -2102,7 +2161,7 @@ pub(crate) mod test {
             left: 3 * TEST_BLOCK_WIDTH,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(4),
@@ -2111,7 +2170,7 @@ pub(crate) mod test {
             left: 2 * TEST_BLOCK_WIDTH,
             right: 10 * TEST_BLOCK_WIDTH,
             parent: NIL,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(5),
@@ -2120,7 +2179,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 7 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(6),
@@ -2129,7 +2188,7 @@ pub(crate) mod test {
             left: 6 * TEST_BLOCK_WIDTH,
             right: 8 * TEST_BLOCK_WIDTH,
             parent: 10 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(7),
@@ -2138,7 +2197,7 @@ pub(crate) mod test {
             left: NIL,
             right: 9 * TEST_BLOCK_WIDTH,
             parent: 7 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(8),
@@ -2147,7 +2206,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 8 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(9),
@@ -2156,7 +2215,7 @@ pub(crate) mod test {
             left: 7 * TEST_BLOCK_WIDTH,
             right: 11 * TEST_BLOCK_WIDTH,
             parent: 5 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(10),
@@ -2165,7 +2224,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 10 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(11),
@@ -2201,7 +2260,7 @@ pub(crate) mod test {
             left: 2 * TEST_BLOCK_WIDTH,
             right: TEST_BLOCK_WIDTH,
             parent: NIL,
-            color: Color::Red,
+            color: Color::Red as u8,
             value: TestOrderAsk::new(0),
             payload_type: 0,
             _unused_padding: 0,
@@ -2210,7 +2269,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 0 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             value: TestOrderAsk::new(0),
             payload_type: 0,
             _unused_padding: 0,
@@ -2219,7 +2278,7 @@ pub(crate) mod test {
             left: 4 * TEST_BLOCK_WIDTH,
             right: 3 * TEST_BLOCK_WIDTH,
             parent: 0 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             value: TestOrderAsk::new(0),
             payload_type: 0,
             _unused_padding: 0,
@@ -2228,7 +2287,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             value: TestOrderAsk::new(0),
             payload_type: 0,
             _unused_padding: 0,
@@ -2237,7 +2296,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             value: TestOrderAsk::new(1),
             payload_type: 0,
             _unused_padding: 0,
@@ -2258,7 +2317,7 @@ pub(crate) mod test {
             left: 2 * TEST_BLOCK_WIDTH,
             right: 3 * TEST_BLOCK_WIDTH,
             parent: NIL,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(1),
@@ -2267,7 +2326,7 @@ pub(crate) mod test {
             left: 4 * TEST_BLOCK_WIDTH,
             right: 22 * TEST_BLOCK_WIDTH,
             parent: TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(2),
@@ -2276,7 +2335,7 @@ pub(crate) mod test {
             left: 29 * TEST_BLOCK_WIDTH,
             right: 5 * TEST_BLOCK_WIDTH,
             parent: TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(3),
@@ -2285,7 +2344,7 @@ pub(crate) mod test {
             left: 6 * TEST_BLOCK_WIDTH,
             right: 7 * TEST_BLOCK_WIDTH,
             parent: 2 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(4),
@@ -2294,7 +2353,7 @@ pub(crate) mod test {
             left: 8 * TEST_BLOCK_WIDTH,
             right: 9 * TEST_BLOCK_WIDTH,
             parent: 3 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(5),
@@ -2303,7 +2362,7 @@ pub(crate) mod test {
             left: 10 * TEST_BLOCK_WIDTH,
             right: 20 * TEST_BLOCK_WIDTH,
             parent: 4 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(6),
@@ -2312,7 +2371,7 @@ pub(crate) mod test {
             left: 11 * TEST_BLOCK_WIDTH,
             right: 12 * TEST_BLOCK_WIDTH,
             parent: 4 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(7),
@@ -2321,7 +2380,7 @@ pub(crate) mod test {
             left: 13 * TEST_BLOCK_WIDTH,
             right: 21 * TEST_BLOCK_WIDTH,
             parent: 5 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(8),
@@ -2330,7 +2389,7 @@ pub(crate) mod test {
             left: 14 * TEST_BLOCK_WIDTH,
             right: 15 * TEST_BLOCK_WIDTH,
             parent: 5 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(9),
@@ -2339,7 +2398,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 6 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(10),
@@ -2348,7 +2407,7 @@ pub(crate) mod test {
             left: 16 * TEST_BLOCK_WIDTH,
             right: 17 * TEST_BLOCK_WIDTH,
             parent: 7 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(11),
@@ -2357,7 +2416,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 7 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(12),
@@ -2366,7 +2425,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 8 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(13),
@@ -2375,7 +2434,7 @@ pub(crate) mod test {
             left: 18 * TEST_BLOCK_WIDTH,
             right: 19 * TEST_BLOCK_WIDTH,
             parent: 9 * TEST_BLOCK_WIDTH,
-            color: Color::Red,
+            color: Color::Red as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(14),
@@ -2384,7 +2443,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 9 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(15),
@@ -2393,7 +2452,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 11 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(16),
@@ -2402,7 +2461,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 11 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(17),
@@ -2411,7 +2470,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 14 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(18),
@@ -2420,7 +2479,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 14 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(19),
@@ -2429,7 +2488,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 6 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(20),
@@ -2438,7 +2497,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 8 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(21),
@@ -2447,7 +2506,7 @@ pub(crate) mod test {
             left: 23 * TEST_BLOCK_WIDTH,
             right: 24 * TEST_BLOCK_WIDTH,
             parent: 2 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(22),
@@ -2456,7 +2515,7 @@ pub(crate) mod test {
             left: 25 * TEST_BLOCK_WIDTH,
             right: 26 * TEST_BLOCK_WIDTH,
             parent: 22 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(23),
@@ -2465,7 +2524,7 @@ pub(crate) mod test {
             left: 27 * TEST_BLOCK_WIDTH,
             right: 28 * TEST_BLOCK_WIDTH,
             parent: 22 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(24),
@@ -2474,7 +2533,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 23 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(25),
@@ -2483,7 +2542,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 23 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(26),
@@ -2492,7 +2551,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 24 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(27),
@@ -2501,7 +2560,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 24 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(28),
@@ -2510,7 +2569,7 @@ pub(crate) mod test {
             left: 30 * TEST_BLOCK_WIDTH,
             right: 31 * TEST_BLOCK_WIDTH,
             parent: 3 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(29),
@@ -2519,7 +2578,7 @@ pub(crate) mod test {
             left: 32 * TEST_BLOCK_WIDTH,
             right: 33 * TEST_BLOCK_WIDTH,
             parent: 29 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(30),
@@ -2528,7 +2587,7 @@ pub(crate) mod test {
             left: 34 * TEST_BLOCK_WIDTH,
             right: 35 * TEST_BLOCK_WIDTH,
             parent: 29 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(31),
@@ -2537,7 +2596,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 30 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(32),
@@ -2546,7 +2605,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 30 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(33),
@@ -2555,7 +2614,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 31 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(34),
@@ -2564,7 +2623,7 @@ pub(crate) mod test {
             left: NIL,
             right: NIL,
             parent: 31 * TEST_BLOCK_WIDTH,
-            color: Color::Black,
+            color: Color::Black as u8,
             payload_type: 0,
             _unused_padding: 0,
             value: TestOrderBid::new(35),
