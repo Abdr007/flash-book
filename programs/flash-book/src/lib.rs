@@ -51,8 +51,8 @@ use matcher::risk::{
     PositionSnapshot as RiskPosSnap,
 };
 use state::{
-    FeeAccrualAccount, FlpExposureAccount, InsuranceFundAccount, MarketAccount, MarketParams,
-    TraderStateAccount,
+    CopyVaultAccount, CopyVaultShareAccount, FeeAccrualAccount, FlpExposureAccount,
+    InsuranceFundAccount, MarketAccount, MarketParams, TraderStateAccount,
 };
 
 declare_id!("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
@@ -3511,6 +3511,112 @@ pub mod flash_book {
             recipient: ctx.accounts.fee_accrual.recipient,
             amount_quote_lots: amount,
         });
+        Ok(())
+    }
+
+    /// Copy-vault: create a managed/copy-trading vault for `manager`. The vault
+    /// owns its OWN isolated SPL token vault (this PDA is its authority), so its
+    /// funds never commingle with the shared protocol vault. Permissionless —
+    /// any signer may create a vault naming any manager. Share accounting is
+    /// `matcher::vault_math` (Lean-proven).
+    pub fn create_copy_vault(ctx: Context<CreateCopyVault>, manager: Pubkey) -> Result<()> {
+        require!(manager != Pubkey::default(), FlashBookError::OutOfRange);
+        let v = &mut ctx.accounts.copy_vault;
+        v.manager = manager;
+        v.quote_mint = ctx.accounts.quote_mint.key();
+        v.token_vault = ctx.accounts.token_vault.key();
+        v.total_shares = 0;
+        v.total_assets_quote_lots = 0;
+        v.bump = ctx.bumps.copy_vault;
+        Ok(())
+    }
+
+    /// Copy-vault deposit: transfer `amount` quote lots into the vault's isolated
+    /// token vault and mint the depositor proportional shares
+    /// (`vault_math::shares_on_deposit`, rounds down in the vault's favour).
+    pub fn deposit_to_copy_vault(ctx: Context<DepositToCopyVault>, amount: u64) -> Result<()> {
+        require!(amount > 0, FlashBookError::ZeroSize);
+        let (total_shares, total_assets) = {
+            let v = &ctx.accounts.copy_vault;
+            (v.total_shares, v.total_assets_quote_lots)
+        };
+        let minted = matcher::vault_math::shares_on_deposit(amount, total_shares, total_assets)?;
+        require!(minted > 0, FlashBookError::ZeroSize);
+
+        // Move tokens depositor → vault's isolated token vault.
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.depositor_quote_ata.to_account_info(),
+            to: ctx.accounts.token_vault.to_account_info(),
+            authority: ctx.accounts.depositor.to_account_info(),
+        };
+        token::transfer(
+            CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts),
+            amount,
+        )?;
+
+        let v = &mut ctx.accounts.copy_vault;
+        v.total_assets_quote_lots = v
+            .total_assets_quote_lots
+            .checked_add(amount)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        v.total_shares = v
+            .total_shares
+            .checked_add(minted)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+
+        let s = &mut ctx.accounts.share_account;
+        s.vault = ctx.accounts.copy_vault.key();
+        s.owner = ctx.accounts.depositor.key();
+        s.shares = s
+            .shares
+            .checked_add(minted)
+            .ok_or_else(|| error!(FlashBookError::ArithmeticOverflow))?;
+        s.bump = ctx.bumps.share_account;
+        Ok(())
+    }
+
+    /// Copy-vault withdraw: burn `shares` and return the proportional assets
+    /// (`vault_math::assets_on_withdraw`, rounds down in the vault's favour),
+    /// PDA-signed from the vault's isolated token vault.
+    pub fn withdraw_from_copy_vault(
+        ctx: Context<WithdrawFromCopyVault>,
+        shares: u64,
+    ) -> Result<()> {
+        require!(shares > 0, FlashBookError::ZeroSize);
+        require!(
+            ctx.accounts.share_account.shares >= shares,
+            FlashBookError::InsufficientCollateral
+        );
+        let (total_shares, total_assets, manager, bump) = {
+            let v = &ctx.accounts.copy_vault;
+            (v.total_shares, v.total_assets_quote_lots, v.manager, v.bump)
+        };
+        let assets = matcher::vault_math::assets_on_withdraw(shares, total_shares, total_assets)?;
+        require!(
+            ctx.accounts.token_vault.amount >= assets,
+            FlashBookError::InsufficientCollateral
+        );
+
+        // PDA-signed transfer out of the vault's isolated token vault.
+        let signer_seeds: &[&[u8]] = &[CopyVaultAccount::SEED, manager.as_ref(), &[bump]];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.token_vault.to_account_info(),
+            to: ctx.accounts.owner_quote_ata.to_account_info(),
+            authority: ctx.accounts.copy_vault.to_account_info(),
+        };
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.key(),
+                cpi_accounts,
+                &[signer_seeds],
+            ),
+            assets,
+        )?;
+
+        let v = &mut ctx.accounts.copy_vault;
+        v.total_shares -= shares; // checked by the share_account balance require above
+        v.total_assets_quote_lots = v.total_assets_quote_lots.saturating_sub(assets);
+        ctx.accounts.share_account.shares -= shares;
         Ok(())
     }
 
@@ -16491,6 +16597,82 @@ pub struct ClaimFeeAccrual<'info> {
     #[account(mut, address = insurance_fund.quote_vault)]
     pub quote_vault: Account<'info, TokenAccount>,
 
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+#[instruction(manager: Pubkey)]
+pub struct CreateCopyVault<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        init,
+        payer = payer,
+        space = CopyVaultAccount::space(),
+        seeds = [CopyVaultAccount::SEED, manager.as_ref()],
+        bump,
+    )]
+    pub copy_vault: Box<Account<'info, CopyVaultAccount>>,
+    pub quote_mint: Account<'info, Mint>,
+    /// The vault's OWN isolated token vault; this PDA is its authority.
+    #[account(
+        init,
+        payer = payer,
+        token::mint = quote_mint,
+        token::authority = copy_vault,
+    )]
+    pub token_vault: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct DepositToCopyVault<'info> {
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [CopyVaultAccount::SEED, copy_vault.manager.as_ref()],
+        bump = copy_vault.bump,
+    )]
+    pub copy_vault: Box<Account<'info, CopyVaultAccount>>,
+    #[account(
+        init_if_needed,
+        payer = depositor,
+        space = CopyVaultShareAccount::space(),
+        seeds = [CopyVaultShareAccount::SEED, copy_vault.key().as_ref(), depositor.key().as_ref()],
+        bump,
+    )]
+    pub share_account: Box<Account<'info, CopyVaultShareAccount>>,
+    #[account(mut, token::mint = copy_vault.quote_mint, token::authority = depositor)]
+    pub depositor_quote_ata: Account<'info, TokenAccount>,
+    #[account(mut, address = copy_vault.token_vault)]
+    pub token_vault: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawFromCopyVault<'info> {
+    pub owner: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [CopyVaultAccount::SEED, copy_vault.manager.as_ref()],
+        bump = copy_vault.bump,
+    )]
+    pub copy_vault: Box<Account<'info, CopyVaultAccount>>,
+    #[account(
+        mut,
+        seeds = [CopyVaultShareAccount::SEED, copy_vault.key().as_ref(), owner.key().as_ref()],
+        bump = share_account.bump,
+        constraint = share_account.owner == owner.key() @ FlashBookError::Unauthorized,
+    )]
+    pub share_account: Box<Account<'info, CopyVaultShareAccount>>,
+    #[account(mut, token::mint = copy_vault.quote_mint, token::authority = owner)]
+    pub owner_quote_ata: Account<'info, TokenAccount>,
+    #[account(mut, address = copy_vault.token_vault)]
+    pub token_vault: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 }
 
