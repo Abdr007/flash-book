@@ -150,7 +150,7 @@ noted).
 |---|---|---|
 | `set_market_status` | authority or guardian | Status changes; the guardian may only restrict (never unpause). |
 | `set_guardian` | authority | Set/clear the emergency guardian PDA. |
-| `update_market_params` | authority | Immediate validated params update. |
+| `update_market_params` | authority | RESTRICTED (K-3): immediate path may ONLY enable a disabled oracle-staleness gate; all economic changes go through the timelock. |
 | `propose_param_update` / `execute_param_update` / `cancel_param_update` | authority | 48 h timelocked params path bound to a keccak params-hash. |
 | `guardian_veto_param_update` | guardian | Veto a pending params update during its delay. |
 | `transfer_market_authority` | authority | Immediate transfer (rejects the zero key). |

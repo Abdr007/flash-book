@@ -43,11 +43,18 @@ mistyped or dead key.
 
 ## Timelocked parameter updates
 
-The immediate `update_market_params` path exists; the production-safe path
-is timelocked via `PendingParamUpdateAccount` (`["pending_params", market]`):
+All economic parameter changes (fees, margins, funding, oracle band, FLP
+coefficients, …) go through the timelocked path via `PendingParamUpdateAccount`
+(`["pending_params", market]`). **K-3:** the immediate `update_market_params`
+instruction no longer changes economic params — it is restricted to a single
+safety operation, enabling a *disabled* (legacy, pre-bound-era)
+oracle-staleness gate (`oracle_staleness_max_seconds == 0` → a sane
+`[MIN_HEAL_STALENESS_SECONDS, MAX_HEAL_STALENESS_SECONDS]` value), with every
+other field required byte-identical to the live params. So it cannot change
+fees/margins/funding without notice; the timelock is the only path for those:
 
-1. `propose_param_update` validates the new params (the same
-   `validate_market_params` as the immediate path) and stores
+1. `propose_param_update` validates the new params (`validate_market_params`)
+   and stores
    `keccak(params)` plus `eta = now + PARAM_UPDATE_TIMELOCK_SECONDS`
    (48 hours). Nothing is applied. `ParamUpdateProposedEvent` carries the
    eta so LPs and traders can see the pre-announced change and react.

@@ -11222,11 +11222,12 @@
       "name": "propose_param_update",
       "docs": [
         "Propose a TIMELOCKED market-params update.",
-        "Validates `new_params` (same checks as `update_market_params`), then records",
+        "Validates `new_params` (via `validate_market_params`), then records",
         "`keccak(new_params)` + `eta = now + PARAM_UPDATE_TIMELOCK_SECONDS`; does NOT",
         "apply. `execute_param_update` applies it only after the delay. Authority-only.",
-        "Re-proposing overwrites the pending update (and restarts the clock). The",
-        "immediate `update_market_params` is left in place as the un-timelocked path."
+        "Re-proposing overwrites the pending update (and restarts the clock). K-3:",
+        "this is the ONLY path for economic param changes — the immediate",
+        "`update_market_params` is restricted to enabling a disabled staleness gate."
       ],
       "discriminator": [
         15,
@@ -14552,16 +14553,22 @@
     {
       "name": "update_market_params",
       "docs": [
-        "Update mutable market parameters (authority-only).",
+        "Immediate market-params update — RESTRICTED (K-3).",
         "",
-        "Immutable fields (set at initialization, NEVER mutable post-init):",
-        "- tick_size, base_lot_size, quote_lot_size, min_base_lots",
-        "These define the market's measurement primitives. Changing them",
-        "would silently invalidate every existing order and position.",
-        "",
-        "Mutable: everything else — fees, margins, FLP coefficients, funding",
-        "rates, oracle band, VPIN, batch interval. Changes are applied to the",
-        "next batch."
+        "This path may perform exactly ONE change: ENABLING a disabled (legacy,",
+        "pre-bound-era) oracle-staleness gate — when the market's current",
+        "`oracle_staleness_max_seconds == 0`, set it to a sane value in",
+        "`[MIN_HEAL_STALENESS_SECONDS, MAX_HEAL_STALENESS_SECONDS]`. Every OTHER",
+        "parameter change — all economic params (fees, margins, funding, oracle",
+        "band, FLP coefficients, …) and any change to an ALREADY-enabled staleness",
+        "bound — MUST go through the timelocked `propose_param_update` →",
+        "`execute_param_update` path, so LPs and traders get 48h notice. This",
+        "removes the immediate-governance rug vector while preserving the one",
+        "operationally-necessary heal for markets created before the staleness",
+        "bound existed. \"Nothing else changed\" is enforced ROBUSTLY: the staleness",
+        "field is masked to its current value and the remainder of `new_params` is",
+        "required byte-identical to the live params (via `hash_params`), so no",
+        "field can slip through an unlisted gap."
       ],
       "discriminator": [
         70,

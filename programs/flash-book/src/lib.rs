@@ -7268,16 +7268,22 @@ pub mod flash_book {
         Ok(())
     }
 
-    /// Update mutable market parameters (authority-only).
+    /// Immediate market-params update — RESTRICTED (K-3).
     ///
-    /// Immutable fields (set at initialization, NEVER mutable post-init):
-    ///   - tick_size, base_lot_size, quote_lot_size, min_base_lots
-    ///   These define the market's measurement primitives. Changing them
-    ///   would silently invalidate every existing order and position.
-    ///
-    /// Mutable: everything else — fees, margins, FLP coefficients, funding
-    /// rates, oracle band, VPIN, batch interval. Changes are applied to the
-    /// next batch.
+    /// This path may perform exactly ONE change: ENABLING a disabled (legacy,
+    /// pre-bound-era) oracle-staleness gate — when the market's current
+    /// `oracle_staleness_max_seconds == 0`, set it to a sane value in
+    /// `[MIN_HEAL_STALENESS_SECONDS, MAX_HEAL_STALENESS_SECONDS]`. Every OTHER
+    /// parameter change — all economic params (fees, margins, funding, oracle
+    /// band, FLP coefficients, …) and any change to an ALREADY-enabled staleness
+    /// bound — MUST go through the timelocked `propose_param_update` →
+    /// `execute_param_update` path, so LPs and traders get 48h notice. This
+    /// removes the immediate-governance rug vector while preserving the one
+    /// operationally-necessary heal for markets created before the staleness
+    /// bound existed. "Nothing else changed" is enforced ROBUSTLY: the staleness
+    /// field is masked to its current value and the remainder of `new_params` is
+    /// required byte-identical to the live params (via `hash_params`), so no
+    /// field can slip through an unlisted gap.
     pub fn update_market_params(
         ctx: Context<UpdateMarketAuthority>,
         new_params: MarketParams,
@@ -7289,121 +7295,32 @@ pub mod flash_book {
             FlashBookError::Unauthorized
         );
 
-        // Enforce immutability of measurement primitives.
+        // Only a DISABLED (legacy) staleness gate may be healed on the immediate
+        // path; an already-enabled bound changes only through the timelock.
         require!(
-            new_params.tick_size == market.params.tick_size,
+            market.params.oracle_staleness_max_seconds == 0,
             FlashBookError::OutOfRange
         );
+        // Enable to a sane bound only (floor: no always-stale foot-gun; ceiling:
+        // no "enable" to a uselessly-loose value).
+        let new_staleness = new_params.oracle_staleness_max_seconds;
         require!(
-            new_params.base_lot_size == market.params.base_lot_size,
+            (constants::MIN_HEAL_STALENESS_SECONDS..=constants::MAX_HEAL_STALENESS_SECONDS)
+                .contains(&new_staleness),
             FlashBookError::OutOfRange
         );
+        // Reject ANY other field change: mask the staleness field to the current
+        // value and require the remainder byte-identical to the live params. This
+        // subsumes the measurement-primitive immutability checks and closes the
+        // economic-param backdoor without a fragile per-field enumeration.
+        let mut masked = new_params;
+        masked.oracle_staleness_max_seconds = market.params.oracle_staleness_max_seconds;
         require!(
-            new_params.quote_lot_size == market.params.quote_lot_size,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            new_params.min_base_lots == market.params.min_base_lots,
-            FlashBookError::OutOfRange
-        );
-
-        // Sanity bounds on the mutable fields.
-        require!(new_params.max_leverage >= 1, FlashBookError::OutOfRange);
-        // Never let the staleness bound be zeroed post-init —
-        // that would silently disable the staleness gate on every price consumer.
-        require!(
-            new_params.oracle_staleness_max_seconds > 0,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            new_params.maintenance_margin_ratio_bps <= new_params.initial_margin_ratio_bps,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            new_params.flp_max_growth_per_batch_bps <= constants::BPS_DENOM,
-            FlashBookError::OutOfRange
-        );
-        // Reject an absurdly-wide mark band at config time (was
-        // <= BPS_DENOM = 100%). apply_fill additionally caps the EFFECTIVE band to
-        // MAX at runtime, so this is early operator feedback, not the sole guard.
-        require!(
-            new_params.oracle_band_bps <= constants::MAX_ORACLE_BAND_BPS,
+            hash_params(&masked)? == hash_params(&market.params)?,
             FlashBookError::OutOfRange
         );
 
-        // Explicit absolute caps on margin ratios.
-        // Without these, authority could set MMR/IM to >= 100%, which
-        // would instantly mark every existing position liquidatable.
-        // 5000 bps (50%) is a generous ceiling — well above any plausible
-        // market parameter (BTC = 5%, exotic alt = 30% in typical CEX
-        // configs). Tighter than BPS_DENOM to prevent griefing.
-        require!(
-            new_params.maintenance_margin_ratio_bps < 5_000,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            new_params.initial_margin_ratio_bps < 5_000,
-            FlashBookError::OutOfRange
-        );
-        // Concentration extra MMR must also be bounded so MMR + extra
-        // doesn't push past 50% combined.
-        require!(
-            new_params
-                .maintenance_margin_ratio_bps
-                .saturating_add(new_params.concentration_extra_mmr_bps)
-                < 5_000,
-            FlashBookError::OutOfRange
-        );
-
-        // Absolute ceilings on the fee / funding / penalty fields: without
-        // them a compromised authority could set a 100% taker fee or an
-        // extreme funding rate and siphon user collateral on the next fill /
-        // funding tick. The bounds are generous — well above any real market
-        // config, tight enough to bound abuse.
-        require!(
-            new_params.taker_fee_bps <= constants::MAX_FEE_TIER_BPS,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            new_params.maker_rebate_bps.unsigned_abs() <= constants::MAX_FEE_TIER_BPS,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            new_params.toxicity_tax_max_bps <= constants::MAX_FEE_TIER_BPS,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            new_params.jit_bonus_rebate_bps <= constants::MAX_FEE_TIER_BPS,
-            FlashBookError::OutOfRange
-        );
-        // Liquidation economics: penalty ≤ 50%, and the liquidator's reward can
-        // never exceed the penalty actually charged (else it mints value).
-        require!(
-            new_params.liq_penalty_bps <= 5_000,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            new_params.liquidator_reward_bps <= new_params.liq_penalty_bps,
-            FlashBookError::OutOfRange
-        );
-        // Funding: bound both the per-second rate and the per-period clamp.
-        require!(
-            new_params.funding_rate_max_bps_per_sec <= constants::BPS_DENOM,
-            FlashBookError::OutOfRange
-        );
-        require!(
-            new_params.funding_per_period_max_bps <= 5_000,
-            FlashBookError::OutOfRange
-        );
-        // Fee-share splits can never exceed 100% of the net fee.
-        require!(
-            new_params.referrer_share_bps <= constants::BPS_DENOM
-                && new_params.builder_share_bps <= constants::BPS_DENOM
-                && new_params.creator_share_bps <= constants::BPS_DENOM,
-            FlashBookError::OutOfRange
-        );
-
-        market.params = new_params;
+        market.params.oracle_staleness_max_seconds = new_staleness;
         emit!(MarketParamsUpdatedEvent {
             market: market.key(),
         });
@@ -7626,11 +7543,12 @@ pub mod flash_book {
     }
 
     /// Propose a TIMELOCKED market-params update.
-    /// Validates `new_params` (same checks as `update_market_params`), then records
+    /// Validates `new_params` (via `validate_market_params`), then records
     /// `keccak(new_params)` + `eta = now + PARAM_UPDATE_TIMELOCK_SECONDS`; does NOT
     /// apply. `execute_param_update` applies it only after the delay. Authority-only.
-    /// Re-proposing overwrites the pending update (and restarts the clock). The
-    /// immediate `update_market_params` is left in place as the un-timelocked path.
+    /// Re-proposing overwrites the pending update (and restarts the clock). K-3:
+    /// this is the ONLY path for economic param changes — the immediate
+    /// `update_market_params` is restricted to enabling a disabled staleness gate.
     pub fn propose_param_update(
         ctx: Context<ProposeParamUpdate>,
         new_params: MarketParams,
@@ -21815,11 +21733,13 @@ fn accrue_to_fee_account(ai: &AccountInfo<'_>, add: u64) -> Result<()> {
 }
 
 /// Shared market-params validation — the immutability
-/// of the measurement primitives + the mutable-field bounds. Used by the timelocked
-/// `propose_param_update` / `execute_param_update` so they enforce EXACTLY the same
-/// invariants as the immediate `update_market_params`. NOTE: this mirrors the inline
-/// checks in `update_market_params`; keep the two in sync (a proptest/BanksClient
-/// test pins a representative rejection on both paths).
+/// of the measurement primitives + the mutable-field bounds. K-3: this is the SOLE
+/// economic-param validator, used by the timelocked `propose_param_update` /
+/// `execute_param_update`. The immediate `update_market_params` no longer changes
+/// economic params (it only enables a disabled staleness gate and requires every
+/// other field byte-identical via `hash_params`), so there are no inline checks
+/// left to keep in sync. A proptest/BanksClient test pins a representative
+/// rejection on the timelocked path.
 /// Keccak of the borsh-serialized params — the
 /// commitment stored at propose and re-checked at execute so the applied change is
 /// exactly the pre-announced one. (borsh 1.x dropped the inherent `try_to_vec`;
