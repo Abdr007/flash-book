@@ -4,6 +4,44 @@ All notable changes to Clober are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-07-14
+
+Post-launch: external insurance capitalization, CI hardening, and safety-config
+tuning to the funded insurance. All code changes merged through branch protection
+(7 required CI checks, `enforce_admins`) and hash-verified on devnet.
+
+### Added
+- **`deposit_insurance_fund(amount_quote_lots)`** — permissionless external
+  capitalization of the insurance fund. Transfers quote tokens from the depositor's
+  ATA into the shared vault (the depositor signs for their own ATA — no PDA signer)
+  and credits the same amount to `balance_quote_lots` + `total_contributions`.
+  Because it adds equally to the vault and the insurance bucket, the protocol-
+  solvency surplus (`vault − insurance − lp`) is invariant — conservation-preserving
+  by construction, proven over the whole u64 domain by the Kani harness
+  `insurance_deposit_is_exact_and_conservative`. Emits `InsuranceDepositEvent`.
+  Closes a real gap: the fund could previously only grow from fee/toxicity/
+  liquidation accrual during trading, with no path to inject external capital.
+  (PR #349, `f914f89`.)
+
+### CI / infrastructure
+- Kani job now carries `timeout-minutes: 90` so a pathologically-slow proof (one
+  that forces CBMC to bit-blast a symbolic 128-bit divider) fails fast instead of
+  hanging to GitHub's 6-hour default. (PR #348.)
+- Branch protection on `main`: 7 required status checks (Kani, Lean, Rust tests,
+  SBF, clippy, IDL-drift, cargo-audit), `strict`, and `enforce_admins` — no merge,
+  by anyone including admins, until CI is green.
+
+### Deployment & configuration (devnet)
+- Program `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq` upgraded to include
+  `deposit_insurance_fund` (slot 476067185); deployed bytecode hash-verified
+  against the local build.
+- Insurance fund capitalized to **100,000 USDC** via `deposit_insurance_fund`.
+- Launch-market OI-vs-insurance breaker armed and re-scaled to the funded level:
+  pause threshold **50,000 USDC**, OI floor **100,000 USDC**, multiple **10×** →
+  **≈$1,000,001 effective OI cap**. Verified on-chain: market Active, funded, not
+  tripping, new positions allowed. (On devnet, 1 quote-lot = 1e-6 USDC; the USDC
+  figures are the human-readable amounts.)
+
 ## [0.2.0] — 2026-07-14
 
 Second devnet release. Merged via PR #347 (`535fe60`) with CI 8/8 green
