@@ -3612,6 +3612,55 @@ pub mod clober {
         Ok(())
     }
 
+    /// Capitalize the insurance fund with external quote tokens (permissionless).
+    /// Transfers `amount_quote_lots` from the depositor's ATA INTO the shared
+    /// quote vault and credits the SAME amount to `balance_quote_lots`. Because it
+    /// adds equally to the vault and the insurance bucket, the protocol-solvency
+    /// surplus (`vault − insurance − lp`) is unchanged — conservation-preserving by
+    /// construction (proven `insurance_deposit_is_exact_and_conservative`). Anyone
+    /// may strengthen the fund; a deposit can only ADD backing, never remove it, so
+    /// no authority gate is needed. Complements the organic fee/toxicity/liq
+    /// accrual paths with a direct top-up (there was previously no way to inject
+    /// external capital — the fund could only grow from trading).
+    pub fn deposit_insurance_fund(
+        ctx: Context<DepositInsuranceFund>,
+        amount_quote_lots: u64,
+    ) -> Result<()> {
+        require!(amount_quote_lots > 0, CloberError::ZeroSize);
+
+        // Credit through the proven overflow-checked core BEFORE the transfer, so a
+        // pathological overflow rejects without moving tokens.
+        let new_balance = matcher::insurance::insurance_deposit_credit(
+            ctx.accounts.insurance_fund.balance_quote_lots,
+            amount_quote_lots,
+        )
+        .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
+
+        // SPL transfer: depositor ATA → shared quote vault. The DEPOSITOR signs for
+        // their own ATA (no PDA signer), so this can only move the depositor's own
+        // tokens into the protocol.
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.depositor_quote_ata.to_account_info(),
+            to: ctx.accounts.quote_vault.to_account_info(),
+            authority: ctx.accounts.depositor.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts);
+        token::transfer(cpi_ctx, amount_quote_lots)?;
+
+        let f = &mut ctx.accounts.insurance_fund;
+        f.balance_quote_lots = new_balance;
+        f.total_contributions = f
+            .total_contributions
+            .checked_add(amount_quote_lots)
+            .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
+        emit!(InsuranceDepositEvent {
+            depositor: ctx.accounts.depositor.key(),
+            amount_quote_lots,
+            new_balance,
+        });
+        Ok(())
+    }
+
     /// 2.3: create the canonical on-chain accrual account for a fee-share
     /// recipient (referrer / builder / curated creator). Permissionless — the
     /// payer funds rent; the account is bound to `recipient` by its PDA seeds,
@@ -16901,6 +16950,38 @@ pub struct WithdrawInsuranceFund<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+/// Accounts for `deposit_insurance_fund` — permissionless external top-up. Mirror
+/// of `WithdrawInsuranceFund` with the transfer reversed (depositor → vault) and
+/// no authority gate (a deposit can only ADD backing).
+#[derive(Accounts)]
+pub struct DepositInsuranceFund<'info> {
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
+
+    #[account(address = insurance_fund.quote_mint)]
+    pub quote_mint: Account<'info, Mint>,
+
+    /// Depositor's USDC ATA — source of the deposited capital.
+    #[account(
+        mut,
+        associated_token::mint = quote_mint,
+        associated_token::authority = depositor,
+    )]
+    pub depositor_quote_ata: Account<'info, TokenAccount>,
+
+    #[account(mut, address = insurance_fund.quote_vault)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
 #[derive(Accounts)]
 #[instruction(recipient: Pubkey)]
 pub struct InitFeeAccrual<'info> {
@@ -19337,6 +19418,14 @@ pub struct CollateralDepositedEvent {
 pub struct CollateralWithdrawnEvent {
     pub trader: Pubkey,
     pub amount: u64,
+    pub new_balance: u64,
+}
+
+/// Emitted when the insurance fund is capitalized via `deposit_insurance_fund`.
+#[event]
+pub struct InsuranceDepositEvent {
+    pub depositor: Pubkey,
+    pub amount_quote_lots: u64,
     pub new_balance: u64,
 }
 

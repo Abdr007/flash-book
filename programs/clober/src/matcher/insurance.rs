@@ -206,10 +206,41 @@ pub fn assess_solvency(
     Ok((solvent, surplus))
 }
 
+/// Credit an external insurance-fund deposit. Returns the new balance, or `None`
+/// on overflow (the caller maps it to ArithmeticOverflow). A deposit transfers
+/// `amount` quote-lots INTO the shared vault and credits the SAME `amount` to the
+/// insurance balance, so the protocol-solvency surplus (`vault − insurance − lp`)
+/// is unchanged — capitalizing the fund is conservation-preserving by
+/// construction (proven `insurance_deposit_is_exact_and_conservative`).
+#[inline]
+pub fn insurance_deposit_credit(balance: u64, amount: u64) -> Option<u64> {
+    balance.checked_add(amount)
+}
+
 /// FV: machine-checked protocol-solvency arithmetic (Kani, add/compare only → fast).
 #[cfg(kani)]
 mod solvency_kani_proofs {
-    use super::{assess_solvency, assess_solvency_full, partial_collateral_proves_insolvent};
+    use super::{
+        assess_solvency, assess_solvency_full, insurance_deposit_credit,
+        partial_collateral_proves_insolvent,
+    };
+
+    /// CONSERVATION: an external insurance deposit credits EXACTLY the deposited
+    /// amount — the new balance is `balance + amount` (no wrap) and is monotone
+    /// (≥ both inputs). Because the SAME `amount` also enters the shared vault, the
+    /// solvency surplus `(vault + amount) − (insurance + amount) − lp == vault −
+    /// insurance − lp` is invariant, so capitalizing the fund never manufactures or
+    /// destroys backed value. Whole u64 domain, no division.
+    #[kani::proof]
+    fn insurance_deposit_is_exact_and_conservative() {
+        let balance: u64 = kani::any();
+        let amount: u64 = kani::any();
+        if let Some(new_balance) = insurance_deposit_credit(balance, amount) {
+            assert!(new_balance == balance + amount); // exact credit, no wrap
+            assert!(new_balance >= balance);
+            assert!(new_balance >= amount);
+        }
+    }
 
     /// P-SOLV-4 CORRECTNESS: full-invariant `solvent` is exactly
     /// `vault >= total_collateral + lp + insurance`.
@@ -390,5 +421,23 @@ mod solvency_full_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod insurance_deposit_tests {
+    use super::insurance_deposit_credit;
+
+    #[test]
+    fn deposit_credit_is_exact_and_rejects_overflow() {
+        // exact credit
+        assert_eq!(insurance_deposit_credit(100_955, 100_000), Some(200_955));
+        // from empty
+        assert_eq!(insurance_deposit_credit(0, 100_000), Some(100_000));
+        // zero deposit is a no-op credit
+        assert_eq!(insurance_deposit_credit(500, 0), Some(500));
+        // overflow is rejected (never wraps a balance smaller)
+        assert_eq!(insurance_deposit_credit(u64::MAX, 1), None);
+        assert_eq!(insurance_deposit_credit(u64::MAX - 3, 10), None);
     }
 }
