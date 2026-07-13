@@ -11,9 +11,9 @@ where
     V        = vault total (SPL vault: deposits + LP capital + insurance + fees)
     C_tot    = Σ committed trader collateral
     I        = insurance fund balance
-    Residual = V − C_tot − I  (folds FLP capital + junior-profit backing + surplus)
+    Residual = V − C_tot − I  (folds LP capital + junior-profit backing + surplus)
 
-flash-book does not recompute this each block — it DELTA-TRACKS `Residual` (every
+clober does not recompute this each block — it DELTA-TRACKS `Residual` (every
 money-moving ix feeds a signed delta through `haircut::apply_residual_delta`). The
 per-instruction delta table is documented at `matcher/haircut.rs:460`
 (`| Ix | ΔV | ΔC_tot | ΔI | ΔResidual |`). Conservation is preserved iff EVERY
@@ -40,7 +40,7 @@ Theorems are `#print axioms`-clean (no `sorry`).
 -/
 import Mathlib.Tactic
 
-namespace FlashBook.ResidualConservation
+namespace Clober.ResidualConservation
 
 /-- The four protocol-wide value buckets, signed so deltas compose freely. -/
 structure Ledger where
@@ -79,12 +79,12 @@ Each is an `applyDelta` instance whose delta tuple satisfies `ΔV = ΔC + ΔI + 
 
 def depositCollateral  (a : ℤ) : Ledger → Ledger := applyDelta a a 0 0
 def withdrawCollateral (a : ℤ) : Ledger → Ledger := applyDelta (-a) (-a) 0 0
-def depositFlpCapital  (a : ℤ) : Ledger → Ledger := applyDelta a 0 0 a
-def withdrawFlpCapital (a : ℤ) : Ledger → Ledger := applyDelta (-a) 0 0 (-a)
+def depositLpCapital  (a : ℤ) : Ledger → Ledger := applyDelta a 0 0 a
+def withdrawLpCapital (a : ℤ) : Ledger → Ledger := applyDelta (-a) 0 0 (-a)
 def insuranceDeposit   (a : ℤ) : Ledger → Ledger := applyDelta a 0 a 0
 def insuranceWithdraw  (a : ℤ) : Ledger → Ledger := applyDelta (-a) 0 (-a) 0
 def flushHaircutDust   (d : ℤ) : Ledger → Ledger := applyDelta 0 0 d (-d)
-def feeToFlp           (f : ℤ) : Ledger → Ledger := applyDelta f 0 0 f
+def feeToLp           (f : ℤ) : Ledger → Ledger := applyDelta f 0 0 f
 def feeToInsurance     (f : ℤ) : Ledger → Ledger := applyDelta f 0 f 0
 def liquidationReward  (r : ℤ) : Ledger → Ledger := applyDelta (-r) (-r) 0 0
 def realizedPnlLoss    (l : ℤ) : Ledger → Ledger := applyDelta 0 (-l) 0 l
@@ -99,12 +99,12 @@ theorem deposit_collateral_conserves (a : ℤ) (L) (h : conserved L) :
 theorem withdraw_collateral_conserves (a : ℤ) (L) (h : conserved L) :
     conserved (withdrawCollateral a L) := by
   simp only [conserved, withdrawCollateral, applyDelta] at *; omega
-theorem deposit_flp_capital_conserves (a : ℤ) (L) (h : conserved L) :
-    conserved (depositFlpCapital a L) := by
-  simp only [conserved, depositFlpCapital, applyDelta] at *; omega
-theorem withdraw_flp_capital_conserves (a : ℤ) (L) (h : conserved L) :
-    conserved (withdrawFlpCapital a L) := by
-  simp only [conserved, withdrawFlpCapital, applyDelta] at *; omega
+theorem deposit_lp_capital_conserves (a : ℤ) (L) (h : conserved L) :
+    conserved (depositLpCapital a L) := by
+  simp only [conserved, depositLpCapital, applyDelta] at *; omega
+theorem withdraw_lp_capital_conserves (a : ℤ) (L) (h : conserved L) :
+    conserved (withdrawLpCapital a L) := by
+  simp only [conserved, withdrawLpCapital, applyDelta] at *; omega
 theorem insurance_deposit_conserves (a : ℤ) (L) (h : conserved L) :
     conserved (insuranceDeposit a L) := by
   simp only [conserved, insuranceDeposit, applyDelta] at *; omega
@@ -114,9 +114,9 @@ theorem insurance_withdraw_conserves (a : ℤ) (L) (h : conserved L) :
 theorem flush_haircut_dust_conserves (d : ℤ) (L) (h : conserved L) :
     conserved (flushHaircutDust d L) := by
   simp only [conserved, flushHaircutDust, applyDelta] at *; omega
-theorem fee_to_flp_conserves (f : ℤ) (L) (h : conserved L) :
-    conserved (feeToFlp f L) := by
-  simp only [conserved, feeToFlp, applyDelta] at *; omega
+theorem fee_to_lp_conserves (f : ℤ) (L) (h : conserved L) :
+    conserved (feeToLp f L) := by
+  simp only [conserved, feeToLp, applyDelta] at *; omega
 theorem fee_to_insurance_conserves (f : ℤ) (L) (h : conserved L) :
     conserved (feeToInsurance f L) := by
   simp only [conserved, feeToInsurance, applyDelta] at *; omega
@@ -183,7 +183,7 @@ out of `Residual`, so `R = F + R'`. This refines the 4-bucket ledger into
 
     V = C + I + F + R'
 
-`F` is a claimable vault LIABILITY; `R'` is the leftover residual (surplus + FLP +
+`F` is a claimable vault LIABILITY; `R'` is the leftover residual (surplus + LP +
 junior backing). The two 2.3 money moves:
 
 * **accrue** (`apply_fill`): reserve `a` of surplus as fee liability — `ΔF = +a`,
@@ -241,7 +241,7 @@ theorem conserved5_iff_conserved (L : Ledger5) :
   simp only [conserved5, conserved, project]; omega
 
 /-- The extended solvency floor `verify_protocol_solvency` now enforces:
-`vault ≥ insurance + flp + fee_accrued` (here `C + I + F ≤ V`) holds iff the
+`vault ≥ insurance + lp + fee_accrued` (here `C + I + F ≤ V`) holds iff the
 leftover residual is non-negative. -/
 theorem extended_solvent_of_conserved_nonneg_residual (L : Ledger5)
     (hL : conserved5 L) (hR : 0 ≤ L.R) : L.C + L.I + L.F ≤ L.V := by
@@ -274,4 +274,4 @@ theorem fee_share_claim_preserves_solvency (a : ℤ) (L : Ledger5)
 #print axioms fee_share_accrue_preserves_solvency
 #print axioms fee_share_claim_preserves_solvency
 
-end FlashBook.ResidualConservation
+end Clober.ResidualConservation

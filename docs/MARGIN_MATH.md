@@ -3,15 +3,15 @@
 Formal specification of the margin model — cross vs isolated buckets,
 healthy-trader invariant, stress lattice, and the liquidation/funding
 routing that depends on those invariants. Companion to `MATH.md` (which
-covers batch auction clearing, FLP quoter, funding, etc.).
+covers batch auction clearing, LP quoter, funding, etc.).
 
 Target audience: auditors and contributors who need to verify that the
-implementation in `programs/flash-book/src/matcher/risk.rs` +
-`programs/flash-book/src/lib.rs` matches the model below.
+implementation in `programs/clober/src/matcher/risk.rs` +
+`programs/clober/src/lib.rs` matches the model below.
 
 ## 0. Conventions
 
-- All collateral and notional values are in **quote-lots** (Flash Book
+- All collateral and notional values are in **quote-lots** (Clober
   uses USDC-style 6-decimal quote at the lot level; convention shared
   with `MATH.md` and the rest of the program).
 - `i128` arithmetic is used for intermediate signed sums to avoid
@@ -361,7 +361,7 @@ Implementation: lines 2577–2615.
 
 ### 8.1 Realized PnL materialisation — RESOLVED (Phase 2g)
 
-**Status: fixed.** The post-Phase-2g `apply_fill` and `apply_flp_fill`
+**Status: fixed.** The post-Phase-2g `apply_fill` and `apply_lp_fill`
 handlers now materialise the realized-PnL delta into the right
 collateral bucket on every fill, closing the gap this section
 previously documented.
@@ -373,7 +373,7 @@ accumulates the realized-PnL delta onto `pos.realized_pnl_quote_lots`
 as it did before — that field remains the per-position lifetime
 realized-PnL tally for indexers.
 
-The new piece is at the `apply_fill` and `apply_flp_fill` call sites
+The new piece is at the `apply_fill` and `apply_lp_fill` call sites
 (lib.rs around line 3226 and 5295). Each handler now:
 
 1. Snapshots `pos.realized_pnl_quote_lots` and
@@ -431,9 +431,9 @@ shortfall.
 
 #### What still doesn't materialise
 
-The FLP-pool side of `apply_flp_fill` doesn't accumulate on
-`pos.realized_pnl_quote_lots` (the FLP's PnL flows through the
-`FlpMarketExposure` per-market entry and is captured in NAV walks);
+The LP-pool side of `apply_lp_fill` doesn't accumulate on
+`pos.realized_pnl_quote_lots` (the LP's PnL flows through the
+`LpMarketExposure` per-market entry and is captured in NAV walks);
 no settlement is needed there.
 
 `auto_deleverage` still writes the bankruptcy-price loss directly to

@@ -1,0 +1,55 @@
+[package]
+name = "clober"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clober — pool-backed CLOB, continuously matched on MagicBlock ER."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "clober"
+
+[features]
+default = []
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+# Certora Solana Prover harness — verification-only. Never in the product/CI
+# build path; pulls the proprietary-registry-free public cvlr SDK.
+certora = ["no-entrypoint", "dep:cvlr", "dep:cvlr-solana", "dep:nondet"]
+
+[dependencies]
+anchor-lang = { workspace = true, features = ["init-if-needed"] }
+anchor-spl = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+solana-security-txt = "1.1.1"
+solana-keccak-hasher = "2.2.1"
+# cvlr is optional + pulled ONLY under the `certora` feature — the pre-existing
+# hypertree verification instrumentation (red_black_tree.rs / hypertree.rs) uses
+# it. The Certora rule harness itself lives in the separate certora/harness-crate
+# (kept out of this crate so `anchor idl build` stays clean).
+cvlr = { workspace = true, optional = true }
+cvlr-solana = { workspace = true, optional = true }
+nondet = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = "1.6"
+# solana-sdk 3.x is a cohesive umbrella: message/instruction/pubkey/keypair +
+# system_program all resolve to the same solana-* 3.x crate set (solana-pubkey
+# 3.0), which ALSO matches the anchor 1.x program -> host and program share one
+# Pubkey type. Paired with the contemporaneous program-test 3.1.
+# `agave-unstable-api` acknowledges the BanksClient test API (it's gated behind
+# a deprecation note without the feature) — silences the harness deprecation
+# warnings without changing behavior.
+solana-program-test = { version = "3.1", features = ["agave-unstable-api"] }
+solana-sdk = "3.0"
+# Pin to 2.0 so it links solana-pubkey 3.0 (matches solana-sdk 3.0 + the program).
+solana-system-interface = { version = "2.0", features = ["bincode"] }
+spl-token = { version = "8", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "6", features = ["no-entrypoint"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

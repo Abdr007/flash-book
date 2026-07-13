@@ -29,7 +29,7 @@ exactly the true requirement, never an under-count. (Mirrors the host proof
 `n_position_margin_is_collateral_monotone_and_frame_stable`, `risk.rs:1148`.)
 
 ── 3. Liquidation dedupe ────────────────────────────────────────────────────
-`liquidate_portfolio_v2` (`lib.rs:9839`) seeds a dedup set with the EXECUTION
+`liquidate_portfolio` (`lib.rs:9839`) seeds a dedup set with the EXECUTION
 market and folds supplied markets in. Modeled as a `Finset` accumulation: the
 execution market is always present (can't be dropped) and re-supplying an
 already-counted market is a no-op (can't double-count a position into the walk).
@@ -41,7 +41,7 @@ Theorems are `#print axioms`-clean (no `sorry`).
 -/
 import Mathlib
 
-namespace FlashBook.AuthCompleteness
+namespace Clober.AuthCompleteness
 
 variable {α : Type*}
 
@@ -97,7 +97,7 @@ theorem complete_walk_requirement_exact [DecidableEq α] (floor : α → ℤ)
 /-! ### 3 · Liquidation dedupe (exec-seeded, idempotent) -/
 
 /-- The dedup market set: fold supplied markets into a seed via `Finset.insert`
-(distinct by construction). Models `liquidate_portfolio_v2`'s exec-seeded walk. -/
+(distinct by construction). Models `liquidate_portfolio`'s exec-seeded walk. -/
 def dedupWalk [DecidableEq α] (seed : Finset α) (xs : List α) : Finset α :=
   xs.foldl (fun acc x => insert x acc) seed
 
@@ -138,4 +138,4 @@ theorem unauthorized_rejected (signer authority : α) (h : signer ≠ authority)
 #print axioms exec_always_present
 #print axioms reinsert_noop
 
-end FlashBook.AuthCompleteness
+end Clober.AuthCompleteness

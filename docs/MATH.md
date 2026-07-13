@@ -3,7 +3,7 @@
 Formal specification of the load-bearing computations. The settlement and
 margin arithmetic have their own detailed documents
 ([SETTLEMENT.md](SETTLEMENT.md), [MARGIN_MATH.md](MARGIN_MATH.md),
-[HAIRCUT_MATH.md](HAIRCUT_MATH.md)); this file covers matching, the FLP
+[HAIRCUT_MATH.md](HAIRCUT_MATH.md)); this file covers matching, the LP
 quoter, funding, and the fee/insurance/solvency arithmetic.
 
 ## Notation
@@ -37,9 +37,9 @@ taker's compute stays within budget ([SETTLEMENT.md](SETTLEMENT.md) §5).
 
 ---
 
-## 2. FLP quoter spread function
+## 2. LP quoter spread function
 
-The FLP pool quotes two-sided passive liquidity on the book. Per quote
+The LP pool quotes two-sided passive liquidity on the book. Per quote
 level `i ∈ {1..N_levels}` with cumulative size `Q_i`:
 
 ```
@@ -47,7 +47,7 @@ s(Q_i) = s₀ + α·vpin_bps + β·u + γ·|oi_imb| + κ·(Q_i / D_floor) + δ·
 ```
 
 where `s₀` is the base spread floor and `α..δ` are the per-market spread
-coefficients (`flp_spread_*_bps`). The `vpin_bps` toxicity term is held at
+coefficients (`lp_spread_*_bps`). The `vpin_bps` toxicity term is held at
 **zero** — the VPIN accumulator is retired — so the spread is driven by
 utilization, OI imbalance, depth amortization, and realized volatility.
 
@@ -70,10 +70,10 @@ P_ask_i = round_to_tick(fair_value · (1 + s(Q_i)))
 ```
 
 Each level emits one bid and one ask of `per_level_size`. The pool cannot
-grow its position by more than `flp_max_growth_per_batch_bps` of capital
+grow its position by more than `lp_max_growth_per_batch_bps` of capital
 per refresh, and a hard inventory cap bounds gross exposure. Prices are
 additionally validated within a band of the fresh oracle at settlement
-(`FLP_MAX_FILL_DEVIATION_BPS`). Implementation: `matcher/flp_quoter.rs`.
+(`LP_MAX_FILL_DEVIATION_BPS`). Implementation: `matcher/lp_quoter.rs`.
 
 ---
 
@@ -182,12 +182,12 @@ At every settlement:
 
 ```
 Σ trader_collateral
-  + FLP_capital
+  + LP_capital
   + insurance_fund.balance
   ≤ quote_vault_balance  (± accrued fees)
 ```
 
-The protocol-owned subset (`vault ≥ insurance + FLP`) is machine-checked
+The protocol-owned subset (`vault ≥ insurance + LP`) is machine-checked
 directly (`matcher/insurance::assess_solvency`, Kani-proven). The
 whole-program form including trader collateral is the Certora target
 (`certora/PROPERTIES.md`) and is checked one-sidedly on-chain by

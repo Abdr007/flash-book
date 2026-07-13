@@ -1,6 +1,6 @@
 # The ER trust boundary
 
-Flash Book matches on a MagicBlock Ephemeral Rollup and settles on Solana L1.
+Clober matches on a MagicBlock Ephemeral Rollup and settles on Solana L1.
 This document states precisely what the ER operator is and is not trusted
 with, how each trust claim is enforced and tested, and which closure steps
 are operational rather than code.
@@ -13,7 +13,7 @@ The market book, fill-commitment ring, and fill outbox are *delegated* to the
 MagicBlock delegation program (`DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh`),
 matched on the ER validator, and periodically *committed* back to L1.
 
-**Flash Book runs a single-sequencer trust model, by deliberate design.**
+**Clober runs a single-sequencer trust model, by deliberate design.**
 Operating a dedicated decentralized validator set was evaluated and ruled out
 for this stage. The assumption is bounded and precise:
 

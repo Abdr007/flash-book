@@ -1,6 +1,6 @@
 # Governance
 
-On-chain governance of a Flash Book market is built around one principle:
+On-chain governance of a Clober market is built around one principle:
 **asymmetry**. Fail-safe actions (pause, tighten, veto) are fast and
 low-privilege; fail-dangerous actions (unpause, loosen, transfer control)
 are slow, explicit, and bound to exactly what was pre-announced.
@@ -43,7 +43,7 @@ mistyped or dead key.
 
 ## Timelocked parameter updates
 
-All economic parameter changes (fees, margins, funding, oracle band, FLP
+All economic parameter changes (fees, margins, funding, oracle band, LP
 coefficients, …) go through the timelocked path via `PendingParamUpdateAccount`
 (`["pending_params", market]`). **K-3:** the immediate `update_market_params`
 instruction no longer changes economic params — it is restricted to a single

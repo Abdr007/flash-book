@@ -36,7 +36,7 @@ market-A isolated bucket, draining the cross pool below the market-B reservation
 and walling that collateral off from B's settlement — dumping bad debt onto
 insurance. Total collateral was unchanged, so no direct theft, but it defeats the
 withdraw-anytime reserve-margin bridge via isolation instead of withdrawal.
-**Fix (this PR):** gate on `er_active == 0` (`FlashBookError::ErMarginReserved`),
+**Fix (this PR):** gate on `er_active == 0` (`CloberError::ErMarginReserved`),
 mirroring the identical `withdraw_collateral` / `partial_withdraw_collateral` /
 `sweep_collateral` gates — an ER-active trader must resolve the ER (undelegate /
 cancel resting orders) before isolating. Fail-closed; a strict no-op for every
@@ -76,14 +76,14 @@ turned into a griefing lever. **Fix:** for a stale-priced sibling, fall back to 
 conservative worst-case valuation of that leg rather than aborting the whole
 liquidation; or require staleness config on every listed market. Devnet cycle.
 
-### L-2 (LOW) — v3 vault / FLP-v3 withdraw lack an `er_active` check
-`withdraw_vault_v3` (`lib.rs:11340`), FLP-v3 withdraw (`lib.rs:11930`). Both
+### L-2 (LOW) — v3 vault / LP-v3 withdraw lack an `er_active` check
+`withdraw_vault_v3` (`lib.rs:11340`), LP-v3 withdraw (`lib.rs:11930`). Both
 release from the shared vault against a PDA-owned balance without consulting
 `er_active`/`er_reserved`. Only reachable if a strategy PDA rests ER orders
 (unusual). **Fix:** add the same `er_active == 0` assertion for symmetry. Devnet cycle.
 
 ### L-3 (LOW) — `fee_tiers` is keeper-selectable, not commitment-bound  ✅ ACCEPTED RESIDUAL (documented; fix specified + trigger-gated)
-`ApplyFill`/`ApplyFlpFill` contexts. On an armed (permissionless) market a keeper
+`ApplyFill`/`ApplyLpFill` contexts. On an armed (permissionless) market a keeper
 can omit the `Option<fee_tiers>` account, forcing the flat `market.params`
 fee/rebate instead of the traders' volume-tier rates. No value is minted or stolen
 by the keeper — the delta flows to insurance, not the attacker — and it only applies
@@ -107,7 +107,7 @@ without the singleton initialized.
 **Fix to apply WHEN fee tiers are activated pre-launch** (the trigger that makes this
 non-latent): initialize the `[b"fee_tiers"]` singleton as a standing genesis account
 (default `tier_count = 0`), then make `fee_tiers` a **required** account on
-`ApplyFill`/`ApplyFlpFill` and require the caller to pass the canonical PDA. With the
+`ApplyFill`/`ApplyLpFill` and require the caller to pass the canonical PDA. With the
 singleton always present, an honest keeper always supplies it (public account, zero
 cost) and a griefer can no longer strip tiers — with no per-market flag, no migration,
 and no keccak change. Tracked in the roadmap fix queue against the fee-tier-activation
@@ -132,10 +132,10 @@ milestone.
 ## Confirmed-clean invariants (adversarially verified, no finding)
 
 Fill fabrication/redirection/reorder (armed); replay/double-settle/off-by-one;
-sequencer zero-pubkey fail-closed; book↔FLP handler separation; settlement account
+sequencer zero-pubkey fail-closed; book↔LP handler separation; settlement account
 substitution; reduce/flip/stack position math; taker self-trade/crossing/tick;
 reserve-margin gate on withdraw/partial/sweep/transfer/xdomain/session; token-CPI
-substitution & signer seeds; V = C_tot + I + Residual conservation; FLP NAV
+substitution & signer seeds; V = C_tot + I + Residual conservation; LP NAV
 dilution / JIT lock / flat-gate; residual over-statement; ADL bankruptcy gate &
 `.min(loss)` value conservation; isolated↔cross double-counting; cross-market
 netting; liquidation reward / bad-debt routing; margin-walk completeness;
@@ -149,7 +149,7 @@ authority gate; sub-account & session isolation; init/re-init front-running.
 1. **M-2** — route `partial_withdraw_core` + `sweep_collateral` valuation through
    `effective_health_mark` (worse-of + staleness). Highest priority.
 2. **L-1** — conservative sibling-leg fallback in `liquidate_portfolio_v2`.
-3. **L-2** — `er_active == 0` on v3 vault / FLP-v3 withdraw.
+3. **L-2** — `er_active == 0` on v3 vault / LP-v3 withdraw.
 4. **L-3** — bind `fee_tiers` into the fill commitment.
 5. **I-1..I-5** — over-conservative floor tidy, PDA-derivation asserts, Lazer
    robustness, channel gate.

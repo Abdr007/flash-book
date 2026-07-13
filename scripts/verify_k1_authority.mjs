@@ -2,7 +2,7 @@
 // K-1 live-verification gate — the PASS predicate for the single-key rug finding.
 //
 // Asserts, against the LIVE chain, that every authority that could drain or
-// rug Flash Book has been migrated off the single deploy wallet onto the
+// rug Clober has been migrated off the single deploy wallet onto the
 // governance multisig, and that the sequencer hot key holds NO authority role:
 //
 //   1. program upgrade authority        == <multisig>   (or None = immutable)
@@ -21,7 +21,7 @@
 //     --markets <MARKET_PDA>[,<MARKET_PDA>...] \
 //     [--insurance <INSURANCE_FUND_PDA>] [--url <RPC>] [--immutable]
 //
-// Requires the `solana` CLI on PATH and idl/flash_book.json for field offsets.
+// Requires the `solana` CLI on PATH and idl/clober.json for field offsets.
 
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -46,7 +46,7 @@ if (!PROGRAM || (!MULTISIG && !IMMUTABLE)) {
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
-const idl = JSON.parse(readFileSync(join(here, "..", "idl", "flash_book.json"), "utf8"));
+const idl = JSON.parse(readFileSync(join(here, "..", "idl", "clober.json"), "utf8"));
 
 // Fixed-size byte widths for the primitive types we need to skip.
 const WIDTH = { pubkey: 32, publicKey: 32, u128: 16, i128: 16, u64: 8, i64: 8, u32: 4, i32: 4, u16: 2, i16: 2, u8: 1, i8: 1, bool: 1 };

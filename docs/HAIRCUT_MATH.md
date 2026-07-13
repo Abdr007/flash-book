@@ -1,11 +1,11 @@
 # H-Haircut Math
 
-Formal spec for flash-book's **junior-claim profit gating** primitive,
-in flash-book's lot/decimal conventions (`USD_UNIT = 10^6`,
+Formal spec for clober's **junior-claim profit gating** primitive,
+in clober's lot/decimal conventions (`USD_UNIT = 10^6`,
 `BPS_DENOM = 10^4`).
 
 The pure-function core lives at
-`programs/flash-book/src/matcher/haircut.rs`; this document is the
+`programs/clober/src/matcher/haircut.rs`; this document is the
 normative reference for that module's behaviour and for its wire-in to
 `apply_realized_pnl_delta`.
 
@@ -245,7 +245,7 @@ hot path stays O(1) per fill.
 ## 10. Invariants under proptest
 
 Each invariant in §2-§7 is encoded as a property in
-`programs/flash-book/tests/proptest_haircut.rs`. The current suite runs
+`programs/clober/tests/proptest_haircut.rs`. The current suite runs
 each property over 2000 random cases.
 
 | Invariant | Property file | Property name |
@@ -291,8 +291,8 @@ The on-chain wire-in consists of:
      unchanged in this specific case — confirm before shipping).
    - `withdraw_collateral`: same — no Residual change for
      ordinary collateral withdrawals.
-   - Fee accrual to insurance / FLP: increases V and (insurance ↑ or
-     FLP capital ↑ which is part of V). For FLP fees, Residual
+   - Fee accrual to insurance / LP: increases V and (insurance ↑ or
+     LP capital ↑ which is part of V). For LP fees, Residual
      **increases** by the fee amount. For insurance fees, Residual
      stays flat.
    - Liquidation reward to liquidator: decreases V and

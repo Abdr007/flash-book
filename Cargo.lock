@@ -1435,6 +1435,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "clober"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "anchor-spl",
+ "bytemuck",
+ "cvlr",
+ "cvlr-nondet 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
+ "cvlr-solana",
+ "proptest",
+ "serde",
+ "serde_json",
+ "solana-keccak-hasher 2.2.1",
+ "solana-program-test",
+ "solana-sdk",
+ "solana-security-txt",
+ "solana-system-interface 2.0.0",
+ "spl-associated-token-account",
+ "spl-token 8.0.0",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2548,30 +2572,6 @@ name = "five8_core"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "059c31d7d36c43fe39d89e55711858b4da8be7eb6dabac23c7289b1a19489406"
-
-[[package]]
-name = "flash-book"
-version = "0.1.0"
-dependencies = [
- "anchor-lang",
- "anchor-spl",
- "bytemuck",
- "cvlr",
- "cvlr-nondet 0.6.1 (git+https://github.com/Certora/cvlr?tag=cvlr-v0.6.1)",
- "cvlr-solana",
- "proptest",
- "serde",
- "serde_json",
- "solana-keccak-hasher 2.2.1",
- "solana-program-test",
- "solana-sdk",
- "solana-security-txt",
- "solana-system-interface 2.0.0",
- "spl-associated-token-account",
- "spl-token 8.0.0",
- "thiserror 2.0.18",
- "tokio",
-]
 
 [[package]]
 name = "flate2"

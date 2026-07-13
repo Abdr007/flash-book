@@ -1,6 +1,6 @@
 # Decentralized sequencer — design and on-chain status
 
-Flash Book today runs one sequencer per market: it operates the continuous
+Clober today runs one sequencer per market: it operates the continuous
 CLOB on the Ephemeral Rollup and signs fill settlement. What that single
 party can and cannot do is bounded on-chain — fill **authenticity** is
 enforced by the commitment ring, settlement replay/reorder by the monotone

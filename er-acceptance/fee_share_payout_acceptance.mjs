@@ -20,7 +20,7 @@ const FRESH = new PublicKey(process.env.PROGRAM || "BRtnEAZ6Tc61gz8m93unL1vzaC4G
 const OLD = new PublicKey("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
 const EXPLORER = (s) => `https://explorer.solana.com/tx/${s}?cluster=devnet`;
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const sys = SystemProgram.programId;
 const TOKEN = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const ATA_PROG = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
@@ -46,11 +46,11 @@ const rec = (n, ok, d, sig) => { rows.push({ n, ok, d, sig }); console.log(`${ok
 
 console.log(`\nProgram : ${FRESH.toBase58()}\nRPC     : ${L1_RPC.split("?")[0]}\nSigner  : ${signer.publicKey.toBase58()}\n`);
 
-// ── genesis: reuse INS/FLP; fresh ARMED market with a referrer share ──────────
+// ── genesis: reuse INS/LP; fresh ARMED market with a referrer share ──────────
 const INS = pda(["insurance_fund"]);
 const ins = await program.account.insuranceFundAccount.fetch(INS);
 const QUOTE = ins.quoteMint, VAULT = ins.quoteVault;
-const FLP = pda(["flp_exposure"]);
+const LP = pda(["lp_exposure"]);
 const ref = await oldProgram.account.marketAccount.fetch(REF_MARKET);
 const params = { ...ref.params, oracleStalenessMaxSeconds: 600, referrerShareBps: 2000, takerFeeBps: 50, makerRebateBps: 0, minNotionalQuoteLots: new BN(0) };
 const base = Keypair.generate();
@@ -59,7 +59,7 @@ const BOOK = pda(["market_book", M]);
 const FC = pda(["fill_commit", M]);
 const FO = pda(["fill_outbox", M]);
 const dummy = Keypair.generate().publicKey;
-await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: dummy, quoteVault: VAULT, oracleAccount: dummy, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [base]);
+await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: dummy, quoteVault: VAULT, oracleAccount: dummy, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
 await send(await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction());
 await send(await program.methods.initFillCommitment(105).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction());
 await send(await program.methods.initFillOutbox().accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, fillCommitment: FC, systemProgram: sys }).instruction());
@@ -107,7 +107,7 @@ if (accrued.gtn(0)) {
   await send(SystemProgram.transfer({ fromPubkey: signer.publicKey, toPubkey: referrer.publicKey, lamports: 20_000_000 }));
   const rAta = ata(referrer.publicKey, QUOTE);
   await send([createAtaIx(signer.publicKey, referrer.publicKey, QUOTE)]);
-  const claimSig = await send(await program.methods.claimFeeAccrual().accountsPartial({ recipient: referrer.publicKey, feeAccrual: FA, insuranceFund: INS, flpExposure: FLP, quoteMint: QUOTE, recipientQuoteAta: rAta, quoteVault: VAULT, tokenProgram: TOKEN }).instruction(), [referrer]);
+  const claimSig = await send(await program.methods.claimFeeAccrual().accountsPartial({ recipient: referrer.publicKey, feeAccrual: FA, insuranceFund: INS, lpExposure: LP, quoteMint: QUOTE, recipientQuoteAta: rAta, quoteVault: VAULT, tokenProgram: TOKEN }).instruction(), [referrer]);
   const bal = BigInt((await l1.getTokenAccountBalance(rAta)).value.amount);
   const faAfter = await program.account.feeAccrualAccount.fetch(FA);
   rec("2.3 claim_fee_accrual pays out to referrer ATA + zeroes accrual", bal === BigInt(accrued.toString()) && faAfter.accruedQuoteLots.eqn(0), `ATA balance=${bal} accrual now=${faAfter.accruedQuoteLots}`, claimSig);

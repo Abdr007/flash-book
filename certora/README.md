@@ -1,6 +1,6 @@
-# Flash Book — Certora / Formal Property Specification
+# Clober — Certora / Formal Property Specification
 
-`PROPERTIES.md` is the protocol's formal property set — the invariants Flash Book
+`PROPERTIES.md` is the protocol's formal property set — the invariants Clober
 must satisfy, each tagged with its current verification status:
 
 - **`[KANI]`** / **`[LEAN]`** — machine-proven *today* (reproducible, see below).
@@ -16,7 +16,7 @@ once a license is wired.
 
 ## Reproduce the proofs that run today
 ```bash
-cargo kani --package flash-book --features no-entrypoint   # Kani harnesses
+cargo kani --package clober --features no-entrypoint   # Kani harnesses
 cd formal_verification/lean && lake build                  # Lean (4.24 + Mathlib)
 ```
 

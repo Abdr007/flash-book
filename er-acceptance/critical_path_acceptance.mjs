@@ -31,7 +31,7 @@ const OLD = new PublicKey("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
 const EXPLORER = (sig) => `https://explorer.solana.com/tx/${sig}?cluster=devnet`;
 
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const IDL_FRESH = { ...IDL, address: FRESH.toBase58() };
 const IDL_OLD = { ...IDL, address: OLD.toBase58() };
 
@@ -94,7 +94,7 @@ console.log(`program (fresh throwaway) : ${FRESH.toBase58()}`);
 console.log(`L1 RPC                    : ${L1_RPC.split("?")[0]}\n`);
 
 // ── GENESIS (fresh program) ──────────────────────────────────────────────────
-console.log("GENESIS — mint · flp · insurance(+vault) · market(IM>0) · book · ring");
+console.log("GENESIS — mint · lp · insurance(+vault) · market(IM>0) · book · ring");
 const ver = await l1.getVersion(); console.log(`  cluster solana-core ${ver["solana-core"]}`);
 const bal = await l1.getBalance(signer.publicKey); console.log(`  authority ${signer.publicKey.toBase58().slice(0, 8)}… balance ${(bal / 1e9).toFixed(2)} SOL`);
 
@@ -103,7 +103,7 @@ const ref = await oldProgram.account.marketAccount.fetch(REF_MARKET);
 const params = { ...ref.params, oracleStalenessMaxSeconds: 60 };
 console.log(`  cloned params: IM=${params.initialMarginRatioBps}bps MM=${params.maintenanceMarginRatioBps}bps tick=${Number(params.tickSize)}`);
 
-// The insurance fund + FLP are GLOBAL singletons (seed has no market/mint), bound to ONE
+// The insurance fund + LP are GLOBAL singletons (seed has no market/mint), bound to ONE
 // quote mint for the program's life. Reuse that mint if the singleton already exists (we
 // hold its mint authority from the run that created it); otherwise create a fresh mint.
 const INS = pda(["insurance_fund"]);
@@ -122,9 +122,9 @@ if (await l1.getAccountInfo(INS)) {
   await send(await program.methods.initializeInsuranceFund(0, 0, 0, new BN(0)).accountsPartial({ authority: signer.publicKey, insuranceFund: INS, quoteMint: QUOTE, quoteVault: vaultKp.publicKey, tokenProgram: TOKEN, rent: RENT, systemProgram: sys }).instruction(), [vaultKp]);
   console.log(`  fresh quote mint ${QUOTE.toBase58().slice(0, 8)}…`);
 }
-const FLP = pda(["flp_exposure"]);
+const LP = pda(["lp_exposure"]);
 const authLp = pda(["lp_position", signer.publicKey]);
-if (!(await l1.getAccountInfo(FLP))) await send(await program.methods.initializeFlpExposure(new BN(0)).accountsPartial({ authority: signer.publicKey, flpExposure: FLP, authorityLpPosition: authLp, insuranceFund: INS, systemProgram: sys }).instruction());
+if (!(await l1.getAccountInfo(LP))) await send(await program.methods.initializeLiquidityPool(new BN(0)).accountsPartial({ authority: signer.publicKey, lpExposure: LP, authorityLpPosition: authLp, insuranceFund: INS, systemProgram: sys }).instruction());
 const insAcc = await program.account.insuranceFundAccount.fetch(INS);
 const VAULT = insAcc.quoteVault;
 console.log(`  insurance ${INS.toBase58().slice(0, 8)}…  vault ${VAULT.toBase58().slice(0, 8)}…`);
@@ -136,7 +136,7 @@ const BOOK = pda(["market_book", M]);
 const FC = pda(["fill_commit", M]);
 const ENV = pda(["envelope", M]);
 const dummyOracle = Keypair.generate().publicKey;
-await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: dummyOracle, quoteVault: VAULT, oracleAccount: dummyOracle, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [base]);
+await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: dummyOracle, quoteVault: VAULT, oracleAccount: dummyOracle, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
 await send(await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction());
 await send(await program.methods.initFillCommitment(256).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction());
 console.log(`  market(IM>0) ${M.toBase58()}\n  book ${BOOK.toBase58().slice(0, 8)}…  ring ${FC.toBase58().slice(0, 8)}…`);

@@ -43,7 +43,7 @@ reconciled source rather than a live row — reported honestly, not claimed.
 ## Protocol dimensions → evidence
 
 ### Order book core
-- Zero-copy hypertree book — `programs/flash-book/src/state_v2.rs`; every hot-path
+- Zero-copy hypertree book — `programs/clober/src/state_v2.rs`; every hot-path
   load bounds+aligns the header roots (`from_account_data`).
 - Corruption-proof ingest — `validate_node_links`: cycle-free visited-bitmap DFS,
   link bounds, color-byte validity, free-list disjointness; a malicious ER commit
@@ -117,7 +117,7 @@ reconciled source rather than a live row — reported honestly, not claimed.
 | ✅ **CLOSED — HIGH 4.8** intake-margin gate on v3 injection + `vault_place_order_v3` | DONE — shared `gate_injection_open` on all 6 opening-maker paths (reduce-only exempt); **devnet-accepted** (3 independent paths reject `InsufficientCollateral` + exemption accepts). PR #300 `3998b9bd`, all CI green | eng ✓ |
 | ✅ **CLOSED — HIGH liq-cancel** owner-cancel of the injected `order_type==3` close order | DONE — owner-cancel blocked (`LiquidationOrderNotCancelable`) + `retire_liquidation_order_v2` keeper/authority path; **devnet-accepted** by a REAL liquidation (order_type==3 injected → owner cancel rejected → authority retire accepted). PR #300 | eng ✓ |
 | ✅ **CLOSED — MED M-2** withdraw/sweep raw-mark pricing | DONE — routed through the worse-of `effective_health_mark`. PR #300. Clean devnet flip N/A on realistic params (stress-IM ≈ max-loss → no collateral window); covered by in-tree suite + source | eng ✓ |
-| MED/LOW — ER attestation-lag, `record_flp_fill_v3` trust, funding snapshot, dormant-sibling liq | per `docs/SECURITY_AUDIT_2026-07-10*.md` fix queue (next devnet cycle; none HIGH) | eng (devnet cycle) |
+| MED/LOW — ER attestation-lag, `record_lp_fill_v3` trust, funding snapshot, dormant-sibling liq | per `docs/SECURITY_AUDIT_2026-07-10*.md` fix queue (next devnet cycle; none HIGH) | eng (devnet cycle) |
 | Certora whole-program run | VERIFICATION SUCCESSFUL in CI (licensed) | vendor |
 | External audit signature | firm's report | vendor |
 | MagicBlock owner-recovery | executable force-undelegate | vendor |
@@ -129,7 +129,7 @@ that is permanent and hard to copy. The audit's **two HIGH launch-blockers and t
 MED withdraw-pricing gap are now closed, merged (PR #300), and the HIGHs are
 devnet-accepted** against hash-verified on-chain bytes. What remains before
 "9.5 shipped" is a **non-HIGH MED/LOW fix tail** (ER attestation-lag,
-`record_flp_fill_v3` trust, funding snapshot, dormant-sibling liq) and **three
+`record_lp_fill_v3` trust, funding snapshot, dormant-sibling liq) and **three
 honest vendor waits** (Certora whole-program run, external audit signature,
 MagicBlock owner-recovery). The gate is no longer HIGH-blocked; nothing here is
 faked to look closed, and the residuals are named rather than buried.

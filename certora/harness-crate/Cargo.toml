@@ -1,27 +1,27 @@
 # Certora Solana Prover harness — SEPARATE verification-only crate.
 #
 # It lives OUTSIDE the `programs/*` workspace glob (so normal workspace CI never
-# builds it) and path-depends on flash-book with the `certora` feature. Kept
+# builds it) and path-depends on clober with the `certora` feature. Kept
 # separate on purpose: Anchor's IDL source-parser (`anchor idl build`) walks
 # every `mod` regardless of `cfg` and cannot parse cvlr types — so the harness
-# must not be a module of the flash-book crate, or the IDL drift gate breaks.
+# must not be a module of the clober crate, or the IDL drift gate breaks.
 [package]
-name = "flash-book-certora-harness"
+name = "clober-certora-harness"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "lib"]
-name = "flash_book_certora_harness"
+name = "clober_certora_harness"
 
 [features]
-# cargo-certora-sbf enables `--features certora` by default; the flash-book dep
+# cargo-certora-sbf enables `--features certora` by default; the clober dep
 # already bakes in its own certora feature, so this one is just a satisfied flag.
 certora = []
 
 [dependencies]
-flash-book = { path = "../../programs/flash-book", features = ["certora"] }
+clober = { path = "../../programs/clober", features = ["certora"] }
 cvlr = { git = "https://github.com/Certora/cvlr", tag = "cvlr-v0.6.1" }
 cvlr-solana = { git = "https://github.com/Certora/cvlr-solana", tag = "cvlr-solana-v0.5.0" }
 
@@ -29,5 +29,5 @@ cvlr-solana = { git = "https://github.com/Certora/cvlr-solana", tag = "cvlr-sola
 sources = [
     "src/**/*.rs",
     "Cargo.toml",
-    "../../programs/flash-book/src/**/*.rs",
+    "../../programs/clober/src/**/*.rs",
 ]

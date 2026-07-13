@@ -17,7 +17,7 @@ The fill lifecycle is split across two instructions:
 | Stage | Instruction | Where it runs |
 |-------|-------------|---------------|
 | Match: walk the hypertree, decrement/remove maker orders, produce fills | `place_taker_order_v2` | on-chain (L1, or the delegated ER) |
-| Settle: mutate collateral / position / PnL from the fill's economics | `apply_fill` / `apply_flp_fill` | base layer |
+| Settle: mutate collateral / position / PnL from the fill's economics | `apply_fill` / `apply_lp_fill` | base layer |
 
 Matching is trustless — the book is mutated on-chain and fills are a
 deterministic function of book state. Settlement takes the fill's economics
@@ -81,14 +81,14 @@ markets, and the flag can never be cleared.
    delegated account — which is exactly how reduce-only in-flight tracking
    works (§3).
 
-### The FLP path
+### The LP path
 
-FLP fills are quotes against pool liquidity — there is no resting order to
+LP fills are quotes against pool liquidity — there is no resting order to
 commit, so they cannot ride the ring slot-for-slot. Authenticity is an
-**oracle-anchored band**: an honest FLP fill always prices within the
-quoter's spread of fair value, so `apply_flp_fill` requires the fill price
-to lie within `FLP_MAX_FILL_DEVIATION_BPS` (300 bps = 3%) of the **fresh**
-oracle price (`FlpPriceOutsideBand` otherwise). The band anchors to the
+**oracle-anchored band**: an honest LP fill always prices within the
+quoter's spread of fair value, so `apply_lp_fill` requires the fill price
+to lie within `LP_MAX_FILL_DEVIATION_BPS` (300 bps = 3%) of the **fresh**
+oracle price (`LpPriceOutsideBand` otherwise). The band anchors to the
 oracle — fresh at settlement and immune to quoter-input drift — and caps
 what a compromised sequencer could extract per (replay-guarded) fill at 3%
 of notional. Exact re-derivation of the quote at settlement is deliberately
@@ -262,12 +262,12 @@ produced = u64_le(acct.data[8..16])
 cap      = u32_le(acct.data[24..28])
 for idx in consumed .. produced:              # ascending = FIFO
     slot = decode(acct.data, 64 + (idx % cap) * 96)
-    if slot.maker == Pubkey::default():  apply_flp_fill(slot, fill_seq = idx)
+    if slot.maker == Pubkey::default():  apply_lp_fill(slot, fill_seq = idx)
     else:                                apply_fill(slot,     fill_seq = idx)
     on success: consumed = idx + 1; persist(consumed)
 ```
 
-Slot layout (96 B): `taker[0..32]`, `maker[32..64]` (all-zero ⇒ FLP fill),
+Slot layout (96 B): `taker[0..32]`, `maker[32..64]` (all-zero ⇒ LP fill),
 `size_lots u64 @64`, `price_ticks u64 @72`, `maker_id u64 @80` (bookkeeping
 only), `taker_side @88`, `taker_sub_index @89`, `maker_sub_index @90`,
 `taker_was_jit @91`, pad to 96. The reader validates the discriminator
@@ -306,7 +306,7 @@ Reproduce:
 
 ```
 cargo build-sbf --tools-version v1.52
-SBF_OUT_DIR=$PWD/target/deploy cargo test -p flash-book --test integration \
+SBF_OUT_DIR=$PWD/target/deploy cargo test -p clober --test integration \
     deep_book_matching_cu_curve -- --nocapture
 ```
 

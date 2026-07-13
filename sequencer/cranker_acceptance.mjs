@@ -27,7 +27,7 @@ if (!ER_RPC) {
 }
 const L1_RPC = process.env.L1_RPC || "https://api.devnet.solana.com";
 
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const PID = new PublicKey(IDL.address);
 const DELEG = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
 const ER_VALIDATOR = new PublicKey(process.env.ER_VALIDATOR || "MAS1Dt9qreoRMQ14YQuhg8UTZMMzDdKhmkZMECCzk57");
@@ -71,7 +71,7 @@ const signer = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(`
 const l1 = new Connection(L1_RPC, "confirmed");
 const er = new Connection(ER_RPC, "confirmed");
 const program = new Program(IDL, new AnchorProvider(l1, new Wallet(signer), { commitment: "confirmed" }));
-const FLP = PublicKey.findProgramAddressSync([Buffer.from("flp_exposure")], PID)[0];
+const LP = PublicKey.findProgramAddressSync([Buffer.from("lp_exposure")], PID)[0];
 const pda = (s, p = PID) => PublicKey.findProgramAddressSync(s.map((x) => (Buffer.isBuffer(x) ? x : (typeof x === "string" ? Buffer.from(x) : x.toBuffer()))), p)[0];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -159,7 +159,7 @@ try {
   console.log("market A", M.toBase58(), "| market B", MB.toBase58());
 
   await stage("L1 init market + book + ring + outbox", async () => {
-    await send(l1, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [base]);
+    await send(l1, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
     await send(l1, await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction(), []);
     await send(l1, await program.methods.initFillCommitment(105).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction(), []);
     await send(l1, await program.methods.initFillOutbox().accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, fillCommitment: FC, systemProgram: sys }).instruction(), []);
@@ -285,7 +285,7 @@ try {
 
   // ════ Market B (L1-resident): the same window RELEASES at settlement ════
   await stage("B: L1 init market + book + ring + outbox (cranker picks it up lazily)", async () => {
-    await send(l1, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: baseB.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: MB, insuranceFund: INS, flpExposure: FLP, systemProgram: sys }).instruction(), [baseB]);
+    await send(l1, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: baseB.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: MB, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [baseB]);
     await send(l1, await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: MB, marketBook: BOOKB, systemProgram: sys }).instruction(), []);
     await send(l1, await program.methods.initFillCommitment(105).accountsPartial({ authority: signer.publicKey, market: MB, fillCommitment: FCB, systemProgram: sys }).instruction(), []);
     await send(l1, await program.methods.initFillOutbox().accountsPartial({ authority: signer.publicKey, market: MB, fillOutbox: FOB, fillCommitment: FCB, systemProgram: sys }).instruction(), []);

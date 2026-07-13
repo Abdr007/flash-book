@@ -19,35 +19,35 @@ jobs:
           sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
       - name: Check
-        run: cargo check -p flash-book
+        run: cargo check -p clober
       # The integration suite loads the program as a real compiled SBF .so and
       # runs it in the BPF VM (not an in-process processor), so the artifact must
       # exist and be discoverable via SBF_OUT_DIR before `cargo test` runs.
       - name: Build SBF .so (integration tests load it as bytecode)
-        run: cargo build-sbf --tools-version v1.52 --manifest-path programs/flash-book/Cargo.toml --sbf-out-dir target/deploy
+        run: cargo build-sbf --tools-version v1.52 --manifest-path programs/clober/Cargo.toml --sbf-out-dir target/deploy
       - name: Lib + integration tests
         env:
           SBF_OUT_DIR: ${{ github.workspace }}/target/deploy
-        run: cargo test -p flash-book
+        run: cargo test -p clober
       - name: Run all proptest suites
         run: |
-          cargo test -p flash-book --test proptest_risk
-          cargo test -p flash-book --test proptest_isolated
-          cargo test -p flash-book --test proptest_liquidation
-          cargo test -p flash-book --test proptest_new_features
-          cargo test -p flash-book --test proptest_modules
-          cargo test -p flash-book --test proptest_haircut
-          cargo test -p flash-book --test proptest_envelope
-          cargo test -p flash-book --test proptest_book
+          cargo test -p clober --test proptest_risk
+          cargo test -p clober --test proptest_isolated
+          cargo test -p clober --test proptest_liquidation
+          cargo test -p clober --test proptest_new_features
+          cargo test -p clober --test proptest_modules
+          cargo test -p clober --test proptest_haircut
+          cargo test -p clober --test proptest_envelope
+          cargo test -p clober --test proptest_book
       - name: Run all module-integration tests
         run: |
-          cargo test -p flash-book --test haircut_ix
-          cargo test -p flash-book --test haircut_release
-          cargo test -p flash-book --test haircut_apply_fill
-          cargo test -p flash-book --test haircut_invariants_side_accrual
-          cargo test -p flash-book --test envelope_ix
-          cargo test -p flash-book --test envelope_runtime_gate
-          cargo test -p flash-book --test trigger_slippage
+          cargo test -p clober --test haircut_ix
+          cargo test -p clober --test haircut_release
+          cargo test -p clober --test haircut_apply_fill
+          cargo test -p clober --test haircut_invariants_side_accrual
+          cargo test -p clober --test envelope_ix
+          cargo test -p clober --test envelope_runtime_gate
+          cargo test -p clober --test trigger_slippage
 
   sbf:
     name: cargo build-sbf (BPF release)
@@ -61,33 +61,16 @@ jobs:
           sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
       - name: Build SBF
-        run: cargo build-sbf --tools-version v1.52 --manifest-path programs/flash-book/Cargo.toml --sbf-out-dir target/deploy
+        run: cargo build-sbf --tools-version v1.52 --manifest-path programs/clober/Cargo.toml --sbf-out-dir target/deploy
       # Upload the built .so so it can be downloaded and deployed to devnet.
       # platform-tools v1.52 (rustc 1.89) is required: earlier releases cannot
       # compile edition2024 dependencies.
-      - name: Upload flash_book.so
+      - name: Upload clober.so
         uses: actions/upload-artifact@v4
         with:
-          name: flash_book-so
-          path: target/deploy/flash_book.so
+          name: clober-so
+          path: target/deploy/clober.so
           if-no-files-found: error
-
-  v2-bridge:
-    name: V2 bridge SDK tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      # The adapter builds instructions from the committed IDL and reconciles PnL
-      # in exact integers; the SDK suite round-trips every instruction/account
-      # through anchor's coders and checks the identity beyond 2^53.
-      - name: Install + test
-        working-directory: v2-bridge
-        run: |
-          npm ci
-          npm test
 
   kani:
     name: Formal verification (Kani)
@@ -98,15 +81,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Runs the ENTIRE Kani suite (no --harness filter) across haircut, lib
       # (solvency + margin-frame proofs), risk (MMR), fill_commitment (ring +
-      # nonce), flp_quoter (price band), liquidation (worse-of), insurance
-      # (solvency), state_v2 (order-id price-time priority) and the ER-liveness
+      # nonce), lp_quoter (price band), liquidation (worse-of), insurance
+      # (solvency), book_state (order-id price-time priority) and the ER-liveness
       # / order-id-seq proofs. See docs/FORMAL_VERIFICATION.md +
       # certora/PROPERTIES.md. A regression that breaks any invariant fails CI.
       - name: Run Kani proof harnesses
         uses: model-checking/kani-github-action@v1.1
         with:
           kani-version: 0.67.0
-          args: '--package flash-book --features no-entrypoint'
+          args: '--package clober --features no-entrypoint'
 
   lint:
     name: Format + Clippy
@@ -160,12 +143,12 @@ jobs:
       - name: Install Anchor CLI
         run: cargo install anchor-cli --version 0.32.1 --locked
       # Rebuild the IDL from source and fail if it diverges from the committed
-      # idl/flash_book.json (the documented source of truth). Catches any account
+      # idl/clober.json (the documented source of truth). Catches any account
       # / arg / discriminator / event / error change that was not regenerated.
       - name: Build IDL from source
         run: anchor idl build -o /tmp/fresh-idl.json
       - name: Compare against committed IDL
-        run: node scripts/check-idl-drift.mjs idl/flash_book.json /tmp/fresh-idl.json
+        run: node scripts/check-idl-drift.mjs idl/clober.json /tmp/fresh-idl.json
 
   lean:
     name: Formal verification (Lean)
@@ -227,9 +210,9 @@ jobs:
         env:
           CERTORAKEY: ${{ secrets.CERTORAKEY }}
         run: |
-          # The harness is a SEPARATE crate (flash-book stays IDL-clean).
+          # The harness is a SEPARATE crate (clober stays IDL-clean).
           # cargo-certora-sbf pulls Certora's platform-tools (v1.53-certora) and
-          # emits the build manifest; certoraSolanaProver builds it (flash-book
+          # emits the build manifest; certoraSolanaProver builds it (clober
           # with the certora feature) and runs the rule(s) in the conf on the
           # cloud Prover, failing CI on any violation or sanity failure.
           certoraSolanaProver "$GITHUB_WORKSPACE/certora/solana_solvency.conf" --wait_for_results

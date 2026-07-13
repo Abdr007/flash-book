@@ -1,6 +1,6 @@
 # Pyth Oracle Integration
 
-Flash Book V3 supports two oracle paths per market:
+Clober V3 supports two oracle paths per market:
 
 1. **Trusted `update_oracle`** — authority writes raw values. Acceptable for devnet/testnet, **never for mainnet**.
 2. **Permissionless `update_oracle_from_pyth`** — reads a real Pyth `PriceUpdateV2` account on-chain. Validates feed_id, staleness, and confidence. Anyone can call.
@@ -10,7 +10,7 @@ This doc shows how to switch a market to the Pyth path.
 ## One-time setup per market (authority)
 
 ```typescript
-import { FlashBookClient } from './client';
+import { CloberClient } from './client';
 // Pyth feed IDs — fetch from https://www.pyth.network/developers/price-feed-ids
 // SOL/USD mainnet:
 const SOL_USD_FEED_ID = Buffer.from(
@@ -57,7 +57,7 @@ On success, it writes the price to `market.oracle_price_ticks`. The mark-engine'
 
 Pyth quotes prices as `(price: i64, exponent: i32)` where `real_usd = price * 10^exponent`. SOL/USD typically has `exponent = -8`, so `price = 9_995_000_000` means $99.95.
 
-Flash Book stores `oracle_price_ticks` as a raw u64 where `1 tick = 10^(-tick_decimals)` USDC. With our default `tickDecimals = 3`:
+Clober stores `oracle_price_ticks` as a raw u64 where `1 tick = 10^(-tick_decimals)` USDC. With our default `tickDecimals = 3`:
 - 1 tick = $0.001
 - $99.95 = 99,950 ticks
 

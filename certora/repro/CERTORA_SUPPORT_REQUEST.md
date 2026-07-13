@@ -5,7 +5,7 @@ pointer analysis get past the `&'static` global-string copy inside Anchor's
 `error!`/`#[error_code]` construction, so rules that call real Anchor handler
 symbols verify instead of returning `UNKNOWN`.
 
-This blocks the whole-program solvency proof for **flash-book** (Solana CLOB perps).
+This blocks the whole-program solvency proof for **clober** (Solana CLOB perps).
 Four solvency rules already pass on the real invariant symbol; the remaining ~47
 money-path sites are inline mutations inside Anchor `Context` handlers, and any rule
 that executes one hits the failure below.
@@ -23,10 +23,10 @@ that executes one hits the failure below.
 | Program | Anchor `anchor-lang 1.x`, solana-program 2.x |
 
 ## Minimal reproducer (self-contained)
-Rule (`certora/repro/minimal_repro.rs`, compiled into the `flash-book-certora-harness` crate):
+Rule (`certora/repro/minimal_repro.rs`, compiled into the `clober-certora-harness` crate):
 ```rust
 use cvlr::prelude::*;
-use flash_book::xmargin::check_simple_withdraw;
+use clober::xmargin::check_simple_withdraw;
 
 #[rule]
 pub fn repro_anchor_error_memcpy() {
@@ -42,9 +42,9 @@ pub fn repro_anchor_error_memcpy() {
 `check_simple_withdraw` is a trivial real function:
 ```rust
 pub fn check_simple_withdraw(collateral: u64, amount: u64, er_reserved: u64) -> Result<()> {
-    require!(amount <= collateral, FlashBookError::InsufficientCollateral); // -> error!(...)
+    require!(amount <= collateral, CloberError::InsufficientCollateral); // -> error!(...)
     let remaining = collateral - amount;
-    require!(remaining >= er_reserved, FlashBookError::ErMarginReserved);
+    require!(remaining >= er_reserved, CloberError::ErMarginReserved);
     Ok(())
 }
 ```
@@ -65,22 +65,22 @@ Dev message: Pointer domain: dereference of an absolute address 22976 (0x59c0) a
       sol_memcpy_ /*unhoisted_memcpy*/
 Warning: The following functions are neither inlined nor summarized. They are treated as
       external. [<anchor_lang_error::Error as From<anchor_lang_error::AnchorError>>::from,
-      <flash_book::errors::FlashBookError as core::fmt::Display>::fmt]
+      <clober::errors::CloberError as core::fmt::Display>::fmt]
 ```
 Shareable report (anonymousKey — openable without our account):
 `https://prover.certora.com/output/10652951/7b5a39aaf5a24c7089e91fe512a286be?anonymousKey=36da2a88cd4e144bd9959f6a01daf3bd93e4ef40`
 
 ## Root cause (our analysis)
-Anchor's `error!(FlashBookError::…)` → `Error::from(FlashBookError)` builds an
+Anchor's `error!(CloberError::…)` → `Error::from(CloberError)` builds an
 `AnchorError` whose `error_msg`/origin come from `#[msg("…")]` and `file!()`
 **`&'static` globals**, copied via `to_string()`→`Display::fmt`→`write_str` and stored,
 at **many `#[inline]`d sites** across the program. The pointer analysis cannot classify
-the source global at the `sol_memcpy_`, so any path that constructs a `FlashBookError`
+the source global at the `sol_memcpy_`, so any path that constructs a `CloberError`
 (i.e. every `require!`/`.or_overflow()?`) yields `UNKNOWN`.
 
 ## Workarounds we tried and DISPROVED (so the ask is precise)
 1. **Function-boundary points-to summaries** — `<Error as From<AnchorError>>::from`,
-   `<FlashBookError as Display>::fmt`, `<FlashBookError as ToString>::to_string`,
+   `<CloberError as Display>::fmt`, `<CloberError as ToString>::to_string`,
    `solana_address::Address::{find,try_find,create}_program_address`. Each provably
    works (the failing global address *moves*: `0x532a`→`0x51f0`→`0x5880`→`0x59c0`), but
    it never converges — the copies are scattered across inlined sites.

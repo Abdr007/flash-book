@@ -9,7 +9,7 @@ multiplies — and the stacked entry is `(entry·size + price·fill) / (size+fil
 whose BRACKET property (the averaged entry lies between the old entry and the
 fill price) requires reasoning about the RESULT of an integer division. CBMC
 (via `cargo kani`) bit-blasts both and does not terminate in CI, so
-`programs/flash-book/src/matcher/position_math.rs` covers the PnL value and the
+`programs/clober/src/matcher/position_math.rs` covers the PnL value and the
 VWAP bracket with host/proptest sweeps at `B = 256` ONLY (see the `NOTE ON
 PnL-VALUE COVERAGE` there). Lean proves the same properties over unbounded `Int`
 (PnL) and `Nat` (entry), so the identities hold at every magnitude, not just the
@@ -29,7 +29,7 @@ The core money-safety facts proven below:
   1. sign correctness — a long realizes a PROFIT iff it closes above entry, a
      short iff it closes below entry (no side/sign confusion can mint value);
   2. breakeven — closing at the entry price realizes exactly zero;
-  3. cross-system reconciliation — the flash-book PnL satisfies the Flash V2
+  3. cross-system reconciliation — the clober PnL satisfies the notional-return formula
      notional identity `pnl · entry = sign · (price − entry) · notional`
      (`notional = closed · entry · tick`) EXACTLY, at unbounded width;
   4. the closed-lot count is `min(fill, size)` — `fill` on a pure reduce,
@@ -42,7 +42,7 @@ Theorems are intended `#print axioms`-clean (no `sorry`).
 -/
 import Mathlib.Tactic
 
-namespace FlashBook.RealizedPnl
+namespace Clober.RealizedPnl
 
 /-- Long side (price up = profit). Matches `position_math::SIDE_LONG`. -/
 def SIDE_LONG : ℕ := 0
@@ -126,14 +126,14 @@ theorem realized_on_reduce (side entry price tick fill size : ℕ) (h : fill ≤
       = sign side * (fill : ℤ) * ((price : ℤ) - (entry : ℤ)) * (tick : ℤ) := by
   rw [closed_reduce fill size h]; rfl
 
-/-- MARQUEE — cross-system reconciliation with the Flash V2 notional-return
+/-- MARQUEE — cross-system reconciliation with the notional-return
 formula. V2 settles `(mark − entry)/entry · notional` with
-`notional = closed·entry·tick`; multiplying out the division, the flash-book
+`notional = closed·entry·tick`; multiplying out the division, the clober
 integer PnL satisfies the exact identity
 `pnl · entry = sign · (price − entry) · notional` at UNBOUNDED width — the two
 systems settle the same value, with no rounding wedge (this is the host
 `matches_v2_notional_return_formula` test lifted to all magnitudes). -/
-theorem realized_reconciles_v2 (side closed entry price tick : ℕ) :
+theorem realized_reconciles (side closed entry price tick : ℕ) :
     realizedPnl side closed entry price tick * (entry : ℤ)
       = sign side * ((price : ℤ) - (entry : ℤ)) * ((closed : ℤ) * (entry : ℤ) * (tick : ℤ)) := by
   unfold realizedPnl; ring
@@ -187,9 +187,9 @@ theorem vwap_same_price (entry posSize fillSize : ℕ) (h : 1 ≤ posSize + fill
   have : entry * posSize + entry * fillSize = entry * (posSize + fillSize) := by ring
   rw [this, Nat.mul_div_cancel _ (show 0 < posSize + fillSize from h)]
 
-#print axioms realized_reconciles_v2
+#print axioms realized_reconciles
 #print axioms long_pnl_pos_iff
 #print axioms vwap_lower_bound
 #print axioms vwap_upper_bound
 
-end FlashBook.RealizedPnl
+end Clober.RealizedPnl

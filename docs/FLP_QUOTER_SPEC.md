@@ -1,11 +1,11 @@
-# FLP On-Book Quoter — Specification (roadmap 5.1)
+# LP On-Book Quoter — Specification (roadmap 5.1)
 
-The Flash Liquidity Pool (FLP) posts two-sided maker quotes onto the same
+The Flash Liquidity Pool (LP) posts two-sided maker quotes onto the same
 hypertree order book that external traders use — a pool-backed CLOB market maker.
 This document specifies the pricing model it uses. It is an
 **Avellaneda–Stoikov-inspired** inventory-aware quoter, adapted to an on-chain,
 integer-only setting. Everything here is grounded in
-`programs/flash-book/src/matcher/flp_quoter.rs` (`generate_quotes`) — no
+`programs/clober/src/matcher/lp_quoter.rs` (`generate_quotes`) — no
 aspirational behaviour.
 
 All rates are in basis points (`BPS_DENOM = 10_000`). All arithmetic is
@@ -75,8 +75,8 @@ ask_i = align_tick( fair_value · (1 + s_bps / BPS_DENOM) , tick_size )
 size_i = per_level_lots           (bids and asks; cumulative depth = i · per_level_lots)
 ```
 
-Orders are emitted as `OrderType::FlpVirtual` on `Side::Long` (bids) /
-`Side::Short` (asks), owned by the FLP trader PDA. A level whose aligned price
+Orders are emitted as `OrderType::LpVirtual` on `Side::Long` (bids) /
+`Side::Short` (asks), owned by the LP trader PDA. A level whose aligned price
 rounds to `0` is dropped (never post a zero-price order).
 
 ## 4. Inventory cap — the hard backstop
@@ -102,7 +102,7 @@ that an authentic quote lands within `max_dev_bps` of oracle. Complementary
 resting-order guards: `price_sig_figs_ok` (≤ 5 significant figures, roadmap 4.2)
 and `order_notional_ok` (per-order quote-lot floor, roadmap 4.1).
 
-## 6. Parameters (`FlpQuoterParams`)
+## 6. Parameters (`LpQuoterParams`)
 
 `base_spread_bps`, `alpha_bps`, `beta_bps`, `gamma_bps`, `delta_bps`,
 `kappa_bps`, `inventory_lambda_bps`, `depth_floor_lots`, `levels`, `tick_size`,

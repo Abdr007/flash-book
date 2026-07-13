@@ -15,9 +15,9 @@ share/NAV math are sound.
 | Surface | Result |
 |---|---|
 | ER / cross-domain / delegation | Attestation authenticity, delegation seeds, corrupt-book fail-closed, force-undelegate all clean. **1 MED (attestation-lag trust residual) + LOW/INFO.** |
-| V3 strategist-vaults + FLP-v3 | Share/NAV math a faithful copy of the audited singleton (no donation/inflation/first-depositor; floors pool-favorable). **1 HIGH (`vault_place_order_v3` intake-gate) + 1 MED (`record_flp_fill_v3` trust) + LOW.** |
+| V3 strategist-vaults + LP-v3 | Share/NAV math a faithful copy of the audited singleton (no donation/inflation/first-depositor; floors pool-favorable). **1 HIGH (`vault_place_order_v3` intake-gate) + 1 MED (`record_lp_fill_v3` trust) + LOW.** |
 | Advanced order injection | Trigger/TWAP fire predicates, slippage-at-fire, reduce-only clamp, OCO, idempotency all clean. **1 HIGH (intake-gate, item 4.8) + 2 MED (OI cap, oracle band) + LOW.** |
-| Economic / MEV / DoS / compute | Compute bounds, liquidation-reward cap, insurance isolation, FLP math all clean. **1 HIGH (liquidation-cancel dodge) + 1 MED (funding snapshot) + LOW/INFO.** |
+| Economic / MEV / DoS / compute | Compute bounds, liquidation-reward cap, insurance isolation, LP math all clean. **1 HIGH (liquidation-cancel dodge) + 1 MED (funding snapshot) + LOW/INFO.** |
 
 ## HIGH findings
 
@@ -35,7 +35,7 @@ other maker-open paths omit it:**
 **Exploit:** deposit dust, inject a large resting order via any of the six; a
 second wallet crosses it (its own taker leg is IM-gated, the maker's is not); at
 `apply_fill` the attacker opens a position vastly exceeding its collateral — a free
-option whose tail loss socializes to insurance/FLP. Confirmed by two independent
+option whose tail loss socializes to insurance/LP. Confirmed by two independent
 reviewers + the code's own comment; the reduce-only branches and the margin-gated
 `basket` path are correctly exempt/covered.
 **Fix (devnet cycle):** a shared `assert_injection_intake(...)` (IM +
@@ -71,8 +71,8 @@ atomically at injection. Devnet acceptance required.
   mitigated by the honest-sequencer model (attest-before-ack). **Harden:** require
   attest-confirm before an ER order rests/fills + an on-chain max-staleness bound on
   xdomain withdraw.
-- **MED (`record_flp_fill_v3` trust)** — authority-gated and cannot be forged by an
-  outside user, but a compromised sequencer/authority can inflate FLP `realized_pnl`
+- **MED (`record_lp_fill_v3` trust)** — authority-gated and cannot be forged by an
+  outside user, but a compromised sequencer/authority can inflate LP `realized_pnl`
   (→ NAV) with no on-chain link to a real vault-entering counterparty loss. Sequencer
   trust concentration; **harden:** commit fills against an attested book-state root.
 - **MED (funding snapshot)** — `crank_funding` samples the instantaneous
@@ -93,8 +93,8 @@ are real engineering that belongs in focused passes, not a rushed tail change:
   order rests/fills + an on-chain max-staleness bound on the attestation used by
   xdomain withdraw) is a money-path + ER-flow change — attach to the ER-hardening /
   decentralized-sequencer track (2.x), devnet-gated.
-- **`record_flp_fill_v3` trust** — not forgeable by an outside user; only a
-  *compromised* sequencer/authority can inflate FLP NAV, i.e. it lives entirely
+- **`record_lp_fill_v3` trust** — not forgeable by an outside user; only a
+  *compromised* sequencer/authority can inflate LP NAV, i.e. it lives entirely
   inside the already-disclosed sequencer-trust assumption. Proper fix (commit fills
   against an attested book-state root) is the same primitive the decentralized-
   sequencer milestone introduces — attach there.
@@ -110,7 +110,7 @@ are real engineering that belongs in focused passes, not a rushed tail change:
 
 **Net:** the MED/LOW audit tail is closed — **L-1, L-2, and the funding-snapshot MED
 fixed + merged** (devnet-CI green); L-3 and the remaining two MEDs (ER attestation-lag,
-`record_flp_fill_v3` trust) are accepted residuals inside the disclosed single-sequencer
+`record_lp_fill_v3` trust) are accepted residuals inside the disclosed single-sequencer
 trust boundary, with a **named fix and the milestone each attaches to** — none blocking
 launch (no HIGH, no outside-attacker theft). This matches the venue's discipline: name
 every residual, force nothing risky.
@@ -118,12 +118,12 @@ every residual, force nothing risky.
 ## LOW / INFO (see the fix queue)
 
 OI-cap bypass and oracle-band bypass on the injection paths (fold into H-A's
-`assert_injection_intake`); v3 vault/FLP withdraw `er_active` check (wave-1 L-2);
+`assert_injection_intake`); v3 vault/LP withdraw `er_active` check (wave-1 L-2);
 `fee_tiers` not commitment-bound (wave-1 L-3); dormant-sibling liquidation dodge
 (wave-1 L-1); `reset_er_margin_attestation` authority-power / attestor
-non-rotatable; unarmed-FLP fill price unbounded when staleness disabled; canonical
+non-rotatable; unarmed-LP fill price unbounded when staleness disabled; canonical
 PDA rent-leak (no close ix); `apply_fill` haircut PDAs not `init_if_needed`;
-`flp_refresh_quotes` full-book walk (physically bounded, rate-limited);
+`lp_refresh_quotes` full-book walk (physically bounded, rate-limited);
 `verify_collateral_solvency` O(n²) dedup (view ix, caller-paid).
 
 ## DoS / compute-exhaustion — no exploitable finding
@@ -143,7 +143,7 @@ basket/privacy caps all named constants.
    the OI-cap + oracle-band MEDs together).
 2. **H-B** — protect `order_type==3` from owner-cancel + keeper/authority retirement.
 3. **M-2** (wave 1) — `effective_health_mark` in withdraw/sweep.
-4. MED — ER attest-before-fill + staleness bound; funding TWAP; FLP-fill state-root.
+4. MED — ER attest-before-fill + staleness bound; funding TWAP; LP-fill state-root.
 5. LOW/INFO — per the lists above.
 
 Every item closes with a devnet deploy + a live acceptance run per the standing

@@ -1,4 +1,4 @@
-# Flash Book — Settlement Policy (pre-committed, algorithmic-only)
+# Clober — Settlement Policy (pre-committed, algorithmic-only)
 
 This is a **pre-commitment**, published before launch, on how markets settle,
 delist, and liquidate. It exists so that the answer to *"can the operator reprice
@@ -26,10 +26,10 @@ a market to their advantage in a crisis?"* is a permanent, verifiable **no**.
    reserve-margin gate allows leaves collateral ≥ maintenance margin, so no one
    can withdraw into a liquidatable state and dump the loss on insurance.
 
-5. **The insurance fund cannot be drained by an FLP (market-maker) loss.**
+5. **The insurance fund cannot be drained by an LP (market-maker) loss.**
    Machine-proven: Kani `bad_debt_coverage_is_insurance_isolated_and_bounded` —
    the bad-debt waterfall debits insurance only as a function of its own balance
-   and the shortfall; FLP capital is a separate bucket with no drain path. This
+   and the shortfall; LP capital is a separate bucket with no drain path. This
    is the structural fix for Hyperliquid's single-vault SPOF.
 
 ## Why this is credible here and not elsewhere

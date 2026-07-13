@@ -29,7 +29,7 @@ insurance balance.
 exceeds the loser's collateral before a liquidator acts), with the haircut
 engine not enabled.
 
-*Fix.* `apply_fill` and `apply_flp_fill` now require
+*Fix.* `apply_fill` and `apply_lp_fill` now require
 `!market.is_permissionless || market.haircut_enabled`. The haircut (junior-claim)
 engine routes winner gains to a solvency-gated reserve that only matures while
 the protocol is solvent, so an uncovered loser shortfall is absorbed by the

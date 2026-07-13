@@ -12,7 +12,7 @@
 //     im = ceil(size_lots × price_ticks × tick_size × initial_margin_ratio_bps / 10_000)
 // over (a) every RESTING order on the book, and (b) every UNSETTLED fill —
 // outbox rows at absolute indices [ring.settled, ring.produced), reserved for
-// BOTH the taker and the maker (an FLP virtual-quote fill, maker ==
+// BOTH the taker and the maker (an LP virtual-quote fill, maker ==
 // Pubkey::default(), reserves only the taker side). A fill therefore keeps its
 // margin reserved seamlessly from the moment the order rests until apply_fill
 // settles it into a position the filled-position gate covers — the
@@ -46,7 +46,7 @@ if (MARKETS.length === 0) {
   process.exit(1);
 }
 
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const PID = new PublicKey(IDL.address);
 const keypairPath = process.env.KEYPAIR || `${os.homedir()}/.config/solana/id.json`;
 const attestor = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(keypairPath))));
@@ -165,7 +165,7 @@ function computeReservations(orders, fills, tickSize, imBps) {
     if (f.sizeLots === 0n) continue;
     const im = imFor(f.sizeLots, f.priceTicks, tickSize, imBps);
     add(f.taker, f.takerSub, im);
-    if (!f.maker.equals(DEFAULT_PUBKEY)) add(f.maker, f.makerSub, im); // FLP fills reserve pool margin, not a trader's
+    if (!f.maker.equals(DEFAULT_PUBKEY)) add(f.maker, f.makerSub, im); // LP fills reserve pool margin, not a trader's
   }
   return perState;
 }

@@ -65,5 +65,5 @@ for (const key of new Set([...Object.keys(committed), ...Object.keys(fresh)])) {
     }
   }
 }
-console.error("\nRegenerate with: anchor idl build -o idl/flash_book.json");
+console.error("\nRegenerate with: anchor idl build -o idl/clober.json");
 process.exit(1);

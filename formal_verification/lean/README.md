@@ -5,7 +5,7 @@ over the **actual** denominator `H_DENOM = 1_000_000_000`.
 
 ## Why this complements the Kani proofs
 
-The Kani proofs in `programs/flash-book/src/matcher/haircut.rs` are bounded model
+The Kani proofs in `programs/clober/src/matcher/haircut.rs` are bounded model
 checking (CBMC). CBMC cannot decide 128-bit division by a non-power-of-two, so
 those proofs use a **representative power-of-two divisor** (`D = 1 << 30 ≈ 1e9`)
 and document that the result is divisor-agnostic.
@@ -30,7 +30,7 @@ domain / unbounded width a property CBMC cannot decide tractably:
 |---|---|---|
 | `OiMmr.lean` | scaled-OI maintenance-margin bound + monotonicity | `matcher/risk.rs` OI-MMR |
 | `Funding.lean` | funding is zero-sum (long owes exactly what short receives), independent of the `>>64` rounding | `funding.rs funding_owed` |
-| `RealizedPnl.lean` | reduce/flip realized-PnL value `sign·closed·Δticks·tick`, exact Flash V2 notional reconciliation, and the VWAP-entry bracket `min ≤ entry' ≤ max` — the two properties `matcher/position_math.rs` can only host-pin at B=256 (128-bit multiply + division-result reasoning) | `position_math.rs apply_fill` (closes G2) |
+| `RealizedPnl.lean` | reduce/flip realized-PnL value `sign·closed·Δticks·tick`, exact notional-return reconciliation, and the VWAP-entry bracket `min ≤ entry' ≤ max` — the two properties `matcher/position_math.rs` can only host-pin at B=256 (128-bit multiply + division-result reasoning) | `position_math.rs apply_fill` (closes G2) |
 | `PerDomainCredit.lean` | per-domain realizable-credit haircut bound at the real `1e9` divisor (credit never exceeds collateral; monotone in realizable value) | `matcher/risk.rs` haircut/credit |
 | `ResidualConservation.lean` | triple-ledger identity `V = C_tot + I + Residual` preserved by all 12 money-moving instructions (`ΔV = ΔC + ΔI + ΔR`), `foldl_conserves` sequence-closure, and the `Residual ≥ 0 ⟺ V ≥ C_tot + I` solvency corollary | `haircut.rs` delta table (closes G4) |
 | `AuthCompleteness.lean` | Finset-cardinality margin-walk completeness (every position visited), liquidation dedupe, and the authorization gate | `matcher/risk.rs` margin walk (closes G7) |

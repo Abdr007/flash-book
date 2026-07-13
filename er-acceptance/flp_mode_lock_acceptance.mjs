@@ -1,8 +1,8 @@
-// FLP mode-lock live acceptance (F-4). Run AFTER `solana program deploy`.
-//   L1_RPC=<devnet> node flp_mode_lock_acceptance.mjs
-// Proves on-chain that the singleton and per-market v3 FLP systems are mutually
+// LP mode-lock live acceptance (F-4). Run AFTER `solana program deploy`.
+//   L1_RPC=<devnet> node lp_mode_lock_acceptance.mjs
+// Proves on-chain that the singleton and per-market v3 LP systems are mutually
 // exclusive on minting LP shares: a singleton deposit claims MODE_SINGLETON,
-// after which a v3 deposit fails closed with FlpSystemModeConflict.
+// after which a v3 deposit fails closed with LpSystemModeConflict.
 import fs from "fs";
 import os from "os";
 import anchor from "@coral-xyz/anchor";
@@ -10,7 +10,7 @@ import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 const { Program, AnchorProvider, Wallet, BN } = anchor;
 
 const L1_RPC = process.env.L1_RPC || "https://solana-devnet.api.onfinality.io/public";
-const IDL = JSON.parse(fs.readFileSync(new URL("../idl/flash_book.json", import.meta.url)));
+const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
 const PID = new PublicKey(IDL.address);
 const signer = Keypair.fromSecretKey(
   new Uint8Array(JSON.parse(fs.readFileSync(`${os.homedir()}/.config/solana/id.json`))),
@@ -30,8 +30,8 @@ const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
 const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
 const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
-const FLP = pda(["flp_exposure"]);
-const FLP_MODE = pda(["flp_mode"]);
+const LP = pda(["lp_exposure"]);
+const LP_MODE = pda(["lp_mode"]);
 const TOKEN = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const ATOKEN = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const ata = (owner, mint) =>
@@ -58,15 +58,15 @@ const ok = (c, m) => {
   }
 };
 
-console.log(`FLP mode-lock live acceptance — L1=${L1_RPC}\n`);
+console.log(`LP mode-lock live acceptance — L1=${L1_RPC}\n`);
 
-// ── Setup: the singleton deposit marks NAV across every LIVE FLP exposure
+// ── Setup: the singleton deposit marks NAV across every LIVE LP exposure
 // slot, so each registered market must ride in remaining_accounts with a
 // FRESH oracle. Leftover throwaway markets from prior acceptance runs may
 // have a zero staleness bound (pre-bound era) or a stale/absent oracle —
 // heal each: give it a real bound, ensure its envelope config exists, and
 // refresh the oracle at the current mark (zero price move). ──────────────────
-const exp = await program.account.flpExposureAccount.fetch(FLP);
+const exp = await program.account.lpExposureAccount.fetch(LP);
 const liveMarkets = exp.perMarket.filter((s) => s.side !== 255).map((s) => s.market);
 console.log(`  (NAV walk spans ${liveMarkets.length} live exposure slot(s))`);
 for (const mkt of liveMarkets) {
@@ -100,12 +100,12 @@ let sig;
 try {
   sig = await send(
     await program.methods
-      .depositFlpCapital(new BN(1_000_000))
+      .depositLpCapital(new BN(1_000_000))
       .accountsPartial({
         authority: signer.publicKey,
-        flpExposure: FLP,
+        lpExposure: LP,
         lpPosition: lpPos,
-        flpMode: FLP_MODE,
+        lpMode: LP_MODE,
         insuranceFund: INS,
         quoteMint: QUOTE,
         authorityQuoteAta: SIGNER_ATA,
@@ -116,40 +116,40 @@ try {
       .remainingAccounts(liveMetas)
       .instruction(),
   );
-  ok(true, `singleton deposit_flp_capital ALLOWED (claims MODE_SINGLETON) — ${sig}`);
+  ok(true, `singleton deposit_lp_capital ALLOWED (claims MODE_SINGLETON) — ${sig}`);
 } catch (e) {
   ok(false, "singleton deposit failed: " + e);
 }
-const mode = await program.account.flpModeAccount.fetch(FLP_MODE);
-ok(mode.mode === 1, `flp_mode.mode == 1 (singleton), got ${mode.mode}`);
+const mode = await program.account.lpModeAccount.fetch(LP_MODE);
+ok(mode.mode === 1, `lp_mode.mode == 1 (singleton), got ${mode.mode}`);
 
 // ── Negative: a v3 deposit is rejected by the lock ───────────────────────────
 // Reuse the existing REF_MARKET; init its v3 pool if absent (tolerant of an
 // already-initialized pool from a prior run).
 const M = REF_MARKET;
-const EXP = pda(["flp_per_market", M]);
+const EXP = pda(["lp_per_market", M]);
 try {
   await send(
     await program.methods
-      .initFlpPerMarketV3()
+      .initLpPerMarketV3()
       .accountsPartial({ authority: signer.publicKey, insuranceFund: INS, market: M, exposure: EXP, systemProgram: sys })
       .instruction(),
   );
 } catch (e) {
   // already initialized — fine
 }
-const POS = pda(["flp_position_v3", EXP, signer.publicKey]);
+const POS = pda(["lp_position_v3", EXP, signer.publicKey]);
 let rejErr = "";
 let rejected = false;
 try {
   await send(
     await program.methods
-      .flpDepositV3(new BN(1_000_000))
+      .lpDepositV3(new BN(1_000_000))
       .accountsPartial({
         lp: signer.publicKey,
         exposure: EXP,
         position: POS,
-        flpMode: FLP_MODE,
+        lpMode: LP_MODE,
         insuranceFund: INS,
         quoteMint: QUOTE,
         lpQuoteAta: SIGNER_ATA,
@@ -164,10 +164,10 @@ try {
   rejErr = String(e) + " " + JSON.stringify(e.logs || (e.transactionLogs ?? []));
 }
 ok(
-  rejected && (rejErr.includes("FlpSystemModeConflict") || rejErr.includes("8321") || rejErr.includes("0x2081")),
-  `v3 flp_deposit_v3 REJECTED with FlpSystemModeConflict while singleton active${rejected ? "" : " (NOT rejected!)"}`,
+  rejected && (rejErr.includes("LpSystemModeConflict") || rejErr.includes("8321") || rejErr.includes("0x2081")),
+  `v3 lp_deposit_v3 REJECTED with LpSystemModeConflict while singleton active${rejected ? "" : " (NOT rejected!)"}`,
 );
-if (rejected && !(rejErr.includes("FlpSystemModeConflict") || rejErr.includes("8321") || rejErr.includes("0x2081")))
+if (rejected && !(rejErr.includes("LpSystemModeConflict") || rejErr.includes("8321") || rejErr.includes("0x2081")))
   console.log("    (rejected but with unexpected error:", rejErr.slice(0, 400), ")");
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);

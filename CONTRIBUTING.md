@@ -7,14 +7,14 @@ below apply to it.
 
 ```bash
 # Build + test the program
-cargo test -p flash-book
-cargo build-sbf --manifest-path programs/flash-book/Cargo.toml
+cargo test -p clober
+cargo build-sbf --manifest-path programs/clober/Cargo.toml
 
 # Formal-verification proofs (one-time: cargo install --locked kani-verifier && cargo kani setup)
 cargo kani --features no-entrypoint
 
 # Regenerate the IDL after Anchor program changes
-anchor idl build -o idl/flash_book.json
+anchor idl build -o idl/clober.json
 ```
 
 ## Ground rules
@@ -24,7 +24,7 @@ anchor idl build -o idl/flash_book.json
 - **Integer arithmetic only in the matcher and risk modules.** Every
   `size × price × tick_size` is computed in `u128` with `checked_mul`;
   final casts to `u64` saturate at `u64::MAX` or return
-  `FlashBookError::ArithmeticOverflow`.
+  `CloberError::ArithmeticOverflow`.
 - **`i128` for signed sums** (PnL, funding); clamp to `i64` only at
   output boundaries.
 - **No floats on-chain.**
@@ -34,11 +34,11 @@ anchor idl build -o idl/flash_book.json
 
 - Every PR ships at least one test demonstrating the change.
 - Risk / margin / liquidation: property tests preferred — mirror the
-  existing `programs/flash-book/tests/proptest_*.rs` patterns.
+  existing `programs/clober/tests/proptest_*.rs` patterns.
 - Anchor handlers: integration tests in
-  `programs/flash-book/tests/integration.rs`.
+  `programs/clober/tests/integration.rs`.
 - Math touching haircut conservation / solvency: extend the Kani proofs
-  in `programs/flash-book/src/matcher/haircut.rs` (`#[cfg(kani)]`). See
+  in `programs/clober/src/matcher/haircut.rs` (`#[cfg(kani)]`). See
   [`docs/FORMAL_VERIFICATION.md`](docs/FORMAL_VERIFICATION.md).
 
 ### Rust / Anchor
@@ -52,7 +52,7 @@ anchor idl build -o idl/flash_book.json
   to avoid Borsh ser/deser CU (see [`docs/SETTLEMENT.md`](docs/SETTLEMENT.md)).
   Pod layouts must have no implicit padding and no `u128` (host/SBF
   alignment differ).
-- Regenerate the IDL (`anchor idl build -o idl/flash_book.json`) in the
+- Regenerate the IDL (`anchor idl build -o idl/clober.json`) in the
   same PR as any instruction/account change.
 
 ### Documentation
@@ -75,7 +75,7 @@ the module where applicable (`matcher`, `risk`, `liquidation`, `funding`,
 
 ## Pull requests
 
-- All gates must pass: `cargo test -p flash-book`, `cargo build-sbf` (no
+- All gates must pass: `cargo test -p clober`, `cargo build-sbf` (no
   stack-frame warnings), and `cargo kani --features no-entrypoint`.
 - Regenerate the IDL for any instruction/account change.
 - Mark draft PRs `[wip]`. CI runs anyway.

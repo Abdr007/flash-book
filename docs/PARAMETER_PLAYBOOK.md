@@ -1,6 +1,6 @@
 # Parameter Playbook
 
-Recommended parameter ranges for Flash Book markets, organized by
+Recommended parameter ranges for Clober markets, organized by
 asset class. Use these as starting points; tune based on observed
 volatility and flow.
 
@@ -38,7 +38,7 @@ MarketParams {
     mark_max_change_bps:                500,                // 5% clamp
     liquidation_cooldown_slots:         50,                 // ~20 seconds
     liquidation_penalty_bps:            150,                // 1.5%
-    flp_max_growth_per_batch_bps:       100,                // 1%
+    lp_max_growth_per_batch_bps:       100,                // 1%
 }
 ```
 
@@ -147,7 +147,7 @@ below this, auto-deleverage becomes eligible.
 
 1. **Initialize** market with the recommended params for its asset class.
 2. **Observe** for 1 week: volatility, OI growth, liquidation count,
-   funding rate range, FLP NAV.
+   funding rate range, LP NAV.
 3. **Adjust** parameters via the timelocked path
    `propose_param_update` → (48h) → `execute_param_update`. Each executed
    update is logged via `MarketParamsUpdatedEvent`. (K-3: the immediate
@@ -192,7 +192,7 @@ When tuning, compare against:
 - **dYdX**: governance proposals reference real param history.
 - **GMX V2**: `DataStore.getUint(Keys.X(market))` direct on-chain reads.
 
-Flash Book is the only protocol shipping the **envelope inequality**;
+Clober is the only protocol shipping the **envelope inequality**;
 the other DEXes have ad-hoc parameter validation. The envelope makes
 mis-configured markets structurally impossible — a strong defense
 against operator error.

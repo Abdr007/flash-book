@@ -21,7 +21,7 @@ Theorems are `#print axioms`-clean (no `sorry`).
 -/
 import Mathlib.Tactic
 
-namespace FlashBook.VaultShares
+namespace Clober.VaultShares
 
 /-- Shares minted for `d` deposited into a vault of `ts` shares / `ta` assets. -/
 def sharesOnDeposit (d ts ta : ℕ) : ℕ := if ts = 0 then d else d * ts / ta
@@ -65,4 +65,4 @@ theorem first_deposit_one_to_one (d ta : ℕ) : sharesOnDeposit d 0 ta = d := by
 #print axioms withdraw_mono_in_shares
 #print axioms first_deposit_one_to_one
 
-end FlashBook.VaultShares
+end Clober.VaultShares

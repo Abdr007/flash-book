@@ -3,7 +3,7 @@
 **Status: scaffold, not yet run.** Discharging `solvency.spec` needs a Certora
 Solana license + the `cvlr` SDK. Nothing here is part of the production cargo
 build or CI (the harness is `#[cfg(feature = "certora")]` and lives outside
-`programs/flash-book/src`), so the green build is unaffected until a licensed
+`programs/clober/src`), so the green build is unaffected until a licensed
 operator opts in.
 
 ## What is already done (no license required)
@@ -12,8 +12,8 @@ The **arithmetic** of the invariant and the **soundness** of the runtime
 detector are machine-proven *today* by Kani — run them with:
 
 ```bash
-cargo kani -p flash-book --harness full_solvent_iff_vault_covers_all_liabilities
-cargo kani -p flash-book --harness partial_insolvency_detector_is_sound
+cargo kani -p clober --harness full_solvent_iff_vault_covers_all_liabilities
+cargo kani -p clober --harness partial_insolvency_detector_is_sound
 ```
 
 and exercised at runtime by the permissionless `verify_collateral_solvency`
@@ -23,7 +23,7 @@ from the 47 collateral-mutation sites the way a stored aggregate would).
 ## What Certora adds
 
 The **all-paths preservation** proof: that *no reachable instruction path* drives
-`vault ≥ Σ collateral + FLP + insurance` from true to false. This is the part a
+`vault ≥ Σ collateral + LP + insurance` from true to false. This is the part a
 one-sided runtime sweep (which cannot enumerate unbounded traders) structurally
 cannot give.
 
@@ -33,7 +33,7 @@ cannot give.
 2. Implement the three summaries in `cvt_summaries.txt` so the ghost views in
    `specs/solvency.spec` resolve to live account reads:
    - `vaultAmount()`      → quote `TokenAccount.amount`
-   - `flpCapital()`       → `FlpExposureAccount.total_capital_quote_lots`
+   - `lpCapital()`       → `LiquidityPoolAccount.total_capital_quote_lots`
    - `insuranceBalance()` → `InsuranceFundAccount.balance_quote_lots`
    - `totalCollateral()`  → Σ `TraderStateAccount.collateral_quote_lots`
                             + Σ isolated `PositionAccount.collateral_quote_lots`
@@ -47,10 +47,10 @@ certoraRun certora/solana_solvency.conf
 ## Proof-obligation set (the 19 balance-mutating instructions)
 
 deposit_collateral, withdraw_collateral, partial_withdraw_collateral,
-sweep_collateral, deposit_flp_capital, withdraw_flp_capital,
+sweep_collateral, lp_deposit, lp_withdraw,
 withdraw_insurance_fund, settle_funding, apply_fill, liquidate_position_v2,
 liquidate_portfolio_v2, vault_place_order_v3, vault_cancel_order_v3,
-settle_vault_perf_fee_v3, flp_deposit_v3, flp_withdraw_v3, mature_position,
+settle_vault_perf_fee_v3, lp_deposit_v3, lp_withdraw_v3, mature_position,
 convert_position, cancel_order_v2.
 
 Every other handler is a view/admin/order-book op that does not move value across

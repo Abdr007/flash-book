@@ -20,7 +20,7 @@ Every `INTERVAL_MS` (default 2s), per watched market:
    summed per `(trader, sub_index)` → trader_state over **both** live
    surfaces: every resting order, and every unsettled fill (outbox rows at
    absolute indices `[ring.settled, ring.produced)`, reserved for the taker
-   and the maker; FLP virtual-quote fills reserve only the taker side). A
+   and the maker; LP virtual-quote fills reserve only the taker side). A
    fill's margin therefore stays reserved seamlessly from the moment the
    order rests until `apply_fill` settles it into a position the
    filled-position gate covers.
