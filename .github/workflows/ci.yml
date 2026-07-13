@@ -75,6 +75,12 @@ jobs:
   kani:
     name: Formal verification (Kani)
     runs-on: ubuntu-latest
+    # Fail fast on a pathologically-slow proof instead of hanging to the 6h job
+    # default. A legitimate full run (cold compile + all harnesses) completes in
+    # ~10-15 min; a proof that forces CBMC to bit-blast a symbolic 128-bit divider
+    # does not terminate (see the `incremental_im` / OI-breaker / funding notes).
+    # 90 min leaves generous headroom over a real run while capping such a hang.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
