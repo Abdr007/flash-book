@@ -158,30 +158,52 @@ pub fn clamp_delta_to_period_cap(
         .saturating_mul(FUNDING_INDEX_ONE)
         .saturating_mul(dt)
         / (BPS_DENOM as i128 * period);
-    delta.clamp(-cap, cap)
+    clamp_to_symmetric_bound(delta, cap)
+}
+
+/// Symmetric clamp to a non-negative bound: returns `delta` confined to
+/// `[-|bound|, |bound|]`. `bound` is taken as its magnitude (`max(0)`), so this can
+/// NEVER panic on an inverted `min > max` regardless of sign — panic-freedom is
+/// structural, not a fact about the caller's cap. Factored out of
+/// [`clamp_delta_to_period_cap`] so the per-period bound property is machine-
+/// provable (Kani) over a SYMBOLIC bound: the full function derives `cap` via an
+/// i128 divide by `BPS_DENOM · period` with a symbolic `period`, and CBMC cannot
+/// discharge a symbolic 128-bit divider in a practical bound (the same limitation
+/// documented for `incremental_im` / the OI breaker). The division-dependent cap
+/// magnitude is instead pinned by the host proptest
+/// `clamp_delta_to_period_cap_never_exceeds_bound`. Division-free, total.
+#[inline]
+pub fn clamp_to_symmetric_bound(delta: i128, bound: i128) -> i128 {
+    let b = bound.max(0);
+    delta.clamp(-b, b)
 }
 
 #[cfg(kani)]
 #[kani::proof]
-fn clamp_delta_to_period_cap_is_bounded_and_panic_free() {
+fn clamp_to_symmetric_bound_is_bounded_and_panic_free() {
     let delta: i128 = kani::any();
-    let per_period_max_bps: u32 = kani::any();
+    let bound: i128 = kani::any();
+    // Whole i128 domain over both inputs — no division, so CBMC discharges it fast.
+    let out = clamp_to_symmetric_bound(delta, bound);
+    let b = bound.max(0);
+    // The clamped delta is confined to the symmetric bound in either direction,
+    // and never panics (a negative `bound` is treated as 0, not an inverted clamp).
+    assert!(out <= b && out >= -b);
+    // Idempotent: a value already within the bound is unchanged.
+    if delta >= -b && delta <= b {
+        assert!(out == delta);
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn clamp_delta_to_period_cap_zero_is_identity() {
+    // The division-free contract of the full function: a zero cap opts out
+    // (returns delta unchanged). `per_period_max_bps == 0` short-circuits BEFORE
+    // the i128 divide, so this stays fast. Whole domain over delta/dt/period.
+    let delta: i128 = kani::any();
     let dt: u64 = kani::any();
     let period: u32 = kani::any();
-    // Domain: a configured cap within the validated permissionless envelope.
-    kani::assume(per_period_max_bps > 0 && per_period_max_bps <= BPS_DENOM);
-    kani::assume(period >= 1 && period <= 604_800); // ≤ 7 days
-    kani::assume(dt <= period as u64);
-    let out = clamp_delta_to_period_cap(delta, per_period_max_bps, dt, period);
-    let p = period.max(1) as i128;
-    let d = (dt.min(period.max(1) as u64)) as i128;
-    let cap = (per_period_max_bps as i128)
-        .saturating_mul(FUNDING_INDEX_ONE)
-        .saturating_mul(d)
-        / (BPS_DENOM as i128 * p);
-    // The clamped delta never exceeds the per-period bound in either direction.
-    assert!(out <= cap && out >= -cap);
-    // A zero cap is the identity (opt-out preserves legacy behaviour).
     assert!(clamp_delta_to_period_cap(delta, 0, dt, period) == delta);
 }
 
