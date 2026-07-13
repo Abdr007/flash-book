@@ -16488,6 +16488,12 @@ fn hip3_valid_params() -> MarketParams {
         referrer_share_bps: 0,
         builder_share_bps: 0,
         creator_share_bps: 0,
+        // Funding bounded within the permissionless envelope: a non-zero
+        // per-period cap is required, the period is in range, and the
+        // per-second rate is capped.
+        funding_rate_max_bps_per_sec: 1_000,
+        funding_per_period_max_bps: 50,
+        funding_period_seconds: 3_600,
         ..default_params()
     }
 }
@@ -16621,6 +16627,50 @@ async fn create_permissionless_market_rejects_out_of_envelope_params() {
         format!("{err:?}").contains("Custom(7003)"),
         "predatory (50x) params must be rejected by the HIP-3 envelope, got: {err:?}"
     );
+
+    // Funding is a predatory lever too: a hostile creator must not be able to
+    // set an unbounded funding rate (the drain-via-crank attack), omit the
+    // required per-period backstop, or blow past the per-period cap.
+    let make = |f: &dyn Fn(&mut MarketParams)| {
+        let mut p = hip3_valid_params();
+        f(&mut p);
+        p
+    };
+    for (bad, label) in [
+        (
+            make(&|p| p.funding_rate_max_bps_per_sec = u32::MAX),
+            "unbounded per-second funding rate",
+        ),
+        (
+            make(&|p| p.funding_per_period_max_bps = 0),
+            "missing per-period backstop",
+        ),
+        (
+            make(&|p| p.funding_per_period_max_bps = 101),
+            "per-period cap over 1%",
+        ),
+        (
+            make(&|p| p.funding_period_seconds = 0),
+            "degenerate funding period",
+        ),
+    ] {
+        let (_m, ix) = create_perm_market_ix(&creator, &protocol, bad).await;
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let err = ctx
+            .banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&creator.pubkey()),
+                &[&creator],
+                bh,
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Custom(7003)"),
+            "{label} must be rejected by the HIP-3 funding envelope, got: {err:?}"
+        );
+    }
 }
 
 // ── copy-vaults: share-accounting vault ─────────────────────────────────────

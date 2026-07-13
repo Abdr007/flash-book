@@ -132,6 +132,59 @@ pub fn funding_index_delta_smoothed(
     Ok((delta, smoothed_rate as i64))
 }
 
+/// Per-period funding backstop. Clamp a single crank's funding-index `delta`
+/// so the cumulative funding charged over one full `period_seconds` cannot
+/// exceed `per_period_max_bps` of a position's notional. The cap is pro-rated
+/// by `dt / period` (dt is already ≤ period at the crank), so several short
+/// cranks inside one period together stay under the full-period bound. A zero
+/// cap disables the backstop (unbounded). This bounds the worst-case value
+/// transfer per period even when the per-second rate cap is loose — the
+/// guarantee a permissionless market's untrusted funding params rely on.
+#[inline]
+pub fn clamp_delta_to_period_cap(
+    delta: i128,
+    per_period_max_bps: u32,
+    dt_seconds: u64,
+    period_seconds: u32,
+) -> i128 {
+    if per_period_max_bps == 0 {
+        return delta;
+    }
+    let period = period_seconds.max(1) as i128;
+    let dt = dt_seconds.min(period_seconds.max(1) as u64) as i128;
+    // cap = per_period_max_bps · ONE · dt / (BPS · period). Saturating multiplies
+    // so an extreme cap only ever widens the bound, never wraps it tight/negative.
+    let cap = (per_period_max_bps as i128)
+        .saturating_mul(FUNDING_INDEX_ONE)
+        .saturating_mul(dt)
+        / (BPS_DENOM as i128 * period);
+    delta.clamp(-cap, cap)
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn clamp_delta_to_period_cap_is_bounded_and_panic_free() {
+    let delta: i128 = kani::any();
+    let per_period_max_bps: u32 = kani::any();
+    let dt: u64 = kani::any();
+    let period: u32 = kani::any();
+    // Domain: a configured cap within the validated permissionless envelope.
+    kani::assume(per_period_max_bps > 0 && per_period_max_bps <= BPS_DENOM);
+    kani::assume(period >= 1 && period <= 604_800); // ≤ 7 days
+    kani::assume(dt <= period as u64);
+    let out = clamp_delta_to_period_cap(delta, per_period_max_bps, dt, period);
+    let p = period.max(1) as i128;
+    let d = (dt.min(period.max(1) as u64)) as i128;
+    let cap = (per_period_max_bps as i128)
+        .saturating_mul(FUNDING_INDEX_ONE)
+        .saturating_mul(d)
+        / (BPS_DENOM as i128 * p);
+    // The clamped delta never exceeds the per-period bound in either direction.
+    assert!(out <= cap && out >= -cap);
+    // A zero cap is the identity (opt-out preserves legacy behaviour).
+    assert!(clamp_delta_to_period_cap(delta, 0, dt, period) == delta);
+}
+
 /// Funding owed by a position since last settlement. Returns signed Q-units
 /// of quote-lots (positive = trader owes).
 ///
@@ -383,6 +436,29 @@ mod tests {
                 funding_owed(false, notional, delta, 0),
             ) {
                 prop_assert_eq!(long, -short);
+            }
+        }
+
+        /// The per-period cap clamps every funding step into ±cap (never wider),
+        /// where cap = per_period_max_bps · ONE · dt / (BPS · period); a zero cap
+        /// is the identity. This is the stateless per-period funding bound.
+        #[test]
+        fn clamp_delta_to_period_cap_never_exceeds_bound(
+            delta in any::<i128>(),
+            ppmb in 0u32..=10_000,
+            dt in 0u64..=604_800,
+            period in 1u32..=604_800,
+        ) {
+            let out = clamp_delta_to_period_cap(delta, ppmb, dt, period);
+            if ppmb == 0 {
+                prop_assert_eq!(out, delta);
+            } else {
+                let d = dt.min(period.max(1) as u64) as i128;
+                let cap = (ppmb as i128)
+                    .saturating_mul(FUNDING_INDEX_ONE)
+                    .saturating_mul(d)
+                    / (BPS_DENOM as i128 * period.max(1) as i128);
+                prop_assert!(out <= cap && out >= -cap);
             }
         }
     }

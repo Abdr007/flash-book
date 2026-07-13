@@ -285,6 +285,16 @@ pub const HIP3_MAX_LIQ_BPS: u32 = 1_000;
 pub const HIP3_MAX_ORACLE_STALENESS_SECS: u32 = 120;
 /// Max any single fee-share (referrer/builder/creator), bps.
 pub const HIP3_MAX_SHARE_BPS: u32 = 2_000;
+/// Max funding charged over one funding period (bps of notional) a
+/// permissionless market may configure. 1% per period bounds the worst-case
+/// per-period value transfer a hostile creator can drive through the funding
+/// crank; enforced at the crank via `clamp_delta_to_period_cap`.
+pub const HIP3_MAX_FUNDING_PER_PERIOD_BPS: u32 = 100;
+/// Min / max funding period (seconds) for a permissionless market, so the
+/// pro-rated per-period cap is meaningful (not a degenerate 0-length or
+/// multi-week window).
+pub const HIP3_MIN_FUNDING_PERIOD_SECS: u32 = 60;
+pub const HIP3_MAX_FUNDING_PERIOD_SECS: u32 = 86_400;
 
 #[cfg(test)]
 mod oracle_band_tests {

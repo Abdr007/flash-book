@@ -192,18 +192,18 @@ pub struct MarketParams {
     /// Capped at MARK_HISTORY_LEN (16). Typical: 4-8 batches.
     pub funding_premium_twap_window: u8,
 
-    /// Funding-per-period cap (anti-gouge). When non-zero, the absolute
-    /// cumulative funding paid in a rolling window of
-    /// `funding_period_seconds` cannot exceed `funding_per_period_max_bps`
-    /// (in bps of position notional). Once the cap is hit, the funding
-    /// rate is scaled down for the remainder of the window so the
-    /// total stays at or under the cap. Smarter than HL where extended
-    /// one-way funding can drain a position without a daily ceiling.
-    /// Bookkeeping fields live on MarketAccount (period_*).
-    /// 0 = disabled.
+    /// Funding-per-period cap (anti-gouge), in bps of position notional. When
+    /// non-zero, the crank clamps each funding-index step (via
+    /// `funding::clamp_delta_to_period_cap`) to this fraction pro-rated by
+    /// `dt / funding_period_seconds`. Because the per-crank dt's tiling any
+    /// `funding_period_seconds` window sum to that window, the cumulative
+    /// funding over ANY such rolling window stays at or under this cap — a
+    /// stateless bound needing no extra bookkeeping. This is what makes an
+    /// untrusted (permissionless) market's funding params safe for its
+    /// counterparties. 0 = disabled (unbounded; trusted/authority markets only).
     pub funding_per_period_max_bps: u32,
-    /// Period length for the funding cap, in seconds. Typical: 86_400
-    /// (24h). Ignored if `funding_per_period_max_bps == 0`.
+    /// Period length the per-period funding cap is measured over, in seconds.
+    /// Typical: 86_400 (24h). Ignored if `funding_per_period_max_bps == 0`.
     pub funding_period_seconds: u32,
 
     /// Bootstrap-period batches for permissionless markets. Within the
@@ -328,13 +328,12 @@ pub struct MarketAccount {
     pub total_fees_collected: u64,
     pub total_toxicity_tax_collected: u64,
     pub total_liquidations: u64,
-    /// Period bookkeeping for the funding-per-period cap. The
-    /// `period_funding_paid_abs_bps` accumulator advances with every
-    /// `settle_funding` call; resets at the start of each new period.
-    /// `period_started_at_unix == 0` means uninitialised — first
-    /// settlement seeds it from the current clock.
-    pub period_started_at_unix: u64,
-    pub period_funding_paid_abs_bps: u64,
+    /// Reserved layout headroom (two u64, zero-initialised). The
+    /// funding-per-period cap is enforced statelessly at the crank
+    /// (`funding::clamp_delta_to_period_cap`) and needs no accumulator, so
+    /// these carry no live state; kept as fixed-offset padding for the proven
+    /// account layout and future use.
+    pub _reserved_funding_period: [u64; 2],
     /// Slot of the most recent `settle_mark` call. 0 = never settled.
     /// Used to enforce `params.mark_settle_min_slots` rate-limit.
     pub last_mark_settle_slot: u64,

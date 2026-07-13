@@ -5466,6 +5466,26 @@ pub mod clober {
             market.last_funding_rate_bps_per_sec,
             market.params.funding_premium_twap_window,
         )?;
+        // Per-period backstop: bound the funding accrued over one period to
+        // `funding_per_period_max_bps` of notional, pro-rated by dt/period. This
+        // caps the worst-case per-period value transfer even when the per-second
+        // rate cap is loose, so an untrusted (permissionless) market's funding
+        // params can never drain a counterparty beyond the disclosed envelope.
+        let delta_capped = matcher::funding::clamp_delta_to_period_cap(
+            delta,
+            market.params.funding_per_period_max_bps,
+            dt,
+            market.params.funding_period_seconds,
+        );
+        if delta_capped != delta {
+            emit!(FundingPeriodCapHitEvent {
+                market: market_key,
+                crank_unix: now,
+                cap_bps: market.params.funding_per_period_max_bps,
+                rate_bps_per_sec: smoothed_rate,
+            });
+        }
+        let delta = delta_capped;
         if delta != 0 {
             market.cum_funding_index = market
                 .cum_funding_index
@@ -15033,8 +15053,7 @@ fn write_market_genesis(
     market.total_fees_collected = 0;
     market.total_toxicity_tax_collected = 0;
     market.total_liquidations = 0;
-    market.period_started_at_unix = 0;
-    market.period_funding_paid_abs_bps = 0;
+    market._reserved_funding_period = [0; 2];
     market.last_mark_settle_slot = 0;
     // 0 ⇒ "freshness not yet stamped"; the first apply_fill/settle_mark sets it.
     // Until then liquidation prices oracle-only (fail-safe) and the market is
@@ -19894,16 +19913,15 @@ pub struct QuoteLadderSnapshotEvent {
     pub level_count: u8,
 }
 
-/// Emitted when funding hits the per-period cap and is scaled to fit.
-/// Off-chain monitors page operators on repeated emissions (sign that
-/// the cap is too tight or that the market is in extended one-way
-/// funding stress).
+/// Emitted by `crank_funding` when a step is clamped by the per-period cap.
+/// Off-chain monitors page operators on repeated emissions (sign that the cap
+/// is too tight or that the market is in extended one-way funding stress).
 #[event]
 pub struct FundingPeriodCapHitEvent {
     pub market: Pubkey,
-    pub period_started_at_unix: u64,
-    pub cap_bps: u64,
-    pub attenuated_rate_bps_per_sec: i64,
+    pub crank_unix: u64,
+    pub cap_bps: u32,
+    pub rate_bps_per_sec: i64,
 }
 
 /// Anti-flash-crash event. Emitted when the post-batch mark would have
@@ -21807,6 +21825,25 @@ fn validate_hip3_params(p: &MarketParams) -> Result<()> {
     require!(p.oracle_band_bps > 0, CloberError::OutOfRange);
     // Per-trader position must be bounded (no unbounded single-account OI).
     require!(p.max_position_lots_per_trader > 0, CloberError::OutOfRange);
+    // Funding is a predatory lever like fees and penalties, so it is bounded on
+    // the same footing. The per-second rate is capped, a NON-ZERO per-period
+    // backstop is REQUIRED (enforced at the crank by `clamp_delta_to_period_cap`
+    // — a hostile creator cannot drain a counterparty through a predatory
+    // funding crank), and the period is bounded so the pro-rated cap is real.
+    require!(
+        p.funding_rate_max_bps_per_sec <= BPS_DENOM,
+        CloberError::OutOfRange
+    );
+    require!(
+        p.funding_per_period_max_bps > 0
+            && p.funding_per_period_max_bps <= HIP3_MAX_FUNDING_PER_PERIOD_BPS,
+        CloberError::OutOfRange
+    );
+    require!(
+        p.funding_period_seconds >= HIP3_MIN_FUNDING_PERIOD_SECS
+            && p.funding_period_seconds <= HIP3_MAX_FUNDING_PERIOD_SECS,
+        CloberError::OutOfRange
+    );
     Ok(())
 }
 
