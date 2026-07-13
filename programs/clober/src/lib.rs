@@ -6752,10 +6752,13 @@ pub mod clober {
 
         // OI-vs-insurance circuit breaker. The fill is fully settled above
         // (OI + collateral + insurance). If gross OI notional now exceeds the
-        // insurance-relative cap, auto-PAUSE the market — a plain flag write, NOT
-        // a revert (the committed fill must stand; intake already rejects Paused,
-        // so only NEW risk is blocked). Opt-in: `oi_insurance_multiple_bps == 0`
-        // (default / legacy) makes `oi_exceeds_insurance_cap` return false.
+        // effective cap `max(insurance · multiple / BPS, floor)`, auto-PAUSE the
+        // market — a plain flag write, NOT a revert (the committed fill must stand;
+        // intake already rejects Paused, so only NEW risk is blocked). Opt-in:
+        // `oi_insurance_multiple_bps == 0` (default / legacy) makes
+        // `oi_exceeds_insurance_cap` return false. The `oi_insurance_floor_notional`
+        // is the absolute OI notional always tolerated so enabling the breaker on a
+        // near-zero-insurance market can't brick it.
         {
             let market_key = ctx.accounts.market.key();
             let insurance_balance = ctx.accounts.insurance_fund.balance_quote_lots;
@@ -6769,6 +6772,7 @@ pub mod clober {
                     market.params.tick_size,
                     insurance_balance,
                     market.oi_insurance_multiple_bps,
+                    market.oi_insurance_floor_notional,
                 )
             {
                 let previous_status = market.status;
@@ -6777,12 +6781,14 @@ pub mod clober {
                     .saturating_mul(market.mark_price_ticks as u128)
                     .saturating_mul(market.params.tick_size as u128);
                 let multiple_bps = market.oi_insurance_multiple_bps;
+                let floor_notional = market.oi_insurance_floor_notional;
                 market.status = MarketStatus::Paused as u8;
                 emit!(OiInsuranceBreakerTrippedEvent {
                     market: market_key,
                     gross_oi_notional,
                     insurance_balance_quote_lots: insurance_balance,
                     multiple_bps,
+                    floor_notional,
                     previous_status,
                 });
             }
@@ -7284,6 +7290,42 @@ pub mod clober {
             market: market.key(),
             previous_bps: previous,
             new_bps: bps,
+        });
+        Ok(())
+    }
+
+    /// set the OI-vs-insurance breaker's BOOTSTRAP FLOOR (authority-only) — the
+    /// absolute gross-OI notional the market may always carry regardless of
+    /// insurance balance. The effective cap enforced at settlement is
+    /// `max(insurance_balance · oi_insurance_multiple_bps / BPS_DENOM,
+    /// floor_notional)`; the floor is what lets the breaker be enabled on a fresh
+    /// (near-zero-insurance) market without auto-pausing it on the first fill.
+    /// `floor == 0` clears the floor (pure insurance-scaled); otherwise it must be
+    /// `<= MAX_OI_INSURANCE_FLOOR_NOTIONAL`. Immediate (not timelocked) for the same
+    /// reason as the multiple setter: it grants no power the authority lacks — the
+    /// authority can already halt the market and can fully disable the breaker — and
+    /// it can never move funds. A floor only ever LOOSENS an enabled breaker (proven
+    /// `oi_breaker_floor_only_loosens`), so it can never tighten risk on traders.
+    pub fn set_oi_insurance_floor_notional(
+        ctx: Context<UpdateMarketAuthority>,
+        floor: u64,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        require_keys_eq!(
+            market.authority,
+            ctx.accounts.authority.key(),
+            CloberError::Unauthorized
+        );
+        require!(
+            floor <= constants::MAX_OI_INSURANCE_FLOOR_NOTIONAL,
+            CloberError::OutOfRange
+        );
+        let previous = market.oi_insurance_floor_notional;
+        market.oi_insurance_floor_notional = floor;
+        emit!(OiInsuranceFloorSetEvent {
+            market: market.key(),
+            previous_floor_notional: previous,
+            new_floor_notional: floor,
         });
         Ok(())
     }
@@ -9445,9 +9487,10 @@ pub mod clober {
         }
 
         // OI-vs-insurance circuit breaker (same as apply_fill). The LP fill
-        // is fully settled above; if gross OI notional now exceeds the
-        // insurance-relative cap, auto-PAUSE (flag write, never a revert — intake
-        // already rejects Paused). No-op when opted out / already Paused / Closed.
+        // is fully settled above; if gross OI notional now exceeds the effective
+        // cap `max(insurance · multiple / BPS, floor)`, auto-PAUSE (flag write,
+        // never a revert — intake already rejects Paused). No-op when opted out /
+        // already Paused / Closed.
         {
             let market_key = ctx.accounts.market.key();
             let insurance_balance = ctx.accounts.insurance_fund.balance_quote_lots;
@@ -9461,6 +9504,7 @@ pub mod clober {
                     market.params.tick_size,
                     insurance_balance,
                     market.oi_insurance_multiple_bps,
+                    market.oi_insurance_floor_notional,
                 )
             {
                 let previous_status = market.status;
@@ -9469,12 +9513,14 @@ pub mod clober {
                     .saturating_mul(market.mark_price_ticks as u128)
                     .saturating_mul(market.params.tick_size as u128);
                 let multiple_bps = market.oi_insurance_multiple_bps;
+                let floor_notional = market.oi_insurance_floor_notional;
                 market.status = MarketStatus::Paused as u8;
                 emit!(OiInsuranceBreakerTrippedEvent {
                     market: market_key,
                     gross_oi_notional,
                     insurance_balance_quote_lots: insurance_balance,
                     multiple_bps,
+                    floor_notional,
                     previous_status,
                 });
             }
@@ -17506,7 +17552,9 @@ pub struct CancelAuthorityTransfer<'info> {
         bump = market.bump,
         constraint = market.authority == authority.key() @ CloberError::Unauthorized,
     )]
-    pub market: Account<'info, MarketAccount>,
+    // Boxed to keep this `try_accounts` frame under the 4 KiB BPF stack limit —
+    // `MarketAccount` deserialized inline on the stack here would overflow it.
+    pub market: Box<Account<'info, MarketAccount>>,
     #[account(
         mut,
         close = authority,
@@ -17550,7 +17598,9 @@ pub struct ExecuteParamUpdate<'info> {
         bump = market.bump,
         constraint = market.authority == authority.key() @ CloberError::Unauthorized,
     )]
-    pub market: Account<'info, MarketAccount>,
+    // Boxed to keep this `try_accounts` frame under the 4 KiB BPF stack limit —
+    // `MarketAccount` deserialized inline on the stack here would overflow it.
+    pub market: Box<Account<'info, MarketAccount>>,
     #[account(
         mut,
         close = authority,
@@ -19464,17 +19514,28 @@ pub struct OiInsuranceMultipleSetEvent {
     pub new_bps: u64,
 }
 
+/// emitted when the OI-vs-insurance breaker's bootstrap floor is set/cleared
+/// via `set_oi_insurance_floor_notional`.
+#[event]
+pub struct OiInsuranceFloorSetEvent {
+    pub market: Pubkey,
+    pub previous_floor_notional: u64,
+    pub new_floor_notional: u64,
+}
+
 /// emitted when the OI-vs-insurance breaker TRIPS at settlement — gross OI
-/// notional exceeded `insurance_balance · multiple_bps / BPS_DENOM`, so the
-/// market was auto-paused. `apply_fill`/`apply_lp_fill` still settle the
-/// committed fill; only NEW intake is blocked. Operators observe this and
-/// recover via `set_market_status` once OI/insurance are back in balance.
+/// notional exceeded the effective cap `max(insurance_balance · multiple_bps /
+/// BPS_DENOM, floor_notional)`, so the market was auto-paused.
+/// `apply_fill`/`apply_lp_fill` still settle the committed fill; only NEW intake
+/// is blocked. Operators observe this and recover via `set_market_status` once
+/// OI/insurance are back in balance.
 #[event]
 pub struct OiInsuranceBreakerTrippedEvent {
     pub market: Pubkey,
     pub gross_oi_notional: u128,
     pub insurance_balance_quote_lots: u64,
     pub multiple_bps: u64,
+    pub floor_notional: u64,
     pub previous_status: u8,
 }
 

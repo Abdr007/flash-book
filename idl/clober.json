@@ -13110,6 +13110,74 @@
       ]
     },
     {
+      "name": "set_oi_insurance_floor_notional",
+      "docs": [
+        "set the OI-vs-insurance breaker's BOOTSTRAP FLOOR (authority-only) — the",
+        "absolute gross-OI notional the market may always carry regardless of",
+        "insurance balance. The effective cap enforced at settlement is",
+        "`max(insurance_balance · oi_insurance_multiple_bps / BPS_DENOM,",
+        "floor_notional)`; the floor is what lets the breaker be enabled on a fresh",
+        "(near-zero-insurance) market without auto-pausing it on the first fill.",
+        "`floor == 0` clears the floor (pure insurance-scaled); otherwise it must be",
+        "`<= MAX_OI_INSURANCE_FLOOR_NOTIONAL`. Immediate (not timelocked) for the same",
+        "reason as the multiple setter: it grants no power the authority lacks — the",
+        "authority can already halt the market and can fully disable the breaker — and",
+        "it can never move funds. A floor only ever LOOSENS an enabled breaker (proven",
+        "`oi_breaker_floor_only_loosens`), so it can never tighten risk on traders."
+      ],
+      "discriminator": [
+        59,
+        113,
+        242,
+        155,
+        248,
+        141,
+        240,
+        117
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "floor",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "set_oi_insurance_multiple_bps",
       "docs": [
         "set the OI-vs-insurance circuit-breaker multiple (authority-only).",
@@ -19094,6 +19162,19 @@
       ]
     },
     {
+      "name": "OiInsuranceFloorSetEvent",
+      "discriminator": [
+        82,
+        209,
+        111,
+        189,
+        108,
+        88,
+        213,
+        96
+      ]
+    },
+    {
       "name": "OiInsuranceMultipleSetEvent",
       "discriminator": [
         194,
@@ -22151,10 +22232,9 @@
     {
       "name": "FundingPeriodCapHitEvent",
       "docs": [
-        "Emitted when funding hits the per-period cap and is scaled to fit.",
-        "Off-chain monitors page operators on repeated emissions (sign that",
-        "the cap is too tight or that the market is in extended one-way",
-        "funding stress)."
+        "Emitted by `crank_funding` when a step is clamped by the per-period cap.",
+        "Off-chain monitors page operators on repeated emissions (sign that the cap",
+        "is too tight or that the market is in extended one-way funding stress)."
       ],
       "type": {
         "kind": "struct",
@@ -22164,15 +22244,15 @@
             "type": "pubkey"
           },
           {
-            "name": "period_started_at_unix",
+            "name": "crank_unix",
             "type": "u64"
           },
           {
             "name": "cap_bps",
-            "type": "u64"
+            "type": "u32"
           },
           {
-            "name": "attenuated_rate_bps_per_sec",
+            "name": "rate_bps_per_sec",
             "type": "i64"
           }
         ]
@@ -23781,19 +23861,20 @@
             "type": "u64"
           },
           {
-            "name": "period_started_at_unix",
+            "name": "_reserved_funding_period",
             "docs": [
-              "Period bookkeeping for the funding-per-period cap. The",
-              "`period_funding_paid_abs_bps` accumulator advances with every",
-              "`settle_funding` call; resets at the start of each new period.",
-              "`period_started_at_unix == 0` means uninitialised — first",
-              "settlement seeds it from the current clock."
+              "Reserved layout headroom (two u64, zero-initialised). The",
+              "funding-per-period cap is enforced statelessly at the crank",
+              "(`funding::clamp_delta_to_period_cap`) and needs no accumulator, so",
+              "these carry no live state; kept as fixed-offset padding for the proven",
+              "account layout and future use."
             ],
-            "type": "u64"
-          },
-          {
-            "name": "period_funding_paid_abs_bps",
-            "type": "u64"
+            "type": {
+              "array": [
+                "u64",
+                2
+              ]
+            }
           },
           {
             "name": "last_mark_settle_slot",
@@ -24040,6 +24121,25 @@
               "rejects on `Paused`). `0 = DISABLED` — the default, so this is opt-in per",
               "market and legacy accounts (which read this trailing field as 0) are",
               "byte-for-byte unaffected. Set via `set_oi_insurance_multiple_bps`."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "oi_insurance_floor_notional",
+            "docs": [
+              "Bootstrap floor for the OI-vs-insurance breaker (above): the absolute GROSS",
+              "open-interest notional the market may ALWAYS carry, regardless of insurance",
+              "balance. The effective cap the breaker enforces is `max(insurance_balance ·",
+              "oi_insurance_multiple_bps / BPS_DENOM, oi_insurance_floor_notional)`. Without",
+              "it the insurance-scaled cap collapses to ~0 when the fund is empty, so",
+              "enabling the breaker on a FRESH market would auto-pause it on the first fill;",
+              "the floor is what makes the breaker safely enable-able at launch. Because the",
+              "cap is the MAX of the two terms, a floor only ever RAISES the ceiling — it can",
+              "never trip the breaker more often than the floorless version. `0 = no floor`",
+              "(pure insurance-scaled), the legacy behaviour. Trailing field ⇒ pre-existing",
+              "accounts (zero-padded to `space()`) read it as 0 — byte-for-byte unaffected.",
+              "Bounded by `MAX_OI_INSURANCE_FLOOR_NOTIONAL`; set via",
+              "`set_oi_insurance_floor_notional`."
             ],
             "type": "u64"
           }
@@ -25057,23 +25157,23 @@
           {
             "name": "funding_per_period_max_bps",
             "docs": [
-              "Funding-per-period cap (anti-gouge). When non-zero, the absolute",
-              "cumulative funding paid in a rolling window of",
-              "`funding_period_seconds` cannot exceed `funding_per_period_max_bps`",
-              "(in bps of position notional). Once the cap is hit, the funding",
-              "rate is scaled down for the remainder of the window so the",
-              "total stays at or under the cap. Smarter than HL where extended",
-              "one-way funding can drain a position without a daily ceiling.",
-              "Bookkeeping fields live on MarketAccount (period_*).",
-              "0 = disabled."
+              "Funding-per-period cap (anti-gouge), in bps of position notional. When",
+              "non-zero, the crank clamps each funding-index step (via",
+              "`funding::clamp_delta_to_period_cap`) to this fraction pro-rated by",
+              "`dt / funding_period_seconds`. Because the per-crank dt's tiling any",
+              "`funding_period_seconds` window sum to that window, the cumulative",
+              "funding over ANY such rolling window stays at or under this cap — a",
+              "stateless bound needing no extra bookkeeping. This is what makes an",
+              "untrusted (permissionless) market's funding params safe for its",
+              "counterparties. 0 = disabled (unbounded; trusted/authority markets only)."
             ],
             "type": "u32"
           },
           {
             "name": "funding_period_seconds",
             "docs": [
-              "Period length for the funding cap, in seconds. Typical: 86_400",
-              "(24h). Ignored if `funding_per_period_max_bps == 0`."
+              "Period length the per-period funding cap is measured over, in seconds.",
+              "Typical: 86_400 (24h). Ignored if `funding_per_period_max_bps == 0`."
             ],
             "type": "u32"
           },
@@ -25422,10 +25522,11 @@
       "name": "OiInsuranceBreakerTrippedEvent",
       "docs": [
         "emitted when the OI-vs-insurance breaker TRIPS at settlement — gross OI",
-        "notional exceeded `insurance_balance · multiple_bps / BPS_DENOM`, so the",
-        "market was auto-paused. `apply_fill`/`apply_lp_fill` still settle the",
-        "committed fill; only NEW intake is blocked. Operators observe this and",
-        "recover via `set_market_status` once OI/insurance are back in balance."
+        "notional exceeded the effective cap `max(insurance_balance · multiple_bps /",
+        "BPS_DENOM, floor_notional)`, so the market was auto-paused.",
+        "`apply_fill`/`apply_lp_fill` still settle the committed fill; only NEW intake",
+        "is blocked. Operators observe this and recover via `set_market_status` once",
+        "OI/insurance are back in balance."
       ],
       "type": {
         "kind": "struct",
@@ -25447,8 +25548,36 @@
             "type": "u64"
           },
           {
+            "name": "floor_notional",
+            "type": "u64"
+          },
+          {
             "name": "previous_status",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OiInsuranceFloorSetEvent",
+      "docs": [
+        "emitted when the OI-vs-insurance breaker's bootstrap floor is set/cleared",
+        "via `set_oi_insurance_floor_notional`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous_floor_notional",
+            "type": "u64"
+          },
+          {
+            "name": "new_floor_notional",
+            "type": "u64"
           }
         ]
       }

@@ -138,6 +138,22 @@ pub const MAX_HEAL_STALENESS_SECONDS: u32 = 86_400;
 pub const MIN_OI_INSURANCE_MULTIPLE_BPS: u64 = 10_000;
 pub const MAX_OI_INSURANCE_MULTIPLE_BPS: u64 = 100_000_000;
 
+/// upper bound for a market's `oi_insurance_floor_notional` — the absolute
+/// bootstrap floor on gross OI notional under the OI-vs-insurance breaker. The
+/// insurance-scaled cap `insurance_balance · multiple_bps / BPS_DENOM` collapses
+/// to ~0 when the fund is empty, so without a floor the breaker cannot be enabled
+/// on a fresh market (it would auto-pause on the first fill). The floor is the OI
+/// notional the market may always carry while the fund is thin; the effective cap
+/// is `max(insurance-scaled, floor)`. `0 = no floor` (pure insurance-scaled) is
+/// always allowed. This ceiling is a FOOT-GUN GUARD, not a trust boundary — the
+/// authority can already fully disable the breaker with `multiple_bps == 0`, and a
+/// floor only ever LOOSENS an enabled breaker (never trips more often), so an
+/// over-high floor grants no power the authority lacks. It is bounded below
+/// `u64::MAX` so the setter cannot stamp a saturating value that silently defeats
+/// the breaker while it still reads "enabled". ~1e18 is astronomically generous
+/// for any real per-market bootstrap notional yet finite.
+pub const MAX_OI_INSURANCE_FLOOR_NOTIONAL: u64 = 1_000_000_000_000_000_000;
+
 /// minimum L1 slots between two `set_insurance_pause_threshold` changes.
 /// The pause threshold is the ADL/insurance-pause trigger floor; without a
 /// cooldown a compromised or erratic insurance authority could rapidly toggle

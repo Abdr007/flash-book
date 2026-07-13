@@ -493,6 +493,20 @@ pub struct MarketAccount {
     /// market and legacy accounts (which read this trailing field as 0) are
     /// byte-for-byte unaffected. Set via `set_oi_insurance_multiple_bps`.
     pub oi_insurance_multiple_bps: u64,
+    /// Bootstrap floor for the OI-vs-insurance breaker (above): the absolute GROSS
+    /// open-interest notional the market may ALWAYS carry, regardless of insurance
+    /// balance. The effective cap the breaker enforces is `max(insurance_balance ·
+    /// oi_insurance_multiple_bps / BPS_DENOM, oi_insurance_floor_notional)`. Without
+    /// it the insurance-scaled cap collapses to ~0 when the fund is empty, so
+    /// enabling the breaker on a FRESH market would auto-pause it on the first fill;
+    /// the floor is what makes the breaker safely enable-able at launch. Because the
+    /// cap is the MAX of the two terms, a floor only ever RAISES the ceiling — it can
+    /// never trip the breaker more often than the floorless version. `0 = no floor`
+    /// (pure insurance-scaled), the legacy behaviour. Trailing field ⇒ pre-existing
+    /// accounts (zero-padded to `space()`) read it as 0 — byte-for-byte unaffected.
+    /// Bounded by `MAX_OI_INSURANCE_FLOOR_NOTIONAL`; set via
+    /// `set_oi_insurance_floor_notional`.
+    pub oi_insurance_floor_notional: u64,
 }
 
 /// Optional emergency guardian for one market, held in a SEPARATE PDA (not a

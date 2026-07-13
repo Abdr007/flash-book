@@ -314,14 +314,31 @@ pub fn required_collateral_with_er(im_required: u64, notional_floor: u64, er_res
 }
 
 /// OI-vs-insurance circuit-breaker predicate. TRUE iff the market's GROSS
-/// open-interest notional exceeds the insurance-relative cap
-/// `insurance_balance · multiple_bps / BPS_DENOM`. `multiple_bps == 0` DISABLES
-/// the breaker (returns false), so legacy markets that never opted in are
-/// unaffected. All arithmetic is 128-bit SATURATING: it can never overflow or
-/// panic, and an overflowed notional saturates to the max and trips the breaker
-/// — fail-safe (pause rather than silently permit unbounded OI). Pure, so the
-/// settlement path gains only a status-flag write, never new fallible math.
-/// Proven in `oi_breaker_disabled_is_false` / `oi_breaker_no_overflow`.
+/// open-interest notional exceeds the effective cap
+/// `max(insurance_balance · multiple_bps / BPS_DENOM, floor_notional)`.
+/// `multiple_bps == 0` DISABLES the breaker (returns false), so legacy markets
+/// that never opted in are unaffected.
+///
+/// BOOTSTRAP FLOOR (`floor_notional`): the pure insurance-scaled cap collapses to
+/// ~0 when the fund is empty, so enabling the breaker on a FRESH (near-zero-
+/// insurance) market would auto-pause it on the very first fill — the cap is
+/// un-turn-on-able at launch. `floor_notional` is an absolute gross-notional the
+/// market may always carry regardless of insurance; the effective cap is the MAX
+/// of the two, so OI up to the floor is tolerated while the fund is thin and the
+/// insurance-scaled term takes over once it grows past
+/// `floor_notional · BPS_DENOM / multiple_bps`. Because the cap is `max(scaled,
+/// floor) >= scaled`, adding a floor can only ever RAISE the ceiling — it never
+/// trips more often than the floorless breaker (`oi_breaker_floor_only_loosens`),
+/// and a market whose gross OI is within its floor can never be bricked
+/// (`oi_breaker_floor_never_bricks_bootstrap`). `floor_notional == 0` = no floor
+/// (pure insurance-scaled), the legacy behaviour.
+///
+/// All arithmetic is 128-bit SATURATING: it can never overflow or panic, and an
+/// overflowed notional saturates to the max and trips the breaker — fail-safe
+/// (pause rather than silently permit unbounded OI). Pure, so the settlement path
+/// gains only a status-flag write, never new fallible math. Proven in
+/// `oi_breaker_disabled_is_false` / `oi_breaker_no_overflow` /
+/// `oi_breaker_floor_never_bricks_bootstrap` / `oi_breaker_floor_only_loosens`.
 pub fn oi_exceeds_insurance_cap(
     oi_long_lots: u64,
     oi_short_lots: u64,
@@ -329,6 +346,7 @@ pub fn oi_exceeds_insurance_cap(
     tick_size: u64,
     insurance_balance: u64,
     multiple_bps: u64,
+    floor_notional: u64,
 ) -> bool {
     if multiple_bps == 0 {
         return false;
@@ -337,9 +355,30 @@ pub fn oi_exceeds_insurance_cap(
         .saturating_add(oi_short_lots as u128)
         .saturating_mul(mark_ticks as u128)
         .saturating_mul(tick_size as u128);
-    let cap = (insurance_balance as u128).saturating_mul(multiple_bps as u128)
+    let insurance_cap = (insurance_balance as u128).saturating_mul(multiple_bps as u128)
         / crate::constants::BPS_DENOM as u128;
-    gross_notional > cap
+    // Effective cap = max(insurance-scaled, absolute bootstrap floor). Never below
+    // the floor ⇒ a thin fund can't brick a market whose OI is within its floor.
+    notional_exceeds_effective_cap(gross_notional, insurance_cap, floor_notional)
+}
+
+/// Division-free core of the OI-breaker cap comparison: TRUE iff `gross_notional`
+/// exceeds the effective cap `max(insurance_cap, floor_notional)`. Factored out of
+/// [`oi_exceeds_insurance_cap`] so the floor's bootstrap-safety and loosen-only
+/// properties can be machine-proven (Kani) over a SYMBOLIC `insurance_cap` — which
+/// sidesteps the u128 `/ BPS_DENOM` non-power-of-2 division the full predicate
+/// performs. CBMC bit-blasts that divider by the u128 TYPE width (not the value
+/// range), so a proof that keeps the division live does not terminate in a
+/// practical bound (the same limitation documented for `incremental_im`). The
+/// division-dependent behaviour is instead pinned by the host test
+/// `oi_insurance_breaker_predicate`. Pure, total, no division.
+#[inline]
+pub fn notional_exceeds_effective_cap(
+    gross_notional: u128,
+    insurance_cap: u128,
+    floor_notional: u64,
+) -> bool {
+    gross_notional > insurance_cap.max(floor_notional as u128)
 }
 
 #[cfg(test)]
@@ -400,25 +439,26 @@ mod tests {
     #[test]
     fn oi_insurance_breaker_predicate() {
         let bps = crate::constants::BPS_DENOM as u64; // 10_000
-                                                      // Disabled (multiple 0) never trips, whatever the OI.
+                                                      // Disabled (multiple 0) never trips, whatever the OI/floor.
         assert!(!oi_exceeds_insurance_cap(
             u64::MAX,
             u64::MAX,
             u64::MAX,
             u64::MAX,
             0,
+            0,
             0
         ));
-        // multiple = 10_000 bps = 1×: cap == insurance balance (in quote lots).
+        // multiple = 10_000 bps = 1×, no floor: cap == insurance balance (quote lots).
         // gross_notional = (long+short)·mark·tick. long=short=5, mark=100, tick=1
         // ⇒ 10·100·1 = 1_000. insurance 1_000, 1× cap = 1_000 ⇒ NOT exceeded (>).
-        assert!(!oi_exceeds_insurance_cap(5, 5, 100, 1, 1_000, bps));
+        assert!(!oi_exceeds_insurance_cap(5, 5, 100, 1, 1_000, bps, 0));
         // insurance 999 ⇒ cap 999 < 1_000 ⇒ tripped.
-        assert!(oi_exceeds_insurance_cap(5, 5, 100, 1, 999, bps));
+        assert!(oi_exceeds_insurance_cap(5, 5, 100, 1, 999, bps, 0));
         // 10× multiple (100_000 bps): cap = insurance·10. notional 1_000 vs
         // insurance 100 → cap 1_000 ⇒ not exceeded; insurance 99 → cap 990 ⇒ tripped.
-        assert!(!oi_exceeds_insurance_cap(5, 5, 100, 1, 100, 10 * bps));
-        assert!(oi_exceeds_insurance_cap(5, 5, 100, 1, 99, 10 * bps));
+        assert!(!oi_exceeds_insurance_cap(5, 5, 100, 1, 100, 10 * bps, 0));
+        assert!(oi_exceeds_insurance_cap(5, 5, 100, 1, 99, 10 * bps, 0));
         // Saturation is fail-safe: an overflowing notional trips (never panics).
         assert!(oi_exceeds_insurance_cap(
             u64::MAX,
@@ -426,8 +466,25 @@ mod tests {
             u64::MAX,
             u64::MAX,
             1,
-            bps
+            bps,
+            0
         ));
+
+        // ── Bootstrap floor ──────────────────────────────────────────────
+        // Zero insurance + enabled breaker (1×) would give cap 0 and brick the
+        // market at any OI. A floor of 1_000 lets gross OI up to 1_000 stand.
+        // notional 1_000, insurance 0, floor 1_000 ⇒ cap max(0, 1_000)=1_000 ⇒ OK.
+        assert!(!oi_exceeds_insurance_cap(5, 5, 100, 1, 0, bps, 1_000));
+        // One tick over the floor with a still-empty fund ⇒ tripped.
+        assert!(oi_exceeds_insurance_cap(5, 5, 100, 1, 0, bps, 999));
+        // The floor is a LOWER bound on the cap: once insurance·multiple exceeds
+        // the floor, the insurance-scaled term governs. insurance 5_000 (1× ⇒ cap
+        // 5_000) with a small floor 100 ⇒ notional 1_000 well under 5_000 ⇒ OK.
+        assert!(!oi_exceeds_insurance_cap(5, 5, 100, 1, 5_000, bps, 100));
+        // A floor never trips MORE than floorless: with insurance 999 (cap 999) the
+        // floorless breaker trips on notional 1_000, but floor 2_000 rescues it.
+        assert!(oi_exceeds_insurance_cap(5, 5, 100, 1, 999, bps, 0));
+        assert!(!oi_exceeds_insurance_cap(5, 5, 100, 1, 999, bps, 2_000));
     }
 
     #[test]
@@ -640,7 +697,8 @@ mod xmargin_kani_proofs {
 
     /// the breaker is DISABLED when `multiple_bps == 0` — it never trips, so
     /// a legacy market that never opted in is byte-for-byte unaffected. Over the
-    /// whole input domain (no assumptions).
+    /// whole input domain (no assumptions), including ANY floor value — a floor
+    /// alone never activates a disabled breaker.
     #[kani::proof]
     fn oi_breaker_disabled_is_false() {
         let oi_long: u64 = kani::any();
@@ -648,8 +706,9 @@ mod xmargin_kani_proofs {
         let mark: u64 = kani::any();
         let tick: u64 = kani::any();
         let insurance: u64 = kani::any();
+        let floor: u64 = kani::any();
         assert!(!oi_exceeds_insurance_cap(
-            oi_long, oi_short, mark, tick, insurance, 0
+            oi_long, oi_short, mark, tick, insurance, 0, floor
         ));
     }
 
@@ -664,8 +723,53 @@ mod xmargin_kani_proofs {
         let tick: u64 = kani::any();
         let insurance: u64 = kani::any();
         let multiple: u64 = kani::any();
-        let _ = oi_exceeds_insurance_cap(oi_long, oi_short, mark, tick, insurance, multiple);
+        let floor: u64 = kani::any();
+        let _ = oi_exceeds_insurance_cap(oi_long, oi_short, mark, tick, insurance, multiple, floor);
         assert!(true); // reached ⇒ no panic/overflow for any inputs
+    }
+
+    /// BOOTSTRAP SAFETY: a market whose GROSS OI notional is within its absolute
+    /// floor can NEVER trip the breaker — regardless of the insurance-scaled cap.
+    /// This is the property that makes the breaker safely enable-able on a fresh
+    /// market: `gross <= floor ⇒ !trips`. Proven over the DIVISION-FREE core
+    /// (`notional_exceeds_effective_cap`) with a SYMBOLIC `insurance_cap` — so it
+    /// holds for EVERY value the real `insurance · multiple / BPS_DENOM` could take,
+    /// including 0 (empty fund) — while the real saturating `gross` computation is
+    /// kept intact. No division ⇒ CBMC discharges it fast. Whole domain.
+    #[kani::proof]
+    fn oi_breaker_floor_never_bricks_bootstrap() {
+        let oi_long: u64 = kani::any();
+        let oi_short: u64 = kani::any();
+        let mark: u64 = kani::any();
+        let tick: u64 = kani::any();
+        let insurance_cap: u128 = kani::any(); // abstracts insurance·multiple/BPS (any value)
+        let floor: u64 = kani::any();
+        // Real gross OI notional (same saturating form the predicate uses).
+        let gross = (oi_long as u128)
+            .saturating_add(oi_short as u128)
+            .saturating_mul(mark as u128)
+            .saturating_mul(tick as u128);
+        // Precondition: the market's OI is within the absolute floor.
+        kani::assume(gross <= floor as u128);
+        assert!(!notional_exceeds_effective_cap(gross, insurance_cap, floor));
+    }
+
+    /// LIVENESS MONOTONICITY: adding (or raising) a floor can only ever LOOSEN the
+    /// breaker — it never trips more often than the floorless (pure insurance-
+    /// scaled) breaker. Formally: if the FLOORED comparison trips, the FLOORLESS one
+    /// (floor 0) trips too. Proven over the division-free core with SYMBOLIC
+    /// `gross`/`insurance_cap` (so it covers every real division result); no
+    /// division ⇒ fast. A market fine under the plain breaker stays fine with a
+    /// floor added; the floor never introduces a new pause.
+    #[kani::proof]
+    fn oi_breaker_floor_only_loosens() {
+        let gross: u128 = kani::any();
+        let insurance_cap: u128 = kani::any();
+        let floor: u64 = kani::any();
+        let floored = notional_exceeds_effective_cap(gross, insurance_cap, floor);
+        let floorless = notional_exceeds_effective_cap(gross, insurance_cap, 0);
+        // floored ⇒ floorless (a floor only removes trips, never adds them).
+        assert!(!floored || floorless);
     }
 
     // NOTE: `incremental_im`'s "never understates" property is verified exhaustively

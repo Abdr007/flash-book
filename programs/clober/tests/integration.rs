@@ -17257,3 +17257,225 @@ async fn g3_oi_insurance_breaker_disabled_no_pause() {
         "intake on an Active (disabled-breaker) market must succeed, got: {intake:?}"
     );
 }
+
+/// Call the authority-only `set_oi_insurance_floor_notional(floor)` (accounts:
+/// authority signer + market — the same `UpdateMarketAuthority` layout). Returns
+/// the raw result so callers can assert success or a specific `Custom(...)`.
+async fn send_set_oi_floor(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    market_pda: Pubkey,
+    floor: u64,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let ix = build_ix(
+        clober::instruction::SetOiInsuranceFloorNotional { floor },
+        vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            bh,
+        ))
+        .await
+}
+
+/// (4): `set_oi_insurance_floor_notional` bounds. The authority may set
+/// `floor = 0` (clear) or any value in `[0, MAX_OI_INSURANCE_FLOOR_NOTIONAL]`, and
+/// reads back verbatim; a floor above MAX rejects `OutOfRange` = `Custom(7003)` and
+/// leaves the field untouched.
+#[tokio::test]
+async fn g3_oi_insurance_floor_setter_bounds() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+
+    // Default is 0 (no floor) fresh out of initialize_market.
+    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        m0.oi_insurance_floor_notional, 0,
+        "floor defaults to 0 (no floor)"
+    );
+
+    // floor = 1_000_000 (in range) succeeds → reads back verbatim.
+    send_set_oi_floor(&mut ctx, &payer, market_pda, 1_000_000)
+        .await
+        .expect("floor=1_000_000 accepted");
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m.oi_insurance_floor_notional, 1_000_000);
+
+    // floor = MAX succeeds.
+    send_set_oi_floor(
+        &mut ctx,
+        &payer,
+        market_pda,
+        clober::constants::MAX_OI_INSURANCE_FLOOR_NOTIONAL,
+    )
+    .await
+    .expect("floor=MAX accepted");
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        m.oi_insurance_floor_notional,
+        clober::constants::MAX_OI_INSURANCE_FLOOR_NOTIONAL
+    );
+
+    // floor = MAX + 1 rejects Custom(7003); field unchanged (inert).
+    let above = send_set_oi_floor(
+        &mut ctx,
+        &payer,
+        market_pda,
+        clober::constants::MAX_OI_INSURANCE_FLOOR_NOTIONAL + 1,
+    )
+    .await;
+    assert!(
+        format!("{above:?}").contains("Custom(7003)"),
+        "floor above MAX must reject OutOfRange (Custom(7003)), got: {above:?}"
+    );
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        m.oi_insurance_floor_notional,
+        clober::constants::MAX_OI_INSURANCE_FLOOR_NOTIONAL,
+        "rejected set is inert"
+    );
+
+    // floor = 0 clears it.
+    send_set_oi_floor(&mut ctx, &payer, market_pda, 0)
+        .await
+        .expect("floor=0 (clear) accepted");
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m.oi_insurance_floor_notional, 0);
+}
+
+/// (5): the P3-4 BOOTSTRAP FLOOR. An ENABLED breaker (1×) with a near-empty
+/// insurance fund would auto-pause a fresh market on its very first fill — the cap
+/// `insurance · 1` collapses to ~0. The floor fixes this: with the floor set above
+/// the fill's gross OI notional, the SAME fill that trips a floorless 1× breaker
+/// (see test (2)) leaves the market ACTIVE and intake works. Then, once gross OI
+/// grows past the floor, the breaker still trips — proving the floor is a real
+/// LOWER BOUND on the cap, not a disable.
+#[tokio::test]
+async fn g3_oi_insurance_floor_prevents_bootstrap_brick() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // mark 100_000, tick 1
+    let insurance_fund_pda = protocol.insurance_fund;
+    let book_pda = init_market_book_for(&mut ctx, &payer, market_pda).await;
+
+    // Enable the breaker at 1× — with a thin fund this alone would brick bootstrap.
+    send_set_oi_multiple(&mut ctx, &payer, market_pda, 10_000)
+        .await
+        .expect("enable breaker @ 1x");
+    // Empty insurance fund — the bootstrap condition.
+    seed_insurance_balance(&mut ctx, insurance_fund_pda, 0).await;
+
+    // Set a floor comfortably ABOVE the first fill's gross OI. A size-1 fill @
+    // 100_000 (tick 1) yields gross = (1 + 1) · 100_000 = 200_000; floor 1_000_000
+    // covers it, so cap = max(0·1, 1_000_000) = 1_000_000 > 200_000 ⇒ no trip.
+    send_set_oi_floor(&mut ctx, &payer, market_pda, 1_000_000)
+        .await
+        .expect("set bootstrap floor");
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
+    let maker_state = setup_trader(&mut ctx, &payer, &maker, 100_000, &protocol).await;
+
+    apply_one_fill(
+        &mut ctx,
+        &payer,
+        market_pda,
+        insurance_fund_pda,
+        taker_state,
+        maker_state,
+        1,
+        100_000,
+        2,
+    )
+    .await;
+
+    // Bootstrap NOT bricked: enabled breaker + empty fund, yet the floor keeps the
+    // market Active.
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        (market.oi_long_lots, market.oi_short_lots),
+        (1, 1),
+        "fill settled"
+    );
+    assert_eq!(
+        market.status,
+        clober::MarketStatus::Active as u8,
+        "floor must keep an enabled breaker from bricking a zero-insurance bootstrap market"
+    );
+
+    // Intake still works on the still-Active market.
+    let placer = Keypair::new();
+    let placer_state = setup_trader(&mut ctx, &payer, &placer, 100_000, &protocol).await;
+    let place = build_ix(
+        clober::instruction::PlaceLimitOrder {
+            side: 1,
+            size_lots: 1,
+            limit_ticks: 105_000,
+            flags: 0,
+            expires_at_slot: 0,
+            sub_index: 0,
+        },
+        vec![
+            AccountMeta::new(placer.pubkey(), true),
+            AccountMeta::new(market_pda, false),
+            AccountMeta::new(book_pda, false),
+            AccountMeta::new_readonly(placer_state, false),
+            AccountMeta::new_readonly(program_id(), false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let intake = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[place],
+            Some(&payer.pubkey()),
+            &[&payer, &placer],
+            bh,
+        ))
+        .await;
+    assert!(
+        intake.is_ok(),
+        "intake under a floor-protected bootstrap market must succeed, got: {intake:?}"
+    );
+
+    // Now LOWER the floor below the current gross OI (200_000) and grow OI with one
+    // more fill: the effective cap max(0, 100_000) = 100_000 is now exceeded by the
+    // post-fill gross (2 + 2)·100_000 = 400_000, so the breaker DOES trip — the
+    // floor is a real bound, not a disable.
+    send_set_oi_floor(&mut ctx, &payer, market_pda, 100_000)
+        .await
+        .expect("lower the floor");
+    let taker2 = Keypair::new();
+    let maker2 = Keypair::new();
+    let taker2_state = setup_trader(&mut ctx, &payer, &taker2, 100_000, &protocol).await;
+    let maker2_state = setup_trader(&mut ctx, &payer, &maker2, 100_000, &protocol).await;
+    apply_one_fill(
+        &mut ctx,
+        &payer,
+        market_pda,
+        insurance_fund_pda,
+        taker2_state,
+        maker2_state,
+        1,
+        100_000,
+        3,
+    )
+    .await;
+    let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        market.status,
+        clober::MarketStatus::Paused as u8,
+        "once gross OI exceeds the (lowered) floor, the breaker still trips"
+    );
+}
