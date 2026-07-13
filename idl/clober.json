@@ -4174,6 +4174,175 @@
       ]
     },
     {
+      "name": "deposit_insurance_fund",
+      "docs": [
+        "Capitalize the insurance fund with external quote tokens (permissionless).",
+        "Transfers `amount_quote_lots` from the depositor's ATA INTO the shared",
+        "quote vault and credits the SAME amount to `balance_quote_lots`. Because it",
+        "adds equally to the vault and the insurance bucket, the protocol-solvency",
+        "surplus (`vault − insurance − lp`) is unchanged — conservation-preserving by",
+        "construction (proven `insurance_deposit_is_exact_and_conservative`). Anyone",
+        "may strengthen the fund; a deposit can only ADD backing, never remove it, so",
+        "no authority gate is needed. Complements the organic fee/toxicity/liq",
+        "accrual paths with a direct top-up (there was previously no way to inject",
+        "external capital — the fund could only grow from trading)."
+      ],
+      "discriminator": [
+        237,
+        0,
+        91,
+        28,
+        87,
+        48,
+        239,
+        248
+      ],
+      "accounts": [
+        {
+          "name": "depositor",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "insurance_fund",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "depositor_quote_ata",
+          "docs": [
+            "Depositor's USDC ATA — source of the deposited capital."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "depositor"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "quote_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "quote_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_quote_lots",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "deposit_to_copy_vault",
       "docs": [
         "Copy-vault deposit: transfer `amount` quote lots into the vault's isolated",
@@ -18707,6 +18876,19 @@
       ]
     },
     {
+      "name": "InsuranceDepositEvent",
+      "discriminator": [
+        40,
+        206,
+        171,
+        111,
+        135,
+        146,
+        114,
+        50
+      ]
+    },
+    {
       "name": "InsurancePauseThresholdUpdatedEvent",
       "discriminator": [
         181,
@@ -22606,6 +22788,29 @@
           },
           {
             "name": "remaining_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "InsuranceDepositEvent",
+      "docs": [
+        "Emitted when the insurance fund is capitalized via `deposit_insurance_fund`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount_quote_lots",
+            "type": "u64"
+          },
+          {
+            "name": "new_balance",
             "type": "u64"
           }
         ]
