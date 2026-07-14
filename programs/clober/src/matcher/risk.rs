@@ -85,6 +85,13 @@ pub struct MarketSnapshot {
     /// is scaled (losses always count fully), so it can only RAISE the margin
     /// requirement — conservative-safe.
     pub paper_profit_haircut_bps: u32,
+    /// Phase 1 per-market calibrated stress shock (bps). Every default_scenarios
+    /// shock applied to THIS market is scaled by `scale_shock(base, this)` so a
+    /// lower-vol asset is stress-tested to a smaller move (→ higher leverage).
+    /// `0` ⇒ legacy ±30% (full-strength lattice) — FAIL-SAFE: a forgotten/legacy
+    /// snapshot is stressed at full strength, never zero. Populate from
+    /// `MarketAccount::stress_shock_bps` (raw; the scaler resolves 0 → 3000).
+    pub stress_shock_bps: u32,
 }
 
 /// 3.1: apply a market's paper-profit haircut to a signed unrealized-PnL figure.
@@ -241,8 +248,63 @@ mod paper_haircut_tests {
 }
 
 #[cfg(test)]
-mod oi_mmr_tests {
+mod stress_scaler_tests {
     use super::*;
+
+    #[test]
+    fn scale_shock_legacy_is_identity() {
+        // eff 0 ⇒ legacy 3000 ⇒ identity; eff == 3000 ⇒ identity too.
+        for &b in &[-3000i32, -2000, -200, 0, 200, 2000, 3000] {
+            assert_eq!(scale_shock(b, 0), b, "eff=0 must be full-strength identity");
+            assert_eq!(scale_shock(b, 3000), b, "eff=3000 must be identity");
+        }
+    }
+
+    #[test]
+    fn scale_shock_tier_scales_proportionally() {
+        // 1.5% tier (150) ⇒ ×0.05: ±3000 → ±150, ±2000 → ±100.
+        assert_eq!(scale_shock(3000, 150), 150);
+        assert_eq!(scale_shock(-3000, 150), -150);
+        assert_eq!(scale_shock(2000, 150), 100);
+        assert_eq!(scale_shock(-2000, 150), -100);
+        // 5% tier (500) ⇒ ×(1/6): ±3000 → ±500.
+        assert_eq!(scale_shock(3000, 500), 500);
+    }
+
+    #[test]
+    fn scale_shock_is_monotone_grid() {
+        // Pins the ÷3000 divide end-to-end: |scaled| non-decreasing in eff.
+        for &base in &[-3000i32, -2000, -500, -200, 200, 500, 2000, 3000] {
+            let mut prev = 0u32;
+            for &eff in &[1u32, 150, 300, 500, 1000, 3000, 6000, 10000] {
+                let cur = scale_shock(base, eff).unsigned_abs();
+                assert!(cur >= prev, "base={base} eff={eff}: {cur} < {prev}");
+                prev = cur;
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(8000))]
+        /// Whole-domain monotonicity of the stress scaler — the property CBMC
+        /// cannot discharge (a comparison of two symbolic products). For any
+        /// `base` and `e1 <= e2`, `|scale_shock_num(base, ·)|` is non-decreasing
+        /// in the tier, so a tighter (larger) stress tier can only ever RAISE the
+        /// scaled shock ⇒ strictly higher required margin. Pins the product-vs-
+        /// product comparison over 8000 random points across the full i32/u32
+        /// domain; `scale_shock_is_monotone_grid` pins the ÷3000 end-to-end.
+        #[test]
+        fn scale_shock_num_monotone_in_tier_proptest(
+            base in proptest::prelude::any::<i32>(),
+            a in proptest::prelude::any::<u32>(),
+            b in proptest::prelude::any::<u32>(),
+        ) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let n_lo = super::scale_shock_num(base, lo).unsigned_abs();
+            let n_hi = super::scale_shock_num(base, hi).unsigned_abs();
+            proptest::prelude::prop_assert!(n_lo <= n_hi);
+        }
+    }
 
     #[test]
     fn oi_scaled_zero_slope_returns_zero() {
@@ -290,6 +352,7 @@ mod oi_mmr_tests {
             oi_mmr_slope_bps_per_million_lots: 100,
             oi_mmr_max_extra_bps: 1_000,
             paper_profit_haircut_bps: 0,
+            stress_shock_bps: 0,
         };
         assert_eq!(snap.effective_mmr_bps(2_000), 200);
         // Below the concentration threshold the extra drops out.
@@ -357,6 +420,38 @@ fn shocked_price(price: Ticks, shock_bps: i32) -> Result<Ticks> {
     // truncating. Only reachable with a pathological governance shock.
     let stressed = (price.0 as u128).checked_add(delta).or_overflow()?;
     Ok(Ticks(u64::try_from(stressed).ok().or_overflow()?))
+}
+
+/// Division-free NUMERATOR of the per-market stress scaler: `base_bps ·
+/// eff_shock_bps` in i64 (no divide). Factored out so the monotonicity of the
+/// scaled shock in `eff_shock_bps` is Kani-provable over the whole domain,
+/// sidestepping the non-power-of-2 `/ LEGACY_STRESS_SHOCK_BPS` divide CBMC
+/// cannot discharge (same discipline as `notional_exceeds_effective_cap`). The
+/// divide (order-preserving, positive constant) is applied in [`scale_shock`]
+/// and pinned end-to-end by the host test `scale_shock_is_monotone_grid`.
+#[inline]
+fn scale_shock_num(base_bps: i32, eff_shock_bps: u32) -> i64 {
+    (base_bps as i64) * (eff_shock_bps as i64)
+}
+
+/// Scale a base default-lattice shock to a market's calibrated stress tier:
+/// `scaled = base_bps · eff / LEGACY_STRESS_SHOCK_BPS`, where `eff` is the
+/// market's effective stress shock (`0` ⇒ legacy 3000, so an un-tiered/forgotten
+/// market is stressed at FULL strength — fail-safe, never zero-stress). The
+/// magnitude scales linearly with `eff`: a smaller tier ⇒ smaller stress ⇒
+/// LOWER required margin ⇒ higher permissible leverage; a larger tier ⇒ strictly
+/// higher required margin (monotone — `scale_shock_num` + order-preserving
+/// divide). Sign-preserving; saturating to i32 defends a pathological tier.
+#[inline]
+fn scale_shock(base_bps: i32, eff_shock_bps: u32) -> i32 {
+    let eff = if eff_shock_bps == 0 {
+        crate::constants::LEGACY_STRESS_SHOCK_BPS
+    } else {
+        eff_shock_bps
+    };
+    let scaled =
+        scale_shock_num(base_bps, eff) / (crate::constants::LEGACY_STRESS_SHOCK_BPS as i64);
+    scaled.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
 fn lookup_market<'a>(markets: &'a [MarketSnapshot], pk: &Pubkey) -> Option<&'a MarketSnapshot> {
@@ -451,7 +546,11 @@ pub fn assess_margin(
                 Some(m) => m,
                 None => continue,
             };
-            let shock = shock_for_market(scenario, &pos.market);
+            // Phase 1: scale the base-lattice shock to THIS market's calibrated
+            // stress tier. `m.stress_shock_bps == 0` ⇒ full ±30% (legacy,
+            // fail-safe). A tighter (larger) tier ⇒ strictly larger scaled shock
+            // ⇒ strictly higher required margin (monotone, proven).
+            let shock = scale_shock(shock_for_market(scenario, &pos.market), m.stress_shock_bps);
             let stressed = shocked_price(m.mark_price, shock)?;
 
             // Loss contribution = maintenance margin − unrealized PnL, both at
@@ -888,6 +987,7 @@ mod isolated_margin_tests {
             oi_mmr_slope_bps_per_million_lots: 0,
             oi_mmr_max_extra_bps: 0,
             paper_profit_haircut_bps: 0,
+            stress_shock_bps: 0,
         };
         (pk, m)
     }
@@ -1000,6 +1100,21 @@ mod mmr_kani_proofs {
     use crate::matcher::lot::Ticks;
     use anchor_lang::prelude::Pubkey;
 
+    /// PHASE 1 (T3): the per-market stress scaler is MONOTONE in the tier —
+    /// a larger effective shock never yields a smaller-magnitude scaled shock, so
+    /// a tighter (higher-vol) tier can only RAISE required margin, never lower it
+    /// below the true worst case (Law 4, one-sided sound). Proven division-free on
+    /// the numerator; the ÷LEGACY_STRESS_SHOCK_BPS is a positive constant
+    /// (order-preserving) pinned end-to-end by `scale_shock_is_monotone_grid`.
+    // NOTE: monotonicity of the stress scaler is `|base·e1| <= |base·e2|` for
+    // `e1 <= e2` — a comparison of TWO symbolic products. CBMC bit-blasts a
+    // product-vs-product comparison into an intractable (non-terminating) SAT
+    // instance, the same limitation Law 5 documents for symbolic non-power-of-2
+    // division. It is therefore pinned by the host proptest
+    // `scale_shock_num_monotone_in_tier_proptest` (whole-domain random) plus the
+    // fixed-grid `scale_shock_is_monotone_grid`, NOT by Kani. `scale_shock_num`
+    // itself is division-free; only the monotonicity *comparison* is host-pinned.
+
     /// The OI surcharge NEVER exceeds its configured cap — a crowded book cannot
     /// be charged more maintenance margin than governance bounded.
     #[kani::proof]
@@ -1037,6 +1152,7 @@ mod mmr_kani_proofs {
             oi_mmr_slope_bps_per_million_lots: kani::any(),
             oi_mmr_max_extra_bps: kani::any(),
             paper_profit_haircut_bps: 0,
+            stress_shock_bps: 0,
         };
         let size_lots: u64 = kani::any();
         assert!(snap.effective_mmr_bps(size_lots) >= snap.maintenance_margin_bps);
@@ -1069,6 +1185,7 @@ mod assess_margin_frame_tests {
                 oi_mmr_slope_bps_per_million_lots: 0,
                 oi_mmr_max_extra_bps: 0,
                 paper_profit_haircut_bps: 0,
+                stress_shock_bps: 0,
             },
         )
     }
@@ -1184,6 +1301,7 @@ mod conservative_stress_rounding_tests {
             oi_mmr_slope_bps_per_million_lots: 0,
             oi_mmr_max_extra_bps: 0,
             paper_profit_haircut_bps: 0,
+            stress_shock_bps: 0,
         }
     }
 
@@ -1338,6 +1456,7 @@ mod assess_margin_real_symbol_kani_proofs {
             oi_mmr_slope_bps_per_million_lots: 0,
             oi_mmr_max_extra_bps: 0,
             paper_profit_haircut_bps: 0,
+            stress_shock_bps: 0,
         }
     }
 
@@ -1413,6 +1532,7 @@ mod high1_cross_market_regression {
             oi_mmr_slope_bps_per_million_lots: 0,
             oi_mmr_max_extra_bps: 0,
             paper_profit_haircut_bps: 0,
+            stress_shock_bps: 0,
         }
     }
 

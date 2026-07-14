@@ -13313,6 +13313,108 @@
       ]
     },
     {
+      "name": "set_market_stress_tier",
+      "docs": [
+        "Calibrate a market's per-asset stress tier (Phase 1). Sets the margin",
+        "`stress_shock_bps` (scales the margin lattice ⇒ tiered leverage) and the",
+        "`backstop_tail_bps` (the black-swan gap the insurance fund underwrites).",
+        "Authority-only, bounded, opt-in, and REVERSIBLE (both 0 ⇒ full legacy",
+        "±30% margin + 30% tail, the off-switch).",
+        "",
+        "Validated BEFORE any write, so leverage never outruns the fund:",
+        "1. a nonzero tier meets the calibration floor (`>= MIN_STRESS_SHOCK_BPS`);",
+        "2. the tail underwrites a true black swan AND exceeds the margin shock",
+        "(`eff_tail >= max(3000, eff_shock)`) ⇒ the backstop gap is never",
+        "vacuous (`BackstopTailTooLow` otherwise);",
+        "3. the market's mm/im still satisfy `hip3_core_bounds_ok` for the new",
+        "(tighter) maintenance floor — IM ≥ MM ≥ shock;",
+        "4. the fund covers the worst tail-gap loss over the market's HARD OI cap",
+        "(`worst_gap_loss_exceeds_insurance` is false) — a tiered market MUST",
+        "cap OI (`max_oi_base_lots > 0`) so the backstop is finite."
+      ],
+      "discriminator": [
+        150,
+        98,
+        140,
+        138,
+        169,
+        101,
+        60,
+        160
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "insurance_fund",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "worst_shock_bps",
+          "type": "u32"
+        },
+        {
+          "name": "backstop_tail_bps",
+          "type": "u32"
+        }
+      ]
+    },
+    {
       "name": "set_oi_insurance_floor_notional",
       "docs": [
         "set the OI-vs-insurance breaker's BOOTSTRAP FLOOR (authority-only) — the",
@@ -19369,6 +19471,19 @@
       ]
     },
     {
+      "name": "MarketStressTierSetEvent",
+      "discriminator": [
+        115,
+        163,
+        178,
+        20,
+        9,
+        78,
+        50,
+        8
+      ]
+    },
+    {
       "name": "OiInsuranceBreakerTrippedEvent",
       "discriminator": [
         22,
@@ -20397,6 +20512,16 @@
       "code": 7403,
       "name": "NotLiquidatable",
       "msg": "Trader is healthy; no liquidation needed"
+    },
+    {
+      "code": 7404,
+      "name": "StressTierUncovered",
+      "msg": "Stress tier not covered: worst tail-gap loss over the OI cap exceeds the insurance fund"
+    },
+    {
+      "code": 7405,
+      "name": "BackstopTailTooLow",
+      "msg": "Backstop tail too low: must be >= 30% and >= the margin stress shock"
     },
     {
       "code": 7500,
@@ -24380,6 +24505,34 @@
               "`set_oi_insurance_floor_notional`."
             ],
             "type": "u64"
+          },
+          {
+            "name": "stress_shock_bps",
+            "docs": [
+              "Per-market calibrated stress shock (bps) driving the margin lattice",
+              "(Phase 1). Scales every default_scenarios shock proportionally",
+              "(`scale_shock`), so a lower-vol asset is stress-tested to a smaller move",
+              "and can carry higher leverage. The maintenance floor is tied to this via",
+              "`hip3_core_bounds_ok` so a position is liquidatable exactly when a",
+              "worst-shock move would breach it. `0` ⇒ legacy ±30% (full lattice +",
+              "legacy 5% MM floor) — the safe default and off-switch. Trailing field ⇒",
+              "pre-existing accounts (zero-padded to `space()`) read it as 0. Set via",
+              "`set_market_stress_tier`; a nonzero value must be ≥ `MIN_STRESS_SHOCK_BPS`."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "backstop_tail_bps",
+            "docs": [
+              "Per-market backstop tail (bps) — the black-swan gap the INSURANCE FUND",
+              "underwrites, distinct from the (smaller) margin tier above. The backstop",
+              "gate requires `insurance ≥ OI_cap × max(0, tail − MM) / BPS`, so leverage",
+              "can never outrun what the fund can absorb on a tail gap PAST maintenance.",
+              "The setter enforces `tail ≥ max(LEGACY_STRESS_SHOCK_BPS, stress_shock)`,",
+              "so `tail > MM` always ⇒ the gate is never vacuous. `0` ⇒ legacy 30% tail.",
+              "Trailing field ⇒ pre-existing accounts read it as 0."
+            ],
+            "type": "u32"
           }
         ]
       }
@@ -25752,6 +25905,52 @@
           {
             "name": "new_status",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketStressTierSetEvent",
+      "docs": [
+        "`set_market_stress_tier` calibrated a market's per-asset stress tier and",
+        "backstop tail. `worst_gap_loss` is the fund draw the tier is proven to be",
+        "covered against (`OI_cap × max(0, tail − MM) / BPS`); `0` shocks/tail = the",
+        "legacy ±30% off-switch."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "worst_shock_bps",
+            "type": "u32"
+          },
+          {
+            "name": "backstop_tail_bps",
+            "type": "u32"
+          },
+          {
+            "name": "mm_bps",
+            "type": "u32"
+          },
+          {
+            "name": "im_bps",
+            "type": "u32"
+          },
+          {
+            "name": "max_leverage",
+            "type": "u32"
+          },
+          {
+            "name": "insurance_balance",
+            "type": "u64"
+          },
+          {
+            "name": "worst_gap_loss",
+            "type": "u64"
           }
         ]
       }

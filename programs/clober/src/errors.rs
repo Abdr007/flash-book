@@ -120,6 +120,12 @@ pub enum CloberError {
     LiquidationStale = 1402,
     #[msg("Trader is healthy; no liquidation needed")]
     NotLiquidatable = 1403,
+    #[msg(
+        "Stress tier not covered: worst tail-gap loss over the OI cap exceeds the insurance fund"
+    )]
+    StressTierUncovered = 1404,
+    #[msg("Backstop tail too low: must be >= 30% and >= the margin stress shock")]
+    BackstopTailTooLow = 1405,
 
     // ── 1500-1599 insurance fund ────────────────────────────────────
     #[msg("Insurance fund balance below threshold")]

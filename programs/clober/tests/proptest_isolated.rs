@@ -47,6 +47,7 @@ fn market(seed: [u8; 32], mark: u64, mmr_bps: u32) -> MarketSnapshot {
         oi_mmr_slope_bps_per_million_lots: 0,
         oi_mmr_max_extra_bps: 0,
         paper_profit_haircut_bps: 0,
+        stress_shock_bps: 0,
     }
 }
 

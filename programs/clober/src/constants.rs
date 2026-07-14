@@ -298,12 +298,32 @@ pub const MAX_REAP_PER_CALL: usize = 64;
 // market created by ANY signer is provably conservative regardless of intent.
 // (`validate_hip3_params` enforces these; `hip3_params_are_safe` proves it.)
 
-/// Max leverage a permissionless market may offer. Conservative vs. the
-/// authority path — a hostile creator can't lure with 100x then let it blow up.
-pub const HIP3_MAX_LEVERAGE: u32 = 10;
-/// Minimum maintenance-margin ratio (bps). 5% floor bounds the worst-case
-/// gap between a breach and the liquidation fill.
+/// Max leverage a permissionless market may offer. The per-market maintenance
+/// floor (tied to the calibrated stress tier) is the binding constraint below
+/// this ceiling; a market only reaches high leverage when its stress tier AND
+/// its backstop coverage provably permit it (see `hip3_core_bounds_ok`,
+/// `worst_gap_loss_exceeds_insurance`).
+pub const HIP3_MAX_LEVERAGE: u32 = 65;
+/// Minimum maintenance-margin ratio (bps) for a LEGACY (un-tiered) market —
+/// `stress_shock_bps == 0`. Tiered markets use `max(stress_shock_bps,
+/// MIN_MM_ABS_BPS)` instead (see `hip3_core_bounds_ok`).
 pub const HIP3_MIN_MAINTENANCE_MARGIN_BPS: u32 = 500;
+
+/// ── Per-market calibrated-stress leverage tiers (Phase 1) ──────────────────
+/// Minimum per-market stress shock (bps) a market may calibrate to. 1.5% floor
+/// caps the maintenance-tied leverage a governance tier can unlock, so no tier
+/// is gameable into unbounded leverage. `stress_shock_bps` below this (nonzero)
+/// is rejected by the setter.
+pub const MIN_STRESS_SHOCK_BPS: u32 = 150;
+/// The stress shock a market with `stress_shock_bps == 0` (never opted into a
+/// tier) is treated as — the legacy ±30% black swan. This is BOTH the default
+/// scenario-scaling shock (full 30% lattice, fail-safe) AND the default
+/// backstop tail. Selecting 0 is the safe off-switch.
+pub const LEGACY_STRESS_SHOCK_BPS: u32 = 3000;
+/// Absolute maintenance-margin floor (bps) for a TIERED market. Even the
+/// calmest calibrated tier must hold ≥ 0.25% maintenance, bounding the
+/// liquidation gap when the tier's own shock is tiny.
+pub const MIN_MM_ABS_BPS: u32 = 25;
 /// Max taker fee (bps). 1% cap — no predatory fee extraction.
 pub const HIP3_MAX_TAKER_FEE_BPS: u32 = 100;
 /// Max liquidation penalty + liquidator reward (bps). 10% cap.

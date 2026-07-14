@@ -381,6 +381,53 @@ pub fn notional_exceeds_effective_cap(
     gross_notional > insurance_cap.max(floor_notional as u128)
 }
 
+/// Backstop gate (Phase 1): TRUE iff the market's worst-case TAIL gap loss —
+/// the bad debt if the price gaps to the per-market underwritten `tail_bps`
+/// BEYOND maintenance — exceeds the insurance fund. Leverage is thereby bounded
+/// by the fund: a stress tier whose worst gap loss the fund cannot absorb is
+/// refused by `set_market_stress_tier`.
+///
+///   gap_bps = max(0, tail_bps − mm_bps)          // gap PAST maintenance
+///   loss    = oi_cap_notional · gap_bps / BPS    // conservative: full OI, zero recovery
+///   trips iff loss > insurance_balance
+///
+/// `tail_bps` is the per-market black-swan tail the fund underwrites — DISTINCT
+/// from (and ≥) the margin `stress_shock_bps`; the setter enforces `tail ≥
+/// max(LEGACY_STRESS_SHOCK_BPS, stress_shock)` so `tail > mm` for any leverage-
+/// unlocking tier ⇒ the gate is never vacuous (`backstop_gate_is_non_vacuous`).
+/// All arithmetic is 128-bit SATURATING — an overflowed loss trips (fail-safe,
+/// never panics). The `/ BPS_DENOM` divide is pinned by the host grid-test
+/// `backstop_gap_loss_predicate`; the comparison is proven division-free over a
+/// symbolic pre-divided `loss` in `gap_loss_exceeds_insurance`.
+pub fn worst_gap_loss_exceeds_insurance(
+    oi_cap_notional: u128,
+    tail_bps: u32,
+    mm_bps: u32,
+    insurance_balance: u64,
+) -> bool {
+    let gap_bps = tail_gap_bps(tail_bps, mm_bps) as u128;
+    let loss = oi_cap_notional.saturating_mul(gap_bps) / crate::constants::BPS_DENOM as u128;
+    gap_loss_exceeds_insurance(loss, insurance_balance)
+}
+
+/// Division-free core of the backstop comparison: TRUE iff the (already-divided)
+/// tail-gap `loss` exceeds `insurance_balance`. Factored out so the bound is
+/// Kani-provable over a SYMBOLIC `loss`, sidestepping the u128 `/ BPS_DENOM`
+/// divide CBMC cannot discharge (same discipline as
+/// `notional_exceeds_effective_cap`). Pure, total, no division.
+#[inline]
+pub fn gap_loss_exceeds_insurance(loss: u128, insurance_balance: u64) -> bool {
+    loss > insurance_balance as u128
+}
+
+/// The tail gap PAST maintenance, in bps: `max(0, tail_bps − mm_bps)`.
+/// Division-free; the non-vacuity guarantee (`tail > mm ⇒ gap > 0`) is proven
+/// on this in `backstop_gate_is_non_vacuous`.
+#[inline]
+pub fn tail_gap_bps(tail_bps: u32, mm_bps: u32) -> u32 {
+    tail_bps.saturating_sub(mm_bps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +534,79 @@ mod tests {
         assert!(!oi_exceeds_insurance_cap(5, 5, 100, 1, 999, bps, 2_000));
     }
 
+    /// BACKSTOP end-to-end (pins the `/ BPS_DENOM` divide the Kani core omits):
+    /// over a grid, `worst_gap_loss_exceeds_insurance` trips iff the exact
+    /// conservative loss `OI_cap · max(0, tail−mm) / BPS` exceeds insurance, is
+    /// fail-safe on overflow (saturates ⇒ trips), and is NON-VACUOUS whenever
+    /// tail > mm with a nonzero OI cap.
+    #[test]
+    fn backstop_gap_loss_predicate() {
+        let bps = crate::constants::BPS_DENOM as u128; // 10_000
+                                                       // tail 30%, mm 1.5% ⇒ gap 28.5%. OI cap 1_000_000 ⇒ loss 285_000.
+        let oi = 1_000_000u128;
+        let loss = oi * (3000 - 150) / bps; // 285_000
+        assert_eq!(loss, 285_000);
+        assert!(!worst_gap_loss_exceeds_insurance(oi, 3000, 150, 285_000)); // == cap ⇒ not exceeded
+        assert!(worst_gap_loss_exceeds_insurance(oi, 3000, 150, 284_999)); // one under ⇒ tripped
+                                                                           // tail == mm ⇒ zero gap ⇒ zero loss ⇒ never trips (fund 0 ok).
+        assert!(!worst_gap_loss_exceeds_insurance(oi, 3000, 3000, 0));
+        assert!(!worst_gap_loss_exceeds_insurance(oi, 150, 150, 0));
+        // Non-vacuity: tail > mm with a real OI ⇒ requires strictly-positive fund.
+        assert!(worst_gap_loss_exceeds_insurance(oi, 3000, 150, 0));
+        // Fail-safe: an overflowing OI·gap saturates and trips (never panics).
+        assert!(worst_gap_loss_exceeds_insurance(
+            u128::MAX,
+            3000,
+            150,
+            u64::MAX
+        ));
+        // Grid: matches the exact conservative formula.
+        for &oi in &[0u128, 1, 1_000, 1_000_000, 1u128 << 60] {
+            for &tail in &[150u32, 500, 1_000, 3_000, 6_000] {
+                for &mm in &[25u32, 150, 500, 3_000] {
+                    for &ins in &[0u64, 1, 285_000, u64::MAX] {
+                        let gap = tail.saturating_sub(mm) as u128;
+                        let exact = oi.saturating_mul(gap) / bps;
+                        assert_eq!(
+                            worst_gap_loss_exceeds_insurance(oi, tail, mm, ins),
+                            exact > ins as u128,
+                            "oi={oi} tail={tail} mm={mm} ins={ins}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(8000))]
+        /// BACKSTOP NON-VACUITY (host-pinned; the symbolic u128×u128 product CBMC
+        /// cannot discharge): whenever the underwritten tail exceeds the
+        /// maintenance floor and the OI cap is nonzero, the worst-case required
+        /// loss is STRICTLY positive — so with an empty fund the gate TRIPS. Hence
+        /// the backstop genuinely bounds leverage by the fund (it is not a no-op).
+        #[test]
+        fn backstop_nonzero_gap_forces_nonzero_loss_proptest(
+            oi in 1u128..=(u128::MAX / crate::constants::BPS_DENOM as u128),
+            mm in 0u32..=500_000u32,
+            gap_bps in 1u32..=500_000u32,
+        ) {
+            // Construct tail = mm + gap (gap ≥ 1) so tail > mm holds BY
+            // CONSTRUCTION (no rejects). The gap PAST maintenance is strictly
+            // positive; when oi·gap ≥ BPS the floored loss is ≥ 1 > 0, so an empty
+            // fund is provably uncovered (the gate trips) — the backstop is not a
+            // no-op.
+            let tail = mm + gap_bps; // ≤ 1_000_000, no overflow
+            let gap = gap_bps as u128;
+            if oi.saturating_mul(gap) >= crate::constants::BPS_DENOM as u128 {
+                proptest::prelude::prop_assert!(
+                    worst_gap_loss_exceeds_insurance(oi, tail, mm, 0),
+                    "oi={oi} tail={tail} mm={mm}: nonzero gap+OI must require a nonzero fund"
+                );
+            }
+        }
+    }
+
     #[test]
     fn reservation_round_trip_and_saturation() {
         let r = reserve_add(0, 25_000).unwrap();
@@ -570,6 +690,53 @@ mod tests {
 #[cfg(kani)]
 mod xmargin_kani_proofs {
     use super::*;
+
+    /// BACKSTOP (T4): the division-free backstop comparison is EXACT and
+    /// MONOTONE over the whole domain (no division). A larger tail-gap loss can
+    /// only make the gate MORE likely to trip; a larger fund only LESS likely —
+    /// so the gate is a sound one-sided bound (it never lets leverage through
+    /// that the fund cannot cover).
+    #[kani::proof]
+    fn backstop_gap_gate_is_monotone_and_exact() {
+        let loss: u128 = kani::any();
+        let insurance: u64 = kani::any();
+        let trips = gap_loss_exceeds_insurance(loss, insurance);
+        assert!(trips == (loss > insurance as u128));
+        let more: u128 = kani::any();
+        if more >= loss && trips {
+            assert!(gap_loss_exceeds_insurance(more, insurance));
+        }
+        let more_ins: u64 = kani::any();
+        if more_ins >= insurance && !trips {
+            assert!(!gap_loss_exceeds_insurance(loss, more_ins));
+        }
+    }
+
+    /// BACKSTOP NON-VACUITY: whenever the underwritten tail exceeds the
+    /// maintenance floor — the setter enforces `tail ≥ max(3000, shock)` and
+    /// (decision A) `mm = max(shock, 25)`, so `tail > mm` for every leverage-
+    /// unlocking tier — the gap PAST maintenance is STRICTLY positive, and a
+    /// nonzero OI cap forces a strictly-positive worst-case loss. Hence the gate
+    /// CAN trip: leverage is genuinely bounded by the fund (not a no-op). This is
+    /// the proof that the resolved model is not vacuous. Division-free.
+    #[kani::proof]
+    fn backstop_gate_is_non_vacuous() {
+        // Non-vacuity reduces to: whenever the underwritten tail exceeds the
+        // maintenance floor (the setter enforces tail ≥ max(3000, shock) and,
+        // decision A, mm = max(shock, 25), so tail > mm for every leverage-
+        // unlocking tier), the gap PAST maintenance is STRICTLY positive — so a
+        // nonzero OI cap forces a strictly-positive required loss and the gate
+        // CAN trip (leverage is genuinely fund-bounded, not a no-op). Only this
+        // `gap > 0` step is proven in Kani (division-free, no multiply). The
+        // remaining `oi > 0 ∧ gap > 0 ⇒ oi·gap > 0` is a symbolic u128×u128
+        // product CBMC cannot discharge (same class as symbolic division, Law 5);
+        // it is pinned by the host proptest
+        // `backstop_nonzero_gap_forces_nonzero_loss_proptest`.
+        let tail: u32 = kani::any();
+        let mm: u32 = kani::any();
+        kani::assume(tail > mm);
+        assert!(tail_gap_bps(tail, mm) > 0);
+    }
 
     /// SAFETY: if the simple-withdraw gate passes, the post-withdrawal collateral
     /// is provably ≥ the ER reserved margin (collateral backing resting ER orders

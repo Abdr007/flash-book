@@ -507,6 +507,26 @@ pub struct MarketAccount {
     /// Bounded by `MAX_OI_INSURANCE_FLOOR_NOTIONAL`; set via
     /// `set_oi_insurance_floor_notional`.
     pub oi_insurance_floor_notional: u64,
+
+    /// Per-market calibrated stress shock (bps) driving the margin lattice
+    /// (Phase 1). Scales every default_scenarios shock proportionally
+    /// (`scale_shock`), so a lower-vol asset is stress-tested to a smaller move
+    /// and can carry higher leverage. The maintenance floor is tied to this via
+    /// `hip3_core_bounds_ok` so a position is liquidatable exactly when a
+    /// worst-shock move would breach it. `0` ⇒ legacy ±30% (full lattice +
+    /// legacy 5% MM floor) — the safe default and off-switch. Trailing field ⇒
+    /// pre-existing accounts (zero-padded to `space()`) read it as 0. Set via
+    /// `set_market_stress_tier`; a nonzero value must be ≥ `MIN_STRESS_SHOCK_BPS`.
+    pub stress_shock_bps: u32,
+
+    /// Per-market backstop tail (bps) — the black-swan gap the INSURANCE FUND
+    /// underwrites, distinct from the (smaller) margin tier above. The backstop
+    /// gate requires `insurance ≥ OI_cap × max(0, tail − MM) / BPS`, so leverage
+    /// can never outrun what the fund can absorb on a tail gap PAST maintenance.
+    /// The setter enforces `tail ≥ max(LEGACY_STRESS_SHOCK_BPS, stress_shock)`,
+    /// so `tail > MM` always ⇒ the gate is never vacuous. `0` ⇒ legacy 30% tail.
+    /// Trailing field ⇒ pre-existing accounts read it as 0.
+    pub backstop_tail_bps: u32,
 }
 
 /// Optional emergency guardian for one market, held in a SEPARATE PDA (not a
@@ -583,6 +603,28 @@ const _: () = assert!(
 
 impl MarketAccount {
     pub const SEED: &'static [u8] = b"market";
+
+    /// Effective per-market stress shock (bps) for the margin lattice. `0`
+    /// (never tiered / legacy account) ⇒ the legacy ±30% black swan, so an
+    /// un-tiered market is stress-tested at full strength (fail-safe) and only
+    /// an explicit tier can LOWER the required margin.
+    pub fn effective_stress_shock_bps(&self) -> u32 {
+        if self.stress_shock_bps == 0 {
+            crate::constants::LEGACY_STRESS_SHOCK_BPS
+        } else {
+            self.stress_shock_bps
+        }
+    }
+
+    /// Effective per-market backstop tail (bps) the insurance fund underwrites.
+    /// `0` ⇒ the legacy 30% tail.
+    pub fn effective_backstop_tail_bps(&self) -> u32 {
+        if self.backstop_tail_bps == 0 {
+            crate::constants::LEGACY_STRESS_SHOCK_BPS
+        } else {
+            self.backstop_tail_bps
+        }
+    }
     /// Effective matcher batch cap. `max_batch_orders` if a market has opted into
     /// a raised cap (always paired with an armed fill-outbox), else the global
     /// log-safe default `MAX_BATCH_ORDERS_PER_SIDE_V2`. `0` (unset) ⇒
