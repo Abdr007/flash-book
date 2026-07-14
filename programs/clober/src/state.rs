@@ -527,6 +527,17 @@ pub struct MarketAccount {
     /// so `tail > MM` always ⇒ the gate is never vacuous. `0` ⇒ legacy 30% tail.
     /// Trailing field ⇒ pre-existing accounts read it as 0.
     pub backstop_tail_bps: u32,
+
+    /// Phase 2 — partial-liquidation restore buffer (bps). A gentle (partial)
+    /// liquidation closes only the minimum size to restore the position to
+    /// `maintenance_required × (1 + liq_restore_buffer_bps/BPS)` — slightly ABOVE
+    /// the bare maintenance line, so the position does not immediately re-liquidate
+    /// on the next adverse tick (avoids churn / repeated penalties). `0` ⇒ no
+    /// buffer (restore to exactly maintenance), which is still valid. The setter
+    /// bounds it so the scaled target can never exceed initial margin (a partial
+    /// liquidation never over-closes past IM). Trailing field ⇒ pre-existing
+    /// accounts read it as 0.
+    pub liq_restore_buffer_bps: u16,
 }
 
 /// Optional emergency guardian for one market, held in a SEPARATE PDA (not a

@@ -126,6 +126,10 @@ pub enum CloberError {
     StressTierUncovered = 1404,
     #[msg("Backstop tail too low: must be >= 30% and >= the margin stress shock")]
     BackstopTailTooLow = 1405,
+    #[msg("Partial liquidation over-closes a solvent position: close only the minimum to restore health")]
+    LiquidationOverClose = 1406,
+    #[msg("Liquidation restore buffer too high: MM x (1 + buffer) would exceed initial margin")]
+    LiqRestoreBufferTooHigh = 1407,
 
     // ── 1500-1599 insurance fund ────────────────────────────────────
     #[msg("Insurance fund balance below threshold")]
