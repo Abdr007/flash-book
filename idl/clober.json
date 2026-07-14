@@ -2147,6 +2147,158 @@
       "args": []
     },
     {
+      "name": "close_legacy_lp_accounts",
+      "docs": [
+        "One-time migration for deployments that predate the pool-singleton",
+        "seed rename (`flp_exposure` → `lp_exposure`): the singleton moved to",
+        "a new PDA but the treasury `LpPositionAccount` seed did not, so a",
+        "pre-rename treasury survives at the exact address",
+        "`initialize_liquidity_pool` must `init` — permanently wedging pool",
+        "(re)initialization. Closes the stranded treasury position and drains",
+        "the orphaned pre-rename singleton, refunding rent to the authority.",
+        "",
+        "Only legal while the canonical `lp_exposure` singleton does NOT",
+        "exist (`AlreadyInitialized` otherwise): once the pool is live, the",
+        "same seeds address the LIVE treasury endowment, which must never be",
+        "closeable."
+      ],
+      "discriminator": [
+        125,
+        234,
+        171,
+        30,
+        49,
+        13,
+        25,
+        85
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "insurance_fund",
+          "docs": [
+            "Admin-gated exactly like `initialize_liquidity_pool`: only the",
+            "insurance-fund authority may run the migration."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "lp_exposure",
+          "docs": [
+            "handler gates on it (seeds pin the address; owner/data checked there)."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "legacy_treasury_position",
+          "docs": [
+            "The stranded pre-rename treasury endowment; rent refunds to the",
+            "authority. Typed, so discriminator + seeds bind it to a real",
+            "`LpPositionAccount` owned by this program."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "authority"
+              }
+            ]
+          }
+        },
+        {
+          "name": "legacy_flp_exposure",
+          "docs": [
+            "PDA; seeds pin the address, the handler checks program ownership."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  108,
+                  112,
+                  95,
+                  101,
+                  120,
+                  112,
+                  111,
+                  115,
+                  117,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "close_trader_ata",
       "docs": [
         "Close the trader's quote ATA and refund the rent lamports to",
@@ -19228,6 +19380,19 @@
       ]
     },
     {
+      "name": "LegacyLpAccountsClosedEvent",
+      "discriminator": [
+        169,
+        156,
+        39,
+        205,
+        153,
+        190,
+        201,
+        252
+      ]
+    },
+    {
       "name": "LiqRestoreBufferSetEvent",
       "discriminator": [
         164,
@@ -23490,6 +23655,22 @@
             "docs": [
               "0 = never expires."
             ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LegacyLpAccountsClosedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "reclaimed_lamports",
             "type": "u64"
           }
         ]
