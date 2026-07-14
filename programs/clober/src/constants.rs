@@ -58,9 +58,21 @@ pub const MAX_ORDERS_PER_BATCH: usize = 256;
 /// Maximum recent clearing prices retained for TWAP / volatility.
 pub const MARK_HISTORY_LEN: usize = 16;
 
-/// Cumulative funding index uses fixed-point Q64.64 — enough for
-/// 100+ years of accumulation at any reasonable rate without overflow.
-pub const FUNDING_INDEX_FRACTIONAL_BITS: u32 = 64;
+/// Fractional bits of the cumulative funding index. The index is
+/// PRICE-WEIGHTED: each crank folds the funding notional-per-lot
+/// (`mark_ticks · tick_size`) into the accumulated delta, so a position's
+/// funding is charged at the price observed AT EACH CRANK, not the price at
+/// its (caller-chosen) settlement time — making funding path-independent and
+/// cross-book zero-sum. Folding a per-lot notional (up to ~u64) into the index
+/// requires headroom, so the scale is Q(112).16 rather than Q64.64: 16
+/// fractional bits keep sub-quote-lot precision while leaving the i128 integer
+/// part ample room for the price-weighted accumulation (all products are
+/// checked and fail closed on the pathological extreme).
+///
+/// NOTE: this changed the on-chain UNIT of `cum_funding_index` and every
+/// position's `cum_funding_index_at_entry`; pre-existing on-chain markets must
+/// be recreated (a fresh redeploy resets them). No in-place migration exists.
+pub const FUNDING_INDEX_FRACTIONAL_BITS: u32 = 16;
 
 /// VPIN EMA uses fixed-point Q32.32.
 pub const VPIN_FRACTIONAL_BITS: u32 = 32;

@@ -5468,12 +5468,8 @@ pub mod clober {
         // is shared with `apply_fill` via `settle_position_funding` so the two can
         // never diverge. Behavior here is byte-identical to the prior inline body.
         let mkt_cfi = market.cum_funding_index;
-        let mkt_mark = market.mark_price_ticks;
-        let mkt_tick = market.params.tick_size;
         let owed_i64 = settle_position_funding(
             mkt_cfi,
-            mkt_mark,
-            mkt_tick,
             &mut position,
             &mut trader_state,
             &mut ctx.accounts.haircut_state.residual_quote_lots,
@@ -5560,7 +5556,13 @@ pub mod clober {
             market.params.funding_period_seconds,
             market.last_funding_rate_bps_per_sec,
             market.params.funding_premium_twap_window,
+            market.params.tick_size,
         )?;
+        // Price-weighted index: the per-period cap scales with the same
+        // crank-time funding notional-per-lot folded into the delta.
+        let funding_notional_per_lot = (funding_mark as u128)
+            .checked_mul(market.params.tick_size as u128)
+            .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
         // Per-period backstop: bound the funding accrued over one period to
         // `funding_per_period_max_bps` of notional, pro-rated by dt/period. This
         // caps the worst-case per-period value transfer even when the per-second
@@ -5571,6 +5573,7 @@ pub mod clober {
             market.params.funding_per_period_max_bps,
             dt,
             market.params.funding_period_seconds,
+            funding_notional_per_lot,
         );
         if delta_capped != delta {
             emit!(FundingPeriodCapHitEvent {
@@ -6424,31 +6427,15 @@ pub mod clober {
             // move needs the haircut state, so this runs only when the haircut engine
             // is present (mandatory when `haircut_enabled`); haircut-disabled markets
             // keep relying on the `settle_funding` crank exactly as before.
-            let mkt_mark = market.mark_price_ticks;
-            let mkt_tick = market.params.tick_size;
             if let Some(mh) = ctx.accounts.market_haircut.as_mut() {
                 let res = &mut mh.residual_quote_lots;
                 {
                     let mut tts = ctx.accounts.taker_trader_state.load_mut()?;
-                    settle_position_funding(
-                        funding_index,
-                        mkt_mark,
-                        mkt_tick,
-                        &mut taker_pos,
-                        &mut tts,
-                        res,
-                    )?;
+                    settle_position_funding(funding_index, &mut taker_pos, &mut tts, res)?;
                 }
                 {
                     let mut mts = ctx.accounts.maker_trader_state.load_mut()?;
-                    settle_position_funding(
-                        funding_index,
-                        mkt_mark,
-                        mkt_tick,
-                        &mut maker_pos,
-                        &mut mts,
-                        res,
-                    )?;
+                    settle_position_funding(funding_index, &mut maker_pos, &mut mts, res)?;
                 }
             }
 
@@ -9482,14 +9469,7 @@ pub mod clober {
             if let Some(mh) = ctx.accounts.market_haircut.as_mut() {
                 let res = &mut mh.residual_quote_lots;
                 let mut tts = ctx.accounts.taker_trader_state.load_mut()?;
-                settle_position_funding(
-                    funding_index,
-                    market.mark_price_ticks,
-                    market.params.tick_size,
-                    &mut taker_pos,
-                    &mut tts,
-                    res,
-                )?;
+                settle_position_funding(funding_index, &mut taker_pos, &mut tts, res)?;
             }
 
             apply_fill_to_position(
@@ -21213,8 +21193,6 @@ fn adl_bankruptcy_reached(side: u8, health_mark: u64, bp_ticks: u64) -> bool {
 
 fn settle_position_funding(
     market_cum_funding_index: i128,
-    mark_price_ticks: u64,
-    tick_size: u64,
     position: &mut state::PositionAccount,
     trader_state: &mut TraderStateAccount,
     residual_quote_lots: &mut u128,
@@ -21223,23 +21201,14 @@ fn settle_position_funding(
         position.set_cum_funding_index(market_cum_funding_index);
         return Ok(0);
     }
-    // notional = size × mark_price × tick_size (quote lots); mark-priced to match
-    // assess_margin's funding term ().
-    let notional_u128 = (position.size_lots as u128)
-        .checked_mul(mark_price_ticks as u128)
-        .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?
-        .checked_mul(tick_size as u128)
-        .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
-    require!(
-        notional_u128 <= u64::MAX as u128,
-        CloberError::ArithmeticOverflow
-    );
-    let notional = notional_u128 as u64;
-
+    // Price-weighted index: the crank already folded the funding notional-per-lot
+    // (mark × tick) into the index, so the charge is size × Δindex with NO
+    // settle-time price multiply — that is what makes funding independent of when
+    // this position is settled.
     let is_long = position.side == 0;
     let owed_i128 = funding_owed(
         is_long,
-        notional,
+        position.size_lots,
         market_cum_funding_index,
         position.cum_funding_index(),
     )?;
@@ -23239,8 +23208,7 @@ mod realized_pnl_routing_tests {
         let market_index: i128 = 1 << 60; // non-zero funding accrued since entry
         let (col0, res0) = (ts.collateral_quote_lots as i128, residual as i128);
 
-        let owed = settle_position_funding(market_index, 1000, 1, &mut pos, &mut ts, &mut residual)
-            .unwrap();
+        let owed = settle_position_funding(market_index, &mut pos, &mut ts, &mut residual).unwrap();
         assert_eq!(
             pos.cum_funding_index(),
             market_index,
@@ -23255,8 +23223,7 @@ mod realized_pnl_routing_tests {
         // Idempotent: anchor now == market_index, so a second call settles 0.
         let (colp, resp) = (ts.collateral_quote_lots, residual);
         let owed2 =
-            settle_position_funding(market_index, 1000, 1, &mut pos, &mut ts, &mut residual)
-                .unwrap();
+            settle_position_funding(market_index, &mut pos, &mut ts, &mut residual).unwrap();
         assert_eq!(
             owed2, 0,
             "already settled to this index → no further charge"

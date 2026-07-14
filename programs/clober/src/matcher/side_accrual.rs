@@ -31,7 +31,7 @@
 //! sub-second tick.
 //!
 //! Scaling conventions: `USD_UNIT = 10^6`, `BPS_DENOM = 10^4`,
-//! `FUNDING_INDEX_FRACTIONAL_BITS = 64`.
+//! `FUNDING_INDEX_FRACTIONAL_BITS = 16` (price-weighted funding index).
 
 /// Multiplier denominator for `A`. Starting value of every side is
 /// `ADL_ONE`; reductions scale all opposing positions pro-rata.

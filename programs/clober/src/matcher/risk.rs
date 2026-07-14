@@ -406,18 +406,13 @@ pub fn assess_margin(
                 m.paper_profit_haircut_bps,
             ))
             .or_overflow()?;
-        let notional = (pos.size_lots as u128)
-            .checked_mul(m.mark_price.0 as u128)
-            .or_overflow()?
-            .checked_mul(m.tick_size as u128)
-            .or_overflow()?;
-        if notional > u64::MAX as u128 {
-            return Err(error!(CloberError::ArithmeticOverflow));
-        }
+        // Price-weighted funding index: the crank folded the notional-per-lot in,
+        // so the funding term is size × Δindex with no settle-time mark multiply
+        // (matches settle_position_funding).
         funding_total = funding_total
             .checked_add(funding_owed(
                 pos.side == Side::Long,
-                notional as u64,
+                pos.size_lots,
                 m.cum_funding_index,
                 pos.cum_funding_index_at_entry,
             )?)
