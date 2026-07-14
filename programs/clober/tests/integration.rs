@@ -2170,6 +2170,153 @@ async fn send_capture(
 }
 
 #[tokio::test]
+async fn set_market_stress_tier_gates_leverage_by_backstop() {
+    use solana_sdk::account::Account as SolAccount;
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // mark=100_000
+    let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
+
+    // Patch the market so a nonzero tier is admissible: mm=300 (≥ tier shock),
+    // im=600, a HARD OI cap of 10 base-lots. mark=100_000, tick=1 ⇒ OI-cap
+    // notional = 10·100_000·1 = 1_000_000. Tail 30%, mm 3% ⇒ gap 2700 bps ⇒
+    // worst gap loss = 1_000_000·2700/10_000 = 270_000.
+    let acc = ctx
+        .banks_client
+        .get_account(market_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut m: MarketAccount = MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+    m.params.maintenance_margin_ratio_bps = 300;
+    m.params.initial_margin_ratio_bps = 600;
+    m.params.max_oi_base_lots = 10;
+    let mut md = Vec::new();
+    m.try_serialize(&mut md).unwrap();
+    md.resize(acc.data.len(), 0);
+    ctx.set_account(
+        &market_pda,
+        &SolAccount {
+            lamports: acc.lamports,
+            data: md,
+            owner: acc.owner,
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    async fn patch_fund(ctx: &mut solana_program_test::ProgramTestContext, fund: Pubkey, bal: u64) {
+        use solana_sdk::account::Account as SolAccount;
+        let a = ctx.banks_client.get_account(fund).await.unwrap().unwrap();
+        let mut f =
+            clober::state::InsuranceFundAccount::try_deserialize(&mut a.data.as_slice()).unwrap();
+        f.balance_quote_lots = bal;
+        let mut d = Vec::new();
+        f.try_serialize(&mut d).unwrap();
+        d.resize(a.data.len(), 0);
+        ctx.set_account(
+            &fund,
+            &SolAccount {
+                lamports: a.lamports,
+                data: d,
+                owner: a.owner,
+                executable: a.executable,
+                rent_epoch: a.rent_epoch,
+            }
+            .into(),
+        );
+    }
+
+    let tier_ix = |shock: u32, tail: u32| {
+        build_ix(
+            clober::instruction::SetMarketStressTier {
+                worst_shock_bps: shock,
+                backstop_tail_bps: tail,
+            },
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true), // authority
+                AccountMeta::new(market_pda, false),
+                AccountMeta::new_readonly(insurance_fund, false),
+            ],
+        )
+    };
+    async fn send(
+        ctx: &mut solana_program_test::ProgramTestContext,
+        ix: Instruction,
+        payer: &Keypair,
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        // Advance to a FRESH blockhash each send. Steps (3) and (4) submit the
+        // identical `tier_ix(300, 3000)`; with a reused blockhash the second tx
+        // would carry the same signature as the already-processed first and be
+        // rejected as a duplicate (AlreadyProcessed), an ordering-dependent flake.
+        // A new blockhash makes every tx signature unique and the test
+        // deterministic.
+        let bh = ctx
+            .get_new_latest_blockhash()
+            .await
+            .unwrap_or(ctx.last_blockhash);
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&payer.pubkey()),
+                &[payer],
+                bh,
+            ))
+            .await
+    }
+
+    // (1) Below the stress floor ⇒ OutOfRange (1003 ⇒ Custom 7003).
+    let e = send(&mut ctx, tier_ix(100, 3000), &payer)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e:?}").contains("Custom(7003)"),
+        "shock<MIN must reject: {e:?}"
+    );
+
+    // (2) Tail below the black-swan floor ⇒ BackstopTailTooLow (1405 ⇒ 7405).
+    let e = send(&mut ctx, tier_ix(300, 2000), &payer)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e:?}").contains("Custom(7405)"),
+        "tail<30% must reject: {e:?}"
+    );
+
+    // (3) Backstop uncovered: insurance 269_999 < worst gap loss 270_000 ⇒
+    //     StressTierUncovered (1404 ⇒ 7404).
+    patch_fund(&mut ctx, insurance_fund, 269_999).await;
+    let e = send(&mut ctx, tier_ix(300, 3000), &payer)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e:?}").contains("Custom(7404)"),
+        "uncovered must reject: {e:?}"
+    );
+
+    // (4) Fund exactly covers ⇒ succeeds; fields are written.
+    patch_fund(&mut ctx, insurance_fund, 270_000).await;
+    send(&mut ctx, tier_ix(300, 3000), &payer)
+        .await
+        .expect("covered tier must be accepted");
+    let m2: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m2.stress_shock_bps, 300);
+    assert_eq!(m2.backstop_tail_bps, 3000);
+    assert_eq!(m2.effective_stress_shock_bps(), 300);
+
+    // (5) Off-switch (0, 0) ⇒ reverts to full legacy; always accepted.
+    send(&mut ctx, tier_ix(0, 0), &payer)
+        .await
+        .expect("off-switch must always be accepted");
+    let m3: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m3.stress_shock_bps, 0);
+    assert_eq!(m3.backstop_tail_bps, 0);
+    assert_eq!(m3.effective_stress_shock_bps(), 3000); // legacy ±30%
+}
+
+#[tokio::test]
 async fn d19_reconciler_rebuilds_collateral_and_funding_from_events() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
@@ -16638,9 +16785,11 @@ async fn create_permissionless_market_rejects_out_of_envelope_params() {
         .await
         .unwrap();
 
-    // 50x leverage is outside the HIP-3 envelope (max 10x) → OutOfRange (7003).
+    // 100x leverage is outside the HIP-3 envelope (max HIP3_MAX_LEVERAGE=65) →
+    // OutOfRange (7003). (The per-market maintenance floor still binds below this
+    // ceiling; the ceiling itself rejects an absurd advertised leverage.)
     let mut bad = hip3_valid_params();
-    bad.max_leverage = 50;
+    bad.max_leverage = 100;
     let (_market, ix) = create_perm_market_ix(&creator, &protocol, bad).await;
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let err = ctx
@@ -16655,7 +16804,7 @@ async fn create_permissionless_market_rejects_out_of_envelope_params() {
         .unwrap_err();
     assert!(
         format!("{err:?}").contains("Custom(7003)"),
-        "predatory (50x) params must be rejected by the HIP-3 envelope, got: {err:?}"
+        "predatory (100x) params must be rejected by the HIP-3 envelope, got: {err:?}"
     );
 
     // Funding is a predatory lever too: a hostile creator must not be able to

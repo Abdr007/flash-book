@@ -4443,6 +4443,7 @@ pub mod clober {
                         .oi_mmr_slope_bps_per_million_lots,
                     oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
                     paper_profit_haircut_bps: market_acct.paper_profit_haircut_bps,
+                    stress_shock_bps: market_acct.stress_shock_bps,
                 });
                 market_keys.push(market_ai.key());
             }
@@ -5099,6 +5100,7 @@ pub mod clober {
                 oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: market.paper_profit_haircut_bps,
+                stress_shock_bps: market.stress_shock_bps,
             });
             market_keys.push(m_ai.key());
             i += 2;
@@ -5142,6 +5144,7 @@ pub mod clober {
                 .oi_mmr_slope_bps_per_million_lots,
             oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: target_market.paper_profit_haircut_bps,
+            stress_shock_bps: target_market.stress_shock_bps,
         });
         market_keys.push(target_market_key);
 
@@ -5304,6 +5307,7 @@ pub mod clober {
                 oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: market.paper_profit_haircut_bps,
+                stress_shock_bps: market.stress_shock_bps,
             });
             market_keys.push(m_ai.key());
             i += 2;
@@ -5345,6 +5349,7 @@ pub mod clober {
                     .oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: target_market.paper_profit_haircut_bps,
+                stress_shock_bps: target_market.stress_shock_bps,
             });
             market_keys.push(target_market_key);
         }
@@ -7470,6 +7475,120 @@ pub mod clober {
         Ok(())
     }
 
+    /// Calibrate a market's per-asset stress tier (Phase 1). Sets the margin
+    /// `stress_shock_bps` (scales the margin lattice ⇒ tiered leverage) and the
+    /// `backstop_tail_bps` (the black-swan gap the insurance fund underwrites).
+    /// Authority-only, bounded, opt-in, and REVERSIBLE (both 0 ⇒ full legacy
+    /// ±30% margin + 30% tail, the off-switch).
+    ///
+    /// Validated BEFORE any write, so leverage never outruns the fund:
+    ///   1. a nonzero tier meets the calibration floor (`>= MIN_STRESS_SHOCK_BPS`);
+    ///   2. the tail underwrites a true black swan AND exceeds the margin shock
+    ///      (`eff_tail >= max(3000, eff_shock)`) ⇒ the backstop gap is never
+    ///      vacuous (`BackstopTailTooLow` otherwise);
+    ///   3. the market's mm/im still satisfy `hip3_core_bounds_ok` for the new
+    ///      (tighter) maintenance floor — IM ≥ MM ≥ shock;
+    ///   4. the fund covers the worst tail-gap loss over the market's HARD OI cap
+    ///      (`worst_gap_loss_exceeds_insurance` is false) — a tiered market MUST
+    ///      cap OI (`max_oi_base_lots > 0`) so the backstop is finite.
+    pub fn set_market_stress_tier(
+        ctx: Context<SetMarketStressTier>,
+        worst_shock_bps: u32,
+        backstop_tail_bps: u32,
+    ) -> Result<()> {
+        let insurance_balance = ctx.accounts.insurance_fund.balance_quote_lots;
+        let market = &mut ctx.accounts.market;
+        require_keys_eq!(
+            market.authority,
+            ctx.accounts.authority.key(),
+            CloberError::Unauthorized
+        );
+
+        let mm = market.params.maintenance_margin_ratio_bps;
+        let im = market.params.initial_margin_ratio_bps;
+        let max_lev = market.params.max_leverage;
+
+        // Off-switch: (0, 0) ⇒ full legacy (±30% margin lattice + 30% tail).
+        if worst_shock_bps == 0 && backstop_tail_bps == 0 {
+            market.stress_shock_bps = 0;
+            market.backstop_tail_bps = 0;
+            emit!(MarketStressTierSetEvent {
+                market: market.key(),
+                worst_shock_bps: 0,
+                backstop_tail_bps: 0,
+                mm_bps: mm,
+                im_bps: im,
+                max_leverage: max_lev,
+                insurance_balance,
+                worst_gap_loss: 0,
+            });
+            return Ok(());
+        }
+
+        // (1) calibration floor for a nonzero margin tier.
+        if worst_shock_bps != 0 {
+            require!(
+                worst_shock_bps >= constants::MIN_STRESS_SHOCK_BPS,
+                CloberError::OutOfRange
+            );
+        }
+        let eff_shock = if worst_shock_bps == 0 {
+            constants::LEGACY_STRESS_SHOCK_BPS
+        } else {
+            worst_shock_bps
+        };
+        let eff_tail = if backstop_tail_bps == 0 {
+            constants::LEGACY_STRESS_SHOCK_BPS
+        } else {
+            backstop_tail_bps
+        };
+
+        // (2) tail underwrites a true black swan AND exceeds the margin shock ⇒
+        // gap (tail − MM) strictly positive ⇒ backstop never vacuous.
+        require!(
+            eff_tail >= constants::LEGACY_STRESS_SHOCK_BPS && eff_tail >= eff_shock,
+            CloberError::BackstopTailTooLow
+        );
+
+        // (3) params consistent with the new maintenance floor (IM ≥ MM ≥ shock).
+        require!(
+            hip3_core_bounds_ok(max_lev, mm, im, eff_shock),
+            CloberError::OutOfRange
+        );
+
+        // (4) fund covers the worst tail gap over the market's HARD OI cap.
+        require!(market.params.max_oi_base_lots > 0, CloberError::OutOfRange);
+        let oi_cap_notional = (market.params.max_oi_base_lots as u128)
+            .saturating_mul(market.mark_price_ticks as u128)
+            .saturating_mul(market.params.tick_size as u128);
+        require!(
+            !xmargin::worst_gap_loss_exceeds_insurance(
+                oi_cap_notional,
+                eff_tail,
+                mm,
+                insurance_balance
+            ),
+            CloberError::StressTierUncovered
+        );
+        let gap = xmargin::tail_gap_bps(eff_tail, mm) as u128;
+        let worst_gap_loss = (oi_cap_notional.saturating_mul(gap) / constants::BPS_DENOM as u128)
+            .min(u64::MAX as u128) as u64;
+
+        market.stress_shock_bps = worst_shock_bps;
+        market.backstop_tail_bps = backstop_tail_bps;
+        emit!(MarketStressTierSetEvent {
+            market: market.key(),
+            worst_shock_bps,
+            backstop_tail_bps,
+            mm_bps: mm,
+            im_bps: im,
+            max_leverage: max_lev,
+            insurance_balance,
+            worst_gap_loss,
+        });
+        Ok(())
+    }
+
     /// Set (or clear) the market's emergency guardian
     /// — a key that may only RESTRICT market status (pause/post-only/close), never
     /// loosen (see `set_market_status`). Authority-only. `Pubkey::default()` clears
@@ -8275,6 +8394,7 @@ pub mod clober {
                 oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: market.paper_profit_haircut_bps,
+                stress_shock_bps: market.stress_shock_bps,
             });
         }
         if !snaps.is_empty() {
@@ -8416,6 +8536,7 @@ pub mod clober {
                     .oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: markets[i].params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: markets[i].paper_profit_haircut_bps,
+                stress_shock_bps: markets[i].stress_shock_bps,
             });
         }
         if !snaps.is_empty() {
@@ -8713,6 +8834,7 @@ pub mod clober {
                     .oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: market_acct.paper_profit_haircut_bps,
+                stress_shock_bps: market_acct.stress_shock_bps,
             });
             market_keys.push(market_ai.key());
         }
@@ -9870,6 +9992,7 @@ pub mod clober {
             oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
             oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: market.paper_profit_haircut_bps,
+            stress_shock_bps: market.stress_shock_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         // Unified dispatch: if position is isolated (pos_snap.collateral_quote_lots > 0),
@@ -10490,6 +10613,7 @@ pub mod clober {
             oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
             oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: market.paper_profit_haircut_bps,
+            stress_shock_bps: market.stress_shock_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         let assessment = assess_margin_unified_fn(
@@ -10870,6 +10994,7 @@ pub mod clober {
             oi_mmr_slope_bps_per_million_lots: exec_market.params.oi_mmr_slope_bps_per_million_lots,
             oi_mmr_max_extra_bps: exec_market.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: exec_market.paper_profit_haircut_bps,
+            stress_shock_bps: exec_market.stress_shock_bps,
         });
         position_snaps.push(RiskPosSnap {
             market: exec_position.market,
@@ -10962,6 +11087,7 @@ pub mod clober {
                 oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: market.paper_profit_haircut_bps,
+                stress_shock_bps: market.stress_shock_bps,
             });
             position_snaps.push(RiskPosSnap {
                 market: position.market,
@@ -14766,6 +14892,7 @@ fn partial_withdraw_core<'info>(
             oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
             oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: market.paper_profit_haircut_bps,
+            stress_shock_bps: market.stress_shock_bps,
         });
         market_keys.push(m_ai.key());
         i += 2;
@@ -17666,6 +17793,26 @@ pub struct UpdateMarketAuthority<'info> {
     pub market: Account<'info, MarketAccount>,
 }
 
+/// Accounts for `set_market_stress_tier`. The insurance fund is loaded (read-only)
+/// so the backstop gate can bound the new tier's worst gap loss by the fund's
+/// current balance. Market is Boxed (large account) to keep the frame off the
+/// 4 KiB BPF stack.
+#[derive(Accounts)]
+pub struct SetMarketStressTier<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+    )]
+    pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
+}
+
 /// `set_market_status` context. Auth is checked
 /// in-handler (authority OR guardian, with the restrict-only asymmetry). The
 /// guardian PDA is OPTIONAL — supplied for a guardian-restrict call, omitted for an
@@ -19660,6 +19807,22 @@ pub struct HaircutDustFlushedEvent {
 pub struct PositionHaircutInitializedEvent {
     pub market: Pubkey,
     pub position: Pubkey,
+}
+
+/// `set_market_stress_tier` calibrated a market's per-asset stress tier and
+/// backstop tail. `worst_gap_loss` is the fund draw the tier is proven to be
+/// covered against (`OI_cap × max(0, tail − MM) / BPS`); `0` shocks/tail = the
+/// legacy ±30% off-switch.
+#[event]
+pub struct MarketStressTierSetEvent {
+    pub market: Pubkey,
+    pub worst_shock_bps: u32,
+    pub backstop_tail_bps: u32,
+    pub mm_bps: u32,
+    pub im_bps: u32,
+    pub max_leverage: u32,
+    pub insurance_balance: u64,
+    pub worst_gap_loss: u64,
 }
 
 #[event]
@@ -22076,10 +22239,20 @@ fn hash_params(p: &MarketParams) -> Result<[u8; 32]> {
 /// so the true max leverage `BPS/IM ≤ max_leverage ≤ HIP3_MAX_LEVERAGE`). The
 /// `u32 → u64` widen makes the product overflow-free.
 #[inline]
-fn hip3_core_bounds_ok(max_leverage: u32, mm_bps: u32, im_bps: u32) -> bool {
+fn hip3_core_bounds_ok(max_leverage: u32, mm_bps: u32, im_bps: u32, worst_shock_bps: u32) -> bool {
     use constants::*;
+    // Maintenance floor (decision A): a LEGACY, un-tiered market (worst_shock == 0)
+    // keeps the flat 5% floor. A TIERED market ties its maintenance floor to its
+    // calibrated stress shock — mm ≥ max(shock, MIN_MM_ABS). Combined with
+    // im ≥ mm this gives im ≥ mm ≥ shock (theorem T2), so a position is
+    // liquidatable exactly when a worst-shock move would breach it.
+    let mm_floor = if worst_shock_bps == 0 {
+        HIP3_MIN_MAINTENANCE_MARGIN_BPS
+    } else {
+        worst_shock_bps.max(MIN_MM_ABS_BPS)
+    };
     (1..=HIP3_MAX_LEVERAGE).contains(&max_leverage)
-        && mm_bps >= HIP3_MIN_MAINTENANCE_MARGIN_BPS
+        && mm_bps >= mm_floor
         && im_bps >= mm_bps
         && (im_bps as u64) * (max_leverage as u64) >= BPS_DENOM as u64
 }
@@ -22100,6 +22273,10 @@ fn validate_hip3_params(p: &MarketParams) -> Result<()> {
             p.max_leverage,
             p.maintenance_margin_ratio_bps,
             p.initial_margin_ratio_bps,
+            // Creation is un-tiered (stress_shock_bps defaults to 0 ⇒ legacy 5%
+            // MM floor). A calibrated tier is opted into later via
+            // set_market_stress_tier, which re-checks these bounds for the new shock.
+            0,
         ),
         CloberError::OutOfRange
     );
@@ -22585,6 +22762,7 @@ fn assert_cross_portfolio_intake_im(
             oi_mmr_slope_bps_per_million_lots: market_acct.params.oi_mmr_slope_bps_per_million_lots,
             oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: market_acct.paper_profit_haircut_bps,
+            stress_shock_bps: market_acct.stress_shock_bps,
         });
         market_keys.push(position.market);
     }
@@ -22619,6 +22797,7 @@ fn assert_cross_portfolio_intake_im(
         oi_mmr_slope_bps_per_million_lots: target_market.params.oi_mmr_slope_bps_per_million_lots,
         oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
         paper_profit_haircut_bps: target_market.paper_profit_haircut_bps,
+        stress_shock_bps: target_market.stress_shock_bps,
     });
     market_keys.push(*target_market_key);
 
@@ -24804,11 +24983,39 @@ mod hip3_kani_proofs {
         let max_lev: u32 = kani::any();
         let mm: u32 = kani::any();
         let im: u32 = kani::any();
-        if hip3_core_bounds_ok(max_lev, mm, im) {
+        // Legacy (un-tiered) envelope: flat 5% maintenance floor, unchanged.
+        if hip3_core_bounds_ok(max_lev, mm, im, 0) {
             assert!((1..=HIP3_MAX_LEVERAGE).contains(&max_lev));
             assert!(mm >= HIP3_MIN_MAINTENANCE_MARGIN_BPS);
             assert!(im >= mm);
             assert!(im >= HIP3_MIN_MAINTENANCE_MARGIN_BPS);
+            assert!((im as u64) * (max_lev as u64) >= BPS_DENOM as u64);
+        }
+    }
+
+    /// PHASE 1 (T2): for a TIERED market, whenever the bound accepts the params
+    /// the initial margin is ≥ the calibrated worst shock AND ≥ the absolute MM
+    /// floor — so a position is margined to survive a worst-shock move and is
+    /// liquidatable exactly when one would breach it (decision A). Proven for ALL
+    /// `(max_leverage, mm, im, shock)`; also confirms the leverage/IM product is
+    /// overflow-free and the ceiling holds.
+    #[kani::proof]
+    fn tiered_im_covers_worst_shock() {
+        let max_lev: u32 = kani::any();
+        let mm: u32 = kani::any();
+        let im: u32 = kani::any();
+        let shock: u32 = kani::any();
+        if hip3_core_bounds_ok(max_lev, mm, im, shock) {
+            assert!((1..=HIP3_MAX_LEVERAGE).contains(&max_lev));
+            assert!(im >= mm);
+            if shock == 0 {
+                assert!(mm >= HIP3_MIN_MAINTENANCE_MARGIN_BPS);
+            } else {
+                // MM ≥ max(shock, MIN_MM_ABS) ⇒ IM ≥ MM ≥ shock and ≥ MIN_MM_ABS.
+                assert!(mm >= shock);
+                assert!(mm >= MIN_MM_ABS_BPS);
+                assert!(im >= shock);
+            }
             assert!((im as u64) * (max_lev as u64) >= BPS_DENOM as u64);
         }
     }
