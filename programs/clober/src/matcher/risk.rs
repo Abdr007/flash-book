@@ -92,6 +92,14 @@ pub struct MarketSnapshot {
     /// snapshot is stressed at full strength, never zero. Populate from
     /// `MarketAccount::stress_shock_bps` (raw; the scaler resolves 0 → 3000).
     pub stress_shock_bps: u32,
+    /// Phase 3 cross-asset offset — correlation group id (`0` = no group = no
+    /// offset). Markets sharing a non-zero group id net opposing worst-case
+    /// losses by the group's (minimum) `corr_rho_bps`. Populate from
+    /// `MarketAccount::corr_group_id`.
+    pub corr_group_id: u16,
+    /// Phase 3 — this market's correlation with its group, in bps (`0..=BPS`,
+    /// `0` = no offset). Populate from `MarketAccount::corr_rho_bps`.
+    pub corr_rho_bps: u16,
 }
 
 /// 3.1: apply a market's paper-profit haircut to a signed unrealized-PnL figure.
@@ -305,6 +313,105 @@ mod stress_scaler_tests {
             proptest::prelude::prop_assert!(n_lo <= n_hi);
         }
 
+        /// PHASE 3 offset relief matches the exact formula and RESPECTS THE CAP:
+        /// `offset_relief_le_cap(rho, min) == min(min, rho·min/BPS)` and is always
+        /// `≤ min` — even for a pathological `rho > BPS` (the `.min` caps it), so
+        /// required can never drop below the correlated worst-case. Exercises the
+        /// REAL fn (the rho·min/BPS product is a symbolic multiply CBMC can't
+        /// discharge — Law 5). rho 0 ⇒ 0 relief (off-switch).
+        #[test]
+        fn offset_relief_within_cap_proptest(
+            rho in proptest::prelude::any::<u16>(),
+            min_du in proptest::prelude::any::<u128>(),
+        ) {
+            let relief = super::offset_relief_le_cap(rho, min_du);
+            proptest::prelude::prop_assert!(relief <= min_du);
+            let exact = min_du
+                .saturating_mul(rho as u128)
+                .checked_div(crate::constants::BPS_DENOM as u128)
+                .unwrap_or(0)
+                .min(min_du);
+            proptest::prelude::prop_assert_eq!(relief, exact);
+            if rho == 0 {
+                proptest::prelude::prop_assert_eq!(relief, 0u128);
+            }
+        }
+
+        /// PHASE 3 relief is MONOTONE in rho — a higher correlation grants no LESS
+        /// relief (and, capped, never more than the nettable overlap). Guarantees
+        /// the setter's rho knob behaves and can't be gamed to over-relieve.
+        #[test]
+        fn offset_relief_monotone_in_rho(
+            r1 in proptest::prelude::any::<u16>(),
+            r2 in proptest::prelude::any::<u16>(),
+            min_du in proptest::prelude::any::<u128>(),
+        ) {
+            let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+            let rl = super::offset_relief_le_cap(lo, min_du);
+            let rh = super::offset_relief_le_cap(hi, min_du);
+            proptest::prelude::prop_assert!(rl <= rh);
+        }
+
+        /// PHASE 3 END-TO-END one-sided soundness on the REAL `assess_margin`: for a
+        /// hedged 2-market book (long A, short B, same correlation group), the
+        /// offset-adjusted required (a) never EXCEEDS the no-offset (decorrelated)
+        /// required, and (b) never drops below the worst SINGLE leg's requirement
+        /// — you always margin at least the bigger leg, even fully hedged. Since
+        /// max(D,U) ≥ |D−U| = the fully-correlated joint worst, (b) is a strictly
+        /// stronger floor than the correlated worst-case. Exercises the whole
+        /// grouped decomposition + `offset_relief_le_cap` on real data.
+        #[test]
+        fn cross_offset_assess_margin_one_sided_sound(
+            sz_a in 1u64..=50_000u64,
+            sz_b in 1u64..=50_000u64,
+            entry in 50_000u64..=150_000u64,
+            rho in 0u16..=10_000u16,
+        ) {
+            let a = Pubkey::new_from_array([1u8; 32]);
+            let b = Pubkey::new_from_array([2u8; 32]);
+            let mk = |m: Pubkey, group: u16, r: u16| MarketSnapshot {
+                market: m,
+                mark_price: Ticks(entry),
+                cum_funding_index: 0,
+                maintenance_margin_bps: 500,
+                tick_size: 1,
+                concentration_threshold_lots: 0,
+                concentration_extra_mmr_bps: 0,
+                side_oi_lots: 0,
+                oi_mmr_slope_bps_per_million_lots: 0,
+                oi_mmr_max_extra_bps: 0,
+                paper_profit_haircut_bps: 0,
+                stress_shock_bps: 0,
+                corr_group_id: group,
+                corr_rho_bps: r,
+            };
+            let pos = |m: Pubkey, side: Side, sz: u64| PositionSnapshot {
+                market: m,
+                side,
+                size_lots: sz,
+                entry_price: Ticks(entry),
+                cum_funding_index_at_entry: 0,
+                collateral_quote_lots: 0,
+            };
+            let positions = [pos(a, Side::Long, sz_a), pos(b, Side::Short, sz_b)];
+            let scen = default_scenarios(&[a, b]);
+            let req_on = assess_margin(&positions, &[mk(a, 1, rho), mk(b, 1, rho)], &scen, 0)
+                .map(|x| x.required_quote_lots);
+            let req_off = assess_margin(&positions, &[mk(a, 0, 0), mk(b, 0, 0)], &scen, 0)
+                .map(|x| x.required_quote_lots);
+            let req_a = assess_margin(&[positions[0]], &[mk(a, 0, 0)], &default_scenarios(&[a]), 0)
+                .map(|x| x.required_quote_lots);
+            let req_b = assess_margin(&[positions[1]], &[mk(b, 0, 0)], &default_scenarios(&[b]), 0)
+                .map(|x| x.required_quote_lots);
+            if let (Ok(on), Ok(off), Ok(ra), Ok(rb)) = (req_on, req_off, req_a, req_b) {
+                proptest::prelude::prop_assert!(on <= off, "offset must never raise required");
+                proptest::prelude::prop_assert!(
+                    on >= ra.max(rb),
+                    "offset must never drop below the worst single leg (correlated-worst floor)"
+                );
+            }
+        }
+
         /// PHASE 2: `assess_margin.required_quote_lots` is NON-DECREASING in
         /// position size (all else equal). This is the monotonicity that makes the
         /// minimal-close cap sound: closing lots lowers required, so meeting the
@@ -334,6 +441,8 @@ mod stress_scaler_tests {
                 oi_mmr_max_extra_bps: 0,
                 paper_profit_haircut_bps: 0,
                 stress_shock_bps: 0,
+                corr_group_id: 0,
+                corr_rho_bps: 0,
             };
             let possnap = |size: u64| PositionSnapshot {
                 market: mkt,
@@ -419,6 +528,8 @@ mod stress_scaler_tests {
             oi_mmr_max_extra_bps: 1_000,
             paper_profit_haircut_bps: 0,
             stress_shock_bps: 0,
+            corr_group_id: 0,
+            corr_rho_bps: 0,
         };
         assert_eq!(snap.effective_mmr_bps(2_000), 200);
         // Below the concentration threshold the extra drops out.
@@ -557,6 +668,23 @@ fn scale_shock(base_bps: i32, eff_shock_bps: u32) -> i32 {
 
 fn lookup_market<'a>(markets: &'a [MarketSnapshot], pk: &Pubkey) -> Option<&'a MarketSnapshot> {
     markets.iter().find(|m| m.market == *pk)
+}
+
+/// Phase 3 cross-asset offset relief for ONE correlation group. `min_du` is
+/// `min(D, U)` — the smaller of the group's summed net-long (down-adverse) vs
+/// net-short (up-adverse) worst-case losses, i.e. the nettable overlap. Relief
+/// is `min(min_du, rho_bps · min_du / BPS)`. The trailing `min` CAP is the
+/// soundness keystone: it forces `relief ≤ min_du` for ANY `rho_bps` (even a
+/// pathological `> BPS`), so `required = decorr − Σrelief ≥ decorr − Σmin_du ≥
+/// Σ max(D,U) ≥ Σ |D−U|` = the fully-correlated joint worst-case. Saturating; the
+/// `rho·min/BPS ≤ min` step (⟺ rho ≤ BPS) is a symbolic product host-pinned by
+/// `offset_relief_within_cap_proptest`; the `relief ≤ min_du` CAP and its
+/// downstream floor are Kani-proven in `offset_relief_respects_cap` /
+/// `cross_offset_never_below_correlated_worst`.
+#[inline]
+pub fn offset_relief_le_cap(rho_bps: u16, min_du: u128) -> u128 {
+    let scaled = min_du.saturating_mul(rho_bps as u128) / (BPS_DENOM as u128);
+    scaled.min(min_du)
 }
 
 fn shock_for_market(scenario: &Scenario, market: &Pubkey) -> i32 {
@@ -700,20 +828,83 @@ pub fn assess_margin(
         }
     }
 
-    // required = Σ_market max(worst_market_loss_m, 0). A market whose worst case
-    // is still a net gain contributes 0 (never a negative that offsets another
-    // market's loss).
-    let mut worst_loss: u64 = 0;
-    for (_, w) in market_worst {
-        if w > 0 {
-            let add = if w > u64::MAX as i128 {
-                u64::MAX
-            } else {
-                w as u64
-            };
-            worst_loss = worst_loss.saturating_add(add);
+    // Decorrelated base = Σ_market max(worst_market_loss_m, 0). A market whose
+    // worst case is still a net gain contributes 0 (never a negative that
+    // offsets another market's loss).
+    //
+    // Phase 3 cross-asset offset credit: the decorrelated sum OVER-margins a
+    // hedged/correlated book (it charges every market's worst independently — all
+    // markets hitting their worst in OPPOSITE directions at once). Within a
+    // correlation GROUP, net the opposing worst-case losses by the group's
+    // MINIMUM rho:
+    //   D_G = Σ worst over net-LONG markets (down-adverse),
+    //   U_G = Σ worst over net-SHORT markets (up-adverse),
+    //   relief_G = offset_relief_le_cap(rho_G, min(D_G,U_G))  (≤ min(D_G,U_G)),
+    //   required = Σ_all worst − Σ_G relief_G   (saturating; ≥ 0).
+    // Because relief_G ≤ min(D_G,U_G), required ≥ Σ_G max(D_G,U_G) ≥ Σ_G |D_G−U_G|
+    // = the fully-correlated joint worst — ONE-SIDED SOUND (never below the true
+    // correlated worst-case) while ≤ the decorrelated sum. group 0 / rho 0 ⇒ no
+    // offset (byte-identical to legacy).
+    let mut decorr: u64 = 0;
+    // Active correlation groups: (group_id, D, U, rho_min).
+    let mut groups: Vec<(u16, u64, u64, u16)> = Vec::new();
+    for (mk, w) in &market_worst {
+        if *w <= 0 {
+            continue;
+        }
+        let loss = if *w > u64::MAX as i128 {
+            u64::MAX
+        } else {
+            *w as u64
+        };
+        decorr = decorr.saturating_add(loss);
+        let (gid, rho) = lookup_market(markets, mk)
+            .map(|s| (s.corr_group_id, s.corr_rho_bps))
+            .unwrap_or((0, 0));
+        if gid == 0 || rho == 0 {
+            continue; // ungrouped / no correlation ⇒ no offset
+        }
+        // Net position direction on this market (Σ size·side); net-long is
+        // down-adverse (→ D), net-short is up-adverse (→ U).
+        let net: i128 = positions
+            .iter()
+            .filter(|p| p.market == *mk)
+            .map(|p| {
+                if p.side == Side::Long {
+                    p.size_lots as i128
+                } else {
+                    -(p.size_lots as i128)
+                }
+            })
+            .sum();
+        let is_net_long = net >= 0;
+        match groups.iter_mut().find(|(g, ..)| *g == gid) {
+            Some((_, d, u, r)) => {
+                if is_net_long {
+                    *d = d.saturating_add(loss);
+                } else {
+                    *u = u.saturating_add(loss);
+                }
+                *r = (*r).min(rho); // group rho = MIN across members (fail-safe)
+            }
+            None => {
+                let (d, u) = if is_net_long { (loss, 0) } else { (0, loss) };
+                groups.push((gid, d, u, rho));
+            }
         }
     }
+    let mut total_relief: u64 = 0;
+    for (_, d, u, rho) in &groups {
+        let min_du = (*d).min(*u) as u128;
+        let relief = offset_relief_le_cap(*rho, min_du);
+        let relief_u64 = if relief > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            relief as u64
+        };
+        total_relief = total_relief.saturating_add(relief_u64);
+    }
+    let worst_loss: u64 = decorr.saturating_sub(total_relief);
 
     // Healthy iff the trader's available collateral covers the worst-case
     // stressed loss. Gate on `collateral − funding`, NOT
@@ -1089,6 +1280,8 @@ mod isolated_margin_tests {
             oi_mmr_max_extra_bps: 0,
             paper_profit_haircut_bps: 0,
             stress_shock_bps: 0,
+            corr_group_id: 0,
+            corr_rho_bps: 0,
         };
         (pk, m)
     }
@@ -1201,6 +1394,42 @@ mod mmr_kani_proofs {
     use crate::matcher::lot::Ticks;
     use anchor_lang::prelude::Pubkey;
 
+    /// PHASE 3 offset CAP (structural): the per-group relief is `scaled.min(min_du)`,
+    /// so it is ALWAYS ≤ `min_du` regardless of `scaled` — the keystone that keeps
+    /// required ≥ the correlated worst-case. Proven over the `min` alone (no
+    /// multiply); the interior `scaled = rho·min/BPS` is a symbolic product host-
+    /// pinned by `offset_relief_within_cap_proptest`, and `rho = 0 ⇒ scaled = 0 ⇒
+    /// relief 0` is likewise host-pinned (`offset_disabled_gives_zero_relief`).
+    #[kani::proof]
+    fn offset_relief_respects_cap() {
+        let scaled: u128 = kani::any();
+        let min_du: u128 = kani::any();
+        let relief = scaled.min(min_du);
+        assert!(relief <= min_du);
+    }
+
+    /// PHASE 3 ONE-SIDED SOUNDNESS: given ANY per-group relief that respects the
+    /// cap (`relief ≤ min(D,U)`, proven above), the offset-adjusted required never
+    /// drops below the correlated worst-case. For one group plus ungrouped losses
+    /// `other`: `required = (D+U+other) − relief`; since `relief ≤ min(D,U)`,
+    /// `required ≥ max(D,U) + other ≥ |D−U| + other` = the fully-correlated joint
+    /// worst-case. And `required ≤ D+U+other` (the decorrelated sum). Pure
+    /// additions/comparisons — no multiply, CBMC-tractable.
+    #[kani::proof]
+    fn cross_offset_never_below_correlated_worst() {
+        let d: u64 = kani::any();
+        let u: u64 = kani::any();
+        let other: u64 = kani::any();
+        let min_du = d.min(u);
+        let relief: u64 = kani::any();
+        kani::assume(relief <= min_du);
+        let decorr = (d as u128) + (u as u128) + (other as u128);
+        let required = decorr - relief as u128; // relief ≤ min_du ≤ decorr ⇒ no underflow
+        let corr_worst = (d.max(u) as u128) - (d.min(u) as u128) + (other as u128);
+        assert!(required >= corr_worst);
+        assert!(required <= decorr);
+    }
+
     /// PHASE 2: the partial-liquidation restore-target comparison is EXACT and
     /// MONOTONE over the whole domain (division-free). A larger required target
     /// can only make the position LESS likely to meet it; more equity only MORE
@@ -1279,6 +1508,8 @@ mod mmr_kani_proofs {
             oi_mmr_max_extra_bps: kani::any(),
             paper_profit_haircut_bps: 0,
             stress_shock_bps: 0,
+            corr_group_id: 0,
+            corr_rho_bps: 0,
         };
         let size_lots: u64 = kani::any();
         assert!(snap.effective_mmr_bps(size_lots) >= snap.maintenance_margin_bps);
@@ -1312,6 +1543,8 @@ mod assess_margin_frame_tests {
                 oi_mmr_max_extra_bps: 0,
                 paper_profit_haircut_bps: 0,
                 stress_shock_bps: 0,
+                corr_group_id: 0,
+                corr_rho_bps: 0,
             },
         )
     }
@@ -1428,6 +1661,8 @@ mod conservative_stress_rounding_tests {
             oi_mmr_max_extra_bps: 0,
             paper_profit_haircut_bps: 0,
             stress_shock_bps: 0,
+            corr_group_id: 0,
+            corr_rho_bps: 0,
         }
     }
 
@@ -1583,6 +1818,8 @@ mod assess_margin_real_symbol_kani_proofs {
             oi_mmr_max_extra_bps: 0,
             paper_profit_haircut_bps: 0,
             stress_shock_bps: 0,
+            corr_group_id: 0,
+            corr_rho_bps: 0,
         }
     }
 
@@ -1659,6 +1896,8 @@ mod high1_cross_market_regression {
             oi_mmr_max_extra_bps: 0,
             paper_profit_haircut_bps: 0,
             stress_shock_bps: 0,
+            corr_group_id: 0,
+            corr_rho_bps: 0,
         }
     }
 

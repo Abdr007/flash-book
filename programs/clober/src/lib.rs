@@ -4444,6 +4444,8 @@ pub mod clober {
                     oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
                     paper_profit_haircut_bps: market_acct.paper_profit_haircut_bps,
                     stress_shock_bps: market_acct.stress_shock_bps,
+                    corr_group_id: market_acct.corr_group_id,
+                    corr_rho_bps: market_acct.corr_rho_bps,
                 });
                 market_keys.push(market_ai.key());
             }
@@ -5101,6 +5103,8 @@ pub mod clober {
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: market.paper_profit_haircut_bps,
                 stress_shock_bps: market.stress_shock_bps,
+                corr_group_id: market.corr_group_id,
+                corr_rho_bps: market.corr_rho_bps,
             });
             market_keys.push(m_ai.key());
             i += 2;
@@ -5145,6 +5149,8 @@ pub mod clober {
             oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: target_market.paper_profit_haircut_bps,
             stress_shock_bps: target_market.stress_shock_bps,
+            corr_group_id: target_market.corr_group_id,
+            corr_rho_bps: target_market.corr_rho_bps,
         });
         market_keys.push(target_market_key);
 
@@ -5308,6 +5314,8 @@ pub mod clober {
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: market.paper_profit_haircut_bps,
                 stress_shock_bps: market.stress_shock_bps,
+                corr_group_id: market.corr_group_id,
+                corr_rho_bps: market.corr_rho_bps,
             });
             market_keys.push(m_ai.key());
             i += 2;
@@ -5350,6 +5358,8 @@ pub mod clober {
                 oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: target_market.paper_profit_haircut_bps,
                 stress_shock_bps: target_market.stress_shock_bps,
+                corr_group_id: target_market.corr_group_id,
+                corr_rho_bps: target_market.corr_rho_bps,
             });
             market_keys.push(target_market_key);
         }
@@ -7628,6 +7638,39 @@ pub mod clober {
         Ok(())
     }
 
+    /// Phase 3 — set (or clear) this market's cross-asset correlation. Markets
+    /// sharing a non-zero `corr_group_id` net their opposing worst-case losses by
+    /// the group's MINIMUM `corr_rho_bps`, lowering margin on hedged/correlated
+    /// books. Authority-only, bounded (`rho ≤ BPS`), reversible: `(0, 0)` ⇒ no
+    /// group, no offset (fully decorrelated — the off-switch). The offset is
+    /// provably ONE-SIDED SOUND — it can never drop required below the correlated
+    /// worst-case (see `offset_relief_le_cap` /
+    /// `cross_offset_never_below_correlated_worst`).
+    pub fn set_market_correlation(
+        ctx: Context<SetMarketCorrelation>,
+        corr_group_id: u16,
+        corr_rho_bps: u16,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        require_keys_eq!(
+            market.authority,
+            ctx.accounts.authority.key(),
+            CloberError::Unauthorized
+        );
+        require!(
+            corr_rho_bps <= constants::BPS_DENOM as u16,
+            CloberError::OutOfRange
+        );
+        market.corr_group_id = corr_group_id;
+        market.corr_rho_bps = corr_rho_bps;
+        emit!(MarketCorrelationSetEvent {
+            market: market.key(),
+            corr_group_id,
+            corr_rho_bps,
+        });
+        Ok(())
+    }
+
     /// Set (or clear) the market's emergency guardian
     /// — a key that may only RESTRICT market status (pause/post-only/close), never
     /// loosen (see `set_market_status`). Authority-only. `Pubkey::default()` clears
@@ -8434,6 +8477,8 @@ pub mod clober {
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: market.paper_profit_haircut_bps,
                 stress_shock_bps: market.stress_shock_bps,
+                corr_group_id: market.corr_group_id,
+                corr_rho_bps: market.corr_rho_bps,
             });
         }
         if !snaps.is_empty() {
@@ -8576,6 +8621,8 @@ pub mod clober {
                 oi_mmr_max_extra_bps: markets[i].params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: markets[i].paper_profit_haircut_bps,
                 stress_shock_bps: markets[i].stress_shock_bps,
+                corr_group_id: markets[i].corr_group_id,
+                corr_rho_bps: markets[i].corr_rho_bps,
             });
         }
         if !snaps.is_empty() {
@@ -8874,6 +8921,8 @@ pub mod clober {
                 oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: market_acct.paper_profit_haircut_bps,
                 stress_shock_bps: market_acct.stress_shock_bps,
+                corr_group_id: market_acct.corr_group_id,
+                corr_rho_bps: market_acct.corr_rho_bps,
             });
             market_keys.push(market_ai.key());
         }
@@ -10032,6 +10081,8 @@ pub mod clober {
             oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: market.paper_profit_haircut_bps,
             stress_shock_bps: market.stress_shock_bps,
+            corr_group_id: market.corr_group_id,
+            corr_rho_bps: market.corr_rho_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         // Unified dispatch: if position is isolated (pos_snap.collateral_quote_lots > 0),
@@ -10083,6 +10134,8 @@ pub mod clober {
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: market.paper_profit_haircut_bps,
                 stress_shock_bps: market.stress_shock_bps,
+                corr_group_id: market.corr_group_id,
+                corr_rho_bps: market.corr_rho_bps,
             };
             let probe_assessment = assess_margin_unified_fn(
                 &[probe_pos],
@@ -10714,6 +10767,8 @@ pub mod clober {
             oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: market.paper_profit_haircut_bps,
             stress_shock_bps: market.stress_shock_bps,
+            corr_group_id: market.corr_group_id,
+            corr_rho_bps: market.corr_rho_bps,
         };
         let scenarios = default_scenarios_fn(&[market.key()]);
         let assessment = assess_margin_unified_fn(
@@ -11095,6 +11150,8 @@ pub mod clober {
             oi_mmr_max_extra_bps: exec_market.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: exec_market.paper_profit_haircut_bps,
             stress_shock_bps: exec_market.stress_shock_bps,
+            corr_group_id: exec_market.corr_group_id,
+            corr_rho_bps: exec_market.corr_rho_bps,
         });
         position_snaps.push(RiskPosSnap {
             market: exec_position.market,
@@ -11188,6 +11245,8 @@ pub mod clober {
                 oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
                 paper_profit_haircut_bps: market.paper_profit_haircut_bps,
                 stress_shock_bps: market.stress_shock_bps,
+                corr_group_id: market.corr_group_id,
+                corr_rho_bps: market.corr_rho_bps,
             });
             position_snaps.push(RiskPosSnap {
                 market: position.market,
@@ -14993,6 +15052,8 @@ fn partial_withdraw_core<'info>(
             oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: market.paper_profit_haircut_bps,
             stress_shock_bps: market.stress_shock_bps,
+            corr_group_id: market.corr_group_id,
+            corr_rho_bps: market.corr_rho_bps,
         });
         market_keys.push(m_ai.key());
         i += 2;
@@ -17927,6 +17988,20 @@ pub struct SetLiqRestoreBuffer<'info> {
     pub market: Box<Account<'info, MarketAccount>>,
 }
 
+/// `set_market_correlation` context (Phase 3). Authority-only; the auth check is
+/// in the handler. The correlation params are bounded (rho ≤ BPS) and local to
+/// the market.
+#[derive(Accounts)]
+pub struct SetMarketCorrelation<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+}
+
 /// `set_market_status` context. Auth is checked
 /// in-handler (authority OR guardian, with the restrict-only asymmetry). The
 /// guardian PDA is OPTIONAL — supplied for a guardian-restrict call, omitted for an
@@ -19941,6 +20016,14 @@ pub struct MarketStressTierSetEvent {
 
 /// Phase 2 — the partial-liquidation restore buffer was set. `buffer_bps == 0`
 /// ⇒ restore to exactly maintenance (no buffer, the off-switch).
+/// Phase 3 — a market's cross-asset correlation was set. `(0, 0)` ⇒ no offset.
+#[event]
+pub struct MarketCorrelationSetEvent {
+    pub market: Pubkey,
+    pub corr_group_id: u16,
+    pub corr_rho_bps: u16,
+}
+
 #[event]
 pub struct LiqRestoreBufferSetEvent {
     pub market: Pubkey,
@@ -22887,6 +22970,8 @@ fn assert_cross_portfolio_intake_im(
             oi_mmr_max_extra_bps: market_acct.params.oi_mmr_max_extra_bps,
             paper_profit_haircut_bps: market_acct.paper_profit_haircut_bps,
             stress_shock_bps: market_acct.stress_shock_bps,
+            corr_group_id: market_acct.corr_group_id,
+            corr_rho_bps: market_acct.corr_rho_bps,
         });
         market_keys.push(position.market);
     }
@@ -22922,6 +23007,8 @@ fn assert_cross_portfolio_intake_im(
         oi_mmr_max_extra_bps: target_market.params.oi_mmr_max_extra_bps,
         paper_profit_haircut_bps: target_market.paper_profit_haircut_bps,
         stress_shock_bps: target_market.stress_shock_bps,
+        corr_group_id: target_market.corr_group_id,
+        corr_rho_bps: target_market.corr_rho_bps,
     });
     market_keys.push(*target_market_key);
 

@@ -538,6 +538,17 @@ pub struct MarketAccount {
     /// liquidation never over-closes past IM). Trailing field ⇒ pre-existing
     /// accounts read it as 0.
     pub liq_restore_buffer_bps: u16,
+    /// Phase 3 cross-asset offset credit — correlation group id. Positions in
+    /// markets sharing a non-zero group id net their opposing worst-case losses
+    /// by the group's correlation `corr_rho_bps`. `0` ⇒ market is in NO group ⇒
+    /// no offset (fully decorrelated, byte-identical to legacy). Trailing field
+    /// within `space()` headroom; pre-existing accounts read it as 0.
+    pub corr_group_id: u16,
+    /// Phase 3 — this market's correlation with its group, in bps (`0..=BPS`).
+    /// The group's EFFECTIVE rho is the MINIMUM across its markets (fail-safe: a
+    /// mis-set high rho on one market cannot grant more relief than the group's
+    /// weakest member). `0` ⇒ no offset even if grouped. Bounded at write time.
+    pub corr_rho_bps: u16,
 }
 
 /// Optional emergency guardian for one market, held in a SEPARATE PDA (not a

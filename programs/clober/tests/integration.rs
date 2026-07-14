@@ -16855,6 +16855,51 @@ async fn set_liq_restore_buffer_enforces_im_bound() {
     );
 }
 
+/// Phase 3 — set_market_correlation writes the group/rho, bounds rho ≤ BPS, and
+/// (0,0) is the reversible off-switch. The margin-relief soundness itself is
+/// proven at the assess_margin level (risk.rs proptests + Kani).
+#[tokio::test]
+async fn set_market_correlation_writes_and_bounds() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let corr_ix = |gid: u16, rho: u16| {
+        build_ix(
+            clober::instruction::SetMarketCorrelation {
+                corr_group_id: gid,
+                corr_rho_bps: rho,
+            },
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+            ],
+        )
+    };
+    // Happy path: group 7, rho 90% is written.
+    phase2_send(&mut ctx, corr_ix(7, 9_000), &payer)
+        .await
+        .expect("valid correlation must be accepted");
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m.corr_group_id, 7);
+    assert_eq!(m.corr_rho_bps, 9_000);
+    // rho > BPS ⇒ rejected (OutOfRange = 1003 ⇒ Custom 7003).
+    let e = phase2_send(&mut ctx, corr_ix(7, 10_001), &payer)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e:?}").contains("Custom(7003)"),
+        "rho > BPS must reject: {e:?}"
+    );
+    // Off-switch: (0,0) clears the group ⇒ no offset.
+    phase2_send(&mut ctx, corr_ix(0, 0), &payer)
+        .await
+        .expect("off-switch must be accepted");
+    let m2: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m2.corr_group_id, 0);
+    assert_eq!(m2.corr_rho_bps, 0);
+}
+
 // ── 3.1: paper-profit haircut crank (percolator per-domain credit) ──────────
 
 #[tokio::test]
