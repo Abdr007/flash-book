@@ -18,7 +18,7 @@
 //!     here keeps the state-machine proofs tractable; collision-resistance of
 //!     keccak is the (stated) cryptographic assumption, not a Kani obligation.
 //!
-//! Composes with the H1 part-A monotonic `fill_seq` replay guard: part A stops a
+//! Composes with the part-A monotonic `fill_seq` replay guard: part A stops a
 //! *replayed* settlement, this stops a *fabricated* one.
 
 /// 32-byte commitment to a single fill — `keccak256(fill_preimage(..))`, computed
@@ -539,7 +539,7 @@ pub fn buffer_upgrade_to(data: &mut [u8], market: &[u8; 32]) -> Result<(), FillR
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Settlement nonce (H1 part A / P-SETTLE-1). The pure core of the per-market
+// Settlement nonce (part A / P-SETTLE-1). The pure core of the per-market
 // replay/reorder guard shared by `apply_fill` and `apply_lp_fill`: a settlement
 // must carry a `fill_seq` STRICTLY greater than the market's current nonce, and
 // the nonce then advances to exactly that value. Extracted here so the monotonic

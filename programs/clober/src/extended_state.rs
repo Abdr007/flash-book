@@ -1,4 +1,4 @@
-//! Clober V3 account types — trigger/TWAP/iceberg orders, vaults,
+//! Account types — trigger/TWAP/iceberg orders, vaults,
 //! LP per-market state, oracle configs, and the risk/haircut siblings.
 //! All types live under the `clober` program ID; PDAs use distinct
 //! seed prefixes (`trigger`, `vault`, etc.) so they coexist
@@ -8,7 +8,7 @@ use anchor_lang::prelude::*;
 
 // ─── Trigger orders v3 ──────────────────────────────────────────────
 
-/// V3 trigger order. Seeds: `[b"trigger", market, trader, trigger_id]`.
+/// Trigger order. Seeds: `[b"trigger", market, trader, trigger_id]`.
 /// Distinct from the v1 `[b"trigger", ...]` prefix so both PDA families
 /// can coexist without collision.
 #[account]
@@ -108,7 +108,7 @@ impl TriggerOrderAccount {
     }
 }
 
-/// V3 TWAP order. Seeds: `[b"twap", market, trader, twap_id]`.
+/// TWAP order. Seeds: `[b"twap", market, trader, twap_id]`.
 #[account]
 #[derive(Debug)]
 pub struct TwapOrderAccount {
@@ -152,7 +152,7 @@ impl TwapOrderAccount {
     }
 }
 
-/// V3 iceberg order. Seeds: `[b"iceberg", market, trader, iceberg_id]`.
+/// Iceberg order. Seeds: `[b"iceberg", market, trader, iceberg_id]`.
 #[account]
 #[derive(Debug)]
 pub struct IcebergOrderAccount {
@@ -185,7 +185,7 @@ impl IcebergOrderAccount {
 
 // ─── Vaults v3 ──────────────────────────────────────────────────────
 
-/// V3 vault account. Seeds: `[b"vault", strategist, vault_id]`.
+/// Vault account. Seeds: `[b"vault", strategist, vault_id]`.
 #[account]
 #[derive(Debug)]
 pub struct VaultAccount {
@@ -211,7 +211,7 @@ impl VaultAccount {
     }
 }
 
-/// V3 vault depositor position. Seeds: `[b"vault_position", vault, depositor]`.
+/// Vault depositor position. Seeds: `[b"vault_position", vault, depositor]`.
 #[account]
 #[derive(Debug, Default)]
 pub struct VaultPositionAccount {
@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn jit_offer_pda_seed_distinct_from_v3_others() {
-        // Confirm the JIT seed prefix doesn't collide with any sibling V3 seed
+        // Confirm the JIT seed prefix doesn't collide with any sibling seed
         // (regression: someone reusing `trigger` etc).
         let jit = JitLiquidationOfferAccount::SEED;
         assert_ne!(jit, TriggerOrderAccount::SEED);
@@ -980,7 +980,7 @@ mod tests {
 
     /// `space()` must cover the FULL Borsh serialization of a populated
     /// account, not an undercounted body — an undercount fails a
-    /// fully-populated V3 TWAP (e.g. one carrying `acceptable_price_ticks`)
+    /// fully-populated TWAP (e.g. one carrying `acceptable_price_ticks`)
     /// with AccountDidNotSerialize. Unlike the sibling `>= 8 + body` checks,
     /// this pins the EXACT serialized length so any future field addition
     /// that desyncs `space()` fails loudly.

@@ -2794,7 +2794,7 @@
         {
           "name": "trader_state",
           "docs": [
-            "H9: the converted matured PnL is credited here (isolated bucket if the",
+            "The converted matured PnL is credited here (isolated bucket if the",
             "Position is isolated, else the cross pool).",
             "declared BEFORE `position` and relaxed (no seed) so the position PDA can",
             "be keyed by `trader_state.key()` — the old wallet-keyed seed never matched",
@@ -5086,6 +5086,40 @@
               {
                 "kind": "account",
                 "path": "trader_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_book",
+          "docs": [
+            "DELEGATION_PROGRAM_ID` — i.e. the book is ACTUALLY delegated to the ER",
+            "right now — so the emergency force-close cannot run against a book that",
+            "has already been undelegated back to L1 (where the trader can exit",
+            "normally). Seed-validated; never deserialized (owned by the delegation",
+            "program while delegated)."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  98,
+                  111,
+                  111,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
               }
             ]
           }
@@ -8390,7 +8424,7 @@
         {
           "name": "lp_quote_ata",
           "docs": [
-            "LP's USDC ATA — debited. C1: bound to the protocol quote mint + the LP",
+            "LP's USDC ATA — debited. Bound to the protocol quote mint + the LP",
             "so a foreign/worthless-mint source cannot be substituted."
           ],
           "writable": true,
@@ -9289,12 +9323,12 @@
     {
       "name": "migrate_market_layout",
       "docs": [
-        "Migrate a market account from the pre-V3 mark-engine layout (1024 B body)",
-        "to the V3 layout (1152 B body). V3 added `last_mark_settle_slot` plus",
+        "Migrate a market account from the legacy 1024-B mark-engine layout",
+        "to the extended 1152-B layout, which added `last_mark_settle_slot` plus",
         "four mark-engine params (mark_ema_alpha_bps, mark_max_change_bps,",
         "mark_settle_min_slots, drift_alert_bps).",
         "",
-        "Idempotent: if the account is already at the V3 size and the mark-engine",
+        "Idempotent: if the account is already at the extended-layout size and the mark-engine",
         "params look set, returns Ok with a log message and no state change.",
         "",
         "Authority-gated: only `market.authority` may call."
@@ -14310,7 +14344,7 @@
       "name": "settle_mark",
       "docs": [
         "PERMISSIONLESS: hard-reset `mark_price_ticks` to the current",
-        "`oracle_price_ticks`. The V3 mark-engine's second mark-update path.",
+        "`oracle_price_ticks`. The mark-engine's second mark-update path.",
         "",
         "Anyone (sequencers, keepers, even traders) can call this — the only",
         "gate is the per-market `mark_settle_min_slots` rate limit, which",
@@ -15919,7 +15953,7 @@
         {
           "name": "depositor_quote_ata",
           "docs": [
-            "Depositor's USDC ATA — debited. C1: bound to the protocol quote mint +",
+            "Depositor's USDC ATA — debited. Bound to the protocol quote mint +",
             "the depositor so a foreign/worthless-mint source cannot be substituted."
           ],
           "writable": true,
@@ -16672,7 +16706,11 @@
         "Permissionless: anyone can poke a market to check. The protocol",
         "pays off-chain monitors / keepers nothing extra; calling this is",
         "just a tx fee. On any violation, the market is auto-flipped to",
-        "Paused so no new orders can land while operators investigate.",
+        "Paused so no new orders can land while operators investigate, and the",
+        "instruction returns Ok so that pause write COMMITS (returning Err would",
+        "roll the whole tx back, discarding the pause). Callers detect a breach",
+        "from the emitted `InvariantBreachDetectedEvent` and the market's new",
+        "`Paused` status, not from the tx result.",
         "",
         "Currently checks:",
         "S5 — open interest balance: oi_long_lots == oi_short_lots",
@@ -20391,11 +20429,6 @@
       "msg": "Delegation expired"
     },
     {
-      "code": 7703,
-      "name": "ForceIncludeUnsupported",
-      "msg": "Force-include from L1 not yet supported in this build"
-    },
-    {
       "code": 7704,
       "name": "ErStillLive",
       "msg": "ER still live: settlement-liveness timeout not elapsed; cannot force-undelegate"
@@ -20548,32 +20581,32 @@
     {
       "code": 8206,
       "name": "FillCommitmentMissing",
-      "msg": "Market is armed: the fill-commitment account is mandatory for settlement (C-1)"
+      "msg": "Market is armed: the fill-commitment account is mandatory for settlement"
     },
     {
       "code": 8207,
       "name": "CrossLiquidationNeedsPortfolio",
-      "msg": "Cross-margined trader with multiple positions must be liquidated via liquidate_portfolio (H-4)"
+      "msg": "Cross-margined trader with multiple positions must be liquidated via liquidate_portfolio"
     },
     {
       "code": 8208,
       "name": "SelfLiquidationForbidden",
-      "msg": "Self-liquidation forbidden: the liquidator must not be the liquidatee (M-2)"
+      "msg": "Self-liquidation forbidden: the liquidator must not be the liquidatee"
     },
     {
       "code": 8209,
       "name": "OrderSeqExhausted",
-      "msg": "Order sequence exhausted: per-market seq exceeded the 24-bit order_id encoding ceiling; reseat the market (H1)"
+      "msg": "Order sequence exhausted: per-market seq exceeded the 24-bit order_id encoding ceiling; reseat the market"
     },
     {
       "code": 8210,
       "name": "BaselineAlreadyStamped",
-      "msg": "Liveness baseline already stamped (book_delegated_at_slot != 0) (F1)"
+      "msg": "Liveness baseline already stamped (book_delegated_at_slot != 0)"
     },
     {
       "code": 8211,
       "name": "BookNotDelegated",
-      "msg": "Market book is not delegated; nothing to stamp a liveness baseline for (F1)"
+      "msg": "Market book is not delegated; nothing to stamp a liveness baseline for"
     },
     {
       "code": 8212,
@@ -20806,7 +20839,7 @@
     {
       "name": "BadDebtSocializedEvent",
       "docs": [
-        "H6 — emitted when a realized loss exceeds the position's backing (a bankrupt",
+        "Emitted when a realized loss exceeds the position's backing (a bankrupt",
         "close) and the deficit is absorbed by the insurance fund instead of reverting",
         "settlement. `uncovered_quote_lots > 0` means the fund itself was insufficient",
         "— true socialized bad debt that an ADL/backstop must resolve."
@@ -22579,7 +22612,7 @@
     {
       "name": "HealthGateSourceEvent",
       "docs": [
-        "V3 liquidation engine — emitted by `liquidate_position` so the",
+        "Liquidation engine — emitted by `liquidate_position` so the",
         "off-chain UI / keeper logs can show *which* price source flagged the",
         "trader as unhealthy. `source` byte:",
         "0 = mark_price was the more adverse price",
@@ -22619,7 +22652,7 @@
     {
       "name": "IcebergOrderAccount",
       "docs": [
-        "V3 iceberg order. Seeds: `[b\"iceberg\", market, trader, iceberg_id]`."
+        "Iceberg order. Seeds: `[b\"iceberg\", market, trader, iceberg_id]`."
       ],
       "type": {
         "kind": "struct",
@@ -23853,7 +23886,7 @@
     {
       "name": "MarkPriceDriftEvent",
       "docs": [
-        "V3 mark engine — emitted when |mark - oracle| / oracle exceeds",
+        "Mark engine — emitted when |mark - oracle| / oracle exceeds",
         "`params.drift_alert_bps`. Off-chain observers use this as a nudge to",
         "call `settle_mark` and snap the mark back to the (fresh) oracle."
       ],
@@ -23885,7 +23918,7 @@
     {
       "name": "MarkPriceUpdatedEvent",
       "docs": [
-        "V3 mark engine — emitted whenever `mark_price_ticks` is updated.",
+        "Mark engine — emitted whenever `mark_price_ticks` is updated.",
         "`source` byte:",
         "0 = `apply_fill` EMA blend (last-trade-price tracking)",
         "1 = `settle_mark` hard reset to oracle",
@@ -27572,7 +27605,7 @@
     {
       "name": "TriggerOrderAccount",
       "docs": [
-        "V3 trigger order. Seeds: `[b\"trigger\", market, trader, trigger_id]`.",
+        "Trigger order. Seeds: `[b\"trigger\", market, trader, trigger_id]`.",
         "Distinct from the v1 `[b\"trigger\", ...]` prefix so both PDA families",
         "can coexist without collision."
       ],
@@ -27823,7 +27856,7 @@
     {
       "name": "TwapOrderAccount",
       "docs": [
-        "V3 TWAP order. Seeds: `[b\"twap\", market, trader, twap_id]`."
+        "TWAP order. Seeds: `[b\"twap\", market, trader, twap_id]`."
       ],
       "type": {
         "kind": "struct",
@@ -28109,7 +28142,7 @@
     {
       "name": "VaultAccount",
       "docs": [
-        "V3 vault account. Seeds: `[b\"vault\", strategist, vault_id]`."
+        "Vault account. Seeds: `[b\"vault\", strategist, vault_id]`."
       ],
       "type": {
         "kind": "struct",
@@ -28299,7 +28332,7 @@
     {
       "name": "VaultPositionAccount",
       "docs": [
-        "V3 vault depositor position. Seeds: `[b\"vault_position\", vault, depositor]`."
+        "Vault depositor position. Seeds: `[b\"vault_position\", vault, depositor]`."
       ],
       "type": {
         "kind": "struct",

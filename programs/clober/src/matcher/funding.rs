@@ -1,14 +1,21 @@
-//! Cumulative funding index — fixed-point Q64.64.
+//! Cumulative funding index — PRICE-WEIGHTED fixed-point (16 fractional bits).
 //!
-//! A position's funding charge at settlement is
-//! sign·notional·(I_now − I_entry). The index is advanced by the live,
-//! permissionless `crank_funding` instruction (rate-limited, oracle-gated;
-//! see `funding_index_delta`), and the settlement-side charge math below
-//! applies it. Both sides — the rate driver and the charge — are covered by
-//! the proofs/tests in this module.
+//! Each `crank_funding` tick folds the funding notional-per-lot
+//! (`mark_ticks · tick_size`) into the accumulated delta, so the index carries
+//! quote-lots-per-base-lot rather than a dimensionless rate. A position's
+//! funding charge at settlement is therefore `sign · size_lots · (I_now −
+//! I_entry)` — with NO settle-time price multiply. Because the price is
+//! captured AT EACH CRANK (identical for every position over a given index
+//! window), funding is independent of when a position is settled and is exactly
+//! long/short zero-sum across the book (given the maintained `oi_long ==
+//! oi_short` invariant). The prior design multiplied a dimensionless index by a
+//! caller-chosen settle-time mark, which let a delta-neutral trader extract
+//! from the residual by timing each leg's settlement; folding price at crank
+//! time closes that.
 //!
-//! The index is an i128 in Q64.64: ±2^63 in the integer part, which no
-//! realistic rate can overflow.
+//! The index is an i128 with 16 fractional bits; folding a per-lot notional (up
+//! to ~u64) leaves ample integer headroom, and every multiply is checked so the
+//! pathological extreme fails closed rather than wrapping.
 
 use crate::constants::{BPS_DENOM, FUNDING_INDEX_FRACTIONAL_BITS};
 use crate::errors::OrOverflow;
@@ -35,6 +42,10 @@ pub const FUNDING_INDEX_ONE: i128 = 1i128 << FUNDING_INDEX_FRACTIONAL_BITS;
 /// Returns `(delta_index, rate_bps_per_sec)`. The crank only advances the index;
 /// value moves later, per position, through the Kani-proven `route_funding`
 /// settle path (Δcollateral == −Δresidual), so this tick mints nothing.
+///
+/// `tick_size` folds the crank-time funding notional-per-lot
+/// (`mark_ticks · tick_size`) into the delta so the index is price-weighted;
+/// see the module header. The notional fold is checked and fails closed.
 pub fn funding_index_delta(
     mark_ticks: u64,
     oracle_ticks: u64,
@@ -42,6 +53,7 @@ pub fn funding_index_delta(
     k_bps: u32,
     rate_max_bps_per_sec: u32,
     period_seconds: u32,
+    tick_size: u64,
 ) -> Result<(i128, i64)> {
     if oracle_ticks == 0 || dt_seconds == 0 {
         return Ok((0, 0));
@@ -55,8 +67,15 @@ pub fn funding_index_delta(
         .checked_div(oracle_ticks as i128)
         .or_div_zero()?
         .clamp(-rate_max, rate_max);
+    // Funding notional per base-lot at THIS crank's mark. Folded into the index
+    // so a position's charge uses the crank-time price, not its settle-time mark.
+    let notional_per_lot = (mark_ticks as i128)
+        .checked_mul(tick_size as i128)
+        .or_overflow()?;
     let delta = rate
         .checked_mul(dt as i128)
+        .or_overflow()?
+        .checked_mul(notional_per_lot)
         .or_overflow()?
         .checked_mul(FUNDING_INDEX_ONE)
         .or_overflow()?
@@ -92,6 +111,7 @@ pub fn funding_index_delta_smoothed(
     period_seconds: u32,
     prev_rate_bps_per_sec: i64,
     twap_window_periods: u8,
+    tick_size: u64,
 ) -> Result<(i128, i64)> {
     // No anchor / same-second crank ⇒ accrue nothing; keep the prior smoothed rate.
     if oracle_ticks == 0 || dt_seconds == 0 {
@@ -122,8 +142,14 @@ pub fn funding_index_delta_smoothed(
     }
     // Defensive: hold the rate cap even if `prev` predates a rate_max reduction.
     .clamp(-rate_max, rate_max);
+    // Fold the crank-time funding notional-per-lot into the index (price-weighted).
+    let notional_per_lot = (mark_ticks as i128)
+        .checked_mul(tick_size as i128)
+        .or_overflow()?;
     let delta = smoothed_rate
         .checked_mul(dt as i128)
+        .or_overflow()?
+        .checked_mul(notional_per_lot)
         .or_overflow()?
         .checked_mul(FUNDING_INDEX_ONE)
         .or_overflow()?
@@ -146,15 +172,20 @@ pub fn clamp_delta_to_period_cap(
     per_period_max_bps: u32,
     dt_seconds: u64,
     period_seconds: u32,
+    notional_per_lot: u128,
 ) -> i128 {
     if per_period_max_bps == 0 {
         return delta;
     }
     let period = period_seconds.max(1) as i128;
     let dt = dt_seconds.min(period_seconds.max(1) as u64) as i128;
-    // cap = per_period_max_bps · ONE · dt / (BPS · period). Saturating multiplies
-    // so an extreme cap only ever widens the bound, never wraps it tight/negative.
+    // cap = per_period_max_bps · notional_per_lot · ONE · dt / (BPS · period).
+    // The index is price-weighted, so the per-period bound scales with the
+    // funding notional-per-lot to still mean "≤ per_period_max_bps of notional
+    // per period". Saturating multiplies so an extreme cap only ever widens the
+    // bound, never wraps it tight/negative.
     let cap = (per_period_max_bps as i128)
+        .saturating_mul(notional_per_lot.min(i128::MAX as u128) as i128)
         .saturating_mul(FUNDING_INDEX_ONE)
         .saturating_mul(dt)
         / (BPS_DENOM as i128 * period);
@@ -204,17 +235,20 @@ fn clamp_delta_to_period_cap_zero_is_identity() {
     let delta: i128 = kani::any();
     let dt: u64 = kani::any();
     let period: u32 = kani::any();
-    assert!(clamp_delta_to_period_cap(delta, 0, dt, period) == delta);
+    let notional: u128 = kani::any();
+    assert!(clamp_delta_to_period_cap(delta, 0, dt, period, notional) == delta);
 }
 
-/// Funding owed by a position since last settlement. Returns signed Q-units
-/// of quote-lots (positive = trader owes).
+/// Funding owed by a position since last settlement. Returns signed
+/// quote-lots (positive = trader owes).
 ///
-/// `notional_quote_lots` is the position's notional in quote-lots
-/// (size × price × tick_size_factor).
+/// `size_lots` is the position's size in BASE lots. The price is already baked
+/// into the price-weighted index at crank time, so there is NO settle-time
+/// notional multiply here — this is what makes funding independent of when the
+/// position is settled (see the module header).
 pub fn funding_owed(
     is_long: bool,
-    notional_quote_lots: u64,
+    size_lots: u64,
     cum_index_now: FundingIndex,
     cum_index_at_entry: FundingIndex,
 ) -> Result<i128> {
@@ -222,15 +256,14 @@ pub fn funding_owed(
         .checked_sub(cum_index_at_entry)
         .or_underflow()?;
     let sign: i128 = if is_long { 1 } else { -1 };
-    // owed = sign * notional * delta / 2^64  (Q64.64 → linear). The arithmetic
+    // owed = sign * size * delta / ONE. The index already carries the crank-time
+    // notional-per-lot, so size · delta is quote-lots (× ONE). The arithmetic
     // right shift rounds toward -infinity, so `scaled` under-states a positive
     // charge and over-states (in magnitude) a negative one by at most one
     // quote-lot. Settlement moves collateral and the Residual bucket by this
     // same equal-and-opposite amount, so the dust is a transfer direction,
     // never a mint (see the truncation-direction tests below).
-    let prod = (notional_quote_lots as i128)
-        .checked_mul(delta)
-        .or_overflow()?;
+    let prod = (size_lots as i128).checked_mul(delta).or_overflow()?;
     let scaled = prod >> FUNDING_INDEX_FRACTIONAL_BITS;
     Ok(sign * scaled)
 }
@@ -301,9 +334,11 @@ mod tests {
     fn twap_window_zero_is_identical_to_the_instant_delta() {
         // window == 0 disables smoothing ⇒ byte-identical to funding_index_delta.
         for (mark, oracle, dt) in [(110u64, 100u64, 60u64), (100, 110, 30), (100, 100, 60)] {
-            let instant = funding_index_delta(mark, oracle, dt, BPS_DENOM, 2000, 3600).unwrap();
+            let instant =
+                funding_index_delta(mark, oracle, dt, BPS_DENOM, 2000, 3600, /*tick*/ 7).unwrap();
             let smoothed = funding_index_delta_smoothed(
                 mark, oracle, dt, BPS_DENOM, 2000, 3600, /*prev*/ 12345, /*window*/ 0,
+                /*tick*/ 7,
             )
             .unwrap();
             assert_eq!(instant, smoothed, "window=0 must match the instant delta");
@@ -317,7 +352,7 @@ mod tests {
         let rate_max = 1000u32;
         let (_delta, smoothed) = funding_index_delta_smoothed(
             2_000_000, 100, /*dt*/ 1, BPS_DENOM, rate_max, /*period*/ 3600,
-            /*prev*/ 0, /*window*/ 8,
+            /*prev*/ 0, /*window*/ 8, /*tick*/ 1,
         )
         .unwrap();
         // instant would clamp to +rate_max (1000); after dt/window = 1/28800 weighting it is ~0.
@@ -330,7 +365,7 @@ mod tests {
         let mut prev = 0i64;
         for _ in 0..40 {
             let (_d2, r) = funding_index_delta_smoothed(
-                2_000_000, 100, 3600, BPS_DENOM, rate_max, 3600, prev, 8,
+                2_000_000, 100, 3600, BPS_DENOM, rate_max, 3600, prev, 8, /*tick*/ 1,
             )
             .unwrap();
             prev = r;
@@ -347,16 +382,17 @@ mod tests {
         // even with an out-of-band prev, the output is clamped into [-rate_max, rate_max].
         let (_d, r) = funding_index_delta_smoothed(
             9_999_999, 100, 100, BPS_DENOM, rate_max, 3600, /*prev*/ 30_000, 4,
+            /*tick*/ 1,
         )
         .unwrap();
         assert!(r.unsigned_abs() <= rate_max as u64);
         // no oracle anchor / zero Δt ⇒ accrue nothing, keep the prior rate.
         assert_eq!(
-            funding_index_delta_smoothed(100, 0, 60, BPS_DENOM, rate_max, 3600, 77, 4).unwrap(),
+            funding_index_delta_smoothed(100, 0, 60, BPS_DENOM, rate_max, 3600, 77, 4, 1).unwrap(),
             (0, 77)
         );
         assert_eq!(
-            funding_index_delta_smoothed(100, 90, 0, BPS_DENOM, rate_max, 3600, 77, 4).unwrap(),
+            funding_index_delta_smoothed(100, 90, 0, BPS_DENOM, rate_max, 3600, 77, 4, 1).unwrap(),
             (0, 77)
         );
     }
@@ -402,11 +438,11 @@ mod tests {
     #[test]
     fn crank_no_anchor_or_no_time_accrues_nothing() {
         assert_eq!(
-            funding_index_delta(100, 0, 60, 10_000, 1000, 3600).unwrap(),
+            funding_index_delta(100, 0, 60, 10_000, 1000, 3600, 1).unwrap(),
             (0, 0)
         );
         assert_eq!(
-            funding_index_delta(100, 90, 0, 10_000, 1000, 3600).unwrap(),
+            funding_index_delta(100, 90, 0, 10_000, 1000, 3600, 1).unwrap(),
             (0, 0)
         );
     }
@@ -414,10 +450,10 @@ mod tests {
     #[test]
     fn crank_rate_is_clamped_to_cap_both_signs() {
         // Huge positive premium with k=1x would blow past the cap → clamp to +max.
-        let (_, up) = funding_index_delta(1_000_000, 100, 1, BPS_DENOM, 5, 3600).unwrap();
+        let (_, up) = funding_index_delta(1_000_000, 100, 1, BPS_DENOM, 5, 3600, 1).unwrap();
         assert_eq!(up, 5);
         // Huge negative premium → clamp to −max.
-        let (_, down) = funding_index_delta(1, 1_000_000, 1, BPS_DENOM, 5, 3600).unwrap();
+        let (_, down) = funding_index_delta(1, 1_000_000, 1, BPS_DENOM, 5, 3600, 1).unwrap();
         assert_eq!(down, -5);
     }
 
@@ -425,18 +461,22 @@ mod tests {
     fn crank_dt_is_clamped_to_one_period() {
         // dt far exceeds the period; the accrual uses the clamped period, so a
         // long-stale crank can't apply the rate over an unbounded interval.
-        let (d_huge, _) = funding_index_delta(200, 100, u64::MAX, BPS_DENOM, 100, 60).unwrap();
-        let (d_period, _) = funding_index_delta(200, 100, 60, BPS_DENOM, 100, 60).unwrap();
+        let (d_huge, _) = funding_index_delta(200, 100, u64::MAX, BPS_DENOM, 100, 60, 1).unwrap();
+        let (d_period, _) = funding_index_delta(200, 100, 60, BPS_DENOM, 100, 60, 1).unwrap();
         assert_eq!(d_huge, d_period);
     }
 
     #[test]
     fn crank_delta_is_exact_for_a_known_tick() {
         // premium = 110−100 = 10; rate = 10·10_000/100 = 1000 bps/sec (≤ cap 2000).
-        // delta = 1000 · 60 · 2^64 / 10_000 = 6 · 2^64.
-        let (delta, rate) = funding_index_delta(110, 100, 60, BPS_DENOM, 2000, 3600).unwrap();
+        // Price-weighted: notional_per_lot = mark·tick = 110·1 = 110.
+        // delta = rate·dt·notional·ONE / BPS = 1000·60·110·ONE / 10_000 = 660·ONE.
+        let (delta, rate) = funding_index_delta(110, 100, 60, BPS_DENOM, 2000, 3600, 1).unwrap();
         assert_eq!(rate, 1000);
-        assert_eq!(delta, 6i128 * FUNDING_INDEX_ONE);
+        assert_eq!(delta, 660i128 * FUNDING_INDEX_ONE);
+        // tick_size scales the delta linearly (notional_per_lot = 110·5 = 550).
+        let (delta5, _) = funding_index_delta(110, 100, 60, BPS_DENOM, 2000, 3600, 5).unwrap();
+        assert_eq!(delta5, 3_300i128 * FUNDING_INDEX_ONE);
     }
 
     use proptest::prelude::*;
@@ -452,12 +492,48 @@ mod tests {
         /// position floor-dust that the settle path routes to the Residual via the
         /// Kani-proven `route_funding`, Δcollateral == −Δresidual.)
         #[test]
-        fn funding_owed_long_short_zero_sum(notional in any::<u64>(), delta in any::<i128>()) {
+        fn funding_owed_long_short_zero_sum(size in any::<u64>(), delta in any::<i128>()) {
             if let (Ok(long), Ok(short)) = (
-                funding_owed(true, notional, delta, 0),
-                funding_owed(false, notional, delta, 0),
+                funding_owed(true, size, delta, 0),
+                funding_owed(false, size, delta, 0),
             ) {
                 prop_assert_eq!(long, -short);
+            }
+        }
+
+        /// M1 REGRESSION — funding is independent of the (caller-chosen) settle
+        /// time/mark. In the price-weighted design `funding_owed` takes SIZE, not
+        /// a settle-time notional, so a long and short of equal size over the same
+        /// index window net to EXACTLY zero no matter at what marks (m1, m2) each
+        /// leg is settled. The OLD design multiplied a dimensionless index by
+        /// `size·mark·tick` at settle time, so settling the long at m1 and the
+        /// short at m2 left a residue `∝ (m1 − m2)` — the value a delta-neutral
+        /// trader extracted from the residual. Reconstructing that old formula
+        /// here shows it was NOT zero-sum, while the new `funding_owed` is.
+        #[test]
+        fn funding_zero_sum_across_differing_settle_marks(
+            size in 1u64..=1_000_000u64,
+            idx in (1i128 << 20)..=(1i128 << 48),
+            m1 in 1u64..=1_000_000u64,
+            m2 in 1u64..=1_000_000u64,
+            tick in 1u64..=1_000u64,
+        ) {
+            // NEW: settle-mark-independent, exactly zero-sum.
+            let long = funding_owed(true, size, idx, 0).unwrap();
+            let short = funding_owed(false, size, idx, 0).unwrap();
+            prop_assert_eq!(long + short, 0);
+
+            // OLD (reconstructed): dimensionless index × settle-time notional.
+            // With m1 != m2 and a material index this leaves a non-zero residue —
+            // the extraction. (Same shift on both sides for a fair comparison.)
+            let old_long = ((size as i128 * m1 as i128 * tick as i128) * idx) >> 16;
+            let old_short = -(((size as i128 * m2 as i128 * tick as i128) * idx) >> 16);
+            if m1 != m2 {
+                prop_assert_ne!(
+                    old_long + old_short,
+                    0,
+                    "old settle-time-mark design leaked across differing marks"
+                );
             }
         }
 
@@ -470,13 +546,15 @@ mod tests {
             ppmb in 0u32..=10_000,
             dt in 0u64..=604_800,
             period in 1u32..=604_800,
+            notional in 0u128..=(u64::MAX as u128),
         ) {
-            let out = clamp_delta_to_period_cap(delta, ppmb, dt, period);
+            let out = clamp_delta_to_period_cap(delta, ppmb, dt, period, notional);
             if ppmb == 0 {
                 prop_assert_eq!(out, delta);
             } else {
                 let d = dt.min(period.max(1) as u64) as i128;
                 let cap = (ppmb as i128)
+                    .saturating_mul(notional.min(i128::MAX as u128) as i128)
                     .saturating_mul(FUNDING_INDEX_ONE)
                     .saturating_mul(d)
                     / (BPS_DENOM as i128 * period.max(1) as i128);
@@ -503,7 +581,9 @@ mod proofs {
         let k: u32 = kani::any();
         let rate_max: u32 = kani::any();
         let period: u32 = kani::any();
-        if let Ok((delta, rate)) = funding_index_delta(mark, oracle, dt, k, rate_max, period) {
+        let tick: u64 = kani::any();
+        if let Ok((delta, rate)) = funding_index_delta(mark, oracle, dt, k, rate_max, period, tick)
+        {
             assert!(rate.unsigned_abs() <= rate_max as u64);
             if oracle == 0 || dt == 0 {
                 assert!(delta == 0 && rate == 0);
@@ -549,8 +629,9 @@ mod proofs {
         let period: u32 = kani::any();
         let prev: i64 = kani::any();
         let window: u8 = kani::any();
+        let tick: u64 = kani::any();
         if let Ok((delta, rate)) =
-            funding_index_delta_smoothed(mark, oracle, dt, k, rate_max, period, prev, window)
+            funding_index_delta_smoothed(mark, oracle, dt, k, rate_max, period, prev, window, tick)
         {
             if oracle == 0 || dt == 0 {
                 // No anchor / same-second: accrue nothing, preserve the prior rate.

@@ -4236,7 +4236,8 @@ async fn verify_market_invariants_passes_when_oi_balanced() {
 #[tokio::test]
 async fn verify_market_invariants_auto_halts_on_oi_drift() {
     // Synthetically inject oi_long != oi_short into market state, then
-    // call verify. Tx must fail AND market must flip to Paused.
+    // call verify. Tx must SUCCEED (so the write commits) AND the market must
+    // flip to Paused on-chain.
     use solana_sdk::account::Account as SolAccount;
 
     let pt = make_program_test();
@@ -4286,30 +4287,23 @@ async fn verify_market_invariants_auto_halts_on_oi_drift() {
             bh,
         ))
         .await;
+    // The auto-halt must COMMIT, so verify returns Ok on breach (returning Err
+    // would roll the whole tx back and discard the Paused write). The breach is
+    // signalled by the emitted InvariantBreachDetectedEvent, and the persisted
+    // Paused status is the on-chain kill-switch.
     assert!(
-        result.is_err(),
-        "verify_market_invariants must fail when OI drifts"
+        result.is_ok(),
+        "verify_market_invariants must succeed so the auto-pause persists"
     );
 
-    // Crucially, the auto-halt mutation is rolled back when the tx fails
-    // (Solana's atomicity guarantee). To inspect the auto-halt path, we'd
-    // need the verify to commit successfully on success but mutate +
-    // return Err on breach — which Solana CANNOT do.
-    //
-    // Production design: verify is called by an off-chain monitor; on
-    // breach, the monitor (a) sees the failed tx + emitted log, then (b)
-    // calls set_market_status(Paused) explicitly via the authority. The
-    // emitted InvariantBreachDetectedEvent in this tx (rolled back) won't
-    // persist either — but the on-chain state staying healthy is the
-    // safer default.
-    //
-    // For now: verify failure IS the kill-switch signal for off-chain
-    // automation. A future enhancement could make verify a "checkpoint"
-    // that stores a flag without erroring when invariants hold, and
-    // splits the breach-pause action into a separate ix.
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    // Status remains pre-tx because the tx errored (rolled back). The OI
-    // drift is still present too because we set_account'd it directly.
+    // The market is now genuinely Paused on-chain — no new orders can land.
+    assert_eq!(
+        market.status,
+        clober::MarketStatus::Paused as u8,
+        "breach must persist an auto-pause"
+    );
+    // verify does not repair OI; it pauses. The injected drift is unchanged.
     assert_eq!(market.oi_long_lots, 100);
     assert_eq!(market.oi_short_lots, 99);
 }
@@ -13024,6 +13018,7 @@ async fn force_reduce_position_oracle_frees_trapped_margin_when_er_dead() {
     );
 
     let (fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market.as_ref()]);
     let force_close = || {
         build_ix(
             clober::instruction::ForceReducePositionOracle {},
@@ -13033,6 +13028,7 @@ async fn force_reduce_position_oracle_frees_trapped_margin_when_er_dead() {
                 AccountMeta::new(fund_pda, false),
                 AccountMeta::new(taker_state, false),
                 AccountMeta::new(taker_pos, false),
+                AccountMeta::new_readonly(book_pda, false), // book PDA — owner proves delegation
             ],
         )
     };
@@ -13082,6 +13078,22 @@ async fn force_reduce_position_oracle_frees_trapped_margin_when_er_dead() {
             owner: m_acc.owner,
             executable: m_acc.executable,
             rent_epoch: m_acc.rent_epoch,
+        }
+        .into(),
+    );
+
+    // The recovery gate also requires the book PDA to be ACTUALLY owned by the
+    // delegation program (not merely the market's `book_delegated` flag).
+    // Simulate a genuinely-delegated book: an account at the book PDA owned by
+    // the delegation program (force_reduce only reads its owner).
+    ctx.set_account(
+        &book_pda,
+        &SolAccount {
+            lamports: 1_000_000,
+            data: vec![],
+            owner: to_sdk(clober::er::DELEGATION_PROGRAM_ID),
+            executable: false,
+            rent_epoch: 0,
         }
         .into(),
     );
@@ -13189,6 +13201,7 @@ async fn force_reduce_position_oracle_frees_isolated_margin() {
     }
 
     let (fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market.as_ref()]);
     // Warp past the stall timeout; patch the mark fresh (down 10%), ER stale.
     ctx.warp_to_slot(5_000).unwrap();
     let clock: Clock = ctx.banks_client.get_sysvar().await.unwrap();
@@ -13213,6 +13226,19 @@ async fn force_reduce_position_oracle_frees_isolated_margin() {
         }
         .into(),
     );
+    // Genuinely-delegated book: an account at the book PDA owned by the
+    // delegation program (the recovery gate now checks the real owner).
+    ctx.set_account(
+        &book_pda,
+        &SolAccount {
+            lamports: 1_000_000,
+            data: vec![],
+            owner: to_sdk(clober::er::DELEGATION_PROGRAM_ID),
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
 
     let ts_before = fetch::<TraderStateAccount>(&mut ctx.banks_client, taker_state)
         .await
@@ -13233,6 +13259,7 @@ async fn force_reduce_position_oracle_frees_isolated_margin() {
             AccountMeta::new(fund_pda, false),
             AccountMeta::new(taker_state, false),
             AccountMeta::new(taker_pos, false),
+            AccountMeta::new_readonly(book_pda, false), // book PDA — owner proves delegation
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -16494,6 +16521,9 @@ fn hip3_valid_params() -> MarketParams {
         funding_rate_max_bps_per_sec: 1_000,
         funding_per_period_max_bps: 50,
         funding_period_seconds: 3_600,
+        // Mark engine must track the tape — a zero EMA weight would leave the
+        // mark permanently frozen (rejected by validate_hip3_params).
+        mark_ema_alpha_bps: 2_000,
         ..default_params()
     }
 }
@@ -16652,6 +16682,10 @@ async fn create_permissionless_market_rejects_out_of_envelope_params() {
         (
             make(&|p| p.funding_period_seconds = 0),
             "degenerate funding period",
+        ),
+        (
+            make(&|p| p.mark_ema_alpha_bps = 0),
+            "frozen mark (zero EMA weight would read as fresh in the liq gate)",
         ),
     ] {
         let (_m, ix) = create_perm_market_ix(&creator, &protocol, bad).await;
