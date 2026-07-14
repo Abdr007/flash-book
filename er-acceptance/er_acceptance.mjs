@@ -133,6 +133,9 @@ try {
   if (!ref.params.oracleStalenessMaxSeconds || ref.params.oracleStalenessMaxSeconds === 0) {
     ref.params.oracleStalenessMaxSeconds = 60;
   }
+  // This suite trades 1-lot orders; a cloned anti-dust floor would reject
+  // them (OrderNotionalTooSmall). The floor has its own coverage in CI.
+  ref.params.minNotionalQuoteLots = new BN(0);
 
   // ── L1: build a fresh cap-105 market (book + ring + FULL outbox, no grow) ──
   await stage(`L1 init_market + book + ring + outbox (cap ${CAP}, ER-capable)`, async () => {
@@ -175,24 +178,30 @@ try {
   // is skipped by self-trade prevention, so a real fill needs two parties. Both
   // open a trader-state on L1 and deposit collateral to back the position each
   // opens; the ER reads these non-delegated accounts as L1 clones during matching.
+  // Both traders are fresh ephemeral keypairs: the signer's own trader-state
+  // accumulates one open position per past acceptance run (positions are
+  // never closed here) and eventually trips the MAX_POSITIONS intake gate
+  // (TooManyOpenPositions), wedging every later run.
+  const maker = Keypair.generate();
   const taker = Keypair.generate();
-  const makerTS = traderStatePda(signer.publicKey);
+  const makerTS = traderStatePda(maker.publicKey);
   const takerTS = traderStatePda(taker.publicKey);
-  const makerAta = ata(signer.publicKey, QUOTE);
+  const signerAta = ata(signer.publicKey, QUOTE);
+  const makerAta = ata(maker.publicKey, QUOTE);
   const takerAta = ata(taker.publicKey, QUOTE);
   const DEPOSIT = 5_000_000_000; // 5,000 quote-lots — ample initial margin
   await stage("L1 fund maker + taker trader-states (open + deposit)", async () => {
+    await send(l1, SystemProgram.transfer({ fromPubkey: signer.publicKey, toPubkey: maker.publicKey, lamports: 50_000_000 }), []);
     await send(l1, SystemProgram.transfer({ fromPubkey: signer.publicKey, toPubkey: taker.publicKey, lamports: 50_000_000 }), []);
-    // Fund the taker's quote ATA from the signer.
-    await send(l1, [createAtaIx(signer.publicKey, taker.publicKey, QUOTE), transferIx(makerAta, takerAta, signer.publicKey, DEPOSIT)], []);
-    // Open both trader-states (each trader pays its own rent). The maker's
-    // state may persist from a prior run — open only when absent.
-    if (!(await l1.getAccountInfo(makerTS)))
-      await send(l1, await program.methods.openTraderState().accountsPartial({ trader: signer.publicKey, traderState: makerTS, systemProgram: sys }).instruction(), []);
+    // Fund both quote ATAs from the signer.
+    await send(l1, [createAtaIx(signer.publicKey, maker.publicKey, QUOTE), transferIx(signerAta, makerAta, signer.publicKey, DEPOSIT)], []);
+    await send(l1, [createAtaIx(signer.publicKey, taker.publicKey, QUOTE), transferIx(signerAta, takerAta, signer.publicKey, DEPOSIT)], []);
+    // Open both trader-states (each trader pays its own rent).
+    await send(l1, await program.methods.openTraderState().accountsPartial({ trader: maker.publicKey, traderState: makerTS, systemProgram: sys }).instruction(), [maker]);
     await send(l1, await program.methods.openTraderState().accountsPartial({ trader: taker.publicKey, traderState: takerTS, systemProgram: sys }).instruction(), [taker]);
     // Deposit collateral for both.
     const dep = (trader, traderState, tAta, extra) => program.methods.depositCollateral(new BN(DEPOSIT)).accountsPartial({ trader, traderState, insuranceFund: INS, quoteMint: QUOTE, traderQuoteAta: tAta, quoteVault: VAULT, tokenProgram: TOKEN_PROGRAM }).instruction();
-    await send(l1, await dep(signer.publicKey, makerTS, makerAta), []);
+    await send(l1, await dep(maker.publicKey, makerTS, makerAta), [maker]);
     await send(l1, await dep(taker.publicKey, takerTS, takerAta), [taker]);
     // Set up ER margin attestations on L1: order placement on a delegated book
     // requires er_margin_ready (set by initErMarginAttestation), so the sequencer
@@ -208,9 +217,9 @@ try {
   await stage("ER rest bids + taker sweep (4 fills; commitments + outbox on the ER)", async () => {
     for (let i = 0; i < 4; i++) {
       const tick = 90000 - i * 10;
-      await send(er, await program.methods.placeLimitOrderV2(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: makerTS, position: null }).instruction(), []);
+      await send(er, await program.methods.placeLimitOrder(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: makerTS, position: null }).instruction(), [maker]);
     }
-    await send(er, await program.methods.placeTakerOrderV2(1, new BN(4), new BN(1), 0, new BN(0), 0)
+    await send(er, await program.methods.placeTakerOrder(1, new BN(4), new BN(1), 0, new BN(0), 0)
       .accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: takerTS, position: null })
       .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
   });
@@ -220,7 +229,7 @@ try {
     // holds no position here (positions form only at post-undelegate settlement),
     // and a rejected order never touches the ring, so this leaves the round-trip
     // untouched. FLAG_REDUCE_ONLY = 2; ReduceOnlyNoPosition = Anchor Custom(8324)/0x2084.
-    const roIx = await program.methods.placeTakerOrderV2(1, new BN(1), new BN(1), 2, new BN(0), 0)
+    const roIx = await program.methods.placeTakerOrder(1, new BN(1), new BN(1), 2, new BN(0), 0)
       .accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: takerTS, position: null })
       .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction();
     let rejected = false;
