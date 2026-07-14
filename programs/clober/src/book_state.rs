@@ -296,7 +296,7 @@ pub fn probe_order(order_id: u64) -> RestingOrder {
 mod order_id_priority_kani_proofs {
     use super::{encode_order_id, seq_is_encodable, MAX_PRICE_TICKS_ENCODABLE, MAX_SEQ_ENCODABLE};
 
-    /// H1: the insert-time guard `seq_is_encodable` admits EXACTLY the seqs every
+    /// The insert-time guard `seq_is_encodable` admits EXACTLY the seqs every
     /// proof in this module `assume()`s — so runtime enforcement and the FV
     /// precondition are provably the same bound, not two constants that can drift.
     #[kani::proof]
@@ -305,7 +305,7 @@ mod order_id_priority_kani_proofs {
         assert_eq!(seq_is_encodable(seq), seq <= MAX_SEQ_ENCODABLE);
     }
 
-    /// H1: composing the guard with the encoding — any two DISTINCT orders the
+    /// Composing the guard with the encoding — any two DISTINCT orders the
     /// guard admits never collide on `order_id` (the book key stays injective).
     /// This restates `distinct_orders_never_collide` through the ACTUAL runtime
     /// predicate (`seq_is_encodable`) instead of a free `assume`, closing the loop
@@ -972,7 +972,7 @@ impl<'a> MarketBookHandle<'a> {
     /// RBT. Returns the new size_lots. Used by the matcher to apply partial
     /// fills without removing the order from the book.
     ///
-    /// MATCH-H3: **checked** sub. A `delta` larger than the resting size is an
+    /// **Checked** sub. A `delta` larger than the resting size is an
     /// over-fill accounting bug (base/quote would stop conserving) — it is now
     /// rejected instead of being silently saturated to zero, which masked the
     /// bug while the taker still recorded the full fill. Returns the new size.
@@ -1517,7 +1517,7 @@ mod tests {
         let new_size = handle.decrement_size_at(idx, 30).unwrap();
         assert_eq!(new_size, 70);
         assert_eq!(handle.order_at(idx).size_lots, 70);
-        // MATCH-H3: over-decrement (delta > size) is now REJECTED, not
+        // Over-decrement (delta > size) is now REJECTED, not
         // silently saturated to zero. The size is left unchanged.
         assert!(handle.decrement_size_at(idx, 999).is_err());
         assert_eq!(handle.order_at(idx).size_lots, 70);

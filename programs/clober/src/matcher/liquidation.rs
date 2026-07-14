@@ -134,7 +134,7 @@ pub fn compute_shortfall(
     liq_penalty_bps: u32,
 ) -> Result<ShortfallResult> {
     let sign: i128 = if pos.side == Side::Long { 1 } else { -1 };
-    // RISK-H3: checked, matching the `penalty` path below. The old raw `*`
+    // Checked, matching the `penalty` path below. The old raw `*`
     // chain could panic (debug) / wrap (release) on a numerically extreme
     // position, producing a garbage shortfall → wrong insurance draw.
     let price_diff = (fill_price.0 as i128)

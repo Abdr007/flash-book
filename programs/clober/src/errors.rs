@@ -84,8 +84,8 @@ pub enum CloberError {
     #[msg("ADL not eligible: insurance fund above threshold or counter unprofitable at bankruptcy price")]
     AdlNotEligible = 1220,
     // Codes 1221 and 1222 (BondTooSmall, BondUnbondingDelay) were
-    // retired with the removal of the HIP-3 deployer-bond infrastructure
-    // in Clober V3 — markets are authority-gated only. Codes are
+    // retired with the removal of the deployer-bond infrastructure —
+    // markets are authority-gated only. Codes are
     // intentionally left unallocated so on-chain logs from prior
     // deployments stay decodable.
     #[msg("Vault NAV market mismatch — passed market doesn't match position")]
@@ -138,8 +138,6 @@ pub enum CloberError {
     AlreadyDelegated = 1701,
     #[msg("Delegation expired")]
     DelegationExpired = 1702,
-    #[msg("Force-include from L1 not yet supported in this build")]
-    ForceIncludeUnsupported = 1703,
     #[msg("ER still live: settlement-liveness timeout not elapsed; cannot force-undelegate")]
     ErStillLive = 1704,
 
@@ -197,7 +195,7 @@ pub enum CloberError {
     #[msg("Trigger slippage cap breached — oracle moved past acceptable_price")]
     TriggerSlippageExceeded = 2100,
 
-    // ── 2200-2299 settlement integrity (H1) ─────────────────────────
+    // ── 2200-2299 settlement integrity ──────────────────────────────
     #[msg("Fill sequence not strictly increasing — replayed or out-of-order settlement")]
     FillSeqReplay = 2200,
     // ── settlement-authenticity fill-commitment queue ──────────────────
@@ -211,17 +209,19 @@ pub enum CloberError {
     FillRingCorrupt = 2204,
     #[msg("LP fill price deviates from the oracle by more than the safety band — fabricated or mispriced")]
     LpPriceOutsideBand = 2205,
-    #[msg("Market is armed: the fill-commitment account is mandatory for settlement (C-1)")]
+    #[msg("Market is armed: the fill-commitment account is mandatory for settlement")]
     FillCommitmentMissing = 2206,
-    #[msg("Cross-margined trader with multiple positions must be liquidated via liquidate_portfolio (H-4)")]
+    #[msg(
+        "Cross-margined trader with multiple positions must be liquidated via liquidate_portfolio"
+    )]
     CrossLiquidationNeedsPortfolio = 2207,
-    #[msg("Self-liquidation forbidden: the liquidator must not be the liquidatee (M-2)")]
+    #[msg("Self-liquidation forbidden: the liquidator must not be the liquidatee")]
     SelfLiquidationForbidden = 2208,
-    #[msg("Order sequence exhausted: per-market seq exceeded the 24-bit order_id encoding ceiling; reseat the market (H1)")]
+    #[msg("Order sequence exhausted: per-market seq exceeded the 24-bit order_id encoding ceiling; reseat the market")]
     OrderSeqExhausted = 2209,
-    #[msg("Liveness baseline already stamped (book_delegated_at_slot != 0) (F1)")]
+    #[msg("Liveness baseline already stamped (book_delegated_at_slot != 0)")]
     BaselineAlreadyStamped = 2210,
-    #[msg("Market book is not delegated; nothing to stamp a liveness baseline for (F1)")]
+    #[msg("Market book is not delegated; nothing to stamp a liveness baseline for")]
     BookNotDelegated = 2211,
     #[msg("Session token expired (or not yet valid); re-create the session key")]
     SessionExpired = 2212,

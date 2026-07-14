@@ -18,7 +18,7 @@ pub fn get_mut_helper<T: Get>(data: &mut [u8], index: DataIndex) -> &mut T {
     bytemuck::from_bytes_mut(&mut data[index_usize..index_usize + size_of::<T>()])
 }
 
-/// HYP-H4: bounds-checked read — returns `None` instead of panicking when the
+/// Bounds-checked read — returns `None` instead of panicking when the
 /// index + struct size would run off the end of `data` (e.g. a malformed /
 /// short account, or an out-of-range index supplied by an untrusted caller
 /// such as the sequencer). Solana programs must not panic on attacker input;
@@ -31,7 +31,7 @@ pub fn get_helper_checked<T: Get>(data: &[u8], index: DataIndex) -> Option<&T> {
     Some(bytemuck::from_bytes(slice))
 }
 
-/// HYP-H4: bounds-checked, in-range predicate for an index into the slab.
+/// Bounds-checked, in-range predicate for an index into the slab.
 /// True iff a `T` at `index` lies fully within `data`.
 pub fn index_in_bounds<T: Get>(data: &[u8], index: DataIndex) -> bool {
     (index as usize)

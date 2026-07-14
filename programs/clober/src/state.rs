@@ -227,7 +227,7 @@ pub struct MarketParams {
     /// Default false = HL-equivalent.
     pub funding_oi_dampening: bool,
 
-    // ─── V3 mark-price engine ────────────────────────────────────────
+    // ─── Mark-price engine ────────────────────────────────────────
     /// EMA weight (in bps) applied to a fresh fill price when blending
     /// it into `mark_price_ticks` inside `apply_fill`.
     ///     new_mark = alpha * fill + (1 - alpha) * old_mark
