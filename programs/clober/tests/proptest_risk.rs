@@ -38,6 +38,8 @@ fn market(mark: u64, maintenance_bps: u32) -> MarketSnapshot {
         oi_mmr_max_extra_bps: 0,
         paper_profit_haircut_bps: 0,
         stress_shock_bps: 0,
+        corr_group_id: 0,
+        corr_rho_bps: 0,
     }
 }
 

@@ -13227,6 +13227,74 @@
       ]
     },
     {
+      "name": "set_market_correlation",
+      "docs": [
+        "Phase 3 — set (or clear) this market's cross-asset correlation. Markets",
+        "sharing a non-zero `corr_group_id` net their opposing worst-case losses by",
+        "the group's MINIMUM `corr_rho_bps`, lowering margin on hedged/correlated",
+        "books. Authority-only, bounded (`rho ≤ BPS`), reversible: `(0, 0)` ⇒ no",
+        "group, no offset (fully decorrelated — the off-switch). The offset is",
+        "provably ONE-SIDED SOUND — it can never drop required below the correlated",
+        "worst-case (see `offset_relief_le_cap` /",
+        "`cross_offset_never_below_correlated_worst`)."
+      ],
+      "discriminator": [
+        169,
+        134,
+        81,
+        87,
+        16,
+        30,
+        148,
+        35
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "corr_group_id",
+          "type": "u16"
+        },
+        {
+          "name": "corr_rho_bps",
+          "type": "u16"
+        }
+      ]
+    },
+    {
       "name": "set_market_sequencer",
       "docs": [
         "Rotate the fill-settlement signer (`market.sequencer`) that",
@@ -19446,6 +19514,19 @@
       ]
     },
     {
+      "name": "MarketCorrelationSetEvent",
+      "discriminator": [
+        231,
+        219,
+        12,
+        190,
+        85,
+        77,
+        57,
+        2
+      ]
+    },
+    {
       "name": "MarketDelegatedEvent",
       "discriminator": [
         196,
@@ -23416,10 +23497,6 @@
     },
     {
       "name": "LiqRestoreBufferSetEvent",
-      "docs": [
-        "Phase 2 — the partial-liquidation restore buffer was set. `buffer_bps == 0`",
-        "⇒ restore to exactly maintenance (no buffer, the off-switch)."
-      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -24665,6 +24742,27 @@
               "accounts read it as 0."
             ],
             "type": "u16"
+          },
+          {
+            "name": "corr_group_id",
+            "docs": [
+              "Phase 3 cross-asset offset credit — correlation group id. Positions in",
+              "markets sharing a non-zero group id net their opposing worst-case losses",
+              "by the group's correlation `corr_rho_bps`. `0` ⇒ market is in NO group ⇒",
+              "no offset (fully decorrelated, byte-identical to legacy). Trailing field",
+              "within `space()` headroom; pre-existing accounts read it as 0."
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "corr_rho_bps",
+            "docs": [
+              "Phase 3 — this market's correlation with its group, in bps (`0..=BPS`).",
+              "The group's EFFECTIVE rho is the MINIMUM across its markets (fail-safe: a",
+              "mis-set high rho on one market cannot grant more relief than the group's",
+              "weakest member). `0` ⇒ no offset even if grouped. Bounded at write time."
+            ],
+            "type": "u16"
           }
         ]
       }
@@ -24830,6 +24928,31 @@
           {
             "name": "data_bytes",
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketCorrelationSetEvent",
+      "docs": [
+        "Phase 2 — the partial-liquidation restore buffer was set. `buffer_bps == 0`",
+        "⇒ restore to exactly maintenance (no buffer, the off-switch).",
+        "Phase 3 — a market's cross-asset correlation was set. `(0, 0)` ⇒ no offset."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "corr_group_id",
+            "type": "u16"
+          },
+          {
+            "name": "corr_rho_bps",
+            "type": "u16"
           }
         ]
       }
