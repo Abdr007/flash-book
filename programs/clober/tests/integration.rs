@@ -16553,6 +16553,308 @@ async fn liquidate_position_v2_caps_close_at_one_tranche() {
     );
 }
 
+// ── Phase 2: gentlest partial liquidation (minimal-close cap + restore buffer) ─
+
+/// Send helper — a FRESH blockhash per tx (identical/repeated liquidate ix would
+/// otherwise reuse a blockhash and be rejected as a duplicate signature).
+async fn phase2_send(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    ix: Instruction,
+    signer: &Keypair,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let bh = ctx
+        .get_new_latest_blockhash()
+        .await
+        .unwrap_or(ctx.last_blockhash);
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            bh,
+        ))
+        .await
+}
+
+/// Build a liquidatable 4-lot long: open at entry 100_000 (IM needs 10_000), then
+/// patch the cross collateral to `collateral` and the mark/oracle down to `mark`.
+/// With default MM=125bps and required≈notional×MM, `collateral=6_000` @ mark
+/// 99_000 gives minimal-close c*=2 (leave 2 lots healthy): closes of 3/4 are
+/// over-close, 2 is minimal, 1 is under-close. `collateral=1_000` @ mark 90_000
+/// gives equity<0 (bankrupt).
+async fn phase2_setup(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    collateral: u64,
+    mark: u64,
+    stress_shock_bps: u32,
+) -> (Pubkey, Pubkey, Pubkey, Pubkey, Keypair, Pubkey) {
+    use solana_sdk::account::Account as SolAccount;
+    let (protocol, market_pda, _, _, _) = setup_market(ctx, payer).await;
+    let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
+    phase2_send(
+        ctx,
+        build_ix(
+            clober::instruction::InitMarketBook {},
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market_pda, false),
+                AccountMeta::new(book_pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        ),
+        payer,
+    )
+    .await
+    .unwrap();
+
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let liq = Keypair::new();
+    let taker_state = setup_trader(ctx, payer, &taker, 20_000, &protocol).await;
+    let maker_state = setup_trader(ctx, payer, &maker, 500_000, &protocol).await;
+    let liq_state = setup_trader(ctx, payer, &liq, 100_000, &protocol).await;
+    let taker_pos = open_cross_position_sized(
+        ctx,
+        payer,
+        market_pda,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+        4,
+    )
+    .await;
+
+    // Fund the insurance fund generously so a bankrupt full-close can draw it.
+    {
+        let a = ctx
+            .banks_client
+            .get_account(protocol.insurance_fund)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut f =
+            clober::state::InsuranceFundAccount::try_deserialize(&mut a.data.as_slice()).unwrap();
+        f.balance_quote_lots = 10_000_000;
+        let mut d = Vec::new();
+        f.try_serialize(&mut d).unwrap();
+        d.resize(a.data.len(), 0);
+        ctx.set_account(
+            &protocol.insurance_fund,
+            &SolAccount {
+                lamports: a.lamports,
+                data: d,
+                owner: a.owner,
+                executable: a.executable,
+                rent_epoch: a.rent_epoch,
+            }
+            .into(),
+        );
+    }
+
+    // Patch the mark/oracle down (position underwater) and clear any tranche cap.
+    let now = ctx
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    let slot = ctx.banks_client.get_sysvar::<Clock>().await.unwrap().slot;
+    {
+        let acc = ctx
+            .banks_client
+            .get_account(market_pda)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut m = MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
+        m.oracle_price_ticks = mark;
+        m.oracle_published_at_unix_seconds = now as u64;
+        m.mark_price_ticks = mark;
+        m.last_mark_update_slot = slot;
+        // Tier the market directly (test shortcut — bypasses the setter's MM≥shock
+        // validation, which is Phase 1's concern, not Phase 2's). A LOW shock (e.g.
+        // 500 = 5%) scales the margin lattice so `required ≈ 5% of notional`, the
+        // regime where a small partial close actually restores health. `0` keeps
+        // the legacy ±30% lattice (used for the bankrupt case).
+        m.stress_shock_bps = stress_shock_bps;
+        m.params.max_liq_tranche_lots = 0; // no tranche cap — close_size == requested
+        m.params.liquidation_cooldown_slots = 0;
+        let mut data = Vec::new();
+        m.try_serialize(&mut data).unwrap();
+        data.resize(acc.data.len(), 0);
+        ctx.set_account(
+            &market_pda,
+            &SolAccount {
+                lamports: acc.lamports,
+                data,
+                owner: acc.owner,
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            }
+            .into(),
+        );
+    }
+    // Patch the cross collateral (zero-copy trader_state).
+    {
+        let ts_acc = ctx
+            .banks_client
+            .get_account(taker_state)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ts: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+        ts.collateral_quote_lots = collateral;
+        let disc = <TraderStateAccount as anchor_lang::Discriminator>::DISCRIMINATOR;
+        let mut data = vec![0u8; ts_acc.data.len()];
+        data[..8].copy_from_slice(disc);
+        let ser = bytemuck::bytes_of(&ts);
+        data[8..8 + ser.len()].copy_from_slice(ser);
+        ctx.set_account(
+            &taker_state,
+            &SolAccount {
+                lamports: ts_acc.lamports,
+                data,
+                owner: ts_acc.owner,
+                executable: ts_acc.executable,
+                rent_epoch: ts_acc.rent_epoch,
+            }
+            .into(),
+        );
+    }
+    (market_pda, book_pda, taker_state, liq_state, liq, taker_pos)
+}
+
+fn liq_ix(
+    liq: &Keypair,
+    market: Pubkey,
+    book: Pubkey,
+    taker_state: Pubkey,
+    liq_state: Pubkey,
+    taker_pos: Pubkey,
+    requested_close_lots: u64,
+) -> Instruction {
+    build_ix(
+        clober::instruction::LiquidatePosition {
+            requested_close_lots,
+        },
+        vec![
+            AccountMeta::new(liq.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(book, false),
+            AccountMeta::new(taker_state, false),
+            AccountMeta::new(liq_state, false),
+            AccountMeta::new(taker_pos, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    )
+}
+
+/// Solvent-below-MM position on a LOW-stress (tiered) market: the minimal-close
+/// cap is exercised across every close size. The exact minimal `c*` is discovered
+/// EMPIRICALLY (robust to the precise margin formula): accepted closes must form
+/// the prefix `1..=c*` (under-closes + the minimal-to-restore), and every close
+/// `> c*` must be REJECTED with LiquidationOverClose (the cap bites). `1<=c*<=3`
+/// proves a partial restores health while the full close is capped.
+#[tokio::test]
+async fn liquidate_position_phase2_minimal_close_cap() {
+    let mut outcomes: Vec<(u64, bool, String)> = Vec::new();
+    for c in 1u64..=4 {
+        // Fresh context per close size — an accepted close mutates book/state.
+        let pt = make_program_test();
+        let mut ctx = pt.start_with_context().await;
+        let payer = ctx.payer.insecure_clone();
+        let (market, book, taker_state, liq_state, liq, taker_pos) =
+            phase2_setup(&mut ctx, &payer, 14_000, 99_000, 500).await;
+        let r = phase2_send(
+            &mut ctx,
+            liq_ix(&liq, market, book, taker_state, liq_state, taker_pos, c),
+            &liq,
+        )
+        .await;
+        let msg = r
+            .as_ref()
+            .err()
+            .map(|e| format!("{e:?}"))
+            .unwrap_or_default();
+        outcomes.push((c, r.is_ok(), msg));
+    }
+    let c_star = outcomes
+        .iter()
+        .filter(|(_, ok, _)| *ok)
+        .map(|(c, _, _)| *c)
+        .max()
+        .expect("at least the minimal-to-restore close must be accepted");
+    assert!(
+        (1..=3).contains(&c_star),
+        "cap must bite (a partial restores, full close capped): expected 1<=c*<=3, got c*={c_star}; outcomes={outcomes:?}"
+    );
+    for (c, ok, msg) in &outcomes {
+        if *c <= c_star {
+            assert!(ok, "close {c} <= c*({c_star}) must be accepted; got {msg}");
+        } else {
+            assert!(
+                msg.contains("Custom(7406)"),
+                "over-close {c} > c*({c_star}) must fail with LiquidationOverClose(7406); got ok={ok} msg={msg}"
+            );
+        }
+    }
+}
+
+/// A BANKRUPT position (equity ≤ 0) is exempt from the over-close cap — a full
+/// close proceeds into the existing insurance / bad-debt path.
+#[tokio::test]
+async fn liquidate_position_phase2_bankrupt_full_close_uncapped() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    // collateral 1_000, mark 90_000 ⇒ equity(4) = 1_000 - 40_000 < 0 (bankrupt).
+    // Legacy market (stress 0) — the bankruptcy exemption is independent of tier.
+    let (market, book, taker_state, liq_state, liq, taker_pos) =
+        phase2_setup(&mut ctx, &payer, 1_000, 90_000, 0).await;
+    phase2_send(
+        &mut ctx,
+        liq_ix(&liq, market, book, taker_state, liq_state, taker_pos, 0),
+        &liq,
+    )
+    .await
+    .expect("bankrupt full close must proceed (over-close cap does not apply)");
+}
+
+/// `set_liq_restore_buffer` accepts a buffer within the IM headroom and rejects
+/// one that would push MM×(1+buffer) past IM.
+#[tokio::test]
+async fn set_liq_restore_buffer_enforces_im_bound() {
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let buf_ix = |bps: u16| {
+        build_ix(
+            clober::instruction::SetLiqRestoreBuffer { buffer_bps: bps },
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new(market_pda, false),
+            ],
+        )
+    };
+    // MM=125, IM=250 ⇒ MM×(1+buf) ≤ IM ⟺ buf ≤ 10_000 (100%). 5_000 is fine.
+    phase2_send(&mut ctx, buf_ix(5_000), &payer)
+        .await
+        .expect("in-bound buffer must be accepted");
+    let m: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(m.liq_restore_buffer_bps, 5_000);
+    // 20_000 (200%) would make MM×3 = 375 > IM 250 ⇒ rejected (Custom 7407).
+    let e = phase2_send(&mut ctx, buf_ix(20_000), &payer)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e:?}").contains("Custom(7407)"),
+        "over-IM buffer must be rejected: {e:?}"
+    );
+}
+
 // ── 3.1: paper-profit haircut crank (percolator per-domain credit) ──────────
 
 #[tokio::test]

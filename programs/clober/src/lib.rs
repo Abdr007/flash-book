@@ -7589,6 +7589,45 @@ pub mod clober {
         Ok(())
     }
 
+    /// Phase 2 — set the partial-liquidation restore buffer (bps). A gentle
+    /// (partial) liquidation closes only the minimum to restore the position to
+    /// `maintenance × (1 + buffer)`, slightly above the bare liquidation line so it
+    /// does not immediately re-liquidate. Authority-only, bounded, REVERSIBLE
+    /// (`0` = no buffer = restore to exactly maintenance, the off-switch).
+    ///
+    /// Bound: `MM × (1 + buffer) ≤ IM` — a partial liquidation can never over-close
+    /// past the initial-margin line, so it never re-margins the trader beyond what
+    /// opening required (`LiqRestoreBufferTooHigh` otherwise). With MM ≤ IM this is
+    /// `buffer_bps ≤ (IM − MM) · BPS / MM`.
+    pub fn set_liq_restore_buffer(
+        ctx: Context<SetLiqRestoreBuffer>,
+        buffer_bps: u16,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        require_keys_eq!(
+            market.authority,
+            ctx.accounts.authority.key(),
+            CloberError::Unauthorized
+        );
+        let mm = market.params.maintenance_margin_ratio_bps as u128;
+        let im = market.params.initial_margin_ratio_bps as u128;
+        // MM × (1 + buffer/BPS) ≤ IM  ⟺  MM·BPS + MM·buffer ≤ IM·BPS.
+        // All ≤ u32·u32 ⇒ fits u128, no overflow, no division.
+        let lhs = mm
+            .saturating_mul(constants::BPS_DENOM as u128)
+            .saturating_add(mm.saturating_mul(buffer_bps as u128));
+        let rhs = im.saturating_mul(constants::BPS_DENOM as u128);
+        require!(lhs <= rhs, CloberError::LiqRestoreBufferTooHigh);
+        market.liq_restore_buffer_bps = buffer_bps;
+        emit!(LiqRestoreBufferSetEvent {
+            market: market.key(),
+            buffer_bps,
+            maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+            initial_margin_bps: market.params.initial_margin_ratio_bps,
+        });
+        Ok(())
+    }
+
     /// Set (or clear) the market's emergency guardian
     /// — a key that may only RESTRICT market status (pause/post-only/close), never
     /// loosen (see `set_market_status`). Authority-only. `Pubkey::default()` clears
@@ -10005,6 +10044,67 @@ pub mod clober {
             trader_state_pre_collateral,
         )?;
         require!(!assessment.is_healthy, CloberError::NotLiquidatable);
+
+        // ── PHASE 2: gentlest liquidation — cap a SOLVENT position's close at the
+        // minimum needed to restore health, so a partial liquidation NEVER
+        // over-closes. A BANKRUPT position (equity ≤ 0 at the health price — a full
+        // close still cannot cover) skips the cap and full-closes into the existing
+        // insurance / bad-debt path below.
+        //
+        // Conservative by construction: the probe re-assesses the reduced position
+        // against the PRE-close collateral. Closing at the health price only moves
+        // unrealized PnL into realized collateral (minus the penalty), so this
+        // OVERSTATES the remaining equity by at most the liquidation penalty — the
+        // cap can therefore only ever be TIGHTER than the true minimal, i.e. it may
+        // force a slightly smaller close (fail-safe: never over-closes a solvent
+        // trader, never strands bad debt). Under-close is permitted — the position
+        // simply stays liquidatable for the next call.
+        if assessment.equity_quote_lots_signed > 0 {
+            let remaining = position.size_lots.saturating_sub(close_size);
+            let probe = remaining.saturating_add(1); // ≥ 1 since close_size ≥ 1
+            let probe_pos = RiskPosSnap {
+                market: position.market,
+                side: pos_side,
+                size_lots: probe,
+                entry_price: Ticks(position.entry_price_ticks),
+                cum_funding_index_at_entry: position.cum_funding_index(),
+                collateral_quote_lots: position.collateral_quote_lots,
+            };
+            let probe_mkt = RiskMarketSnap {
+                market: market.key(),
+                mark_price: Ticks(health_price_ticks),
+                cum_funding_index: market.cum_funding_index,
+                maintenance_margin_bps: market.params.maintenance_margin_ratio_bps,
+                tick_size: market.params.tick_size,
+                concentration_threshold_lots: market.params.concentration_threshold_lots,
+                concentration_extra_mmr_bps: market.params.concentration_extra_mmr_bps,
+                side_oi_lots: oi_side_lots(market, matches!(pos_side, Side::Long)),
+                oi_mmr_slope_bps_per_million_lots: market.params.oi_mmr_slope_bps_per_million_lots,
+                oi_mmr_max_extra_bps: market.params.oi_mmr_max_extra_bps,
+                paper_profit_haircut_bps: market.paper_profit_haircut_bps,
+                stress_shock_bps: market.stress_shock_bps,
+            };
+            let probe_assessment = assess_margin_unified_fn(
+                &[probe_pos],
+                &[probe_mkt],
+                &scenarios,
+                trader_state_pre_collateral,
+            )?;
+            // Closing one lot LESS (leaving `probe = remaining + 1`) must NOT already
+            // restore the position to maintenance × (1 + restore buffer). If it did,
+            // this close exceeds the minimum-to-restore ⇒ reject (over-close).
+            // `required` is monotone in size (proven), so `!one_less_restored` is
+            // exactly "close ≤ minimal".
+            let one_less_already_restored = matcher::risk::equity_meets_scaled_required(
+                probe_assessment.equity_quote_lots_signed,
+                probe_assessment.required_quote_lots,
+                market.liq_restore_buffer_bps,
+            );
+            require!(
+                !one_less_already_restored,
+                CloberError::LiquidationOverClose
+            );
+        }
 
         // Emit the source for transparency — keepers and UIs can show
         // "liquidated by oracle move" vs "liquidated by mark drift".
@@ -17813,6 +17913,20 @@ pub struct SetMarketStressTier<'info> {
     pub insurance_fund: Box<Account<'info, InsuranceFundAccount>>,
 }
 
+/// `set_liq_restore_buffer` context (Phase 2). Authority-only; the auth check is
+/// in-handler (`market.authority == authority`). No insurance account needed —
+/// the buffer bound is purely MM/IM, local to the market.
+#[derive(Accounts)]
+pub struct SetLiqRestoreBuffer<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, MarketAccount>>,
+}
+
 /// `set_market_status` context. Auth is checked
 /// in-handler (authority OR guardian, with the restrict-only asymmetry). The
 /// guardian PDA is OPTIONAL — supplied for a guardian-restrict call, omitted for an
@@ -19823,6 +19937,16 @@ pub struct MarketStressTierSetEvent {
     pub max_leverage: u32,
     pub insurance_balance: u64,
     pub worst_gap_loss: u64,
+}
+
+/// Phase 2 — the partial-liquidation restore buffer was set. `buffer_bps == 0`
+/// ⇒ restore to exactly maintenance (no buffer, the off-switch).
+#[event]
+pub struct LiqRestoreBufferSetEvent {
+    pub market: Pubkey,
+    pub buffer_bps: u16,
+    pub maintenance_margin_bps: u32,
+    pub initial_margin_bps: u32,
 }
 
 #[event]

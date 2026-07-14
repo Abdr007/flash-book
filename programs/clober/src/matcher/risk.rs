@@ -304,6 +304,72 @@ mod stress_scaler_tests {
             let n_hi = super::scale_shock_num(base, hi).unsigned_abs();
             proptest::prelude::prop_assert!(n_lo <= n_hi);
         }
+
+        /// PHASE 2: `assess_margin.required_quote_lots` is NON-DECREASING in
+        /// position size (all else equal). This is the monotonicity that makes the
+        /// minimal-close cap sound: closing lots lowers required, so meeting the
+        /// restore target is monotone in close size, hence `!meets_target(rem+1)`
+        /// ⟺ the close does not exceed the minimal-to-target. Exercises the REAL
+        /// `assess_margin`. Host proptest (size×price is a symbolic product CBMC
+        /// cannot discharge — Law 5 / the Phase 1 hang lesson).
+        #[test]
+        fn assess_required_monotone_in_size(
+            s in 0u64..=1_000_000u64,
+            d in 0u64..=1_000_000u64,
+            entry in 1u64..=100_000u64,
+            mark in 1u64..=100_000u64,
+            mm_bps in 100u32..=5_000u32,
+        ) {
+            let mkt = Pubkey::new_from_array([7u8; 32]);
+            let mksnap = MarketSnapshot {
+                market: mkt,
+                mark_price: Ticks(mark),
+                cum_funding_index: 0,
+                maintenance_margin_bps: mm_bps,
+                tick_size: 1,
+                concentration_threshold_lots: 0,
+                concentration_extra_mmr_bps: 0,
+                side_oi_lots: 0,
+                oi_mmr_slope_bps_per_million_lots: 0,
+                oi_mmr_max_extra_bps: 0,
+                paper_profit_haircut_bps: 0,
+                stress_shock_bps: 0,
+            };
+            let possnap = |size: u64| PositionSnapshot {
+                market: mkt,
+                side: Side::Long,
+                size_lots: size,
+                entry_price: Ticks(entry),
+                cum_funding_index_at_entry: 0,
+                collateral_quote_lots: 0,
+            };
+            let scen = default_scenarios(&[mkt]);
+            let lo = assess_margin(&[possnap(s)], &[mksnap], &scen, 0);
+            let hi = assess_margin(&[possnap(s.saturating_add(d))], &[mksnap], &scen, 0);
+            if let (Ok(lo), Ok(hi)) = (lo, hi) {
+                proptest::prelude::prop_assert!(
+                    hi.required_quote_lots >= lo.required_quote_lots
+                );
+            }
+        }
+
+        /// PHASE 2: pins the `× buffer / BPS` restore-target scaling end-to-end
+        /// (the non-power-of-2 divide the Kani core omits) and confirms
+        /// `equity_meets_scaled_required` matches the exact `equity >= required·(1+buf)`.
+        #[test]
+        fn equity_meets_scaled_required_matches_exact(
+            req in proptest::prelude::any::<u64>(),
+            buf in proptest::prelude::any::<u16>(),
+            eq in proptest::prelude::any::<i128>(),
+        ) {
+            let extra = (req as u128).saturating_mul(buf as u128) / crate::constants::BPS_DENOM as u128;
+            let scaled = (req as u128).saturating_add(extra);
+            let scaled_i = if scaled > i128::MAX as u128 { i128::MAX } else { scaled as i128 };
+            proptest::prelude::prop_assert_eq!(
+                super::equity_meets_scaled_required(eq, req, buf),
+                eq >= scaled_i
+            );
+        }
     }
 
     #[test]
@@ -370,6 +436,41 @@ pub struct MarginAssessment {
     pub is_healthy: bool,
     /// 0-based scenario index that produced the worst case.
     pub worst_scenario_idx: u32,
+}
+
+/// Division-free comparison core for the Phase 2 partial-liquidation restore
+/// target: TRUE iff signed `equity` meets the (already buffer-scaled) required
+/// margin `scaled_required`. Factored out of [`equity_meets_scaled_required`] so
+/// the comparison is Kani-provable over a SYMBOLIC pre-scaled value — the
+/// `× buffer / BPS` scaling is a non-power-of-2 divide CBMC cannot discharge, so
+/// it is applied in the wrapper and pinned by the host grid test
+/// `equity_meets_scaled_required_grid`. Total, no division, no multiply.
+#[inline]
+pub fn equity_meets_target(equity_signed: i128, scaled_required: i128) -> bool {
+    equity_signed >= scaled_required
+}
+
+/// TRUE iff `equity_signed` meets `required × (1 + buffer_bps/BPS)` — the restore
+/// target a gentle partial liquidation must reach (buffer 0 ⇒ exactly the
+/// maintenance requirement). Saturating throughout: an overflowing scaled target
+/// saturates high ⇒ `equity` cannot meet it ⇒ FALSE (fail-safe: never claims a
+/// position is restored when it is not). The bare comparison is the proven core.
+#[inline]
+pub fn equity_meets_scaled_required(
+    equity_signed: i128,
+    required_quote_lots: u64,
+    buffer_bps: u16,
+) -> bool {
+    let extra = (required_quote_lots as u128).saturating_mul(buffer_bps as u128)
+        / crate::constants::BPS_DENOM as u128;
+    let scaled = (required_quote_lots as u128).saturating_add(extra);
+    // `scaled` (≤ ~u64::MAX·2) always fits i128; clamp defends a pathological input.
+    let scaled_i = if scaled > i128::MAX as u128 {
+        i128::MAX
+    } else {
+        scaled as i128
+    };
+    equity_meets_target(equity_signed, scaled_i)
 }
 
 /// Compute unrealized PnL of a position at `at_price`. Result in quote-lots
@@ -1096,9 +1197,34 @@ mod isolated_margin_tests {
 /// properties that hold for ANY division result). Runs in the CI Kani job.
 #[cfg(kani)]
 mod mmr_kani_proofs {
-    use super::{oi_scaled_mmr_extra_bps, MarketSnapshot};
+    use super::{equity_meets_target, oi_scaled_mmr_extra_bps, MarketSnapshot};
     use crate::matcher::lot::Ticks;
     use anchor_lang::prelude::Pubkey;
+
+    /// PHASE 2: the partial-liquidation restore-target comparison is EXACT and
+    /// MONOTONE over the whole domain (division-free). A larger required target
+    /// can only make the position LESS likely to meet it; more equity only MORE
+    /// likely — so the "restored to target" test is a sound one-sided bound
+    /// (it never reports a position as restored when its equity is below target).
+    /// Underpins the minimal-close cap: closing more lowers required, so meeting
+    /// the target is monotone in close size.
+    #[kani::proof]
+    fn equity_meets_target_is_exact_and_monotone() {
+        let equity: i128 = kani::any();
+        let target: i128 = kani::any();
+        let meets = equity_meets_target(equity, target);
+        assert!(meets == (equity >= target));
+        // More equity, same target: still meets.
+        let more_eq: i128 = kani::any();
+        if more_eq >= equity && meets {
+            assert!(equity_meets_target(more_eq, target));
+        }
+        // Higher target, same equity: if it FAILED, it still fails (harder).
+        let higher_t: i128 = kani::any();
+        if higher_t >= target && !meets {
+            assert!(!equity_meets_target(equity, higher_t));
+        }
+    }
 
     /// PHASE 1 (T3): the per-market stress scaler is MONOTONE in the tier —
     /// a larger effective shock never yields a smaller-magnitude scaled shock, so

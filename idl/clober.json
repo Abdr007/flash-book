@@ -13161,6 +13161,72 @@
       ]
     },
     {
+      "name": "set_liq_restore_buffer",
+      "docs": [
+        "Phase 2 — set the partial-liquidation restore buffer (bps). A gentle",
+        "(partial) liquidation closes only the minimum to restore the position to",
+        "`maintenance × (1 + buffer)`, slightly above the bare liquidation line so it",
+        "does not immediately re-liquidate. Authority-only, bounded, REVERSIBLE",
+        "(`0` = no buffer = restore to exactly maintenance, the off-switch).",
+        "",
+        "Bound: `MM × (1 + buffer) ≤ IM` — a partial liquidation can never over-close",
+        "past the initial-margin line, so it never re-margins the trader beyond what",
+        "opening required (`LiqRestoreBufferTooHigh` otherwise). With MM ≤ IM this is",
+        "`buffer_bps ≤ (IM − MM) · BPS / MM`."
+      ],
+      "discriminator": [
+        128,
+        178,
+        146,
+        15,
+        67,
+        1,
+        98,
+        247
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.base_mint",
+                "account": "MarketAccount"
+              },
+              {
+                "kind": "account",
+                "path": "market.quote_mint",
+                "account": "MarketAccount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "buffer_bps",
+          "type": "u16"
+        }
+      ]
+    },
+    {
       "name": "set_market_sequencer",
       "docs": [
         "Rotate the fill-settlement signer (`market.sequencer`) that",
@@ -19094,6 +19160,19 @@
       ]
     },
     {
+      "name": "LiqRestoreBufferSetEvent",
+      "discriminator": [
+        164,
+        130,
+        201,
+        100,
+        161,
+        209,
+        151,
+        196
+      ]
+    },
+    {
       "name": "LiquidationInjectedV2Event",
       "discriminator": [
         159,
@@ -20522,6 +20601,16 @@
       "code": 7405,
       "name": "BackstopTailTooLow",
       "msg": "Backstop tail too low: must be >= 30% and >= the margin stress shock"
+    },
+    {
+      "code": 7406,
+      "name": "LiquidationOverClose",
+      "msg": "Partial liquidation over-closes a solvent position: close only the minimum to restore health"
+    },
+    {
+      "code": 7407,
+      "name": "LiqRestoreBufferTooHigh",
+      "msg": "Liquidation restore buffer too high: MM x (1 + buffer) would exceed initial margin"
     },
     {
       "code": 7500,
@@ -23326,6 +23415,34 @@
       }
     },
     {
+      "name": "LiqRestoreBufferSetEvent",
+      "docs": [
+        "Phase 2 — the partial-liquidation restore buffer was set. `buffer_bps == 0`",
+        "⇒ restore to exactly maintenance (no buffer, the off-switch)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "buffer_bps",
+            "type": "u16"
+          },
+          {
+            "name": "maintenance_margin_bps",
+            "type": "u32"
+          },
+          {
+            "name": "initial_margin_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
       "name": "LiquidationInjectedV2Event",
       "type": {
         "kind": "struct",
@@ -24533,6 +24650,21 @@
               "Trailing field ⇒ pre-existing accounts read it as 0."
             ],
             "type": "u32"
+          },
+          {
+            "name": "liq_restore_buffer_bps",
+            "docs": [
+              "Phase 2 — partial-liquidation restore buffer (bps). A gentle (partial)",
+              "liquidation closes only the minimum size to restore the position to",
+              "`maintenance_required × (1 + liq_restore_buffer_bps/BPS)` — slightly ABOVE",
+              "the bare maintenance line, so the position does not immediately re-liquidate",
+              "on the next adverse tick (avoids churn / repeated penalties). `0` ⇒ no",
+              "buffer (restore to exactly maintenance), which is still valid. The setter",
+              "bounds it so the scaled target can never exceed initial margin (a partial",
+              "liquidation never over-closes past IM). Trailing field ⇒ pre-existing",
+              "accounts read it as 0."
+            ],
+            "type": "u16"
           }
         ]
       }
