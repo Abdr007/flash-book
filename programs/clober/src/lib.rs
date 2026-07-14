@@ -3133,6 +3133,49 @@ pub mod clober {
         Ok(())
     }
 
+    /// One-time migration for deployments that predate the pool-singleton
+    /// seed rename (`flp_exposure` → `lp_exposure`): the singleton moved to
+    /// a new PDA but the treasury `LpPositionAccount` seed did not, so a
+    /// pre-rename treasury survives at the exact address
+    /// `initialize_liquidity_pool` must `init` — permanently wedging pool
+    /// (re)initialization. Closes the stranded treasury position and drains
+    /// the orphaned pre-rename singleton, refunding rent to the authority.
+    ///
+    /// Only legal while the canonical `lp_exposure` singleton does NOT
+    /// exist (`AlreadyInitialized` otherwise): once the pool is live, the
+    /// same seeds address the LIVE treasury endowment, which must never be
+    /// closeable.
+    pub fn close_legacy_lp_accounts(ctx: Context<CloseLegacyLpAccounts>) -> Result<()> {
+        let pool = &ctx.accounts.lp_exposure;
+        require!(
+            pool.owner == &anchor_lang::system_program::ID && pool.data_is_empty(),
+            CloberError::AlreadyInitialized
+        );
+
+        // The orphaned pre-rename singleton is program-owned at the retired
+        // PDA. Drain its lamports to the authority and zero the data so the
+        // runtime reaps it and stale bytes can never be re-read.
+        let legacy = &ctx.accounts.legacy_flp_exposure;
+        require!(legacy.owner == &crate::ID, CloberError::Unauthorized);
+        let reclaimed = legacy.lamports();
+        **legacy.try_borrow_mut_lamports()? = 0;
+        let authority_ai = ctx.accounts.authority.to_account_info();
+        let topped = authority_ai
+            .lamports()
+            .checked_add(reclaimed)
+            .ok_or(error!(CloberError::ArithmeticOverflow))?;
+        **authority_ai.try_borrow_mut_lamports()? = topped;
+        legacy.try_borrow_mut_data()?.fill(0);
+
+        // `legacy_treasury_position` is closed (rent → authority) by its
+        // `close = authority` constraint.
+        emit!(LegacyLpAccountsClosedEvent {
+            authority: ctx.accounts.authority.key(),
+            reclaimed_lamports: reclaimed,
+        });
+        Ok(())
+    }
+
     /// Deposit capital into the LP pool and mint shares at the current
     /// NAV/share price. Permissionless — any signer can become an LP.
     /// Their LpPositionAccount is created lazily via init_if_needed.
@@ -17232,6 +17275,43 @@ pub struct InitializeLiquidityPool<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// One-time legacy-seed migration (see `close_legacy_lp_accounts`).
+#[derive(Accounts)]
+pub struct CloseLegacyLpAccounts<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// Admin-gated exactly like `initialize_liquidity_pool`: only the
+    /// insurance-fund authority may run the migration.
+    #[account(
+        seeds = [InsuranceFundAccount::SEED],
+        bump = insurance_fund.bump,
+        constraint = insurance_fund.authority == authority.key() @ CloberError::Unauthorized,
+    )]
+    pub insurance_fund: Account<'info, InsuranceFundAccount>,
+
+    /// CHECK: canonical pool-singleton PDA, REQUIRED UNINITIALIZED — the
+    /// handler gates on it (seeds pin the address; owner/data checked there).
+    #[account(seeds = [LiquidityPoolAccount::SEED], bump)]
+    pub lp_exposure: UncheckedAccount<'info>,
+
+    /// The stranded pre-rename treasury endowment; rent refunds to the
+    /// authority. Typed, so discriminator + seeds bind it to a real
+    /// `LpPositionAccount` owned by this program.
+    #[account(
+        mut,
+        close = authority,
+        seeds = [state::LpPositionAccount::SEED, authority.key().as_ref()],
+        bump = legacy_treasury_position.bump,
+    )]
+    pub legacy_treasury_position: Box<Account<'info, state::LpPositionAccount>>,
+
+    /// CHECK: orphaned pre-rename singleton at the retired `flp_exposure`
+    /// PDA; seeds pin the address, the handler checks program ownership.
+    #[account(mut, seeds = [b"flp_exposure"], bump)]
+    pub legacy_flp_exposure: UncheckedAccount<'info>,
+}
+
 #[derive(Accounts)]
 pub struct LpDeposit<'info> {
     #[account(mut)]
@@ -19950,6 +20030,12 @@ pub struct PartialCollateralWithdrawnEvent {
 pub struct LiquidityPoolInitializedEvent {
     pub authority: Pubkey,
     pub initial_capital: u64,
+}
+
+#[event]
+pub struct LegacyLpAccountsClosedEvent {
+    pub authority: Pubkey,
+    pub reclaimed_lamports: u64,
 }
 
 #[event]

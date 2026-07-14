@@ -18009,3 +18009,281 @@ async fn g3_oi_insurance_floor_prevents_bootstrap_brick() {
         "once gross OI exceeds the (lowered) floor, the breaker still trips"
     );
 }
+
+// ─── legacy LP-seed wedge migration ─────────────────────────────────────────
+//
+// The pool-singleton seed rename (`flp_exposure` → `lp_exposure`) left
+// pre-rename deployments with (a) an orphaned singleton at the retired PDA and
+// (b) a stranded treasury `LpPositionAccount` at the EXACT address
+// `initialize_liquidity_pool` must `init` — so the pool can never be
+// (re)initialized. `close_legacy_lp_accounts` clears both; it is admin-gated
+// and only legal while the canonical singleton does not exist.
+
+#[tokio::test]
+async fn legacy_lp_seed_wedge_migration_unblocks_pool_init() {
+    use solana_sdk::account::Account as SolAccount;
+
+    let pt = make_program_test();
+    let mut ctx = pt.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+
+    let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
+    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
+    let (treasury_pos, treasury_bump) = pda(&[
+        clober::state::LpPositionAccount::SEED,
+        payer.pubkey().as_ref(),
+    ]);
+    let (legacy_flp, _) = pda(&[b"flp_exposure"]);
+
+    // Insurance fund init (authority = payer) — required by both the wedged
+    // pool init and the migration's admin gate.
+    let quote_mint = create_mint(&mut ctx, &payer).await;
+    let quote_vault = Keypair::new();
+    let ix = build_ix(
+        clober::instruction::InitializeInsuranceFund {
+            fee_contribution_bps: 1_000,
+            toxicity_tax_contribution_bps: 5_000,
+            liq_penalty_contribution_bps: 5_000,
+            pause_threshold_quote_lots: 5_000,
+        },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(insurance_fund, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(quote_vault.pubkey(), true),
+            AccountMeta::new_readonly(spl_token_id(), false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::rent::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer, &quote_vault],
+            bh,
+        ))
+        .await
+        .unwrap();
+
+    // Inject the pre-rename wreckage: a stranded treasury LpPositionAccount at
+    // the canonical treasury address, and an orphaned program-owned singleton
+    // at the retired `flp_exposure` PDA.
+    let inject_treasury = |lp: Pubkey, bump: u8| {
+        let state = clober::state::LpPositionAccount {
+            lp: to_anchor(lp),
+            bump,
+            shares: 42,
+            total_deposited_quote_lots: 42,
+            total_withdrawn_quote_lots: 0,
+            deposited_at_slot: 0,
+        };
+        let mut data = Vec::new();
+        state.try_serialize(&mut data).unwrap();
+        data.resize(104, 0);
+        data
+    };
+    let rent = solana_sdk::rent::Rent::default();
+    ctx.set_account(
+        &treasury_pos,
+        &SolAccount {
+            lamports: rent.minimum_balance(104),
+            data: inject_treasury(payer.pubkey(), treasury_bump),
+            owner: program_id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+    let legacy_flp_lamports = rent.minimum_balance(200);
+    ctx.set_account(
+        &legacy_flp,
+        &SolAccount {
+            lamports: legacy_flp_lamports,
+            data: vec![0xAB; 200],
+            owner: program_id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    let (authority_lp_position, _) = pda(&[
+        clober::state::LpPositionAccount::SEED,
+        payer.pubkey().as_ref(),
+    ]);
+    let pool_init_ix = || {
+        build_ix(
+            clober::instruction::InitializeLiquidityPool {
+                initial_capital_quote_lots: 0,
+            },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(lp_exposure, false),
+                AccountMeta::new(authority_lp_position, false),
+                AccountMeta::new_readonly(insurance_fund, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        )
+    };
+
+    // 1. Wedge reproduced: pool init fails while the stranded treasury
+    //    occupies the `init` address.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[pool_init_ix()],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(0)"),
+        "wedged pool init must fail on create (account already in use), got: {err:?}"
+    );
+
+    // 2. Migration is admin-gated: a non-authority signer (with its own
+    //    injected stranded treasury, so the gate — not a missing account —
+    //    is what rejects) fails Unauthorized.
+    let rando = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &rando.pubkey(),
+                1_000_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let (rando_pos, rando_bump) = pda(&[
+        clober::state::LpPositionAccount::SEED,
+        rando.pubkey().as_ref(),
+    ]);
+    ctx.set_account(
+        &rando_pos,
+        &SolAccount {
+            lamports: rent.minimum_balance(104),
+            data: inject_treasury(rando.pubkey(), rando_bump),
+            owner: program_id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+    let migrate_ix = |authority: Pubkey, treasury: Pubkey| {
+        build_ix(
+            clober::instruction::CloseLegacyLpAccounts {},
+            vec![
+                AccountMeta::new(authority, true),
+                AccountMeta::new_readonly(insurance_fund, false),
+                AccountMeta::new_readonly(lp_exposure, false),
+                AccountMeta::new(treasury, false),
+                AccountMeta::new(legacy_flp, false),
+            ],
+        )
+    };
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[migrate_ix(rando.pubkey(), rando_pos)],
+            Some(&rando.pubkey()),
+            &[&rando],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7100)"),
+        "non-authority migration must fail Unauthorized, got: {err:?}"
+    );
+
+    // 3. Authority migration succeeds: both legacy accounts are gone and the
+    //    rent came back.
+    let balance_before = ctx.banks_client.get_balance(payer.pubkey()).await.unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[migrate_ix(payer.pubkey(), treasury_pos)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        ctx.banks_client
+            .get_account(treasury_pos)
+            .await
+            .unwrap()
+            .is_none(),
+        "stranded treasury must be closed"
+    );
+    assert!(
+        ctx.banks_client
+            .get_account(legacy_flp)
+            .await
+            .unwrap()
+            .is_none(),
+        "orphaned pre-rename singleton must be reaped"
+    );
+    let balance_after = ctx.banks_client.get_balance(payer.pubkey()).await.unwrap();
+    assert!(
+        balance_after > balance_before,
+        "rent must be reclaimed to the authority (before={balance_before}, after={balance_after})"
+    );
+
+    // 4. The wedge is gone: pool init now succeeds and the endowment is
+    //    freshly written (not the injected legacy values).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[pool_init_ix()],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap();
+    let pool: LiquidityPoolAccount = fetch(&mut ctx.banks_client, lp_exposure).await;
+    assert_eq!(pool.authority, to_anchor(payer.pubkey()));
+    assert_eq!(pool.lp_shares_outstanding, 0);
+    let endowment: clober::state::LpPositionAccount =
+        fetch(&mut ctx.banks_client, authority_lp_position).await;
+    assert_eq!(endowment.shares, 0, "live endowment starts at zero shares");
+
+    // 5. SAFETY: once the pool is live, the same seeds address the LIVE
+    //    treasury endowment — the migration must refuse to close it.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let err = ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[migrate_ix(payer.pubkey(), treasury_pos)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Custom(7101)"),
+        "migration after pool init must fail AlreadyInitialized, got: {err:?}"
+    );
+    assert!(
+        ctx.banks_client
+            .get_account(authority_lp_position)
+            .await
+            .unwrap()
+            .is_some(),
+        "live endowment must survive a migration attempt"
+    );
+}
