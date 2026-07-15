@@ -2275,10 +2275,10 @@ async fn set_market_stress_tier_gates_leverage_by_backstop() {
     send(&mut ctx, tier_ix(0, 0), &payer)
         .await
         .expect("off-switch must always be accepted");
-    let m3: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    assert_eq!(m3.stress_shock_bps, 0);
-    assert_eq!(m3.backstop_tail_bps, 0);
-    assert_eq!(m3.effective_stress_shock_bps(), 3000); // baseline ±30%
+    let baseline_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(baseline_market.stress_shock_bps, 0);
+    assert_eq!(baseline_market.backstop_tail_bps, 0);
+    assert_eq!(baseline_market.effective_stress_shock_bps(), 3000); // baseline ±30%
 }
 
 #[tokio::test]
@@ -4325,20 +4325,26 @@ async fn second_market_initializes_at_different_oracle_price() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (_protocol, m1, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (_protocol, first_market, _, _, _) = setup_market(&mut ctx, &payer).await;
     let (second_market, _, _, _) = setup_additional_market(&mut ctx, &payer, 200_000).await;
 
-    let market1: MarketAccount = fetch(&mut ctx.banks_client, m1).await;
-    let market2: MarketAccount = fetch(&mut ctx.banks_client, second_market).await;
+    let first_market_state: MarketAccount = fetch(&mut ctx.banks_client, first_market).await;
+    let second_market_state: MarketAccount = fetch(&mut ctx.banks_client, second_market).await;
 
-    assert_eq!(market1.oracle_price_ticks, 100_000);
-    assert_eq!(market2.oracle_price_ticks, 200_000);
-    assert_ne!(market1.base_mint, market2.base_mint);
-    assert_ne!(market1.quote_mint, market2.quote_mint);
+    assert_eq!(first_market_state.oracle_price_ticks, 100_000);
+    assert_eq!(second_market_state.oracle_price_ticks, 200_000);
+    assert_ne!(first_market_state.base_mint, second_market_state.base_mint);
+    assert_ne!(
+        first_market_state.quote_mint,
+        second_market_state.quote_mint
+    );
     // Both should share the same authority + global PDAs.
-    assert_eq!(market1.authority, market2.authority);
-    assert_eq!(market1.lp_pool, market2.lp_pool);
-    assert_eq!(market1.insurance_fund, market2.insurance_fund);
+    assert_eq!(first_market_state.authority, second_market_state.authority);
+    assert_eq!(first_market_state.lp_pool, second_market_state.lp_pool);
+    assert_eq!(
+        first_market_state.insurance_fund,
+        second_market_state.insurance_fund
+    );
 }
 
 #[tokio::test]
@@ -16922,7 +16928,7 @@ async fn set_market_correlation_writes_and_bounds() {
     assert_eq!(reset_market.corr_rho_bps, 0);
 }
 
-// ── 3.1: paper-profit haircut crank (percolator per-domain credit) ──────────
+// ── Paper-profit haircut crank (per-domain credit) ──────────────────────────
 
 #[tokio::test]
 async fn set_paper_profit_haircut_cranks_and_gates_auth() {
@@ -16932,8 +16938,11 @@ async fn set_paper_profit_haircut_cranks_and_gates_auth() {
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     // Precondition: default is 0 (no haircut) for a fresh market.
-    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    assert_eq!(m0.paper_profit_haircut_bps, 0, "default must be no-haircut");
+    let initial_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        initial_market.paper_profit_haircut_bps, 0,
+        "default must be no-haircut"
+    );
 
     // Authority (payer) cranks the haircut to 3000 bps.
     let ix = build_ix(
@@ -16953,13 +16962,13 @@ async fn set_paper_profit_haircut_cranks_and_gates_auth() {
         ))
         .await
         .unwrap();
-    let m1: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    let configured_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(
-        m1.paper_profit_haircut_bps, 3000,
+        configured_market.paper_profit_haircut_bps, 3000,
         "crank must persist the haircut"
     );
     assert!(
-        m1.paper_haircut_updated_slot > 0,
+        configured_market.paper_haircut_updated_slot > 0,
         "crank must stamp the slot"
     );
 
@@ -17642,9 +17651,9 @@ async fn g3_oi_insurance_multiple_setter_bounds() {
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     // Default is 0 (disabled) fresh out of initialize_market.
-    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    let initial_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(
-        m0.oi_insurance_multiple_bps, 0,
+        initial_market.oi_insurance_multiple_bps, 0,
         "breaker defaults to 0 (disabled)"
     );
 
@@ -17827,8 +17836,11 @@ async fn g3_oi_insurance_breaker_disabled_no_pause() {
     let book_pda = init_market_book_for(&mut ctx, &payer, market_pda).await;
 
     // Do NOT set the multiple: it stays 0 (disabled).
-    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    assert_eq!(m0.oi_insurance_multiple_bps, 0, "breaker left disabled");
+    let initial_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        initial_market.oi_insurance_multiple_bps, 0,
+        "breaker left disabled"
+    );
 
     // Even a tiny insurance balance would trip a 1× breaker on this fill — but the
     // breaker is off, so it must stay dormant.
@@ -17940,9 +17952,9 @@ async fn g3_oi_insurance_floor_setter_bounds() {
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     // Default is 0 (no floor) fresh out of initialize_market.
-    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    let initial_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(
-        m0.oi_insurance_floor_notional, 0,
+        initial_market.oi_insurance_floor_notional, 0,
         "floor defaults to 0 (no floor)"
     );
 
