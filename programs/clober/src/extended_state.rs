@@ -291,9 +291,8 @@ const _: () = assert!(
 // collateral; the insurance fund draws LESS; the maker gets a
 // guaranteed fill at a price they pre-committed.
 //
-// NO other on-chain DEX has this primitive — HL has private liquidations,
-// Drift / dYdX use external keepers + insurance. JIT auctions = public
-// pre-commit primitive where any maker can underbid the synthetic.
+// This primitive keeps liquidation participation public and lets any maker
+// pre-commit an offer that can underbid the synthetic order.
 //
 // Seeds: `[b"jit_liq_offer", market, maker, &nonce.to_le_bytes()]`.
 // `nonce` is a u32 the maker picks so they can have multiple concurrent

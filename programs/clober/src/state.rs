@@ -114,7 +114,7 @@ pub struct MarketParams {
     /// same block.
     pub liquidation_auction_duration_slots: u32,
 
-    /// Drift-style JIT bonus: extra bps of rebate the maker earns when
+    /// Inventory-aware JIT bonus: extra bps of rebate the maker earns when
     /// filling a JIT-tagged taker order (flag bit 3 on place_limit_order).
     /// 0 = JIT inactive. Typical setting: 5-20 bps (0.05-0.2% of notional)
     /// added on top of the base maker_rebate_bps. Encourages MMs to
@@ -134,7 +134,7 @@ pub struct MarketParams {
     /// (referrer is per-trader; builder is per-order).
     pub builder_share_bps: u32,
 
-    /// HIP-3 / permissionless-deployer share. When the market was created
+    /// Permissionless-deployer share. When the market was created
     /// permissionlessly, `MarketAccount.creator` is the deployer pubkey and
     /// this is the share of net fees credited to them. 0 = no creator
     /// share (typical for protocol-deployed core markets). Typical for
@@ -176,8 +176,8 @@ pub struct MarketParams {
     /// margin becomes `maintenance_margin_ratio_bps +
     /// concentration_extra_mmr_bps`. Penalises whales whose size is
     /// harder to liquidate without market impact. 0 threshold = tier
-    /// disabled (single-MMR for the whole market). Smarter than HL's
-    /// flat per-market MMR.
+    /// disabled (single-MMR for the whole market). A concentration tier
+    /// raises maintenance requirements for positions that are harder to unwind.
     /// Typical: threshold sized to 1-5% of LP capital; extra 100-500 bps.
     pub concentration_threshold_lots: u64,
     pub concentration_extra_mmr_bps: u32,
@@ -187,7 +187,7 @@ pub struct MarketParams {
     /// rate uses the average of the last N batches' (mark - oracle)
     /// premium instead of the instantaneous one — kills funding spikes
     /// from microbursts of toxic flow that move the mark for one batch.
-    /// HL uses single-tick premium; this is mathematically smarter.
+    /// This averages the premium across the configured window.
     /// Capped at MARK_HISTORY_LEN (16). Typical: 4-8 batches.
     pub funding_premium_twap_window: u8,
 
@@ -220,10 +220,9 @@ pub struct MarketParams {
     /// When the book is balanced (skew = 0), funding is fully dampened
     /// (zero) — no reason to drain anyone since no side dominates.
     /// When the book is one-sided (skew = 10_000 = 100%), funding is
-    /// at full strength to incentivise correction. HL charges full
-    /// premium-driven funding even with balanced OI; this is a
-    /// genuinely smarter signal of "actual incentive needed."
-    /// Default false = HL-equivalent.
+    /// at full strength to incentivise correction. Full premium-driven funding
+    /// is unnecessary when open interest is balanced.
+    /// Default false leaves the dampener disabled.
     pub funding_oi_dampening: bool,
 
     // ─── Mark-price engine ────────────────────────────────────────
@@ -466,14 +465,14 @@ pub struct MarketAccount {
     /// Trailing field ⇒ pre-existing accounts read 0. A stale haircut is
     /// over-conservative (safe), so this gates crank cadence, not solvency.
     pub paper_haircut_updated_slot: u64,
-    /// HIP-3: `true` if this market was created permissionlessly (any signer)
+    /// `true` if this market was created permissionlessly (any signer)
     /// via `create_permissionless_market`, rather than by the protocol authority
     /// via `initialize_market`. A permissionless market's bad debt is NEVER
     /// socialized to the shared insurance fund (`cover_bad_debt` skips the draw)
     /// — its participants bear its risk (ADL + the per-domain paper-profit
     /// haircut), so a hostile creator can never drain the global fund. Its params
     /// are additionally clamped to a hard safety envelope at creation
-    /// (`validate_hip3_params`). Trailing field ⇒ pre-existing (authority-created)
+    /// (`validate_permissionless_market_params`). Trailing field ⇒ pre-existing (authority-created)
     /// markets read `false` = fully insurance-backed, exact prior behaviour.
     pub is_permissionless: bool,
     /// OI-vs-insurance circuit breaker. Max GROSS open-interest notional the
@@ -505,7 +504,7 @@ pub struct MarketAccount {
     /// (Phase 1). Scales every default_scenarios shock proportionally
     /// (`scale_shock`), so a lower-vol asset is stress-tested to a smaller move
     /// and can carry higher leverage. The maintenance floor is tied to this via
-    /// `hip3_core_bounds_ok` so a position is liquidatable exactly when a
+    /// `permissionless_market_core_bounds_ok` so a position is liquidatable exactly when a
     /// worst-shock move would breach it. `0` ⇒ default ±30% (full lattice +
     /// default 5% MM floor) — the safe default and off-switch. Trailing field ⇒
     /// pre-existing accounts (zero-padded to `space()`) read it as 0. Set via
@@ -687,8 +686,8 @@ pub struct FeeTiersAccount {
     pub _pad0: [u8; 6],
     /// Length of the volume-tracking window in slots. Crossing this
     /// boundary on the next apply_fill resets the trader's
-    /// `volume_30d_quote_lots` to 0 and re-anchors the window. HL
-    /// pattern uses 14 days ≈ 3_024_000 slots @ 0.4s. Authority sets
+    /// `volume_30d_quote_lots` to 0 and re-anchors the window. A typical
+    /// configuration uses 14 days ≈ 3_024_000 slots @ 0.4s. Authority sets
     /// this to match their preferred review cadence.
     pub volume_window_slots: u64,
     /// Sorted ascending by `min_volume_quote_lots`. Tier 0 (volume 0

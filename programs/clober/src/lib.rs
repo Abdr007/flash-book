@@ -80,7 +80,7 @@ pub mod clober {
     /// Initialize a new market and all associated PDAs. AUTHORITY-GATED:
     /// only the protocol authority can deploy markets — Clober does
     /// not support permissionless market creation. The `creator` field
-    /// on the market account is zeroed (no creator share / HIP-3-style
+    /// on the market account is zeroed (no creator share / permissionless-market-style
     /// fee split is paid out unless the authority later patches in a
     /// curated creator via a future migration ix).
     pub fn initialize_market(
@@ -91,13 +91,13 @@ pub mod clober {
         initialize_market_inner(ctx, params, initial_oracle_ticks)
     }
 
-    /// HIP-3: create a market PERMISSIONLESSLY — ANY signer, no protocol-authority
+    /// Create a market permissionlessly: any signer, with no protocol-authority
     /// gate. The signer becomes the market's authority + sequencer + creator and
     /// pays rent. Safety rests on two guarantees, both proven:
-    ///   1. `validate_hip3_params` clamps every param to a hard safety envelope
+    ///   1. `validate_permissionless_market_params` clamps every param to a hard safety envelope
     ///      (bounded leverage, MM floor, `IM ≥ MM`, non-predatory fees, fresh
     ///      oracle) — so the market is conservative regardless of creator intent
-    ///      (`hip3_params_are_safe`, Kani).
+    ///      (`permissionless_market_params_are_safe`, Kani).
     ///   2. The market is flagged `is_permissionless`, so its bad debt is NEVER
     ///      socialized to the shared insurance fund (`cover_bad_debt` skips the
     ///      draw) — a hostile creator can never drain the global backstop; the
@@ -112,7 +112,7 @@ pub mod clober {
         params: MarketParams,
         initial_oracle_ticks: u64,
     ) -> Result<()> {
-        validate_hip3_params(&params)?;
+        validate_permissionless_market_params(&params)?;
         require!(initial_oracle_ticks > 0, CloberError::ZeroPrice);
         let bump = ctx.bumps.market;
         let creator = ctx.accounts.creator.key();
@@ -5570,7 +5570,7 @@ pub mod clober {
                     && ctx.accounts.maker_position_haircut.is_some()),
             CloberError::HaircutNotInitialized
         );
-        // HIP-3 solvency: a PERMISSIONLESS market's bad debt
+        // permissionless-market solvency: a PERMISSIONLESS market's bad debt
         // is isolated from the shared insurance fund (`cover_bad_debt` skips the
         // draw), so an uncovered loser shortfall must NOT be able to leave the
         // winner over-credited against the shared vault. The haircut engine is
@@ -7278,7 +7278,7 @@ pub mod clober {
     ///   2. the tail underwrites a true black swan AND exceeds the margin shock
     ///      (`eff_tail >= max(3000, eff_shock)`) ⇒ the backstop gap is never
     ///      vacuous (`BackstopTailTooLow` otherwise);
-    ///   3. the market's mm/im still satisfy `hip3_core_bounds_ok` for the new
+    ///   3. the market's mm/im still satisfy `permissionless_market_core_bounds_ok` for the new
     ///      (tighter) maintenance floor — IM ≥ MM ≥ shock;
     ///   4. the fund covers the worst tail-gap loss over the market's HARD OI cap
     ///      (`worst_gap_loss_exceeds_insurance` is false) — a tiered market MUST
@@ -7344,7 +7344,7 @@ pub mod clober {
 
         // (3) params consistent with the new maintenance floor (IM ≥ MM ≥ shock).
         require!(
-            hip3_core_bounds_ok(max_lev, mm, im, eff_shock),
+            permissionless_market_core_bounds_ok(max_lev, mm, im, eff_shock),
             CloberError::OutOfRange
         );
 
@@ -9210,7 +9210,7 @@ pub mod clober {
                     && ctx.accounts.taker_position_haircut.is_some()),
             CloberError::HaircutNotInitialized
         );
-        // HIP-3 solvency: mirrors apply_fill — a permissionless
+        // permissionless-market solvency: mirrors apply_fill — a permissionless
         // market (insurance-isolated) may only settle once its haircut engine is
         // enabled, so winner gains are solvency-gated and can't over-credit the
         // shared vault against an uncovered shortfall.
@@ -15110,7 +15110,7 @@ fn cancel_order_core(
 
 /// Shared init body for `initialize_market`. Permissionless market
 /// creation has been removed — markets are authority-gated and the
-/// `creator` field on the market account is zeroed (no HIP-3-style
+/// `creator` field on the market account is zeroed (no permissionless-market-style
 /// creator share is paid out unless the authority later migrates the
 /// market to a curated creator).
 fn initialize_market_inner(
@@ -15291,12 +15291,12 @@ pub struct InitializeMarket<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// HIP-3 permissionless-market creation. Identical to `InitializeMarket` EXCEPT
+/// Permissionless market creation. Identical to `InitializeMarket` except
 /// the signer is any `creator` (no `insurance_fund.authority == signer` gate).
 /// This is safe because: (1) the commitment ring is mandatory, so the
 /// creator-as-sequencer cannot
 /// fabricate fills — apply_fill requires a real keccak commitment from a book
-/// crossing, else `FillNotCommitted`; (2) `validate_hip3_params` clamps the
+/// crossing, else `FillNotCommitted`; (2) `validate_permissionless_market_params` clamps the
 /// params; (3) `is_permissionless` isolates the market's bad debt from the shared
 /// insurance fund. The insurance_fund / lp_exposure are still referenced
 /// (read-only PDAs) so the market records the canonical vault, but NO authority
@@ -19981,7 +19981,7 @@ pub struct BuilderFeeOwedEvent {
     pub amount_quote_lots: u64,
 }
 
-/// HIP-3 deployer share. Off-chain ledger credits the market creator
+/// permissionless-market deployer share. Off-chain ledger credits the market creator
 /// with `amount_quote_lots` per fill. Pull-based — no creator account
 /// is touched in the apply_fill hot path.
 #[event]
@@ -21535,7 +21535,7 @@ fn cover_bad_debt<'info>(
     if shortfall == 0 {
         return;
     }
-    // HIP-3 isolation: a PERMISSIONLESS market's bad debt is NEVER socialized to
+    // permissionless-market isolation: a PERMISSIONLESS market's bad debt is NEVER socialized to
     // the shared insurance fund — a hostile creator must not be able to drain the
     // global backstop. The shortfall is left uncovered (borne by that market's
     // own participants via ADL + the per-domain paper-profit haircut); the event
@@ -21945,23 +21945,28 @@ fn hash_params(p: &MarketParams) -> Result<[u8; 32]> {
     Ok(solana_keccak_hasher::hashv(&[&bytes]).0)
 }
 
-/// HIP-3: the hard safety envelope every PERMISSIONLESS market's params must
+/// The hard safety envelope every permissionless market's parameters must
 /// satisfy. Because any signer may call `create_permissionless_market`, the
 /// params are attacker-controlled; this clamps them so the resulting market is
 /// provably conservative no matter who created it — bounded leverage, a real
 /// maintenance-margin floor, `IM ≥ MM` (the anti-self-liquidation invariant),
 /// non-predatory fees, a fresh-oracle requirement, and bounded liquidation
-/// incentives + fee shares. `hip3_params_are_safe` (Kani) proves that anything
+/// incentives + fee shares. `permissionless_market_params_are_safe` (Kani) proves that anything
 /// this accepts satisfies the envelope. Authority-created markets bypass this
 /// (they are already trusted); only the permissionless path calls it.
-/// The numeric leverage/margin core of the HIP-3 safety envelope, as a pure
-/// predicate so `hip3_params_are_safe` (Kani) proves exactly the deployed logic:
+/// The numeric leverage/margin core of the permissionless-market safety envelope, as a pure
+/// predicate so `permissionless_market_params_are_safe` (Kani) proves exactly the deployed logic:
 /// bounded leverage, a maintenance floor, `IM ≥ MM`, and `IM · leverage ≥
 /// BPS_DENOM` (the advertised leverage is actually funded by the initial margin,
-/// so the true max leverage `BPS/IM ≤ max_leverage ≤ HIP3_MAX_LEVERAGE`). The
+/// so the true max leverage `BPS/IM ≤ max_leverage ≤ PERMISSIONLESS_MAX_LEVERAGE`). The
 /// `u32 → u64` widen makes the product overflow-free.
 #[inline]
-fn hip3_core_bounds_ok(max_leverage: u32, mm_bps: u32, im_bps: u32, worst_shock_bps: u32) -> bool {
+fn permissionless_market_core_bounds_ok(
+    max_leverage: u32,
+    mm_bps: u32,
+    im_bps: u32,
+    worst_shock_bps: u32,
+) -> bool {
     use constants::*;
     // Maintenance floor (decision A): a DEFAULT, un-tiered market (worst_shock == 0)
     // keeps the flat 5% floor. A TIERED market ties its maintenance floor to its
@@ -21969,17 +21974,17 @@ fn hip3_core_bounds_ok(max_leverage: u32, mm_bps: u32, im_bps: u32, worst_shock_
     // im ≥ mm this gives im ≥ mm ≥ shock (theorem T2), so a position is
     // liquidatable exactly when a worst-shock move would breach it.
     let mm_floor = if worst_shock_bps == 0 {
-        HIP3_MIN_MAINTENANCE_MARGIN_BPS
+        PERMISSIONLESS_MIN_MAINTENANCE_MARGIN_BPS
     } else {
         worst_shock_bps.max(MIN_MM_ABS_BPS)
     };
-    (1..=HIP3_MAX_LEVERAGE).contains(&max_leverage)
+    (1..=PERMISSIONLESS_MAX_LEVERAGE).contains(&max_leverage)
         && mm_bps >= mm_floor
         && im_bps >= mm_bps
         && (im_bps as u64) * (max_leverage as u64) >= BPS_DENOM as u64
 }
 
-fn validate_hip3_params(p: &MarketParams) -> Result<()> {
+fn validate_permissionless_market_params(p: &MarketParams) -> Result<()> {
     use constants::*;
     // Measurement primitives must be real.
     require!(p.tick_size > 0, CloberError::OutOfRange);
@@ -21989,9 +21994,9 @@ fn validate_hip3_params(p: &MarketParams) -> Result<()> {
     // Leverage capped; maintenance floored; IM ≥ MM (feeds the proven
     // withdraw-cannot-self-liquidate guarantee); IM consistent with the
     // advertised leverage. The numeric core is a shared predicate so the Kani
-    // proof (`hip3_params_are_safe`) covers exactly the deployed logic.
+    // proof (`permissionless_market_params_are_safe`) covers exactly the deployed logic.
     require!(
-        hip3_core_bounds_ok(
+        permissionless_market_core_bounds_ok(
             p.max_leverage,
             p.maintenance_margin_ratio_bps,
             p.initial_margin_ratio_bps,
@@ -22004,27 +22009,27 @@ fn validate_hip3_params(p: &MarketParams) -> Result<()> {
     );
     // Non-predatory economics.
     require!(
-        p.taker_fee_bps <= HIP3_MAX_TAKER_FEE_BPS,
+        p.taker_fee_bps <= PERMISSIONLESS_MAX_TAKER_FEE_BPS,
         CloberError::OutOfRange
     );
     require!(
-        p.liq_penalty_bps <= HIP3_MAX_LIQ_BPS,
+        p.liq_penalty_bps <= PERMISSIONLESS_MAX_LIQ_BPS,
         CloberError::OutOfRange
     );
     require!(
-        p.liquidator_reward_bps <= HIP3_MAX_LIQ_BPS,
+        p.liquidator_reward_bps <= PERMISSIONLESS_MAX_LIQ_BPS,
         CloberError::OutOfRange
     );
     require!(
-        p.referrer_share_bps <= HIP3_MAX_SHARE_BPS
-            && p.builder_share_bps <= HIP3_MAX_SHARE_BPS
-            && p.creator_share_bps <= HIP3_MAX_SHARE_BPS,
+        p.referrer_share_bps <= PERMISSIONLESS_MAX_SHARE_BPS
+            && p.builder_share_bps <= PERMISSIONLESS_MAX_SHARE_BPS
+            && p.creator_share_bps <= PERMISSIONLESS_MAX_SHARE_BPS,
         CloberError::OutOfRange
     );
     // Fresh oracle required (bounded staleness), band configured.
     require!(
         p.oracle_staleness_max_seconds >= 1
-            && p.oracle_staleness_max_seconds <= HIP3_MAX_ORACLE_STALENESS_SECS,
+            && p.oracle_staleness_max_seconds <= PERMISSIONLESS_MAX_ORACLE_STALENESS_SECS,
         CloberError::OutOfRange
     );
     require!(p.oracle_band_bps > 0, CloberError::OutOfRange);
@@ -22050,12 +22055,12 @@ fn validate_hip3_params(p: &MarketParams) -> Result<()> {
     );
     require!(
         p.funding_per_period_max_bps > 0
-            && p.funding_per_period_max_bps <= HIP3_MAX_FUNDING_PER_PERIOD_BPS,
+            && p.funding_per_period_max_bps <= PERMISSIONLESS_MAX_FUNDING_PER_PERIOD_BPS,
         CloberError::OutOfRange
     );
     require!(
-        p.funding_period_seconds >= HIP3_MIN_FUNDING_PERIOD_SECS
-            && p.funding_period_seconds <= HIP3_MAX_FUNDING_PERIOD_SECS,
+        p.funding_period_seconds >= PERMISSIONLESS_MIN_FUNDING_PERIOD_SECS
+            && p.funding_period_seconds <= PERMISSIONLESS_MAX_FUNDING_PERIOD_SECS,
         CloberError::OutOfRange
     );
     Ok(())
@@ -24670,28 +24675,28 @@ mod oi_crowding_wiring_tests {
 }
 
 #[cfg(kani)]
-mod hip3_kani_proofs {
-    //! HIP-3 permissionless-market param safety.
-    use super::hip3_core_bounds_ok;
+mod permissionless_market_kani_proofs {
+    //! Permissionless-market parameter safety.
+    use super::permissionless_market_core_bounds_ok;
     use crate::constants::*;
 
     /// Anything the permissionless param envelope accepts is conservative:
     /// leverage is capped, maintenance is floored, `IM >= MM` (the
     /// anti-self-liquidation invariant), and the advertised leverage is actually
-    /// funded by the initial margin (effective leverage <= HIP3_MAX_LEVERAGE).
+    /// funded by the initial margin (effective leverage <= PERMISSIONLESS_MAX_LEVERAGE).
     /// Proven for ALL `(max_leverage, mm, im)` — no hostile param combination
     /// slips through, and the `IM * leverage` product is overflow-free.
     #[kani::proof]
-    fn hip3_params_are_safe() {
+    fn permissionless_market_params_are_safe() {
         let max_lev: u32 = kani::any();
         let mm: u32 = kani::any();
         let im: u32 = kani::any();
         // Default (un-tiered) envelope: flat 5% maintenance floor, unchanged.
-        if hip3_core_bounds_ok(max_lev, mm, im, 0) {
-            assert!((1..=HIP3_MAX_LEVERAGE).contains(&max_lev));
-            assert!(mm >= HIP3_MIN_MAINTENANCE_MARGIN_BPS);
+        if permissionless_market_core_bounds_ok(max_lev, mm, im, 0) {
+            assert!((1..=PERMISSIONLESS_MAX_LEVERAGE).contains(&max_lev));
+            assert!(mm >= PERMISSIONLESS_MIN_MAINTENANCE_MARGIN_BPS);
             assert!(im >= mm);
-            assert!(im >= HIP3_MIN_MAINTENANCE_MARGIN_BPS);
+            assert!(im >= PERMISSIONLESS_MIN_MAINTENANCE_MARGIN_BPS);
             assert!((im as u64) * (max_lev as u64) >= BPS_DENOM as u64);
         }
     }
@@ -24708,11 +24713,11 @@ mod hip3_kani_proofs {
         let mm: u32 = kani::any();
         let im: u32 = kani::any();
         let shock: u32 = kani::any();
-        if hip3_core_bounds_ok(max_lev, mm, im, shock) {
-            assert!((1..=HIP3_MAX_LEVERAGE).contains(&max_lev));
+        if permissionless_market_core_bounds_ok(max_lev, mm, im, shock) {
+            assert!((1..=PERMISSIONLESS_MAX_LEVERAGE).contains(&max_lev));
             assert!(im >= mm);
             if shock == 0 {
-                assert!(mm >= HIP3_MIN_MAINTENANCE_MARGIN_BPS);
+                assert!(mm >= PERMISSIONLESS_MIN_MAINTENANCE_MARGIN_BPS);
             } else {
                 // MM ≥ max(shock, MIN_MM_ABS) ⇒ IM ≥ MM ≥ shock and ≥ MIN_MM_ABS.
                 assert!(mm >= shock);

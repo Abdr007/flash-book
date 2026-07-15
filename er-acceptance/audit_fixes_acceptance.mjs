@@ -1,6 +1,5 @@
-// AUDIT-FIXES LIVE ACCEPTANCE (devnet) — validates the 2026-07 adversarial-audit
-// remediation on the real chain, end-to-end. Requires the post-remediation program
-// deployed (the added intake accounts + gates). Run AFTER `solana program deploy`.
+// LIVE ACCEPTANCE (devnet) — validates the critical intake, settlement, and
+// governance controls on the current Clober deployment, end-to-end.
 //
 //   C-1 (CRITICAL): a taker/maker order committed against a NON-EXISTENT TraderState
 //                   must be REJECTED at intake (pre-fix it settled → permanent FIFO
@@ -30,14 +29,14 @@ const program = new Program(IDL, new AnchorProvider(l1, new Wallet(signer), { co
 const sys = SystemProgram.programId;
 const pda = (s, p = PID) => PublicKey.findProgramAddressSync(s.map((x) => (Buffer.isBuffer(x) ? x : (typeof x === "string" ? Buffer.from(x) : x.toBuffer()))), p)[0];
 
-// Reference devnet accounts (shared across the acceptance suite).
-const QUOTE = new PublicKey("CJKxS7WBFaEoZkEBxd8kgWPtVShvTAfZswx4oFwGtQL3");
-const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
-const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
-const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
-const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
+// Current-program devnet fixture shared across the acceptance suite.
+const QUOTE = new PublicKey("5NL1XQZ4ZdiLR6a6VwCZWQ6DMCLdafCvbDFjeVRzcama");
+const INS = new PublicKey("B9MgERuAheDM3pzh3Z4VwYMZxSGpMmYATfjpuutpgAVJ");
+const VAULT = new PublicKey("2FNwaiQ1u5aJLbHviSch2p3pBVmnyMJK54v1cVtMuPVd");
+const OBV = new PublicKey("Cbf3TwLKvHsh1mH72PjNt7z7dpmbtxdYZNTWxybyde22");
+const OOR = new PublicKey("GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD");
 const LP = pda(["lp_exposure"]);
-const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
+const REF_MARKET = new PublicKey("DRTiohFdhTbyCHkc8huNMSgrgV3oDryayJHEavB5vztZ");
 
 // TraderState PDA: sub_index 0 = [b"trader_state", trader]; N>0 = [.., trader, [N]].
 const traderStatePda = (trader, sub = 0) =>
@@ -68,17 +67,15 @@ const mkMarket = async (params, tag) => {
   const M = pda(["market", base.publicKey, QUOTE]);
   const BOOK = pda(["market_book", M]);
   const FC = pda(["fill_commit", M]);
-  await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
+  await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), []);
   await send(await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction());
   await send(await program.methods.initFillCommitment(256).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction());
   console.log(`  ${tag} market ${M.toBase58()}`);
   return { M, BOOK, FC };
 };
 
-// NOTE: the reference market was created under the OLD program with
-// oracle_staleness_max_seconds == 0; the post-remediation program REJECTS that
-// (AUDIT M-5 — a 0 bound silently disables the staleness gate). Supply a valid
-// bound. (This rejection is itself a live M-5 acceptance — see below.)
+// Keep a positive staleness window in the derived test parameters. A zero bound
+// disables the oracle-freshness gate and is rejected by current initialization.
 const paramsIM0 = { ...ref.params, initialMarginRatioBps: 0, oracleStalenessMaxSeconds: new BN(60) };
 const paramsIM = { ...ref.params, oracleStalenessMaxSeconds: new BN(60) };
 

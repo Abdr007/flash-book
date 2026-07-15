@@ -1163,7 +1163,7 @@ mod fee_tier_tests {
 
     #[test]
     fn picks_highest_satisfied_tier() {
-        // HL-style schedule (monotone improving):
+        // Monotone tier schedule (monotone improving):
         //   tier 0 (vol 0):       maker 2 bps rebate, taker 5 bps fee
         //   tier 1 ($1M):         maker 3 bps rebate, taker 4 bps fee
         //   tier 2 ($5M):         maker 4 bps rebate, taker 3 bps fee

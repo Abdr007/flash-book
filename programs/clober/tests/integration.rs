@@ -17024,9 +17024,9 @@ async fn set_paper_profit_haircut_cranks_and_gates_auth() {
     );
 }
 
-// ── HIP-3: permissionless market creation ───────────────────────────────────
+// ── permissionless-market: permissionless market creation ───────────────────────────────────
 
-fn hip3_valid_params() -> MarketParams {
+fn permissionless_market_valid_params() -> MarketParams {
     MarketParams {
         max_leverage: 10,
         maintenance_margin_ratio_bps: 500,
@@ -17047,7 +17047,7 @@ fn hip3_valid_params() -> MarketParams {
         funding_per_period_max_bps: 50,
         funding_period_seconds: 3_600,
         // Mark engine must track the tape — a zero EMA weight would leave the
-        // mark permanently frozen (rejected by validate_hip3_params).
+        // mark permanently frozen (rejected by validate_permissionless_market_params).
         mark_ema_alpha_bps: 2_000,
         ..default_params()
     }
@@ -17107,7 +17107,8 @@ async fn create_permissionless_market_by_non_authority_succeeds_and_isolates() {
         .await
         .unwrap();
 
-    let (market, ix) = create_perm_market_ix(&creator, &protocol, hip3_valid_params()).await;
+    let (market, ix) =
+        create_perm_market_ix(&creator, &protocol, permissionless_market_valid_params()).await;
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -17159,10 +17160,10 @@ async fn create_permissionless_market_rejects_out_of_envelope_params() {
         .await
         .unwrap();
 
-    // 100x leverage is outside the HIP-3 envelope (max HIP3_MAX_LEVERAGE=65) →
+    // 100x leverage is outside the permissionless-market envelope (max PERMISSIONLESS_MAX_LEVERAGE=65) →
     // OutOfRange (7003). (The per-market maintenance floor still binds below this
     // ceiling; the ceiling itself rejects an absurd advertised leverage.)
-    let mut bad = hip3_valid_params();
+    let mut bad = permissionless_market_valid_params();
     bad.max_leverage = 100;
     let (_market, ix) = create_perm_market_ix(&creator, &protocol, bad).await;
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -17178,14 +17179,14 @@ async fn create_permissionless_market_rejects_out_of_envelope_params() {
         .unwrap_err();
     assert!(
         format!("{err:?}").contains("Custom(7003)"),
-        "predatory (100x) params must be rejected by the HIP-3 envelope, got: {err:?}"
+        "predatory (100x) params must be rejected by the permissionless-market envelope, got: {err:?}"
     );
 
     // Funding is a predatory lever too: a hostile creator must not be able to
     // set an unbounded funding rate (the drain-via-crank attack), omit the
     // required per-period backstop, or blow past the per-period cap.
     let make = |f: &dyn Fn(&mut MarketParams)| {
-        let mut p = hip3_valid_params();
+        let mut p = permissionless_market_valid_params();
         f(&mut p);
         p
     };
@@ -17225,7 +17226,7 @@ async fn create_permissionless_market_rejects_out_of_envelope_params() {
             .unwrap_err();
         assert!(
             format!("{err:?}").contains("Custom(7003)"),
-            "{label} must be rejected by the HIP-3 funding envelope, got: {err:?}"
+            "{label} must be rejected by the permissionless-market funding envelope, got: {err:?}"
         );
     }
 }

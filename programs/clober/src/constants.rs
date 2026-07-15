@@ -287,21 +287,21 @@ pub const MAX_PRICE_SIG_FIGS: u32 = 5;
 /// calls. 64 comfortably fits a transaction's account/data budget.
 pub const MAX_REAP_PER_CALL: usize = 64;
 
-// ─── HIP-3 permissionless-market safety envelope ────────────────────────────
+// ─── Permissionless-market safety envelope ────────────────────────────
 // Hard bounds every `create_permissionless_market` param must satisfy, so a
 // market created by ANY signer is provably conservative regardless of intent.
-// (`validate_hip3_params` enforces these; `hip3_params_are_safe` proves it.)
+// (`validate_permissionless_market_params` enforces these; `permissionless_market_params_are_safe` proves it.)
 
 /// Max leverage a permissionless market may offer. The per-market maintenance
 /// floor (tied to the calibrated stress tier) is the binding constraint below
 /// this ceiling; a market only reaches high leverage when its stress tier AND
-/// its backstop coverage provably permit it (see `hip3_core_bounds_ok`,
+/// its backstop coverage provably permit it (see `permissionless_market_core_bounds_ok`,
 /// `worst_gap_loss_exceeds_insurance`).
-pub const HIP3_MAX_LEVERAGE: u32 = 65;
+pub const PERMISSIONLESS_MAX_LEVERAGE: u32 = 65;
 /// Minimum maintenance-margin ratio (bps) for a DEFAULT (un-tiered) market —
 /// `stress_shock_bps == 0`. Tiered markets use `max(stress_shock_bps,
-/// MIN_MM_ABS_BPS)` instead (see `hip3_core_bounds_ok`).
-pub const HIP3_MIN_MAINTENANCE_MARGIN_BPS: u32 = 500;
+/// MIN_MM_ABS_BPS)` instead (see `permissionless_market_core_bounds_ok`).
+pub const PERMISSIONLESS_MIN_MAINTENANCE_MARGIN_BPS: u32 = 500;
 
 /// ── Per-market calibrated-stress leverage tiers (Phase 1) ──────────────────
 /// Minimum per-market stress shock (bps) a market may calibrate to. 1.5% floor
@@ -319,24 +319,24 @@ pub const BASELINE_STRESS_SHOCK_BPS: u32 = 3000;
 /// liquidation gap when the tier's own shock is tiny.
 pub const MIN_MM_ABS_BPS: u32 = 25;
 /// Max taker fee (bps). 1% cap — no predatory fee extraction.
-pub const HIP3_MAX_TAKER_FEE_BPS: u32 = 100;
+pub const PERMISSIONLESS_MAX_TAKER_FEE_BPS: u32 = 100;
 /// Max liquidation penalty + liquidator reward (bps). 10% cap.
-pub const HIP3_MAX_LIQ_BPS: u32 = 1_000;
+pub const PERMISSIONLESS_MAX_LIQ_BPS: u32 = 1_000;
 /// Max oracle staleness (seconds) — a permissionless market must consume a
 /// FRESH oracle; 120 s bounds mark drift feeding worse-of liquidations.
-pub const HIP3_MAX_ORACLE_STALENESS_SECS: u32 = 120;
+pub const PERMISSIONLESS_MAX_ORACLE_STALENESS_SECS: u32 = 120;
 /// Max any single fee-share (referrer/builder/creator), bps.
-pub const HIP3_MAX_SHARE_BPS: u32 = 2_000;
+pub const PERMISSIONLESS_MAX_SHARE_BPS: u32 = 2_000;
 /// Max funding charged over one funding period (bps of notional) a
 /// permissionless market may configure. 1% per period bounds the worst-case
 /// per-period value transfer a hostile creator can drive through the funding
 /// crank; enforced at the crank via `clamp_delta_to_period_cap`.
-pub const HIP3_MAX_FUNDING_PER_PERIOD_BPS: u32 = 100;
+pub const PERMISSIONLESS_MAX_FUNDING_PER_PERIOD_BPS: u32 = 100;
 /// Min / max funding period (seconds) for a permissionless market, so the
 /// pro-rated per-period cap is meaningful (not a degenerate 0-length or
 /// multi-week window).
-pub const HIP3_MIN_FUNDING_PERIOD_SECS: u32 = 60;
-pub const HIP3_MAX_FUNDING_PERIOD_SECS: u32 = 86_400;
+pub const PERMISSIONLESS_MIN_FUNDING_PERIOD_SECS: u32 = 60;
+pub const PERMISSIONLESS_MAX_FUNDING_PERIOD_SECS: u32 = 86_400;
 
 #[cfg(test)]
 mod oracle_band_tests {
